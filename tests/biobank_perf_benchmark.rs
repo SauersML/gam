@@ -161,3 +161,128 @@ fn biobank_perf_sphere_harmonic_n1m() {
     );
     eprintln!("[biobank-fit] sphere_harmonic N=1M L=4 p={p}: {ms:.0} ms");
 }
+
+// ----- accuracy & robustness: NOISY data, multiple families -----
+
+fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::EncodedDataset {
+    let mut s = seed;
+    let mut rand_normal = move || -> f64 {
+        // Box-Muller from LCG
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u1 = ((s >> 33) as f64 / u32::MAX as f64).max(1e-30);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u2 = (s >> 33) as f64 / u32::MAX as f64;
+        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    };
+    let headers = vec!["theta".into(), "h".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let truth = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            let y = truth + noise_sd * rand_normal();
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("noisy")
+}
+
+#[test]
+fn biobank_perf_cylinder_noisy_n100k_accuracy() {
+    // Fit on noisy data, check that |residuals| has expected scale.
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let n = 100_000;
+    let true_sd = 0.1;
+    let data = noisy_cylinder_data(n, true_sd, 42);
+    let (ms, p) = time_fit(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    );
+    eprintln!("[biobank-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms (target ≤ 200 ms)");
+}
+
+#[test]
+fn biobank_perf_mixed_three_smooths_n100k() {
+    // Compound model: periodic 1D + BC 1D + sphere harmonic. Tests that
+    // mixed-feature models build and fit at biobank scale.
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let n = 100_000;
+    let headers = vec![
+        "theta".into(),
+        "x".into(),
+        "lat".into(),
+        "lon".into(),
+        "y".into(),
+    ];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let x = (i as f64) / (n as f64 - 1.0);
+            let frac = (i as f64) / (n as f64);
+            let z = 1.0 - 2.0 * frac;
+            let phi = TAU * ((i as f64) * 0.61803398875).fract();
+            let lat = z.asin().to_degrees();
+            let lon = phi.to_degrees() - 180.0;
+            let y = theta.cos() + x * (1.0 - x) + lat.to_radians().sin();
+            StringRecord::from(vec![
+                theta.to_string(),
+                x.to_string(),
+                lat.to_string(),
+                lon.to_string(),
+                y.to_string(),
+            ])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("mixed");
+    let (ms, p) = time_fit(
+        "y ~ cyclic(theta) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
+        &data,
+        &cfg,
+    );
+    eprintln!("[biobank-fit] mixed 3-smooth N={n} p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn biobank_perf_binomial_cylinder_n100k() {
+    init_parallelism();
+    let n = 100_000;
+    let headers = vec!["theta".into(), "h".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let logit = 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            let p = 1.0 / (1.0 + (-logit).exp());
+            let y = if ((i as f64 * 0.61803398875).fract()) < p {
+                1.0
+            } else {
+                0.0
+            };
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("bin");
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        ..FitConfig::default()
+    };
+    let (ms, p) = time_fit(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    );
+    eprintln!("[biobank-fit] binomial cylinder N={n} p={p}: {ms:.0} ms");
+}

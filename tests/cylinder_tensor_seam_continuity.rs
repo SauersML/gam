@@ -26,7 +26,10 @@ fn cylinder_dataset(n_theta: usize, n_h: usize) -> gam::data::EncodedDataset {
         for j in 0..n_h {
             let h = -1.0 + 2.0 * (j as f64) / ((n_h - 1) as f64);
             // Smooth signal that genuinely uses the cylinder topology
-            let y = 1.0 + 0.6 * theta.cos() + 0.3 * (2.0 * theta).sin() + 0.4 * h
+            let y = 1.0
+                + 0.6 * theta.cos()
+                + 0.3 * (2.0 * theta).sin()
+                + 0.4 * h
                 + 0.25 * theta.cos() * h;
             records.push(StringRecord::from(vec![
                 theta.to_string(),
@@ -50,15 +53,20 @@ fn predict_data(thetas: &[f64], hs: &[f64]) -> Array2<f64> {
     m
 }
 
-fn predict(formula: &str, data: &gam::data::EncodedDataset, thetas: &[f64], hs: &[f64])
-    -> Vec<f64>
-{
+fn predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    thetas: &[f64],
+    hs: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("cylinder fit succeeded");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let new_data = predict_data(thetas, hs);
     let test_design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
