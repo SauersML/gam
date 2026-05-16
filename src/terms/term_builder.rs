@@ -687,6 +687,20 @@ pub fn build_smooth_basis(
                 auto_spatial_center_strategy(centers, cols.len())
             };
             let nu = parse_matern_nu(options.get("nu").map(String::as_str).unwrap_or("5/2"))?;
+            // The exponential (ν = 1/2) Matérn kernel has a singular Laplacian
+            // at zero in d ≥ 2, so the operator-collocation penalty machinery
+            // hits a non-invertible matrix during fit. Surface the cause
+            // up-front instead of letting the user see the generic
+            // "Matrix conditioning issue detected" wrapper from PIRLS.
+            if matches!(nu, MaternNu::Half) && cols.len() >= 2 {
+                return Err(format!(
+                    "matern() with nu=1/2 is not supported for d>=2 (got {} covariates): \
+                     the exponential kernel's Laplacian is singular at center collisions, \
+                     which makes the operator-collocation penalty non-invertible. \
+                     Choose nu>=3/2 (e.g. nu=3/2 or the default nu=5/2) for multi-dimensional smooths.",
+                    cols.len()
+                ));
+            }
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
             } else {
