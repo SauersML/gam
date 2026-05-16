@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""2-D Duchon surface demo with a sharp plateau-transition truth, fit via the gam CLI and rendered as a heatmap."""
 from __future__ import annotations
 
 import argparse
