@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""1-D Duchon demo: noisy data with a sharp middle jump, fit via the gam CLI with adaptive regularization and plotted against truth."""
 from __future__ import annotations
 
 import argparse
