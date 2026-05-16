@@ -82,23 +82,29 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # Capture cargo test's exit status without aborting, so the
-          # forbidden-substring grep below can act as a diagnostic
-          # classifier on failure rather than a separate gate that trips
-          # on log output from passing tests that deliberately exercise
-          # these error paths.
-          cargo test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
+          # cargo test captures stdout/stderr by default and only re-prints
+          # it in the per-failure "failures:" section of tests that actually
+          # failed. That is what we want here: the forbidden-pattern grep
+          # below only fires when cargo test itself returned non-zero, and
+          # at that point the failed tests' captured output is already in
+          # /tmp/cargo-test.log via the failures: section. Passing tests
+          # that deliberately drive the solver into degenerate states (and
+          # the diagnostic eprintln!/log::warn! sites they exercise on the
+          # hot REML / PIRLS / joint-Newton paths) stay silent, so their
+          # output cannot accumulate on the runner's disk and exhaust it
+          # mid-link. That accumulation was the recurring "exit code 101 /
+          # LLVM ERROR: No space left on device" failure mode that this
+          # step kept reproducing every time a probe `eprintln!` got added
+          # anywhere in the hot solver paths.
+          cargo test --all-features 2>&1 | tee /tmp/cargo-test.log
           test_status=${PIPESTATUS[0]}
 
           # The patterns here are literal/ERE substrings that match the
           # exact log::warn!/log::error!/Display strings emitted at runtime
-          # when the solver hits specific degenerate states. Many library
-          # tests deliberately drive the solver into those states — e.g.
-          # perfect-separation coverage, seed-exhaustion coverage,
-          # PIRLS-non-convergence coverage. On a passing run those
-          # emissions are *expected* test output, not regressions. The
-          # grep only fires when cargo test itself returned non-zero,
-          # where the pattern match helps classify the failure mode.
+          # when the solver hits specific degenerate states. The grep only
+          # fires when cargo test itself returned non-zero, where the
+          # pattern match helps classify the failure mode against the
+          # failures: section that cargo writes for failing tests.
           #
           # Patterns verified against src/ to match non-test runtime log
           # output:
