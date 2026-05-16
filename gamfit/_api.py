@@ -55,6 +55,7 @@ def _build_fit_payload(
     frailty_sd: float | None,
     hazard_loading: str | None,
     scale_dimensions: bool | None,
+    adaptive_regularization: bool | None,
     firth: bool | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -78,6 +79,7 @@ def _build_fit_payload(
         "frailty_sd": frailty_sd,
         "hazard_loading": hazard_loading,
         "scale_dimensions": scale_dimensions,
+        "adaptive_regularization": adaptive_regularization,
         "firth": firth,
     }
     for key, value in kwarg_items.items():
@@ -110,6 +112,7 @@ def fit(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
+    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     response_geometry: str | None = None,
     response_columns: list[str] | tuple[str, ...] | None = None,
@@ -192,6 +195,10 @@ def fit(
         When ``True``, enables learned per-axis anisotropic length scales on
         spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
         scales are learned, not specified. Corresponds to ``--scale-dimensions``.
+    adaptive_regularization:
+        Enable exact local adaptive regularization for compatible spatial
+        smooths. Omit to use the automatic policy, which enables it for Duchon
+        smooths.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
     config:
@@ -258,6 +265,7 @@ def fit(
                 "frailty_sd": frailty_sd,
                 "hazard_loading": hazard_loading,
                 "scale_dimensions": scale_dimensions,
+                "adaptive_regularization": adaptive_regularization,
                 "firth": firth,
                 "config": nested_config or None,
             },
@@ -290,6 +298,7 @@ def fit(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
+        adaptive_regularization=adaptive_regularization,
         firth=firth,
         config=rust_config or None,
     )
@@ -383,6 +392,7 @@ def validate_formula(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
+    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     config: dict[str, Any] | None = None,
 ) -> FormulaValidation:
@@ -418,6 +428,7 @@ def validate_formula(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
+        adaptive_regularization=adaptive_regularization,
         firth=firth,
         config=rust_config or None,
     )
