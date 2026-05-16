@@ -496,12 +496,16 @@ def build_scene(plotter, shapes, point_size):
 
 
 def set_all_cameras(plotter, panels, azim_deg):
+    # `plotter.camera_position = ...` is silently no-op in subplot mode after
+    # the initial render; using set_position/set_focus/set_viewup actually
+    # mutates the active renderer's camera.
     for pn in panels:
         plotter.subplot(pn["r"], pn["c"])
         vd = view_dir(pn["elev"], azim_deg)
         eye = pn["centroid"] + pn["dist"] * vd
-        plotter.camera_position = [tuple(eye), tuple(pn["centroid"]),
-                                    (0, 0, 1)]
+        plotter.set_position(tuple(eye))
+        plotter.set_focus(tuple(pn["centroid"]))
+        plotter.set_viewup((0, 0, 1))
         plotter.reset_camera_clipping_range()
 
 
