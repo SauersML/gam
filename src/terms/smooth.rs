@@ -156,6 +156,8 @@ pub enum SmoothBasisSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
     pub marginalspecs: Vec<BSplineBasisSpec>,
+    #[serde(default)]
+    pub periods: Vec<Option<f64>>,
     pub double_penalty: bool,
     #[serde(default)]
     pub identifiability: TensorBSplineIdentifiability,
@@ -2456,12 +2458,14 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
         BasisMetadata::ThinPlate {
             centers,
             length_scale,
+            periodic,
             identifiability_transform: None,
             input_scales,
             radial_reparam,
         } => BasisMetadata::ThinPlate {
             centers,
             length_scale,
+            periodic,
             identifiability_transform: Some(Array2::eye(raw_cols)),
             input_scales,
             radial_reparam,
@@ -2469,6 +2473,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
         BasisMetadata::Duchon {
             centers,
             length_scale,
+            periodic,
             power,
             nullspace_order,
             identifiability_transform: None,
@@ -2477,6 +2482,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
         } => BasisMetadata::Duchon {
             centers,
             length_scale,
+            periodic,
             power,
             nullspace_order,
             identifiability_transform: Some(Array2::eye(raw_cols)),
@@ -2493,6 +2499,7 @@ fn matern_operator_penalty_triplet_from_metadata(
     let BasisMetadata::Matern {
         centers,
         length_scale,
+        periodic,
         nu,
         include_intercept,
         identifiability_transform,
@@ -2504,8 +2511,9 @@ fn matern_operator_penalty_triplet_from_metadata(
             "Matérn operator penalties require Matérn metadata".to_string(),
         ));
     };
+    let penalty_centers = crate::basis::expand_periodic_centers(centers, periodic.as_deref())?;
     let ops = build_matern_collocation_operator_matrices(
-        centers.view(),
+        penalty_centers.view(),
         None,
         *length_scale,
         *nu,
@@ -2641,6 +2649,7 @@ fn build_shape_constraint_design_1d(
             },
         ) => {
             let evalspec = ThinPlateBasisSpec {
+                periodic: None,
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
                 double_penalty: false,
@@ -2675,6 +2684,7 @@ fn build_shape_constraint_design_1d(
                 })
                 .unwrap_or(MaternIdentifiability::None);
             let evalspec = MaternBasisSpec {
+                periodic: None,
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
                 nu: *nu,
@@ -2700,6 +2710,7 @@ fn build_shape_constraint_design_1d(
             },
         ) => {
             let evalspec = DuchonBasisSpec {
+                periodic: None,
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
                 power: *power,
@@ -2876,6 +2887,62 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
+fn build_periodic_fourier_margin(
+    x: ArrayView1<'_, f64>,
+    period: f64,
+    requested_cols: usize,
+    penalty_order: usize,
+) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), BasisError> {
+    if !period.is_finite() || period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic tensor margin requires finite positive period, got {period}"
+        )));
+    }
+    let q = requested_cols.max(3);
+    let harmonics = q / 2;
+    let has_nyquist_cos = q % 2 == 0;
+    let mut basis = Array2::<f64>::zeros((x.len(), q));
+    basis.column_mut(0).fill(1.0);
+    for (i, &xi) in x.iter().enumerate() {
+        let angle = 2.0 * std::f64::consts::PI * xi / period;
+        let mut col = 1usize;
+        for h in 1..=harmonics {
+            if col >= q {
+                break;
+            }
+            basis[[i, col]] = (h as f64 * angle).cos();
+            col += 1;
+            if col >= q {
+                break;
+            }
+            basis[[i, col]] = (h as f64 * angle).sin();
+            col += 1;
+        }
+        if has_nyquist_cos && q > 1 {
+            basis[[i, q - 1]] = (harmonics as f64 * angle).cos();
+        }
+    }
+    let mut penalty = Array2::<f64>::zeros((q, q));
+    let order = penalty_order.max(1) as i32;
+    let mut col = 1usize;
+    for h in 1..=harmonics {
+        let w = (h as f64).powi(2 * order);
+        if col < q {
+            penalty[[col, col]] = w;
+            col += 1;
+        }
+        if col < q {
+            penalty[[col, col]] = w;
+            col += 1;
+        }
+    }
+    if has_nyquist_cos && q > 1 {
+        penalty[[q - 1, q - 1]] = (harmonics as f64).powi(2 * order);
+    }
+    let knots = Array1::linspace(0.0, period, q + 1);
+    Ok((basis, penalty, knots))
+}
+
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -2891,6 +2958,13 @@ fn build_tensor_bspline_basis(
             "TensorBSpline feature/spec mismatch: feature_cols={}, marginalspecs={}",
             feature_cols.len(),
             spec.marginalspecs.len()
+        )));
+    }
+    if !spec.periods.is_empty() && spec.periods.len() != feature_cols.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "TensorBSpline periods length {} does not match feature count {}",
+            spec.periods.len(),
+            feature_cols.len()
         )));
     }
     let p = data.ncols();
@@ -2919,37 +2993,62 @@ fn build_tensor_bspline_basis(
         // identifiability constraints here would change marginal penalty sizes
         // without changing the tensor design construction, causing dimension
         // mismatch. Keep marginal builders unconstrained at this stage.
-        let mut marginal_unconstrained = marginalspec.clone();
-        marginal_unconstrained.identifiability = BSplineIdentifiability::None;
-        let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
-        let knots = match built.metadata {
-            BasisMetadata::BSpline1D { knots, .. } => knots,
-            _ => {
-                return Err(BasisError::InvalidInput(format!(
-                    "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
-                )));
-            }
-        };
-        marginal_knots.push(knots);
-        marginal_degrees.push(marginalspec.degree);
-        marginalnum_basis.push(built.design.ncols());
-        marginal_designs.push(built.design.to_dense());
-        marginal_penalties.push(
-            built
-                .penalties
-                .first()
-                .ok_or_else(|| {
-                    BasisError::InvalidInput(format!(
-                        "internal TensorBSpline error at dim {dim}: missing marginal penalty"
-                    ))
-                })?
-                .clone(),
-        );
-        built.nullspace_dims.first().ok_or_else(|| {
-            BasisError::InvalidInput(format!(
-                "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
-            ))
-        })?;
+        if let Some(period) = spec.periods.get(dim).and_then(|p| *p) {
+            let requested_cols = match marginalspec.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + marginalspec.degree + 1,
+                BSplineKnotSpec::Provided(ref knots) => {
+                    knots.len().saturating_sub(marginalspec.degree + 1)
+                }
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots, ..
+                } => num_internal_knots.unwrap_or(8) + marginalspec.degree + 1,
+            };
+            let (basis, penalty, knots) = build_periodic_fourier_margin(
+                data.column(col),
+                period,
+                requested_cols,
+                marginalspec.penalty_order,
+            )?;
+            marginal_knots.push(knots);
+            marginal_degrees.push(marginalspec.degree);
+            marginalnum_basis.push(basis.ncols());
+            marginal_designs.push(basis);
+            marginal_penalties.push(penalty);
+        } else {
+            let mut marginal_unconstrained = marginalspec.clone();
+            marginal_unconstrained.identifiability = BSplineIdentifiability::None;
+            let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
+            let knots = match built.metadata {
+                BasisMetadata::BSpline1D { knots, .. } => knots,
+                _ => {
+                    return Err(BasisError::InvalidInput(format!(
+                        "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
+                    )));
+                }
+            };
+            marginal_knots.push(knots);
+            marginal_degrees.push(marginalspec.degree);
+            marginalnum_basis.push(built.design.ncols());
+            marginal_designs.push(built.design.to_dense());
+            marginal_penalties.push(
+                built
+                    .penalties
+                    .first()
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "internal TensorBSpline error at dim {dim}: missing marginal penalty"
+                        ))
+                    })?
+                    .clone(),
+            );
+            built.nullspace_dims.first().ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
+                ))
+            })?;
+        }
     }
 
     let total_cols: usize = marginalnum_basis.iter().product();
@@ -3072,6 +3171,11 @@ fn build_tensor_bspline_basis(
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
             degrees: marginal_degrees,
+            periods: if spec.periods.is_empty() {
+                vec![None; feature_cols.len()]
+            } else {
+                spec.periods.clone()
+            },
             identifiability_transform: z_opt,
         },
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
@@ -4928,12 +5032,14 @@ fn with_identifiability_transform(
         BasisMetadata::ThinPlate {
             centers,
             length_scale,
+            periodic,
             identifiability_transform,
             input_scales,
             radial_reparam,
         } => Ok(BasisMetadata::ThinPlate {
             centers: centers.clone(),
             length_scale: *length_scale,
+            periodic: periodic.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -4944,6 +5050,7 @@ fn with_identifiability_transform(
         BasisMetadata::Matern {
             centers,
             length_scale,
+            periodic,
             nu,
             include_intercept,
             identifiability_transform,
@@ -4952,6 +5059,7 @@ fn with_identifiability_transform(
         } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
             length_scale: *length_scale,
+            periodic: periodic.clone(),
             nu: *nu,
             include_intercept: *include_intercept,
             identifiability_transform: compose_identifiability_transforms(
@@ -4964,6 +5072,7 @@ fn with_identifiability_transform(
         BasisMetadata::Duchon {
             centers,
             length_scale,
+            periodic,
             power,
             nullspace_order,
             identifiability_transform,
@@ -4972,6 +5081,7 @@ fn with_identifiability_transform(
         } => Ok(BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
+            periodic: periodic.clone(),
             power: *power,
             nullspace_order: *nullspace_order,
             input_scales: input_scales.clone(),
@@ -4985,11 +5095,13 @@ fn with_identifiability_transform(
             feature_cols,
             knots,
             degrees,
+            periods,
             identifiability_transform,
         } => Ok(BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.clone(),
             knots: knots.clone(),
             degrees: degrees.clone(),
+            periods: periods.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -11929,6 +12041,7 @@ pub fn freeze_term_collection_from_design(
                     // overwrites them with the frozen values from the metadata
                     // captured during the actual basis build.
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+                    periodic: None,
                     length_scale: None,
                     power: 0,
                     nullspace_order: DuchonNullspaceOrder::Zero,
@@ -11964,10 +12077,10 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::ThinPlate {
                     centers,
                     length_scale,
+                    periodic: meta_periodic,
                     identifiability_transform,
                     input_scales: meta_scales,
                     radial_reparam,
-                    ..
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -11982,6 +12095,7 @@ pub fn freeze_term_collection_from_design(
                     },
                 };
                 s.radial_reparam = radial_reparam.clone();
+                s.periodic = meta_periodic.clone();
                 *input_scales = meta_scales.clone();
             }
             (
@@ -11989,6 +12103,7 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
+                    periodic: meta_periodic,
                     power,
                     nullspace_order,
                     identifiability_transform,
@@ -12009,6 +12124,7 @@ pub fn freeze_term_collection_from_design(
                 term.basis = SmoothBasisSpec::Duchon {
                     feature_cols: feature_cols.clone(),
                     spec: DuchonBasisSpec {
+                        periodic: meta_periodic.clone(),
                         center_strategy: crate::basis::CenterStrategy::UserProvided(
                             centers.clone(),
                         ),
@@ -12031,12 +12147,12 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::Matern {
                     centers,
                     length_scale,
+                    periodic: meta_periodic,
                     nu,
                     include_intercept,
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
-                    ..
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -12050,6 +12166,7 @@ pub fn freeze_term_collection_from_design(
                     None => MaternIdentifiability::None,
                 };
                 s.aniso_log_scales = meta_aniso.clone();
+                s.periodic = meta_periodic.clone();
                 *input_scales = meta_scales.clone();
             }
             (
@@ -12061,6 +12178,7 @@ pub fn freeze_term_collection_from_design(
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
+                    periodic: meta_periodic,
                     power,
                     nullspace_order,
                     identifiability_transform,
@@ -12085,6 +12203,7 @@ pub fn freeze_term_collection_from_design(
                     },
                 };
                 s.aniso_log_scales = meta_aniso.clone();
+                s.periodic = meta_periodic.clone();
                 *input_scales = meta_scales.clone();
             }
             (
@@ -12096,6 +12215,7 @@ pub fn freeze_term_collection_from_design(
                     feature_cols: fitted_cols,
                     knots,
                     degrees,
+                    periods,
                     identifiability_transform,
                 },
             ) => {
@@ -12113,6 +12233,7 @@ pub fn freeze_term_collection_from_design(
                     s.marginalspecs[i].degree = degrees[i];
                     s.marginalspecs[i].knotspec = BSplineKnotSpec::Provided(knots[i].clone());
                 }
+                s.periods = periods.clone();
                 s.identifiability = match identifiability_transform {
                     Some(z) => TensorBSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -14399,6 +14520,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![1, 2],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: true,
@@ -14443,6 +14565,7 @@ mod tests {
             basis: SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0, 1],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
                     length_scale: 1.0,
                     double_penalty: false,
@@ -14474,6 +14597,7 @@ mod tests {
             basis: SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: 1.0,
                     double_penalty: false,
@@ -14513,6 +14637,7 @@ mod tests {
             basis: SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0, 1, 2],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 3 },
                     length_scale: 1.0,
                     double_penalty: false,
@@ -14565,6 +14690,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1, 2, 3, 4],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                         length_scale: 1.0,
                         double_penalty: false,
@@ -14624,6 +14750,7 @@ mod tests {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0],
                 spec: MaternBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: 0.7,
                     nu: MaternNu::FiveHalves,
@@ -14655,6 +14782,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(0.9),
                     power: 5,
@@ -14735,6 +14863,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![1, 2],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: true,
@@ -14818,6 +14947,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: false,
@@ -14873,6 +15003,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: false,
@@ -14933,6 +15064,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: false,
@@ -15007,6 +15139,7 @@ mod tests {
                     basis: SmoothBasisSpec::ThinPlate {
                         feature_cols: vec![feature],
                         spec: ThinPlateBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                             length_scale: 1.0,
                             double_penalty: false,
@@ -15074,6 +15207,7 @@ mod tests {
                     basis: SmoothBasisSpec::ThinPlate {
                         feature_cols: vec![1],
                         spec: ThinPlateBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                             length_scale: 1.0,
                             double_penalty: true,
@@ -15089,6 +15223,7 @@ mod tests {
                     basis: SmoothBasisSpec::ThinPlate {
                         feature_cols: vec![2],
                         spec: ThinPlateBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                             length_scale: 1.0,
                             double_penalty: true,
@@ -15176,6 +15311,7 @@ mod tests {
             basis: SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::UserProvided(centers),
                     length_scale: 1.0,
                     double_penalty: false,
@@ -15215,6 +15351,7 @@ mod tests {
             basis: SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0, 1],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                     length_scale: 1.0,
                     double_penalty: false,
@@ -15280,6 +15417,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: Some(1.0),
                     power: 5,
@@ -15390,6 +15528,7 @@ mod tests {
                     basis: SmoothBasisSpec::Duchon {
                         feature_cols: vec![0, 1],
                         spec: DuchonBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                             length_scale: Some(1.0),
                             power: 1,
@@ -15469,6 +15608,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(centers),
                         length_scale: 1.0,
                         double_penalty: false,
@@ -15521,6 +15661,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: 1.0,
                         double_penalty: false,
@@ -15558,6 +15699,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(centers),
                         length_scale,
                         double_penalty: false,
@@ -15616,6 +15758,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 1.3,
                         double_penalty: true,
@@ -15637,6 +15780,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 1.1,
                         nu: MaternNu::FiveHalves,
@@ -15660,6 +15804,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: Some(1.4),
                         power: 5,
@@ -15727,6 +15872,7 @@ mod tests {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: (0..d).collect(),
                 spec: MaternBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                     length_scale: 0.75,
                     nu: MaternNu::FiveHalves,
@@ -15780,6 +15926,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(0.9),
                     power: 5,
@@ -15816,6 +15963,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(1.0),
                     power: 3,
@@ -15864,6 +16012,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
                         power: 3,
@@ -15916,6 +16065,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
                         power: 3,
@@ -15960,6 +16110,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: (0..d).collect(),
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
                         power: 3,
@@ -16002,6 +16153,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: (0..d).collect(),
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 1.0,
                         nu: MaternNu::FiveHalves,
@@ -16062,6 +16214,7 @@ mod tests {
             basis: SmoothBasisSpec::TensorBSpline {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
+                    periods: Vec::new(),
                     marginalspecs: vec![spec_x, spec_y],
                     double_penalty: true,
                     identifiability: TensorBSplineIdentifiability::default(),
@@ -16126,6 +16279,7 @@ mod tests {
             basis: SmoothBasisSpec::TensorBSpline {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
+                    periods: Vec::new(),
                     marginalspecs: vec![spec_x, spec_y],
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
@@ -16163,6 +16317,7 @@ mod tests {
             basis: SmoothBasisSpec::TensorBSpline {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
+                    periods: Vec::new(),
                     marginalspecs: vec![
                         BSplineBasisSpec {
                             degree: 3,
@@ -16244,6 +16399,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1, 2],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: 20.0,
                         nu: MaternNu::FiveHalves,
@@ -16349,6 +16505,7 @@ mod tests {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0, 1],
                 spec: MaternBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale,
                     nu: MaternNu::FiveHalves,
@@ -16525,6 +16682,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: 0.85,
                         nu: MaternNu::FiveHalves,
@@ -16683,6 +16841,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
                         power: 1,
@@ -16920,6 +17079,7 @@ mod tests {
             SmoothBasisSpec::ThinPlate {
                 feature_cols: vec![0],
                 spec: ThinPlateBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: 1.0,
                     double_penalty: false,
@@ -16932,6 +17092,7 @@ mod tests {
             SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(1.0),
                     power: 1,
@@ -17237,6 +17398,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
                         power: 1,
@@ -17442,6 +17604,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
                         power: 1,
@@ -17675,6 +17838,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
                         power: 1,
@@ -17849,6 +18013,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
                         power: 1,
@@ -18024,6 +18189,7 @@ mod tests {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0, 1],
                 spec: MaternBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::Auto(Box::new(
                         CenterStrategy::FarthestPoint { num_centers: 8 },
                     )),
@@ -18254,6 +18420,7 @@ mod tests {
                     basis: SmoothBasisSpec::Matern {
                         feature_cols: vec![0, 1],
                         spec: MaternBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                             length_scale: 0.8,
                             nu: MaternNu::FiveHalves,
@@ -18386,6 +18553,7 @@ mod tests {
             basis: SmoothBasisSpec::Matern {
                 feature_cols: vec![0, 1],
                 spec: MaternBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                     length_scale,
                     nu: MaternNu::FiveHalves,
@@ -18522,6 +18690,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 0.9,
                         nu: MaternNu::FiveHalves,
@@ -18625,6 +18794,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 0.85,
                         nu: MaternNu::FiveHalves,
@@ -18841,6 +19011,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: 0.4,
                         nu: MaternNu::FiveHalves,
@@ -18907,6 +19078,7 @@ mod tests {
                 basis: SmoothBasisSpec::ThinPlate {
                     feature_cols: vec![0, 1],
                     spec: ThinPlateBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
                         length_scale: 0.7,
                         double_penalty: true,
@@ -19013,6 +19185,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
                         length_scale: Some(0.7),
                         power: 1,
@@ -19124,6 +19297,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: 12.0,
                         nu: MaternNu::FiveHalves,
@@ -19238,6 +19412,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                         length_scale: 1.8,
                         nu: MaternNu::FiveHalves,
@@ -19347,6 +19522,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(0.9),
                         power: 1,
@@ -19440,6 +19616,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: None,
                         power: 1,
@@ -19475,6 +19652,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(array![
                             [0.0, 0.0],
                             [1.0, 0.0],
@@ -19522,6 +19700,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(array![
                             [0.0, 0.0, 0.0],
                             [1.0, 0.0, 0.0],
@@ -19565,6 +19744,7 @@ mod tests {
                     basis: SmoothBasisSpec::Matern {
                         feature_cols: vec![0, 1],
                         spec: MaternBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::UserProvided(array![
                                 [0.0, 0.0],
                                 [1.0, 0.0],
@@ -19586,6 +19766,7 @@ mod tests {
                     basis: SmoothBasisSpec::Matern {
                         feature_cols: vec![0, 1],
                         spec: MaternBasisSpec {
+                            periodic: None,
                             center_strategy: CenterStrategy::UserProvided(array![
                                 [0.0, 0.0],
                                 [1.0, 0.0],
@@ -19631,6 +19812,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(array![
                             [0.0, 0.0],
                             [1.0, 0.0],
@@ -19714,6 +19896,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
                         power: 1,
@@ -19788,6 +19971,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::UserProvided(array![
                             [0.0, 0.0],
                             [1.0, 0.0],
@@ -19908,6 +20092,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1, 2],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
                         power: 1,
@@ -20056,6 +20241,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(length_scale),
                     power: 3,
@@ -20193,6 +20379,7 @@ mod tests {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                     length_scale: None,
                     power: 2,
@@ -20894,6 +21081,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                         length_scale: 0.7,
                         nu: MaternNu::FiveHalves,
@@ -20981,6 +21169,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                         length_scale: 0.7,
                         nu: MaternNu::FiveHalves,
@@ -21066,6 +21255,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: 0.6,
                         nu: MaternNu::FiveHalves,
@@ -21288,6 +21478,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 31 },
                         length_scale: Some(1.0),
                         power: 2,
@@ -21466,6 +21657,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 120 },
                         length_scale: Some(1.0),
                         power: 2,
@@ -21631,6 +21823,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
                         length_scale: 0.8,
                         nu: MaternNu::FiveHalves,
@@ -21716,6 +21909,7 @@ mod tests {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 11 },
                         length_scale: Some(0.8),
                         power: 2,
