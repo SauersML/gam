@@ -121,6 +121,8 @@ fn duchon_pc_smooth(name: &str) -> SmoothTermSpec {
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: Some(vec![0.0; 16]),
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
+
+                periodic: false,
             },
             input_scales: None,
         },
