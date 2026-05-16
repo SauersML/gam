@@ -382,6 +382,7 @@ pub fn build_smooth_basis(
                     degree + 1
                 ));
             }
+            let period = parse_periods(options, &[true])?[0].unwrap_or(maxv - minv);
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
@@ -389,7 +390,7 @@ pub fn build_smooth_basis(
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
                     knotspec: BSplineKnotSpec::Periodic {
                         domain_start: minv,
-                        period: maxv - minv,
+                        period,
                         num_basis,
                     },
                     double_penalty: smooth_double_penalty,
@@ -435,15 +436,13 @@ pub fn build_smooth_basis(
                             .to_string(),
                     );
                 }
-                BSplineKnotSpec::Periodic {
-                    domain_start: minv,
-                    period: periods[0].ok_or_else(|| {
-                        format!(
-                            "periodic smooth '{}' requires period=<value> or period=[value]",
-                            vars.join(",")
-                        )
-                    })?,
-                    num_basis: n_knots + degree + 1,
+                {
+                    let p_value = periods[0].unwrap_or(maxv - minv);
+                    BSplineKnotSpec::Periodic {
+                        domain_start: minv,
+                        period: p_value,
+                        num_basis: n_knots + degree + 1,
+                    }
                 }
             } else {
                 BSplineKnotSpec::Generate {
