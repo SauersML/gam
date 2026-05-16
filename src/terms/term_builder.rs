@@ -358,8 +358,7 @@ pub fn build_smooth_basis(
             }
             let degree = 3usize;
             let knots_internal = option_usize(options, "knots");
-            let basis_dim =
-                option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+            let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
             if knots_internal.is_some() && basis_dim.is_some() {
                 return Err(
                     "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
@@ -403,8 +402,7 @@ pub fn build_smooth_basis(
                         .iter()
                         .map(|v| v.to_string())
                         .collect::<Vec<_>>()
-                        .join(", "),
-                    vars.join(",")
+                        .join(", ")
                 ));
             }
             let periodic_axes = parse_periodic_axes(options, cols.len())?;
@@ -930,6 +928,37 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
     let ceiling = ((unique as f64).cbrt() as usize).max(20);
     (unique / 4).clamp(4, ceiling)
+}
+
+fn cap_inferred_tensor_internal_knots(internal_knots: &mut [usize], degree: usize, n: usize) {
+    if internal_knots.is_empty() {
+        return;
+    }
+    let min_basis = degree + 1;
+    let max_product = inferred_tensor_basis_product_cap(n, internal_knots.len());
+    loop {
+        let product = internal_knots
+            .iter()
+            .try_fold(1usize, |acc, &knots| acc.checked_mul(knots + min_basis));
+        if matches!(product, Some(p) if p <= max_product) {
+            break;
+        }
+        let Some((idx, _)) = internal_knots
+            .iter()
+            .enumerate()
+            .filter(|(_, knots)| **knots > 1)
+            .max_by_key(|(_, knots)| **knots + min_basis)
+        else {
+            break;
+        };
+        internal_knots[idx] -= 1;
+    }
+}
+
+fn inferred_tensor_basis_product_cap(n: usize, ndim: usize) -> usize {
+    let n_cap = (4.0 * (n.max(1) as f64).sqrt()).round() as usize;
+    let dim_floor = 8usize.saturating_pow(ndim as u32).max(96).min(400);
+    n_cap.clamp(dim_floor, 400)
 }
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {
