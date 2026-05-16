@@ -12,9 +12,9 @@ use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
-    default_num_centers, default_spatial_center_strategy, plan_spatial_basis,
-    resolve_duchon_orders,
+    MaternNu, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
+    plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
@@ -362,6 +362,7 @@ pub fn build_smooth_basis(
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
+                    boundary_conditions: Default::default(),
                 },
             })
         }
@@ -392,17 +393,24 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
-            let cyclic = option_bool(options, "cyclic").unwrap_or(false)
+            let periodic = option_bool(options, "cyclic").unwrap_or(false)
                 || option_bool(options, "periodic").unwrap_or(false);
+            let boundary_conditions = parse_bspline_boundary_conditions(options)?;
+            if periodic && !boundary_conditions.is_free() {
+                return Err(
+                    "periodic B-splines cannot also declare endpoint boundary conditions"
+                        .to_string(),
+                );
+            }
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                    knotspec: if cyclic {
-                        BSplineKnotSpec::CyclicGenerate {
+                    knotspec: if periodic {
+                        BSplineKnotSpec::PeriodicUniform {
                             data_range: (minv, maxv),
-                            num_basis_functions: n_knots + degree + 1,
+                            num_basis: n_knots + degree + 1,
                         }
                     } else {
                         BSplineKnotSpec::Generate {
@@ -412,7 +420,7 @@ pub fn build_smooth_basis(
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
-                    boundary_conditions: parse_bspline_boundary_conditions(options)?,
+                    boundary_conditions,
                 },
             })
         }
