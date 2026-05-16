@@ -165,7 +165,7 @@ fn periodic_bspline_derivative_preserves_analytic_periodic_invariants() {
     let period = TAU;
     let k = 12;
     let degree = 3;
-    let xs = ndarray::array![0.0, 0.5, 1.7, 3.14, 4.2, 5.5, period];
+    let xs = ndarray::array![0.0, 0.5, 1.7, 3.0, 4.2, 5.5, period];
     let d = create_periodic_bspline_derivative_dense(xs.view(), (0.0, period), degree, k).unwrap();
 
     for (i, row) in d.outer_iter().enumerate() {
