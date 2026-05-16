@@ -294,7 +294,7 @@ pub fn parse_survival_distribution(raw: &str) -> Result<ResidualDistribution, St
         "gumbel" | "cloglog" => Ok(ResidualDistribution::Gumbel),
         "logistic" | "logit" => Ok(ResidualDistribution::Logistic),
         other => Err(format!(
-            "unsupported --survival-distribution '{other}'; use gaussian|gumbel|logistic"
+            "unsupported survmodel(distribution='{other}'); accepted: gaussian / probit, gumbel / cloglog, logistic / logit"
         )),
     }
 }
