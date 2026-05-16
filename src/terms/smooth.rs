@@ -30,10 +30,10 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState, PenaltySpec,
-    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
+    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas_andwarm_start,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerSvd, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DesignBlock,
@@ -5379,6 +5379,50 @@ fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
     })
 }
 
+fn feasible_linear_constraint_warm_start(
+    constraints: Option<&LinearInequalityConstraints>,
+    p: usize,
+) -> Option<Array1<f64>> {
+    let constraints = constraints?;
+    if constraints.a.ncols() != p
+        || constraints.a.nrows() == 0
+        || constraints.b.len() != constraints.a.nrows()
+    {
+        return None;
+    }
+    if constraints.b.iter().all(|v| v.abs() <= 1e-14) {
+        return None;
+    }
+
+    let gram = constraints.a.dot(&constraints.a.t());
+    let (u_opt, singular, vt_opt) = gram.svd(true, true).ok()?;
+    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
+        return None;
+    };
+    let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular.max(1.0);
+    let mut coeff = u.t().dot(&constraints.b);
+    for (idx, value) in coeff.iter_mut().enumerate() {
+        let sigma = singular[idx];
+        if sigma.abs() > tol {
+            *value /= sigma;
+        } else {
+            *value = 0.0;
+        }
+    }
+    let dual = vt.t().dot(&coeff);
+    let beta = constraints.a.t().dot(&dual);
+    if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let slack = constraints.a.dot(&beta) - &constraints.b;
+    if slack.iter().all(|v| *v >= -1e-8) {
+        Some(beta)
+    } else {
+        None
+    }
+}
+
 fn fit_term_collection_on_realized_design(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -5402,14 +5446,19 @@ fn fit_term_collection_on_realized_design(
         );
     }
     let base_fit_opts = adaptive_fit_options_base(options, design);
+    let warm_start = feasible_linear_constraint_warm_start(
+        design.linear_constraints.as_ref(),
+        design.design.ncols(),
+    );
     let fitted = FittedTermCollection {
-        fit: fit_gamwith_heuristic_lambdas(
+        fit: fit_gamwith_heuristic_lambdas_andwarm_start(
             design.design.clone(),
             y,
             weights,
             offset,
             &design.penalties,
             heuristic_lambdas,
+            warm_start.as_ref().map(|beta| beta.view()),
             family,
             &base_fit_opts,
         )?,

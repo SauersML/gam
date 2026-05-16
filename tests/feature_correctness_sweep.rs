@@ -471,7 +471,7 @@ fn build_harmonic(
 }
 
 #[test]
-fn sphere_harmonic_basis_dim_is_L_times_L_plus_2() {
+fn sphere_harmonic_basis_dim_is_l_times_l_plus_2() {
     for l in 1..=8 {
         let pts = random_lat_lon(50, 7 * l as u64);
         let built = build_harmonic(pts.view(), l, false).unwrap();
@@ -480,7 +480,7 @@ fn sphere_harmonic_basis_dim_is_L_times_L_plus_2() {
 }
 
 #[test]
-fn sphere_harmonic_design_finite_for_all_L_at_random_points() {
+fn sphere_harmonic_design_finite_for_all_l_at_random_points() {
     for l in 1..=8 {
         let pts = random_lat_lon(200, 31 * l as u64);
         let built = build_harmonic(pts.view(), l, false).unwrap();
@@ -522,7 +522,7 @@ fn sphere_harmonic_at_north_pole_reduces_to_legendre() {
 }
 
 #[test]
-fn sphere_harmonic_radians_matches_degrees_across_L_and_points() {
+fn sphere_harmonic_radians_matches_degrees_across_l_and_points() {
     let deg = ndarray::array![
         [10.0, 20.0],
         [-30.0, -45.0],
@@ -590,7 +590,7 @@ fn sphere_harmonic_row_gram_invariant_under_longitude_shift() {
 }
 
 #[test]
-fn sphere_harmonic_rejects_L_zero_and_too_large() {
+fn sphere_harmonic_rejects_l_zero_and_too_large() {
     let pts = ndarray::array![[10.0_f64, 20.0_f64]];
     // L=0 has no columns; rejected
     let spec = SphericalSplineBasisSpec {
