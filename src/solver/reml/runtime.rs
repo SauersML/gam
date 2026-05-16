@@ -2156,6 +2156,7 @@ impl<'a> RemlState<'a> {
             kronecker_penalty_system: None,
             kronecker_factored: None,
             penalty_block_structural_nullities: RwLock::new(None),
+            gaussian_fixed_cache: RwLock::new(None),
         })
     }
 
@@ -2202,6 +2203,9 @@ impl<'a> RemlState<'a> {
         self.kronecker_penalty_system = kronecker_penalty_system;
         self.kronecker_factored = kronecker_factored;
         *self.penalty_block_structural_nullities.write().unwrap() = None;
+        // The Gaussian-fixed cache is keyed to (X, y, w, offset); replacing the
+        // design invalidates it. The new surface will repopulate it on demand.
+        *self.gaussian_fixed_cache.write().unwrap() = None;
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         // The new surface has a different design / penalty system /
@@ -3752,6 +3756,7 @@ impl<'a> RemlState<'a> {
                 y: self.y,
                 priorweights: self.weights,
                 covariate_se: None,
+                gaussian_fixed_cache: None,
             };
             let penalty = pirls::PenaltyConfig {
                 canonical_penalties: &self.canonical_penalties,
