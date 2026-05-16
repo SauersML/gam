@@ -22,7 +22,9 @@
 //! CPU path is the unconditional fallback, and the user-visible behavior is
 //! unchanged on hosts without a usable NVIDIA driver.
 
+mod blas;
 pub mod device;
+pub mod dispatch;
 pub mod kernels;
 pub mod memory;
 pub mod policy;
@@ -31,6 +33,9 @@ pub mod runtime;
 pub mod traits;
 
 pub use device::{GpuCapability, GpuDeviceInfo};
+pub use dispatch::{
+    try_fast_ab, try_fast_atb, try_fast_atv, try_fast_av, try_fast_xt_diag_x, try_fast_xt_diag_y,
+};
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector, MatrixLocation};
 pub use policy::DispatchPolicy;
 pub use profile::{KernelStat, KernelStatsSnapshot, cpu_scope};
