@@ -509,8 +509,75 @@ pub trait WorkingModel {
         self.update_with_curvature(beta, curvature)
     }
 
+    /// Cheap LM-candidate evaluation that skips Hessian assembly when
+    /// possible. The default falls back to `update_candidate`, but Models
+    /// that can evaluate `η + Xδ → μ, weights, deviance` without the O(np²)
+    /// curvature build should override this for a meaningful speed-up.
+    fn screen_candidate(
+        &mut self,
+        beta: &Coefficients,
+        _direction: &Array1<f64>,
+        _current_eta: &LinearPredictor,
+        curvature: HessianCurvatureKind,
+    ) -> Result<CandidateEvaluation, EstimationError> {
+        self.update_candidate(beta, curvature)
+            .map(CandidateEvaluation::Full)
+    }
+
     fn supports_observed_information_curvature(&self) -> bool {
         false
+    }
+}
+
+/// Result of a cheap LM-candidate screen: penalized objective + arithmetic
+/// finiteness, without the gradient/Hessian needed for an accepted step.
+#[derive(Debug, Clone)]
+pub struct CandidateScreen {
+    pub penalized_objective: f64,
+    pub deviance: f64,
+    pub penalty_term: f64,
+    pub arithmetic_finite: bool,
+}
+
+/// Outcome of `WorkingModel::screen_candidate`: either a cheap screen result
+/// (LM loop must upgrade with `update_with_curvature` on acceptance) or the
+/// full state when screening was not applicable.
+pub enum CandidateEvaluation {
+    Screen(CandidateScreen),
+    Full(WorkingState),
+}
+
+impl CandidateEvaluation {
+    #[inline]
+    fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
+        match self {
+            Self::Screen(s) => s.penalized_objective,
+            Self::Full(state) => {
+                let mut value = state.deviance + state.penalty_term;
+                if firth_bias_reduction
+                    && let Some(j) = state.jeffreys_logdet()
+                {
+                    value -= 2.0 * j;
+                }
+                value
+            }
+        }
+    }
+
+    #[inline]
+    fn arithmetic_finite(&self) -> bool {
+        match self {
+            Self::Screen(s) => s.arithmetic_finite,
+            Self::Full(state) => state.gradient.iter().all(|g| g.is_finite()),
+        }
+    }
+
+    #[inline]
+    fn into_full(self) -> Option<WorkingState> {
+        match self {
+            Self::Full(state) => Some(state),
+            Self::Screen(_) => None,
+        }
     }
 }
 
