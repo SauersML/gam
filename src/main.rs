@@ -217,6 +217,7 @@ fn classify_cli_error(message: String) -> CliError {
 #[derive(Parser, Debug)]
 #[command(name = "gam")]
 #[command(about = "Formula-first GAM CLI", long_about = None)]
+#[command(version)]
 #[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
