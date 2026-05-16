@@ -356,6 +356,7 @@ pub fn build_smooth_basis(
                     vars.join(", ")
                 ));
             }
+            let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             let degree = 3usize;
             let knots_internal = option_usize(options, "knots");
             let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
@@ -434,7 +435,7 @@ pub fn build_smooth_basis(
                         degree,
                         penalty_order: 2,
                         knotspec,
-                        double_penalty: smooth_double_penalty,
+                        double_penalty: tensor_double_penalty,
                         identifiability: BSplineIdentifiability::None,
                         boundary_conditions: Default::default(),
                     })
@@ -444,7 +445,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: TensorBSplineSpec {
                     marginalspecs: specs,
-                    double_penalty: smooth_double_penalty,
+                    double_penalty: tensor_double_penalty,
                     identifiability: parse_tensor_identifiability(options)?,
                 },
             })
