@@ -2544,16 +2544,8 @@ where
             } else {
                 None
             })
-            .with_arc_initial_regularization(if gaussian_identity {
-                Some(0.25)
-            } else {
-                None
-            })
-            .with_operator_initial_trust_radius(if gaussian_identity {
-                Some(4.0)
-            } else {
-                None
-            })
+            .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
+            .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(ref h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())

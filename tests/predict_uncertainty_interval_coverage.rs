@@ -50,7 +50,9 @@ fn smooth_1d_95pct_predictive_interval_covers_truth() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ smooth(x)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
 
     // 200 held-out test points across the interior of the train range
     let n_test = 200;
