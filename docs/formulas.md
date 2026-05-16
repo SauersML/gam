@@ -243,6 +243,8 @@ the condition exactly. Aliases: `bc_left|left_bc|start_bc`, plus
 
 ```
 y ~ sphere(lat, lon)                                    # Wahba kernel, m=2
+y ~ sos(lat, lon)                                       # alias of sphere()
+y ~ spherical(lat, lon)                                 # alias of sphere()
 y ~ s(lat, lon, type=sphere)                            # equivalent
 y ~ s(lat, lon, bs=sos)                                 # mgcv alias
 y ~ sphere(lat, lon, m=3, radians=true, k=64)           # m∈{1..4}; centers=k
