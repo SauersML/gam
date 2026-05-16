@@ -42,16 +42,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--power", type=int)
     parser.add_argument("--length-scale", type=float)
     parser.add_argument(
-        "--pure-duchon",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Disable the wrapper's large-data hybrid default. When not set, "
-            "multidimensional fits default to length_scale=1.0 because the "
-            "hybrid Duchon path is much faster and more stable."
-        ),
-    )
-    parser.add_argument(
         "--pilot-subsample-threshold",
         type=int,
         default=2_000,
@@ -159,12 +149,8 @@ def build_formulas(args: argparse.Namespace) -> tuple[str, str | None]:
 
 
 def resolved_length_scale(args: argparse.Namespace, num_features: int) -> float | None:
-    if args.pure_duchon:
-        return None
     if args.length_scale is not None:
         return float(args.length_scale)
-    if num_features >= 2:
-        return 1.0
     return None
 
 
