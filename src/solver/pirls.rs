@@ -9153,7 +9153,42 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
-    use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
+    use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
+
+    #[test]
+    fn signed_streaming_xtwx_preserves_negative_observed_weights() {
+        let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0], [0.5, -3.0]];
+        let weights = array![2.0, -1.5, 0.25, -3.0];
+        let mut chunk = Array2::<f64>::zeros((0, 0));
+        let mut streamed = Array2::<f64>::zeros((x.ncols(), x.ncols()).f());
+
+        PirlsWorkspace::add_dense_xtwx_streaming_signed(
+            &weights,
+            &mut chunk,
+            &x,
+            &mut streamed,
+            faer::Par::Seq,
+        );
+
+        // Reference: brute-force xᵀ diag(w) x preserving sign.
+        let mut expected = Array2::<f64>::zeros((x.ncols(), x.ncols()));
+        for i in 0..x.nrows() {
+            for a in 0..x.ncols() {
+                for b in 0..x.ncols() {
+                    expected[[a, b]] += weights[i] * x[[i, a]] * x[[i, b]];
+                }
+            }
+        }
+        for (got, exp) in streamed.iter().zip(expected.iter()) {
+            assert_relative_eq!(*got, *exp, epsilon = 1e-12);
+        }
+        // The diagonal must be negative because the dominant weights are
+        // negative — a sqrt(max(w,0)) Gram path would silently zero them.
+        assert!(
+            streamed[[0, 0]] < 0.0 && streamed[[1, 1]] < 0.0,
+            "negative observed-Hessian weights must survive signed XtWX, got {streamed:?}",
+        );
+    }
 
     /// Calculate scale parameter correctly for different link functions.
     ///
