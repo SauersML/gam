@@ -183,7 +183,6 @@ def main() -> Path:
         ax.set_title(name)
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
         # Equal-ish bounds
-        all_pts = np.vstack([P, curve, Xs.reshape(-1, 1).repeat(1, axis=1)])
         for setter, vals in zip(
             (ax.set_xlim, ax.set_ylim, ax.set_zlim),
             (np.concatenate([P[:, 0], Xs.ravel()]),

@@ -7065,6 +7065,70 @@ mod tests {
     }
 
     #[test]
+    fn screening_cap_survives_per_seed_reset_before_proxy_eval() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 3;
+        seed_config.seed_budget = 1;
+        seed_config.risk_profile = crate::seeding::SeedRiskProfile::Gaussian;
+        let screening_cap = Arc::new(AtomicUsize::new(0));
+        let proxy_saw_cap = Arc::new(AtomicBool::new(false));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_seed_config(seed_config)
+            .with_screening_cap(Arc::clone(&screening_cap))
+            .with_max_iter(1);
+        let mut obj = problem.build_objective_with_screening_proxy(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(0.0),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: theta[0].abs(),
+                    gradient: array![0.0],
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            |_: &mut (), theta: &Array1<f64>, _: OuterEvalOrder| {
+                Ok(OuterEval {
+                    cost: theta[0].abs(),
+                    gradient: array![0.0],
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            {
+                let screening_cap = Arc::clone(&screening_cap);
+                Some(move |_: &mut ()| {
+                    screening_cap.store(0, Ordering::Relaxed);
+                })
+            },
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+            {
+                let screening_cap = Arc::clone(&screening_cap);
+                let proxy_saw_cap = Arc::clone(&proxy_saw_cap);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    let cap = screening_cap.load(Ordering::Relaxed);
+                    if cap > 0 {
+                        proxy_saw_cap.store(true, Ordering::Relaxed);
+                        Ok(theta[0].abs())
+                    } else {
+                        Err(EstimationError::RemlOptimizationFailed(
+                            "screening proxy ran without an active cap".to_string(),
+                        ))
+                    }
+                }
+            },
+        );
+        problem
+            .run(&mut obj, "screening cap reset regression")
+            .expect("screening cap should be restored after each per-seed reset");
+        assert!(
+            proxy_saw_cap.load(Ordering::Relaxed),
+            "screening proxy should observe a nonzero cap"
+        );
+        assert_eq!(screening_cap.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn rank_seeds_cascade_escalates_when_initial_cap_collapses_all() {
         // When every seed's cost is non-finite at the initial screening cap
         // we must NOT jump straight to a fully uncapped re-evaluation on
