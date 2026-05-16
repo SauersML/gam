@@ -9789,27 +9789,6 @@ fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     (matrix.mapv(|v| v / norm), norm)
 }
 
-fn orient_semidefinite_penalty(
-    matrix: &Array2<f64>,
-    context: &str,
-) -> Result<Array2<f64>, BasisError> {
-    let (sym, evals, _) = spectral_summary(matrix)?;
-    let tol = spectral_tolerance(&sym, &evals);
-    let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
-    let max_ev = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let oriented = if max_ev <= tol && min_ev < -tol {
-        sym.mapv(|v| -v)
-    } else {
-        sym
-    };
-    validate_psd_penalty(
-        &oriented,
-        context,
-        "native pure Duchon penalty must be semidefinite after CPD side constraints",
-    )?;
-    Ok(oriented)
-}
-
 pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
     q: usize,
     m: usize,
@@ -10796,56 +10775,6 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
         g_padded
     };
     symmetrize(&g_total)
-}
-
-fn native_pure_duchon_penalty_candidates(
-    centers: ArrayView2<'_, f64>,
-    p_order: usize,
-    s_order: usize,
-    kernel_nullspace: Option<&Array2<f64>>,
-    polynomial_block_cols: usize,
-    outer_identifiability: Option<&Array2<f64>>,
-) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let k = centers.nrows();
-    let d = centers.ncols();
-    let pure_coeff = PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), d);
-    let mut kernel = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in i..k {
-            let r =
-                stable_euclidean_norm((0..d).map(|axis| centers[[i, axis]] - centers[[j, axis]]));
-            let value = pure_coeff.eval(r);
-            kernel[[i, j]] = value;
-            kernel[[j, i]] = value;
-        }
-    }
-
-    let kernel = if let Some(z) = kernel_nullspace {
-        let zt_k = fast_atb(z, &kernel);
-        fast_ab(&zt_k, z)
-    } else {
-        kernel
-    };
-    let kernel_cols = kernel.nrows();
-    let total_pre_cols = kernel_cols + polynomial_block_cols;
-    let mut penalty = Array2::<f64>::zeros((total_pre_cols, total_pre_cols));
-    penalty
-        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
-        .assign(&kernel);
-    if let Some(t) = outer_identifiability {
-        let tt_s = fast_atb(t, &penalty);
-        penalty = fast_ab(&tt_s, t);
-    }
-    let penalty = orient_semidefinite_penalty(&penalty, "native pure Duchon penalty")?;
-    let (matrix, normalization_scale) = normalize_penalty(&penalty);
-    Ok(vec![PenaltyCandidate {
-        matrix,
-        nullspace_dim_hint: polynomial_block_cols,
-        source: PenaltySource::Primary,
-        normalization_scale,
-        kronecker_factors: None,
-        op: None,
-    }])
 }
 
 /// Pure-Duchon (κ=0 / `length_scale = None`) counterpart of
@@ -17924,17 +17853,15 @@ pub fn build_duchon_basiswithworkspace(
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
-    if spec.length_scale.is_none() && aniso.is_none() {
-        validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
-    } else {
-        validate_duchon_collocation_orders(
-            spec.length_scale,
-            p_order,
-            spec.power,
-            data.ncols(),
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-        )?;
-    }
+    let max_active_operator_order =
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties);
+    validate_duchon_collocation_orders(
+        spec.length_scale,
+        p_order,
+        spec.power,
+        data.ncols(),
+        max_active_operator_order,
+    )?;
     let kernel_transform = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -18079,66 +18006,55 @@ pub fn build_duchon_basiswithworkspace(
         };
         (design, identifiability_transform)
     };
-    let candidates = if spec.length_scale.is_none() && aniso.is_none() {
-        native_pure_duchon_penalty_candidates(
+    let ops = build_duchon_collocation_operator_matriceswithworkspace(
+        centers.view(),
+        None,
+        spec.length_scale,
+        spec.power,
+        effective_nullspace_order,
+        aniso.as_deref(),
+        identifiability_transform.as_ref().map(|z| z.view()),
+        max_active_operator_order,
+        workspace,
+    )?;
+    // Closed-form Lebesgue penalty: admitted at any nullspace order. The
+    // polynomial-block contribution to the L²-Lebesgue operator penalty is
+    // genuinely zero on R^d (polynomials live in the unpenalized null space),
+    // so zero-padding the polynomial block is the mathematically faithful
+    // object — not a substitute for the collocation D^T D poly block, which
+    // is a different finite-K object. The kernel sub-block of the closed-form
+    // Q^T G_raw Q matches the collocation kernel sub-block in the limit
+    // (pointwise basis evaluations of the Lebesgue Gram). Linear+ no longer
+    // forces the collocation D^T D fallback.
+    let candidates = if let Some(length_scale) = spec.length_scale {
+        operator_penalty_candidates_closed_form(
             centers.view(),
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            &spec.operator_penalties,
             p_order,
             spec.power,
+            length_scale,
+            aniso.as_deref(),
             Some(&kernel_transform),
             poly_cols,
             identifiability_transform.as_ref(),
-        )?
+        )
     } else {
-        let ops = build_duchon_collocation_operator_matriceswithworkspace(
+        operator_penalty_candidates_closed_form_pure(
             centers.view(),
-            None,
-            spec.length_scale,
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            &spec.operator_penalties,
+            p_order,
             spec.power,
-            effective_nullspace_order,
             aniso.as_deref(),
-            identifiability_transform.as_ref().map(|z| z.view()),
-            duchon_max_active_operator_derivative_order(&spec.operator_penalties),
-            workspace,
-        )?;
-        // Closed-form Lebesgue penalty: admitted at any nullspace order. The
-        // polynomial-block contribution to the L²-Lebesgue operator penalty is
-        // genuinely zero on R^d (polynomials live in the unpenalized null space),
-        // so zero-padding the polynomial block is the mathematically faithful
-        // object — not a substitute for the collocation D^T D poly block, which
-        // is a different finite-K object. The kernel sub-block of the closed-form
-        // Q^T G_raw Q matches the collocation kernel sub-block in the limit
-        // (pointwise basis evaluations of the Lebesgue Gram). Linear+ no longer
-        // forces the collocation D^T D fallback.
-        if let Some(length_scale) = spec.length_scale {
-            operator_penalty_candidates_closed_form(
-                centers.view(),
-                &ops.d0,
-                &ops.d1,
-                &ops.d2,
-                &spec.operator_penalties,
-                p_order,
-                spec.power,
-                length_scale,
-                aniso.as_deref(),
-                Some(&kernel_transform),
-                poly_cols,
-                identifiability_transform.as_ref(),
-            )
-        } else {
-            operator_penalty_candidates_closed_form_pure(
-                centers.view(),
-                &ops.d0,
-                &ops.d1,
-                &ops.d2,
-                &spec.operator_penalties,
-                p_order,
-                spec.power,
-                aniso.as_deref(),
-                Some(&kernel_transform),
-                poly_cols,
-                identifiability_transform.as_ref(),
-            )
-        }
+            Some(&kernel_transform),
+            poly_cols,
+            identifiability_transform.as_ref(),
+        )
     };
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
