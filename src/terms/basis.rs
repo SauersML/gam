@@ -2086,6 +2086,10 @@ pub struct SphericalSplineBasisSpec {
     pub penalty_order: usize,
     /// Add a ridge-like shrinkage penalty on the constrained kernel coefficients.
     pub double_penalty: bool,
+    /// Interpret latitude/longitude in radians instead of degrees. Default is
+    /// degrees (Earth/data-frame convention); set true for radians.
+    #[serde(default)]
+    pub radians: bool,
 }
 
 impl Default for SphericalSplineBasisSpec {
@@ -2094,6 +2098,7 @@ impl Default for SphericalSplineBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
             penalty_order: 2,
             double_penalty: true,
+            radians: false,
         }
     }
 }
@@ -12985,10 +12990,14 @@ pub fn create_matern_spline_basiswithworkspace(
 /// Generic Matérn builder returning design + penalty list.
 
 #[inline]
-fn validate_lat_lon_matrix(data: ArrayView2<'_, f64>, context: &str) -> Result<(), BasisError> {
+fn validate_lat_lon_matrix(
+    data: ArrayView2<'_, f64>,
+    context: &str,
+    radians: bool,
+) -> Result<(), BasisError> {
     if data.ncols() != 2 {
         return Err(BasisError::DimensionMismatch(format!(
-            "{context} requires exactly two columns: latitude and longitude in degrees; got {}",
+            "{context} requires exactly two columns: latitude and longitude; got {}",
             data.ncols()
         )));
     }
@@ -12997,6 +13006,15 @@ fn validate_lat_lon_matrix(data: ArrayView2<'_, f64>, context: &str) -> Result<(
             "{context} requires at least one row"
         )));
     }
+    let (lat_lo, lat_hi, unit) = if radians {
+        (
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+            "radians",
+        )
+    } else {
+        (-90.0, 90.0, "degrees")
+    };
     for (i, row) in data.outer_iter().enumerate() {
         let lat = row[0];
         let lon = row[1];
@@ -13005,9 +13023,9 @@ fn validate_lat_lon_matrix(data: ArrayView2<'_, f64>, context: &str) -> Result<(
                 "{context} requires finite latitude/longitude; row {i} has ({lat}, {lon})"
             )));
         }
-        if !(-90.0..=90.0).contains(&lat) {
+        if !(lat_lo..=lat_hi).contains(&lat) {
             return Err(BasisError::InvalidInput(format!(
-                "{context} latitude must be in [-90, 90] degrees; row {i} has {lat}"
+                "{context} latitude must be in [{lat_lo}, {lat_hi}] {unit}; row {i} has {lat}"
             )));
         }
     }
@@ -13072,12 +13090,13 @@ pub fn spherical_wahba_kernel_matrix(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     penalty_order: usize,
+    radians: bool,
 ) -> Result<Array2<f64>, BasisError> {
-    validate_lat_lon_matrix(data, "spherical spline data")?;
-    validate_lat_lon_matrix(centers, "spherical spline centers")?;
+    validate_lat_lon_matrix(data, "spherical spline data", radians)?;
+    validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
     let n = data.nrows();
     let k = centers.nrows();
-    let deg = std::f64::consts::PI / 180.0;
+    let deg = if radians { 1.0 } else { std::f64::consts::PI / 180.0 };
     let mut out = Array2::<f64>::zeros((n, k));
     let mut center_trig = Vec::with_capacity(k);
     for c in centers.outer_iter() {
@@ -13122,7 +13141,7 @@ pub fn build_spherical_spline_basis(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    validate_lat_lon_matrix(data, "spherical spline")?;
+    validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
     if !(1..=4).contains(&spec.penalty_order) {
         return Err(BasisError::InvalidInput(format!(
             "spherical spline penalty_order must be one of 1, 2, 3, 4; got {}",
@@ -13130,15 +13149,20 @@ pub fn build_spherical_spline_basis(
         )));
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    validate_lat_lon_matrix(centers.view(), "spherical spline centers")?;
+    validate_lat_lon_matrix(centers.view(), "spherical spline centers", spec.radians)?;
     if centers.nrows() < 2 {
         return Err(BasisError::InsufficientColumnsForConstraint {
             found: centers.nrows(),
         });
     }
-    let raw_design = spherical_wahba_kernel_matrix(data, centers.view(), spec.penalty_order)?;
-    let raw_penalty =
-        spherical_wahba_kernel_matrix(centers.view(), centers.view(), spec.penalty_order)?;
+    let raw_design =
+        spherical_wahba_kernel_matrix(data, centers.view(), spec.penalty_order, spec.radians)?;
+    let raw_penalty = spherical_wahba_kernel_matrix(
+        centers.view(),
+        centers.view(),
+        spec.penalty_order,
+        spec.radians,
+    )?;
     let z = coefficient_sum_to_zero_transform(centers.nrows())?;
     let design = raw_design.dot(&z);
     let penalty = z.t().dot(&raw_penalty).dot(&z);
