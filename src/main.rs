@@ -249,7 +249,7 @@ struct FitArgs {
     #[arg(
         value_name = "FORMULA",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
     /// Fit a second RHS-only formula for the scale/noise block in
@@ -11581,6 +11581,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11598,6 +11599,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11615,6 +11617,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11738,6 +11741,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
                 },
@@ -11774,6 +11778,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11792,6 +11797,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                     },
                     shape: ShapeConstraint::None,
