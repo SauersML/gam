@@ -2208,10 +2208,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// Debug-only: return the *projected* Hessian log-determinant
     /// `log|U_Sᵀ H U_S|_+` at the PIRLS state driven to convergence at this
     /// `theta`.  This is the same scalar that the REML/LAML cost identity
-    /// uses (via `hop.logdet() + hessian_logdet_correction`), so centered-
-    /// differencing it along ψ gives the analytic `d/dψ log|H_proj|` that
-    /// the production trace formula computes — i.e. the correct FD oracle
-    /// for the penalty-subspace projection invariant.
+    /// uses (via `hop.logdet() + hessian_logdet_correction`), so a centered
+    /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
+    /// that the production trace formula computes — i.e. the correct
+    /// finite-difference reference for the penalty-subspace projection invariant.
     #[cfg(test)]
     pub(crate) fn debug_logdet_h_proj(
         &mut self,
