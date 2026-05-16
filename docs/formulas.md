@@ -105,13 +105,13 @@ second-order difference penalty. Options:
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 | `bc` | `free` | Apply the same endpoint boundary condition on both ends: `free`, `clamped`, or `anchored`. |
 | `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition for half-open smooths. `clamped` forces zero endpoint derivative; `anchored` forces the endpoint value. |
-| `anchor_left`, `anchor_right` | `0` | Anchor value for `bc_left=anchored` / `bc_right=anchored`. Nonzero anchors are enforced as exact equality constraints. |
+| `anchor_left`, `anchor_right` | `0` | Anchor value for `bc_left=anchored` / `bc_right=anchored`. Currently only zero anchors are supported by the fitter. |
 
 Examples:
 
 ```
 y ~ s(x, bc_left=clamped)                 # starts flat, right end free
-y ~ s(x, bc_left=anchored, anchor_left=0.5, bc_right=free)
+y ~ s(x, bc_left=anchored, bc_right=free) # starts at zero, right end free
 y ~ s(x, bc=clamped)                      # zero slope at both endpoints
 ```
 
@@ -224,13 +224,13 @@ when the angular domain is wider than the observed sample.
 ```
 y ~ s(x, bc=clamped)                       # zero first derivative at both ends
 y ~ s(x, bc=clamped, side=left)            # zero first derivative at the start
-y ~ s(x, bc_left=anchored, anchor_left=0.5)
-y ~ s(x, start_bc=clamped, end_bc=anchored, anchor_right=1.0)
+y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
+y ~ s(x, start_bc=clamped, end_bc=anchored, end_anchor=0)
 ```
 
-Endpoint conditions are exact. Homogeneous conditions use the projected
-null-space basis; nonzero anchors are carried as paired linear constraints
-against the fitted coefficient vector. Aliases: `bc_left|left_bc|start_bc`, plus
+Endpoint conditions are imposed by projecting onto the null space of the
+boundary-condition rows (Wood §5.4.1), so the constrained smooth honours
+the condition exactly. Aliases: `bc_left|left_bc|start_bc`, plus
 `bc_right|right_bc|end_bc`. Values: `free|none|open`, `clamped|zero_derivative`,
 `anchored|zero|zero_value`. Per-side anchor overrides: `anchor_<side>`,
 `<side>_anchor`, falling back to global `anchor`/`anchor_value`/`value`.
