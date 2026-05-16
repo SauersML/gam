@@ -47,7 +47,9 @@ fn group_random_effect_recovers_per_group_means() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ group(g)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
 
     // Predict for one anchor per group.
     let mut nd = Array2::<f64>::zeros((true_means.len(), 2));
@@ -66,7 +68,9 @@ fn group_random_effect_recovers_per_group_means() {
             "  group {gi}: predicted={:.4}  truth={:.4}  |err|={e:.4}",
             pred[gi], mu
         );
-        if e > worst { worst = e; }
+        if e > worst {
+            worst = e;
+        }
     }
     eprintln!("[group-recover] worst |err| = {worst:.4} (budget 0.25)");
     assert!(
