@@ -1,11 +1,13 @@
-//! FAILING TEST (potentially) — ticket: predictions just outside the training
-//! support should remain bounded and not blow up by orders of magnitude.
+//! Regression guard: predictions just outside the training support must
+//! stay bounded — no orders-of-magnitude blow-up characteristic of TPS
+//! kernels exploding outside the convex hull of their centres.
 //!
 //! Fit a smooth on x ∈ [0, 1]. Predict at x ∈ {-0.05, -0.02, 1.02, 1.05}.
 //! Truth peak-to-peak is ~2 (sin curve); a sane extrapolation should stay
-//! within a few times the training range. We assert |pred| ≤ 10 (very
-//! lenient — a real failure would be 100x larger, characteristic of TPS
-//! kernels exploding outside the convex hull of centers).
+//! within a few times the training range. Asserts |pred| ≤ 10 (very
+//! lenient — a real failure would be 100x larger).
+//!
+//! Currently passing — kept as a regression guard.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;

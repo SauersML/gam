@@ -1,14 +1,15 @@
-//! FAILING TEST (potentially) — ticket: 95% predictive intervals on a smooth
-//! 1D fit should cover the truth at ≥ ~90% of held-out points (calibration:
-//! ~95% expected, allow some slack from finite-sample / smoothing bias).
+//! Regression guard: 95% predictive intervals on a smooth 1-D fit must
+//! cover the truth at ≥ ~90% of held-out points (calibration target
+//! ~95%, with slack for finite-sample / smoothing bias).
 //!
-//! Repro path: fit `y ~ smooth(x)` on a sin curve + noise, call the
-//! predict-with-uncertainty path via the saved-model JSON API. Compute the
-//! fraction of test points whose [mean_lower, mean_upper] interval contains
-//! the noise-free truth.
+//! Fits `y ~ smooth(x)` on a sin curve + noise, calls the
+//! predict-with-uncertainty path via the saved-model JSON API, and
+//! computes the fraction of test points whose [mean_lower, mean_upper]
+//! interval contains the noise-free truth. If coverage drops below
+//! 80%, the predictive uncertainty is under-stated — a real
+//! calibration bug (or a too-narrow conditional covariance).
 //!
-//! If coverage drops below 80%, the predictive uncertainty is under-stated —
-//! a real calibration bug (or a too-narrow conditional covariance).
+//! Currently passing — kept as a regression guard.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
