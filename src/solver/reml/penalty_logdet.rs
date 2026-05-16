@@ -310,7 +310,6 @@ impl PenaltyPseudologdet {
         // Collect block ranges and assemble per-block combined penalties.
         // Each penalty contributes to its own block (disjoint assumption).
         struct BlockData {
-            idx: usize,
             start: usize,
             end: usize,
             local: Array2<f64>,
@@ -340,7 +339,6 @@ impl PenaltyPseudologdet {
                 local.scaled_add(lambda, &cp.local);
                 let idx = blocks.len();
                 blocks.push(BlockData {
-                    idx,
                     start: r.start,
                     end: r.end,
                     local,
