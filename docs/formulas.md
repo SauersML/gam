@@ -229,6 +229,12 @@ periodic margin uses a folded cardinal-cubic B-spline and a cyclic
 difference penalty. `period_start`/`period_end` (1D) override the data range
 when the angular domain is wider than the observed sample.
 
+Period values can be plain numbers (e.g. `6.283185307`) or the symbolic
+constants `pi` / `PI` / `tau` / `TAU` (case-insensitive), optionally
+multiplied by a single numeric literal: `pi`, `2*pi`, `pi*2`, `.5*pi`,
+and `tau` are all accepted; `pi/2` and `2*3.14` (number ✕ number) are
+not. The same rule applies inside list syntax: `period=[2*pi, None]`.
+
 ### Boundary-conditioned 1D smooths
 
 ```
