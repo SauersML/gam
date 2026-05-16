@@ -1668,6 +1668,14 @@ impl<'a> GamWorkingModel<'a> {
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
                 let x_dense = x.to_dense_arc();
+                // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as a single
+                // device GEMM after row-scaling. The signed weights are
+                // preserved because the device kernel forms `Xᵀ (W X)`
+                // without any sqrt clipping. Falls through to the host
+                // streaming path on CPU-only builds.
+                if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), weights) {
+                    return Ok(out);
+                }
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                     workspace.hessian_buf = Array2::zeros((p, p).f());
@@ -6730,19 +6738,24 @@ fn solve_penalized_least_squares_implicit(
         DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
             let p = x_dense.ncols();
             let x_dense = x_dense.to_dense_arc();
-            if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
-                workspace.hessian_buf = Array2::zeros((p, p).f());
+            // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as one device GEMM.
+            if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights) {
+                out
             } else {
-                workspace.hessian_buf.fill(0.0);
+                if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                    workspace.hessian_buf = Array2::zeros((p, p).f());
+                } else {
+                    workspace.hessian_buf.fill(0.0);
+                }
+                PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                    &weights,
+                    &mut workspace.weighted_x_chunk,
+                    x_dense.as_ref(),
+                    &mut workspace.hessian_buf,
+                    get_global_parallelism(),
+                );
+                std::mem::take(&mut workspace.hessian_buf)
             }
-            PirlsWorkspace::add_dense_xtwx_streaming_signed(
-                &weights,
-                &mut workspace.weighted_x_chunk,
-                x_dense.as_ref(),
-                &mut workspace.hessian_buf,
-                get_global_parallelism(),
-            );
-            std::mem::take(&mut workspace.hessian_buf)
         }
         _ => x_original
             .diag_xtw_x(&weights_owned)
