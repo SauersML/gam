@@ -203,7 +203,11 @@ impl PenaltyPseudologdet {
             // Group penalties by overlapping column ranges.
             Self::from_penalties_block_factored(penalties, lambdas, ridge, p_total)
         } else {
-            let structural_nullity = structural_nullity_from_penalties(penalties, p_total)?;
+            let structural_nullity = if ridge > 0.0 {
+                structural_nullity_from_penalties(penalties, p_total)?
+            } else {
+                None
+            };
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
             for (k, cp) in penalties.iter().enumerate() {
@@ -310,10 +314,14 @@ impl PenaltyPseudologdet {
             blocks
                 .iter()
                 .map(|bd| {
-                    let structural_nullity = Some(super::unified::exact_intersection_nullity(
-                        &bd.component_matrices,
-                        &bd.component_nullities,
-                    ));
+                    let structural_nullity = if ridge > 0.0 {
+                        Some(super::unified::exact_intersection_nullity(
+                            &bd.component_matrices,
+                            &bd.component_nullities,
+                        ))
+                    } else {
+                        None
+                    };
                     let block_pld =
                         Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
@@ -335,10 +343,14 @@ impl PenaltyPseudologdet {
             blocks
                 .par_iter()
                 .map(|bd| {
-                    let structural_nullity = Some(super::unified::exact_intersection_nullity(
-                        &bd.component_matrices,
-                        &bd.component_nullities,
-                    ));
+                    let structural_nullity = if ridge > 0.0 {
+                        Some(super::unified::exact_intersection_nullity(
+                            &bd.component_matrices,
+                            &bd.component_nullities,
+                        ))
+                    } else {
+                        None
+                    };
                     let block_pld =
                         Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
