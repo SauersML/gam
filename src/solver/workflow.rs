@@ -3338,12 +3338,14 @@ mod tests {
             DuchonNullspaceOrder::Degree(2)
         ));
 
-        let err = materialize(
+        let err = match materialize(
             "y ~ duchon(ct, st, centers=12, pure=true, length_scale=1.0)",
             &data,
             &FitConfig::default(),
-        )
-        .expect_err("pure=true plus length_scale should be rejected");
+        ) {
+            Ok(_) => panic!("pure=true plus length_scale should be rejected"),
+            Err(err) => err,
+        };
         assert!(err.contains("either pure=true or length_scale"));
     }
 
