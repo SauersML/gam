@@ -9442,7 +9442,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Tracked here at cycle scope so the end-of-cycle convergence
         // test can consume the value from the accepted trust-region
         // attempt. Reset every cycle alongside the line-search state.
-        let mut accepted_predicted_reduction: f64 = f64::INFINITY;
+        let mut _accepted_predicted_reduction: f64 = f64::INFINITY;
 
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
@@ -10176,7 +10176,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // is the model's promised decrease at the realized
                     // step magnitude; for an unclipped Newton step it
                     // equals half the Newton decrement squared.
-                    accepted_predicted_reduction = predicted_reduction;
+                    _accepted_predicted_reduction = predicted_reduction;
                     accepted = true;
                     break;
                 }
@@ -10329,7 +10329,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
                 last_cycle_obj_change_below_tol = false;
-                accepted_predicted_reduction = f64::INFINITY;
+                _accepted_predicted_reduction = f64::INFINITY;
                 continue;
             }
 
