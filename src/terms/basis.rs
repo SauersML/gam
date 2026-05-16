@@ -13580,8 +13580,9 @@ fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
 
 /// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
 /// `cos_gamma` produces one kernel value. Numerical agreement with the
-/// scalar path is exercised by `tests/wahba_simd_correctness.rs` — max
-/// abs/rel diff stays below 1e-12 across the full domain.
+/// scalar path is exercised by the in-file unit test
+/// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance` —
+/// max abs/rel diff stays below 1e-12 across the full domain.
 #[inline]
 fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
     use wide::f64x4;
@@ -33607,5 +33608,63 @@ mod tests {
             assert_abs_diff_eq!(*sum, 0.0, epsilon = 1e-10);
         }
         assert_eq!(built.penalties.len(), 2);
+    }
+
+    #[test]
+    fn wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance() {
+        // Doc-comment on `wahba_sphere_kernel_from_cos_simd` claims max
+        // abs/rel diff < 1e-12 vs the scalar path across the full domain.
+        // Sweep cos_gamma across [-1, 1] (including degenerate endpoints
+        // and the floor near cos_gamma = 1) for every supported penalty
+        // order. Use a slightly looser 1e-11 assertion so genuine
+        // regressions trip while floating-point ULP wiggle doesn't.
+        let xs: [f64; 16] = [
+            -1.0, -0.999_999_999, -0.9, -0.5, -0.123_456, -1.0e-6,
+            0.0, 1.0e-6, 0.123_456, 0.5, 0.7, 0.9,
+            0.999_9, 0.999_999_9, 1.0 - 1.0e-12, 1.0,
+        ];
+        let mut max_abs = 0.0f64;
+        let mut max_rel = 0.0f64;
+        for &m in &[1_usize, 2, 3, 4] {
+            for chunk in xs.chunks(4) {
+                let lane = wide::f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                let simd = wahba_sphere_kernel_from_cos_simd(lane, m);
+                let simd_arr: [f64; 4] = simd.into();
+                for (i, &x) in chunk.iter().enumerate() {
+                    let scalar = wahba_sphere_kernel_from_cos(x, m)
+                        .expect("scalar kernel must produce finite value over closed [-1, 1]");
+                    let abs = (simd_arr[i] - scalar).abs();
+                    let rel = abs / scalar.abs().max(1.0e-300);
+                    if abs.is_finite() {
+                        max_abs = max_abs.max(abs);
+                    }
+                    if rel.is_finite() {
+                        max_rel = max_rel.max(rel);
+                    }
+                    assert!(
+                        abs < 1.0e-11,
+                        "SIMD vs scalar abs diff {abs:.3e} > 1e-11 at \
+                         cos_gamma={x:.6e} penalty_order={m}; \
+                         simd={s:.17e} scalar={c:.17e}",
+                        s = simd_arr[i],
+                        c = scalar,
+                    );
+                    assert!(
+                        rel < 1.0e-11,
+                        "SIMD vs scalar rel diff {rel:.3e} > 1e-11 at \
+                         cos_gamma={x:.6e} penalty_order={m}; \
+                         simd={s:.17e} scalar={c:.17e}",
+                        s = simd_arr[i],
+                        c = scalar,
+                    );
+                }
+            }
+        }
+        // Surface the measured maxima in cargo-test output for visibility
+        // when the test is run with --nocapture.
+        eprintln!(
+            "wahba simd-vs-scalar: max abs diff = {max_abs:.3e}, \
+             max rel diff = {max_rel:.3e}",
+        );
     }
 }
