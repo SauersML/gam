@@ -20,7 +20,6 @@ mod blas;
 pub mod device;
 pub mod dispatch;
 mod driver;
-pub mod kernels;
 pub mod policy;
 pub mod runtime;
 pub mod solver;
