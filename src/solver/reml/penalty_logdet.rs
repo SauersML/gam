@@ -133,6 +133,17 @@ struct PenaltyBlockSpan {
     rank_end: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PenaltyBlockStructuralNullities {
+    block_nullities: Vec<Option<usize>>,
+}
+
+impl PenaltyBlockStructuralNullities {
+    fn get(&self, idx: usize) -> Option<usize> {
+        self.block_nullities.get(idx).copied().flatten()
+    }
+}
+
 #[derive(Clone)]
 pub struct PenaltyPseudologdet {
     /// W factor: p × rank, with W W^T = S⁺.
@@ -184,6 +195,59 @@ impl PenaltyPseudologdet {
         ridge: f64,
         p_total: usize,
     ) -> Result<Self, String> {
+        Self::from_penalties_with_cached_block_nullities(penalties, lambdas, ridge, p_total, None)
+    }
+
+    pub(crate) fn structural_block_nullities(
+        penalties: &[crate::construction::CanonicalPenalty],
+    ) -> Result<PenaltyBlockStructuralNullities, String> {
+        struct BlockData {
+            start: usize,
+            end: usize,
+            component_matrices: Vec<Array2<f64>>,
+            component_nullities: Vec<usize>,
+        }
+
+        let mut blocks: Vec<BlockData> = Vec::new();
+        for cp in penalties {
+            let r = &cp.col_range;
+            let local_rank = infer_penalty_rank(cp)?;
+            let local_nullity = cp.block_dim().saturating_sub(local_rank);
+            if let Some(bd) = blocks
+                .iter_mut()
+                .find(|bd| bd.start == r.start && bd.end == r.end)
+            {
+                bd.component_matrices.push(cp.local.clone());
+                bd.component_nullities.push(local_nullity);
+            } else {
+                blocks.push(BlockData {
+                    start: r.start,
+                    end: r.end,
+                    component_matrices: vec![cp.local.clone()],
+                    component_nullities: vec![local_nullity],
+                });
+            }
+        }
+
+        let block_nullities = blocks
+            .iter()
+            .map(|bd| {
+                Some(super::unified::exact_intersection_nullity(
+                    &bd.component_matrices,
+                    &bd.component_nullities,
+                ))
+            })
+            .collect();
+        Ok(PenaltyBlockStructuralNullities { block_nullities })
+    }
+
+    pub(crate) fn from_penalties_with_cached_block_nullities(
+        penalties: &[crate::construction::CanonicalPenalty],
+        lambdas: &[f64],
+        ridge: f64,
+        p_total: usize,
+        cached_block_nullities: Option<&PenaltyBlockStructuralNullities>,
+    ) -> Result<Self, String> {
         if penalties.is_empty() {
             return Ok(Self {
                 w_factor: Array2::zeros((0, 0)),
@@ -201,7 +265,13 @@ impl PenaltyPseudologdet {
         if disjoint {
             // Block-factored path: assemble and eigendecompose per-block.
             // Group penalties by overlapping column ranges.
-            Self::from_penalties_block_factored(penalties, lambdas, ridge, p_total)
+            Self::from_penalties_block_factored(
+                penalties,
+                lambdas,
+                ridge,
+                p_total,
+                cached_block_nullities,
+            )
         } else {
             let structural_nullity = if ridge > 0.0 {
                 structural_nullity_from_penalties(penalties, p_total)?
@@ -233,15 +303,18 @@ impl PenaltyPseudologdet {
         lambdas: &[f64],
         ridge: f64,
         p_total: usize,
+        cached_block_nullities: Option<&PenaltyBlockStructuralNullities>,
     ) -> Result<Self, String> {
         use ndarray::s;
 
         // Collect block ranges and assemble per-block combined penalties.
         // Each penalty contributes to its own block (disjoint assumption).
         struct BlockData {
+            idx: usize,
             start: usize,
             end: usize,
             local: Array2<f64>,
+            structural_nullity: Option<usize>,
             component_matrices: Vec<Array2<f64>>,
             component_nullities: Vec<usize>,
         }
@@ -265,10 +338,13 @@ impl PenaltyPseudologdet {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
                 local.scaled_add(lambda, &cp.local);
+                let idx = blocks.len();
                 blocks.push(BlockData {
+                    idx,
                     start: r.start,
                     end: r.end,
                     local,
+                    structural_nullity: cached_block_nullities.and_then(|cache| cache.get(idx)),
                     component_matrices: vec![cp.local.clone()],
                     component_nullities: vec![local_nullity],
                 });
@@ -315,10 +391,12 @@ impl PenaltyPseudologdet {
                 .iter()
                 .map(|bd| {
                     let structural_nullity = if ridge > 0.0 {
-                        Some(super::unified::exact_intersection_nullity(
-                            &bd.component_matrices,
-                            &bd.component_nullities,
-                        ))
+                        bd.structural_nullity.or_else(|| {
+                            Some(super::unified::exact_intersection_nullity(
+                                &bd.component_matrices,
+                                &bd.component_nullities,
+                            ))
+                        })
                     } else {
                         None
                     };
@@ -344,10 +422,12 @@ impl PenaltyPseudologdet {
                 .par_iter()
                 .map(|bd| {
                     let structural_nullity = if ridge > 0.0 {
-                        Some(super::unified::exact_intersection_nullity(
-                            &bd.component_matrices,
-                            &bd.component_nullities,
-                        ))
+                        bd.structural_nullity.or_else(|| {
+                            Some(super::unified::exact_intersection_nullity(
+                                &bd.component_matrices,
+                                &bd.component_nullities,
+                            ))
+                        })
                     } else {
                         None
                     };
