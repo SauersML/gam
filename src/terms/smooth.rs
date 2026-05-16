@@ -2639,9 +2639,8 @@ fn build_shape_constraint_design_1d(
                 penalty_order: spec.penalty_order,
                 knotspec: periodic
                     .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
-                            domain_start,
-                            period,
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_start + period),
                             num_basis,
                         },
                     )
@@ -12017,21 +12016,14 @@ pub fn freeze_term_collection_from_design(
                     periodic,
                 },
             ) => {
-<<<<<<< HEAD
-                if !matches!(s.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
-                    s.knotspec = BSplineKnotSpec::Provided(knots.clone());
-                }
-=======
                 s.knotspec = periodic
                     .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
-                            domain_start,
-                            period,
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_start + period),
                             num_basis,
                         },
                     )
                     .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
->>>>>>> origin/pr-43
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -12210,9 +12202,8 @@ pub fn freeze_term_collection_from_design(
                     s.marginalspecs[i].degree = degrees[i];
                     s.marginalspecs[i].knotspec = periodic[i]
                         .map(
-                            |(domain_start, period, num_basis)| BSplineKnotSpec::Periodic {
-                                domain_start,
-                                period,
+                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                                data_range: (domain_start, domain_start + period),
                                 num_basis,
                             },
                         )
@@ -16216,13 +16207,13 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic {
-                domain_start: 0.0,
-                period: 7.0,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 7.0),
                 num_basis: 8,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic bspline");
         let dense = built.design.to_dense();
@@ -16253,24 +16244,24 @@ mod tests {
         let spec_day = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic {
-                domain_start: 0.0,
-                period: 7.0,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 7.0),
                 num_basis: 7,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let spec_hour = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic {
-                domain_start: 0.0,
-                period: 24.0,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 24.0),
                 num_basis: 8,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let spec_collection = TermCollectionSpec {
             linear_terms: vec![],
@@ -16307,11 +16298,17 @@ mod tests {
             SmoothBasisSpec::TensorBSpline { spec, .. } => {
                 assert!(matches!(
                     spec.marginalspecs[0].knotspec,
-                    BSplineKnotSpec::Periodic { period: 7.0, .. }
+                    BSplineKnotSpec::PeriodicUniform {
+                        data_range: (0.0, 7.0),
+                        ..
+                    }
                 ));
                 assert!(matches!(
                     spec.marginalspecs[1].knotspec,
-                    BSplineKnotSpec::Periodic { period: 24.0, .. }
+                    BSplineKnotSpec::PeriodicUniform {
+                        data_range: (0.0, 24.0),
+                        ..
+                    }
                 ));
             }
             _ => panic!("expected tensor spec"),
