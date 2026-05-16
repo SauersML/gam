@@ -56,19 +56,23 @@ impl DispatchPolicy {
         let peak_gpu_gflops = device.peak_fp64_gflops();
         let speedup = (peak_gpu_gflops / CPU_FP64_GFLOPS).max(1.0);
 
-        let gemm_min_flops =
-            crossover_flops(/*payload_bytes=*/ 256.0 * 1024.0 * 1024.0, peak_gpu_gflops) as u64;
-        let gemv_min_flops =
-            crossover_flops(/*payload_bytes=*/ 64.0 * 1024.0 * 1024.0, peak_gpu_gflops) as u64;
+        let gemm_min_flops = flops_threshold(
+            /*payload_bytes=*/ 256.0 * 1024.0 * 1024.0,
+            peak_gpu_gflops,
+        );
+        let gemv_min_flops = flops_threshold(
+            /*payload_bytes=*/ 64.0 * 1024.0 * 1024.0,
+            peak_gpu_gflops,
+        );
 
         // XᵀWX threshold scales inversely with speedup so biobank-scale
         // designs (n ≥ 1e5) reach the device while per-iteration small
         // fits stay on the host.
-        let xtwx_min_rows = (4096.0 / speedup).clamp(512.0, 65_536.0) as usize;
+        let xtwx_min_rows = usize_threshold((4096.0 / speedup).clamp(512.0, 65_536.0));
 
         // cuSPARSE pays heavy descriptor-setup latency; require bulk nnz
         // and a meaningful row count.
-        let spmv_min_nnz = (1_000_000.0 / speedup).max(100_000.0) as usize;
+        let spmv_min_nnz = usize_threshold((1_000_000.0 / speedup).max(100_000.0));
         let spmv_min_rows = 1_024;
 
         Self {
@@ -127,9 +131,7 @@ impl DispatchPolicy {
 /// Solves `F / gpu + bytes / pcie ≤ F / cpu` for `F`:
 ///   `F ≥ bytes · gpu · cpu / (pcie · (gpu − cpu))`
 ///
-/// Returns `f64::INFINITY` when the GPU is slower than the host; the
-/// caller's `as u64` cast then clamps to `u64::MAX`, which suppresses
-/// dispatch.
+/// Returns `f64::INFINITY` when the GPU is slower than the host.
 fn crossover_flops(payload_bytes: f64, peak_gpu_gflops: f64) -> f64 {
     if peak_gpu_gflops <= CPU_FP64_GFLOPS {
         return f64::INFINITY;
@@ -139,6 +141,28 @@ fn crossover_flops(payload_bytes: f64, peak_gpu_gflops: f64) -> f64 {
     let pcie_bytes_per_s = PCIE_GB_PER_S * 1e9;
     payload_bytes * cpu_flops_per_s * gpu_flops_per_s
         / (pcie_bytes_per_s * (gpu_flops_per_s - cpu_flops_per_s))
+}
+
+fn flops_threshold(payload_bytes: f64, peak_gpu_gflops: f64) -> u64 {
+    let threshold = crossover_flops(payload_bytes, peak_gpu_gflops).ceil();
+    if !threshold.is_finite() || threshold >= u64::MAX as f64 {
+        u64::MAX
+    } else if threshold <= 0.0 {
+        0
+    } else {
+        threshold as u64
+    }
+}
+
+fn usize_threshold(value: f64) -> usize {
+    let threshold = value.ceil();
+    if !threshold.is_finite() || threshold >= usize::MAX as f64 {
+        usize::MAX
+    } else if threshold <= 0.0 {
+        0
+    } else {
+        threshold as usize
+    }
 }
 
 impl Default for DispatchPolicy {
