@@ -186,7 +186,9 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     )
     .unwrap();
     match &built.metadata {
-        gam::terms::basis::BasisMetadata::BSpline1D { knots, .. } => assert!(knots.is_empty()),
+        gam::terms::basis::BasisMetadata::BSpline1D { periodic, .. } => {
+            assert_eq!(*periodic, Some((0.0, 1.0, 10)));
+        }
         other => panic!("unexpected metadata {other:?}"),
     }
 
