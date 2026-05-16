@@ -3298,7 +3298,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_standard_duchon_defaults_to_hybrid_length_scale() {
+    fn materialize_standard_duchon_defaults_to_pure_scale_free_basis() {
         let data = duchon_workflow_dataset();
         let materialized = materialize(
             "y ~ duchon(ct, st, centers=12)",
@@ -3312,8 +3312,11 @@ mod tests {
         let SmoothBasisSpec::Duchon { spec, .. } = &request.spec.smooth_terms[0].basis else {
             panic!("expected Duchon smooth");
         };
-        assert_eq!(spec.length_scale, Some(1.0));
-        assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Zero);
+        assert_eq!(spec.length_scale, None);
+        assert!(matches!(
+            spec.nullspace_order,
+            DuchonNullspaceOrder::Degree(2)
+        ));
         assert_eq!(spec.power, 2);
     }
 
