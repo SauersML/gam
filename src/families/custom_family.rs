@@ -5237,9 +5237,9 @@ fn nonconverged_outer_joint_hyper_eval_result(
     Ok(OuterObjectiveEvalResult {
         objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
         gradient: Array1::<f64>::zeros(theta_dim),
-        outer_hessian: crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::zeros(
-            (theta_dim, theta_dim),
-        )),
+        outer_hessian: crate::solver::outer_strategy::HessianResult::Analytic(
+            Array2::<f64>::zeros((theta_dim, theta_dim)),
+        ),
         warm_start: constrained_warm_start_from_inner(rho, inner),
         inner_converged: false,
     })
@@ -9953,20 +9953,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // 27.7 — large enough to make rapid progress, small
                     // enough that no β coordinate moves further than the
                     // family allows.
-                    let initial_step_inf = delta
-                        .iter()
-                        .copied()
-                        .map(f64::abs)
-                        .fold(0.0_f64, f64::max);
+                    let initial_step_inf =
+                        delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
                     let max_step_inf = family.joint_newton_max_step_inf(specs);
-                    let r_safe = if initial_step_inf > 0.0
-                        && max_step_inf.is_finite()
-                        && max_step_inf > 0.0
-                    {
-                        max_step_inf * initial_step_norm / initial_step_inf
-                    } else {
-                        f64::INFINITY
-                    };
+                    let r_safe =
+                        if initial_step_inf > 0.0 && max_step_inf.is_finite() && max_step_inf > 0.0
+                        {
+                            max_step_inf * initial_step_norm / initial_step_inf
+                        } else {
+                            f64::INFINITY
+                        };
                     let bumped = initial_step_norm.min(1.0e6).min(r_safe);
                     if bumped > joint_trust_radius {
                         joint_trust_radius = bumped;
@@ -10420,9 +10416,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             line_search_attempts,
                             model_rejects,
                             barrier_rejects,
-                            joint_active_set
-                                .as_ref()
-                                .map_or(0, |active| active.len()),
+                            joint_active_set.as_ref().map_or(0, |active| active.len()),
                         );
                     }
                     converged = true;

@@ -915,14 +915,23 @@ impl PirlsWorkspace {
         (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
     }
 
-    fn add_dense_xtwx_streaming_from_sqrt<S>(
-        sqrtw: &Array1<f64>,
+    /// Streaming chunked BLAS computation of `Xᵀ diag(W) X` with signed weights.
+    ///
+    /// Observed-information assembly can produce negative row curvatures, so
+    /// the older `sqrt(max(W,0))` Gram form is mathematically wrong for that
+    /// path: it silently clips negative weights to zero. This streaming
+    /// implementation scales rows by `w_i` (sign-preserving), then forms
+    /// `Xᵀ (WX)` per chunk and reduces in parallel without exceeding one
+    /// chunk-plus-`p×p` accumulator per worker.
+    fn add_dense_xtwx_streaming_signed<S, W>(
+        weights: &ArrayBase<W, Ix1>,
         weighted_x_chunk: &mut Array2<f64>,
         x: &ArrayBase<S, Ix2>,
         out: &mut Array2<f64>,
         par: Par,
     ) where
         S: Data<Elem = f64> + Sync,
+        W: Data<Elem = f64> + Sync,
     {
         let n = x.nrows();
         let p = x.ncols();
@@ -930,9 +939,9 @@ impl PirlsWorkspace {
             return;
         }
         debug_assert_eq!(
-            sqrtw.len(),
+            weights.len(),
             n,
-            "sqrtw length must match row count for streamed XtWX"
+            "weight length must match row count for streamed XtWX"
         );
         let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
 
@@ -940,9 +949,9 @@ impl PirlsWorkspace {
         let use_parallel = num_chunks >= 4 && (n as u64) * (p as u64) >= 200_000;
 
         if use_parallel {
-            // Parallel: use fold/reduce so each thread reuses one chunk buffer
-            // and one p×p accumulator. This reduces allocations from num_chunks×p²
-            // to num_threads×p² (e.g., 8 instead of 400 at biobank scale).
+            // Parallel: each thread reuses one WX chunk buffer and one p×p
+            // accumulator. We never form sqrt(W)·X so negative observed-Hessian
+            // weights survive the assembly exactly.
             let combined = (0..num_chunks)
                 .into_par_iter()
                 .fold(
@@ -958,8 +967,7 @@ impl PirlsWorkspace {
                         {
                             let mut chunk = chunk_buf.slice_mut(s![0..rows, ..]);
                             let x_slice = x.slice(s![start..start + rows, ..]);
-                            let w_slice = sqrtw.slice(s![start..start + rows]);
-                            // Parallel per-row sqrt-weight scaling.
+                            let w_slice = weights.slice(s![start..start + rows]);
                             Zip::from(chunk.rows_mut())
                                 .and(x_slice.rows())
                                 .and(&w_slice)
@@ -967,14 +975,16 @@ impl PirlsWorkspace {
                                     Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                                 });
                         }
-                        let chunkrowsview = chunk_buf.slice(s![0..rows, ..]);
-                        let chunkview = FaerArrayView::new(&chunkrowsview);
+                        let x_slice = x.slice(s![start..start + rows, ..]);
+                        let wx_slice = chunk_buf.slice(s![0..rows, ..]);
+                        let x_view = FaerArrayView::new(&x_slice);
+                        let wx_view = FaerArrayView::new(&wx_slice);
                         let mut accview = array2_to_matmut(&mut acc);
                         matmul(
                             accview.as_mut(),
                             Accum::Add,
-                            chunkview.as_ref().transpose(),
-                            chunkview.as_ref(),
+                            x_view.as_ref().transpose(),
+                            wx_view.as_ref(),
                             1.0,
                             Par::Seq,
                         );
@@ -995,7 +1005,7 @@ impl PirlsWorkspace {
                 );
             *out += &combined.1;
         } else {
-            // Sequential: reuse workspace chunk buffer
+            // Sequential: reuse the workspace WX chunk buffer.
             if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
                 *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
             }
@@ -1005,9 +1015,7 @@ impl PirlsWorkspace {
                 {
                     let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
                     let x_slice = x.slice(s![start..start + rows, ..]);
-                    let w_slice = sqrtw.slice(s![start..start + rows]);
-                    // Parallel over chunk rows; the inner per-row column
-                    // copy stays sequential (small p).
+                    let w_slice = weights.slice(s![start..start + rows]);
                     Zip::from(chunk.rows_mut())
                         .and(x_slice.rows())
                         .and(&w_slice)
@@ -1015,13 +1023,15 @@ impl PirlsWorkspace {
                             Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
                         });
                 }
-                let chunkrowsview = weighted_x_chunk.slice(s![0..rows, ..]);
-                let chunkview = FaerArrayView::new(&chunkrowsview);
+                let x_slice = x.slice(s![start..start + rows, ..]);
+                let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
+                let x_view = FaerArrayView::new(&x_slice);
+                let wx_view = FaerArrayView::new(&wx_slice);
                 matmul(
                     outview.as_mut(),
                     Accum::Add,
-                    chunkview.as_ref().transpose(),
-                    chunkview.as_ref(),
+                    x_view.as_ref().transpose(),
+                    wx_view.as_ref(),
                     1.0,
                     par,
                 );
@@ -1608,15 +1618,14 @@ impl<'a> GamWorkingModel<'a> {
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
                 let x_dense = x.to_dense_arc();
-                workspace.fill_sqrtweights(weights);
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                     workspace.hessian_buf = Array2::zeros((p, p).f());
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
-                    &workspace.sqrtw,
+                PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                    weights,
                     &mut workspace.weighted_x_chunk,
                     x_dense.as_ref(),
                     &mut workspace.hessian_buf,
@@ -6468,7 +6477,6 @@ fn solve_penalized_least_squares_implicit(
     // ── Dense / QS-rotated path ──────────────────────────────────────────
 
     // 1. Prepare weighted buffers
-    workspace.fill_sqrtweights(&weights);
     if workspace.wz.len() != z.len() {
         workspace.wz = Array1::zeros(z.len());
     }
@@ -6489,8 +6497,8 @@ fn solve_penalized_least_squares_implicit(
             } else {
                 workspace.hessian_buf.fill(0.0);
             }
-            PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
-                &workspace.sqrtw,
+            PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                &weights,
                 &mut workspace.weighted_x_chunk,
                 x_dense.as_ref(),
                 &mut workspace.hessian_buf,
