@@ -17,7 +17,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
     DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates,
-    from_col_major_inplace, load_library, to_col_major,
+    from_col_major_inplace, load_library, to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -33,9 +33,8 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
 }
 
 /// Fused Cholesky factor + triangular solve: solve `A X = B` for SPD `A`,
-/// writing the solution into `rhs`. Returns `Some(())` on success, or `None`
-/// to fall back to the host path (size below threshold, factor not PD on
-/// device, or any device error).
+/// writing the solution into `rhs`. Returns `Some(())` when cuSOLVER completes
+/// the solve; `None` leaves the existing host solver path in charge.
 ///
 /// `a` is consumed in-place because cuSOLVER overwrites the lower triangle
 /// with `L` during factorization; callers that need the original matrix
@@ -92,8 +91,10 @@ impl CusolverRuntime {
         unsafe {
             check_cuda((driver.cu_init)(0), "cuInit")?;
             let mut device = 0;
+            let ordinal = to_i32(selected.ordinal)
+                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
             check_cuda(
-                (driver.cu_device_get)(&mut device, selected.ordinal as i32),
+                (driver.cu_device_get)(&mut device, ordinal),
                 "cuDeviceGet",
             )?;
             let mut context = 0usize;
@@ -120,6 +121,7 @@ impl CusolverRuntime {
 
     fn syevd_inplace(&mut self, a: &mut Array2<f64>) -> Option<Array1<f64>> {
         let p = a.nrows();
+        let p_i32 = to_i32(p)?;
         let mut a_col = to_col_major(a);
         let mut eigs = vec![0.0_f64; p];
         let bytes_a = bytes_len::<f64>(a_col.len())?;
@@ -136,9 +138,9 @@ impl CusolverRuntime {
                 self.handle,
                 CUSOLVER_EIG_MODE_VECTORS,
                 CUBLAS_FILL_LOWER,
-                p as i32,
+                p_i32,
                 a_dev.ptr,
-                p as i32,
+                p_i32,
                 eigs_dev.ptr,
                 &mut work_size,
             ) != CUSOLVER_STATUS_SUCCESS
@@ -146,9 +148,10 @@ impl CusolverRuntime {
                 return None;
             }
             let scratch = if work_size > 0 {
+                let work_elems = usize::try_from(work_size).ok()?;
                 Some(DeviceAllocation::new(
                     &self.driver,
-                    (work_size as usize) * std::mem::size_of::<f64>(),
+                    bytes_len::<f64>(work_elems)?,
                 )?)
             } else {
                 None
@@ -158,9 +161,9 @@ impl CusolverRuntime {
                 self.handle,
                 CUSOLVER_EIG_MODE_VECTORS,
                 CUBLAS_FILL_LOWER,
-                p as i32,
+                p_i32,
                 a_dev.ptr,
-                p as i32,
+                p_i32,
                 eigs_dev.ptr,
                 scratch_ptr,
                 work_size,
@@ -199,11 +202,13 @@ impl CusolverRuntime {
 
     /// Fused Cholesky factor + solve: `A` is overwritten with `L`, `rhs`
     /// with `A⁻¹·rhs`. One device round trip; returns `None` on any failure
-    /// (factor not PD, allocation/copy error, library status non-zero) so
-    /// callers fall back to faer.
+    /// (factor not PD, allocation/copy error, library status non-zero), leaving
+    /// faer's host solver path responsible for the result.
     fn chol_solve_inplace(&mut self, a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
         let p = a.nrows();
         let nrhs = rhs.ncols();
+        let p_i32 = to_i32(p)?;
+        let nrhs_i32 = to_i32(nrhs)?;
         let mut a_col = to_col_major(a);
         let mut rhs_col = to_col_major(rhs);
         let bytes_a = bytes_len::<f64>(a_col.len())?;
@@ -219,18 +224,19 @@ impl CusolverRuntime {
             if (self.solver.dpotrf_buffersize)(
                 self.handle,
                 CUBLAS_FILL_LOWER,
-                p as i32,
+                p_i32,
                 a_dev.ptr,
-                p as i32,
+                p_i32,
                 &mut work_size,
             ) != CUSOLVER_STATUS_SUCCESS
             {
                 return None;
             }
             let scratch = if work_size > 0 {
+                let work_elems = usize::try_from(work_size).ok()?;
                 Some(DeviceAllocation::new(
                     &self.driver,
-                    (work_size as usize) * std::mem::size_of::<f64>(),
+                    bytes_len::<f64>(work_elems)?,
                 )?)
             } else {
                 None
@@ -239,9 +245,9 @@ impl CusolverRuntime {
             let factor_status = (self.solver.dpotrf)(
                 self.handle,
                 CUBLAS_FILL_LOWER,
-                p as i32,
+                p_i32,
                 a_dev.ptr,
-                p as i32,
+                p_i32,
                 scratch_ptr,
                 work_size,
                 info_dev.ptr,
@@ -260,19 +266,17 @@ impl CusolverRuntime {
             )
             .ok()?;
             if info != 0 {
-                // Matrix not PD on device; report None so faer's CPU path
-                // can fall through to its own ridge-bump policy.
                 return None;
             }
             let solve_status = (self.solver.dpotrs)(
                 self.handle,
                 CUBLAS_FILL_LOWER,
-                p as i32,
-                nrhs as i32,
+                p_i32,
+                nrhs_i32,
                 a_dev.ptr,
-                p as i32,
+                p_i32,
                 rhs_dev.ptr,
-                p as i32,
+                p_i32,
                 info_dev.ptr,
             );
             if solve_status != CUSOLVER_STATUS_SUCCESS {
