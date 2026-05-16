@@ -165,22 +165,27 @@ fn discretize_then_fit_recovers_baseline_within_tolerance_n10k() {
 fn discretize_fit_scaling_n_100k_vs_full() {
     init_parallelism();
     let formula = "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])";
-    let cfg = FitConfig {
+    let cfg_full = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    for &n in &[10_000_usize, 100_000] {
+    let cfg_cells = FitConfig {
+        family: Some("gaussian".to_string()),
+        weight_column: Some("__cell_weight".to_string()),
+        ..FitConfig::default()
+    };
+    for &n in &[10_000_usize, 100_000, 1_000_000] {
         let data = raw_dataset(n);
         let t0 = Instant::now();
-        let _ = fit_from_formula(formula, &data, &cfg).expect("full");
+        let _ = fit_from_formula(formula, &data, &cfg_full).expect("full");
         let full_ms = t0.elapsed().as_secs_f64() * 1e3;
         let cells = discretize(&data, 50, 16);
         let cells_n = cells.values.nrows();
         let t1 = Instant::now();
-        let _ = fit_from_formula(formula, &cells, &cfg).expect("cells");
+        let _ = fit_from_formula(formula, &cells, &cfg_cells).expect("cells");
         let cells_ms = t1.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "[discretize] N={n} full: {full_ms:.1} ms; cells={cells_n} fit: {cells_ms:.1} ms; speedup={:.1}x",
+            "[discretize] N={n} full: {full_ms:.1} ms; cells={cells_n} weighted: {cells_ms:.1} ms; speedup={:.1}x",
             full_ms / cells_ms
         );
     }
