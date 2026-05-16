@@ -1,5 +1,7 @@
 use crate::custom_family::BlockwiseFitOptions;
-use crate::estimate::{EstimationError, FitOptions, FittedLinkState, UnifiedFitResult};
+use crate::estimate::{
+    AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
+};
 use crate::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
     fit_bernoulli_marginal_slope_terms,
@@ -37,7 +39,7 @@ use crate::families::transformation_normal::{
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design,
+    SmoothBasisSpec, TermCollectionSpec, build_term_collection_design,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
@@ -1331,6 +1333,11 @@ pub struct FitConfig {
 
     // Fitting options
     pub scale_dimensions: bool,
+    /// Enable exact spatial adaptive regularization for standard formula fits.
+    /// `None` uses the automatic policy: enable for Duchon smooths, because
+    /// they expose the full mass/tension/stiffness operator surface and benefit
+    /// from local Charbonnier regularization on high-yield spatial signals.
+    pub adaptive_regularization: Option<bool>,
     pub ridge_lambda: f64,
 
     /// Route the fit through the transformation-normal family.  When set, the
@@ -1377,6 +1384,7 @@ impl Default for FitConfig {
             z_column: None,
             weight_column: None,
             scale_dimensions: false,
+            adaptive_regularization: None,
             ridge_lambda: 1e-6,
             transformation_normal: false,
             firth: false,
@@ -1554,6 +1562,23 @@ fn build_termspec_with_geometry(
         enable_scale_dimensions(&mut spec);
     }
     Ok(spec)
+}
+
+fn standard_adaptive_regularization_options(
+    config: &FitConfig,
+    spec: &TermCollectionSpec,
+) -> Option<AdaptiveRegularizationOptions> {
+    let auto_enable = spec.smooth_terms.iter().any(|term| {
+        matches!(
+            &term.basis,
+            SmoothBasisSpec::Duchon { .. }
+        )
+    });
+    let enabled = config.adaptive_regularization.unwrap_or(auto_enable);
+    enabled.then(|| AdaptiveRegularizationOptions {
+        enabled: true,
+        ..AdaptiveRegularizationOptions::default()
+    })
 }
 
 fn resolve_survival_marginal_slope_base_link(
@@ -1847,7 +1872,7 @@ fn materialize_standard<'a>(
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: config.firth,
-        adaptive_regularization: None,
+        adaptive_regularization: standard_adaptive_regularization_options(config, &spec),
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
@@ -3186,6 +3211,79 @@ mod tests {
             operator_trust_radius: None,
             operator_stop_reason: None,
         }
+    }
+
+    fn duchon_workflow_dataset() -> Dataset {
+        let n = 72usize;
+        let mut values = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+            values[[i, 0]] = 0.5 * t.sin() + 0.15 * (3.0 * t).cos();
+            values[[i, 1]] = t.cos();
+            values[[i, 2]] = t.sin();
+        }
+        Dataset {
+            headers: vec!["y".to_string(), "ct".to_string(), "st".to_string()],
+            values,
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "ct".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "st".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        }
+    }
+
+    #[test]
+    fn materialize_standard_auto_enables_adaptive_regularization_for_duchon() {
+        let data = duchon_workflow_dataset();
+        let materialized = materialize(
+            "y ~ duchon(ct, st, centers=12)",
+            &data,
+            &FitConfig::default(),
+        )
+        .expect("Duchon standard materialization should succeed");
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("expected standard request");
+        };
+        let opts = request
+            .options
+            .adaptive_regularization
+            .expect("Duchon should enable adaptive regularization automatically");
+        assert!(opts.enabled);
+    }
+
+    #[test]
+    fn materialize_standard_honors_adaptive_regularization_disable() {
+        let data = duchon_workflow_dataset();
+        let config = FitConfig {
+            adaptive_regularization: Some(false),
+            ..FitConfig::default()
+        };
+        let materialized = materialize("y ~ duchon(ct, st, centers=12)", &data, &config)
+            .expect("Duchon materialization should allow disabling adaptive regularization");
+        let FitRequest::Standard(request) = materialized.request else {
+            panic!("expected standard request");
+        };
+        assert!(request.options.adaptive_regularization.is_none());
     }
 
     #[test]
