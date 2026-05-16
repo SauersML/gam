@@ -15,9 +15,9 @@ fn wahba_kernel_is_longitude_periodic_and_symmetric() {
     let points = array![[0.0, 0.0], [25.0, 179.0], [-60.0, -45.0]];
     let shifted = array![[0.0, 360.0], [25.0, -181.0], [-60.0, 315.0]];
 
-    let k = spherical_wahba_kernel_matrix(points.view(), points.view(), 2).expect("kernel");
+    let k = spherical_wahba_kernel_matrix(points.view(), points.view(), 2, false).expect("kernel");
     let k_shifted =
-        spherical_wahba_kernel_matrix(points.view(), shifted.view(), 2).expect("kernel");
+        spherical_wahba_kernel_matrix(points.view(), shifted.view(), 2, false).expect("kernel");
 
     for i in 0..k.nrows() {
         for j in 0..k.ncols() {
@@ -46,8 +46,9 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         penalty_order: 2,
         double_penalty: true,
-    
-        radians: false,};
+
+        radians: false,
+    };
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
     assert_eq!(built.design.nrows(), data.nrows());
@@ -135,19 +136,63 @@ fn sphere_formula_and_mgcv_sos_alias_resolve_to_sphere_basis() {
 }
 
 #[test]
+fn wahba_kernel_radians_matches_degrees() {
+    let deg = array![[10.0, 25.0], [-30.0, -60.0], [45.0, 170.0]];
+    let to_rad = std::f64::consts::PI / 180.0;
+    let mut rad = deg.clone();
+    rad.mapv_inplace(|v| v * to_rad);
+    let k_deg =
+        spherical_wahba_kernel_matrix(deg.view(), deg.view(), 2, false).expect("kernel deg");
+    let k_rad = spherical_wahba_kernel_matrix(rad.view(), rad.view(), 2, true).expect("kernel rad");
+    for i in 0..k_deg.nrows() {
+        for j in 0..k_deg.ncols() {
+            assert!(
+                (k_deg[(i, j)] - k_rad[(i, j)]).abs() < 1e-12,
+                "kernel(deg) != kernel(rad) at ({i},{j}): {} vs {}",
+                k_deg[(i, j)],
+                k_rad[(i, j)]
+            );
+        }
+    }
+}
+
+#[test]
+fn wahba_kernel_invariant_under_rigid_rotation_of_sphere() {
+    // rotate all points by 30 deg longitude; intrinsic kernel must be unchanged
+    let pts = array![[0.0, 10.0], [25.0, 60.0], [-45.0, -120.0]];
+    let mut rot = pts.clone();
+    for r in 0..rot.nrows() {
+        rot[(r, 1)] = ((rot[(r, 1)] + 30.0_f64 + 180.0_f64).rem_euclid(360.0_f64)) - 180.0_f64;
+    }
+    let k = spherical_wahba_kernel_matrix(pts.view(), pts.view(), 2, false).expect("k");
+    let k_rot = spherical_wahba_kernel_matrix(rot.view(), rot.view(), 2, false).expect("k_rot");
+    for i in 0..k.nrows() {
+        for j in 0..k.ncols() {
+            assert!(
+                (k[(i, j)] - k_rot[(i, j)]).abs() < 1e-12,
+                "kernel not rotation-invariant at ({i},{j}): {} vs {}",
+                k[(i, j)],
+                k_rot[(i, j)]
+            );
+        }
+    }
+}
+
+#[test]
 fn spherical_basis_rejects_bad_latitudes_and_wrong_dimension() {
     let bad_lat = array![[91.0, 0.0], [0.0, 10.0]];
     let spec = SphericalSplineBasisSpec {
         center_strategy: CenterStrategy::UserProvided(bad_lat.clone()),
         penalty_order: 2,
         double_penalty: false,
-    
-        radians: false,};
+
+        radians: false,
+    };
     let err = build_spherical_spline_basis(bad_lat.view(), &spec).expect_err("invalid latitude");
     assert!(err.to_string().contains("latitude must be in [-90, 90]"));
 
     let wrong_dim = array![[0.0, 0.0, 1.0], [10.0, 20.0, 1.0]];
-    let err = spherical_wahba_kernel_matrix(wrong_dim.view(), wrong_dim.view(), 2)
+    let err = spherical_wahba_kernel_matrix(wrong_dim.view(), wrong_dim.view(), 2, false)
         .expect_err("wrong dimension");
     assert!(err.to_string().contains("exactly two columns"));
 }
