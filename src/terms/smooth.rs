@@ -3545,6 +3545,7 @@ fn build_single_local_smooth_term(
             if bspline_boundary_has_nonzero_anchor(spec.boundary_conditions) {
                 boundary_conditions_for_linear = Some((spec.boundary_conditions, spec.degree));
                 spec_local.boundary_conditions = BSplineBoundaryConditions::default();
+                spec_local.identifiability = BSplineIdentifiability::None;
             }
             if term.shape != ShapeConstraint::None {
                 // Shape-constrained B-splines are anchored by construction.

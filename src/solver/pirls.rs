@@ -6452,6 +6452,23 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         .as_ref()
         .map(|transform| transform.apply_transpose(beta_guess_original.as_ref()))
         .unwrap_or_else(|| beta_guess_original.as_ref().clone());
+    let initial_beta = if let Some(constraints) = linear_constraints.as_ref() {
+        let current_violation = constraints
+            .a
+            .dot(&initial_beta)
+            .iter()
+            .zip(constraints.b.iter())
+            .map(|(lhs, rhs)| (rhs - lhs).max(0.0))
+            .fold(0.0_f64, f64::max);
+        if current_violation > 1e-8 {
+            active_set::feasible_point_for_linear_constraints(constraints, initial_beta.len())
+                .unwrap_or(initial_beta)
+        } else {
+            initial_beta
+        }
+    } else {
+        initial_beta
+    };
     let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
     let base_max_step_halving = if firth_active { 60 } else { 30 };
     let options = WorkingModelPirlsOptions {

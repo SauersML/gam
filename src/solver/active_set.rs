@@ -206,6 +206,49 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     }
 }
 
+pub(crate) fn feasible_point_for_linear_constraints(
+    constraints: &LinearInequalityConstraints,
+    p: usize,
+) -> Option<Array1<f64>> {
+    if constraints.a.ncols() != p
+        || constraints.a.nrows() == 0
+        || constraints.b.len() != constraints.a.nrows()
+    {
+        return None;
+    }
+    if constraints.b.iter().all(|v| v.abs() <= 1e-14) {
+        return Some(Array1::zeros(p));
+    }
+
+    let gram = constraints.a.dot(&constraints.a.t());
+    let (u_opt, singular, vt_opt) = gram.svd(true, true).ok()?;
+    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
+        return None;
+    };
+    let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular.max(1.0);
+    let mut coeff = u.t().dot(&constraints.b);
+    for (idx, value) in coeff.iter_mut().enumerate() {
+        let sigma = singular[idx];
+        if sigma.abs() > tol {
+            *value /= sigma;
+        } else {
+            *value = 0.0;
+        }
+    }
+    let dual = vt.t().dot(&coeff);
+    let beta = constraints.a.t().dot(&dual);
+    if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let slack = constraints.a.dot(&beta) - &constraints.b;
+    if slack.iter().all(|v| *v >= -1e-8) {
+        Some(beta)
+    } else {
+        None
+    }
+}
+
 fn max_linear_constraint_violation(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
