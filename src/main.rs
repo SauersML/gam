@@ -318,7 +318,10 @@ struct FitArgs {
     /// Makeham additive hazard (>0) when baseline-target=gompertz-makeham.
     #[arg(long = "baseline-makeham")]
     baseline_makeham: Option<f64>,
-    /// Time basis for survival mode (`linear`, `ispline`, ...).
+    /// Time basis for survival mode. Accepted values: `ispline` (default,
+    /// monotone non-decreasing I-spline baseline) or `none` (no baseline
+    /// time basis — covariate effects only). `linear` / `bspline` are
+    /// rejected at parse time; use the structural survival paths instead.
     #[arg(long = "time-basis", default_value = "ispline")]
     time_basis: String,
     /// Degree for survival time basis.
