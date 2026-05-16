@@ -17378,6 +17378,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
                         length_scale: 0.8,
                         nu: MaternNu::ThreeHalves,
@@ -17593,6 +17594,7 @@ mod tests {
                 basis: SmoothBasisSpec::Matern {
                     feature_cols: vec![0, 1, 2],
                     spec: MaternBasisSpec {
+                        periodic: None,
                         center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
                         length_scale: 0.45,
                         nu: MaternNu::ThreeHalves,
