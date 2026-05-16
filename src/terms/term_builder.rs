@@ -330,6 +330,41 @@ pub fn build_smooth_basis(
                 },
             })
         }
+        "periodic" | "cyclic" | "periodic-bspline" | "cc" => {
+            if cols.len() != 1 {
+                return Err(format!(
+                    "periodic smooth expects one variable, got {}",
+                    cols.len()
+                ));
+            }
+            let c = cols[0];
+            let (minv, maxv) = col_minmax(ds.values.column(c))?;
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let default_basis = heuristic_knots_for_column(ds.values.column(c)).max(degree + 1);
+            let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                .unwrap_or(default_basis);
+            if num_basis < degree + 1 {
+                return Err(format!(
+                    "periodic smooth: k={} too small for degree {}; expected k >= {}",
+                    num_basis,
+                    degree,
+                    degree + 1
+                ));
+            }
+            Ok(SmoothBasisSpec::BSpline1D {
+                feature_col: c,
+                spec: BSplineBasisSpec {
+                    degree,
+                    penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                    knotspec: BSplineKnotSpec::PeriodicUniform {
+                        data_range: (minv, maxv),
+                        num_basis,
+                    },
+                    double_penalty: smooth_double_penalty,
+                    identifiability: BSplineIdentifiability::default(),
+                },
+            })
+        }
         "bspline" | "ps" | "p-spline" => {
             if cols.len() != 1 {
                 return Err(format!(
