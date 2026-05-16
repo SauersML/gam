@@ -82,26 +82,24 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          # Capture cargo test's exit status without aborting, so the
-          # forbidden-substring grep below can act as a diagnostic
-          # classifier on failure rather than a separate gate that trips
-          # on log output from passing tests that deliberately exercise
-          # these error paths.
-          cargo test --all-features -- --nocapture 2>&1 | tee /tmp/cargo-test.log
+          # cargo test captures stdout/stderr by default and only prints it
+          # in the "failures:" section of tests that actually failed. That
+          # is what we want here: the forbidden-pattern grep below only
+          # fires on a non-zero test exit, and at that point the failed
+          # tests' captured output is already in the log. Passing tests
+          # that deliberately drive the solver into degenerate states stay
+          # silent, so their log::warn!/eprintln! noise cannot accumulate
+          # and exhaust the runner disk — the recurring "exit code 101 /
+          # No space left on device" failure mode that the `--nocapture`
+          # design used to surface here, repeatedly, every time a probe
+          # log got added anywhere in the hot REML/PIRLS/Newton paths.
+          cargo test --all-features 2>&1 | tee /tmp/cargo-test.log
           test_status=${PIPESTATUS[0]}
 
           # The patterns here are literal/ERE substrings that match the
           # exact log::warn!/log::error!/Display strings emitted at runtime
-          # when the solver hits specific degenerate states. Many library
-          # tests deliberately drive the solver into those states — e.g.
-          # perfect-separation coverage, seed-exhaustion coverage,
-          # PIRLS-non-convergence coverage. On a passing run those
-          # emissions are *expected* test output, not regressions. The
-          # grep only fires when cargo test itself returned non-zero,
-          # where the pattern match helps classify the failure mode.
-          #
-          # Patterns verified against src/ to match non-test runtime log
-          # output:
+          # when the solver hits specific degenerate states. Patterns
+          # verified against src/ to match non-test runtime log output:
           #   - "P-IRLS INNER LOOP FAILED" — solver/reml/runtime.rs
           #     log::warn! emitted by the outer REML cost path when PIRLS
           #     returns an error.
