@@ -2584,7 +2584,7 @@ impl Default for SpatialIdentifiability {
 /// - `Wahba`: closed-form reproducing-kernel pseudo-spline (Wahba 1981) on
 ///   a center set selected by `center_strategy`.
 /// - `Harmonic`: real spherical-harmonic truncation up to `max_degree` with
-///   the Laplace-Beltrami squared eigenvalue penalty `[l(l+1)]^2`. Basis
+///   the Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. Basis
 ///   dimension is `max_degree * (max_degree + 2)`; centers are ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SphereMethod {
@@ -2604,8 +2604,10 @@ pub struct SphericalSplineBasisSpec {
     /// Center/knot selection strategy in latitude/longitude coordinates
     /// (used only when `method == Wahba`).
     pub center_strategy: CenterStrategy,
-    /// Wahba pseudo-spline penalty order m. m=1..4 closed form; m=2 is the
-    /// usual curvature penalty. Ignored for `Harmonic`.
+    /// Sphere roughness penalty order m. For Wahba this selects the closed-form
+    /// pseudo-spline kernel order; for Harmonic this raises the
+    /// Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. m=2 is the usual
+    /// curvature penalty.
     pub penalty_order: usize,
     /// Add a ridge-like shrinkage penalty.
     pub double_penalty: bool,
@@ -2614,8 +2616,8 @@ pub struct SphericalSplineBasisSpec {
     #[serde(default)]
     pub radians: bool,
     /// Construction method. Default Wahba (reproducing kernel); Harmonic uses
-    /// real spherical harmonics with the Laplace-Beltrami squared eigenvalue
-    /// penalty (Wood §5.6.2, mgcv `bs="sos"`).
+    /// real spherical harmonics with a Laplace-Beltrami eigenvalue penalty
+    /// (Wood §5.6.2, mgcv `bs="sos"`).
     #[serde(default)]
     pub method: SphereMethod,
     /// Maximum spherical-harmonic degree L when `method == Harmonic`. Basis
@@ -2900,6 +2902,8 @@ pub enum BasisMetadata {
     Sphere {
         centers: Array2<f64>,
         penalty_order: usize,
+        method: SphereMethod,
+        max_degree: Option<usize>,
         constraint_transform: Option<Array2<f64>>,
     },
     Matern {
@@ -13886,6 +13890,8 @@ pub fn build_spherical_spline_basis(
         metadata: BasisMetadata::Sphere {
             centers,
             penalty_order: spec.penalty_order,
+            method: SphereMethod::Wahba,
+            max_degree: None,
             constraint_transform: Some(z),
         },
         kronecker_factored: None,
@@ -14024,6 +14030,12 @@ fn build_spherical_harmonic_basis(
             "spherical-harmonic max_degree {l_max} too large; cap is 32"
         )));
     }
+    if !(1..=4).contains(&spec.penalty_order) {
+        return Err(BasisError::InvalidInput(format!(
+            "spherical-harmonic penalty_order must be one of 1, 2, 3, 4; got {}",
+            spec.penalty_order
+        )));
+    }
     let p = l_max * (l_max + 2);
     let to_rad = if spec.radians {
         1.0
@@ -14069,7 +14081,7 @@ fn build_spherical_harmonic_basis(
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
-        let eig = (l as f64 * (l as f64 + 1.0)).powi(2);
+            let eig = (l as f64 * (l as f64 + 1.0)).powi(spec.penalty_order as i32);
         for _ in 0..(2 * l + 1) {
             penalty[[col, col]] = eig;
             col += 1;
@@ -14098,11 +14110,6 @@ fn build_spherical_harmonic_basis(
     }
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
-    // Metadata-wise the harmonic basis is intrinsic (no centers); we reuse
-    // the existing Sphere metadata variant with an empty center matrix and
-    // None constraint transform, plus the harmonic order encoded as
-    // penalty_order = max_degree | 0x8000_0000 sentinel; freeze can detect
-    // method by inspecting `centers.nrows() == 0`.
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties,
@@ -14110,7 +14117,9 @@ fn build_spherical_harmonic_basis(
         penaltyinfo,
         metadata: BasisMetadata::Sphere {
             centers: Array2::<f64>::zeros((0, 2)),
-            penalty_order: l_max,
+            penalty_order: spec.penalty_order,
+            method: SphereMethod::Harmonic,
+            max_degree: Some(l_max),
             constraint_transform: None,
         },
         kronecker_factored: None,
