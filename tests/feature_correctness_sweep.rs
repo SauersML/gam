@@ -29,7 +29,9 @@ fn random_lat_lon(n: usize, seed: u64) -> Array2<f64> {
     // Deterministic LCG (fine for test data; no need for chacha).
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as f64) / (u32::MAX as f64)
     };
     let mut out = Array2::<f64>::zeros((n, 2));
@@ -58,10 +60,7 @@ fn periodic_bspline_partition_of_unity_across_periods_and_k() {
             assert_eq!(basis.ncols(), k, "period={period} k={k}");
             for i in 0..n {
                 let s = basis.row(i).sum();
-                assert!(
-                    near(s, 1.0, 1e-10),
-                    "period={period} k={k} row {i} sum={s}"
-                );
+                assert!(near(s, 1.0, 1e-10), "period={period} k={k} row {i} sum={s}");
             }
         }
     }
@@ -102,7 +101,10 @@ fn periodic_bspline_for_all_supported_degrees() {
         let basis = create_periodic_bspline_basis_dense(xs.view(), (0.0, period), degree, k)
             .unwrap_or_else(|e| panic!("degree={degree} k={k}: {e}"));
         for i in 0..xs.len() {
-            assert!(near(basis.row(i).sum(), 1.0, 1e-10), "degree={degree} row {i}");
+            assert!(
+                near(basis.row(i).sum(), 1.0, 1e-10),
+                "degree={degree} row {i}"
+            );
         }
     }
 }
@@ -169,7 +171,8 @@ fn periodic_bspline_derivative_matches_finite_difference_at_interior() {
     let xs_plus = &xs + h;
     let xs_minus = &xs - h;
     let bp = create_periodic_bspline_basis_dense(xs_plus.view(), (0.0, period), degree, k).unwrap();
-    let bm = create_periodic_bspline_basis_dense(xs_minus.view(), (0.0, period), degree, k).unwrap();
+    let bm =
+        create_periodic_bspline_basis_dense(xs_minus.view(), (0.0, period), degree, k).unwrap();
     let d = create_periodic_bspline_derivative_dense(xs.view(), (0.0, period), degree, k).unwrap();
     for i in 0..xs.len() {
         for j in 0..k {
@@ -296,13 +299,7 @@ fn bc_bspline_columns_drop_by_constraint_count() {
         p0,
         "single anchored BC should reduce ncols by 1"
     );
-    let both_sides = build_bc(
-        100,
-        8,
-        Anchored { value: 0.0 },
-        Clamped,
-    )
-    .unwrap();
+    let both_sides = build_bc(100, 8, Anchored { value: 0.0 }, Clamped).unwrap();
     assert_eq!(
         both_sides.design.ncols() + 2,
         p0,
@@ -346,7 +343,9 @@ fn wahba_kernel_kxx_is_psd_and_symmetric() {
             for _ in 0..50 {
                 let kv = k.dot(&v);
                 let mut shifted = &v * (1e6_f64) - &kv;
-                let nrm = (shifted.iter().map(|x| x * x).sum::<f64>()).sqrt().max(1e-30);
+                let nrm = (shifted.iter().map(|x| x * x).sum::<f64>())
+                    .sqrt()
+                    .max(1e-30);
                 shifted /= nrm;
                 v = shifted;
             }
@@ -455,7 +454,11 @@ fn wahba_kernel_rejects_lat_out_of_range() {
 
 // ----- SPHERE HARMONIC: ~40 cases -----
 
-fn build_harmonic(data: ArrayView2<'_, f64>, l: usize, radians: bool) -> Result<gam::basis::BasisBuildResult, gam::basis::BasisError> {
+fn build_harmonic(
+    data: ArrayView2<'_, f64>,
+    l: usize,
+    radians: bool,
+) -> Result<gam::basis::BasisBuildResult, gam::basis::BasisError> {
     let spec = SphericalSplineBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
         penalty_order: 2,
@@ -636,7 +639,10 @@ fn sphere_harmonic_penalty_diagonal_eigenvalues_match_l_l_plus_1_squared() {
             );
         }
         if prev_val >= 0.0 {
-            assert!(v0 > prev_val, "L={l_max} l={l}: penalty eigenvalue should be monotone increasing");
+            assert!(
+                v0 > prev_val,
+                "L={l_max} l={l}: penalty eigenvalue should be monotone increasing"
+            );
         }
         prev_val = v0;
         col += block;
