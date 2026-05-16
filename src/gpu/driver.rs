@@ -94,11 +94,7 @@ impl CudaWorkingState {
             let mut device = 0_i32;
             check_cuda((api.cu_device_get)(&mut device, ordinal), "cuDeviceGet").ok()?;
             let mut context = 0_usize;
-            check_cuda(
-                (api.cu_ctx_create)(&mut context, 0, device),
-                "cuCtxCreate",
-            )
-            .ok()?;
+            check_cuda((api.cu_ctx_create)(&mut context, 0, device), "cuCtxCreate").ok()?;
             Some(Self { api, context })
         }
     }

@@ -331,9 +331,8 @@ pub fn build_smooth_basis(
                                 dim, vars[dim]
                             )
                         })?;
-                        BSplineKnotSpec::Periodic {
-                            domain_start: minv,
-                            period,
+                        BSplineKnotSpec::PeriodicUniform {
+                            data_range: (minv, minv + period),
                             num_basis: n_knots + degree + 1,
                         }
                     } else {
@@ -388,9 +387,8 @@ pub fn build_smooth_basis(
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                    knotspec: BSplineKnotSpec::Periodic {
-                        domain_start: minv,
-                        period,
+                    knotspec: BSplineKnotSpec::PeriodicUniform {
+                        data_range: (minv, minv + period),
                         num_basis,
                     },
                     double_penalty: smooth_double_penalty,
@@ -438,9 +436,8 @@ pub fn build_smooth_basis(
                 }
                 {
                     let p_value = periods[0].unwrap_or(maxv - minv);
-                    BSplineKnotSpec::Periodic {
-                        domain_start: minv,
-                        period: p_value,
+                    BSplineKnotSpec::PeriodicUniform {
+                        data_range: (minv, minv + p_value),
                         num_basis: n_knots + degree + 1,
                     }
                 }
