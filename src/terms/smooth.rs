@@ -405,9 +405,12 @@ impl TermCollectionSpec {
         for st in &self.smooth_terms {
             match &st.basis {
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
-                    if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
+                    if !matches!(
+                        spec.knotspec,
+                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                    ) {
                         return Err(format!(
-                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
+                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided or PeriodicUniform",
                             st.name
                         ));
                     }
@@ -11947,7 +11950,9 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                 },
             ) => {
-                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                if !matches!(s.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
+                    s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                }
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
