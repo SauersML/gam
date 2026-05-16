@@ -156,6 +156,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 },
                 double_penalty: true,
                 identifiability: BSplineIdentifiability::None,
+                boundary_conditions: Default::default(),
             },
         },
         shape: gam::terms::smooth::ShapeConstraint::None,
@@ -180,6 +181,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         },
     )
     .unwrap();

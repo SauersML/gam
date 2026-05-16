@@ -11015,7 +11015,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
-                            periodic: false,
+                        periodic: false,
                     },
                     input_scales: None,
                 },

@@ -49,6 +49,8 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: Some(vec![0.0; d]),
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
+
+                periodic: false,
             },
             input_scales: None,
         },
