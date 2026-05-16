@@ -38,7 +38,9 @@ ident_start = _{ ASCII_ALPHA | "_" }
 ident_continue = _{ ASCII_ALPHANUMERIC | "_" | "." }
 
 number = @{
-    "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)?
+    "-"?
+    ~ (ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT*)? | "." ~ ASCII_DIGIT+)
+    ~ (("e" | "E") ~ ("+" | "-")? ~ ASCII_DIGIT+)?
 }
 
 string_lit = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" | "'" ~ (!"'" ~ ANY)* ~ "'" }
@@ -306,6 +308,26 @@ mod tests {
             CallArgSpec::Named {
                 key: "period".to_string(),
                 value: "[7, 24]".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_leading_dot_decimal_options() {
+        let call = parse_function_call("matern(x, nu=.5, length_scale=.05)").expect("matern call");
+        assert_eq!(call.name, "matern");
+        assert_eq!(
+            call.args[1],
+            CallArgSpec::Named {
+                key: "nu".to_string(),
+                value: ".5".to_string(),
+            }
+        );
+        assert_eq!(
+            call.args[2],
+            CallArgSpec::Named {
+                key: "length_scale".to_string(),
+                value: ".05".to_string(),
             }
         );
     }
