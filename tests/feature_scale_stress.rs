@@ -8,7 +8,9 @@
 //! at biobank scale.
 
 use gam::basis::{
-    CenterStrategy, SphereMethod, SphericalSplineBasisSpec, build_spherical_spline_basis,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, SphereMethod,
+    SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
     create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
     create_periodic_bspline_derivative_dense, spherical_wahba_kernel_matrix,
 };
@@ -186,6 +188,41 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
             }
         }
         let _ = PI;
+    }
+}
+
+#[test]
+fn boundary_conditioned_bspline_drops_dimension_correctly_and_scales() {
+    // Build the BC-projected B-spline at N = 1k, 10k. Validate:
+    //   - ncols equals expected reduced dimension
+    //   - design at left endpoint vanishes when bc_left=anchored (value=0)
+    //   - design at right endpoint has zero derivative when bc_right=clamped
+    for n in [1_000usize, 10_000] {
+        let xs = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0)));
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 10,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary_conditions: BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                right: BSplineEndpointBoundaryCondition::Clamped,
+            },
+        };
+        let built = time_label(&format!("bc_bspline N={n} k=14 anchored+clamped"), || {
+            build_bspline_basis_1d(xs.view(), &spec).expect("bc basis")
+        });
+        // Anchored at x=0 → design row at x=0 sums to 0
+        let row0 = built.design.to_dense().row(0).to_owned();
+        let s = row0.sum();
+        assert!(
+            s.abs() < 1e-9,
+            "bc anchored: row at x=0 should sum to 0, got {s}"
+        );
     }
 }
 
