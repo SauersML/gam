@@ -364,15 +364,44 @@ fn quasi_random_2d(n: usize) -> Array2<f64> {
     data
 }
 
-fn time_design_build(spec: &TermCollectionSpec, data: &Array2<f64>) -> (f64, usize, bool) {
-    let t = Instant::now();
+/// Measure design-build cost AND a representative downstream op (X·β) so
+/// the benefit of preserving sparsity through the rest of the solver is
+/// visible, not just the construction cost itself.
+fn time_design_build_and_apply(
+    spec: &TermCollectionSpec,
+    data: &Array2<f64>,
+    num_apply_trials: usize,
+) -> (f64, f64, usize, bool) {
+    use gam::linalg::matrix::LinearOperator;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, Normal};
+
+    let t_build = Instant::now();
     let design = build_term_collection_design(data.view(), spec)
         .expect("te(x, h) design build");
-    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let ms_build = t_build.elapsed().as_secs_f64() * 1e3;
     let term = &design.smooth.term_designs[0];
     let p = term.ncols();
     let is_sparse = matches!(term, DesignMatrix::Sparse(_));
-    (ms, p, is_sparse)
+
+    // Build a fixed RNG so both sparse and dense runs see identical β draws.
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_BAD_C0DE);
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let betas: Vec<ndarray::Array1<f64>> = (0..num_apply_trials)
+        .map(|_| ndarray::Array1::from_iter((0..p).map(|_| normal.sample(&mut rng))))
+        .collect();
+
+    let mut accum_sum = 0.0_f64;
+    let t_apply = Instant::now();
+    for beta in &betas {
+        let y = term.apply(beta);
+        accum_sum += y.sum();
+    }
+    let ms_apply = t_apply.elapsed().as_secs_f64() * 1e3;
+    // Black-box the accumulator so the optimizer can't dead-code the apply.
+    std::hint::black_box(accum_sum);
+    (ms_build, ms_apply, p, is_sparse)
 }
 
 #[test]
@@ -383,23 +412,31 @@ fn biobank_perf_sparse_vs_dense_te_n1m_p128() {
     let data = quasi_random_2d(n);
 
     let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
-    let (ms_sparse, p_sparse, is_sparse) = time_design_build(&spec_sparse, &data);
+    let (ms_build_s, ms_apply_s, p_sparse, is_sparse) =
+        time_design_build_and_apply(&spec_sparse, &data, 8);
     assert!(
         is_sparse,
         "identifiability=None on B-spline marginals must trigger the sparse Khatri-Rao path"
     );
 
     let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
-    let (ms_dense, p_dense, is_sparse_dense) = time_design_build(&spec_dense, &data);
+    let (ms_build_d, ms_apply_d, p_dense, is_sparse_dense) =
+        time_design_build_and_apply(&spec_dense, &data, 8);
     assert!(
         !is_sparse_dense,
         "SumToZero identifiability must take the dense fall-back path"
     );
 
-    let speedup = ms_dense / ms_sparse.max(1e-6);
+    let build_speedup = ms_build_d / ms_build_s.max(1e-6);
+    let apply_speedup = ms_apply_d / ms_apply_s.max(1e-6);
+    let total_s = ms_build_s + ms_apply_s;
+    let total_d = ms_build_d + ms_apply_d;
+    let total_speedup = total_d / total_s.max(1e-6);
     eprintln!(
         "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
-         sparse path = {ms_sparse:.0} ms, dense path = {ms_dense:.0} ms, speedup = {speedup:.1}×"
+         BUILD sparse={ms_build_s:.0} ms vs dense={ms_build_d:.0} ms ({build_speedup:.2}×), \
+         APPLY×8 sparse={ms_apply_s:.0} ms vs dense={ms_apply_d:.0} ms ({apply_speedup:.2}×), \
+         TOTAL sparse={total_s:.0} ms vs dense={total_d:.0} ms ({total_speedup:.2}×)"
     );
 }
 
@@ -410,15 +447,23 @@ fn biobank_perf_sparse_vs_dense_te_n100k_p128() {
     let data = quasi_random_2d(n);
 
     let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
-    let (ms_sparse, p_sparse, is_sparse) = time_design_build(&spec_sparse, &data);
+    let (ms_build_s, ms_apply_s, p_sparse, is_sparse) =
+        time_design_build_and_apply(&spec_sparse, &data, 8);
     assert!(is_sparse);
 
     let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
-    let (ms_dense, p_dense, _) = time_design_build(&spec_dense, &data);
+    let (ms_build_d, ms_apply_d, p_dense, _) =
+        time_design_build_and_apply(&spec_dense, &data, 8);
 
-    let speedup = ms_dense / ms_sparse.max(1e-6);
+    let build_speedup = ms_build_d / ms_build_s.max(1e-6);
+    let apply_speedup = ms_apply_d / ms_apply_s.max(1e-6);
+    let total_s = ms_build_s + ms_apply_s;
+    let total_d = ms_build_d + ms_apply_d;
+    let total_speedup = total_d / total_s.max(1e-6);
     eprintln!(
         "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
-         sparse path = {ms_sparse:.1} ms, dense path = {ms_dense:.1} ms, speedup = {speedup:.1}×"
+         BUILD sparse={ms_build_s:.1} ms vs dense={ms_build_d:.1} ms ({build_speedup:.2}×), \
+         APPLY×8 sparse={ms_apply_s:.1} ms vs dense={ms_apply_d:.1} ms ({apply_speedup:.2}×), \
+         TOTAL sparse={total_s:.1} ms vs dense={total_d:.1} ms ({total_speedup:.2}×)"
     );
 }
