@@ -2320,12 +2320,12 @@ impl<'a> RemlState<'a> {
     /// `hop.logdet() + hessian_logdet_correction` (the latter carries the
     /// `log|H_proj| − hop.logdet()` correction from the dense_assembly
     /// rank-deficiency fix).  Returning the same sum here gives tests a
-    /// matching derivative oracle: probing the projected logdet at
-    /// nearby `theta` values produces the analytic
+    /// matching finite-difference reference: centered-differencing the
+    /// projected logdet across nearby `theta` values produces the analytic
     /// `d/dψ log|H_proj|` that production's trace formula computes — *not*
     /// the full-space `d/dψ log|H_full|`, which differs by the `null(S)`
-    /// directions' contribution and is the wrong oracle for the projected
-    /// LAML cost identity.  Used by
+    /// directions' contribution and is the wrong finite-difference reference
+    /// for the projected LAML cost identity.  Used by
     /// `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
     /// INVARIANT 2.
     #[cfg(test)]
