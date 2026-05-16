@@ -4923,12 +4923,11 @@ fn run_outer_with_plan(
                 if candidate_improves_best(&candidate, best.as_ref()) {
                     best = Some(candidate);
                 }
-                let quality_compare_remaining_gaussian_seeds =
-                    matches!(
-                        config.seed_config.risk_profile,
-                        crate::seeding::SeedRiskProfile::Gaussian
-                    ) && seed_budget > 1
-                        && started_seeds < seed_budget;
+                let quality_compare_remaining_gaussian_seeds = matches!(
+                    config.seed_config.risk_profile,
+                    crate::seeding::SeedRiskProfile::Gaussian
+                ) && seed_budget > 1
+                    && started_seeds < seed_budget;
                 if best.as_ref().is_some_and(|b| b.converged)
                     && !quality_compare_remaining_gaussian_seeds
                 {
@@ -6778,6 +6777,49 @@ mod tests {
         ));
         assert!(candidate_improves_best(&converged, Some(&nonconverged_lo)));
         assert!(!candidate_improves_best(&nonconverged_lo, Some(&converged)));
+    }
+
+    #[test]
+    fn gaussian_multistart_compares_converged_seed_costs() {
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.seed_budget = 2;
+        seed_config.risk_profile = crate::seeding::SeedRiskProfile::Gaussian;
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_seed_config(seed_config)
+            .with_max_iter(4);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(if theta[0] < -1.0 { 0.0 } else { 10.0 }),
+            {
+                let started = Arc::clone(&started);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    started.lock().unwrap().push(theta.clone());
+                    Ok(OuterEval {
+                        cost: if theta[0] < -1.0 { 0.0 } else { 10.0 },
+                        gradient: array![0.0],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "Gaussian quality multistart")
+            .expect("Gaussian multistart should compare both converged seeds");
+        let starts = started.lock().unwrap();
+        assert!(
+            starts.len() >= 2,
+            "Gaussian quality mode should not stop at the first converged seed"
+        );
+        assert!(
+            result.rho[0] < -1.0,
+            "lower-cost converged Gaussian seed should win"
+        );
+        assert_eq!(result.final_value, 0.0);
     }
 
     #[test]
