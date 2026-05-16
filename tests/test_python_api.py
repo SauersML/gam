@@ -735,9 +735,9 @@ def _geometric_smoke_dataset(seed: int = 0, n: int = 200) -> pd.DataFrame:
     "formula",
     [
         # 1-D periodic (cyclic) P-spline
-        "y ~ s(theta, periodic=true, period=6.283185307)",
+        "y ~ s(theta, periodic=true, period=2*pi)",
         # 2-D tensor with one periodic margin (cylinder topology)
-        "y ~ te(theta, h, periodic=[0], period=[6.283185307, None])",
+        "y ~ te(theta, h, periodic=[0], period=[2*pi, None])",
         # Intrinsic S² via Wahba's reproducing kernel
         "y ~ sphere(lat, lon, radians=true)",
         # Intrinsic S² via spherical harmonics
