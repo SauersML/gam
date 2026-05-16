@@ -832,7 +832,6 @@ pub(crate) fn array1_l2_norm(v: &Array1<f64>) -> f64 {
 pub struct PirlsWorkspace {
     // Common IRLS buffers. Only O(n) state is kept persistently; any
     // design-weighted n x p scratch must be streamed through bounded chunks.
-    pub sqrtw: Array1<f64>,
     pub wz: Array1<f64>,
     pub eta_buf: Array1<f64>,
     // Stage 2/4 assembly (use max needed sizes)
@@ -874,7 +873,6 @@ impl PirlsWorkspace {
         // The active code paths resize-on-demand where needed.
 
         PirlsWorkspace {
-            sqrtw: Array1::zeros(n),
             wz: Array1::zeros(n),
             eta_buf: Array1::zeros(n),
             scaled_matrix: Array2::zeros((0, 0).f()),
@@ -1037,19 +1035,6 @@ impl PirlsWorkspace {
                 );
             }
         }
-    }
-
-    #[inline]
-    fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
-    where
-        S: Data<Elem = f64>,
-    {
-        if self.sqrtw.len() != weights.len() {
-            self.sqrtw = Array1::zeros(weights.len());
-        }
-        Zip::from(&mut self.sqrtw)
-            .and(weights)
-            .par_for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
