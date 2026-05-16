@@ -88,6 +88,31 @@ fn main() {
         eprintln!();
         std::process::exit(1);
     }
+
+    // Ignored-test ban: every `#[ignore]` / `#[ignore = "..."]` attribute is
+    // a test the suite no longer enforces. Stop the build until they are
+    // either deleted or restored to the running suite.
+    let mut ignored: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_ignored_tests(&manifest_dir, &manifest_dir, &mut ignored);
+    if !ignored.is_empty() {
+        eprintln!();
+        eprintln!(
+            "error: {} `#[ignore]` test attribute(s) found.",
+            ignored.len()
+        );
+        eprintln!(
+            "       Ignored tests are silently dead. Either delete the test \
+             or remove the `#[ignore]` attribute so it runs again."
+        );
+        eprintln!();
+        for (rel, line_no, line) in &ignored {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
+        }
+        eprintln!();
+        std::process::exit(1);
+    }
 }
 
 fn scan_for_banned_marker(
@@ -102,6 +127,36 @@ fn scan_for_banned_marker(
         }
         for (idx, line) in content.lines().enumerate() {
             if line.contains(needle) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+fn scan_for_ignored_tests(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        // Skip the build script itself: it names the `#[ignore]` attribute
+        // as part of this scanner's own contract.
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        // Only Rust files carry test attributes.
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("#[ignore") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            // Match `#[ignore]` and `#[ignore = "..."]`. The `#[ignore` prefix
+            // is unique enough that no non-attribute construct collides with it.
+            if trimmed.starts_with("#[ignore]") || trimmed.starts_with("#[ignore =") {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
