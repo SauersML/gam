@@ -384,10 +384,11 @@ pub fn build_smooth_basis(
                     .collect()
             };
             if inferred {
+                let effective_n = tensor_effective_support_count(ds, cols);
                 cap_inferred_tensor_internal_knots(
                     &mut internal_knots_by_dim,
                     degree,
-                    ds.values.nrows(),
+                    effective_n,
                 );
             }
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
@@ -723,7 +724,7 @@ pub fn build_smooth_basis(
             let length_scale = if pure_duchon {
                 None
             } else {
-                Some(option_f64(options, "length_scale").unwrap_or(1.0))
+                option_f64(options, "length_scale")
             };
             // Resolve `(nullspace_order, power)` against the joint constraints
             // (operator collocation + pure-mode CPD). Explicit power keeps the
@@ -785,7 +786,7 @@ pub fn build_smooth_basis(
                         inference_notes.push(format!(
                             "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \
                              at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
-                             Specify length_scale=... or omit pure=true to use hybrid Duchon and bypass this constraint.",
+                             Specify length_scale=... to use hybrid Duchon and bypass this constraint.",
                             resolved.0,
                             cols.len(),
                             requested_nullspace_order,
@@ -971,6 +972,13 @@ fn cap_inferred_tensor_internal_knots(internal_knots: &mut [usize], degree: usiz
         };
         internal_knots[idx] -= 1;
     }
+}
+
+fn tensor_effective_support_count(ds: &Dataset, cols: &[usize]) -> usize {
+    let product = cols.iter().try_fold(1usize, |acc, &col| {
+        acc.checked_mul(unique_count_column(ds.values.column(col)))
+    });
+    product.unwrap_or(usize::MAX).min(ds.values.nrows()).max(1)
 }
 
 fn inferred_tensor_basis_product_cap(n: usize, ndim: usize) -> usize {
