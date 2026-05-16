@@ -1,14 +1,9 @@
-//! cuSOLVER routing for dense linear-algebra factorizations.
+//! cuSOLVER routing for large dense symmetric eigensystems.
 //!
-//! The dispatch surface mirrors faer's local CPU calls used inside PIRLS:
-//!
-//! * `try_potrf_inplace`: in-place Cholesky `A = LLᵀ` of a `p×p` SPD matrix.
-//! * `try_potrs_inplace`: triangular solves against a previously factored `A`.
-//! * `try_syevd_inplace`: symmetric eigendecomposition `A = QΛQᵀ`.
-//!
-//! The size thresholds are conservative — host Cholesky on faer is extremely
-//! fast for `p ≤ 256` and the PCIe round-trip eats the win. Above `p ≈ 1024`
-//! cuSOLVER dominates.
+//! The active production surface is the `FaerEigh` implementation: large
+//! lower-triangle eigendecompositions can run through `cusolverDnDsyevd`
+//! after automatic CUDA detection. Smaller matrices stay on faer's CPU path
+//! because the host/device round trip dominates there.
 
 use libloading::Library;
 use ndarray::{Array1, Array2};
@@ -16,31 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 use super::runtime::GpuRuntime;
 
-/// In-place dense Cholesky `A = LLᵀ` (lower triangular factor stored in `A`).
-/// Returns `Some(())` when the device path produced the factorization,
-/// `None` to fall back to faer.
-#[inline]
-pub fn try_potrf_inplace(a: &mut Array2<f64>) -> Option<()> {
-    let p = a.nrows();
-    if p != a.ncols() || !route_potrf(p) {
-        return None;
-    }
-    with_runtime(|rt| rt.potrf_inplace(a))
-}
-
-/// Solve `A X = B` in place on `B`, reusing a previously computed `A = LLᵀ`
-/// in `factor`. Returns `Some(())` on device success.
-#[inline]
-pub fn try_potrs_inplace(factor: &Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
-    let p = factor.nrows();
-    if p != factor.ncols() || rhs.nrows() != p || !route_potrf(p) {
-        return None;
-    }
-    with_runtime(|rt| rt.potrs_inplace(factor, rhs))
-}
-
 /// In-place symmetric eigendecomposition: returns eigenvalues, `a` becomes
-/// the orthonormal eigenvector matrix. `None` falls back to faer.
+/// the orthonormal eigenvector matrix. `None` keeps execution on faer.
 #[inline]
 pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
     let p = a.nrows();
@@ -48,13 +20,6 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
         return None;
     }
     with_runtime(|rt| rt.syevd_inplace(a))
-}
-
-#[inline]
-fn route_potrf(p: usize) -> bool {
-    // Calibrated against PCIe Gen4 host↔device transfer of a p×p double-precision
-    // matrix plus cuSOLVER context setup; below 512 the host BLAS path wins.
-    p >= 512
 }
 
 #[inline]
@@ -117,124 +82,6 @@ impl CusolverRuntime {
                 handle,
             })
         }
-    }
-
-    fn potrf_inplace(&mut self, a: &mut Array2<f64>) -> Option<()> {
-        let p = a.nrows();
-        let mut a_col = to_col_major(a);
-        let bytes_a = bytes_len::<f64>(a_col.len())?;
-        let bytes_info = bytes_len::<i32>(1)?;
-
-        unsafe {
-            self.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_col, bytes_a)?;
-            let info_dev = DeviceAllocation::new(&self.driver, bytes_info)?;
-            let mut work_size: i32 = 0;
-            if (self.solver.dpotrf_buffersize)(
-                self.handle,
-                CUBLAS_FILL_LOWER,
-                p as i32,
-                a_dev.ptr,
-                p as i32,
-                &mut work_size,
-            ) != CUSOLVER_STATUS_SUCCESS
-            {
-                return None;
-            }
-            let scratch = if work_size > 0 {
-                Some(DeviceAllocation::new(
-                    &self.driver,
-                    (work_size as usize) * std::mem::size_of::<f64>(),
-                )?)
-            } else {
-                None
-            };
-            let scratch_ptr = scratch.as_ref().map(|s| s.ptr).unwrap_or(0);
-            let status = (self.solver.dpotrf)(
-                self.handle,
-                CUBLAS_FILL_LOWER,
-                p as i32,
-                a_dev.ptr,
-                p as i32,
-                scratch_ptr,
-                work_size,
-                info_dev.ptr,
-            );
-            if status != CUSOLVER_STATUS_SUCCESS {
-                return None;
-            }
-            let mut info: i32 = 0;
-            check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
-                    (&mut info) as *mut i32 as *mut std::ffi::c_void,
-                    info_dev.ptr,
-                    bytes_info,
-                ),
-                "cuMemcpyDtoH info",
-            )
-            .ok()?;
-            if info != 0 {
-                return None;
-            }
-            check_cuda(
-                (self.driver.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
-                "cuMemcpyDtoH A",
-            )
-            .ok()?;
-        }
-        from_col_major_inplace(&a_col, a);
-        Some(())
-    }
-
-    fn potrs_inplace(&mut self, factor: &Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
-        let p = factor.nrows();
-        let nrhs = rhs.ncols();
-        let factor_col = to_col_major(factor);
-        let mut rhs_col = to_col_major(rhs);
-        let bytes_factor = bytes_len::<f64>(factor_col.len())?;
-        let bytes_rhs = bytes_len::<f64>(rhs_col.len())?;
-        let bytes_info = bytes_len::<i32>(1)?;
-
-        unsafe {
-            self.set_current().ok()?;
-            let factor_dev = self.alloc_copy(&factor_col, bytes_factor)?;
-            let rhs_dev = self.alloc_copy(&rhs_col, bytes_rhs)?;
-            let info_dev = DeviceAllocation::new(&self.driver, bytes_info)?;
-            let status = (self.solver.dpotrs)(
-                self.handle,
-                CUBLAS_FILL_LOWER,
-                p as i32,
-                nrhs as i32,
-                factor_dev.ptr,
-                p as i32,
-                rhs_dev.ptr,
-                p as i32,
-                info_dev.ptr,
-            );
-            if status != CUSOLVER_STATUS_SUCCESS {
-                return None;
-            }
-            let mut info: i32 = 0;
-            check_cuda(
-                (self.driver.cu_memcpy_dtoh)(
-                    (&mut info) as *mut i32 as *mut std::ffi::c_void,
-                    info_dev.ptr,
-                    bytes_info,
-                ),
-                "cuMemcpyDtoH info",
-            )
-            .ok()?;
-            if info != 0 {
-                return None;
-            }
-            check_cuda(
-                (self.driver.cu_memcpy_dtoh)(rhs_col.as_mut_ptr().cast(), rhs_dev.ptr, bytes_rhs),
-                "cuMemcpyDtoH rhs",
-            )
-            .ok()?;
-        }
-        from_col_major_inplace(&rhs_col, rhs);
-        Some(())
     }
 
     fn syevd_inplace(&mut self, a: &mut Array2<f64>) -> Option<Array1<f64>> {
@@ -427,35 +274,6 @@ impl DriverApi {
 type CusolverStatus = i32;
 type CusolverCreate = unsafe extern "C" fn(*mut usize) -> CusolverStatus;
 type CusolverDestroy = unsafe extern "C" fn(usize) -> CusolverStatus;
-type CusolverDpotrfBufferSize = unsafe extern "C" fn(
-    usize, // handle
-    i32,   // uplo
-    i32,   // n
-    u64,   // A
-    i32,   // lda
-    *mut i32,
-) -> CusolverStatus;
-type CusolverDpotrf = unsafe extern "C" fn(
-    usize, // handle
-    i32,   // uplo
-    i32,   // n
-    u64,   // A
-    i32,   // lda
-    u64,   // workspace
-    i32,   // lwork
-    u64,   // devInfo
-) -> CusolverStatus;
-type CusolverDpotrs = unsafe extern "C" fn(
-    usize, // handle
-    i32,   // uplo
-    i32,   // n
-    i32,   // nrhs
-    u64,   // A
-    i32,   // lda
-    u64,   // B
-    i32,   // ldb
-    u64,   // devInfo
-) -> CusolverStatus;
 type CusolverDsyevdBufferSize = unsafe extern "C" fn(
     usize,    // handle
     i32,      // jobz
@@ -482,9 +300,6 @@ type CusolverDsyevd = unsafe extern "C" fn(
 struct CusolverApi {
     create: CusolverCreate,
     destroy: CusolverDestroy,
-    dpotrf_buffersize: CusolverDpotrfBufferSize,
-    dpotrf: CusolverDpotrf,
-    dpotrs: CusolverDpotrs,
     dsyevd_buffersize: CusolverDsyevdBufferSize,
     dsyevd: CusolverDsyevd,
 }
@@ -499,15 +314,6 @@ impl CusolverApi {
                 destroy: *library
                     .get(b"cusolverDnDestroy\0")
                     .map_err(|e| e.to_string())?,
-                dpotrf_buffersize: *library
-                    .get(b"cusolverDnDpotrf_bufferSize\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrf: *library
-                    .get(b"cusolverDnDpotrf\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrs: *library
-                    .get(b"cusolverDnDpotrs\0")
-                    .map_err(|e| e.to_string())?,
                 dsyevd_buffersize: *library
                     .get(b"cusolverDnDsyevd_bufferSize\0")
                     .map_err(|e| e.to_string())?,
@@ -520,7 +326,7 @@ impl CusolverApi {
 }
 
 const CUSOLVER_STATUS_SUCCESS: CusolverStatus = 0;
-const CUBLAS_FILL_LOWER: i32 = 1;
+const CUBLAS_FILL_LOWER: i32 = 0;
 const CUSOLVER_EIG_MODE_VECTORS: i32 = 1;
 
 fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
@@ -592,11 +398,7 @@ mod tests {
     #[test]
     fn small_matrices_do_not_route_to_gpu() {
         let mut a = array![[1.0_f64, 0.0], [0.0, 1.0]];
-        assert!(try_potrf_inplace(&mut a).is_none());
         assert!(try_syevd_inplace(&mut a).is_none());
-        let factor = array![[1.0_f64, 0.0], [0.0, 1.0]];
-        let mut rhs = array![[1.0_f64], [1.0]];
-        assert!(try_potrs_inplace(&factor, &mut rhs).is_none());
     }
 
     #[test]

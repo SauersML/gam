@@ -1375,6 +1375,15 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
         if owned.iter().any(|value| !value.is_finite()) {
             return Err(FaerLinalgError::SelfAdjointEigenNonFiniteInput);
         }
+        if matches!(side, Side::Lower) {
+            let mut gpu_owned = owned.clone();
+            if let Some(evals) = crate::gpu::try_syevd_inplace(&mut gpu_owned)
+                && evals.iter().all(|value| value.is_finite())
+                && gpu_owned.iter().all(|value| value.is_finite())
+            {
+                return Ok((evals, gpu_owned));
+            }
+        }
         if let Ok((evals, evecs)) = try_eigh(&owned, side)
             && evals.iter().all(|value| value.is_finite())
             && evecs.iter().all(|value| value.is_finite())
