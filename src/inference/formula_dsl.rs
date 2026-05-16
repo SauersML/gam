@@ -268,6 +268,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_cyclic_formula_aliases() {
+        let parsed = parse_formula("y ~ cyclic(theta, period_start=0, period_end=6.283)")
+            .expect("parse cyclic formula");
+        match &parsed.terms[0] {
+            super::ParsedTerm::Smooth { vars, options, .. } => {
+                assert_eq!(vars, &vec!["theta".to_string()]);
+                assert_eq!(options.get("type").map(String::as_str), Some("cyclic"));
+                assert_eq!(options.get("period_start").map(String::as_str), Some("0"));
+            }
+            other => panic!("expected cyclic smooth term, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_function_callwithnamed_and_positional_args() {
         let call = parse_function_call("s(log(x + 1), type=\"duchon\", centers=12)").expect("call");
         assert_eq!(call.name, "s");
@@ -1217,11 +1231,14 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" => {
+            "smooth" | "s" | "cyclic" | "cc" | "cp" => {
                 if vars.is_empty() {
                     return Err(format!(
                         "smooth()/s() requires at least one variable: {raw}"
                     ));
+                }
+                if matches!(name.as_str(), "cyclic" | "cc" | "cp") {
+                    options.insert("type".to_string(), "cyclic".to_string());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
@@ -1245,6 +1262,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             "duchon" => {
                 if vars.is_empty() {
                     return Err(format!("duchon() requires at least one variable: {raw}"));
+                }
+                if option_bool(&options, "cyclic").unwrap_or(false)
+                    || option_bool(&options, "periodic").unwrap_or(false)
+                {
+                    options.insert("cyclic".to_string(), "true".to_string());
                 }
                 options.insert("type".to_string(), "duchon".to_string());
                 return Ok(ParsedTerm::Smooth {
@@ -1301,7 +1323,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), cyclic()/cc()/cp(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
