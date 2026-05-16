@@ -59,7 +59,10 @@ fn cylinder_fit_n_10k_stages() {
     match res {
         FitResult::Standard(fit) => {
             eprintln!("[info] p (ncols)={}", fit.fit.beta.len());
-            eprintln!("[info] coef[0..5]={:?}", &fit.fit.beta.as_slice().unwrap()[..5.min(fit.fit.beta.len())]);
+            eprintln!(
+                "[info] coef[0..5]={:?}",
+                &fit.fit.beta.as_slice().unwrap()[..5.min(fit.fit.beta.len())]
+            );
         }
         _ => panic!("expected standard fit"),
     }
@@ -79,10 +82,13 @@ fn cylinder_fit_scaling_curve() {
         let t = Instant::now();
         let res = fit_from_formula(formula, &data, &cfg);
         let ms = t.elapsed().as_secs_f64() * 1e3;
-        let p = res.ok().map(|r| match r {
-            FitResult::Standard(f) => f.fit.beta.len(),
-            _ => 0,
-        }).unwrap_or(0);
+        let p = res
+            .ok()
+            .map(|r| match r {
+                FitResult::Standard(f) => f.fit.beta.len(),
+                _ => 0,
+            })
+            .unwrap_or(0);
         eprintln!("[scale] cylinder te N={n} p={p}: {ms:.3} ms");
     }
 }
