@@ -140,6 +140,36 @@ gamfit.fit(df, "y ~ sphere(lat, lon, method=harmonic, max_degree=8, radians=true
 gamfit.fit(df, "y ~ s(lat, lon, bs=sos)")
 ```
 
+## Manifold-valued response (simplex / sphere)
+
+```python
+# Simplex response (e.g. soil composition) — predictions are guaranteed
+# to be strictly positive and sum to 1 row-wise.
+model = gamfit.fit(
+    train,
+    "composition ~ s(x)",          # LHS is just a label; RHS is reused for every coord
+    response_geometry="simplex",   # or "alr"
+    response_columns=["sand", "silt", "clay"],
+)
+pred = model.predict(test)         # columns: sand, silt, clay
+```
+
+```python
+# Spherical response (e.g. surface normals, direction-of-travel) —
+# predictions are guaranteed to be unit-norm.
+model = gamfit.fit(
+    train,
+    "direction ~ s(x)",
+    response_geometry="spherical",
+    response_columns=["nx", "ny", "nz"],
+)
+pred = model.predict(test)         # columns: nx, ny, nz; per row ||(nx,ny,nz)|| == 1
+```
+
+See [docs/response-geometry.md](response-geometry.md) for the full
+discussion (Aitchison Fréchet mean, Karcher iteration on S², ALR vs
+CLR coordinates, choice of base point).
+
 ## Boundary-conditioned 1-D smooth (clamped endpoint slopes)
 
 ```python
