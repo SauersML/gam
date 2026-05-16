@@ -31,6 +31,7 @@ Pick one via `survival_likelihood=` on `fit()`:
 | `"location-scale"` | Joint location-scale; combine with the `noise_formula` config key. |
 | `"marginal-slope"` | Separates baseline risk from a calibrated score's effect. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Latent-frailty model with parametric baseline. |
+| `"latent-binary"` | Binary-outcome variant of `"latent"`: same latent-frailty framework, Bernoulli response instead of survival times. Incompatible with `--predict-noise`. |
 
 ```python
 gamfit.fit(df,
