@@ -5,8 +5,8 @@
 //! peers) can implement without changing solver call sites:
 //!
 //! * [`runtime`] — one-shot, env-free autodetect of an installed CUDA driver
-//!   via dynamic loading (`libloading`). Builds without a driver fall back to
-//!   CPU silently.
+//!   via dynamic loading (`libloading`). Builds without a driver continue on
+//!   the CPU path silently.
 //! * [`device`] — host-visible description of the selected GPU.
 //! * [`policy`] — workload-size thresholds derived from device capability.
 //! * [`memory`] — host-shadow device buffer / matrix / sparse matrix types
@@ -19,7 +19,7 @@
 //!   numerical contracts a device backend must reproduce.
 //!
 //! The public crate API has no GPU configuration: detection is automatic, the
-//! CPU path is the unconditional fallback, and the user-visible behavior is
+//! CPU execution is unconditional on hosts without CUDA, and the user-visible behavior is
 //! unchanged on hosts without a usable NVIDIA driver.
 
 mod blas;
