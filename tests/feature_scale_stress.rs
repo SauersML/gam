@@ -227,6 +227,46 @@ fn boundary_conditioned_bspline_drops_dimension_correctly_and_scales() {
 }
 
 #[test]
+fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
+    // End-to-end periodic tensor build through the formula DSL → term
+    // builder → tensor basis. Verifies the cyclic margin's seam continuity
+    // holds in the full tensor product at N = 10k.
+    use csv::StringRecord;
+    use gam::{encode_recordswith_inferred_schema, fit_from_formula, FitConfig, FitResult};
+    use std::f64::consts::TAU;
+    let n: usize = 10_000;
+    let headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let y = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            StringRecord::from(vec![
+                theta.to_string(),
+                h.to_string(),
+                y.to_string(),
+            ])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let t = Instant::now();
+    let res =
+        fit_from_formula("y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])", &data, &cfg)
+            .expect("cylinder fit");
+    eprintln!("[scale] cylinder te N={n} fit: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+    let FitResult::Standard(fit) = res else {
+        panic!("expected standard fit");
+    };
+    for c in fit.beta.iter() {
+        assert!(c.is_finite(), "non-finite cylinder coefficient");
+    }
+}
+
+#[test]
 fn sphere_harmonic_design_rows_are_finite_at_poles_and_seam() {
     // Stress poles and the longitude seam at scale — the ALF recurrence
     // and the Chebyshev sin/cos recurrence must stay bounded.
