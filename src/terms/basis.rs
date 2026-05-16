@@ -13579,10 +13579,7 @@ fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
 /// scalar path is exercised by `tests/wahba_simd_correctness.rs` — max
 /// abs/rel diff stays below 1e-12 across the full domain.
 #[inline]
-fn wahba_sphere_kernel_from_cos_simd(
-    cos_gamma: wide::f64x4,
-    penalty_order: usize,
-) -> wide::f64x4 {
+fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
     use wide::f64x4;
     let one = f64x4::ONE;
     let neg_one = f64x4::from(-1.0);
@@ -13602,8 +13599,7 @@ fn wahba_sphere_kernel_from_cos_simd(
         }
         2 => {
             let w2 = w * w;
-            let q2 = a * (f64x4::from(6.0) * w2 - f64x4::from(2.0) * w)
-                - f64x4::from(3.0) * c * w
+            let q2 = a * (f64x4::from(6.0) * w2 - f64x4::from(2.0) * w) - f64x4::from(3.0) * c * w
                 + f64x4::from(3.0) * w
                 + f64x4::from(0.5);
             (q2 / f64x4::from(2.0) - f64x4::from(1.0 / 6.0)) / two_pi
@@ -13623,8 +13619,7 @@ fn wahba_sphere_kernel_from_cos_simd(
             let w2 = w * w;
             let w3 = w2 * w;
             let w4 = w3 * w;
-            let q4 = a
-                * (f64x4::from(70.0) * w4 - f64x4::from(60.0) * w3 + f64x4::from(6.0) * w2)
+            let q4 = a * (f64x4::from(70.0) * w4 - f64x4::from(60.0) * w3 + f64x4::from(6.0) * w2)
                 + f64x4::from(35.0) * w3 * (one - c)
                 + c * f64x4::from(55.0) * w2 / f64x4::from(3.0)
                 - f64x4::from(12.5) * w2
