@@ -5,16 +5,16 @@
 //! * [`runtime`] — one-shot, env-free autodetect of an installed CUDA driver
 //!   via dynamic loading (`libloading`). Builds without a driver continue on
 //!   the CPU path silently.
-//! * [`device`] — host-visible description of the selected GPU.
-//! * [`policy`] — workload-size thresholds derived from device capability.
-//! * [`dispatch`] — public hooks used by CPU linalg call sites.
-//! * [`solver`] — cuSOLVER routing for large dense symmetric eigensystems.
-//! * [`kernels`] — bit-checkable host reference implementations of the
-//!   numerical contracts a device backend must reproduce.
+//! * [`device`] — host-visible description of the selected GPU, including
+//!   measured SM count and FP64 throughput.
+//! * [`policy`] — workload-size thresholds derived from that throughput plus
+//!   the PCIe transfer cost.
+//! * [`dispatch`] — public `try_fast_*` entry points used by CPU linalg
+//!   call sites; route to `blas` / `solver` / `sparse` when the policy
+//!   approves and fall through to CPU otherwise.
 //!
-//! The public crate API has no GPU configuration: detection is automatic, the
-//! CPU execution is unconditional on hosts without CUDA, and the user-visible behavior is
-//! unchanged on hosts without a usable NVIDIA driver.
+//! The public crate API has no GPU configuration: detection is automatic
+//! and behavior on hosts without a usable NVIDIA driver is unchanged.
 
 mod blas;
 pub mod device;
