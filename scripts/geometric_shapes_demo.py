@@ -522,7 +522,7 @@ def update_depth_scalars(panels, azim_deg):
 # ---------------------------------------------------------------------------
 # Fit quality (RMSE / R² against the noise-free analytic truth)
 # ---------------------------------------------------------------------------
-def quality_report(shapes):
+def quality_report():
     """Print per-shape RMSE / R² between predicted (x, y, z) and the
     noise-free analytic truth, evaluated on the dense prediction grid.
 
@@ -769,7 +769,7 @@ def main():
             print("[3/3] all predictions cached")
 
     shapes = build_shapes()
-    quality_report(shapes)
+    quality_report()
     base = SCRIPT.parent / "geometric_shapes_demo"
     if args.still:
         print("[render] still PNG (4000×3000)")
