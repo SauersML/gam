@@ -4003,6 +4003,7 @@ where
     F: FnMut(&WorkingModelIterationInfo),
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
+    const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
 
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
@@ -4070,6 +4071,9 @@ where
     // — virtually free when the optimizer has truly settled, and a
     // principled defence against false positives otherwise.
     let mut plateau_streak = 0usize;
+    let mut constrained_objective_plateau_streak = 0usize;
+    let has_explicit_constraints =
+        options.coefficient_lower_bounds.is_some() || options.linear_constraints.is_some();
     let mut min_penalized_deviance = f64::INFINITY;
     let mut final_state: Option<WorkingState> = None;
     // Initial gradient norm captured at iter 1 so the post-loop
@@ -4766,6 +4770,47 @@ where
                             None => {
                                 plateau_streak = 0;
                             }
+                        }
+
+                        // Explicitly constrained fits can reach a valid
+                        // bounded optimum with a flat objective trace while
+                        // the raw projected-gradient certificate remains
+                        // noisy, especially when small monotone I-spline
+                        // bases are underdetermined. Accept only a long
+                        // streak of finite, monotone, sub-tolerance
+                        // objective movement with eta safely away from the
+                        // clipping boundary. This is deliberately separate
+                        // from the two-iteration soft-acceptance gate above:
+                        // unconstrained one-off plateaus must still run out
+                        // as MaxIterationsReached.
+                        let objective_scale = final_state_ref
+                            .deviance
+                            .abs()
+                            .max(final_state_ref.penalty_term.abs())
+                            .max(1.0);
+                        let strict_objective_plateau = has_explicit_constraints
+                            && deviance_change.is_finite()
+                            && deviance_change >= 0.0
+                            && deviance_change.abs()
+                                <= options.convergence_tolerance * objective_scale * 0.1
+                            && max_abs_eta.is_finite()
+                            && max_abs_eta < PIRLS_ETA_ABS_CAP * 0.5;
+                        if strict_objective_plateau {
+                            constrained_objective_plateau_streak += 1;
+                            if constrained_objective_plateau_streak
+                                >= CONSTRAINED_OBJECTIVE_PLATEAU_STREAK
+                            {
+                                log::debug!(
+                                    "[PIRLS] iter {iter} early-exit on constrained objective \
+                                     plateau (streak={}, ‖g‖={convergence_grad_norm:.3e}, \
+                                     Δdev={deviance_change:.3e})",
+                                    constrained_objective_plateau_streak,
+                                );
+                                status = PirlsStatus::StalledAtValidMinimum;
+                                break 'pirls_loop;
+                            }
+                        } else {
+                            constrained_objective_plateau_streak = 0;
                         }
 
                         break; // Break inner lambda loop, continue outer pirls loop
@@ -11200,6 +11245,39 @@ mod root_cause_tests {
             result.status,
             PirlsStatus::MaxIterationsReached,
             "projected gradient 5e-5 is well above the near-stationary band and must not be promoted to Converged/Stalled — the candidate step is accepted but the outer iteration counter must run out as MaxIterationsReached, not be silently re-classified"
+        );
+    }
+
+    #[test]
+    fn long_constrained_objective_plateau_reports_valid_stall() {
+        let mut model = PlateauStatusModel {
+            gradient: -5e-5,
+            current_deviance: 1.0,
+            candidate_deviance: 1.0 - 1.25e-9,
+        };
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 25,
+            convergence_tolerance: 1e-6,
+            max_step_halving: 4,
+            min_step_size: 0.0,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: Some(array![-1.0]),
+            linear_constraints: None,
+            initial_lm_lambda: None,
+        };
+
+        let result =
+            runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
+                .expect("long constrained objective plateau should preserve the final state");
+
+        assert_eq!(
+            result.status,
+            PirlsStatus::StalledAtValidMinimum,
+            "a long monotone objective plateau under explicit constraints is a valid bounded stall, unlike the unconstrained one-step plateau guard above"
+        );
+        assert!(
+            result.iterations < options.max_iterations,
+            "the long-plateau certificate should exit before exhausting the whole iteration budget"
         );
     }
 
