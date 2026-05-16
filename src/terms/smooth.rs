@@ -474,10 +474,10 @@ impl TermCollectionSpec {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
                         if !matches!(
                             marginal.knotspec,
-                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::CyclicProvided(_)
+                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
                         ) {
                             return Err(format!(
-                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
+                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided or PeriodicUniform",
                                 st.name, dim
                             ));
                         }

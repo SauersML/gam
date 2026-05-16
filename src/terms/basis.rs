@@ -5801,169 +5801,8 @@ pub fn select_centers_by_strategy(
 }
 
 #[inline]
-fn cyclic_cardinal_cubic(t: f64) -> f64 {
-    let u = t.abs();
-    if u < 1.0 {
-        (2.0 / 3.0) - u * u + 0.5 * u * u * u
-    } else if u < 2.0 {
-        let v = 2.0 - u;
-        v * v * v / 6.0
-    } else {
-        0.0
-    }
-}
-
-#[inline]
 fn wrap_to_period(x: f64, left: f64, period: f64) -> f64 {
     left + (x - left).rem_euclid(period)
-}
-
-#[inline]
-fn cyclic_grid_delta_units(x: f64, center: f64, h: f64, p: usize) -> f64 {
-    let raw = (x - center) / h;
-    let p_f = p as f64;
-    raw - (raw / p_f).round() * p_f
-}
-
-/// Build a periodic cubic cardinal/Reinsch basis on a uniform circle.
-/// Rows are periodic in value and first/second derivatives at the endpoints,
-/// and each row partitions unity for p >= 4.
-pub fn create_cyclic_cubic_pspline_basis(
-    data: ArrayView1<'_, f64>,
-    data_range: (f64, f64),
-    num_basis_functions: usize,
-) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
-    if num_basis_functions < 4 {
-        return Err(BasisError::InvalidInput(format!(
-            "cyclic cubic P-splines require at least 4 basis functions, got {num_basis_functions}"
-        )));
-    }
-    let (left, right) = data_range;
-    if !left.is_finite() || !right.is_finite() || left >= right {
-        return Err(BasisError::InvalidRange(left, right));
-    }
-    if data.iter().any(|v| !v.is_finite()) {
-        return Err(BasisError::InvalidInput(
-            "cyclic cubic P-spline data must be finite".to_string(),
-        ));
-    }
-    let p = num_basis_functions;
-    let period = right - left;
-    let h = period / p as f64;
-    let mut basis = Array2::<f64>::zeros((data.len(), p));
-    for (i, &x_raw) in data.iter().enumerate() {
-        let x = wrap_to_period(x_raw, left, period);
-        for j in 0..p {
-            let center = left + j as f64 * h;
-            let t = cyclic_grid_delta_units(x, center, h, p);
-            basis[[i, j]] = cyclic_cardinal_cubic(t);
-        }
-    }
-    let knots = Array1::from_iter((0..=p).map(|j| left + j as f64 * h));
-    Ok((basis, knots))
-}
-
-/// Circular finite-difference penalty `D_c' D_c` used by cyclic Reinsch
-/// P-splines. Each row of `D_c` is the requested forward difference with
-/// coefficient indices taken modulo p.
-pub fn create_cyclic_difference_penalty_matrix(
-    num_basis_functions: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_basis_functions {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order,
-            num_basis: num_basis_functions,
-        });
-    }
-    let p = num_basis_functions;
-    let mut coeffs = Vec::with_capacity(order + 1);
-    for r in 0..=order {
-        let sign = if (order - r) % 2 == 0 { 1.0 } else { -1.0 };
-        coeffs.push(sign * binomial_f64(order, r));
-    }
-    let mut d = Array2::<f64>::zeros((p, p));
-    for i in 0..p {
-        for (r, &c) in coeffs.iter().enumerate() {
-            d[[i, (i + r) % p]] += c;
-        }
-    }
-    Ok(fast_ata(&d))
-}
-
-fn build_cyclic_bspline_basis_1d(
-    data: ArrayView1<'_, f64>,
-    spec: &BSplineBasisSpec,
-    data_range: (f64, f64),
-    num_basis_functions: usize,
-) -> Result<BasisBuildResult, BasisError> {
-    if spec.degree != 3 {
-        return Err(BasisError::InvalidInput(format!(
-            "cyclic P-splines currently require cubic degree=3, got degree={}",
-            spec.degree
-        )));
-    }
-    let (basis_raw, knots) =
-        create_cyclic_cubic_pspline_basis(data, data_range, num_basis_functions)?;
-    let s_bend_raw =
-        create_cyclic_difference_penalty_matrix(num_basis_functions, spec.penalty_order)?;
-    let mut penalties_raw = vec![PenaltyCandidate {
-        matrix: s_bend_raw.clone(),
-        nullspace_dim_hint: 1,
-        source: PenaltySource::Primary,
-        normalization_scale: 1.0,
-        kronecker_factors: None,
-        op: None,
-    }];
-    if spec.double_penalty {
-        penalties_raw.push(PenaltyCandidate {
-            matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
-                .map(|shrink| shrink.sym_penalty)
-                .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
-            nullspace_dim_hint: 0,
-            source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        });
-    }
-    let raw_mats = penalties_raw
-        .iter()
-        .map(|candidate| candidate.matrix.clone())
-        .collect::<Vec<_>>();
-    let (design_c, penalty_mats, identifiability_transform) = apply_bspline_identifiability_policy(
-        basis_raw,
-        raw_mats,
-        &knots,
-        spec.degree,
-        &spec.identifiability,
-    )?;
-    let transformed_candidates = penalty_mats
-        .into_iter()
-        .zip(penalties_raw.into_iter())
-        .map(|(matrix, candidate)| PenaltyCandidate {
-            nullspace_dim_hint: candidate.nullspace_dim_hint,
-            matrix,
-            source: candidate.source,
-            normalization_scale: candidate.normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        })
-        .collect::<Vec<_>>();
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
-        filter_active_penalty_candidates_with_ops(transformed_candidates)?;
-    Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_c)),
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        metadata: BasisMetadata::BSpline1D {
-            knots,
-            identifiability_transform,
-        },
-        kronecker_factored: None,
-        ops,
-    })
 }
 
 /// Generic 1D B-spline builder returning design + penalty list.
@@ -6030,9 +5869,6 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (Some(basis), None, knots)
             }
-            BSplineKnotSpec::CyclicGenerate { .. } | BSplineKnotSpec::CyclicProvided(_) => {
-                unreachable!("cyclic B-spline specs return before sparse/dense branch")
-            }
         }
     } else {
         match &spec.knotspec {
@@ -6095,9 +5931,6 @@ pub fn build_bspline_basis_1d(
                     BasisOptions::value(),
                 )?;
                 (None, Some((*basis).clone()), knots)
-            }
-            BSplineKnotSpec::CyclicGenerate { .. } | BSplineKnotSpec::CyclicProvided(_) => {
-                unreachable!("cyclic B-spline specs return before sparse/dense branch")
             }
         }
     };
@@ -22732,12 +22565,13 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::CyclicGenerate {
+            knotspec: BSplineKnotSpec::PeriodicUniform {
                 data_range: (0.0, 1.0),
-                num_basis_functions: 8,
+                num_basis: 8,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let dense = built.design.to_dense();
