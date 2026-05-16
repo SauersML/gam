@@ -78,12 +78,6 @@ fn build_dataset(theta: &[f64], y_col: &[f64]) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }
 
-/// Fit `y ~ <formula_body>` and return the absolute residual on the *training*
-/// fitted values vs the clean ground truth for a single coordinate. We use the
-/// training-time fitted values (X · β) rather than rebuilding a prediction
-/// design at new points, because the bug we're catching shows up identically
-/// at the training points: the LAML optimizer parks at a bad ρ and the
-/// resulting β over- or under-fits visibly even at the training thetas.
 /// Build a (n, 3) data array with columns [ct, st, y_placeholder] matching the
 /// training layout so the frozen `resolvedspec` indexes into the right columns.
 fn predict_data_matrix(theta_grid: &[f64]) -> Array2<f64> {
