@@ -38,8 +38,8 @@ use crate::families::transformation_normal::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    SmoothBasisSpec, TermCollectionSpec, build_term_collection_design,
+    AdaptiveRegularizationDiagnostics, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
@@ -1568,12 +1568,10 @@ fn standard_adaptive_regularization_options(
     config: &FitConfig,
     spec: &TermCollectionSpec,
 ) -> Option<AdaptiveRegularizationOptions> {
-    let auto_enable = spec.smooth_terms.iter().any(|term| {
-        matches!(
-            &term.basis,
-            SmoothBasisSpec::Duchon { .. }
-        )
-    });
+    let auto_enable = spec
+        .smooth_terms
+        .iter()
+        .any(|term| matches!(&term.basis, SmoothBasisSpec::Duchon { .. }));
     let enabled = config.adaptive_regularization.unwrap_or(auto_enable);
     enabled.then(|| AdaptiveRegularizationOptions {
         enabled: true,
