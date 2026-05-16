@@ -765,7 +765,9 @@ pub fn parse_survival_time_basis_config(
             require_structural_survival_time_basis(time_basis, "survival model configuration")?;
             unreachable!("non-structural survival basis unexpectedly validated");
         }
-        other => Err(format!("unsupported --time-basis '{other}'; use ispline")),
+        other => Err(format!(
+            "unsupported --time-basis '{other}'; accepted values: ispline, none"
+        )),
     }
 }
 
