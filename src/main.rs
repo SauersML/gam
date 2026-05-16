@@ -461,7 +461,11 @@ struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     data: PathBuf,
-    #[arg(long = "alo", default_value_t = false, help = "Also compute approximate-leave-one-out (ALO) statistics")]
+    #[arg(
+        long = "alo",
+        default_value_t = false,
+        help = "Also compute approximate-leave-one-out (ALO) statistics"
+    )]
     alo: bool,
 }
 
@@ -474,13 +478,25 @@ struct SampleArgs {
         help = "Training dataset (CSV or parquet) used to anchor the posterior"
     )]
     data: PathBuf,
-    #[arg(long = "chains", help = "Number of NUTS chains to run (default: family-dependent)")]
+    #[arg(
+        long = "chains",
+        help = "Number of NUTS chains to run (default: family-dependent)"
+    )]
     chains: Option<usize>,
-    #[arg(long = "samples", help = "Post-warmup draws per chain (default: family-dependent)")]
+    #[arg(
+        long = "samples",
+        help = "Post-warmup draws per chain (default: family-dependent)"
+    )]
     samples: Option<usize>,
-    #[arg(long = "warmup", help = "Warmup iterations per chain (default: family-dependent)")]
+    #[arg(
+        long = "warmup",
+        help = "Warmup iterations per chain (default: family-dependent)"
+    )]
     warmup: Option<usize>,
-    #[arg(long = "out", help = "Output path for the posterior draws (parquet); default: <model_stem>.posterior.parquet")]
+    #[arg(
+        long = "out",
+        help = "Output path for the posterior draws (parquet); default: <model_stem>.posterior.parquet"
+    )]
     out: Option<PathBuf>,
 }
 
@@ -493,9 +509,16 @@ struct GenerateArgs {
         help = "Covariate dataset (CSV or parquet) — one set of generated responses per draw, per row"
     )]
     data: PathBuf,
-    #[arg(long = "n-draws", default_value_t = 5, help = "Number of response draws per input row")]
+    #[arg(
+        long = "n-draws",
+        default_value_t = 5,
+        help = "Number of response draws per input row"
+    )]
     n_draws: usize,
-    #[arg(long = "out", help = "Output CSV path; default: <model_stem>.generated.csv")]
+    #[arg(
+        long = "out",
+        help = "Output CSV path; default: <model_stem>.generated.csv"
+    )]
     out: Option<PathBuf>,
 }
 
@@ -508,7 +531,10 @@ struct ReportArgs {
         help = "Optional dataset for diagnostics (CSV or parquet); coefficient + smoothing-parameter summaries don't need it"
     )]
     data: Option<PathBuf>,
-    #[arg(value_name = "OUT", help = "Output HTML path; default: <model_stem>.report.html")]
+    #[arg(
+        value_name = "OUT",
+        help = "Output HTML path; default: <model_stem>.report.html"
+    )]
     out: Option<PathBuf>,
 }
 

@@ -33619,9 +33619,22 @@ mod tests {
         // order. Use a slightly looser 1e-11 assertion so genuine
         // regressions trip while floating-point ULP wiggle doesn't.
         let xs: [f64; 16] = [
-            -1.0, -0.999_999_999, -0.9, -0.5, -0.123_456, -1.0e-6,
-            0.0, 1.0e-6, 0.123_456, 0.5, 0.7, 0.9,
-            0.999_9, 0.999_999_9, 1.0 - 1.0e-12, 1.0,
+            -1.0,
+            -0.999_999_999,
+            -0.9,
+            -0.5,
+            -0.123_456,
+            -1.0e-6,
+            0.0,
+            1.0e-6,
+            0.123_456,
+            0.5,
+            0.7,
+            0.9,
+            0.999_9,
+            0.999_999_9,
+            1.0 - 1.0e-12,
+            1.0,
         ];
         let mut max_abs = 0.0f64;
         let mut max_rel = 0.0f64;
