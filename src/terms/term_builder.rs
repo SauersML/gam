@@ -315,14 +315,23 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
+            let cyclic = option_bool(options, "cyclic").unwrap_or(false)
+                || option_bool(options, "periodic").unwrap_or(false);
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                    knotspec: BSplineKnotSpec::Generate {
-                        data_range: (minv, maxv),
-                        num_internal_knots: n_knots,
+                    knotspec: if cyclic {
+                        BSplineKnotSpec::CyclicGenerate {
+                            data_range: (minv, maxv),
+                            num_basis_functions: n_knots + degree + 1,
+                        }
+                    } else {
+                        BSplineKnotSpec::Generate {
+                            data_range: (minv, maxv),
+                            num_internal_knots: n_knots,
+                        }
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
@@ -524,6 +533,8 @@ pub fn build_smooth_basis(
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
                     operator_penalties,
+                    periodic: option_bool(options, "cyclic").unwrap_or(false)
+                        || option_bool(options, "periodic").unwrap_or(false),
                 },
                 input_scales: None,
             })
