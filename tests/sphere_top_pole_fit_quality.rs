@@ -35,8 +35,8 @@ fn truth(lat: f64, lon: f64) -> f64 {
 
 fn make_training_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let u11 = Uniform::new(-1.0, 1.0).expect("uniform");
-    let u_lon = Uniform::new(0.0, TAU).expect("uniform");
+    let u11 = Uniform::<f64>::new(-1.0, 1.0).expect("uniform");
+    let u_lon = Uniform::<f64>::new(0.0, TAU).expect("uniform");
     let noise = Normal::new(0.0, sigma).expect("normal");
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)

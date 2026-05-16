@@ -28,8 +28,8 @@ const TAU: f64 = std::f64::consts::TAU;
 
 fn make_sphere_radians(n: usize, seed: u64) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let u11 = Uniform::new(-1.0, 1.0).expect("uniform");
-    let u_lon = Uniform::new(0.0, TAU).expect("uniform"); // [0, 2π)
+    let u11 = Uniform::<f64>::new(-1.0, 1.0).expect("uniform");
+    let u_lon = Uniform::<f64>::new(0.0, TAU).expect("uniform"); // [0, 2π)
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
         .map(|_| {
@@ -47,15 +47,20 @@ fn make_sphere_radians(n: usize, seed: u64) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn predict(formula: &str, data: &gam::data::EncodedDataset,
-           lats: &[f64], lons: &[f64]) -> Vec<f64>
-{
+fn predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    lats: &[f64],
+    lons: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("sphere fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let n = lats.len();
     let mut m = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
@@ -63,8 +68,8 @@ fn predict(formula: &str, data: &gam::data::EncodedDataset,
         m[[i, 1]] = lons[i];
         m[[i, 2]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -78,16 +83,24 @@ fn sphere_radians_seam_at_zero_and_two_pi_predict_equal() {
     let taus: Vec<f64> = std::iter::repeat(TAU).take(lats.len()).collect();
 
     for (label, formula) in &[
-        ("wahba",    "y ~ sphere(lat, lon, radians=true, k=80)"),
-        ("harmonic", "y ~ sphere(lat, lon, radians=true, method=harmonic, max_degree=8)"),
+        ("wahba", "y ~ sphere(lat, lon, radians=true, k=80)"),
+        (
+            "harmonic",
+            "y ~ sphere(lat, lon, radians=true, method=harmonic, max_degree=8)",
+        ),
     ] {
         let p0 = predict(formula, &data, &lats, &zeros);
         let p2 = predict(formula, &data, &lats, &taus);
         let mut max_gap = 0.0_f64;
         for (i, (a, b)) in p0.iter().zip(p2.iter()).enumerate() {
             let d = (a - b).abs();
-            eprintln!("  {label} lat={:+.2}  f(0)={:.6}  f(2π)={:.6}  |gap|={:.3e}", lats[i], a, b, d);
-            if d > max_gap { max_gap = d; }
+            eprintln!(
+                "  {label} lat={:+.2}  f(0)={:.6}  f(2π)={:.6}  |gap|={:.3e}",
+                lats[i], a, b, d
+            );
+            if d > max_gap {
+                max_gap = d;
+            }
         }
         eprintln!("[sphere-seam] {label:8} max|f(lat,0) - f(lat,2π)| = {max_gap:.3e}");
         assert!(
