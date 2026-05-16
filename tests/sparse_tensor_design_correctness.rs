@@ -72,10 +72,10 @@ fn cross_check_designs(
     // Entrywise equality of the densified candidate against the reference.
     let candidate_dense = candidate.to_dense();
     let mut max_abs_diff = 0.0_f64;
-    for ((a, b), (r, c)) in candidate_dense.iter().zip(reference.iter()).zip(
-        (0..candidate_dense.nrows())
-            .flat_map(|i| (0..candidate_dense.ncols()).map(move |j| (i, j))),
-    ) {
+    for (((r, c), a), b) in candidate_dense
+        .indexed_iter()
+        .zip(reference.iter())
+    {
         let diff = (a - b).abs();
         if diff > max_abs_diff {
             max_abs_diff = diff;
@@ -118,7 +118,7 @@ fn cross_check_designs(
     eprintln!("[{label}] X·β 50-trial worst rel = {worst_xb:.3e}");
 
     // Xᵀ W X with a random positive-weight vector.
-    let uniform = Uniform::new(0.1_f64, 1.5_f64);
+    let uniform = Uniform::new(0.1_f64, 1.5_f64).expect("uniform");
     let mut w = Array1::<f64>::zeros(n);
     for v in w.iter_mut() {
         *v = uniform.sample(&mut rng);
@@ -126,21 +126,21 @@ fn cross_check_designs(
     let reference_gram = dense_xt_w_x(reference, &w);
     let candidate_gram = dense_xt_w_x(&candidate_dense, &w);
     let mut worst_gram = 0.0_f64;
-    for ((i, j), (a, b)) in candidate_gram
-        .indexed_iter()
-        .zip(reference_gram.iter())
-    {
-        let diff = (a - b).abs();
-        let scale = a.abs().max(b.abs()).max(1.0);
-        let rel = diff / scale;
-        if rel > worst_gram {
-            worst_gram = rel;
+    for i in 0..candidate_gram.nrows() {
+        for j in 0..candidate_gram.ncols() {
+            let a = candidate_gram[(i, j)];
+            let b = reference_gram[(i, j)];
+            let diff = (a - b).abs();
+            let scale = a.abs().max(b.abs()).max(1.0);
+            let rel = diff / scale;
+            if rel > worst_gram {
+                worst_gram = rel;
+            }
+            assert!(
+                rel < 1e-10,
+                "{label}: XᵀWX[{i},{j}] sparse={a} dense={b} rel={rel}"
+            );
         }
-        let _ = (i, j);
-        assert!(
-            rel < 1e-10,
-            "{label}: XᵀWX[{i:?}] sparse={a} dense={b} rel={rel}"
-        );
     }
     eprintln!("[{label}] XᵀWX worst rel = {worst_gram:.3e}");
 }
