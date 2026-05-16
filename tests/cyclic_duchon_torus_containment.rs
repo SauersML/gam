@@ -16,8 +16,7 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    init_parallelism,
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
@@ -80,8 +79,12 @@ fn build_dataset(theta: &[f64], y_col: &[f64]) -> gam::data::EncodedDataset {
 /// design at new points, because the bug we're catching shows up identically
 /// at the training points: the LAML optimizer parks at a bad ρ and the
 /// resulting β over- or under-fits visibly even at the training thetas.
-fn max_residual_against_truth(theta: &[f64], y_noisy: &[f64], y_truth: &[f64],
-                              formula_body: &str) -> f64 {
+fn max_residual_against_truth(
+    theta: &[f64],
+    y_noisy: &[f64],
+    y_truth: &[f64],
+    formula_body: &str,
+) -> f64 {
     let data = build_dataset(theta, y_noisy);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -94,8 +97,12 @@ fn max_residual_against_truth(theta: &[f64], y_noisy: &[f64], y_truth: &[f64],
     };
     let beta = &fit.fit.beta;
     let design = &fit.design.design;
-    assert_eq!(design.ncols(), beta.len(),
-               "design width != beta length for `{}`", formula_body);
+    assert_eq!(
+        design.ncols(),
+        beta.len(),
+        "design width != beta length for `{}`",
+        formula_body
+    );
     let fitted = design.apply(beta);
     // Compare fitted values to the clean truth (not the noisy y) — measures
     // how close the smooth's mean is to the underlying signal.
@@ -121,10 +128,10 @@ fn cyclic_duchon_centers_80_fit_stays_within_envelope() {
     let y_truth: Vec<f64> = clean.column(2).to_vec();
 
     let cases: &[(&str, &str)] = &[
-        ("thinplate",      "thinplate(ct, st)"),
-        ("matern",         "matern(ct, st)"),
+        ("thinplate", "thinplate(ct, st)"),
+        ("matern", "matern(ct, st)"),
         ("duchon default", "duchon(ct, st)"),
-        ("duchon 80",      "duchon(ct, st, centers=80)"),
+        ("duchon 80", "duchon(ct, st, centers=80)"),
     ];
 
     let mut violations = Vec::new();
