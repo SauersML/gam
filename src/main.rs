@@ -237,6 +237,10 @@ enum Command {
 
 #[derive(Args, Debug)]
 struct FitArgs {
+    #[arg(
+        value_name = "DATA",
+        help = "Training dataset (CSV or parquet) — must contain every column referenced in <FORMULA>"
+    )]
     data: PathBuf,
     #[arg(
         value_name = "FORMULA",
@@ -368,9 +372,14 @@ struct FitArgs {
 
 #[derive(Args, Debug)]
 struct PredictArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     model: PathBuf,
+    #[arg(
+        value_name = "NEW_DATA",
+        help = "Dataset to predict on (CSV or parquet); columns must match the model's training schema"
+    )]
     new_data: PathBuf,
-    #[arg(long = "out")]
+    #[arg(long = "out", help = "Output CSV path for the per-row predictions")]
     out: PathBuf,
     #[arg(long = "offset-column")]
     offset_column: Option<String>,
@@ -438,40 +447,61 @@ struct SurvivalArgs {
 
 #[derive(Args, Debug)]
 struct DiagnoseArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
+    )]
     data: PathBuf,
-    #[arg(long = "alo", default_value_t = false)]
+    #[arg(long = "alo", default_value_t = false, help = "Also compute approximate-leave-one-out (ALO) statistics")]
     alo: bool,
 }
 
 #[derive(Args, Debug)]
 struct SampleArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Training dataset (CSV or parquet) used to anchor the posterior"
+    )]
     data: PathBuf,
-    #[arg(long = "chains")]
+    #[arg(long = "chains", help = "Number of NUTS chains to run (default: family-dependent)")]
     chains: Option<usize>,
-    #[arg(long = "samples")]
+    #[arg(long = "samples", help = "Post-warmup draws per chain (default: family-dependent)")]
     samples: Option<usize>,
-    #[arg(long = "warmup")]
+    #[arg(long = "warmup", help = "Warmup iterations per chain (default: family-dependent)")]
     warmup: Option<usize>,
-    #[arg(long = "out")]
+    #[arg(long = "out", help = "Output path for the posterior draws (parquet); default: <model_stem>.posterior.parquet")]
     out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 struct GenerateArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Covariate dataset (CSV or parquet) — one set of generated responses per draw, per row"
+    )]
     data: PathBuf,
-    #[arg(long = "n-draws", default_value_t = 5)]
+    #[arg(long = "n-draws", default_value_t = 5, help = "Number of response draws per input row")]
     n_draws: usize,
-    #[arg(long = "out")]
+    #[arg(long = "out", help = "Output CSV path; default: <model_stem>.generated.csv")]
     out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
 struct ReportArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
     model: PathBuf,
+    #[arg(
+        value_name = "DATA",
+        help = "Optional dataset for diagnostics (CSV or parquet); coefficient + smoothing-parameter summaries don't need it"
+    )]
     data: Option<PathBuf>,
+    #[arg(value_name = "OUT", help = "Output HTML path; default: <model_stem>.report.html")]
     out: Option<PathBuf>,
 }
 
