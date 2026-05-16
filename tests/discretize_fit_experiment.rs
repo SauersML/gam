@@ -69,7 +69,7 @@ fn discretize(
     }
     let theta_step = (theta_max - theta_min) / bins_theta as f64;
     let h_step = (h_max - h_min) / bins_h as f64;
-    // Cell aggregator: (sum_y, sum_w, sum_theta_w, sum_h_w)
+    // Cell aggregator: (sum_y, sum_w, representative_theta, representative_h)
     let mut cells = vec![(0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64); bins_theta * bins_h];
     for i in 0..n {
         let t = data.values[(i, 0)];
@@ -82,20 +82,20 @@ fn discretize(
         let c = &mut cells[ti * bins_h + hi];
         c.0 += y; // sum_y (unweighted, since w_i = 1)
         c.1 += 1.0; // weight count
-        c.2 += t; // sum_theta (for cell center)
-        c.3 += h; // sum_h
+        if c.1 == 1.0 {
+            c.2 = t;
+            c.3 = h;
+        }
     }
     let mut headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
     headers.push("__cell_weight".to_string());
     let mut rows: Vec<StringRecord> = Vec::new();
     for c in cells {
         if c.1 > 0.0 {
-            let theta_mean = c.2 / c.1;
-            let h_mean = c.3 / c.1;
             let y_mean = c.0 / c.1;
             rows.push(StringRecord::from(vec![
-                theta_mean.to_string(),
-                h_mean.to_string(),
+                c.2.to_string(),
+                c.3.to_string(),
                 y_mean.to_string(),
                 c.1.to_string(),
             ]));
