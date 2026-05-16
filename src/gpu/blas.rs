@@ -4,6 +4,10 @@ use libloading::Library;
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::sync::{Mutex, OnceLock};
 
+use super::driver::{
+    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates,
+    from_col_major, load_library, to_col_major,
+};
 use super::runtime::GpuRuntime;
 
 #[inline]
@@ -379,82 +383,6 @@ impl Drop for CublasRuntime {
     }
 }
 
-struct DeviceAllocation<'a> {
-    driver: &'a DriverApi,
-    ptr: u64,
-}
-
-impl<'a> DeviceAllocation<'a> {
-    unsafe fn new(driver: &'a DriverApi, bytes: usize) -> Option<Self> {
-        let mut ptr = 0u64;
-        check_cuda(
-            unsafe { (driver.cu_mem_alloc)(&mut ptr, bytes) },
-            "cuMemAlloc",
-        )
-        .ok()?;
-        Some(Self { driver, ptr })
-    }
-}
-
-impl Drop for DeviceAllocation<'_> {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = (self.driver.cu_mem_free)(self.ptr);
-        }
-    }
-}
-
-type CuResult = i32;
-type CuInit = unsafe extern "C" fn(u32) -> CuResult;
-type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
-type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
-type CuCtxSetCurrent = unsafe extern "C" fn(usize) -> CuResult;
-type CuCtxDestroy = unsafe extern "C" fn(usize) -> CuResult;
-type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
-type CuMemFree = unsafe extern "C" fn(u64) -> CuResult;
-type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
-type CuMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
-
-struct DriverApi {
-    cu_init: CuInit,
-    cu_device_get: CuDeviceGet,
-    cu_ctx_create: CuCtxCreate,
-    cu_ctx_set_current: CuCtxSetCurrent,
-    cu_ctx_destroy: CuCtxDestroy,
-    cu_mem_alloc: CuMemAlloc,
-    cu_mem_free: CuMemFree,
-    cu_memcpy_htod: CuMemcpyHtoD,
-    cu_memcpy_dtoh: CuMemcpyDtoH,
-}
-
-impl DriverApi {
-    fn load(library: &Library) -> Result<Self, String> {
-        unsafe {
-            Ok(Self {
-                cu_init: *library.get(b"cuInit\0").map_err(|e| e.to_string())?,
-                cu_device_get: *library.get(b"cuDeviceGet\0").map_err(|e| e.to_string())?,
-                cu_ctx_create: *library
-                    .get(b"cuCtxCreate_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_ctx_set_current: *library
-                    .get(b"cuCtxSetCurrent\0")
-                    .map_err(|e| e.to_string())?,
-                cu_ctx_destroy: *library
-                    .get(b"cuCtxDestroy_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_mem_alloc: *library.get(b"cuMemAlloc_v2\0").map_err(|e| e.to_string())?,
-                cu_mem_free: *library.get(b"cuMemFree_v2\0").map_err(|e| e.to_string())?,
-                cu_memcpy_htod: *library
-                    .get(b"cuMemcpyHtoD_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_memcpy_dtoh: *library
-                    .get(b"cuMemcpyDtoH_v2\0")
-                    .map_err(|e| e.to_string())?,
-            })
-        }
-    }
-}
-
 type CublasStatus = i32;
 type CublasCreate = unsafe extern "C" fn(*mut usize) -> CublasStatus;
 type CublasDestroy = unsafe extern "C" fn(usize) -> CublasStatus;
@@ -531,35 +459,6 @@ fn cublas_op(transpose: bool) -> i32 {
     if transpose { CUBLAS_OP_T } else { CUBLAS_OP_N }
 }
 
-fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "{name} failed with CUDA driver error code {result}"
-        ))
-    }
-}
-
-fn load_library(candidates: &[&str]) -> Result<Library, String> {
-    for candidate in candidates {
-        if let Ok(library) = unsafe { Library::new(candidate) } {
-            return Ok(library);
-        }
-    }
-    Err(format!("could not load any of: {}", candidates.join(", ")))
-}
-
-fn cuda_library_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["nvcuda.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["/usr/local/cuda/lib/libcuda.dylib", "libcuda.dylib"]
-    } else {
-        &["libcuda.so.1", "libcuda.so"]
-    }
-}
-
 fn cublas_library_candidates() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
         &["cublas64_12.dll", "cublas64_11.dll"]
@@ -572,25 +471,6 @@ fn cublas_library_candidates() -> &'static [&'static str] {
 
 fn to_i32(value: usize) -> Option<i32> {
     i32::try_from(value).ok()
-}
-
-fn bytes_len(len: usize) -> Option<usize> {
-    len.checked_mul(std::mem::size_of::<f64>())
-}
-
-fn to_col_major<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Vec<f64> {
-    let (rows, cols) = a.dim();
-    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
-    for col in 0..cols {
-        for row in 0..rows {
-            out.push(a[[row, col]]);
-        }
-    }
-    out
-}
-
-fn from_col_major(values: &[f64], rows: usize, cols: usize) -> Array2<f64> {
-    Array2::from_shape_fn((rows, cols), |(row, col)| values[col * rows + row])
 }
 
 #[cfg(test)]
