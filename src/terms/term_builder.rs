@@ -228,12 +228,25 @@ pub fn build_smooth_basis(
     smooth_coordinate_count: usize,
 ) -> Result<SmoothBasisSpec, String> {
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
+    let has_periodic_option = options.contains_key("periodic")
+        || options.contains_key("cyclic")
+        || options
+            .get("bc")
+            .map(|bc| {
+                bc.to_ascii_lowercase().contains("periodic")
+                    || bc.to_ascii_lowercase().contains("cyclic")
+            })
+            .unwrap_or(false);
     let type_opt = options
         .get("type")
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te => "tensor".to_string(),
             SmoothKind::S if cols.len() == 1 => "bspline".to_string(),
+            // Mixed periodic Euclidean radial kernels are not separable on the
+            // cylinder. Use a tensor product with a cyclic margin so s(theta,h)
+            // honors seam continuity while preserving the formula-level s(...).
+            SmoothKind::S if has_periodic_option => "tensor".to_string(),
             SmoothKind::S => "tps".to_string(),
         });
 
@@ -263,17 +276,36 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
+            let periodic_axes = parse_periodic_axes(options, cols.len())?;
+            let periods = parse_periods(options, &periodic_axes)?;
             let specs = cols
                 .iter()
-                .map(|&c| {
+                .enumerate()
+                .map(|(dim, &c)| {
                     let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                    let knotspec = if periodic_axes[dim] {
+                        let period = periods[dim].ok_or_else(|| {
+                            format!(
+                                "periodic tensor margin {} ('{}') requires period=[...] entry",
+                                dim, vars[dim]
+                            )
+                        })?;
+                        BSplineKnotSpec::Periodic {
+                            origin: minv,
+                            period,
+                            num_internal_knots: n_knots,
+                            knots: None,
+                        }
+                    } else {
+                        BSplineKnotSpec::Generate {
+                            data_range: (minv, maxv),
+                            num_internal_knots: n_knots,
+                        }
+                    };
                     Ok(BSplineBasisSpec {
                         degree,
                         penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Generate {
-                            data_range: (minv, maxv),
-                            num_internal_knots: n_knots,
-                        },
+                        knotspec,
                         double_penalty: smooth_double_penalty,
                         identifiability: BSplineIdentifiability::None,
                     })
@@ -315,15 +347,32 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
+            let periodic_axes = parse_periodic_axes(options, 1)?;
+            let periods = parse_periods(options, &periodic_axes)?;
+            let knotspec = if periodic_axes[0] {
+                BSplineKnotSpec::Periodic {
+                    origin: minv,
+                    period: periods[0].ok_or_else(|| {
+                        format!(
+                            "periodic smooth '{}' requires period=<value> or period=[value]",
+                            vars.join(",")
+                        )
+                    })?,
+                    num_internal_knots: n_knots,
+                    knots: None,
+                }
+            } else {
+                BSplineKnotSpec::Generate {
+                    data_range: (minv, maxv),
+                    num_internal_knots: n_knots,
+                }
+            };
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                    knotspec: BSplineKnotSpec::Generate {
-                        data_range: (minv, maxv),
-                        num_internal_knots: n_knots,
-                    },
+                    knotspec,
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                 },
@@ -627,6 +676,138 @@ pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
 }
 
+fn parse_math_f64(raw: &str) -> Result<f64, String> {
+    let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
+    if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
+        return Err("None/null is not a number".to_string());
+    }
+    let lower = t.to_ascii_lowercase().replace(' ', "");
+    match lower.as_str() {
+        "pi" => return Ok(std::f64::consts::PI),
+        "tau" | "2pi" | "2*pi" => return Ok(2.0 * std::f64::consts::PI),
+        _ => {}
+    }
+    if let Some(rest) = lower.strip_suffix("*pi") {
+        let coef = if rest.is_empty() {
+            1.0
+        } else {
+            rest.parse::<f64>()
+                .map_err(|_| format!("invalid numeric expression '{raw}'"))?
+        };
+        return Ok(coef * std::f64::consts::PI);
+    }
+    if let Some(rest) = lower.strip_prefix("pi*") {
+        let coef = rest
+            .parse::<f64>()
+            .map_err(|_| format!("invalid numeric expression '{raw}'"))?;
+        return Ok(coef * std::f64::consts::PI);
+    }
+    lower
+        .parse::<f64>()
+        .map_err(|_| format!("invalid numeric expression '{raw}'"))
+}
+
+fn split_list_option(raw: &str) -> Vec<String> {
+    let t = raw.trim();
+    let inner = t
+        .strip_prefix('[')
+        .and_then(|u| u.strip_suffix(']'))
+        .unwrap_or(t);
+    inner.split(',').map(|v| v.trim().to_string()).collect()
+}
+
+fn parse_periodic_axes(
+    options: &BTreeMap<String, String>,
+    ndim: usize,
+) -> Result<Vec<bool>, String> {
+    let mut out = vec![false; ndim];
+    let Some(raw) = options.get("periodic").or_else(|| options.get("cyclic")) else {
+        if let Some(raw_bc) = options.get("bc") {
+            let vals = split_list_option(raw_bc);
+            if vals.len() != ndim {
+                return Err(format!(
+                    "bc must have one entry per margin ({ndim}), got {}",
+                    vals.len()
+                ));
+            }
+            for (i, v) in vals.iter().enumerate() {
+                let l = v.trim_matches('"').trim_matches('\'').to_ascii_lowercase();
+                out[i] = matches!(l.as_str(), "periodic" | "cyclic" | "cc");
+            }
+        }
+        return Ok(out);
+    };
+    let vals = split_list_option(raw);
+    if vals.len() == ndim
+        && vals.iter().all(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "true" | "false" | "yes" | "no"
+            )
+        })
+    {
+        for (i, v) in vals.iter().enumerate() {
+            out[i] = matches!(v.to_ascii_lowercase().as_str(), "true" | "yes");
+        }
+    } else {
+        for v in vals {
+            if v.is_empty() {
+                continue;
+            }
+            let axis = v
+                .parse::<usize>()
+                .map_err(|_| format!("periodic axes must be zero-based integers, got '{v}'"))?;
+            if axis >= ndim {
+                return Err(format!(
+                    "periodic axis {axis} out of range for {ndim}D smooth"
+                ));
+            }
+            out[axis] = true;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_periods(
+    options: &BTreeMap<String, String>,
+    periodic: &[bool],
+) -> Result<Vec<Option<f64>>, String> {
+    let ndim = periodic.len();
+    let mut out = vec![None; ndim];
+    let Some(raw) = options.get("period") else {
+        return Ok(out);
+    };
+    let vals = split_list_option(raw);
+    if vals.len() == 1 && periodic.iter().filter(|&&b| b).count() == 1 {
+        let value = parse_math_f64(&vals[0])?;
+        if value <= 0.0 || !value.is_finite() {
+            return Err("period entries must be positive finite values".to_string());
+        }
+        if let Some(axis) = periodic.iter().position(|&b| b) {
+            out[axis] = Some(value);
+        }
+        return Ok(out);
+    }
+    if vals.len() != ndim {
+        return Err(format!(
+            "period must have one entry per margin ({ndim}), got {}",
+            vals.len()
+        ));
+    }
+    for (i, v) in vals.iter().enumerate() {
+        let l = v.to_ascii_lowercase();
+        if matches!(l.as_str(), "none" | "null" | "na" | "") {
+            continue;
+        }
+        let value = parse_math_f64(v)?;
+        if value <= 0.0 || !value.is_finite() {
+            return Err("period entries must be positive finite values".to_string());
+        }
+        out[i] = Some(value);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Smooth option parsers
 // ---------------------------------------------------------------------------
@@ -807,5 +988,43 @@ fn parse_tensor_identifiability(
         other => Err(format!(
             "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_cylinder_periodic_options_match_requested_forms() {
+        let mut opts = BTreeMap::new();
+        opts.insert("periodic".to_string(), "[0]".to_string());
+        opts.insert("period".to_string(), "[2*pi, None]".to_string());
+        let axes = parse_periodic_axes(&opts, 2).expect("axes");
+        let periods = parse_periods(&opts, &axes).expect("periods");
+        assert_eq!(axes, vec![true, false]);
+        assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert_eq!(periods[1], None);
+
+        let mut bc_opts = BTreeMap::new();
+        bc_opts.insert("bc".to_string(), "['periodic', 'natural']".to_string());
+        bc_opts.insert("period".to_string(), "[2*pi, None]".to_string());
+        let bc_axes = parse_periodic_axes(&bc_opts, 2).expect("bc axes");
+        let bc_periods = parse_periods(&bc_opts, &bc_axes).expect("bc periods");
+        assert_eq!(bc_axes, vec![true, false]);
+        assert!((bc_periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert_eq!(bc_periods[1], None);
+    }
+
+    #[test]
+    fn parse_single_axis_periodic_zero_as_axis_not_false() {
+        let mut opts = BTreeMap::new();
+        opts.insert("periodic".to_string(), "[0]".to_string());
+        opts.insert("period".to_string(), "2*pi".to_string());
+        let axes = parse_periodic_axes(&opts, 1).expect("axes");
+        let periods = parse_periods(&opts, &axes).expect("periods");
+        assert_eq!(axes, vec![true]);
+        assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
     }
 }
