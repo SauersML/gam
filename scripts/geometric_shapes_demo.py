@@ -323,6 +323,10 @@ def load_pred(name):
     return np.loadtxt(DATA / f"{name}_pred.csv", delimiter=",", skiprows=1)[:, 1]
 
 
+def wrap0(A):
+    return np.concatenate([A, A[:1, :]], axis=0)
+
+
 def wrap1(A):
     return np.concatenate([A, A[:, :1]], axis=1)
 
@@ -330,6 +334,20 @@ def wrap1(A):
 def wrap2(A):
     A = np.concatenate([A, A[:, :1]], axis=1)
     return np.concatenate([A, A[:1, :]], axis=0)
+
+
+def make_polydata(X, Y, Z, eps_factor=1e-4):
+    """Convert a coord-array surface to a PolyData with shared seam vertices
+    and smoothed per-vertex normals. Cleans coincident vertices so wrap-seams
+    do not produce shading discontinuities."""
+    sg = pv.StructuredGrid(X, Y, Z)
+    poly = sg.extract_surface()
+    extent = float(np.linalg.norm(
+        [X.max() - X.min(), Y.max() - Y.min(), Z.max() - Z.min()]
+    ))
+    poly = poly.clean(tolerance=extent * eps_factor)
+    poly = poly.compute_normals(split_vertices=False, feature_angle=180.0)
+    return poly
 
 
 def build_shapes():
@@ -353,47 +371,52 @@ def build_shapes():
                     color=PAL["loop"], cmap=cmap_for(PAL["loop"]),
                     elev=18, dist_mul=2.0, tube_r=0.05))
 
-    # Cylinder
+    # Cylinder — periodic along θ (axis=1 of LAT-major reshape)
     NTH, NH = np.load(DATA / "grid_cyl_shape.npy")
     shape = (NH, NTH)
     cloud = np.loadtxt(DATA / "cyl.csv", delimiter=",", skiprows=1)[:, 2:]
     X = wrap1(load_pred("cyl_x").reshape(shape))
     Y = wrap1(load_pred("cyl_y").reshape(shape))
     Z = wrap1(load_pred("cyl_z").reshape(shape))
-    out.append(dict(name="cylinder", kind="surface", cloud=cloud, XYZ=(X, Y, Z),
+    out.append(dict(name="cylinder", kind="surface", cloud=cloud,
+                    mesh=make_polydata(X, Y, Z),
                     color=PAL["cylinder"], cmap=cmap_for(PAL["cylinder"]),
                     elev=10, dist_mul=2.4))
 
-    # Sphere
+    # Sphere — periodic along LON.  meshgrid(lat_1d, lon_1d) gives arrays of
+    # shape (NLON, NLAT) where LON varies along axis=0, so wrap along axis=0.
     NLAT, NLON = np.load(DATA / "grid_sph_shape.npy")
     shape = (NLON, NLAT)
     cloud = np.loadtxt(DATA / "sph.csv", delimiter=",", skiprows=1)[:, 2:]
-    X = wrap1(load_pred("sph_x").reshape(shape))
-    Y = wrap1(load_pred("sph_y").reshape(shape))
-    Z = wrap1(load_pred("sph_z").reshape(shape))
-    out.append(dict(name="sphere", kind="surface", cloud=cloud, XYZ=(X, Y, Z),
+    X = wrap0(load_pred("sph_x").reshape(shape))
+    Y = wrap0(load_pred("sph_y").reshape(shape))
+    Z = wrap0(load_pred("sph_z").reshape(shape))
+    out.append(dict(name="sphere", kind="surface", cloud=cloud,
+                    mesh=make_polydata(X, Y, Z),
                     color=PAL["sphere"], cmap=cmap_for(PAL["sphere"]),
                     elev=15, dist_mul=2.4))
 
-    # Torus
+    # Torus — periodic along both axes
     NU, NV = np.load(DATA / "grid_tor_shape.npy")
     shape = (NV, NU)
     cloud = np.loadtxt(DATA / "tor.csv", delimiter=",", skiprows=1)[:, 2:]
     X = wrap2(load_pred("tor_x").reshape(shape))
     Y = wrap2(load_pred("tor_y").reshape(shape))
     Z = wrap2(load_pred("tor_z").reshape(shape))
-    out.append(dict(name="torus", kind="surface", cloud=cloud, XYZ=(X, Y, Z),
+    out.append(dict(name="torus", kind="surface", cloud=cloud,
+                    mesh=make_polydata(X, Y, Z),
                     color=PAL["torus"], cmap=cmap_for(PAL["torus"]),
                     elev=28, dist_mul=2.4))
 
-    # Möbius
+    # Möbius — periodic along u with period 4π; v is non-periodic (open edge)
     NMU, NMV = np.load(DATA / "grid_mob_shape.npy")
     shape = (NMV, NMU)
     cloud = np.loadtxt(DATA / "mob.csv", delimiter=",", skiprows=1)[:, 2:]
     X = wrap1(load_pred("mob_x").reshape(shape))
     Y = wrap1(load_pred("mob_y").reshape(shape))
     Z = wrap1(load_pred("mob_z").reshape(shape))
-    out.append(dict(name="mobius", kind="surface", cloud=cloud, XYZ=(X, Y, Z),
+    out.append(dict(name="mobius", kind="surface", cloud=cloud,
+                    mesh=make_polydata(X, Y, Z),
                     color=PAL["mobius"], cmap=cmap_for(PAL["mobius"]),
                     elev=20, dist_mul=2.4))
 
@@ -441,37 +464,34 @@ def build_scene(plotter, shapes, point_size):
                                 base=s["cloud"].copy(),
                                 centroid=centroid, dist=dist, elev=s["elev"]))
         else:
+            # Surfaces and tubes are colored solid with smooth shading.
+            # Lighting (ambient + diffuse + specular) gives the depth cue;
+            # adding a colormap across them produces visible bands at the
+            # silhouette (surfaces) or where the loop closes (tubes).
             if s["kind"] == "curve":
                 cpts = s["curve"]
                 lines = np.hstack([[len(cpts)], np.arange(len(cpts))])
                 poly = pv.PolyData(cpts, lines=lines)
-                arc = np.concatenate([[0], np.cumsum(
-                    np.linalg.norm(np.diff(cpts, axis=0), axis=1))])
-                poly["d"] = arc / max(arc.max(), 1e-9)
-                tube = poly.tube(radius=s["tube_r"], n_sides=24)
+                tube = poly.tube(radius=s["tube_r"], n_sides=28)
                 plotter.add_mesh(
-                    tube, scalars="d", cmap=s["cmap"],
-                    smooth_shading=True, show_scalar_bar=False,
-                    ambient=0.3, diffuse=0.7,
-                    specular=0.4, specular_power=20,
+                    tube, color=s["color"], smooth_shading=True,
+                    show_scalar_bar=False,
+                    ambient=0.30, diffuse=0.75,
+                    specular=0.55, specular_power=24,
                 )
                 panels.append(dict(r=r, c=c, kind="tube",
                                     centroid=centroid, dist=dist,
                                     elev=s["elev"]))
             else:
-                X, Y, Z = s["XYZ"]
-                mesh = pv.StructuredGrid(X, Y, Z)
-                pts = mesh.points
-                mesh["d"] = pts[:, 1].copy()
                 plotter.add_mesh(
-                    mesh, scalars="d", cmap=s["cmap"],
-                    smooth_shading=True, show_scalar_bar=False,
-                    ambient=0.25, diffuse=0.75,
-                    specular=0.35, specular_power=18,
+                    s["mesh"], color=s["color"], smooth_shading=True,
+                    show_scalar_bar=False,
+                    ambient=0.28, diffuse=0.78,
+                    specular=0.45, specular_power=22,
                 )
-                panels.append(dict(r=r, c=c, kind="surface", mesh=mesh,
-                                    base=pts.copy(), centroid=centroid,
-                                    dist=dist, elev=s["elev"]))
+                panels.append(dict(r=r, c=c, kind="surface",
+                                    centroid=centroid, dist=dist,
+                                    elev=s["elev"]))
     return panels
 
 
@@ -486,11 +506,12 @@ def set_all_cameras(plotter, panels, azim_deg):
 
 
 def update_depth_scalars(panels, azim_deg):
+    """Only clouds get camera-relative depth coloring; surfaces and tubes
+    derive their depth from solid-color smooth-shading lighting."""
     for pn in panels:
-        if pn["kind"] not in ("cloud", "surface"):
+        if pn["kind"] != "cloud":
             continue
         vd = view_dir(pn["elev"], azim_deg)
-        # near-camera = larger value (so it maps to the dark end of the cmap)
         pn["mesh"]["d"] = -(pn["base"] @ vd)
 
 
@@ -518,7 +539,10 @@ def render_frames(shapes, w, h, n_frames, point_size):
     for k, az in enumerate(np.linspace(0, 360, n_frames, endpoint=False)):
         set_all_cameras(p, panels, az)
         update_depth_scalars(panels, az)
-        frames.append(p.screenshot(return_img=True))
+        # PyVista's screenshot returns a view into the renderer's internal
+        # buffer that gets overwritten next frame, so we must copy.
+        img = np.asarray(p.screenshot(return_img=True)).copy()
+        frames.append(img)
         if (k + 1) % 12 == 0:
             print(f"    frame {k+1}/{n_frames}")
     p.close()
