@@ -21174,6 +21174,89 @@ mod tests {
     }
 
     #[test]
+    fn pure_duchon_exposes_operator_penalties_to_exact_adaptive_regularization() {
+        let n = 56usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+            data[[i, 0]] = t.cos();
+            data[[i, 1]] = t.sin();
+            y[i] = 0.55 * t.sin() + 0.18 * (3.0 * t).cos();
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "pure_duchon_circle".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1],
+                    spec: DuchonBasisSpec {
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 16 },
+                        length_scale: None,
+                        power: 0,
+                        nullspace_order: DuchonNullspaceOrder::Degree(2),
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+
+        let fit = fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodFamily::GaussianIdentity,
+            &FitOptions {
+                latent_cloglog: None,
+                mixture_link: None,
+                optimize_mixture: false,
+                sas_link: None,
+                optimize_sas: false,
+                compute_inference: false,
+                max_iter: 18,
+                tol: 1e-5,
+                nullspace_dims: vec![],
+                linear_constraints: None,
+                firth_bias_reduction: false,
+                adaptive_regularization: Some(AdaptiveRegularizationOptions {
+                    enabled: true,
+                    max_mm_iter: 4,
+                    beta_rel_tol: 1e-4,
+                    max_epsilon_outer_iter: 2,
+                    epsilon_log_step: std::f64::consts::LN_2,
+                    min_epsilon: 1e-6,
+                    weight_floor: 1e-8,
+                    weight_ceiling: 1e8,
+                }),
+                penalty_shrinkage_floor: None,
+                rho_prior: Default::default(),
+                kronecker_penalty_system: None,
+                kronecker_factored: None,
+            },
+        )
+        .expect("pure Duchon exact adaptive fit should succeed");
+
+        let diag = fit
+            .adaptive_diagnostics
+            .as_ref()
+            .expect("pure Duchon operator penalties should enable adaptive diagnostics");
+        assert_eq!(diag.maps.len(), 1);
+        assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
+        assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
+        assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+        assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
     fn exact_spatial_adaptive_binomial_sas_fit_preserves_link_state() {
         let n = 36usize;
         let mut data = Array2::<f64>::zeros((n, 2));
