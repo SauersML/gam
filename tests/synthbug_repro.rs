@@ -132,6 +132,7 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: None,
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            periodic: false,
             },
             input_scales: None,
         },
