@@ -1,11 +1,11 @@
 //! End-to-end stress test for the closed-form Duchon pipeline at
 //! biobank-relevant scale.
 //!
-//! This test is `#[ignore]`-gated by default because it can take many
-//! minutes and uses a lot of memory. To run:
+//! Runs in the default suite. The fit can take many minutes and use a
+//! lot of memory — run under `--release` if iteration time matters:
 //!
 //! ```text
-//! cargo test --release -- --ignored biobank_reml_stress
+//! cargo test --release biobank_reml_stress
 //! ```
 //!
 //! It exercises the full Duchon-on-PC GAM pipeline end-to-end:
@@ -194,7 +194,6 @@ fn relative_l2(pred: &Array1<f64>, truth: &Array1<f64>) -> f64 {
 // ─── Main stress test ───────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn biobank_reml_stress_main() {
     let (x_train, y_train, _y_true_train) = simulate(N_TRAIN, PC_DIM, SEED_BASE);
     let (x_holdout, _y_holdout, y_true_holdout) =
@@ -319,7 +318,6 @@ fn biobank_reml_stress_main() {
 /// well-known REML-conservativeness/anti-conservativeness drift at
 /// this dimensionality).
 #[test]
-#[ignore]
 fn biobank_reml_stress_coverage() {
     let mut total_in = 0usize;
     let mut total_pts = 0usize;

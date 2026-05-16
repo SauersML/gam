@@ -4,11 +4,11 @@
 //! This is a guard against regressions in the inner-Newton / outer-κ
 //! interplay that turn small problems into slow problems. The biobank-scale
 //! reproducers (`tests/biobank_margslope_repro.rs`,
-//! `tests/margslope_inner_pirls_scaling.rs`) are `#[ignore]`d because they
-//! sweep n up to 100k+ — this file runs a single n=2000 fit and asserts
-//! both convergence and a wall-clock budget that is generous for a healthy
-//! solver but tight enough to catch a slow-loop regression like the CTN
-//! exact-fn rejection cycle that recently cost ≥14h of CI.
+//! `tests/margslope_inner_pirls_scaling.rs`) sweep n up to 100k+ —
+//! this file runs a single n=2000 fit and asserts both convergence and
+//! a wall-clock budget that is generous for a healthy solver but tight
+//! enough to catch a slow-loop regression like the CTN exact-fn
+//! rejection cycle that recently cost ≥14h of CI.
 
 use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,

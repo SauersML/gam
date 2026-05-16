@@ -207,7 +207,6 @@ fn fit_biobank_problem(
 }
 
 #[test]
-#[ignore]
 fn biobank_margslope_repro_completes_under_ci_budget() {
     init();
     let options = BlockwiseFitOptions::default();
@@ -238,7 +237,6 @@ fn biobank_margslope_repro_completes_under_ci_budget() {
 }
 
 #[test]
-#[ignore]
 fn biobank_margslope_hessian_build_regression_baseline() {
     init();
     let options = BlockwiseFitOptions {
@@ -266,7 +264,6 @@ fn biobank_margslope_hessian_build_regression_baseline() {
 }
 
 #[test]
-#[ignore]
 fn biobank_margslope_known_good_beta_numerical_fixture() {
     init();
     let options = BlockwiseFitOptions {
