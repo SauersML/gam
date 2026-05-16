@@ -1381,15 +1381,14 @@ pub enum BSplineKnotSpec {
         data_range: (f64, f64),
         num_internal_knots: usize,
     },
-    /// Uniform cyclic B-spline basis on `[domain_start, domain_start + period)`.
+    /// Uniform cyclic B-spline basis on `[data_range.0, data_range.1)`.
     ///
     /// The first and last endpoints are identified, so evaluating at `x` and
     /// `x + m * period` gives identical rows. `num_basis` is the number of
     /// periodic control sites around the loop and must be at least
     /// `degree + 1` for an unaliased local support stencil.
-    Periodic {
-        domain_start: f64,
-        period: f64,
+    PeriodicUniform {
+        data_range: (f64, f64),
         num_basis: usize,
     },
     Automatic {
@@ -5808,7 +5807,11 @@ fn wrap_to_period(x: f64, left: f64, period: f64) -> f64 {
     left + (x - left).rem_euclid(period)
 }
 
-fn periodic_bspline_metadata_knots(domain_start: f64, period: f64, num_basis: usize) -> Array1<f64> {
+fn periodic_bspline_metadata_knots(
+    domain_start: f64,
+    period: f64,
+    num_basis: usize,
+) -> Array1<f64> {
     Array1::from_vec(
         (0..=num_basis)
             .map(|i| domain_start + period * i as f64 / num_basis as f64)
@@ -5902,13 +5905,18 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let BSplineKnotSpec::Periodic {
-        domain_start,
-        period,
+    if let BSplineKnotSpec::PeriodicUniform {
+        data_range,
         num_basis,
     } = spec.knotspec
     {
-        return build_periodic_bspline_basis_1d(data, domain_start, period, num_basis, spec);
+        return build_periodic_bspline_basis_1d(
+            data,
+            data_range.0,
+            data_range.1 - data_range.0,
+            num_basis,
+            spec,
+        );
     }
     let prefer_sparse_design = spec.boundary_conditions.is_free()
         && matches!(
@@ -5941,9 +5949,9 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (Some(basis), None, knots)
             }
-            BSplineKnotSpec::Periodic { .. } => unreachable!(
-                "periodic B-spline handled before storage selection"
-            ),
+            BSplineKnotSpec::PeriodicUniform { .. } => {
+                unreachable!("periodic B-spline handled before storage selection")
+            }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -5995,9 +6003,9 @@ pub fn build_bspline_basis_1d(
                 )?;
                 (None, Some((*basis).clone()), knots)
             }
-            BSplineKnotSpec::Periodic { .. } => unreachable!(
-                "periodic B-spline handled before storage selection"
-            ),
+            BSplineKnotSpec::PeriodicUniform { .. } => {
+                unreachable!("periodic B-spline handled before storage selection")
+            }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -22652,7 +22660,10 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic { domain_start: 0.0, period: 1.0, num_basis: 8 },
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 1.0),
+                num_basis: 8,
+            },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
@@ -32439,9 +32450,8 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic {
-                domain_start: 0.0,
-                period: 1.0,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 1.0),
                 num_basis: 7,
             },
             double_penalty: false,
@@ -32467,9 +32477,8 @@ mod tests {
         let spec = BSplineBasisSpec {
             degree: 3,
             penalty_order: 2,
-            knotspec: BSplineKnotSpec::Periodic {
-                domain_start: 0.0,
-                period: 1.0,
+            knotspec: BSplineKnotSpec::PeriodicUniform {
+                data_range: (0.0, 1.0),
                 num_basis: 6,
             },
             double_penalty: true,
