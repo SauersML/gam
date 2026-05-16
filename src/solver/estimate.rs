@@ -2329,13 +2329,7 @@ fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
         } else {
             10
         },
-        seed_budget: if gaussian && k <= 4 {
-            2
-        } else if k <= 6 {
-            1
-        } else {
-            2
-        },
+        seed_budget: if k <= 6 { 1 } else { 2 },
         risk_profile: if gaussian {
             SeedRiskProfile::Gaussian
         } else {
@@ -5646,8 +5640,8 @@ mod estimate_policy_tests {
             "Gaussian REML should rank deterministic candidate basins before startup"
         );
         assert_eq!(
-            cfg.seed_budget, 2,
-            "low-dimensional Gaussian REML should compare more than one optimized start"
+            cfg.seed_budget, 1,
+            "standard Gaussian REML should fully optimize the best screened start by default"
         );
     }
 
