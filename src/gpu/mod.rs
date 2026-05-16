@@ -8,6 +8,7 @@
 //! * [`device`] — host-visible description of the selected GPU.
 //! * [`policy`] — workload-size thresholds derived from device capability.
 //! * [`dispatch`] — public hooks used by CPU linalg call sites.
+//! * [`solver`] — cuSOLVER routing for large dense symmetric eigensystems.
 //! * [`kernels`] — bit-checkable host reference implementations of the
 //!   numerical contracts a device backend must reproduce.
 //!
@@ -30,5 +31,5 @@ pub use dispatch::{
 };
 pub use policy::DispatchPolicy;
 pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info};
-pub use solver::{try_potrf_inplace, try_potrs_inplace, try_syevd_inplace};
+pub use solver::try_syevd_inplace;
 pub use sparse::{try_csr_spmv_usize, try_csr_t_spmv_usize};
