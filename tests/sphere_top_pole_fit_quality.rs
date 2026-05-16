@@ -1,23 +1,17 @@
-//! FAILING TEST — ticket: sphere fits show a visible artifact near the poles
-//! (≈60–80° latitude band) even on smooth low-frequency truth and ample
-//! training data. The Wahba kernel default uses a *coefficient* sum-to-zero
-//! identifiability (`Σβⱼ = 0` over centers, see
-//! `src/terms/basis.rs:13809 coefficient_sum_to_zero_transform`, applied at
-//! `:13859`), which is an arbitrary anchor that doesn't respect the
-//! sphere's surface measure. With centers placed via Euclidean (lat, lon)
-//! FPS (`select_thin_plate_knots` at `src/terms/basis.rs:18370`) and
-//! training data uniformly distributed on the sphere, the polar centers
-//! have very few nearby training rows; coefficient-sum-to-zero then pulls
-//! their fitted values toward the global zero rather than letting them be
-//! anchored by local data, producing a high-latitude bias.
+//! Regression test: sphere fits should not show a visible artifact near the
+//! poles (≈60–80° latitude band) on smooth low-frequency truth and ample
+//! training data. The Wahba kernel path previously used an unweighted
+//! coefficient sum-to-zero identifiability over centers and Euclidean
+//! farthest-point sampling in raw `(lat, lon)`. Those are arbitrary on S²:
+//! they do not respect surface measure or longitude wrap, and they can
+//! over-anchor sparse polar centers.
 //!
 //! Confirmed empirically (agent investigation): on demo training data
 //! (800 pts, σ=0.10, `sphere(lat, lon, radians=true, k=100)`), the
 //! [+1.2, +1.4) rad latitude band has mean 3D-error ≈ 0.12 vs ≈ 0.061 at the
-//! equator — 2× worse — and this reproduces in BOTH `method=wahba` and
-//! `method=harmonic`. Fix direction: area-weighted sum-to-zero
-//! (`wᵀβ = 0`, w = cos(lat_center) quadrature weight) and switch
-//! `select_thin_plate_knots` to spherical-geodesic distance.
+//! equator — 2× worse — and this reproduced in BOTH `method=wahba` and
+//! `method=harmonic`. This locks in the current area-weighted sum-to-zero
+//! and spherical-distance center placement behavior.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -56,15 +50,20 @@ fn make_training_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedData
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn predict(formula: &str, data: &gam::data::EncodedDataset,
-           lats: &[f64], lons: &[f64]) -> Vec<f64>
-{
+fn predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    lats: &[f64],
+    lons: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("sphere fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let n = lats.len();
     let mut m = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
@@ -72,14 +71,17 @@ fn predict(formula: &str, data: &gam::data::EncodedDataset,
         m[[i, 1]] = lons[i];
         m[[i, 2]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
-fn rmse_in_lat_band(formula: &str, data: &gam::data::EncodedDataset,
-                    lat_lo: f64, lat_hi: f64) -> (f64, usize)
-{
+fn rmse_in_lat_band(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    lat_lo: f64,
+    lat_hi: f64,
+) -> (f64, usize) {
     // Build a grid: NLAT × NLON in the requested latitude band.
     let nlat = 12usize;
     let nlon = 36usize;
@@ -123,10 +125,12 @@ fn sphere_wahba_high_lat_band_rmse_close_to_equator() {
         ratio < 1.4,
         "Sphere Wahba fit degrades sharply at high latitude: \
          RMSE(lat∈[1.2,1.4]) = {:.4} is {:.2}× RMSE(equator) = {:.4} \
-         (budget ≤ 1.4×). Indicates the coefficient sum-to-zero \
-         identifiability and/or Euclidean FPS center placement is creating \
+         (budget ≤ 1.4×). Indicates the sphere identifiability constraint \
+         and/or spherical center placement is creating \
          a polar artifact.",
-        rmse_pole, ratio, rmse_eq,
+        rmse_pole,
+        ratio,
+        rmse_eq,
     );
 }
 
@@ -150,6 +154,8 @@ fn sphere_harmonic_high_lat_band_rmse_close_to_equator() {
          (budget ≤ 1.4×). Same artifact as the Wahba path — suggests the \
          cause is upstream of the kernel choice (sparse polar data vs the \
          identifiability constraint).",
-        rmse_pole, ratio, rmse_eq,
+        rmse_pole,
+        ratio,
+        rmse_eq,
     );
 }
