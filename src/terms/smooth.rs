@@ -405,7 +405,11 @@ impl TermCollectionSpec {
         for st in &self.smooth_terms {
             match &st.basis {
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
-                    if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
+                    if !matches!(
+                        spec.knotspec,
+                        BSplineKnotSpec::Provided(_)
+                            | BSplineKnotSpec::Periodic { knots: Some(_), .. }
+                    ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
                             st.name
@@ -456,7 +460,11 @@ impl TermCollectionSpec {
                 }
                 SmoothBasisSpec::TensorBSpline { spec, .. } => {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if !matches!(marginal.knotspec, BSplineKnotSpec::Provided(_)) {
+                        if !matches!(
+                            marginal.knotspec,
+                            BSplineKnotSpec::Provided(_)
+                                | BSplineKnotSpec::Periodic { knots: Some(_), .. }
+                        ) {
                             return Err(format!(
                                 "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
                                 st.name, dim
@@ -11947,7 +11955,20 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                 },
             ) => {
-                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                s.knotspec = match &s.knotspec {
+                    BSplineKnotSpec::Periodic {
+                        origin,
+                        period,
+                        num_internal_knots,
+                        ..
+                    } => BSplineKnotSpec::Periodic {
+                        origin: *origin,
+                        period: *period,
+                        num_internal_knots: *num_internal_knots,
+                        knots: Some(knots.clone()),
+                    },
+                    _ => BSplineKnotSpec::Provided(knots.clone()),
+                };
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -12111,7 +12132,20 @@ pub fn freeze_term_collection_from_design(
                 *feature_cols = fitted_cols.clone();
                 for i in 0..s.marginalspecs.len() {
                     s.marginalspecs[i].degree = degrees[i];
-                    s.marginalspecs[i].knotspec = BSplineKnotSpec::Provided(knots[i].clone());
+                    s.marginalspecs[i].knotspec = match &s.marginalspecs[i].knotspec {
+                        BSplineKnotSpec::Periodic {
+                            origin,
+                            period,
+                            num_internal_knots,
+                            ..
+                        } => BSplineKnotSpec::Periodic {
+                            origin: *origin,
+                            period: *period,
+                            num_internal_knots: *num_internal_knots,
+                            knots: Some(knots[i].clone()),
+                        },
+                        _ => BSplineKnotSpec::Provided(knots[i].clone()),
+                    };
                 }
                 s.identifiability = match identifiability_transform {
                     Some(z) => TensorBSplineIdentifiability::FrozenTransform {
