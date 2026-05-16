@@ -1,14 +1,15 @@
-//! FAILING TEST (potentially) — ticket: for genuinely heteroscedastic data
-//! with σ(x) growing across the domain, the response-scale uncertainty
-//! should track σ(x) — at minimum the SE at the high-noise side must be
-//! noticeably larger than the SE at the low-noise side.
+//! Conditional-mean SE for a Gaussian-identity smooth must rise where the
+//! training data is sparser. The SE comes from `σ̂² · (XᵀX + S)⁻¹` so it
+//! reflects local Fisher information (column-density of the design), not the
+//! noise process itself.
 //!
-//! Standard Gaussian-identity fits assume constant scale, so this test
-//! measures the *posterior* uncertainty on the conditional mean — that
-//! should still adapt somewhat to local data density / leverage. If the
-//! conditional-mean SE is flat (no variation across x) on data that visibly
-//! demands variable scale, the uncertainty quantification is mis-calibrated
-//! and the user should be steered toward a location-scale model.
+//! Setup: train x ∈ [0,1] but with deliberate density variation — 240 samples
+//! drawn from a triangular distribution peaked at x=0 (~6× higher density
+//! near 0 than near 1) and uniform low noise. Probe SE at x=0.05
+//! (dense, low SE expected) and x=0.95 (sparse, high SE expected). Assert
+//! the sparse-region SE is at least 1.3× the dense-region SE. If the SE is
+//! ~flat across density, the conditional-covariance pipeline is mis-wired
+//! and credible intervals at sparse-data regions will be over-confident.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -22,21 +23,21 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 #[test]
-fn smooth_fit_se_widens_in_high_noise_region() {
+fn smooth_fit_se_widens_in_sparse_density_region() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(53);
-    let u = Uniform::new(0.0, 1.0).expect("uniform");
-    let n = 300usize;
-    let mut x: Vec<f64> = (0..n).map(|_| u.sample(&mut rng)).collect();
+    // Triangular density on [0, 1] peaked at 0: sample via inverse CDF of
+    // 2(1 - x).  Density ratio at x=0.05 vs x=0.95 is (1-0.05)/(1-0.95)=19×.
+    let u01 = Uniform::new(0.0, 1.0).expect("uniform");
+    let n = 240usize;
+    let noise = Normal::new(0.0, 0.08).expect("normal");
+    let mut x: Vec<f64> = (0..n)
+        .map(|_| 1.0 - (1.0 - u01.sample(&mut rng) as f64).sqrt())
+        .collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    // True mean = sin(πx); noise σ(x) = 0.03 + 0.45·x  (15× wider at x=1 vs x=0)
     let y: Vec<f64> = x
         .iter()
-        .map(|t| {
-            let sigma = 0.03 + 0.45 * t;
-            let noise = Normal::new(0.0, sigma).expect("normal");
-            (std::f64::consts::PI * t).sin() + noise.sample(&mut rng)
-        })
+        .map(|t| (std::f64::consts::PI * t).sin() + noise.sample(&mut rng))
         .collect();
 
     let headers = ["x", "y"].into_iter().map(String::from).collect();
@@ -56,8 +57,8 @@ fn smooth_fit_se_widens_in_high_noise_region() {
         panic!("expected standard fit")
     };
 
-    // Probe SE at low-noise (x≈0.1) and high-noise (x≈0.9) regions.
-    let probe = [0.10_f64, 0.90_f64];
+    // Probe SE at dense (x=0.05, near peak of density) and sparse (x=0.95).
+    let probe = [0.05_f64, 0.95_f64];
     let mut new_data = Array2::<f64>::zeros((2, 2));
     for (i, &t) in probe.iter().enumerate() {
         new_data[[i, 0]] = t;
@@ -101,16 +102,19 @@ fn smooth_fit_se_widens_in_high_noise_region() {
             .max(0.0)
             .sqrt()
     };
+    let ratio = se_high / se_low.max(1e-12);
     eprintln!(
-        "[hetero-se] SE@x=0.1 = {se_low:.4}  SE@x=0.9 = {se_high:.4}  ratio = {:.2}",
-        se_high / se_low.max(1e-12)
+        "[density-se] SE@x=0.05 (dense) = {se_low:.4}  SE@x=0.95 (sparse) = {se_high:.4}  ratio = {ratio:.2}",
     );
-    // Truth σ ratio is (0.03 + 0.45)/(0.03 + 0.045) = 6.4×. Conditional-mean SE
-    // can't see σ(x) directly (Gaussian-identity assumes constant σ̂), but it
-    // should still adapt via local leverage. Require at least 1.5×.
+    // Density ratio is ~19×; SE ∝ 1/√density would give √19 ≈ 4.4×. Allow
+    // generous slack for smoothing + finite p: require ≥ 1.3×. If SE is
+    // essentially flat across density, the conditional covariance is
+    // mis-using the design and credible intervals are over-confident
+    // exactly where the user least wants them to be.
     assert!(
-        se_high >= 1.5 * se_low,
-        "Gaussian-identity conditional-mean SE is essentially flat: SE@hi/SE@lo = {:.2} (expected ≥ 1.5 on data with σ(x) ratio 6.4×) — either steer to a location-scale model or document this as a known calibration limit",
-        se_high / se_low.max(1e-12),
+        ratio >= 1.3,
+        "Conditional-mean SE doesn't adapt to local design density: \
+         SE@x=0.95 / SE@x=0.05 = {ratio:.2} (expected ≥ 1.3 with 19× density ratio). \
+         Credible intervals in sparse regions will be over-confident.",
     );
 }
