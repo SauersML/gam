@@ -10753,6 +10753,39 @@ mod root_cause_tests {
         }
     }
 
+    struct LinearObjectivePlateauModel {
+        gradient: f64,
+    }
+
+    impl LinearObjectivePlateauModel {
+        fn state(&self, beta: &Coefficients, curvature: HessianCurvatureKind) -> WorkingState {
+            let deviance = 1.0 + self.gradient * beta[0];
+            scalar_working_state(beta, curvature, self.gradient, deviance)
+        }
+    }
+
+    impl WorkingModel for LinearObjectivePlateauModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(self.state(beta, curvature))
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            Ok(self.state(beta, curvature))
+        }
+    }
+
     /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
     /// is too tight.  A coefficient at 1e-6 above its lower bound with a
     /// positive gradient (KKT multiplier) should be recognized as "at the
@@ -11250,19 +11283,18 @@ mod root_cause_tests {
 
     #[test]
     fn long_constrained_objective_plateau_reports_valid_stall() {
-        let mut model = PlateauStatusModel {
-            gradient: -5e-5,
-            current_deviance: 1.0,
-            candidate_deviance: 1.0 - 1.25e-9,
-        };
+        let mut model = LinearObjectivePlateauModel { gradient: -5e-5 };
         let options = WorkingModelPirlsOptions {
             max_iterations: 25,
             convergence_tolerance: 1e-6,
             max_step_halving: 4,
             min_step_size: 0.0,
             firth_bias_reduction: false,
-            coefficient_lower_bounds: Some(array![-1.0]),
-            linear_constraints: None,
+            coefficient_lower_bounds: None,
+            linear_constraints: Some(LinearInequalityConstraints {
+                a: array![[1.0]],
+                b: array![-100.0],
+            }),
             initial_lm_lambda: None,
         };
 
