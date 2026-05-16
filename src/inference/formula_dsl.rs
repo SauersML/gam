@@ -251,7 +251,7 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
+        CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
         parsed_terms_reference_column, validate_marginal_slope_z_column_exclusion,
     };
 
@@ -265,6 +265,20 @@ mod tests {
         assert_eq!(parsed.rhs_terms[0], "x1");
         assert_eq!(parsed.rhs_terms[1], "s(log(x2 + 1), bs=\"tps\", k=10)");
         assert_eq!(parsed.rhs_terms[2], "te(x3, x4)");
+    }
+
+    #[test]
+    fn parses_sphere_smooth_aliases() {
+        let parsed = parse_formula("y ~ sphere(lat, lon, degree=6)").expect("sphere formula");
+        let ParsedTerm::Smooth { vars, options, .. } = &parsed.terms[0] else {
+            panic!("expected smooth term");
+        };
+        assert_eq!(vars, &vec!["lat".to_string(), "lon".to_string()]);
+        assert_eq!(options.get("type").map(String::as_str), Some("sphere"));
+        assert_eq!(options.get("degree").map(String::as_str), Some("6"));
+
+        let err = parse_formula("y ~ sphere(lat)").expect_err("arity");
+        assert!(err.contains("expects exactly two variables"));
     }
 
     #[test]
@@ -1223,6 +1237,20 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         "smooth()/s() requires at least one variable: {raw}"
                     ));
                 }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "sphere" | "s2" | "sos" => {
+                if vars.len() != 2 {
+                    return Err(format!(
+                        "sphere()/s2()/sos() expects exactly two variables (lat, lon): {raw}"
+                    ));
+                }
+                options.insert("type".to_string(), "sphere".to_string());
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,

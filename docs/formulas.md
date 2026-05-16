@@ -8,7 +8,7 @@ response ~ term + term + ... + option(...)
 
 Terms are joined with `+`. `*` and `:` are not supported — interactions come
 from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`, `matern(...)`,
-`duchon(...)`).
+`duchon(...)`), and intrinsic sphere smooths (`sphere(lat, lon)`).
 
 This page lists every right-hand-side term, its options, and the
 formula-level options (`link(...)`, `linkwiggle(...)`, `timewiggle(...)`,
@@ -101,7 +101,7 @@ second-order difference penalty. Options:
 | `knots` | auto | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
-| `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`. |
+| `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 
 Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
@@ -114,6 +114,7 @@ y ~ tps(x1, x2)                     # alias
 y ~ thinplate(x1, x2)               # alias
 y ~ matern(x1, x2, x3)
 y ~ duchon(x1, x2, x3)
+y ~ sphere(lat, lon)                # intrinsic S² smooth
 y ~ te(x, z)                        # tensor product
 y ~ tensor(x, z)                    # alias
 ```
@@ -160,6 +161,22 @@ stiffness). Scale-free unless `length_scale` is given.
 Three independent penalties (mass, tension, stiffness) each get their own
 smoothing parameter under REML.
 
+### Sphere (`sphere`, `s2`, `sos`)
+
+Intrinsic S² smooth for latitude/longitude data on a sphere. The implementation
+uses real spherical harmonics through degree `L`, drops the global constant so
+the ordinary model intercept remains identifiable, and applies a diagonal
+curvature penalty proportional to `[l(l+1)]²` by harmonic degree. This makes the
+longitude seam periodic and removes artificial boundary conditions at the poles.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `degree` / `max_degree` | auto | Maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
+| `k` / `basis_dim` | auto | Alternative target basis dimension; resolved to the smallest `L` with `L(L+2) >= k`. |
+| `radians` | `false` | Treat latitude/longitude as radians instead of degrees. |
+| `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
+| `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
+
 ### Tensor product (`te`, `tensor`)
 
 Kronecker product of univariate B-spline bases. Each axis gets its own
@@ -182,7 +199,8 @@ the truth is reasonable, but they take different paths to get there:
 | You have... | Use... |
 | --- | --- |
 | One covariate | `s(x)` (P-spline). |
-| Two coordinates in the same units (lat, lon) | `s(x, y)` (thin-plate) or `matern(x, y)`. |
+| Two coordinates on a sphere (lat, lon) | `sphere(lat, lon)`. |
+| Two Euclidean coordinates in the same units | `s(x, y)` (thin-plate) or `matern(x, y)`. |
 | Coordinates in different units (space × time) | `te(x, t)`. |
 | 3+ coordinates, especially in different units | `duchon(...)` with `scale_dims=true`, or `matern(...)`. |
 | You want to control wiggliness directly | `matern(...)` with `nu`. |

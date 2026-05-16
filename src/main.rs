@@ -6843,7 +6843,8 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. } => {
             if feature_cols.len() == 1 {
                 Some(feature_cols[0])
             } else {
@@ -7608,7 +7609,9 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => None,
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::Sphere { .. } => None,
     }
 }
 
@@ -7678,7 +7681,8 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. } => feature_cols.clone(),
     }
 }
 
@@ -7734,6 +7738,7 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::ThinPlate { .. } => 2,
         SmoothBasisSpec::Matern { .. } => 3,
         SmoothBasisSpec::Duchon { .. } => 4,
+        SmoothBasisSpec::Sphere { .. } => 5,
     }
 }
 
