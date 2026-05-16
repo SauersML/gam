@@ -287,21 +287,35 @@ impl CublasRuntime {
             return None;
         }
         let x_host = to_col_major(x);
-        let mut wy_host = Vec::with_capacity(rows.checked_mul(y_cols)?);
-        for col in 0..y_cols {
-            for row in 0..rows {
-                wy_host.push(y[[row, col]] * w[row]);
-            }
-        }
+        let y_host = to_col_major(y);
+        let w_host = w.to_vec();
         let mut out_host = vec![0.0; x_cols.checked_mul(y_cols)?];
         let bytes_x = bytes_len(x_host.len())?;
-        let bytes_wy = bytes_len(wy_host.len())?;
+        let bytes_y = bytes_len(y_host.len())?;
+        let bytes_w = bytes_len(w_host.len())?;
         let bytes_out = bytes_len(out_host.len())?;
 
         unsafe {
             self.set_current().ok()?;
             let x_dev = self.alloc_copy(&x_host, bytes_x)?;
-            let wy_dev = self.alloc_copy(&wy_host, bytes_wy)?;
+            let y_dev = self.alloc_copy(&y_host, bytes_y)?;
+            let w_dev = self.alloc_copy(&w_host, bytes_w)?;
+            let wy_dev = DeviceAllocation::new(&self.driver, bytes_y)?;
+            let scale_status = (self.blas.cublas_ddgmm)(
+                self.handle,
+                CUBLAS_SIDE_LEFT,
+                to_i32(rows)?,
+                to_i32(y_cols)?,
+                y_dev.ptr,
+                to_i32(rows)?,
+                w_dev.ptr,
+                1,
+                wy_dev.ptr,
+                to_i32(rows)?,
+            );
+            if scale_status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
             let out_dev = DeviceAllocation::new(&self.driver, bytes_out)?;
             let alpha = 1.0;
             let beta = 0.0;
@@ -474,12 +488,15 @@ type CublasDgemv = unsafe extern "C" fn(
     u64,
     i32,
 ) -> CublasStatus;
+type CublasDdgmm =
+    unsafe extern "C" fn(usize, i32, i32, i32, u64, i32, u64, i32, u64, i32) -> CublasStatus;
 
 struct CublasApi {
     cublas_create: CublasCreate,
     cublas_destroy: CublasDestroy,
     cublas_dgemm: CublasDgemm,
     cublas_dgemv: CublasDgemv,
+    cublas_ddgmm: CublasDdgmm,
 }
 
 impl CublasApi {
@@ -498,6 +515,7 @@ impl CublasApi {
                 cublas_dgemv: *library
                     .get(b"cublasDgemv_v2\0")
                     .map_err(|e| e.to_string())?,
+                cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
             })
         }
     }
@@ -506,6 +524,7 @@ impl CublasApi {
 const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
+const CUBLAS_SIDE_LEFT: i32 = 0;
 
 #[inline]
 fn cublas_op(transpose: bool) -> i32 {
