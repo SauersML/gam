@@ -1,6 +1,5 @@
-"""Bug #1 repro: Duchon centers=80 on (cos t, sin t) lift produces grossly
-oversmoothed / wandering predictions compared to centers=26 (default) or
-thinplate/matern on identical data.
+"""Duchon quality repro: center-heavy fits on a (cos t, sin t) lift should
+track thinplate/matern quality on identical data.
 
 Vary centers, report RMSE of predicted z vs truth on a dense grid.
 """

@@ -48,11 +48,11 @@ class FuzzVsMgcvFormulaTests(unittest.TestCase):
 
         noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
 
-        # length_scale was dropped in commit 35e62344 to align rust pure
-        # scale-free Duchon with mgcv bs='ds' (mgcv has no hybrid-mode analog).
+        # mgcv bs='ds' has no hybrid-mode analog, so the cross-implementation
+        # fuzz harness requests pure scale-free Duchon explicitly.
         self.assertEqual(
             noise_terms,
-            "duchon(x0, x1, centers=5, order=0, power=2)",
+            "duchon(x0, x1, centers=5, order=0, power=2, pure=true)",
         )
         self.assertNotIn("~", noise_terms)
 

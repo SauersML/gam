@@ -5,13 +5,10 @@
 //! stays sane should produce predictions within a generous 5σ ≈ 0.35 envelope
 //! around the truth. We assert that condition.
 //!
-//! Several smooth families are run side-by-side. As of this test's introduction
-//! `duchon(ct, st, centers=80)` returns predictions that wander outside the
-//! envelope (REML for Duchon's three operator penalties — mass / tension /
-//! stiffness — fails to converge: indefinite LAML Hessian, ARC stalls at 200
-//! iters with `|g| ≈ 9.7`, and the fit silently uses the degenerate ρ from the
-//! pseudo-inverse fallback). `thinplate(ct, st)` and `matern(ct, st)` on the
-//! same data stay within tolerance.
+//! Several smooth families are run side-by-side. This locks in the quality
+//! target that `duchon(ct, st)` and `duchon(ct, st, centers=80)` must stay in
+//! the same sane envelope as thin-plate and Matérn smooths on the same cyclic
+//! lift.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;

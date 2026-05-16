@@ -197,8 +197,8 @@ def fit(
         scales are learned, not specified. Corresponds to ``--scale-dimensions``.
     adaptive_regularization:
         Enable exact local adaptive regularization for compatible spatial
-        smooths. Omit to use the automatic policy, which enables it for Duchon
-        smooths.
+        smooths. Omit to use the quality-first automatic policy, which leaves
+        it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
     config:
