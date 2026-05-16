@@ -635,12 +635,8 @@ pub fn build_smooth_basis(
             )
             .map_err(|e| e.to_string())?;
             let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
-            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                CenterStrategy::FarthestPoint {
-                    num_centers: centers,
-                }
-            } else {
-                auto_spatial_center_strategy(centers, 2)
+            let center_strategy = CenterStrategy::FarthestPoint {
+                num_centers: centers,
             };
             let penalty_order = option_usize(options, "m")
                 .or_else(|| option_usize(options, "order"))
@@ -1676,6 +1672,39 @@ mod tests {
                 data_range,
                 num_basis: 8
             } if *data_range == (0.0, std::f64::consts::TAU)
+        ));
+    }
+
+    #[test]
+    fn default_sphere_smooth_uses_spherical_farthest_point_centers() {
+        let ds = continuous_dataset(
+            &["y", "lat", "lon"],
+            (0..24)
+                .map(|i| {
+                    let t = i as f64 / 24.0;
+                    let lat = -60.0 + 120.0 * t;
+                    let lon = -180.0 + 360.0 * ((7 * i) % 24) as f64 / 24.0;
+                    vec![lat.to_radians().sin(), lat, lon]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ sphere(lat, lon)").expect("parse");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build sphere termspec");
+        let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected sphere term");
+        };
+        assert!(matches!(
+            spec.center_strategy,
+            CenterStrategy::FarthestPoint { .. }
         ));
     }
 
