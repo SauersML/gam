@@ -372,7 +372,7 @@ Surv(entry, exit, event) ~ age + survmodel(spec=net, distribution=gaussian)
 | Option | Meaning |
 | --- | --- |
 | `spec` | Baseline specification, e.g. `net`. |
-| `distribution` | Distributional assumption, e.g. `gaussian`. |
+| `distribution` | Residual distribution. Accepted (case-insensitive): `gaussian` / `probit`, `gumbel` / `cloglog`, `logistic` / `logit`. |
 
 Pair with `survival_likelihood=` on `fit()` and the `--predict-noise` route.
 See [survival.md](survival.md).
