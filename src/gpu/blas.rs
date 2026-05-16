@@ -145,11 +145,7 @@ impl CublasRuntime {
         if create_status != CUBLAS_STATUS_SUCCESS {
             return Err(format!("cublasCreate failed with status {create_status}"));
         }
-        Ok(Self {
-            cuda,
-            blas,
-            handle,
-        })
+        Ok(Self { cuda, blas, handle })
     }
 
     fn gemm<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
@@ -326,7 +322,11 @@ impl CublasRuntime {
                 return None;
             }
             check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(out_host.as_mut_ptr().cast(), out_dev.ptr, bytes_out),
+                (self.cuda.api.cu_memcpy_dtoh)(
+                    out_host.as_mut_ptr().cast(),
+                    out_dev.ptr,
+                    bytes_out,
+                ),
                 "cuMemcpyDtoH",
             )
             .ok()?;
@@ -341,7 +341,9 @@ impl CublasRuntime {
     ) -> Option<DeviceAllocation<'a>> {
         let allocation = unsafe { DeviceAllocation::new(&self.cuda.api, bytes) }?;
         check_cuda(
-            unsafe { (self.cuda.api.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes) },
+            unsafe {
+                (self.cuda.api.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes)
+            },
             "cuMemcpyHtoD",
         )
         .ok()?;
