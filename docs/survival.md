@@ -26,7 +26,7 @@ Pick one via `survival_likelihood=` on `fit()`:
 
 | Mode | Description |
 | --- | --- |
-| `"transformation"` | Flexible, semi-parametric. Recommended starting point. |
+| `"transformation"` | Flexible, semi-parametric. Default when `survival_likelihood=` is not set; recommended starting point. |
 | `"weibull"` | Parametric Weibull baseline + linear covariate effects on log hazard. |
 | `"location-scale"` | Joint location-scale; combine with the `noise_formula` config key. |
 | `"marginal-slope"` | Separates baseline risk from a calibrated score's effect. See [marginal-slope.md](marginal-slope.md). |
