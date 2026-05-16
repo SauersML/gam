@@ -2060,6 +2060,10 @@ pub enum BasisMetadata {
         degrees: Vec<usize>,
         identifiability_transform: Option<Array2<f64>>,
     },
+    Sphere {
+        max_degree: usize,
+        radians: bool,
+    },
 }
 
 /// Standardized basis build result for engine-level composition.
