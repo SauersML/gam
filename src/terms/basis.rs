@@ -13342,10 +13342,7 @@ fn build_spherical_harmonic_basis(
         std::f64::consts::PI / 180.0
     };
     for (i, r) in data.outer_iter().enumerate() {
-        let lat = (r[0] * to_rad).clamp(
-            -std::f64::consts::FRAC_PI_2,
-            std::f64::consts::FRAC_PI_2,
-        );
+        let lat = (r[0] * to_rad).clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
         let lon = r[1] * to_rad;
         fill_real_spherical_harmonics_row(lat, lon, l_max, design.row_mut(i));
     }

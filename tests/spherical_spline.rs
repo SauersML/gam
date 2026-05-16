@@ -48,9 +48,10 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
         double_penalty: true,
 
         radians: false,
-    
+
         method: gam::basis::SphereMethod::Wahba,
-        max_degree: None,};
+        max_degree: None,
+    };
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
     assert_eq!(built.design.nrows(), data.nrows());
@@ -267,9 +268,10 @@ fn spherical_basis_rejects_bad_latitudes_and_wrong_dimension() {
         double_penalty: false,
 
         radians: false,
-    
+
         method: gam::basis::SphereMethod::Wahba,
-        max_degree: None,};
+        max_degree: None,
+    };
     let err = build_spherical_spline_basis(bad_lat.view(), &spec).expect_err("invalid latitude");
     assert!(err.to_string().contains("latitude must be in [-90, 90]"));
 
