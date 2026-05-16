@@ -63,6 +63,10 @@ all work without conversion.
 - **Surface smooths in arbitrary dimension.** Thin-plate, Duchon (with
   triple-operator regularization), and Matérn covariance, with automatic
   knot placement.
+- **Geometric / manifold smooths.** Cyclic 1-D, cylinder / torus tensor,
+  intrinsic sphere (Wahba + spherical harmonics), Möbius strip,
+  boundary-conditioned B-splines. Predictor spaces that wrap or close
+  are first-class — no seams, no pole artefacts.
 - **Adaptive anisotropy.** Per-axis spatial anisotropy shrinks or stretches
   each feature axis independently inside a single joint smooth.
 - **Composable basis/kernel.** Combine a spline kernel with a
