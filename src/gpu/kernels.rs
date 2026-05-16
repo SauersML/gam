@@ -3,10 +3,9 @@
 //! These kernels intentionally avoid faer / BLAS so that a device-backed
 //! implementation can be parity-tested against straight Rust arithmetic.
 //! They are not on the hot path; the production CPU kernels in
-//! [`crate::linalg::faer_ndarray`] are faster. Each kernel is paired with a
-//! `try_*` dispatch entry point in [`super::dispatch`] (or one of the
-//! library bindings in [`super::blas`] / [`super::sparse`] / [`super::solver`])
-//! that returns `None` until a real device backend produces the same result.
+//! [`crate::linalg::faer_ndarray`] are faster. Each kernel is paired with an
+//! active GPU dispatch entry point or a production CPU kernel with the same
+//! numerical contract.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -179,12 +178,12 @@ pub fn hutch_trace_reference<F: FnMut(&Array1<f64>) -> Array1<f64>>(
 /// `w_i · monomial(x_i)` into the `c_i`-th cell accumulator. The reference
 /// here is the simple per-row scatter; a device implementation should use a
 /// segmented reduction keyed by cell index.
-pub fn cell_moment_scatter(
-    cell_index: &[usize],
-    weights: ArrayView1<'_, f64>,
-    out: &mut [f64],
-) {
-    assert_eq!(cell_index.len(), weights.len(), "cell/weight length mismatch");
+pub fn cell_moment_scatter(cell_index: &[usize], weights: ArrayView1<'_, f64>, out: &mut [f64]) {
+    assert_eq!(
+        cell_index.len(),
+        weights.len(),
+        "cell/weight length mismatch"
+    );
     for (idx, &w) in cell_index.iter().zip(weights.iter()) {
         if let Some(slot) = out.get_mut(*idx) {
             *slot += w;

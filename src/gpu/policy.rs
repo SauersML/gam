@@ -22,6 +22,8 @@ pub struct DispatchPolicy {
     pub gemm_min_flops: u64,
     /// Minimum estimated FLOPs to dispatch dense GEMV to the device.
     pub gemv_min_flops: u64,
+    /// Minimum non-zero count to dispatch CSR SpMV to the device.
+    pub sparse_spmv_min_nnz: usize,
 }
 
 impl DispatchPolicy {
@@ -31,6 +33,7 @@ impl DispatchPolicy {
             xtwx_min_rows: 8_192,
             gemm_min_flops: 300_000_000,
             gemv_min_flops: 80_000_000,
+            sparse_spmv_min_nnz: 1_000_000,
         }
     }
 
@@ -47,6 +50,7 @@ impl DispatchPolicy {
                 p.xtwx_min_rows = 65_536;
                 p.gemm_min_flops = 512 * 1024 * 1024;
                 p.gemv_min_flops = 256 * 1024 * 1024;
+                p.sparse_spmv_min_nnz = 4_000_000;
             }
             GpuCapability::Mainstream => {
                 // baseline values
@@ -55,11 +59,13 @@ impl DispatchPolicy {
                 p.xtwx_min_rows = 2_048;
                 p.gemm_min_flops = 16 * 1024 * 1024;
                 p.gemv_min_flops = 8 * 1024 * 1024;
+                p.sparse_spmv_min_nnz = 250_000;
             }
             GpuCapability::HighEndDatacenter => {
                 p.xtwx_min_rows = 1_024;
                 p.gemm_min_flops = 4 * 1024 * 1024;
                 p.gemv_min_flops = 2 * 1024 * 1024;
+                p.sparse_spmv_min_nnz = 100_000;
             }
         }
         p
@@ -86,6 +92,11 @@ impl DispatchPolicy {
     /// Should a dense GEMV route to the device?
     pub fn route_gemv(&self, rows: usize, cols: usize) -> bool {
         rows as u64 * cols as u64 * 2 >= self.gemv_min_flops
+    }
+
+    /// Should a CSR SpMV route to the device?
+    pub fn route_csr_spmv(&self, rows: usize, cols: usize, nnz: usize) -> bool {
+        rows > 0 && cols > 0 && nnz >= self.sparse_spmv_min_nnz
     }
 }
 
@@ -132,5 +143,12 @@ mod tests {
         assert!(p.route_gemm(2_048, 2_048, 8));
         assert!(!p.route_gemv(1_024, 1_024));
         assert!(p.route_gemv(8_192, 8_192));
+    }
+
+    #[test]
+    fn route_csr_spmv_uses_device_threshold() {
+        let p = DispatchPolicy::for_device(Some(&device(GpuCapability::Datacenter)));
+        assert!(!p.route_csr_spmv(10_000, 1_000, 1_024));
+        assert!(p.route_csr_spmv(10_000, 1_000, 250_000));
     }
 }
