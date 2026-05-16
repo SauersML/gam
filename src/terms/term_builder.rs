@@ -590,10 +590,17 @@ pub fn build_smooth_basis(
                     })
                     .unwrap_or(false)
             });
-            let method = match options.get("method").map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            let method = match options
+                .get("method")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref()
+            {
                 None | Some("wahba") | Some("kernel") => crate::basis::SphereMethod::Wahba,
-                Some("harmonic") | Some("harmonics") | Some("spherical_harmonics")
-                | Some("spherical-harmonics") | Some("sh") => crate::basis::SphereMethod::Harmonic,
+                Some("harmonic")
+                | Some("harmonics")
+                | Some("spherical_harmonics")
+                | Some("spherical-harmonics")
+                | Some("sh") => crate::basis::SphereMethod::Harmonic,
                 Some(other) => {
                     return Err(format!(
                         "unsupported sphere method '{other}'; use wahba or harmonic"
@@ -602,7 +609,14 @@ pub fn build_smooth_basis(
             };
             let max_degree = option_usize_any(
                 options,
-                &["max_degree", "max-degree", "max_l", "max-l", "harmonic_degree", "l"],
+                &[
+                    "max_degree",
+                    "max-degree",
+                    "max_l",
+                    "max-l",
+                    "harmonic_degree",
+                    "l",
+                ],
             );
             Ok(SmoothBasisSpec::Sphere {
                 feature_cols: cols.to_vec(),
