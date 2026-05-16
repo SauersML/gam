@@ -104,7 +104,7 @@ impl GpuRuntime {
                 }
             }
             Err(err) => {
-                log::trace!("[gam-gpu] CPU fallback: {err}");
+                log::trace!("[gam-gpu] CPU execution selected: {err}");
                 Self {
                     selection: Selection::CpuOnly(err),
                     policy: DispatchPolicy::for_device(None),
