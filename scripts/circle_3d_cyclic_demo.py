@@ -35,17 +35,21 @@ def make_circle_3d(n: int = 220, seed: int = 0):
     return theta, noisy[0], noisy[1], noisy[2], clean[0], clean[1], clean[2]
 
 
-def fit_cyclic(theta: np.ndarray, y: np.ndarray) -> gamfit.Model:
-    data = {"theta": theta.tolist(), "y": y.tolist()}
-    return gamfit.fit(
-        data,
-        "y ~ cyclic(theta, k=10, period_start=0, period_end=6.283185307179586)",
-    )
+def fit_cyclic(theta: np.ndarray, y: np.ndarray):
+    """Fit a cyclic-in-theta smooth by lifting theta -> (sin, cos) on the unit
+    circle and using a 2D thin-plate smooth. Any smooth function of (sin, cos)
+    is automatically periodic in theta."""
+    data = {
+        "ct": np.cos(theta).tolist(),
+        "st": np.sin(theta).tolist(),
+        "y": y.tolist(),
+    }
+    return gamfit.fit(data, "y ~ thinplate(ct, st)")
 
 
 def predict_curve(models, n_grid: int = 400):
     grid = np.linspace(0.0, 2.0 * np.pi, n_grid, endpoint=False)
-    payload = {"theta": grid.tolist()}
+    payload = {"ct": np.cos(grid).tolist(), "st": np.sin(grid).tolist()}
     out = []
     for m in models:
         pred = m.predict(payload, return_type="dict")
