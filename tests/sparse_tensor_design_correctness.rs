@@ -18,13 +18,15 @@
 //!      gated off and the existing dense fall-back runs. Verifies the
 //!      backward-compatibility branch still works.
 
-use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec};
+use gam::basis::{
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
+};
+use gam::linalg::matrix::{DesignMatrix, LinearOperator};
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplineSpec, TermCollectionSpec,
 };
 use gam::terms::smooth::build_term_collection_design;
-use gam::linalg::matrix::{DesignMatrix, LinearOperator};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -52,12 +54,7 @@ fn dense_xt_w_x(dense: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     dense.t().dot(&wx)
 }
 
-fn cross_check_designs(
-    label: &str,
-    candidate: &DesignMatrix,
-    reference: &Array2<f64>,
-    seed: u64,
-) {
+fn cross_check_designs(label: &str, candidate: &DesignMatrix, reference: &Array2<f64>, seed: u64) {
     assert_eq!(
         candidate.nrows(),
         reference.nrows(),
@@ -72,10 +69,7 @@ fn cross_check_designs(
     // Entrywise equality of the densified candidate against the reference.
     let candidate_dense = candidate.to_dense();
     let mut max_abs_diff = 0.0_f64;
-    for (((r, c), a), b) in candidate_dense
-        .indexed_iter()
-        .zip(reference.iter())
-    {
+    for (((r, c), a), b) in candidate_dense.indexed_iter().zip(reference.iter()) {
         let diff = (a - b).abs();
         if diff > max_abs_diff {
             max_abs_diff = diff;
@@ -145,10 +139,7 @@ fn cross_check_designs(
     eprintln!("[{label}] XᵀWX worst rel = {worst_gram:.3e}");
 }
 
-fn build_non_periodic_design(
-    n: usize,
-    seed: u64,
-) -> (DesignMatrix, Array2<f64>) {
+fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>) {
     // Quasi-random x, h on [0, 1]² so each row's marginal supports differ.
     let mut data = Array2::<f64>::zeros((n, 2));
     let phi1: f64 = 0.6180339887498949;
@@ -187,7 +178,7 @@ fn build_non_periodic_design(
             basis: SmoothBasisSpec::TensorBSpline {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
-                    marginalspecs: vec![spec_x, spec_h],
+                    marginalspecs: vec![spec_x.clone(), spec_h.clone()],
                     double_penalty: false,
                     // Identifiability=None gates the new sparse path on.
                     identifiability: TensorBSplineIdentifiability::None,
@@ -206,13 +197,15 @@ fn build_non_periodic_design(
         "non-periodic te(x, h) with identifiability=None should take the new sparse path; got {candidate:?}"
     );
 
-    // Reference: compute the same Khatri-Rao tensor product densely from the
-    // factored marginal designs preserved on the smooth term.
-    let kron = design.smooth.terms[0]
-        .kronecker_factored
-        .as_ref()
-        .expect("identifiability=None preserves kronecker_factored marginals");
-    let reference = khatri_rao_dense(&kron.marginal_designs);
+    let x_basis = build_bspline_basis_1d(data.column(0), &spec_x)
+        .expect("dense reference x marginal")
+        .design
+        .to_dense();
+    let h_basis = build_bspline_basis_1d(data.column(1), &spec_h)
+        .expect("dense reference h marginal")
+        .design
+        .to_dense();
+    let reference = khatri_rao_dense(&[x_basis, h_basis]);
 
     let _ = seed;
     (candidate, reference)

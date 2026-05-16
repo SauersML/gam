@@ -158,7 +158,11 @@ fn fit_at_rho(
 }
 
 fn rel_diff(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    assert_eq!(a.len(), b.len(), "coefficient vectors must have same length");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "coefficient vectors must have same length"
+    );
     let mut num = 0.0_f64;
     let mut den = 0.0_f64;
     for (x, y) in a.iter().zip(b.iter()) {

@@ -20,9 +20,12 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
-fn make_sin_dataset(freq: f64, sigma: f64, n: usize, seed: u64)
-    -> (Vec<f64>, Vec<f64>, gam::data::EncodedDataset)
-{
+fn make_sin_dataset(
+    freq: f64,
+    sigma: f64,
+    n: usize,
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>, gam::data::EncodedDataset) {
     let mut rng = StdRng::seed_from_u64(seed);
     let ux = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, sigma).expect("normal");
@@ -41,14 +44,11 @@ fn make_sin_dataset(freq: f64, sigma: f64, n: usize, seed: u64)
         .zip(y_noisy.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows)
-        .expect("encode sin dataset");
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode sin dataset");
     (x, y_truth, data)
 }
 
-fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64])
-    -> Vec<f64>
-{
+fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -70,7 +70,13 @@ fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f6
 
 fn rmse(yhat: &[f64], y: &[f64]) -> f64 {
     let n = y.len() as f64;
-    (yhat.iter().zip(y.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f64>() / n).sqrt()
+    (yhat
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt()
 }
 
 fn span(v: &[f64]) -> f64 {
@@ -91,10 +97,10 @@ fn matern_default_does_not_collapse_on_sin8() {
 
     // Several ν values that previously collapsed with length_scale=1.0
     let cases: &[(&str, &str)] = &[
-        ("nu=3/2",  "matern(x, nu=3/2)"),
-        ("nu=5/2",  "matern(x, nu=5/2)"),
-        ("nu=7/2",  "matern(x, nu=7/2)"),
-        ("nu=9/2",  "matern(x, nu=9/2)"),
+        ("nu=3/2", "matern(x, nu=3/2)"),
+        ("nu=5/2", "matern(x, nu=5/2)"),
+        ("nu=7/2", "matern(x, nu=7/2)"),
+        ("nu=9/2", "matern(x, nu=9/2)"),
     ];
 
     let mut violations = Vec::<String>::new();
