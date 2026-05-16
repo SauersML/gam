@@ -17712,57 +17712,61 @@ fn build_periodic_duchon_basis_1d(
         effective_nullspace_order,
         &mut workspace.cache,
     )?;
-    // Per-row independent fill. Parallelize via row chunks; each chunk's
-    // writes are disjoint, and the kernel/center matrices are read-only.
+    // Step 1: build the N×K raw kernel matrix in parallel (each row is
+    // independent; no shared writes). Step 2: design[:, :kernel_cols] =
+    // K @ z via fast_ab (BLAS), which beats a hand-rolled per-row matvec
+    // loop both at small K (compiler vectorizes the inner loop) and at
+    // large K (one big matmul vs. many small ones).
     let centers_col0: Vec<f64> = centers.column(0).to_vec();
-    let z_owned = z.clone();
+    let n_data = data.nrows();
+    let k_centers = centers_col0.len();
     let len_scale = spec.length_scale;
+    let mut raw_kernel = Array2::<f64>::zeros((n_data, k_centers));
     let err_flag = std::sync::atomic::AtomicBool::new(false);
-    {
-        let chunk_size = 1024usize;
-        basis
-            .axis_chunks_iter_mut(ndarray::Axis(0), chunk_size)
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(chunk_idx, mut block)| {
-                let row_offset = chunk_idx * chunk_size;
-                for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
-                    let i = row_offset + local_i;
-                    let x = wrap_to_period(data[[i, 0]], left, period);
-                    for j in 0..centers_col0.len() {
-                        let r = periodic_distance_1d(x, centers_col0[j], period);
-                        let raw_kernel = if let Some(ppc) = pure_poly_coeff.as_ref() {
-                            ppc.eval(r)
-                        } else {
-                            match duchon_matern_kernel_general_from_distance(
-                                r,
-                                len_scale,
-                                p_order,
-                                s_order,
-                                1,
-                                coeffs.as_ref(),
-                            ) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return;
-                                }
+    raw_kernel
+        .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 1024;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let x = wrap_to_period(data[[i, 0]], left, period);
+                for j in 0..k_centers {
+                    let r = periodic_distance_1d(x, centers_col0[j], period);
+                    let v = if let Some(ppc) = pure_poly_coeff.as_ref() {
+                        ppc.eval(r)
+                    } else {
+                        match duchon_matern_kernel_general_from_distance(
+                            r,
+                            len_scale,
+                            p_order,
+                            s_order,
+                            1,
+                            coeffs.as_ref(),
+                        ) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
                             }
-                        };
-                        let raw = raw_kernel * kernel_amp;
-                        for col in 0..kernel_cols {
-                            out_row[col] += raw * z_owned[[j, col]];
                         }
-                    }
-                    out_row[kernel_cols] = 1.0;
+                    };
+                    out_row[j] = v * kernel_amp;
                 }
-            });
-    }
+            }
+        });
     if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(BasisError::InvalidInput(
             "periodic Duchon kernel evaluation produced a non-finite value".to_string(),
         ));
     }
+    // design[:, :kernel_cols] = raw_kernel @ z; design[:, kernel_cols] = 1
+    let design_kernel = fast_ab(&raw_kernel, &z);
+    basis
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&design_kernel);
+    basis.column_mut(kernel_cols).fill(1.0);
     let mut center_kernel = Array2::<f64>::zeros((centers.nrows(), centers.nrows()));
     fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
         let r = periodic_distance_1d(centers[[i, 0]], centers[[j, 0]], period);
