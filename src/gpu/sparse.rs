@@ -10,7 +10,7 @@ use ndarray::{Array1, ArrayBase, Data, Ix1};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, load_static_library, to_i32, to_i64,
+    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, load_static_library, to_i64,
 };
 use super::runtime::GpuRuntime;
 
