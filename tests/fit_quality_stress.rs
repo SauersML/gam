@@ -34,7 +34,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        Self(
+            seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        )
     }
     fn next_u64(&mut self) -> u64 {
         self.0 = self
@@ -268,28 +271,18 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
     let sigma = 0.10;
     let mut rng = Lcg::new(0x51 * (k as u64) + 7);
     let theta: Vec<f64> = (0..n).map(|_| TAU * rng.uniform_01()).collect();
-    let y_truth: Vec<f64> = theta
-        .iter()
-        .map(|t| (k as f64 * t).sin())
-        .collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_truth: Vec<f64> = theta.iter().map(|t| (k as f64 * t).sin()).collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_named_1d("theta", &theta, &y_noisy);
     let kb = (2 * k + 6).max(12);
-    let formula = format!(
-        "y ~ cyclic(theta, k={kb}, period_start=0, period_end=6.283185307179586)"
-    );
+    let formula =
+        format!("y ~ cyclic(theta, k={kb}, period_start=0, period_end=6.283185307179586)");
 
     let mgrid: usize = 400;
     let theta_grid: Vec<f64> = (0..mgrid)
         .map(|i| TAU * (i as f64 + 0.5) / mgrid as f64)
         .collect();
-    let truth: Vec<f64> = theta_grid
-        .iter()
-        .map(|t| (k as f64 * t).sin())
-        .collect();
+    let truth: Vec<f64> = theta_grid.iter().map(|t| (k as f64 * t).sin()).collect();
 
     let (yhat, beta) = match fit_predict_1d(&formula, &data, &theta_grid) {
         Ok(v) => v,
@@ -328,14 +321,8 @@ fn hifreq_bc_probe(k: usize) -> Category {
     let sigma = 0.10;
     let mut rng = Lcg::new(0x77 * (k as u64) + 19);
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
-    let y_truth: Vec<f64> = x
-        .iter()
-        .map(|t| (TAU * k as f64 * t).sin())
-        .collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_truth: Vec<f64> = x.iter().map(|t| (TAU * k as f64 * t).sin()).collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_1d(&x, &y_noisy);
     let kb = (2 * k + 8).max(14);
     let formula = format!("y ~ s(x, bc=anchored, k={kb})");
@@ -344,10 +331,7 @@ fn hifreq_bc_probe(k: usize) -> Category {
     let x_grid: Vec<f64> = (0..mgrid)
         .map(|i| 0.005 + 0.99 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
-    let truth: Vec<f64> = x_grid
-        .iter()
-        .map(|t| (TAU * k as f64 * t).sin())
-        .collect();
+    let truth: Vec<f64> = x_grid.iter().map(|t| (TAU * k as f64 * t).sin()).collect();
 
     let (yhat, beta) = match fit_predict_1d(&formula, &data, &x_grid) {
         Ok(v) => v,
@@ -424,18 +408,13 @@ fn hifreq_sphere_probe(l: usize) -> Category {
         .iter()
         .map(|d| legendre_p(l, (d.to_radians()).sin()))
         .collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_2d_named("lat", &lat_deg, "lon", &lon_deg, &y_noisy);
     let max_deg = l + 2;
     let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree={max_deg})");
 
     // Test grid: zonal stripes
-    let lat_test: Vec<f64> = (0..180)
-        .map(|i| -89.0 + 178.0 * i as f64 / 179.0)
-        .collect();
+    let lat_test: Vec<f64> = (0..180).map(|i| -89.0 + 178.0 * i as f64 / 179.0).collect();
     let lon_test: Vec<f64> = vec![0.0; lat_test.len()];
     let truth: Vec<f64> = lat_test
         .iter()
@@ -492,9 +471,8 @@ fn hifreq_tensor_probe(k: usize) -> Category {
     }
     let data = make_dataset_2d_named("theta", &theta, "h", &h, &y_noisy);
     let kb = (2 * k + 4).max(10);
-    let formula = format!(
-        "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k={kb})"
-    );
+    let formula =
+        format!("y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k={kb})");
 
     // Test grid
     let g: Vec<f64> = (0..25).map(|i| 0.02 + 0.96 * i as f64 / 24.0).collect();
@@ -690,10 +668,7 @@ fn outlier_contamination() {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (3.0 * PI * t).cos())
         .collect();
-    let mut y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let mut y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     // Plant 1% outliers at ±10 σ (alternating sign).
     let n_out = ((n as f64) * 0.01).ceil() as usize;
     for k in 0..n_out {
@@ -749,29 +724,18 @@ fn sparse_dense_imbalance() {
     }
     let f = |t: f64| (2.0 * PI * t).sin() + 0.3 * t;
     let y_truth: Vec<f64> = x.iter().map(|&t| f(t)).collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_1d(&x, &y_noisy);
     let formula = "y ~ s(x, bc=anchored, k=20)";
 
     // Test on sparse side only
-    let xg_sparse: Vec<f64> = (0..100)
-        .map(|i| 0.005 + 0.49 * i as f64 / 99.0)
-        .collect();
+    let xg_sparse: Vec<f64> = (0..100).map(|i| 0.005 + 0.49 * i as f64 / 99.0).collect();
     let truth_sparse: Vec<f64> = xg_sparse.iter().map(|&t| f(t)).collect();
     // Test on dense side only
-    let xg_dense: Vec<f64> = (0..100)
-        .map(|i| 0.505 + 0.49 * i as f64 / 99.0)
-        .collect();
+    let xg_dense: Vec<f64> = (0..100).map(|i| 0.505 + 0.49 * i as f64 / 99.0).collect();
     let truth_dense: Vec<f64> = xg_dense.iter().map(|&t| f(t)).collect();
 
-    let all_x: Vec<f64> = xg_sparse
-        .iter()
-        .chain(xg_dense.iter())
-        .copied()
-        .collect();
+    let all_x: Vec<f64> = xg_sparse.iter().chain(xg_dense.iter()).copied().collect();
     let (yhat_all, beta) = fit_predict_1d(formula, &data, &all_x).expect("imbalance fit");
     check_finite("sparse_dense_imbalance", formula, &yhat_all, &beta);
     let (yhat_sparse, yhat_dense) = yhat_all.split_at(100);
@@ -806,10 +770,7 @@ fn boundary_discontinuity_step() {
     let x: Vec<f64> = (0..n).map(|_| rng.uniform_01()).collect();
     let f = |t: f64| if t < 0.5 { 0.0 } else { 1.0 };
     let y_truth: Vec<f64> = x.iter().map(|&t| f(t)).collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_1d(&x, &y_noisy);
     let formula = "y ~ s(x, bc=anchored, k=25)";
 
@@ -859,18 +820,13 @@ fn tensor_multicollinear_inputs() {
     }
     let f = |aa: f64, bb: f64| (PI * aa).sin() + 0.5 * bb;
     let y_truth: Vec<f64> = a.iter().zip(b.iter()).map(|(&x, &y)| f(x, y)).collect();
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_2d_named("a", &a, "b", &b, &y_noisy);
     let formula = "y ~ te(a, b, k=6)";
 
     // Test on the support manifold (b ≈ 0.95 a) — extrapolating off it
     // is unfair.
-    let g: Vec<f64> = (0..60)
-        .map(|i| 0.02 + 0.96 * i as f64 / 59.0)
-        .collect();
+    let g: Vec<f64> = (0..60).map(|i| 0.02 + 0.96 * i as f64 / 59.0).collect();
     let a_test: Vec<f64> = g.clone();
     let b_test: Vec<f64> = g.iter().map(|&u| 0.95 * u + 0.025).collect();
     let truth: Vec<f64> = a_test
@@ -1004,10 +960,7 @@ fn sphere_antipodal_only() {
         lon.push(-180.0 + 360.0 * rng.uniform_01());
         y_truth.push(-1.0);
     }
-    let y_noisy: Vec<f64> = y_truth
-        .iter()
-        .map(|&v| v + sigma * rng.normal())
-        .collect();
+    let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_2d_named("lat", &lat, "lon", &lon, &y_noisy);
     let formula = "y ~ sphere(lat, lon, method=harmonic, max_degree=4)";
 

@@ -54,7 +54,9 @@ fn bspline_bc_clamped_predict_at_new_points_succeeds() {
     };
     let result = fit_from_formula("y ~ s(x, bc=clamped)", &data, &cfg)
         .expect("BC clamped fit should succeed");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
 
     // Predict at 50 new uniform points.
     let n_test = 50;
