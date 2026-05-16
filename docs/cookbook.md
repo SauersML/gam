@@ -94,6 +94,66 @@ gamfit.fit(
 )
 ```
 
+## Cyclic 1-D smooth (day-of-week, hour-of-day, angles)
+
+```python
+import math
+
+# Day-of-week effect on a daily-aggregated outcome (period = 7).
+gamfit.fit(df, "y ~ s(dow, periodic=true, period=7)")
+
+# Hour-of-day with explicit half-open domain.
+gamfit.fit(df, "y ~ cyclic(hour, period_start=0, period_end=24)")
+
+# Angles in radians.
+gamfit.fit(df, f"y ~ s(theta, periodic=true, period={2*math.pi})")
+```
+
+## Tensor product with a periodic axis (cylinder, day × hour, …)
+
+```python
+import math
+two_pi = 2 * math.pi
+
+# Cylinder: theta wraps, h is open.
+gamfit.fit(df, f"y ~ te(theta, h, periodic=[0], period=[{two_pi}, None])")
+
+# Calendar surface: day-of-week × hour-of-day, both periodic.
+gamfit.fit(df,
+    "y ~ te(dow, hour, bc=['periodic','periodic'],"
+    "       periods=[7, 24], origins=[0, 0])")
+
+# Torus: both axes periodic.
+gamfit.fit(df, f"y ~ te(u, v, periodic=[0,1], period=[{two_pi}, {two_pi}])")
+```
+
+## Intrinsic sphere smooth (lat / lon → scalar)
+
+```python
+# Wahba's reproducing kernel — default, isotropic on S², no pole artefacts.
+gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")
+
+# Spherical-harmonic alternative; max_degree=L gives basis dim L(L+2).
+gamfit.fit(df, "y ~ sphere(lat, lon, method=harmonic, max_degree=8, radians=true)")
+
+# Equivalent mgcv-style alias.
+gamfit.fit(df, "y ~ s(lat, lon, bs=sos)")
+```
+
+## Boundary-conditioned 1-D smooth (clamped endpoint slopes)
+
+```python
+# Both endpoints have zero first derivative.
+gamfit.fit(df, "y ~ s(x, bc=clamped)")
+
+# Pin the start to zero, leave the end free.
+gamfit.fit(df, "y ~ s(x, bc_left=anchored, anchor_left=0)")
+```
+
+The geometric-smooths gallery in
+[docs/manifold-smooths.md](manifold-smooths.md) shows every formula
+above recovering its underlying manifold from noisy 3-D point clouds.
+
 ## Flexible link to correct for misspecification
 
 ```python
