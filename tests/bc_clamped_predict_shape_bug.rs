@@ -1,19 +1,20 @@
-//! FAILING TEST — ticket: `s(x, bc=clamped)` fits cleanly but predicting at
-//! new points crashes with
+//! Regression guard for the original `s(x, bc=clamped)` predict-shape
+//! bug:
 //!
 //!     failed to build prediction design: Dimension mismatch:
 //!     frozen identifiability transform mismatch: design has 22 columns
 //!     but transform has 24 rows
 //!
-//! Repro: any non-trivial fit + predict-at-new-points cycle. The fit's frozen
-//! spec stores an identifiability transform sized for the *unconstrained*
-//! basis (24 cols), but the predict-time design builder applies the BC linear
-//! constraints first, producing a 22-col design that doesn't match the saved
-//! transform. Fix: either freeze the post-constraint transform, or apply the
-//! transform before the BC reduction at predict time.
+//! The fit's frozen spec stored an identifiability transform sized for
+//! the *unconstrained* basis (24 cols), but the predict-time design
+//! builder applied the BC linear constraints first, producing a 22-col
+//! design that didn't match the saved transform. Fixed by freezing the
+//! post-constraint transform so predict and fit see the same basis.
 //!
-//! Until fixed, this test fails at `expect(...)`. Keep it failing — it's the
-//! ticket.
+//! This test currently passes; keep it as a regression guard so any
+//! future reintroduction of the column-count mismatch fails loudly.
+//! See `bc_predict_dimension_invariants.rs` for broader BC-variant
+//! dimension coverage.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
