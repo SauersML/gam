@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, HashMap};
 use ndarray::ArrayView1;
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    plan_spatial_basis, resolve_duchon_orders,
+    BSplineBasisSpec, BSplineBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec,
+    CenterCountRequest, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
+    default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
@@ -217,6 +217,86 @@ pub fn build_termspec(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
+fn parse_option_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    inner
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase()
+        })
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn parse_f64_option_list(raw: &str) -> Vec<f64> {
+    parse_option_list(raw)
+        .into_iter()
+        .filter_map(|v| v.parse::<f64>().ok())
+        .collect()
+}
+
+fn tensor_margin_boundary_conditions(
+    options: &BTreeMap<String, String>,
+    cols: &[usize],
+    ds: &Dataset,
+) -> Result<Vec<BSplineBoundaryCondition>, String> {
+    let mut out = vec![BSplineBoundaryCondition::Open; cols.len()];
+    let Some(raw_bc) = options.get("bc").or_else(|| options.get("boundary")) else {
+        return Ok(out);
+    };
+    let bc = parse_option_list(raw_bc);
+    if bc.len() != cols.len() {
+        return Err(format!(
+            "te()/tensor() bc must have one entry per margin: got {} for {} variables",
+            bc.len(),
+            cols.len()
+        ));
+    }
+    let periods = options
+        .get("period")
+        .or_else(|| options.get("periods"))
+        .map(|raw| parse_f64_option_list(raw))
+        .unwrap_or_default();
+    let origins = options
+        .get("origin")
+        .or_else(|| options.get("origins"))
+        .map(|raw| parse_f64_option_list(raw))
+        .unwrap_or_default();
+    for (i, boundary) in bc.iter().enumerate() {
+        match boundary.as_str() {
+            "periodic" | "cyclic" | "cc" => {
+                let origin = origins.get(i).copied().map(Ok).unwrap_or_else(|| {
+                    col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
+                })?;
+                let period = periods.get(i).copied().ok_or_else(|| {
+                    "te()/tensor() periodic margins require period=[...] with one positive period per margin".to_string()
+                })?;
+                if !period.is_finite() || period <= 0.0 {
+                    return Err(format!(
+                        "te()/tensor() period for margin {} must be finite and positive, got {}",
+                        i, period
+                    ));
+                }
+                out[i] = BSplineBoundaryCondition::Periodic { period, origin };
+            }
+            "open" | "none" | "natural" => {}
+            other => {
+                return Err(format!(
+                    "unsupported te()/tensor() boundary condition '{other}'; supported values are open and periodic"
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn build_smooth_basis(
     kind: SmoothKind,
     vars: &[String],
@@ -263,10 +343,17 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
+            let boundary_conditions = tensor_margin_boundary_conditions(options, cols, ds)?;
             let specs = cols
                 .iter()
-                .map(|&c| {
-                    let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                .enumerate()
+                .map(|(i, &c)| {
+                    let (minv, maxv) = match boundary_conditions[i] {
+                        BSplineBoundaryCondition::Periodic { period, origin } => {
+                            (origin, origin + period)
+                        }
+                        BSplineBoundaryCondition::Open => col_minmax(ds.values.column(c))?,
+                    };
                     Ok(BSplineBasisSpec {
                         degree,
                         penalty_order: 2,
@@ -276,6 +363,7 @@ pub fn build_smooth_basis(
                         },
                         double_penalty: smooth_double_penalty,
                         identifiability: BSplineIdentifiability::None,
+                        boundary_condition: boundary_conditions[i].clone(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -326,6 +414,7 @@ pub fn build_smooth_basis(
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
+                    boundary_condition: Default::default(),
                 },
             })
         }

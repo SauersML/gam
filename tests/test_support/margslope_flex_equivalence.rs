@@ -102,6 +102,7 @@ fn age_smooth(feature_col: usize, name: &str) -> SmoothTermSpec {
                 },
                 double_penalty: false,
                 identifiability: Default::default(),
+                boundary_condition: Default::default(),
             },
         },
         shape: ShapeConstraint::None,

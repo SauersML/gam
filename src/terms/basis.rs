@@ -1403,6 +1403,28 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
+    #[serde(default)]
+    pub boundary_condition: BSplineBoundaryCondition,
+}
+
+/// Boundary condition used by 1D B-spline-like bases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BSplineBoundaryCondition {
+    /// Ordinary open/clamped P-spline basis.
+    Open,
+    /// Fully cyclic margin with the supplied period and coordinate origin.
+    ///
+    /// Periodic margins are represented by a finite Fourier basis with a
+    /// diagonal derivative penalty. This gives exact value/derivative wrapping
+    /// under x -> origin + (x-origin) mod period and composes directly in
+    /// tensor-product smooths.
+    Periodic { period: f64, origin: f64 },
+}
+
+impl Default for BSplineBoundaryCondition {
+    fn default() -> Self {
+        Self::Open
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -5488,11 +5510,145 @@ pub fn select_centers_by_strategy(
     }
 }
 
+fn build_periodic_fourier_basis_1d(
+    data: ArrayView1<'_, f64>,
+    spec: &BSplineBasisSpec,
+    period: f64,
+    origin: f64,
+) -> Result<BasisBuildResult, BasisError> {
+    if !period.is_finite() || period <= 0.0 || !origin.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline margin requires finite origin and positive period, got origin={origin}, period={period}"
+        )));
+    }
+    let q = match &spec.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        } => num_internal_knots + spec.degree + 1,
+        BSplineKnotSpec::Automatic {
+            num_internal_knots, ..
+        } => {
+            num_internal_knots
+                .unwrap_or_else(|| default_internal_knot_count_for_data(data.len(), spec.degree))
+                + spec.degree
+                + 1
+        }
+        BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
+    };
+    if q < 3 {
+        return Err(BasisError::InvalidInput(
+            "periodic margin requires at least three basis coefficients".to_string(),
+        ));
+    }
+
+    let n = data.len();
+    let mut design = Array2::<f64>::zeros((n, q));
+    for (i, &x) in data.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "periodic margin contains non-finite data".to_string(),
+            ));
+        }
+        let u = (x - origin).rem_euclid(period) / period;
+        design[[i, 0]] = 1.0;
+        let mut col = 1usize;
+        let mut harmonic = 1usize;
+        while col < q {
+            let angle = std::f64::consts::TAU * (harmonic as f64) * u;
+            design[[i, col]] = angle.sin();
+            col += 1;
+            if col < q {
+                design[[i, col]] = angle.cos();
+                col += 1;
+            }
+            harmonic += 1;
+        }
+    }
+
+    let mut s_bend = Array2::<f64>::zeros((q, q));
+    let mut col = 1usize;
+    let mut harmonic = 1usize;
+    while col < q {
+        let omega = std::f64::consts::TAU * (harmonic as f64) / period;
+        let weight = omega.powi((2 * spec.penalty_order) as i32);
+        s_bend[[col, col]] = weight;
+        col += 1;
+        if col < q {
+            s_bend[[col, col]] = weight;
+            col += 1;
+        }
+        harmonic += 1;
+    }
+
+    let mut penalties_raw = vec![PenaltyCandidate {
+        matrix: s_bend.clone(),
+        nullspace_dim_hint: 1,
+        source: PenaltySource::Primary,
+        normalization_scale: 1.0,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if spec.double_penalty {
+        let mut shrink = Array2::<f64>::zeros((q, q));
+        shrink[[0, 0]] = 1.0;
+        penalties_raw.push(PenaltyCandidate {
+            matrix: shrink,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+
+    let knots = Array1::linspace(origin, origin + period, q + spec.degree + 1);
+    let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
+        .iter()
+        .map(|candidate| candidate.matrix.clone())
+        .collect();
+    let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
+        design,
+        penalties_raw_mats,
+        &knots,
+        spec.degree,
+        &spec.identifiability,
+    )?;
+    let transformed_candidates = penalties
+        .into_iter()
+        .zip(penalties_raw.into_iter())
+        .map(|(matrix, candidate)| PenaltyCandidate {
+            nullspace_dim_hint: candidate.nullspace_dim_hint,
+            matrix,
+            source: candidate.source,
+            normalization_scale: candidate.normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        })
+        .collect::<Vec<_>>();
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        metadata: BasisMetadata::BSpline1D {
+            knots,
+            identifiability_transform,
+        },
+        kronecker_factored: None,
+        ops,
+    })
+}
+
 /// Generic 1D B-spline builder returning design + penalty list.
 pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    if let BSplineBoundaryCondition::Periodic { period, origin } = spec.boundary_condition {
+        return build_periodic_fourier_basis_1d(data, spec, period, origin);
+    }
     let prefer_sparse_design = matches!(
         spec.identifiability,
         BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
@@ -22658,6 +22814,7 @@ mod tests {
             },
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -22684,6 +22841,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22708,6 +22866,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22745,6 +22904,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22788,6 +22948,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -22806,6 +22967,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -22824,6 +22986,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -22876,6 +23039,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22929,6 +23093,7 @@ mod tests {
             identifiability: BSplineIdentifiability::WeightedSumToZero {
                 weights: Some(weights.clone()),
             },
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22955,9 +23120,11 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
+            boundary_condition: Default::default(),
             ..raw.clone()
         };
 
@@ -22985,6 +23152,7 @@ mod tests {
                 columns: constraints.clone(),
                 weights: None,
             },
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
