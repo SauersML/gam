@@ -2983,6 +2983,7 @@ where
             y: y_o.view(),
             priorweights: w_o.view(),
             covariate_se: None,
+            gaussian_fixed_cache: None,
         },
         pirls::PenaltyConfig {
             canonical_penalties: reml_state.canonical_penalties(),

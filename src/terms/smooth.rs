@@ -3080,6 +3080,14 @@ fn build_tensor_bspline_basis(
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    // Per-marginal sparse representation, populated when the 1D builder returned
+    // a `DesignMatrix::Sparse`. Used to assemble the Khatri-Rao tensor product
+    // sparsely (only ∏(degree+1) nonzeros per row) instead of densifying to
+    // shape (n, ∏ q_j) up front. When any marginal lacks a sparse form (e.g.
+    // periodic B-splines currently realize a dense Array2), we fall back to the
+    // existing dense Khatri-Rao path.
+    let mut marginal_sparse =
+        Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
     let mut marginal_periodic = Vec::<Option<(f64, f64, usize)>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
@@ -3110,6 +3118,14 @@ fn build_tensor_bspline_basis(
         marginal_periodic.push(periodic);
         marginal_degrees.push(marginalspec.degree);
         marginalnum_basis.push(built.design.ncols());
+        // Snapshot the sparse form (if any) BEFORE we densify, so the tensor
+        // builder below can take a sparse Khatri-Rao path when all marginals
+        // expose sparsity AND no identifiability transform alters density.
+        let sparse_for_dim = match &built.design {
+            DesignMatrix::Sparse(s) => Some((**s).clone()),
+            DesignMatrix::Dense(_) => None,
+        };
+        marginal_sparse.push(sparse_for_dim);
         marginal_designs.push(built.design.to_dense());
         marginal_penalties.push(
             built
@@ -3226,8 +3242,30 @@ fn build_tensor_bspline_basis(
 
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
+    let identifiability_is_none =
+        matches!(spec.identifiability, TensorBSplineIdentifiability::None);
+    // All marginals expose a sparse representation iff each `marginal_sparse`
+    // slot is `Some(...)`. Currently this is true when every marginal is a
+    // free-boundary, non-periodic 1D B-spline returned as
+    // `DesignMatrix::Sparse` from `build_bspline_basis_1d`. Periodic B-splines
+    // and other dense-only marginals leave a `None` and trigger the fall-back
+    // path. Identifiability transforms (`SumToZero`, `FrozenTransform`) make
+    // the tensor design dense in general, so we also gate on that.
+    let all_marginals_sparse = marginal_sparse.iter().all(Option::is_some);
     let design = if let Some(dense_design) = dense_design {
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
+    } else if identifiability_is_none && all_marginals_sparse {
+        // Sparse Khatri-Rao path: assemble the (n, ∏ q_j) tensor product
+        // directly as a SparseColMat, preserving the ∏(degree_j+1) nonzero
+        // structure per row instead of densifying to ∏ q_j columns. This is
+        // mathematically identical to `tensor_product_design_from_marginals`
+        // applied to the corresponding dense marginals.
+        let sparse_marginals: Vec<&SparseColMat<usize, f64>> = marginal_sparse
+            .iter()
+            .map(|m| m.as_ref().expect("all_marginals_sparse just verified"))
+            .collect();
+        let sparse_design = tensor_product_design_from_sparse_marginals(&sparse_marginals)?;
+        DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_design))
     } else {
         let marginals: Vec<Arc<Array2<f64>>> = marginal_designs
             .iter()

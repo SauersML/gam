@@ -5946,6 +5946,37 @@ pub struct PirlsProblem<'a, X> {
     pub y: ArrayView1<'a, f64>,
     pub priorweights: ArrayView1<'a, f64>,
     pub covariate_se: Option<ArrayView1<'a, f64>>,
+    /// When set, the inner PLS solver reuses the precomputed `XᵀWX` and
+    /// `XᵀW(y − offset)` in *original* coordinates instead of streaming the
+    /// O(N·p²) GEMM and the O(N·p) matvec on every outer REML iteration.
+    ///
+    /// Valid only when the family is Gaussian + Identity link, prior weights
+    /// are constant across outer iterations (always true in the REML outer
+    /// loop), no Firth bias reduction, and no inequality / lower-bound
+    /// constraints (matching the existing Identity short-circuit at
+    /// `pirls.rs:6237`). The penalty `λ·S` is still added per-λ on top of
+    /// the cached `XᵀWX`.
+    pub gaussian_fixed_cache: Option<&'a GaussianFixedCache>,
+}
+
+/// Reusable `XᵀWX` and `XᵀW(y − offset)` for Gaussian + Identity REML fits.
+///
+/// The Gaussian-identity P-IRLS short-circuit solves a single linear system
+/// `(XᵀWX + Σ λ_k S_k + ρ·I) β = XᵀW(y − offset)`. The right-hand-side matrix
+/// and vector are independent of the smoothing parameters `λ`, so when the
+/// outer REML loop evaluates the same problem at many `(λ_1, …, λ_k)`
+/// candidates we only need to assemble them **once** before the loop and
+/// reuse them inside every inner PIRLS call.
+///
+/// Stored in *original* coordinates (no Qs rotation applied). When the
+/// inner solver uses a `WorkingReparamTransform`, it conjugates / projects
+/// these matrices on the fly — that step is O(p³) / O(p²), independent of N.
+#[derive(Debug)]
+pub struct GaussianFixedCache {
+    /// `XᵀWX` in the original coefficient basis. Symmetric, p × p.
+    pub xtwx_orig: Array2<f64>,
+    /// `XᵀW(y − offset)` in the original basis. Length p.
+    pub xtwy_orig: Array1<f64>,
 }
 
 pub struct PenaltyConfig<'a> {
@@ -5997,6 +6028,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         y,
         priorweights,
         covariate_se,
+        gaussian_fixed_cache,
     } = problem;
     let quadctx = crate::quadrature::QuadratureContext::new();
     let lambdas = rho.exp();
@@ -6235,6 +6267,22 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     };
 
     if matches!(link_function, LinkFunction::Identity) {
+        // Apply the Gaussian-Identity fixed-data cache only when every
+        // precondition for the short-circuit's exact reuse holds: the family
+        // really is Gaussian (z = y), there is no Firth bias-reduction term,
+        // no coefficient lower bounds, and no linear inequality constraints
+        // — anything that would change the right-hand side or the system
+        // beyond the additive penalty would invalidate the cache.
+        let cache_eligible = gaussian_fixed_cache.is_some()
+            && matches!(likelihood.family, GlmLikelihoodFamily::GaussianIdentity)
+            && !config.firth_bias_reduction
+            && penalty.coefficient_lower_bounds.is_none()
+            && penalty.linear_constraints_original.is_none();
+        let cache_for_solve = if cache_eligible {
+            gaussian_fixed_cache
+        } else {
+            None
+        };
         let (pls_result, _) = solve_penalized_least_squares_implicit(
             &x_original,
             transform_active.as_ref(),
@@ -6245,6 +6293,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             &mut workspace,
             y,
             link_function,
+            cache_for_solve,
         )?;
 
         let beta_transformed = pls_result.beta;
@@ -6700,6 +6749,7 @@ fn solve_penalized_least_squares_implicit(
     workspace: &mut PirlsWorkspace,
     y: ArrayView1<f64>,
     link_function: LinkFunction,
+    gaussian_fixed_cache: Option<&GaussianFixedCache>,
 ) -> Result<(StablePLSResult, usize), EstimationError> {
     let p_dim = penalty.dim();
 
@@ -6792,35 +6842,54 @@ fn solve_penalized_least_squares_implicit(
     workspace.wz *= &weights;
 
     // 2. Form X'WX: compute in original coordinates, then rotate by Qs.
+    //
+    // Gaussian + Identity REML reuses a precomputed `XᵀWX` (the weights and
+    // design never change across the outer loop in that family), so when the
+    // caller supplied a `GaussianFixedCache` we skip the O(N·p²) streaming
+    // GEMM here and adopt the cached matrix as-is.
     let weights_owned = weights.to_owned();
-    let xtwx_orig = match x_original {
-        // Only materialized dense designs can use the streaming-BLAS path.
-        // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
-        DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
-            let p = x_dense.ncols();
-            let x_dense = x_dense.to_dense_arc();
-            // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as one device GEMM.
-            if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights) {
-                out
-            } else {
-                if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
-                    workspace.hessian_buf = Array2::zeros((p, p).f());
+    let xtwx_orig = if let Some(cache) = gaussian_fixed_cache {
+        debug_assert_eq!(
+            cache.xtwx_orig.nrows(),
+            x_original.ncols(),
+            "GaussianFixedCache XᵀWX row count must match design p"
+        );
+        debug_assert_eq!(
+            cache.xtwx_orig.ncols(),
+            x_original.ncols(),
+            "GaussianFixedCache XᵀWX col count must match design p"
+        );
+        cache.xtwx_orig.clone()
+    } else {
+        match x_original {
+            // Only materialized dense designs can use the streaming-BLAS path.
+            // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
+            DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
+                let p = x_dense.ncols();
+                let x_dense = x_dense.to_dense_arc();
+                // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as one device GEMM.
+                if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights) {
+                    out
                 } else {
-                    workspace.hessian_buf.fill(0.0);
+                    if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                        workspace.hessian_buf = Array2::zeros((p, p).f());
+                    } else {
+                        workspace.hessian_buf.fill(0.0);
+                    }
+                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                        &weights,
+                        &mut workspace.weighted_x_chunk,
+                        x_dense.as_ref(),
+                        &mut workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                    std::mem::take(&mut workspace.hessian_buf)
                 }
-                PirlsWorkspace::add_dense_xtwx_streaming_signed(
-                    &weights,
-                    &mut workspace.weighted_x_chunk,
-                    x_dense.as_ref(),
-                    &mut workspace.hessian_buf,
-                    get_global_parallelism(),
-                );
-                std::mem::take(&mut workspace.hessian_buf)
             }
+            _ => x_original
+                .diag_xtw_x(&weights_owned)
+                .map_err(EstimationError::InvalidInput)?,
         }
-        _ => x_original
-            .diag_xtw_x(&weights_owned)
-            .map_err(EstimationError::InvalidInput)?,
     };
     #[cfg(debug_assertions)]
     let xtwx_orig_asym = max_symmetric_asymmetry(&xtwx_orig);
@@ -6833,7 +6902,19 @@ fn solve_penalized_least_squares_implicit(
     penalty.add_to_hessian(&mut penalized_hessian);
 
     // 3. Form X'Wz: compute in original coordinates, then rotate.
-    let xtwy_orig = x_original.transpose_vector_multiply(&workspace.wz);
+    //    With the Gaussian-Identity cache `z = y` and `wz = W·(y − offset)`
+    //    is identical across outer iterations, so reuse the precomputed
+    //    `XᵀW(y − offset)` directly.
+    let xtwy_orig = if let Some(cache) = gaussian_fixed_cache {
+        debug_assert_eq!(
+            cache.xtwy_orig.len(),
+            x_original.ncols(),
+            "GaussianFixedCache XᵀW(y−offset) length must match design p"
+        );
+        cache.xtwy_orig.clone()
+    } else {
+        x_original.transpose_vector_multiply(&workspace.wz)
+    };
     if workspace.vec_buf_p.len() != p_dim {
         workspace.vec_buf_p = Array1::zeros(p_dim);
     }
@@ -9980,6 +10061,7 @@ mod tests {
                 y: y.view(),
                 priorweights: w.view(),
                 covariate_se: Some(covariate_se.view()),
+                gaussian_fixed_cache: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -10188,6 +10270,7 @@ mod tests {
                 y: y.view(),
                 priorweights: w.view(),
                 covariate_se: None,
+                gaussian_fixed_cache: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -10260,6 +10343,7 @@ mod tests {
                 y: y.view(),
                 priorweights: w.view(),
                 covariate_se: None,
+                gaussian_fixed_cache: None,
             },
             PenaltyConfig {
                 canonical_penalties: &canonical,
@@ -11447,6 +11531,7 @@ mod root_cause_tests {
                     y: y.view(),
                     priorweights: w.view(),
                     covariate_se: None,
+                    gaussian_fixed_cache: None,
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
@@ -11525,6 +11610,7 @@ mod root_cause_tests {
                     y: y.view(),
                     priorweights: w.view(),
                     covariate_se: None,
+                    gaussian_fixed_cache: None,
                 },
                 PenaltyConfig {
                     canonical_penalties: &canonical,
@@ -11623,6 +11709,7 @@ mod root_cause_tests {
                         y: y.view(),
                         priorweights: w.view(),
                         covariate_se: None,
+                        gaussian_fixed_cache: None,
                     },
                     PenaltyConfig {
                         canonical_penalties: &canonical,
