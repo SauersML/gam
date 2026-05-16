@@ -76,9 +76,9 @@ fn cubic_polynomial_truth_recovered_at_noise_floor() {
     let y_truth: Vec<f64> = x_test.iter().map(|&t| f(t)).collect();
 
     let cases: &[(&str, &str)] = &[
-        ("matern",    "matern(x)"),
-        ("duchon",    "duchon(x)"),
-        ("smooth",    "smooth(x)"),
+        ("matern", "matern(x)"),
+        ("duchon", "duchon(x)"),
+        ("smooth", "smooth(x)"),
         ("s_default", "s(x)"),
     ];
 

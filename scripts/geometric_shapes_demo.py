@@ -69,14 +69,23 @@ def gen_cyl(n=4000, sig=0.14):
     return (th, h), (r * np.cos(th), r * np.sin(th), 2 * (h - 0.5)), sig
 
 
-def gen_sph(n=4000, sig=0.12):
+def gen_sph(n=4500, sig=0.10):
     lat = np.arcsin(RNG.uniform(-1, 1, n))
     lon = RNG.uniform(0, TAU, n)
-    r = (
-        1.0
-        + 0.18 * np.sin(3 * lon) * np.cos(2 * lat)
-        + 0.12 * np.cos(lat) * np.sin(2 * lon)
-    )
+
+    def gd(lat0, lon0):
+        c = (np.sin(lat) * np.sin(lat0)
+             + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
+        return np.arccos(np.clip(c, -1, 1))
+
+    # Several distinct bulges, one deep crater, plus a rippling overlay.
+    r = 1.0
+    r += 0.55 * np.exp(-(gd(0.95, 0.30) / 0.45) ** 2)
+    r += 0.42 * np.exp(-(gd(-0.55, 2.50) / 0.50) ** 2)
+    r -= 0.40 * np.exp(-(gd(0.05, 4.20) / 0.55) ** 2)
+    r += 0.32 * np.exp(-(gd(-1.20, 5.70) / 0.38) ** 2)
+    r += 0.22 * np.sin(4 * lon) * np.cos(3 * lat)
+    r += 0.10 * np.sin(6 * lon + 2 * lat)
     return (lat, lon), (
         r * np.cos(lat) * np.cos(lon),
         r * np.cos(lat) * np.sin(lon),

@@ -49,8 +49,7 @@ fn try_fit_predict(
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, data, &cfg)
-        .map_err(|e| format!("fit error: {e}"))?;
+    let result = fit_from_formula(formula, data, &cfg).map_err(|e| format!("fit error: {e}"))?;
     let FitResult::Standard(fit) = result else {
         return Err("non-standard fit".to_string());
     };
@@ -88,9 +87,9 @@ fn small_n_linear_truth_recovers_slope_or_errors_loudly() {
     let truth_span = span(&y_truth);
 
     let families: &[(&str, &str)] = &[
-        ("matern",    "matern(x)"),
-        ("duchon",    "duchon(x)"),
-        ("smooth",    "smooth(x)"),
+        ("matern", "matern(x)"),
+        ("duchon", "duchon(x)"),
+        ("smooth", "smooth(x)"),
         ("s_default", "s(x)"),
     ];
 
@@ -104,9 +103,7 @@ fn small_n_linear_truth_recovers_slope_or_errors_loudly() {
             }
         };
         let s = span(&yhat);
-        eprintln!(
-            "[small-n] {label:10} span={s:.3} (truth span={truth_span:.3})"
-        );
+        eprintln!("[small-n] {label:10} span={s:.3} (truth span={truth_span:.3})");
         if s < 0.80 * truth_span {
             violations.push(format!(
                 "{label}: predicted span {s:.3} < 0.80 × truth span {truth_span:.3} (collapsed)"

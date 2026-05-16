@@ -81,9 +81,7 @@ fn duplicate_x_rows_produces_finite_fit_and_reasonable_predictions() {
         let want = f(xu);
         let got = pred[i];
         let err = (got - want).abs();
-        eprintln!(
-            "[dup-x] x={xu:.2} truth={want:+.3} pred={got:+.3} err={err:.3}"
-        );
+        eprintln!("[dup-x] x={xu:.2} truth={want:+.3} pred={got:+.3} err={err:.3}");
         if err > 0.10 {
             violations.push(format!(
                 "x={xu:.2}: |pred {got:+.3} − truth {want:+.3}| = {err:.3} > 0.10"

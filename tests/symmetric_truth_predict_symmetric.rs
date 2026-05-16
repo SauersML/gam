@@ -30,11 +30,8 @@ fn build_symmetric_data(n_pairs: usize) -> gam::data::EncodedDataset {
         rows.push(StringRecord::from(vec![xl.to_string(), y.to_string()]));
         rows.push(StringRecord::from(vec![xr.to_string(), y.to_string()]));
     }
-    encode_recordswith_inferred_schema(
-        ["x", "y"].into_iter().map(String::from).collect(),
-        rows,
-    )
-    .expect("encode symmetric dataset")
+    encode_recordswith_inferred_schema(["x", "y"].into_iter().map(String::from).collect(), rows)
+        .expect("encode symmetric dataset")
 }
 
 fn fit_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) -> Vec<f64> {
@@ -61,9 +58,7 @@ fn symmetric_data_yields_symmetric_predictions() {
     init_parallelism();
     let data = build_symmetric_data(120);
 
-    let probes: Vec<f64> = (0..20)
-        .map(|i| 0.05 + 0.40 * i as f64 / 19.0)
-        .collect();
+    let probes: Vec<f64> = (0..20).map(|i| 0.05 + 0.40 * i as f64 / 19.0).collect();
 
     let mut x_test: Vec<f64> = Vec::with_capacity(2 * probes.len());
     for &d in &probes {
