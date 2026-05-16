@@ -1403,6 +1403,47 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
+    /// Optional endpoint value/slope constraints for 1D B-spline smooths.
+    ///
+    /// These are enforced by the smooth-term builder as linear equality
+    /// constraints (represented internally as paired inequalities) in the
+    /// final coefficient coordinates, after identifiability and shape
+    /// reparameterizations have been applied.
+    #[serde(default)]
+    pub boundary_condition: BSplineBoundaryCondition,
+}
+
+/// Per-endpoint boundary condition for a 1D B-spline smooth.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BSplineEndpointCondition {
+    /// Do not constrain this endpoint.
+    None,
+    /// Force the first derivative to zero at this endpoint.
+    Clamped,
+    /// Force the smooth value to the supplied value at this endpoint.
+    Anchored { value: f64 },
+}
+
+impl Default for BSplineEndpointCondition {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Boundary conditions for the left and right endpoints of a 1D B-spline smooth.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BSplineBoundaryCondition {
+    #[serde(default)]
+    pub left: BSplineEndpointCondition,
+    #[serde(default)]
+    pub right: BSplineEndpointCondition,
+}
+
+impl BSplineBoundaryCondition {
+    pub fn is_unconstrained(self) -> bool {
+        matches!(self.left, BSplineEndpointCondition::None)
+            && matches!(self.right, BSplineEndpointCondition::None)
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -22658,6 +22699,7 @@ mod tests {
             },
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -22684,6 +22726,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22708,6 +22751,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22745,6 +22789,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22788,6 +22833,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -22806,6 +22852,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -22824,6 +22871,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -22876,6 +22924,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22929,6 +22978,7 @@ mod tests {
             identifiability: BSplineIdentifiability::WeightedSumToZero {
                 weights: Some(weights.clone()),
             },
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -22955,9 +23005,11 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_condition: Default::default(),
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
+            boundary_condition: Default::default(),
             ..raw.clone()
         };
 
@@ -22985,6 +23037,7 @@ mod tests {
                 columns: constraints.clone(),
                 weights: None,
             },
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
