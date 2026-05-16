@@ -2077,19 +2077,49 @@ impl Default for SpatialIdentifiability {
     }
 }
 
-/// Wahba spherical spline basis configuration.
+/// Which intrinsic S² smooth construction to use.
+///
+/// - `Wahba`: closed-form reproducing-kernel pseudo-spline (Wahba 1981) on
+///   a center set selected by `center_strategy`.
+/// - `Harmonic`: real spherical-harmonic truncation up to `max_degree` with
+///   the Laplace-Beltrami squared eigenvalue penalty `[l(l+1)]^2`. Basis
+///   dimension is `max_degree * (max_degree + 2)`; centers are ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SphereMethod {
+    Wahba,
+    Harmonic,
+}
+
+impl Default for SphereMethod {
+    fn default() -> Self {
+        SphereMethod::Wahba
+    }
+}
+
+/// Intrinsic S² (sphere) smooth configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SphericalSplineBasisSpec {
-    /// Center/knot selection strategy in latitude/longitude coordinates.
+    /// Center/knot selection strategy in latitude/longitude coordinates
+    /// (used only when `method == Wahba`).
     pub center_strategy: CenterStrategy,
-    /// Wahba pseudo-spline penalty order m. Currently m=1..4 are closed form; m=2 is the usual curvature penalty.
+    /// Wahba pseudo-spline penalty order m. m=1..4 closed form; m=2 is the
+    /// usual curvature penalty. Ignored for `Harmonic`.
     pub penalty_order: usize,
-    /// Add a ridge-like shrinkage penalty on the constrained kernel coefficients.
+    /// Add a ridge-like shrinkage penalty.
     pub double_penalty: bool,
     /// Interpret latitude/longitude in radians instead of degrees. Default is
     /// degrees (Earth/data-frame convention); set true for radians.
     #[serde(default)]
     pub radians: bool,
+    /// Construction method. Default Wahba (reproducing kernel); Harmonic uses
+    /// real spherical harmonics with the Laplace-Beltrami squared eigenvalue
+    /// penalty (Wood §5.6.2, mgcv `bs="sos"`).
+    #[serde(default)]
+    pub method: SphereMethod,
+    /// Maximum spherical-harmonic degree L when `method == Harmonic`. Basis
+    /// dimension is `L * (L + 2)`. Ignored for Wahba.
+    #[serde(default)]
+    pub max_degree: Option<usize>,
 }
 
 impl Default for SphericalSplineBasisSpec {
@@ -2099,6 +2129,8 @@ impl Default for SphericalSplineBasisSpec {
             penalty_order: 2,
             double_penalty: true,
             radians: false,
+            method: SphereMethod::Wahba,
+            max_degree: None,
         }
     }
 }
@@ -13143,6 +13175,9 @@ pub fn build_spherical_spline_basis(
     data: ArrayView2<'_, f64>,
     spec: &SphericalSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    if matches!(spec.method, SphereMethod::Harmonic) {
+        return build_spherical_harmonic_basis(data, spec);
+    }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
     if !(1..=4).contains(&spec.penalty_order) {
         return Err(BasisError::InvalidInput(format!(
@@ -13200,6 +13235,167 @@ pub fn build_spherical_spline_basis(
             centers,
             penalty_order: spec.penalty_order,
             constraint_transform: Some(z),
+        },
+        kronecker_factored: None,
+        ops,
+    })
+}
+
+/// Spherical-harmonic norm √((2l+1)/(4π) · (l-m)!/(l+m)!) computed via a
+/// stable ratio loop to avoid factorial overflow even at L ≥ 20.
+fn spherical_harmonic_norm(l: usize, m: usize) -> f64 {
+    let mut ratio = 1.0f64;
+    if m > 0 {
+        for k in (l - m + 1)..=(l + m) {
+            ratio /= k as f64;
+        }
+    }
+    (((2 * l + 1) as f64) / (4.0 * std::f64::consts::PI) * ratio).sqrt()
+}
+
+/// Fill one row of the real-spherical-harmonic design at (lat, lon) in
+/// radians, columns ordered by degree l = 1..=L with m running
+/// -l, -l+1, ..., -1, 0, 1, ..., l (Condon-Shortley convention dropped via
+/// no extra sign).
+fn fill_real_spherical_harmonics_row(
+    lat: f64,
+    lon: f64,
+    max_degree: usize,
+    mut row: ndarray::ArrayViewMut1<'_, f64>,
+) {
+    let x = lat.sin(); // cos(colatitude) = sin(lat)
+    let l_cap = max_degree + 1;
+    let mut p_lm = vec![vec![0.0f64; l_cap]; l_cap];
+    p_lm[0][0] = 1.0;
+    let somx2 = (1.0 - x * x).max(0.0).sqrt();
+    for m in 1..=max_degree {
+        p_lm[m][m] = -((2 * m - 1) as f64) * somx2 * p_lm[m - 1][m - 1];
+    }
+    for m in 0..max_degree {
+        p_lm[m + 1][m] = ((2 * m + 1) as f64) * x * p_lm[m][m];
+    }
+    for m in 0..=max_degree {
+        for l in (m + 2)..=max_degree {
+            p_lm[l][m] = (((2 * l - 1) as f64) * x * p_lm[l - 1][m]
+                - ((l + m - 1) as f64) * p_lm[l - 2][m])
+                / ((l - m) as f64);
+        }
+    }
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let mut col = 0usize;
+    for l in 1..=max_degree {
+        // sin(m·lon) for m = l, l-1, ..., 1
+        for m_pos in (1..=l).rev() {
+            let m = m_pos;
+            let norm = spherical_harmonic_norm(l, m);
+            row[col] = sqrt2 * norm * p_lm[l][m] * (m as f64 * lon).sin();
+            col += 1;
+        }
+        // m = 0
+        row[col] = spherical_harmonic_norm(l, 0) * p_lm[l][0];
+        col += 1;
+        // cos(m·lon) for m = 1, ..., l
+        for m in 1..=l {
+            let norm = spherical_harmonic_norm(l, m);
+            row[col] = sqrt2 * norm * p_lm[l][m] * (m as f64 * lon).cos();
+            col += 1;
+        }
+    }
+}
+
+/// Default L for the harmonic basis when the user does not set `max_degree`.
+/// Targets ~k = 50 columns (mgcv `sos` default), capped at L=12 (168 cols).
+pub fn default_spherical_harmonic_degree(n_rows: usize) -> usize {
+    let target = (n_rows as f64).sqrt().clamp(3.0, 12.0).ceil() as usize;
+    let mut l = 1usize;
+    while l * (l + 2) < target && l < 12 {
+        l += 1;
+    }
+    l.max(2)
+}
+
+/// Build the spherical-harmonic basis (alternative `method == Harmonic`).
+fn build_spherical_harmonic_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &SphericalSplineBasisSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    validate_lat_lon_matrix(data, "spherical-harmonic", spec.radians)?;
+    let n = data.nrows();
+    let l_max = spec
+        .max_degree
+        .unwrap_or_else(|| default_spherical_harmonic_degree(n));
+    if l_max < 1 {
+        return Err(BasisError::InvalidInput(
+            "spherical-harmonic max_degree must be >= 1".to_string(),
+        ));
+    }
+    if l_max > 32 {
+        return Err(BasisError::InvalidInput(format!(
+            "spherical-harmonic max_degree {l_max} too large; cap is 32"
+        )));
+    }
+    let p = l_max * (l_max + 2);
+    let mut design = Array2::<f64>::zeros((n, p));
+    let to_rad = if spec.radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
+    for (i, r) in data.outer_iter().enumerate() {
+        let lat = (r[0] * to_rad).clamp(
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::FRAC_PI_2,
+        );
+        let lon = r[1] * to_rad;
+        fill_real_spherical_harmonics_row(lat, lon, l_max, design.row_mut(i));
+    }
+    // Diagonal eigenvalue penalty [l(l+1)]^2 per (l, m).
+    let mut penalty = Array2::<f64>::zeros((p, p));
+    let mut col = 0usize;
+    for l in 1..=l_max {
+        let eig = (l as f64 * (l as f64 + 1.0)).powi(2);
+        for _ in 0..(2 * l + 1) {
+            penalty[[col, col]] = eig;
+            col += 1;
+        }
+    }
+    let (penalty_norm, c_primary) = normalize_penalty(&penalty);
+    let mut candidates = vec![PenaltyCandidate {
+        matrix: penalty_norm,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale: c_primary,
+        kronecker_factors: None,
+        op: None,
+    }];
+    if spec.double_penalty {
+        let ridge = Array2::<f64>::eye(p);
+        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+        candidates.push(PenaltyCandidate {
+            matrix: ridge_norm,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::DoublePenaltyNullspace,
+            normalization_scale: c_ridge,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    // Metadata-wise the harmonic basis is intrinsic (no centers); we reuse
+    // the existing Sphere metadata variant with an empty center matrix and
+    // None constraint transform, plus the harmonic order encoded as
+    // penalty_order = max_degree | 0x8000_0000 sentinel; freeze can detect
+    // method by inspecting `centers.nrows() == 0`.
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        metadata: BasisMetadata::Sphere {
+            centers: Array2::<f64>::zeros((0, 2)),
+            penalty_order: l_max,
+            constraint_transform: None,
         },
         kronecker_factored: None,
         ops,
