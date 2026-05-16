@@ -2625,6 +2625,7 @@ fn build_shape_constraint_design_1d(
                         transform: z.clone(),
                     })
                     .unwrap_or(BSplineIdentifiability::None),
+                boundary_conditions: Default::default(),
             };
             build_bspline_basis_1d(x_grid.view(), &evalspec)?
                 .design
@@ -14390,6 +14391,7 @@ mod tests {
                         },
                         double_penalty: true,
                         identifiability: BSplineIdentifiability::default(),
+                        boundary_conditions: Default::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -14694,6 +14696,7 @@ mod tests {
                     },
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::default(),
+                    boundary_conditions: Default::default(),
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
@@ -14785,6 +14788,7 @@ mod tests {
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
+                        boundary_conditions: Default::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -15148,6 +15152,7 @@ mod tests {
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
+                        boundary_conditions: Default::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -15271,6 +15276,7 @@ mod tests {
                     },
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::default(),
+                    boundary_conditions: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -15415,6 +15421,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
                         },
                     },
                     shape: ShapeConstraint::None,
@@ -16045,6 +16052,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -16055,6 +16063,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
+            boundary_conditions: Default::default(),
         };
 
         let terms = vec![SmoothTermSpec {
@@ -16100,6 +16109,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -16110,6 +16120,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
         };
         let mx = build_bspline_basis_1d(data.column(0), &spec_x)
             .unwrap()
@@ -16173,6 +16184,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
                         },
                         BSplineBasisSpec {
                             degree: 3,
@@ -16183,6 +16195,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
                         },
                     ],
                     double_penalty: false,
@@ -17834,6 +17847,7 @@ mod tests {
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
+                        boundary_conditions: Default::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -18120,6 +18134,7 @@ mod tests {
                     },
                     double_penalty: true,
                     identifiability: BSplineIdentifiability::None,
+                    boundary_conditions: Default::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -18295,6 +18310,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::None,
+                            boundary_conditions: Default::default(),
                         },
                     },
                     shape: ShapeConstraint::MonotoneIncreasing,
@@ -20002,6 +20018,7 @@ mod tests {
                         },
                         double_penalty: true,
                         identifiability: BSplineIdentifiability::None,
+                        boundary_conditions: Default::default(),
                     },
                 },
                 shape: ShapeConstraint::None,

@@ -11062,6 +11062,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
                         },
                     },
                     shape: ShapeConstraint::None,
