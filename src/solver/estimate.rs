@@ -2318,6 +2318,30 @@ where
     )
 }
 
+fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
+    let gaussian = matches!(link, LinkFunction::Identity);
+    SeedConfig {
+        bounds: (-12.0, 12.0),
+        max_seeds: if gaussian {
+            1
+        } else if k <= 4 {
+            6
+        } else if k <= 12 {
+            8
+        } else {
+            10
+        },
+        seed_budget: if k <= 6 { 1 } else { 2 },
+        risk_profile: if gaussian {
+            SeedRiskProfile::Gaussian
+        } else {
+            SeedRiskProfile::GeneralizedLinear
+        },
+        screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
+        num_auxiliary_trailing: 0,
+    }
+}
+
 fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -2409,24 +2433,7 @@ where
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
-    let reml_seed_config = SeedConfig {
-        bounds: (-12.0, 12.0),
-        max_seeds: if k <= 4 {
-            6
-        } else if k <= 12 {
-            8
-        } else {
-            10
-        },
-        seed_budget: if k <= 6 { 1 } else { 2 },
-        risk_profile: if matches!(cfg.link_function(), LinkFunction::Identity) {
-            SeedRiskProfile::Gaussian
-        } else {
-            SeedRiskProfile::GeneralizedLinear
-        },
-        screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
-        num_auxiliary_trailing: 0,
-    };
+    let reml_seed_config = external_reml_seed_config(k, cfg.link_function());
     let reml_tol = cfg.reml_convergence_tolerance;
     let reml_max_iter = opts.max_iter;
     let outer_eval_idx = AtomicUsize::new(0usize);
@@ -5625,6 +5632,22 @@ mod estimate_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
+
+    #[test]
+    fn gaussian_external_reml_uses_single_seed_policy() {
+        let cfg = external_reml_seed_config(2, LinkFunction::Identity);
+        assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
+        assert_eq!(cfg.max_seeds, 1);
+        assert_eq!(cfg.seed_budget, 1);
+    }
+
+    #[test]
+    fn generalized_external_reml_keeps_multistart_policy() {
+        let cfg = external_reml_seed_config(2, LinkFunction::Logit);
+        assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
+        assert!(cfg.max_seeds > 1);
+        assert_eq!(cfg.seed_budget, 1);
+    }
 
     #[test]
     fn sas_raw_epsilon_hessian_chain_rule_matches_chained_gradient_slope() {
