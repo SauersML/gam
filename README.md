@@ -99,6 +99,33 @@ gamfit.fit(df, "y ~ duchon(x1, x2, x3, x4, centers=80)")
 gamfit.fit(df, "y ~ te(space, time, k=10)")   # tensor product
 ```
 
+### Geometric / manifold smooths
+
+When the predictor space is a circle, cylinder, torus, sphere, or
+Möbius strip, ordinary smooths produce visible seams and pole
+artefacts. gamfit's geometric smooths bake the wrap topology into
+both the basis and the penalty — `periodic=[axes]`, `period=[...]`
+margins for tensor products, an intrinsic `sphere(...)` kernel
+(Wahba's reproducing kernel or spherical harmonics), and
+boundary-conditioned 1-D B-splines.
+
+![rotating recovery of six manifolds (trefoil knot, latent-free loop,
+wobbly cylinder, lumpy sphere, bumpy torus, Möbius strip) from noisy
+3-D point clouds](docs/images/geometric_shapes_demo.gif)
+
+Each pair shows a noisy 3-D point cloud (left) and the smooth
+manifold the geometric smooths recover (right). The full gallery,
+formulas, and reproduction script live in
+[docs/manifold-smooths.md](docs/manifold-smooths.md).
+
+```python
+gamfit.fit(df, "y ~ s(theta, periodic=true, period=6.283)")        # circle
+gamfit.fit(df, "y ~ te(theta, h, periodic=[0], period=[6.283, None])")  # cylinder
+gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[6.283, 6.283])")   # torus
+gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")               # S²
+gamfit.fit(df, "y ~ s(x, bc=clamped)")                             # zero-slope endpoints
+```
+
 ### Flexible / learnable link functions
 
 A spline offset on top of a base link lets the data correct for link
