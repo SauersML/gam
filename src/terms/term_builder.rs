@@ -385,11 +385,7 @@ pub fn build_smooth_basis(
             };
             if inferred {
                 let effective_n = tensor_effective_support_count(ds, cols);
-                cap_inferred_tensor_internal_knots(
-                    &mut internal_knots_by_dim,
-                    degree,
-                    effective_n,
-                );
+                cap_inferred_tensor_internal_knots(&mut internal_knots_by_dim, degree, effective_n);
             }
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 for n_knots in &mut internal_knots_by_dim {

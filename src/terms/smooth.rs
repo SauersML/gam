@@ -2314,12 +2314,16 @@ fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
 /// the auto sentinel (`0.0`), overwrite it with [`auto_initial_length_scale`].
 fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
     match &mut term.basis {
-        SmoothBasisSpec::Matern { feature_cols, spec, .. } => {
+        SmoothBasisSpec::Matern {
+            feature_cols, spec, ..
+        } => {
             if spec.length_scale == 0.0 {
                 spec.length_scale = auto_initial_length_scale(data, feature_cols);
             }
         }
-        SmoothBasisSpec::ThinPlate { feature_cols, spec, .. } => {
+        SmoothBasisSpec::ThinPlate {
+            feature_cols, spec, ..
+        } => {
             if spec.length_scale == 0.0 {
                 spec.length_scale = auto_initial_length_scale(data, feature_cols);
             }
