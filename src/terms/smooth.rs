@@ -16085,6 +16085,76 @@ mod tests {
     }
 
     #[test]
+    fn centered_tensor_penalties_canonicalize_in_transformed_basis_width() {
+        let n = 16usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            data[[i, 1]] = 0.5 + 0.25 * (2.0 * std::f64::consts::PI * t).sin();
+        }
+
+        let tensor_term = SmoothTermSpec {
+            name: "te_centered".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginalspecs: vec![
+                        BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knotspec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 3,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
+                        },
+                        BSplineBasisSpec {
+                            degree: 3,
+                            penalty_order: 2,
+                            knotspec: BSplineKnotSpec::Generate {
+                                data_range: (0.0, 1.0),
+                                num_internal_knots: 2,
+                            },
+                            double_penalty: false,
+                            identifiability: BSplineIdentifiability::default(),
+                            boundary_conditions: Default::default(),
+                        },
+                    ],
+                    double_penalty: false,
+                    identifiability: TensorBSplineIdentifiability::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+        };
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![tensor_term],
+        };
+        let design = build_term_collection_design(data.view(), &spec).unwrap();
+        let penalty_specs = design
+            .penalties
+            .iter()
+            .map(crate::estimate::PenaltySpec::from_blockwise_ref)
+            .collect::<Vec<_>>();
+        let (canonical, _) = crate::terms::construction::canonicalize_penalty_specs(
+            &penalty_specs,
+            &design.nullspace_dims,
+            design.design.ncols(),
+            "centered tensor penalty regression",
+        )
+        .unwrap();
+        for cp in canonical {
+            assert_eq!(cp.root.ncols(), cp.col_range.len());
+            assert_eq!(cp.local.nrows(), cp.col_range.len());
+            assert_eq!(cp.local.ncols(), cp.col_range.len());
+        }
+    }
+
+    #[test]
     fn periodic_bspline_margin_wraps_exactly_at_period() {
         let x = array![0.0, 1.25, 2.5, 3.75, 7.0, 8.25];
         let spec = BSplineBasisSpec {
