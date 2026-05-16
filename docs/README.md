@@ -39,6 +39,9 @@ This site is the Python documentation. For a short overview, see the
 
 - [Formula DSL reference](formulas.md) — every term type, every option, every
   link, every family.
+- [Manifold smooths gallery](manifold-smooths.md) — visual tour of the
+  periodic, cylinder, torus, sphere, Möbius, and boundary-conditioned
+  smooths recovered from noisy 3-D point clouds.
 - [Families and link functions](families-and-links.md) — when to use which,
   including `flexible(...)`, `blended(...)`, `sas`, `beta-logistic`.
 - [Survival models](survival.md) — `Surv(...)` syntax, the four likelihood
