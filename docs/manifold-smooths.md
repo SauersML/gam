@@ -111,6 +111,11 @@ The first run generates noisy CSVs under
 alongside the script. Re-runs reuse the cache; pass `--regen` to start
 fresh, or `--still / --mp4 / --gif` to render only one output.
 
+For a smaller, Python-only entry point — a single tilted 3-D circle
+with a localized radial spike, fit via `gamfit.fit` directly without
+the CLI — see [`scripts/circle_3d_cyclic_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/circle_3d_cyclic_demo.py)
+(120 lines, no PyVista, no rendering dependencies beyond matplotlib).
+
 ## Related reading
 
 - [Formula DSL — periodic / cyclic smooths](formulas.md#periodic--cyclic-smooths)
