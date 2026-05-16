@@ -4923,7 +4923,15 @@ fn run_outer_with_plan(
                 if candidate_improves_best(&candidate, best.as_ref()) {
                     best = Some(candidate);
                 }
-                if best.as_ref().is_some_and(|b| b.converged) {
+                let quality_compare_remaining_gaussian_seeds =
+                    matches!(
+                        config.seed_config.risk_profile,
+                        crate::seeding::SeedRiskProfile::Gaussian
+                    ) && seed_budget > 1
+                        && started_seeds < seed_budget;
+                if best.as_ref().is_some_and(|b| b.converged)
+                    && !quality_compare_remaining_gaussian_seeds
+                {
                     break;
                 }
                 if !candidate_converged && matches!(expensive_seed_limit, Some(limit) if limit > 0)
