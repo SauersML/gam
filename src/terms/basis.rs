@@ -14037,7 +14037,6 @@ fn build_spherical_harmonic_basis(
     // dominates only at tiny n. For biobank n we want rows to fan out across
     // threads; rayon::par_iter over a row range with thread-local scratch.
     {
-        let data_slice = data.as_slice().expect("contiguous lat/lon data");
         let mut row_blocks = design
             .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
             .collect::<Vec<_>>();
@@ -14048,9 +14047,9 @@ fn build_spherical_harmonic_basis(
             let row_offset = chunk_idx * chunk_size;
             for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
                 let i = row_offset + local_i;
-                let lat_raw = data_slice[i * 2] * to_rad;
+                let lat_raw = data[(i, 0)] * to_rad;
                 let lat = lat_raw.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-                let lon = data_slice[i * 2 + 1] * to_rad;
+                let lon = data[(i, 1)] * to_rad;
                 fill_real_spherical_harmonics_row(
                     lat,
                     lon,
