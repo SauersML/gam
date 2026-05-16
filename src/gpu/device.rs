@@ -8,7 +8,7 @@ use std::fmt;
 /// the exact `(major, minor)` is preserved on [`GpuDeviceInfo`] for logging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GpuCapability {
-    /// Pre-Volta: no tensor cores. Use cautiously; mostly host fallback wins.
+    /// Pre-Volta: no tensor cores. Use cautiously; mostly host execution wins.
     Legacy,
     /// Volta / Turing (sm_70 / sm_75): FP32 tensor cores, async copies absent.
     Mainstream,
