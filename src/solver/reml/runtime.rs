@@ -173,33 +173,40 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
     ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
-        let (penalty_rank, log_det_s) =
-            self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?;
+        let lambdas = rho.mapv(f64::exp);
+        let ridge = ridge_passport.penalty_logdet_ridge();
+        let kron_logdet = self
+            .kronecker_penalty_system
+            .as_ref()
+            .filter(|kron| self.kronecker_factored.is_some() && kron.num_penalties() == rho.len())
+            .map(|kron| kron.logdet_rank_and_derivatives(lambdas.as_slice().unwrap(), ridge));
+        let (penalty_rank, log_det_s) = if let Some((logdet, rank, _, _)) = kron_logdet.as_ref() {
+            (*rank, *logdet)
+        } else {
+            self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?
+        };
         log::info!(
             "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
             rho.len(),
             penalty_rank,
             logdet_s_start.elapsed().as_secs_f64(),
         );
-        let lambdas = rho.mapv(f64::exp);
 
         // Use block-local path from canonical penalties (basis-invariant logdet).
         // The penalty logdet log|Σ λ_k S_k|₊ is invariant under orthogonal
         // transformation, so the original-basis canonical penalties give the
         // same result as transformed-basis roots.
-        let (det1, det2_full) = if !self.canonical_penalties.is_empty()
+        let (det1, det2_full) = if let Some((_, _, det1, det2)) = kron_logdet {
+            (det1, det2)
+        } else if !self.canonical_penalties.is_empty()
             && self.canonical_penalties.len() == rho.len()
         {
             self.structural_penalty_logdet_derivatives_block_local(
                 &lambdas,
-                ridge_passport.penalty_logdet_ridge(),
+                ridge,
             )?
         } else if !penalty_roots.is_empty() {
-            self.structural_penalty_logdet_derivatives(
-                penalty_roots,
-                &lambdas,
-                ridge_passport.penalty_logdet_ridge(),
-            )?
+            self.structural_penalty_logdet_derivatives(penalty_roots, &lambdas, ridge)?
         } else {
             (
                 Array1::zeros(rho.len()),

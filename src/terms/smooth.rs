@@ -725,6 +725,73 @@ impl KroneckerPenaltySystem {
             ridge,
         )
     }
+
+    pub fn logdet_rank_and_derivatives(
+        &self,
+        lambdas: &[f64],
+        ridge: f64,
+    ) -> (f64, usize, Array1<f64>, Array2<f64>) {
+        let n_pen = self.num_penalties();
+        assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
+        let d = self.marginal_dims.len();
+        let mut logdet = 0.0;
+        let mut rank = 0usize;
+        let mut grad = Array1::<f64>::zeros(n_pen);
+        let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
+        let tol = 1e-12;
+        let mut multi_idx = vec![0usize; d];
+        loop {
+            let mut sigma = ridge;
+            for k in 0..d {
+                sigma += lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
+            }
+            if self.has_double_penalty {
+                sigma += lambdas[d];
+            }
+
+            if sigma > tol {
+                rank += 1;
+                logdet += sigma.ln();
+                let inv_sigma = 1.0 / sigma;
+                let inv_sigma2 = inv_sigma * inv_sigma;
+                for k in 0..n_pen {
+                    let ck = if k < d {
+                        lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]]
+                    } else {
+                        lambdas[d]
+                    };
+                    grad[k] += ck * inv_sigma;
+                    hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
+                    for l in (k + 1)..n_pen {
+                        let cl = if l < d {
+                            lambdas[l] * self.marginal_eigensystems[l].0[multi_idx[l]]
+                        } else {
+                            lambdas[d]
+                        };
+                        let off = -ck * cl * inv_sigma2;
+                        hess[[k, l]] += off;
+                        hess[[l, k]] += off;
+                    }
+                }
+            }
+
+            let mut carry = true;
+            for dim in (0..d).rev() {
+                if carry {
+                    multi_idx[dim] += 1;
+                    if multi_idx[dim] < self.marginal_dims[dim] {
+                        carry = false;
+                    } else {
+                        multi_idx[dim] = 0;
+                    }
+                }
+            }
+            if carry {
+                break;
+            }
+        }
+        (logdet, rank, grad, hess)
+    }
 }
 
 #[derive(Clone, Debug)]
