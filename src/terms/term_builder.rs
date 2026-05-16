@@ -408,6 +408,7 @@ pub fn build_smooth_basis(
             }
             let periodic_axes = parse_periodic_axes(options, cols.len())?;
             let periods = parse_periods(options, &periodic_axes)?;
+            let origins = parse_period_origins(options, &periodic_axes)?;
             let specs = cols
                 .iter()
                 .enumerate()
@@ -421,8 +422,9 @@ pub fn build_smooth_basis(
                                 dim, vars[dim]
                             )
                         })?;
+                        let domain_start = origins[dim].unwrap_or(minv);
                         BSplineKnotSpec::PeriodicUniform {
-                            data_range: (minv, minv + period),
+                            data_range: (domain_start, domain_start + period),
                             num_basis: n_knots + degree + 1,
                         }
                     } else {
@@ -517,6 +519,7 @@ pub fn build_smooth_basis(
             let boundary_conditions = parse_bspline_boundary_conditions(options)?;
             let periodic_axes = parse_periodic_axes(options, 1)?;
             let periods = parse_periods(options, &periodic_axes)?;
+            let origins = parse_period_origins(options, &periodic_axes)?;
             let knotspec = if periodic_axes[0] {
                 if !boundary_conditions.is_free() {
                     return Err(
@@ -526,7 +529,7 @@ pub fn build_smooth_basis(
                 }
                 {
                     let (domain_start, p_value) = if periods[0].is_some() {
-                        (minv, periods[0].unwrap())
+                        (origins[0].unwrap_or(minv), periods[0].unwrap())
                     } else {
                         parse_periodic_domain_1d(options, minv, maxv)?
                     };
@@ -1065,7 +1068,7 @@ fn parse_periods(
 ) -> Result<Vec<Option<f64>>, String> {
     let ndim = periodic.len();
     let mut out = vec![None; ndim];
-    let Some(raw) = options.get("period") else {
+    let Some(raw) = options.get("period").or_else(|| options.get("periods")) else {
         return Ok(out);
     };
     let vals = split_list_option(raw);
@@ -1095,6 +1098,38 @@ fn parse_periods(
             return Err("period entries must be positive finite values".to_string());
         }
         out[i] = Some(value);
+    }
+    Ok(out)
+}
+
+fn parse_period_origins(
+    options: &BTreeMap<String, String>,
+    periodic: &[bool],
+) -> Result<Vec<Option<f64>>, String> {
+    let ndim = periodic.len();
+    let mut out = vec![None; ndim];
+    let Some(raw) = options.get("origin").or_else(|| options.get("origins")) else {
+        return Ok(out);
+    };
+    let vals = split_list_option(raw);
+    if vals.len() == 1 && periodic.iter().filter(|&&b| b).count() == 1 {
+        if let Some(axis) = periodic.iter().position(|&b| b) {
+            out[axis] = Some(parse_math_f64(&vals[0])?);
+        }
+        return Ok(out);
+    }
+    if vals.len() != ndim {
+        return Err(format!(
+            "origin must have one entry per margin ({ndim}), got {}",
+            vals.len()
+        ));
+    }
+    for (i, v) in vals.iter().enumerate() {
+        let l = v.to_ascii_lowercase();
+        if matches!(l.as_str(), "none" | "null" | "na" | "") {
+            continue;
+        }
+        out[i] = Some(parse_math_f64(v)?);
     }
     Ok(out)
 }
@@ -1152,7 +1187,12 @@ fn parse_periodic_domain_1d(
         ),
         (None, None) => {
             let period = parse_periods(options, &[true])?[0].unwrap_or(data_max - data_min);
-            Ok((data_min, period))
+            let origin = option_math_f64_any(
+                options,
+                &["origin", "period_origin", "period-origin", "domain_origin"],
+            )?
+            .unwrap_or(data_min);
+            Ok((origin, period))
         }
     }
 }
@@ -1371,10 +1411,27 @@ mod tests {
         let mut opts = BTreeMap::new();
         opts.insert("periodic".to_string(), "[0]".to_string());
         opts.insert("period".to_string(), "2*pi".to_string());
+        opts.insert("origin".to_string(), "0".to_string());
         let axes = parse_periodic_axes(&opts, 1).expect("axes");
         let periods = parse_periods(&opts, &axes).expect("periods");
+        let origins = parse_period_origins(&opts, &axes).expect("origins");
         assert_eq!(axes, vec![true]);
         assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert_eq!(origins[0], Some(0.0));
+    }
+
+    #[test]
+    fn parse_tensor_periods_and_origins_aliases() {
+        let mut opts = BTreeMap::new();
+        opts.insert("bc".to_string(), "['periodic', 'periodic']".to_string());
+        opts.insert("periods".to_string(), "[7, 24]".to_string());
+        opts.insert("origins".to_string(), "[0, -12]".to_string());
+        let axes = parse_periodic_axes(&opts, 2).expect("axes");
+        let periods = parse_periods(&opts, &axes).expect("periods");
+        let origins = parse_period_origins(&opts, &axes).expect("origins");
+        assert_eq!(axes, vec![true, true]);
+        assert_eq!(periods, vec![Some(7.0), Some(24.0)]);
+        assert_eq!(origins, vec![Some(0.0), Some(-12.0)]);
     }
 
     #[test]
