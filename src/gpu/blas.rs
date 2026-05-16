@@ -5,8 +5,8 @@ use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates,
-    from_col_major, load_library, to_col_major, to_i32,
+    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates, from_col_major,
+    load_library, to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -145,10 +145,7 @@ impl CublasRuntime {
             let mut device = 0;
             let ordinal = to_i32(selected.ordinal)
                 .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda(
-                (driver.cu_device_get)(&mut device, ordinal),
-                "cuDeviceGet",
-            )?;
+            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
             let mut context = 0usize;
             check_cuda(
                 (driver.cu_ctx_create)(&mut context, 0, device),

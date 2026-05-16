@@ -133,11 +133,7 @@ fn scan_for_banned_marker(
     });
 }
 
-fn scan_for_ignored_tests(
-    root: &Path,
-    dir: &Path,
-    offenders: &mut Vec<(PathBuf, usize, String)>,
-) {
+fn scan_for_ignored_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     visit_files(root, dir, &mut |rel, content| {
         // Skip the build script itself: it names the `#[ignore]` attribute
         // as part of this scanner's own contract.
