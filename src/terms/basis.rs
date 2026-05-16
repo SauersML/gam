@@ -1702,80 +1702,132 @@ fn solve_periodic_cubic_second_derivatives(
             "periodic spacing count must match value rows".to_string(),
         ));
     }
-    let mut a = Array2::<f64>::zeros((n, n));
+    let mut diag = vec![0.0; n];
     let mut rhs = Array2::<f64>::zeros((n, d));
     for i in 0..n {
         let prev = if i == 0 { n - 1 } else { i - 1 };
         let next = if i + 1 == n { 0 } else { i + 1 };
-        a[[i, prev]] = h[prev];
-        a[[i, i]] = 2.0 * (h[prev] + h[i]);
-        a[[i, next]] = h[i];
+        diag[i] = 2.0 * (h[prev] + h[i]);
         for col in 0..d {
             let slope_next = (values[[next, col]] - values[[i, col]]) / h[i];
             let slope_prev = (values[[i, col]] - values[[prev, col]]) / h[prev];
             rhs[[i, col]] = 6.0 * (slope_next - slope_prev);
         }
     }
-    solve_dense_multi_rhs(a, rhs, "periodic cubic spline system is singular")
+    solve_cyclic_tridiagonal_multi_rhs(&h[..n - 1], &diag, &h[..n - 1], h[n - 1], rhs)
 }
 
-fn solve_dense_multi_rhs(
-    mut a: Array2<f64>,
-    mut b: Array2<f64>,
-    singular_message: &str,
+fn solve_cyclic_tridiagonal_multi_rhs(
+    lower: &[f64],
+    diag: &[f64],
+    upper: &[f64],
+    corner: f64,
+    rhs: Array2<f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    let n = a.nrows();
-    if a.ncols() != n || b.nrows() != n {
+    let n = diag.len();
+    if lower.len() + 1 != n || upper.len() + 1 != n || rhs.nrows() != n {
         return Err(BasisError::DimensionMismatch(
-            "dense linear solve shape mismatch".to_string(),
+            "cyclic tridiagonal solve shape mismatch".to_string(),
         ));
     }
-    let nrhs = b.ncols();
-    for k in 0..n {
-        let mut pivot = k;
-        let mut pivot_abs = a[[k, k]].abs();
-        for r in (k + 1)..n {
-            let candidate = a[[r, k]].abs();
-            if candidate > pivot_abs {
-                pivot = r;
-                pivot_abs = candidate;
-            }
+    if n < 3 {
+        return Err(BasisError::InvalidInput(
+            "periodic cubic spline system requires at least three sites".to_string(),
+        ));
+    }
+
+    let nrhs = rhs.ncols();
+    let mut augmented = Array2::<f64>::zeros((n, nrhs + 2));
+    augmented.slice_mut(s![.., 0..nrhs]).assign(&rhs);
+    augmented[[0, nrhs]] = corner;
+    augmented[[n - 1, nrhs + 1]] = corner;
+
+    let solved = solve_tridiagonal_multi_rhs(lower, diag, upper, augmented)?;
+    let y = solved.slice(s![.., 0..nrhs]);
+    let w0_col = nrhs;
+    let w1_col = nrhs + 1;
+
+    let a00 = 1.0 + solved[[n - 1, w0_col]];
+    let a01 = solved[[n - 1, w1_col]];
+    let a10 = solved[[0, w0_col]];
+    let a11 = 1.0 + solved[[0, w1_col]];
+    let det = a00 * a11 - a01 * a10;
+    if det.abs() <= 1e-14 || !det.is_finite() {
+        return Err(BasisError::InvalidInput(
+            "periodic cubic spline system is singular".to_string(),
+        ));
+    }
+
+    let mut out = Array2::<f64>::zeros((n, nrhs));
+    for col in 0..nrhs {
+        let z0 = y[[n - 1, col]];
+        let z1 = y[[0, col]];
+        let correction0 = (a11 * z0 - a01 * z1) / det;
+        let correction1 = (-a10 * z0 + a00 * z1) / det;
+        for row in 0..n {
+            out[[row, col]] = y[[row, col]]
+                - solved[[row, w0_col]] * correction0
+                - solved[[row, w1_col]] * correction1;
         }
-        if pivot_abs <= 1e-14 {
-            return Err(BasisError::InvalidInput(singular_message.to_string()));
+    }
+    if out.iter().all(|v| v.is_finite()) {
+        Ok(out)
+    } else {
+        Err(BasisError::InvalidInput(
+            "periodic cubic spline solve produced non-finite values".to_string(),
+        ))
+    }
+}
+
+fn solve_tridiagonal_multi_rhs(
+    lower: &[f64],
+    diag: &[f64],
+    upper: &[f64],
+    mut rhs: Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    let n = diag.len();
+    if lower.len() + 1 != n || upper.len() + 1 != n || rhs.nrows() != n {
+        return Err(BasisError::DimensionMismatch(
+            "tridiagonal solve shape mismatch".to_string(),
+        ));
+    }
+    let nrhs = rhs.ncols();
+    let mut pivots = vec![0.0; n];
+    let mut upper_factor = vec![0.0; n - 1];
+
+    pivots[0] = diag[0];
+    if pivots[0].abs() <= 1e-14 || !pivots[0].is_finite() {
+        return Err(BasisError::InvalidInput(
+            "periodic cubic spline system is singular".to_string(),
+        ));
+    }
+    upper_factor[0] = upper[0] / pivots[0];
+    for col in 0..nrhs {
+        rhs[[0, col]] /= pivots[0];
+    }
+
+    for i in 1..n {
+        pivots[i] = diag[i] - lower[i - 1] * upper_factor[i - 1];
+        if pivots[i].abs() <= 1e-14 || !pivots[i].is_finite() {
+            return Err(BasisError::InvalidInput(
+                "periodic cubic spline system is singular".to_string(),
+            ));
         }
-        if pivot != k {
-            for c in k..n {
-                a.swap((k, c), (pivot, c));
-            }
-            for c in 0..nrhs {
-                b.swap((k, c), (pivot, c));
-            }
+        if i + 1 < n {
+            upper_factor[i] = upper[i] / pivots[i];
         }
-        for r in (k + 1)..n {
-            let factor = a[[r, k]] / a[[k, k]];
-            a[[r, k]] = 0.0;
-            for c in (k + 1)..n {
-                a[[r, c]] -= factor * a[[k, c]];
-            }
-            for c in 0..nrhs {
-                b[[r, c]] -= factor * b[[k, c]];
-            }
+        for col in 0..nrhs {
+            rhs[[i, col]] = (rhs[[i, col]] - lower[i - 1] * rhs[[i - 1, col]]) / pivots[i];
         }
     }
 
-    let mut x = Array2::<f64>::zeros((n, nrhs));
-    for rhs_col in 0..nrhs {
-        for i_rev in 0..n {
-            let i = n - 1 - i_rev;
-            let mut sum = b[[i, rhs_col]];
-            for c in (i + 1)..n {
-                sum -= a[[i, c]] * x[[c, rhs_col]];
-            }
-            x[[i, rhs_col]] = sum / a[[i, i]];
+    for i_rev in 0..(n - 1) {
+        let i = n - 2 - i_rev;
+        for col in 0..nrhs {
+            rhs[[i, col]] -= upper_factor[i] * rhs[[i + 1, col]];
         }
     }
-    Ok(x)
+    Ok(rhs)
 }
 
 /// Which knot strategy to use for 1D B-spline bases.
