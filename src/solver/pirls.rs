@@ -554,9 +554,7 @@ impl CandidateEvaluation {
             Self::Screen(s) => s.penalized_objective,
             Self::Full(state) => {
                 let mut value = state.deviance + state.penalty_term;
-                if firth_bias_reduction
-                    && let Some(j) = state.jeffreys_logdet()
-                {
+                if firth_bias_reduction && let Some(j) = state.jeffreys_logdet() {
                     value -= 2.0 * j;
                 }
                 value
@@ -1782,6 +1780,113 @@ impl<'a> GamWorkingModel<'a> {
         self.workspace
             .assemble_sparse_penalized_hessian(x_sparse, weights, s_transformed, ridge)
     }
+
+    /// LM-screen helper: evaluates a candidate β by reusing the previous
+    /// `current_eta` plus a single design-matrix matvec `X·δ`, then runs the
+    /// inverse-link only far enough to recover μ, w, z and the deviance.
+    /// No Hessian assembly, no derivative buffers, no Jeffreys logdet.
+    ///
+    /// The LM loop calls `update_with_curvature` to upgrade the screen to a
+    /// full `WorkingState` only when the screen is accepted. Rejected LM
+    /// candidates therefore skip the O(np²) curvature build entirely.
+    fn screen_candidate_from_direction(
+        &mut self,
+        beta: &Coefficients,
+        direction: &Array1<f64>,
+        current_eta: &LinearPredictor,
+    ) -> Result<CandidateScreen, EstimationError> {
+        let n = self.offset.len();
+        if self.workspace.eta_buf.len() != n {
+            self.workspace.eta_buf = Array1::zeros(n);
+        }
+        if self.workspace.delta_eta.len() != n {
+            self.workspace.delta_eta = Array1::zeros(n);
+        }
+
+        // Compute δη = X·direction once into the workspace, then assemble
+        // η_cand = η_current + δη in parallel.
+        let mut delta_eta = std::mem::take(&mut self.workspace.delta_eta);
+        self.transformed_matvec_into(&Coefficients::new(direction.clone()), &mut delta_eta);
+        Zip::from(&mut self.workspace.eta_buf)
+            .and(current_eta.as_ref())
+            .and(&delta_eta)
+            .par_for_each(|eta, &base, &d| *eta = base + d);
+        self.workspace.delta_eta = delta_eta;
+
+        if self.likelihood.scale.gamma_shape_is_estimated() {
+            let shape =
+                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+            self.likelihood = self.likelihood.with_gamma_shape(shape);
+        }
+
+        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
+            quadctx: &self.quadctx,
+            se: se.view(),
+            mixture_link_state: self.link_kind.mixture_state(),
+            sas_link_state: self.link_kind.sas_state(),
+        });
+        match &self.link_kind {
+            InverseLink::Mixture(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_) => {
+                if let Some(integ) = integrated {
+                    update_glmvectors_integrated_for_link(
+                        integ.quadctx,
+                        self.y,
+                        &self.workspace.eta_buf,
+                        integ.se,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                } else {
+                    update_glmvectors(
+                        self.y,
+                        &self.workspace.eta_buf,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                }
+            }
+            InverseLink::Standard(_) => {
+                self.likelihood.irls_update(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
+                    integrated,
+                    None,
+                )?;
+            }
+        }
+
+        let deviance = self
+            .likelihood
+            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
+        let s_beta = self.penalty.apply(beta.as_ref());
+        let penalty_term = beta.as_ref().dot(&s_beta);
+        let penalized_objective = deviance + penalty_term;
+        let arithmetic_finite = penalized_objective.is_finite()
+            && self.workspace.eta_buf.iter().all(|v| v.is_finite())
+            && self.lastmu.iter().all(|v| v.is_finite())
+            && self.lastweights.iter().all(|v| v.is_finite());
+        Ok(CandidateScreen {
+            penalized_objective,
+            deviance,
+            penalty_term,
+            arithmetic_finite,
+        })
+    }
 }
 
 impl<'a> WorkingModel for GamWorkingModel<'a> {
@@ -2147,6 +2252,25 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let result = self.update_with_curvature(beta, curvature);
         self.firth_bias_reduction = firth_enabled;
         result
+    }
+
+    fn screen_candidate(
+        &mut self,
+        beta: &Coefficients,
+        direction: &Array1<f64>,
+        current_eta: &LinearPredictor,
+        curvature: HessianCurvatureKind,
+    ) -> Result<CandidateEvaluation, EstimationError> {
+        if self.firth_bias_reduction {
+            // Jeffreys logdet enters the penalized objective, and the only
+            // safe way to recover it is through the full Fisher Hessian
+            // assembly — fall back to the existing full candidate path.
+            return self
+                .update_candidate(beta, curvature)
+                .map(CandidateEvaluation::Full);
+        }
+        self.screen_candidate_from_direction(beta, direction, current_eta)
+            .map(CandidateEvaluation::Screen)
     }
 
     fn supports_observed_information_curvature(&self) -> bool {
@@ -4323,12 +4447,17 @@ where
             }
             let candidate_beta = Coefficients::new(candidatevec);
             let candidate_eval_start = std::time::Instant::now();
-            let candidate_eval_result =
-                model.update_candidate(&candidate_beta, state.hessian_curvature);
+            let candidate_eval_result = model.screen_candidate(
+                &candidate_beta,
+                direction,
+                &state.eta,
+                state.hessian_curvature,
+            );
             lm_candidate_total += candidate_eval_start.elapsed();
             match candidate_eval_result {
-                Ok(candidate_state) => {
-                    let screening_penalized = penalizedobjective(&candidate_state);
+                Ok(candidate_eval) => {
+                    let screening_penalized =
+                        candidate_eval.penalized_objective(options.firth_bias_reduction);
                     let screening_reduction = current_penalized - screening_penalized;
 
                     // 4. Gain Ratio
@@ -4352,8 +4481,7 @@ where
                     // reason to reject a candidate; only non-finite objective
                     // or gradient arithmetic is. Saturation is diagnosed later
                     // by `pirls_soft_acceptance`.
-                    let candidate_grad_finite =
-                        candidate_state.gradient.iter().all(|g| g.is_finite());
+                    let candidate_grad_finite = candidate_eval.arithmetic_finite();
 
                     if screening_rho > 0.0
                         && screening_penalized.is_finite()
@@ -4392,7 +4520,43 @@ where
                                 }
                             }
                         } else {
-                            candidate_state
+                            match candidate_eval.into_full() {
+                                Some(state) => state,
+                                None => {
+                                    let curv_start = std::time::Instant::now();
+                                    let full_state = model.update_with_curvature(
+                                        &candidate_beta,
+                                        state.hessian_curvature,
+                                    );
+                                    curvature_total += curv_start.elapsed();
+                                    match full_state {
+                                        Ok(state) => state,
+                                        Err(err) => {
+                                            if !is_lm_retriable_candidate_error(&err) {
+                                                return Err(err);
+                                            }
+                                            if lm_retry_exhausted(
+                                                loop_lambda,
+                                                attempts,
+                                                lm_max_attempts,
+                                            ) {
+                                                return Err(lm_nonconvergence_error(
+                                                    options,
+                                                    constrained_stationarity_norm(
+                                                        &state.gradient,
+                                                        beta.as_ref(),
+                                                        options.coefficient_lower_bounds.as_ref(),
+                                                        options.linear_constraints.as_ref(),
+                                                    ),
+                                                ));
+                                            }
+                                            loop_lambda *= madsen_reject_factor;
+                                            madsen_reject_factor *= 2.0;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
                         };
                         let candidate_penalized = penalizedobjective(&accepted_state);
                         if candidate_penalized.is_finite()
