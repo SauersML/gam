@@ -2955,8 +2955,8 @@ fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)
 ///
 /// For `HessianSource::Analytic` (the exact second-order route) a missing
 /// or non-materializable Hessian is FATAL: returning `None` here would
-/// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
-/// estimate the Hessian by finite-differencing the gradient, which (a)
+/// invite `opt::SecondOrderCache` to silently synthesize a Hessian from
+/// gradient probes, which (a)
 /// throws away the analytic structure the route was selected for, and
 /// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
 /// scale, hours of work per silently-mis-routed step. The right
@@ -3004,14 +3004,14 @@ fn build_bridge_hessian_for_source(
                 message: format!(
                     "outer plan declared HessianSource::Analytic but the runtime returned a \
                      non-materializable Hessian operator (dim={}, materialization={:?}); \
-                     finite-difference Hessian estimation is not permitted on the analytic route",
+                     numeric Hessian synthesis is not permitted on the analytic route",
                     op.dim(),
                     op.materialization_capability(),
                 ),
             }),
             HessianResult::Unavailable => Err(ObjectiveEvalError::Fatal {
                 message: "outer plan declared HessianSource::Analytic but the runtime returned \
-                          HessianResult::Unavailable; finite-difference Hessian estimation is \
+                          HessianResult::Unavailable; numeric Hessian synthesis is \
                           not permitted on the analytic route"
                     .to_string(),
             }),
@@ -4506,7 +4506,7 @@ fn run_outer_with_plan(
                         });
                     }
                     // On the exact-Hessian ARC route, forbid both (a)
-                    // finite-difference Hessian estimation if the
+                    // numeric Hessian synthesis if the
                     // objective ever returns
                     // `SecondOrderSample { hessian: None }` and (b)
                     // `opt`'s internal AutoBfgs demotion on step
@@ -5770,8 +5770,8 @@ mod tests {
     /// Phase 1.1 — On `HessianSource::Analytic` the bridge MUST surface a
     /// fatal error rather than producing `SecondOrderSample { hessian: None }`
     /// when the runtime returns `HessianResult::Unavailable`. A `None` here
-    /// would let `opt::SecondOrderCache::finite_difference_hessian` silently
-    /// estimate the Hessian by finite-differencing the gradient — at biobank
+    /// would let `opt::SecondOrderCache` silently synthesize the Hessian from
+    /// gradient probes — at biobank
     /// scale, hours of work per silently-mis-routed step. The seed loop
     /// should retry, demote, or fail loudly instead.
     #[test]
