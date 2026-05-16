@@ -5525,12 +5525,28 @@ impl<'a> RemlState<'a> {
         // `λ_k β'S_k β` terms that should cancel to zero), which makes
         // ARC's deterministic-replay detector fire on a flat REML surface
         // and surfaces "SurvivalLocationScaleFamily expects 3 blocks,
-        // got 0" panics in the downstream refit path. Building the
-        // projected kernel unconditionally under `Smooth` mode costs one
-        // extra eigendecomposition of `S_λ` per outer eval (microseconds
-        // at biobank p ≤ ~50) and restores the gradient cancellation.
+        // got 0" panics in the downstream refit path.
+        //
+        // Gate on `c_nontrivial`: only build the projected kernel when
+        // the IRLS cubic coefficient `c = w'/(2η')` has nonzero support,
+        // i.e. when `D_β H[v] = X' diag(c ⊙ X v) X` can leak onto
+        // `null(S)`. For canonical Gaussian (Identity link) the IRLS
+        // weights `W = 1/σ²` are η-independent so `c ≡ 0` and
+        // `D_β H ≡ 0` — there is no leakage to project away. Activating
+        // the projection there would silently switch the cost identity
+        // from `log|H|` to `log|H_proj|`, putting the analytic ψ-gradient
+        // on a different cost surface than the FD-from-cost oracle (the
+        // missing `dU_S/dψ` contribution shows up as a ~6e-3 rel error in
+        // `iso_kappa_duchon_gaussian_identity_fd`). Skipping the projection
+        // when `c ≡ 0` preserves the classical Gaussian REML cost identity
+        // (`log|H|`) and keeps that FD test on its analytic match.  For
+        // every c-nontrivial family (Probit / Logit / cloglog / Poisson /
+        // Gamma / SAS / GAMLSS noise blocks / etc.) the projection is
+        // still built unconditionally — that is the rank-deficient LAML
+        // fix the comment above motivates.
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
                     &h_for_operator,
@@ -5811,20 +5827,29 @@ impl<'a> RemlState<'a> {
         // since the ψ/τ drift matrices consumed by the trace are produced
         // in the original basis by this assembly path.
         //
-        // The kernel is built UNCONDITIONALLY under `Smooth`, matching the
-        // sibling fix in `build_dense_assembly`.  An earlier version of this
-        // path gated on `penalty_rank < h_total_original.ncols()` — i.e.
-        // structural rank-deficiency of `S_λ` — but that condition is wrong
-        // for non-Gaussian families: the leakage onto `null(S)` is driven by
-        // the third-derivative correction `D_β H[v]`, which has support on
-        // `null(S_k)` for individual penalty components even when total `S_λ`
-        // has full rank.  Skipping the kernel there leaves Duchon ψ-axis
-        // gradients off by orders of magnitude (see
-        // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`) and lets
-        // a spurious nonzero outer gradient leak at large `λ_k` on full-rank
-        // designs that route through this dense-original path.
+        // The kernel is built when (a) the spectral mode is `Smooth` and
+        // (b) the IRLS cubic coefficient `c = w'/(2η')` has nontrivial
+        // support — i.e. the family's `D_β H[v] = X' diag(c ⊙ X v) X` can
+        // actually leak onto `null(S)`.  An earlier version of this path
+        // gated only on `penalty_rank < h_total_original.ncols()`, which
+        // missed `c`-nontrivial-but-full-rank designs.  A subsequent
+        // iteration removed the gate entirely, which over-projected
+        // canonical Gaussian (Identity link, `c ≡ 0`): the cost identity
+        // then silently shifts from `log|H|` to `log|H_proj|`, and the
+        // analytic ψ-gradient (still computed via `K · op_total`) no
+        // longer matches the FD-from-cost oracle within the projection's
+        // numerical roundoff — surfacing as a ~6e-3 rel error in
+        // `iso_kappa_duchon_gaussian_identity_fd`. The `c_nontrivial`
+        // gate keeps the rank-deficient LAML fix active for every
+        // non-Gaussian-Identity family (where the leakage is real and
+        // the projected kernel is the only formula that matches the
+        // cost identity — pinned by
+        // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`)
+        // while keeping the classical `log|H|` cost identity for
+        // canonical Gaussian, where the leakage is identically zero.
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth) {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = qs.t().dot(&h_total_original).dot(qs);
