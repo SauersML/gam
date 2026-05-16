@@ -405,7 +405,10 @@ impl TermCollectionSpec {
         for st in &self.smooth_terms {
             match &st.basis {
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
-                    if !matches!(spec.knotspec, BSplineKnotSpec::Provided(_)) {
+                    if !matches!(
+                        spec.knotspec,
+                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::CyclicProvided(_)
+                    ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: BSpline knotspec must be Provided",
                             st.name
@@ -456,7 +459,10 @@ impl TermCollectionSpec {
                 }
                 SmoothBasisSpec::TensorBSpline { spec, .. } => {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if !matches!(marginal.knotspec, BSplineKnotSpec::Provided(_)) {
+                        if !matches!(
+                            marginal.knotspec,
+                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::CyclicProvided(_)
+                        ) {
                             return Err(format!(
                                 "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided",
                                 st.name, dim
@@ -2712,6 +2718,7 @@ fn build_shape_constraint_design_1d(
                     .unwrap_or_else(|| spec.identifiability.clone()),
                 aniso_log_scales: aniso_log_scales.clone(),
                 operator_penalties: spec.operator_penalties.clone(),
+                periodic: spec.periodic,
             };
             build_duchon_basis(grid_2d.view(), &evalspec)?
                 .design
@@ -11935,6 +11942,7 @@ pub fn freeze_term_collection_from_design(
                     identifiability: original_identifiability,
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             };
@@ -11947,7 +11955,12 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                 },
             ) => {
-                s.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                s.knotspec = match s.knotspec {
+                    BSplineKnotSpec::CyclicGenerate { .. } | BSplineKnotSpec::CyclicProvided(_) => {
+                        BSplineKnotSpec::CyclicProvided(knots.clone())
+                    }
+                    _ => BSplineKnotSpec::Provided(knots.clone()),
+                };
                 s.identifiability = match identifiability_transform {
                     Some(z) => BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
@@ -12018,6 +12031,7 @@ pub fn freeze_term_collection_from_design(
                         identifiability,
                         aniso_log_scales: meta_aniso.clone(),
                         operator_penalties: Default::default(),
+                        periodic: false,
                     },
                     input_scales: meta_scales.clone(),
                 };
@@ -14662,6 +14676,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -15287,6 +15302,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -15397,6 +15413,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
+                            periodic: false,
                         },
                         input_scales: None,
                     },
@@ -15667,6 +15684,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -15787,6 +15805,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -15823,6 +15842,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -15871,6 +15891,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -15923,6 +15944,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -15967,6 +15989,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -16690,6 +16713,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -16939,6 +16963,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             }
@@ -17244,6 +17269,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -17449,6 +17475,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -17682,6 +17709,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -17856,6 +17884,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19020,6 +19049,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19354,6 +19384,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19447,6 +19478,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19487,6 +19519,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0]),
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19534,6 +19567,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::None,
                         aniso_log_scales: Some(vec![0.7, 0.2, 0.1]),
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19721,6 +19755,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -19915,6 +19950,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -20063,6 +20099,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -20200,6 +20237,7 @@ mod tests {
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: Some(vec![0.0; d]),
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: false,
                 },
                 input_scales: None,
             },
@@ -21295,6 +21333,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -21473,6 +21512,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
@@ -21723,6 +21763,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        periodic: false,
                     },
                     input_scales: None,
                 },
