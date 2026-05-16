@@ -210,11 +210,13 @@ y ~ duchon(theta, periodic=true)                      # cyclic Duchon (1D)
 # Tensor with one or more periodic margins (cylinder, torus, …)
 y ~ te(theta, h,  periodic=[0], period=[2*pi, None])
 y ~ te(theta, phi, periodic=[0, 1], period=[2*pi, 2*pi])
-y ~ te(day, hour, bc=['periodic','periodic'], period=[7, 24])
+y ~ te(day, hour, bc=['periodic','periodic'], periods=[7, 24], origins=[0, 0])
 ```
 
 `periodic=[axes]` lists zero-based axis indices that wrap around; `period=`
-holds one positive period per margin (`None` for non-periodic). The
+or `periods=` holds one positive period per margin (`None` for non-periodic).
+`origin=` / `origins=` fixes the half-open cyclic domain start when the
+sample does not contain the true boundary. The
 periodic margin uses a folded cardinal-cubic B-spline and a cyclic
 difference penalty. `period_start`/`period_end` (1D) override the data range
 when the angular domain is wider than the observed sample.
