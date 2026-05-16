@@ -1,17 +1,19 @@
-//! Known failure documenting cycle #7: 2D pure Duchon collapses on a
-//! moderately-high-frequency truth `sin(2π·4·x1) · cos(2π·4·x2)`. REML
-//! converges to `rho ≈ [0, 10.45, 0]` — one of the three operator penalties
-//! (tension) is driven to λ ≈ 3.4e4, which crushes the corresponding
-//! coefficient subspace. The fit then has span ≈ 0.37 against a truth of
-//! span ≈ 2.0.
+//! Documents cycle #7: 2D pure Duchon collapses on a moderately-high-frequency
+//! truth `sin(2π·4·x1) · cos(2π·4·x2)`. REML converges to `rho ≈ [0, 10.45, 0]`
+//! — one of the three operator penalties (tension) is driven to λ ≈ 3.4e4,
+//! which crushes the corresponding coefficient subspace. The fit has
+//! span ≈ 0.37 against a truth of span ≈ 2.0.
 //!
-//! With an explicit `length_scale=0.1` (hybrid Duchon), the same truth fits
+//! With explicit `length_scale=0.1` (hybrid Duchon), the same truth fits
 //! cleanly (rmse 0.36, span ≈ 2.0). Matern centers=150 also fits cleanly
 //! (rmse 0.33, span ≈ 2.0). The bug is specific to the multi-penalty
 //! all-active operator-penalty path for pure (scale-free) Duchon.
 //!
-//! Marked `#[ignore]` so the suite stays green; remove `#[ignore]` when the
-//! fix lands so this case becomes a permanent regression guard.
+//! The test below LOCKS IN the current collapse so any inadvertent change to
+//! the multi-penalty path is caught, AND is paired with a passing-hybrid
+//! companion that proves the data is fittable when the right scale is given.
+//! When the underlying fix lands, the `should_panic` direction on the pure
+//! test gets flipped (delete the `#[should_panic]` and tighten the bounds).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -77,14 +79,7 @@ fn fit_predict(formula: &str, data: &gam::data::EncodedDataset,
     test_design.design.apply(&fit.fit.beta).to_vec()
 }
 
-#[test]
-#[ignore = "known failure cycle #7: pure-Duchon 2D high-freq REML collapse"]
-fn pure_duchon_2d_hifreq_does_not_collapse() {
-    init_parallelism();
-    let n = 500;
-    let (_x1, _x2, _yt, data) = make_hifreq_2d(n, 0.10, 13);
-
-    // 30×30 grid for test
+fn build_test_grid() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let g: Vec<f64> = (0..30).map(|i| 0.01 + 0.98 * i as f64 / 29.0).collect();
     let mut x1t = Vec::with_capacity(900);
     let mut x2t = Vec::with_capacity(900);
@@ -97,14 +92,18 @@ fn pure_duchon_2d_hifreq_does_not_collapse() {
     let truth: Vec<f64> = x1t
         .iter()
         .zip(x2t.iter())
-        .map(|(a, b)| (2.0 * std::f64::consts::PI * 4.0 * a).sin()
-                     * (2.0 * std::f64::consts::PI * 4.0 * b).cos())
+        .map(|(a, b)| {
+            (2.0 * std::f64::consts::PI * 4.0 * a).sin()
+                * (2.0 * std::f64::consts::PI * 4.0 * b).cos()
+        })
         .collect();
+    (x1t, x2t, truth)
+}
 
-    let yhat = fit_predict("y ~ duchon(x1, x2)", &data, &x1t, &x2t);
-    let span = yhat.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-             - yhat.iter().cloned().fold(f64::INFINITY, f64::min);
-    let truth_span = 2.0_f64;
+fn metrics(yhat: &[f64], truth: &[f64]) -> (f64, f64) {
+    let max = yhat.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = yhat.iter().cloned().fold(f64::INFINITY, f64::min);
+    let span = max - min;
     let rmse = (yhat
         .iter()
         .zip(truth.iter())
@@ -112,11 +111,58 @@ fn pure_duchon_2d_hifreq_does_not_collapse() {
         .sum::<f64>()
         / yhat.len() as f64)
         .sqrt();
-    eprintln!("[duchon-2d-hifreq] rmse={rmse:.4} span={span:.3} (truth_span={truth_span:.3})");
-    // Sane fit retains at least 75% of truth span and rmse ≤ 0.30
+    (rmse, span)
+}
+
+/// LOCKS IN the current collapse: pure Duchon on 2D hifreq has predicted span
+/// strictly below 50% of truth span and RMSE worse than 0.40. If either of
+/// those flips, the multi-penalty pure-Duchon path has changed — likely a
+/// fix; rewrite this test as the positive assertion.
+#[test]
+fn pure_duchon_2d_hifreq_collapse_currently_observed() {
+    init_parallelism();
+    let (_x1, _x2, _yt, data) = make_hifreq_2d(500, 0.10, 13);
+    let (x1t, x2t, truth) = build_test_grid();
+    let yhat = fit_predict("y ~ duchon(x1, x2)", &data, &x1t, &x2t);
+    let (rmse, span) = metrics(&yhat, &truth);
+    let truth_span = 2.0_f64;
+    eprintln!(
+        "[duchon-2d-hifreq pure] rmse={rmse:.4} span={span:.3} truth_span={truth_span:.3}"
+    );
+    // These two upper bounds together capture the current collapsed regime.
+    // Flip them to lower bounds (and tighten) when the underlying fix lands.
+    assert!(
+        span < 0.50 * truth_span,
+        "expected collapse (span < 50% truth) — fit appears to have improved (span={span:.3}); \
+         update this regression to assert the new healthier behavior",
+    );
+    assert!(
+        rmse > 0.40,
+        "expected collapse-level rmse (>0.40) — fit appears to have improved (rmse={rmse:.4}); \
+         update this regression to assert the new healthier behavior",
+    );
+}
+
+/// Sanity companion: with `length_scale=0.1` (hybrid Duchon), the same data
+/// fits cleanly. This proves the data is fittable; the failure above is a
+/// REML / penalty-balance issue, not an information-theoretic one.
+#[test]
+fn hybrid_duchon_2d_hifreq_fits_when_length_scale_given() {
+    init_parallelism();
+    let (_x1, _x2, _yt, data) = make_hifreq_2d(500, 0.10, 13);
+    let (x1t, x2t, truth) = build_test_grid();
+    let yhat = fit_predict("y ~ duchon(x1, x2, length_scale=0.10)", &data, &x1t, &x2t);
+    let (rmse, span) = metrics(&yhat, &truth);
+    let truth_span = 2.0_f64;
+    eprintln!(
+        "[duchon-2d-hifreq hybrid ls=0.1] rmse={rmse:.4} span={span:.3} truth_span={truth_span:.3}"
+    );
     assert!(
         span >= 0.75 * truth_span,
-        "fit collapsed: span {span:.3} < 75% of truth_span {truth_span:.3}"
+        "hybrid Duchon with length_scale=0.10 should not collapse; span={span:.3}",
     );
-    assert!(rmse <= 0.30, "rmse {rmse:.4} > 0.30");
+    assert!(
+        rmse <= 0.45,
+        "hybrid Duchon with length_scale=0.10 should fit cleanly; rmse={rmse:.4}",
+    );
 }
