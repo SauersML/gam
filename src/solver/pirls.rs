@@ -2752,6 +2752,28 @@ fn solve_newton_direction_dense(
         *direction_out = Array1::zeros(gradient.len());
     }
 
+    // GPU fast path: fused Cholesky factor + solve in a single host↔device
+    // round-trip. Falls through to the CPU `StableSolver` whenever the GPU
+    // is unavailable, the matrix is too small to amortize the round-trip,
+    // or the device factorization reports a non-PD pivot.
+    let mut hess_buf = hessian.clone();
+    let mut rhs_mat = gradient.to_owned().insert_axis(ndarray::Axis(1));
+    if crate::gpu::try_chol_solve_inplace(&mut hess_buf, &mut rhs_mat).is_some() {
+        let mut solved = rhs_mat.remove_axis(ndarray::Axis(1));
+        if array1_is_finite(&solved) {
+            solved.mapv_inplace(|v| -v);
+            direction_out.assign(&solved);
+            log::info!(
+                "[STAGE] PIRLS dense newton solve (gpu) p={} flops~{} elapsed={:.3}s",
+                p,
+                (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
+                dense_solve_start.elapsed().as_secs_f64(),
+            );
+            return Ok(());
+        }
+        // GPU produced non-finite output; fall through to CPU.
+    }
+
     let factor = StableSolver::new("pirls newton direction")
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
