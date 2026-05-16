@@ -7,6 +7,7 @@ from typing import Any
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._exceptions import map_exception
 from ._model import Model
+from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
 
@@ -110,8 +111,12 @@ def fit(
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
     firth: bool | None = None,
+    response_geometry: str | None = None,
+    response_columns: list[str] | tuple[str, ...] | None = None,
+    response_coordinates: str | None = None,
+    response_reference: int | None = None,
     config: dict[str, Any] | None = None,
-) -> Model:
+) -> Model | ResponseGeometryModel:
     """Fit a GAM model from a formula and a tabular dataset.
 
     Parameters
@@ -162,6 +167,20 @@ def fit(
         Frailty family for frailty-aware survival models. One of
         ``"gaussian-shift"`` or ``"hazard-multiplier"``. Corresponds to
         ``--frailty-kind``.
+    response_geometry:
+        Optional manifold-valued response geometry. Use ``"spherical"`` for
+        unit-sphere responses, or ``"simplex"`` / ``"clr"`` / ``"alr"`` for
+        strictly positive compositional responses. The base point is the
+        intrinsic Fréchet mean of the training responses, not an extrinsic
+        arithmetic mean.
+    response_columns:
+        Sequence of response component columns used when ``response_geometry``
+        is set. One scalar Gaussian GAM is fitted for each tangent coordinate.
+    response_coordinates:
+        Coordinate chart for simplex responses: ``"clr"`` (default) or
+        ``"alr"``. Spherical responses always use ambient tangent coordinates.
+    response_reference:
+        Reference component for ``"alr"`` coordinates (default: last column).
     frailty_sd:
         Fixed frailty standard deviation. Omit to let latent hazard-multiplier
         models learn it. Corresponds to ``--frailty-sd``.
@@ -185,7 +204,74 @@ def fit(
         A fitted model object with ``predict``, ``summary``, and save/load
         helpers.
     """
+    if config:
+        if response_geometry is None and config.get("response_geometry") is not None:
+            response_geometry = str(config["response_geometry"])
+        if response_columns is None and config.get("response_columns") is not None:
+            raw_columns = config["response_columns"]
+            if isinstance(raw_columns, (str, bytes)):
+                raise ValueError(
+                    "response_columns must be a sequence of column names, not a string"
+                )
+            response_columns = tuple(str(name) for name in raw_columns)
+        if response_coordinates is None and config.get("response_coordinates") is not None:
+            response_coordinates = str(config["response_coordinates"])
+        if response_reference is None and config.get("response_reference") is not None:
+            response_reference = int(config["response_reference"])
+
+    if response_geometry is not None:
+        if response_columns is None:
+            raise ValueError("response_columns is required when response_geometry is set")
+        nested_config = dict(config or {})
+        # Geometry is handled by the Python wrapper; scalar coordinate fits keep
+        # using the ordinary Rust standard-GAM path.
+        for key in (
+            "response_geometry",
+            "response_columns",
+            "response_coordinates",
+            "response_reference",
+        ):
+            nested_config.pop(key, None)
+        return fit_response_geometry(
+            fit,
+            data,
+            formula,
+            response_geometry=response_geometry,
+            response_columns=tuple(response_columns),
+            coordinates=response_coordinates,
+            reference=-1 if response_reference is None else int(response_reference),
+            weights=weights,
+            fit_kwargs={
+                "offset": offset,
+                "weights": weights,
+                "transformation_normal": transformation_normal,
+                "survival_likelihood": survival_likelihood,
+                "baseline_target": baseline_target,
+                "baseline_scale": baseline_scale,
+                "baseline_shape": baseline_shape,
+                "baseline_rate": baseline_rate,
+                "baseline_makeham": baseline_makeham,
+                "z_column": z_column,
+                "link": link,
+                "logslope_formula": logslope_formula,
+                "frailty_kind": frailty_kind,
+                "frailty_sd": frailty_sd,
+                "hazard_loading": hazard_loading,
+                "scale_dimensions": scale_dimensions,
+                "firth": firth,
+                "config": nested_config or None,
+            },
+        )
+
     headers, rows, table_kind = normalize_table(data)
+    rust_config = dict(config or {})
+    for key in (
+        "response_geometry",
+        "response_columns",
+        "response_coordinates",
+        "response_reference",
+    ):
+        rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
         offset=offset,
@@ -205,7 +291,7 @@ def fit(
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
         firth=firth,
-        config=config,
+        config=rust_config or None,
     )
     try:
         model_bytes = bytes(
@@ -306,6 +392,14 @@ def validate_formula(
     semantics. See :func:`fit` for parameter documentation.
     """
     headers, rows, _table_kind = normalize_table(data)
+    rust_config = dict(config or {})
+    for key in (
+        "response_geometry",
+        "response_columns",
+        "response_coordinates",
+        "response_reference",
+    ):
+        rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
         offset=offset,
@@ -325,7 +419,7 @@ def validate_formula(
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
         firth=firth,
-        config=config,
+        config=rust_config or None,
     )
     try:
         raw = rust_module().validate_formula_json(
