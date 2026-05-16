@@ -10,13 +10,13 @@ use crate::basis::{
     build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
-    build_spherical_spline_basis, build_thin_plate_basis, create_basis,
-    evaluate_bspline_derivative_scalar,
+    build_spherical_spline_basis, build_thin_plate_basis,
     build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
-    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
-    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
-    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
-    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
+    center_strategy_num_centers, center_strategy_with_num_centers, create_basis,
+    estimate_penalty_nullity, evaluate_bspline_derivative_scalar, filter_active_penalty_candidates,
+    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
+    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
+    points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -2959,18 +2959,21 @@ fn merge_linear_constraints_global(
 }
 
 fn bspline_boundary_has_nonzero_anchor(boundary: BSplineBoundaryConditions) -> bool {
-    [
-        boundary.left,
-        boundary.right,
-    ]
-    .into_iter()
-    .any(|condition| matches!(
-        condition,
-        BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() > 1e-12
-    ))
+    [boundary.left, boundary.right]
+        .into_iter()
+        .any(|condition| {
+            matches!(
+                condition,
+                BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() > 1e-12
+            )
+        })
 }
 
-fn bspline_boundary_endpoint(knots: &Array1<f64>, degree: usize, right: bool) -> Result<f64, BasisError> {
+fn bspline_boundary_endpoint(
+    knots: &Array1<f64>,
+    degree: usize,
+    right: bool,
+) -> Result<f64, BasisError> {
     if knots.len() <= degree + 1 {
         return Err(BasisError::InvalidInput(
             "B-spline boundary condition requires a valid knot vector".to_string(),
@@ -3907,16 +3910,17 @@ fn build_single_local_smooth_term(
     } else {
         None
     };
-    let boundary_linear_constraints = if let Some((boundary, degree)) = boundary_conditions_for_linear {
-        bspline_boundary_linear_constraints(
-            boundary,
-            &metadata,
-            degree,
-            coefficient_transform_for_constraints.as_ref(),
-        )?
-    } else {
-        None
-    };
+    let boundary_linear_constraints =
+        if let Some((boundary, degree)) = boundary_conditions_for_linear {
+            bspline_boundary_linear_constraints(
+                boundary,
+                &metadata,
+                degree,
+                coefficient_transform_for_constraints.as_ref(),
+            )?
+        } else {
+            None
+        };
     let linear_constraints_local =
         merge_linear_constraints_global(linear_constraints_local, boundary_linear_constraints);
 
