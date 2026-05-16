@@ -9,10 +9,11 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, SphereMethod,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, PeriodicSpline1DOptions, SphereMethod,
     SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
     create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, spherical_wahba_kernel_matrix,
+    create_periodic_bspline_derivative_dense, fit_periodic_spline_1d,
+    spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2};
 use std::time::Instant;
@@ -73,10 +74,7 @@ fn periodic_bspline_scales_and_partitions_unity_at_100k() {
         for i in 0..n.min(2048) {
             for j in 0..24 {
                 let d = (basis[(i, j)] - basis_wrap[(i, j)]).abs();
-                assert!(
-                    d < 1e-12,
-                    "periodicity violated at row {i} col {j}: {d}"
-                );
+                assert!(d < 1e-12, "periodicity violated at row {i} col {j}: {d}");
             }
         }
     }
@@ -100,6 +98,50 @@ fn periodic_bspline_derivative_integrates_to_zero_over_loop() {
             s.abs() < 1e-6,
             "column {j} derivative loop integral not zero: {s}"
         );
+    }
+}
+
+#[test]
+fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
+    let period = std::f64::consts::TAU;
+    for n in [1_000usize, 10_000, 100_000] {
+        let u = make_uniform_loop(n, period);
+        let mut y = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            let t = u[i];
+            y[(i, 0)] = (2.0 * t).cos() + 0.125 * (5.0 * t).sin();
+            y[(i, 1)] = 0.5 * t.sin() - 0.2 * (3.0 * t).cos();
+            y[(i, 2)] = 0.1 * (t + 0.3).sin() + 0.05 * (7.0 * t).cos();
+        }
+        let spline = time_label(&format!("exact_periodic_cubic N={n} d=3"), || {
+            fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(period))
+                .expect("exact periodic spline")
+        });
+        assert_eq!(spline.num_sites(), n);
+        assert_eq!(spline.ambient_dim(), 3);
+
+        let fitted = spline.evaluate(u.view()).expect("knot interpolation");
+        for i in (0..n).step_by((n / 2048).max(1)) {
+            for col in 0..3 {
+                let err = (fitted[(i, col)] - y[(i, col)]).abs();
+                assert!(
+                    err < 2e-9,
+                    "periodic cubic interpolation error at N={n}, row={i}, col={col}: {err}"
+                );
+            }
+        }
+
+        let seam = Array1::from_vec(vec![0.0, period, -period, 19.0 * period]);
+        let seam_values = spline.evaluate(seam.view()).expect("seam values");
+        let seam_slopes = spline
+            .evaluate_derivative(seam.view())
+            .expect("seam derivatives");
+        for row in 1..seam.len() {
+            for col in 0..3 {
+                assert!((seam_values[(row, col)] - seam_values[(0, col)]).abs() < 1e-10);
+                assert!((seam_slopes[(row, col)] - seam_slopes[(0, col)]).abs() < 1e-10);
+            }
+        }
     }
 }
 
@@ -136,10 +178,9 @@ fn sphere_wahba_kernel_at_100k_is_symmetric_on_self_eval() {
     // Test at three scales to confirm parallel chunks don't introduce races.
     for n in [256_usize, 4_096, 32_768] {
         let pts = make_sphere_grid(n);
-        let k = time_label(
-            &format!("wahba_kernel_matrix N=K={n} m=2"),
-            || spherical_wahba_kernel_matrix(pts.view(), pts.view(), 2, false).expect("kernel"),
-        );
+        let k = time_label(&format!("wahba_kernel_matrix N=K={n} m=2"), || {
+            spherical_wahba_kernel_matrix(pts.view(), pts.view(), 2, false).expect("kernel")
+        });
         // Spot check 256 random off-diagonal symmetry positions
         let step = (n / 64).max(1);
         for i in (0..n).step_by(step) {
@@ -232,7 +273,7 @@ fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
     // builder → tensor basis. Verifies the cyclic margin's seam continuity
     // holds in the full tensor product at N = 10k.
     use csv::StringRecord;
-    use gam::{encode_recordswith_inferred_schema, fit_from_formula, FitConfig, FitResult};
+    use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
     use std::f64::consts::TAU;
     let n: usize = 10_000;
     let headers = vec!["theta".to_string(), "h".to_string(), "y".to_string()];
@@ -241,11 +282,7 @@ fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
             let theta = TAU * (i as f64) / (n as f64);
             let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
             let y = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
-            StringRecord::from(vec![
-                theta.to_string(),
-                h.to_string(),
-                y.to_string(),
-            ])
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
@@ -254,10 +291,16 @@ fn cylinder_tensor_via_te_formula_scales_and_seam_wraps() {
         ..FitConfig::default()
     };
     let t = Instant::now();
-    let res =
-        fit_from_formula("y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])", &data, &cfg)
-            .expect("cylinder fit");
-    eprintln!("[scale] cylinder te N={n} fit: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+    let res = fit_from_formula(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    )
+    .expect("cylinder fit");
+    eprintln!(
+        "[scale] cylinder te N={n} fit: {:.3} ms",
+        t.elapsed().as_secs_f64() * 1e3
+    );
     let FitResult::Standard(fit) = res else {
         panic!("expected standard fit");
     };
