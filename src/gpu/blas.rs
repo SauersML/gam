@@ -5,7 +5,7 @@ use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_library,
+    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
     to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
@@ -128,15 +128,17 @@ fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T>
 struct CublasRuntime {
     /// Borrowed driver + context owned by [`GpuRuntime`].
     cuda: &'static CudaWorkingState,
-    _cublas_lib: Library,
+    /// cuBLAS entry points. The dlopen'd library is `Box::leak`'d inside
+    /// `load_static_library`, so these fn pointers stay valid for the
+    /// process — no owning field needed.
     blas: CublasApi,
     handle: usize,
 }
 
 impl CublasRuntime {
     fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
-        let cublas_lib = load_library(cublas_library_candidates())?;
-        let blas = CublasApi::load(&cublas_lib)?;
+        let cublas_lib = load_static_library(cublas_library_candidates())?;
+        let blas = CublasApi::load(cublas_lib)?;
         cuda.set_current()?;
         let mut handle = 0_usize;
         let create_status = unsafe { (blas.cublas_create)(&mut handle) };
@@ -145,7 +147,6 @@ impl CublasRuntime {
         }
         Ok(Self {
             cuda,
-            _cublas_lib: cublas_lib,
             blas,
             handle,
         })
