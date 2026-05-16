@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, HashMap};
 use ndarray::ArrayView1;
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    plan_spatial_basis, resolve_duchon_orders,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
+    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    default_num_centers, default_spatial_center_strategy, plan_spatial_basis,
+    resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
@@ -217,6 +218,45 @@ pub fn build_termspec(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
+fn parse_bspline_endpoint_condition(
+    options: &BTreeMap<String, String>,
+    side: &str,
+    global_bc: Option<&str>,
+) -> Result<BSplineEndpointBoundaryCondition, String> {
+    let side_key = format!("bc_{side}");
+    let raw = options
+        .get(&side_key)
+        .map(String::as_str)
+        .or(global_bc)
+        .unwrap_or("free")
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "free" | "none" | "open" => Ok(BSplineEndpointBoundaryCondition::Free),
+        "clamped" | "clamp" | "zero_derivative" | "zero-derivative" => {
+            Ok(BSplineEndpointBoundaryCondition::Clamped)
+        }
+        "anchored" | "anchor" | "zero" | "zero_value" | "zero-value" => {
+            let value_key = format!("anchor_{side}");
+            let value = option_f64(options, &value_key).unwrap_or(0.0);
+            Ok(BSplineEndpointBoundaryCondition::Anchored { value })
+        }
+        other => Err(format!(
+            "unsupported B-spline boundary condition '{other}' for {side} endpoint; use free|clamped|anchored"
+        )),
+    }
+}
+
+fn parse_bspline_boundary_conditions(
+    options: &BTreeMap<String, String>,
+) -> Result<BSplineBoundaryConditions, String> {
+    let global_bc = options.get("bc").map(String::as_str);
+    Ok(BSplineBoundaryConditions {
+        left: parse_bspline_endpoint_condition(options, "left", global_bc)?,
+        right: parse_bspline_endpoint_condition(options, "right", global_bc)?,
+    })
+}
+
 pub fn build_smooth_basis(
     kind: SmoothKind,
     vars: &[String],
@@ -276,6 +316,7 @@ pub fn build_smooth_basis(
                         },
                         double_penalty: smooth_double_penalty,
                         identifiability: BSplineIdentifiability::None,
+                        boundary_conditions: Default::default(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -326,6 +367,7 @@ pub fn build_smooth_basis(
                     },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
+                    boundary_conditions: parse_bspline_boundary_conditions(options)?,
                 },
             })
         }
