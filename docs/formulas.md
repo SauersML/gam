@@ -320,7 +320,7 @@ y ~ x + link(type=flexible(probit))
 | `log` | `g⁻¹(η) = e^η`. For counts and positive-continuous. |
 | `sas` | Sinh-arcsinh skewed link. Don't combine with `linkwiggle`. |
 | `beta-logistic` | Bounded link. Don't combine with `linkwiggle`. |
-| `blended(a, b, …)` | Mixture of two or more component inverse links (e.g. `logit`, `probit`, `cloglog`, `loglog`, `cauchit`). |
+| `blended(a, b, …)` | Mixture of two or more component inverse links (e.g. `logit`, `probit`, `cloglog`, `loglog`, `cauchit`). `mixture(...)` is an accepted alias. |
 | `flexible(base)` | A spline offset from a base link. Enables `linkwiggle`. |
 
 Set it from Python with `link=` on `fit()`:
