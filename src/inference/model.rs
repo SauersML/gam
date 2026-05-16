@@ -1677,9 +1677,17 @@ impl FittedModel {
                 kind_by_header.insert(col.name.as_str(), col.kind);
             }
         }
+        // Periodic axes (sphere longitude, periodic-B-spline 1D, periodic
+        // tensor margins) must never be clipped to the training range:
+        // clamping a value just past the seam to the training extreme breaks
+        // the cyclic invariant f(x₀) = f(x₀ + period) at predict time and
+        // shows up as a visible seam in surface plots.
+        let periodic_axes = self.training_periodic_axes(training_headers);
         let mut clipped = data.to_owned();
         let mut any_clipped = false;
-        for (header, &(lo, hi)) in training_headers.iter().zip(ranges.iter()) {
+        for (col_in_training, (header, &(lo, hi))) in
+            training_headers.iter().zip(ranges.iter()).enumerate()
+        {
             if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
                 continue;
             }
@@ -1687,6 +1695,9 @@ impl FittedModel {
                 kind_by_header.get(header.as_str()).copied(),
                 Some(ColumnKindTag::Continuous)
             ) {
+                continue;
+            }
+            if periodic_axes.contains(&col_in_training) {
                 continue;
             }
             let Some(&col_idx) = col_map.get(header) else {
@@ -1709,6 +1720,66 @@ impl FittedModel {
             }
         }
         if any_clipped { Some(clipped) } else { None }
+    }
+
+    /// Collect the set of training-column indices that are periodic axes —
+    /// i.e. features for which a periodic basis (sphere longitude, periodic
+    /// B-spline 1D, periodic tensor margin) must be allowed to take any
+    /// real value at predict time and not be clamped to the training range.
+    /// Returned indices reference `self.training_headers` (training-time
+    /// layout), matching the iteration in `axis_clip_to_training_ranges`.
+    fn training_periodic_axes(
+        &self,
+        training_headers: &[String],
+    ) -> std::collections::HashSet<usize> {
+        use crate::basis::BSplineKnotSpec;
+        use crate::smooth::SmoothBasisSpec;
+        let mut out: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let Some(spec) = self.resolved_termspec.as_ref() else {
+            return out;
+        };
+        for term in &spec.smooth_terms {
+            match &term.basis {
+                // Sphere terms: longitude (second feature col) is always
+                // periodic. Latitude is bounded and stays clamped.
+                SmoothBasisSpec::Sphere { feature_cols, .. } => {
+                    if let Some(&lon_col) = feature_cols.get(1) {
+                        if lon_col < training_headers.len() {
+                            out.insert(lon_col);
+                        }
+                    }
+                }
+                // 1D periodic B-spline: the single feature column is periodic.
+                SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+                    if matches!(
+                        spec.knotspec,
+                        BSplineKnotSpec::PeriodicUniform { .. }
+                    ) && *feature_col < training_headers.len()
+                    {
+                        out.insert(*feature_col);
+                    }
+                }
+                // Tensor B-spline: each axis whose marginal knotspec is
+                // PeriodicUniform is periodic; mark those columns.
+                SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+                    for (i, marginal) in spec.marginalspecs.iter().enumerate() {
+                        if matches!(
+                            marginal.knotspec,
+                            BSplineKnotSpec::PeriodicUniform { .. }
+                        ) {
+                            if let Some(&col) = feature_cols.get(i) {
+                                if col < training_headers.len() {
+                                    out.insert(col);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     pub fn from_payload(mut payload: FittedModelPayload) -> Self {
