@@ -6,7 +6,6 @@ use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
     boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
-use crate::matrix::LinearOperator;
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
