@@ -1,9 +1,8 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
-    BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    CenterStrategyKind, Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
+    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
+    CenterStrategyKind, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+    KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, PenaltyCandidate,
     PenaltyInfo, PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
     ThinPlateBasisSpec, apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
@@ -12,8 +11,8 @@ use crate::basis::{
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
     build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
-    center_strategy_num_centers, center_strategy_with_num_centers, create_basis,
-    estimate_penalty_nullity, evaluate_bspline_derivative_scalar, filter_active_penalty_candidates,
+    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
+    filter_active_penalty_candidates,
     filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
     orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
     points_in_aniso_y_space, select_centers_by_strategy,
@@ -30,10 +29,10 @@ use crate::custom_family::{
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState, PenaltySpec,
-    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas_andwarm_start,
+    UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerSvd, fast_atb, fast_atv};
+use crate::faer_ndarray::{fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DesignBlock,
@@ -2958,162 +2957,6 @@ fn merge_linear_constraints_global(
     }
 }
 
-fn bspline_boundary_has_nonzero_anchor(boundary: BSplineBoundaryConditions) -> bool {
-    [boundary.left, boundary.right]
-        .into_iter()
-        .any(|condition| {
-            matches!(
-                condition,
-                BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() > 1e-12
-            )
-        })
-}
-
-fn bspline_boundary_endpoint(
-    knots: &Array1<f64>,
-    degree: usize,
-    right: bool,
-) -> Result<f64, BasisError> {
-    if knots.len() <= degree + 1 {
-        return Err(BasisError::InvalidInput(
-            "B-spline boundary condition requires a valid knot vector".to_string(),
-        ));
-    }
-    let n_basis = knots.len() - degree - 1;
-    Ok(if right { knots[n_basis] } else { knots[degree] })
-}
-
-fn bspline_endpoint_constraint_row(
-    knots: &Array1<f64>,
-    degree: usize,
-    condition: BSplineEndpointBoundaryCondition,
-    right: bool,
-    identifiability_transform: Option<&Array2<f64>>,
-    coefficient_transform: Option<&Array2<f64>>,
-) -> Result<Option<(Array1<f64>, f64)>, BasisError> {
-    let target = match condition {
-        BSplineEndpointBoundaryCondition::Free => return Ok(None),
-        BSplineEndpointBoundaryCondition::Clamped => 0.0,
-        BSplineEndpointBoundaryCondition::Anchored { value } => {
-            if !value.is_finite() {
-                return Err(BasisError::InvalidInput(
-                    "anchored B-spline boundary value must be finite".to_string(),
-                ));
-            }
-            value
-        }
-    };
-    let endpoint = bspline_boundary_endpoint(knots, degree, right)?;
-    let mut row = match condition {
-        BSplineEndpointBoundaryCondition::Clamped => {
-            let p = knots.len().checked_sub(degree + 1).ok_or_else(|| {
-                BasisError::InvalidInput("invalid B-spline knot/degree combination".to_string())
-            })?;
-            let mut values = vec![0.0; p];
-            evaluate_bspline_derivative_scalar(endpoint, knots.view(), degree, &mut values)?;
-            Array1::from_vec(values)
-        }
-        BSplineEndpointBoundaryCondition::Anchored { .. } => {
-            let point = Array1::from_vec(vec![endpoint]);
-            let (basis, _) = create_basis::<Dense>(
-                point.view(),
-                KnotSource::Provided(knots.view()),
-                degree,
-                BasisOptions::value(),
-            )?;
-            basis.row(0).to_owned()
-        }
-        BSplineEndpointBoundaryCondition::Free => unreachable!("free handled above"),
-    };
-
-    if let Some(z) = identifiability_transform {
-        if row.len() != z.nrows() {
-            return Err(BasisError::DimensionMismatch(format!(
-                "B-spline boundary identifiability transform mismatch: row has {} columns but transform has {} rows",
-                row.len(),
-                z.nrows()
-            )));
-        }
-        row = row.dot(z);
-    }
-    if let Some(t) = coefficient_transform {
-        if row.len() != t.nrows() {
-            return Err(BasisError::DimensionMismatch(format!(
-                "B-spline boundary coefficient transform mismatch: row has {} columns but transform has {} rows",
-                row.len(),
-                t.nrows()
-            )));
-        }
-        row = row.dot(t);
-    }
-    Ok(Some((row, target)))
-}
-
-fn bspline_boundary_linear_constraints(
-    boundary: BSplineBoundaryConditions,
-    metadata: &BasisMetadata,
-    degree: usize,
-    coefficient_transform: Option<&Array2<f64>>,
-) -> Result<Option<LinearInequalityConstraints>, BasisError> {
-    if boundary.is_free() {
-        return Ok(None);
-    }
-    let BasisMetadata::BSpline1D {
-        knots,
-        identifiability_transform,
-        periodic,
-    } = metadata
-    else {
-        return Err(BasisError::InvalidInput(
-            "B-spline boundary constraints require B-spline metadata".to_string(),
-        ));
-    };
-    if periodic.is_some() {
-        return Err(BasisError::InvalidInput(
-            "periodic B-splines cannot also declare endpoint boundary conditions".to_string(),
-        ));
-    }
-
-    let mut rows = Vec::<Array1<f64>>::new();
-    let mut targets = Vec::<f64>::new();
-    for (condition, right) in [(boundary.left, false), (boundary.right, true)] {
-        if let Some((row, target)) = bspline_endpoint_constraint_row(
-            knots,
-            degree,
-            condition,
-            right,
-            identifiability_transform.as_ref(),
-            coefficient_transform,
-        )? {
-            let norm = row.dot(&row).sqrt();
-            if norm <= 1e-12 {
-                if target.abs() > 1e-12 {
-                    return Err(BasisError::InvalidInput(format!(
-                        "anchored B-spline boundary value {target} is infeasible because the endpoint row is zero"
-                    )));
-                }
-                continue;
-            }
-            rows.push(row);
-            targets.push(target);
-        }
-    }
-    if rows.is_empty() {
-        return Ok(None);
-    }
-
-    let p = rows[0].len();
-    let mut a = Array2::<f64>::zeros((2 * rows.len(), p));
-    let mut b = Array1::<f64>::zeros(2 * rows.len());
-    for (idx, (row, target)) in rows.iter().zip(targets.iter()).enumerate() {
-        a.row_mut(2 * idx).assign(row);
-        b[2 * idx] = *target;
-        a.row_mut(2 * idx + 1).assign(&row.mapv(|v| -v));
-        b[2 * idx + 1] = -*target;
-    }
-    Ok(Some(LinearInequalityConstraints { a, b }))
-}
-
 fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     // Constrained-space normalization:
     //   c = ||S_con||_F,  S_tilde = S_con / c.
@@ -3530,7 +3373,6 @@ fn build_single_local_smooth_term(
         )));
     }
     let mut shape_axis_col: Option<usize> = None;
-    let mut boundary_conditions_for_linear: Option<(BSplineBoundaryConditions, usize)> = None;
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::BSpline1D { feature_col, spec } => {
             if *feature_col >= data.ncols() {
@@ -3542,11 +3384,6 @@ fn build_single_local_smooth_term(
                 )));
             }
             let mut spec_local = spec.clone();
-            if bspline_boundary_has_nonzero_anchor(spec.boundary_conditions) {
-                boundary_conditions_for_linear = Some((spec.boundary_conditions, spec.degree));
-                spec_local.boundary_conditions = BSplineBoundaryConditions::default();
-                spec_local.identifiability = BSplineIdentifiability::None;
-            }
             if term.shape != ShapeConstraint::None {
                 // Shape-constrained B-splines are anchored by construction.
                 // Sum-to-zero side constraints conflict with monotonic/convex cones.
@@ -3819,12 +3656,10 @@ fn build_single_local_smooth_term(
         .collect::<Vec<_>>();
     let use_box_reparam =
         term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-    let mut coefficient_transform_for_constraints: Option<Array2<f64>> = None;
     if let Some((order, sign)) = shape_order_and_sign(term.shape)
         && use_box_reparam
     {
         let t = cumulative_sum_transform_matrix(p_local, order, sign);
-        coefficient_transform_for_constraints = Some(t.clone());
         // Coefficient-side transform: wrap the design in an operator that
         // applies T on the coefficient side, preserving sparsity/operator
         // structure of the inner design.
@@ -3911,19 +3746,6 @@ fn build_single_local_smooth_term(
     } else {
         None
     };
-    let boundary_linear_constraints =
-        if let Some((boundary, degree)) = boundary_conditions_for_linear {
-            bspline_boundary_linear_constraints(
-                boundary,
-                &metadata,
-                degree,
-                coefficient_transform_for_constraints.as_ref(),
-            )?
-        } else {
-            None
-        };
-    let linear_constraints_local =
-        merge_linear_constraints_global(linear_constraints_local, boundary_linear_constraints);
 
     Ok(LocalSmoothTermBuild {
         dim: p_local,
@@ -5380,50 +5202,6 @@ fn has_bounded_linear_terms(spec: &TermCollectionSpec) -> bool {
     })
 }
 
-fn feasible_linear_constraint_warm_start(
-    constraints: Option<&LinearInequalityConstraints>,
-    p: usize,
-) -> Option<Array1<f64>> {
-    let constraints = constraints?;
-    if constraints.a.ncols() != p
-        || constraints.a.nrows() == 0
-        || constraints.b.len() != constraints.a.nrows()
-    {
-        return None;
-    }
-    if constraints.b.iter().all(|v| v.abs() <= 1e-14) {
-        return None;
-    }
-
-    let gram = constraints.a.dot(&constraints.a.t());
-    let (u_opt, singular, vt_opt) = gram.svd(true, true).ok()?;
-    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        return None;
-    };
-    let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular.max(1.0);
-    let mut coeff = u.t().dot(&constraints.b);
-    for (idx, value) in coeff.iter_mut().enumerate() {
-        let sigma = singular[idx];
-        if sigma.abs() > tol {
-            *value /= sigma;
-        } else {
-            *value = 0.0;
-        }
-    }
-    let dual = vt.t().dot(&coeff);
-    let beta = constraints.a.t().dot(&dual);
-    if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let slack = constraints.a.dot(&beta) - &constraints.b;
-    if slack.iter().all(|v| *v >= -1e-8) {
-        Some(beta)
-    } else {
-        None
-    }
-}
-
 fn fit_term_collection_on_realized_design(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -5447,19 +5225,14 @@ fn fit_term_collection_on_realized_design(
         );
     }
     let base_fit_opts = adaptive_fit_options_base(options, design);
-    let warm_start = feasible_linear_constraint_warm_start(
-        design.linear_constraints.as_ref(),
-        design.design.ncols(),
-    );
     let fitted = FittedTermCollection {
-        fit: fit_gamwith_heuristic_lambdas_andwarm_start(
+        fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
             y,
             weights,
             offset,
             &design.penalties,
             heuristic_lambdas,
-            warm_start.as_ref().map(|beta| beta.view()),
             family,
             &base_fit_opts,
         )?,
