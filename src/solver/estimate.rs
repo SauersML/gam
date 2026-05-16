@@ -2322,16 +2322,20 @@ fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     let gaussian = matches!(link, LinkFunction::Identity);
     SeedConfig {
         bounds: (-12.0, 12.0),
-        max_seeds: if gaussian {
-            1
-        } else if k <= 4 {
+        max_seeds: if k <= 4 {
             6
         } else if k <= 12 {
             8
         } else {
             10
         },
-        seed_budget: if k <= 6 { 1 } else { 2 },
+        seed_budget: if gaussian && k <= 4 {
+            2
+        } else if k <= 6 {
+            1
+        } else {
+            2
+        },
         risk_profile: if gaussian {
             SeedRiskProfile::Gaussian
         } else {
@@ -5637,8 +5641,14 @@ mod estimate_policy_tests {
     fn gaussian_external_reml_uses_single_seed_policy() {
         let cfg = external_reml_seed_config(2, LinkFunction::Identity);
         assert_eq!(cfg.risk_profile, SeedRiskProfile::Gaussian);
-        assert_eq!(cfg.max_seeds, 1);
-        assert_eq!(cfg.seed_budget, 1);
+        assert!(
+            cfg.max_seeds > cfg.seed_budget,
+            "Gaussian REML should rank deterministic candidate basins before startup"
+        );
+        assert_eq!(
+            cfg.seed_budget, 2,
+            "low-dimensional Gaussian REML should compare more than one optimized start"
+        );
     }
 
     #[test]
