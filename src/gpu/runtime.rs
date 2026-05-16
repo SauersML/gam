@@ -217,16 +217,9 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
             total_memory_bytes,
         });
     }
-    drop(cu_init);
-    drop(cu_device_get_count);
-    drop(cu_device_get);
-    drop(cu_device_get_name);
-    drop(cu_device_compute_capability);
-    drop(cu_device_total_mem);
-    drop(cu_device_get_attribute);
-    // `library` is a `&'static` handle owned by the `OnceLock` inside
-    // `load_cuda_driver`; the dlopen mapping outlives the program.
-    let _ = library;
+    // The `Symbol` bindings go out of scope at function exit; they don't
+    // carry destructors with side effects. `library` itself is a `&'static`
+    // handle owned by the `OnceLock` inside `load_cuda_driver`.
     Ok(devices)
 }
 
