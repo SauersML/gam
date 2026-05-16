@@ -191,9 +191,9 @@ impl CublasRuntime {
         let a_host = to_col_major(a);
         let b_host = to_col_major(b);
         let mut c_host = vec![0.0; m.checked_mul(n)?];
-        let bytes_a = bytes_len(a_host.len())?;
-        let bytes_b = bytes_len(b_host.len())?;
-        let bytes_c = bytes_len(c_host.len())?;
+        let bytes_a = bytes_len::<f64>(a_host.len())?;
+        let bytes_b = bytes_len::<f64>(b_host.len())?;
+        let bytes_c = bytes_len::<f64>(c_host.len())?;
 
         unsafe {
             self.set_current().ok()?;
@@ -241,9 +241,9 @@ impl CublasRuntime {
         let a_host = to_col_major(a);
         let x_host = v.to_vec();
         let mut y_host = vec![0.0; out_len];
-        let bytes_a = bytes_len(a_host.len())?;
-        let bytes_x = bytes_len(x_host.len())?;
-        let bytes_y = bytes_len(y_host.len())?;
+        let bytes_a = bytes_len::<f64>(a_host.len())?;
+        let bytes_x = bytes_len::<f64>(x_host.len())?;
+        let bytes_y = bytes_len::<f64>(y_host.len())?;
 
         unsafe {
             self.set_current().ok()?;
@@ -294,10 +294,10 @@ impl CublasRuntime {
         let y_host = to_col_major(y);
         let w_host = w.to_vec();
         let mut out_host = vec![0.0; x_cols.checked_mul(y_cols)?];
-        let bytes_x = bytes_len(x_host.len())?;
-        let bytes_y = bytes_len(y_host.len())?;
-        let bytes_w = bytes_len(w_host.len())?;
-        let bytes_out = bytes_len(out_host.len())?;
+        let bytes_x = bytes_len::<f64>(x_host.len())?;
+        let bytes_y = bytes_len::<f64>(y_host.len())?;
+        let bytes_w = bytes_len::<f64>(w_host.len())?;
+        let bytes_out = bytes_len::<f64>(out_host.len())?;
 
         unsafe {
             self.set_current().ok()?;
