@@ -13510,7 +13510,7 @@ fn validate_lat_lon_matrix(
 /// are also coarse at f64 precision; see `wide-0.7.33/src/f64x4_.rs:1297`).
 #[inline]
 fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
-    use wide::f64x4;
+    use wide::{CmpGt, f64x4};
     // Bit-twiddle each lane to split into mantissa m ∈ [1, 2) and integer
     // exponent e. `wide` keeps `fraction_2`/`exponent` private, so we route
     // through `to_array` / `from`. The 8 scalar bit ops below are cheap
