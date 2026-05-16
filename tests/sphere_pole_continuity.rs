@@ -99,3 +99,45 @@ fn sphere_harmonic_north_pole_is_a_single_point() {
         1e-6,
     );
 }
+
+/// Sphere smooths must wrap continuously in longitude: f(lat, +180) and
+/// f(lat, -180) reference the same point and must give the same prediction.
+fn assert_longitude_wrap(formula: &str, tol: f64) {
+    init_parallelism();
+    let data = make_dataset(9, 18);
+    let lats: Vec<f64> = vec![-60.0, -30.0, 0.0, 30.0, 60.0];
+    let mut pos_lons = lats.clone();
+    pos_lons.iter_mut().for_each(|l| *l = *l * 0.0 + 179.99999);
+    let neg_lons: Vec<f64> = pos_lons.iter().map(|_| -179.99999).collect();
+
+    let pred_pos = predict(formula, &data, &lats, &pos_lons);
+    let pred_neg = predict(formula, &data, &lats, &neg_lons);
+
+    let mut max_gap = 0.0_f64;
+    for (a, b) in pred_pos.iter().zip(pred_neg.iter()) {
+        let d = (a - b).abs();
+        if d > max_gap {
+            max_gap = d;
+        }
+    }
+    eprintln!(
+        "[sphere-wrap] formula=`{formula}` max |f(lat, +180) - f(lat, -180)| = {max_gap:.6e} (tol {tol:.1e})"
+    );
+    assert!(
+        max_gap <= tol,
+        "longitude wrap discontinuous: max gap {max_gap:.6e} > tol {tol:.1e} for `{formula}`",
+    );
+}
+
+#[test]
+fn sphere_wahba_longitude_wraps_continuously() {
+    assert_longitude_wrap("y ~ sphere(lat, lon, k=8)", 1e-4);
+}
+
+#[test]
+fn sphere_harmonic_longitude_wraps_continuously() {
+    assert_longitude_wrap(
+        "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
+        1e-4,
+    );
+}
