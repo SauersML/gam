@@ -61,24 +61,11 @@ impl fmt::Display for GpuProbeError {
     }
 }
 
-/// Cached probe outcome. The `Library` is leaked into a `'static` slot so the
-/// dlopen handle outlives the program; callers never touch it directly.
+/// Cached probe outcome — either a selected device or CPU-only.
 #[derive(Debug)]
 pub struct GpuRuntime {
-    selection: Selection,
+    selected_device: Option<GpuDeviceInfo>,
     policy: DispatchPolicy,
-}
-
-#[derive(Debug)]
-enum Selection {
-    CpuOnly(#[allow(dead_code)] GpuProbeError),
-    Cuda {
-        device: GpuDeviceInfo,
-        // Owning handle to the dynamically loaded CUDA driver. Backends that
-        // later need driver entry points should request them via this handle
-        // instead of dlopen'ing the library again.
-        _library: &'static Library,
-    },
 }
 
 impl GpuRuntime {
@@ -90,7 +77,7 @@ impl GpuRuntime {
 
     fn probe() -> Self {
         match probe_cuda_devices() {
-            Ok((library, mut devices)) => {
+            Ok(mut devices) => {
                 debug_assert!(!devices.is_empty());
                 devices.sort_by(|a, b| {
                     b.score()
@@ -101,17 +88,14 @@ impl GpuRuntime {
                 let policy = DispatchPolicy::for_device(Some(&device));
                 log::debug!("[gam-gpu] autodetected {device}");
                 Self {
-                    selection: Selection::Cuda {
-                        device,
-                        _library: library,
-                    },
+                    selected_device: Some(device),
                     policy,
                 }
             }
             Err(err) => {
                 log::trace!("[gam-gpu] CPU execution selected: {err}");
                 Self {
-                    selection: Selection::CpuOnly(err),
+                    selected_device: None,
                     policy: DispatchPolicy::for_device(None),
                 }
             }
@@ -121,22 +105,13 @@ impl GpuRuntime {
     /// True when a CUDA device was successfully selected.
     #[inline]
     pub fn is_available(&self) -> bool {
-        match &self.selection {
-            Selection::Cuda { .. } => true,
-            Selection::CpuOnly(err) => {
-                let _ = err;
-                false
-            }
-        }
+        self.selected_device.is_some()
     }
 
     /// Selected device descriptor, or `None` for CPU-only hosts.
     #[inline]
     pub fn selected_device(&self) -> Option<&GpuDeviceInfo> {
-        match &self.selection {
-            Selection::Cuda { device, .. } => Some(device),
-            Selection::CpuOnly(_) => None,
-        }
+        self.selected_device.as_ref()
     }
 
     /// Workload-size policy for the selected device.
