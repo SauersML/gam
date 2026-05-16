@@ -82,9 +82,7 @@ fn narrow_gaussian_bump_peak_and_baseline() {
         let yhat_base = fit_predict(&format!("y ~ {body}"), &data, &baseline_pts);
         let peak_pred = yhat_dense.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let baseline_abs = yhat_base.iter().cloned().map(f64::abs).fold(0.0, f64::max);
-        eprintln!(
-            "[narrow-bump] {label:14} peak={peak_pred:.3} baseline_abs={baseline_abs:.3}"
-        );
+        eprintln!("[narrow-bump] {label:14} peak={peak_pred:.3} baseline_abs={baseline_abs:.3}");
         if peak_pred < 0.70 {
             violations.push(format!(
                 "{label}: peak prediction {peak_pred:.3} < 0.70 (oversmoothed bump)"

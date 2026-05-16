@@ -91,7 +91,13 @@ fn fit_beta(formula: &str, data: &gam::data::EncodedDataset) -> Array1<f64> {
 
 /// Compare two β vectors of equal length; return the max abs difference.
 fn beta_max_abs_diff(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    assert_eq!(a.len(), b.len(), "β length mismatch ({} vs {})", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "β length mismatch ({} vs {})",
+        a.len(),
+        b.len()
+    );
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -124,8 +130,7 @@ fn data_te_cylinder(n: usize) -> gam::data::EncodedDataset {
         .collect();
     let y: Vec<f64> = (0..n)
         .map(|i| {
-            1.0 + 0.55 * theta[i].cos()
-                - 0.25 * (2.0 * theta[i]).sin()
+            1.0 + 0.55 * theta[i].cos() - 0.25 * (2.0 * theta[i]).sin()
                 + 0.3 * h[i]
                 + 0.05 * rng.next_normal()
         })
@@ -155,7 +160,9 @@ fn data_bc(n: usize) -> gam::data::EncodedDataset {
 
 fn data_sx(n: usize) -> gam::data::EncodedDataset {
     let mut rng = LcgNormal::new(0xDEADBEEF);
-    let x: Vec<f64> = (0..n).map(|i| 2.0 * (i as f64) / (n as f64) - 1.0).collect();
+    let x: Vec<f64> = (0..n)
+        .map(|i| 2.0 * (i as f64) / (n as f64) - 1.0)
+        .collect();
     let y: Vec<f64> = x
         .iter()
         .map(|xi| (xi * PI).sin() + 0.3 * xi + 0.05 * rng.next_normal())

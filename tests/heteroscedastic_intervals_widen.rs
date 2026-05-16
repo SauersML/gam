@@ -52,7 +52,9 @@ fn smooth_fit_se_widens_in_high_noise_region() {
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ smooth(x)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
 
     // Probe SE at low-noise (x≈0.1) and high-noise (x≈0.9) regions.
     let probe = [0.10_f64, 0.90_f64];
@@ -82,14 +84,27 @@ fn smooth_fit_se_widens_in_high_noise_region() {
     let se_low = {
         let xi = x_dense.row(0).to_owned();
         let cxi: Array1<f64> = cov.dot(&xi);
-        xi.iter().zip(cxi.iter()).map(|(a, b)| a * b).sum::<f64>().max(0.0).sqrt()
+        xi.iter()
+            .zip(cxi.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            .max(0.0)
+            .sqrt()
     };
     let se_high = {
         let xi = x_dense.row(1).to_owned();
         let cxi: Array1<f64> = cov.dot(&xi);
-        xi.iter().zip(cxi.iter()).map(|(a, b)| a * b).sum::<f64>().max(0.0).sqrt()
+        xi.iter()
+            .zip(cxi.iter())
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            .max(0.0)
+            .sqrt()
     };
-    eprintln!("[hetero-se] SE@x=0.1 = {se_low:.4}  SE@x=0.9 = {se_high:.4}  ratio = {:.2}", se_high / se_low.max(1e-12));
+    eprintln!(
+        "[hetero-se] SE@x=0.1 = {se_low:.4}  SE@x=0.9 = {se_high:.4}  ratio = {:.2}",
+        se_high / se_low.max(1e-12)
+    );
     // Truth σ ratio is (0.03 + 0.45)/(0.03 + 0.045) = 6.4×. Conditional-mean SE
     // can't see σ(x) directly (Gaussian-identity assumes constant σ̂), but it
     // should still adapt via local leverage. Require at least 1.5×.
