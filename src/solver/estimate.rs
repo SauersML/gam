@@ -2975,6 +2975,9 @@ where
     };
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);
+    // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
+    // so the final accept-fit skips the streaming GEMM as well.
+    let final_cache_handle = reml_state.gaussian_fixed_cache_if_eligible();
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
@@ -2983,7 +2986,7 @@ where
             y: y_o.view(),
             priorweights: w_o.view(),
             covariate_se: None,
-            gaussian_fixed_cache: None,
+            gaussian_fixed_cache: final_cache_handle.as_deref(),
         },
         pirls::PenaltyConfig {
             canonical_penalties: reml_state.canonical_penalties(),

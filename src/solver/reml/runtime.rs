@@ -6,6 +6,7 @@ use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
     boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
+use crate::matrix::LinearOperator;
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
@@ -3341,6 +3342,79 @@ impl<'a> RemlState<'a> {
         &self.balanced_penalty_root
     }
 
+    /// Return a Gaussian-Identity `XᵀWX` / `XᵀW(y−offset)` cache when the
+    /// outer-loop preconditions for the Identity short-circuit hold, building
+    /// it lazily on the first call.  Returns `None` otherwise — callers must
+    /// then route through the non-cached path.
+    ///
+    /// Preconditions: family `GaussianIdentity` + standard `Identity` link
+    /// + no Firth bias reduction + no coefficient lower bounds + no linear
+    /// inequality constraints.  These exactly match the gate in
+    /// `solve_penalized_least_squares_implicit` so the cache is only ever
+    /// consulted where it is mathematically equivalent to streaming the
+    /// dense `XᵀWX` from scratch.
+    pub(crate) fn gaussian_fixed_cache_if_eligible(
+        &self,
+    ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
+        // Static eligibility — these only depend on data the outer loop
+        // never mutates, so the gate is correct once and stays correct.
+        let family_ok = matches!(
+            self.config.likelihood.family,
+            crate::types::GlmLikelihoodFamily::GaussianIdentity
+        );
+        let link_ok = matches!(
+            self.config.link_kind,
+            crate::types::InverseLink::Standard(LinkFunction::Identity)
+        );
+        if !family_ok
+            || !link_ok
+            || self.config.firth_bias_reduction
+            || self.coefficient_lower_bounds.is_some()
+            || self.linear_constraints.is_some()
+        {
+            return None;
+        }
+        // Fast path — already populated.
+        {
+            let guard = self.gaussian_fixed_cache.read().unwrap();
+            if let Some(cache) = guard.as_ref() {
+                return Some(Arc::clone(cache));
+            }
+        }
+        // First-call construction. Re-check under the write lock so two
+        // concurrent callers cannot both pay the O(N·p²) bill.
+        let mut guard = self.gaussian_fixed_cache.write().unwrap();
+        if let Some(cache) = guard.as_ref() {
+            return Some(Arc::clone(cache));
+        }
+        let build_start = std::time::Instant::now();
+        let weights_owned = self.weights.to_owned();
+        // wz_minus_offset = (y - offset) elementwise; cache stores XᵀW(y−offset).
+        let mut wz = self.y.to_owned();
+        wz -= &self.offset;
+        wz *= &weights_owned;
+        let xtwx = match self.x.diag_xtw_x(&weights_owned) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("[gaussian-fixed-cache] disabling cache: failed to build XᵀWX: {e}");
+                return None;
+            }
+        };
+        let xtwy = self.x.transpose_vector_multiply(&wz);
+        let cache = Arc::new(crate::pirls::GaussianFixedCache {
+            xtwx_orig: xtwx,
+            xtwy_orig: xtwy,
+        });
+        log::info!(
+            "[gaussian-fixed-cache] built p={} n={} in {:.3} ms",
+            self.p,
+            self.y.len(),
+            build_start.elapsed().as_secs_f64() * 1e3
+        );
+        *guard = Some(Arc::clone(&cache));
+        Some(cache)
+    }
+
     pub(crate) fn canonical_penalties(&self) -> &[crate::construction::CanonicalPenalty] {
         &self.canonical_penalties
     }
@@ -3750,13 +3824,18 @@ impl<'a> RemlState<'a> {
                 pirls_config.initial_lm_lambda =
                     adaptive_lm_lambda_hint(cached_lambda, last_iters, last_converged);
             }
+            // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
+            // XᵀW(y − offset) across every inner solve; for other families /
+            // links this returns None and the inner solver falls back to the
+            // streaming GEMM.
+            let cache_handle = self.gaussian_fixed_cache_if_eligible();
             let problem = pirls::PirlsProblem {
                 x: &self.x,
                 offset: self.offset.view(),
                 y: self.y,
                 priorweights: self.weights,
                 covariate_se: None,
-                gaussian_fixed_cache: None,
+                gaussian_fixed_cache: cache_handle.as_deref(),
             };
             let penalty = pirls::PenaltyConfig {
                 canonical_penalties: &self.canonical_penalties,

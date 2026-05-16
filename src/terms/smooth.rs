@@ -3303,6 +3303,132 @@ fn build_tensor_bspline_basis(
     })
 }
 
+/// Build the Khatri-Rao tensor product of sparse 1D B-spline marginals as a
+/// single `SparseColMat`, exploiting the per-row sparsity of B-spline bases
+/// (each row of marginal `d` has at most `degree_d + 1` nonzeros).
+///
+/// Column ordering matches `tensor_product_design_from_marginals`: marginal 0
+/// varies slowest, the last marginal varies fastest. For a multi-index
+/// `(j_0, ..., j_{D-1})` the flat column is `j_0 * (q_1 * ... * q_{D-1}) +
+/// j_1 * (q_2 * ... * q_{D-1}) + ... + j_{D-1}`.
+///
+/// Mathematically: `out[i, flat(j_0, ..., j_{D-1})] = ∏_d marginal_d[i, j_d]`.
+fn tensor_product_design_from_sparse_marginals(
+    marginal_sparse: &[&SparseColMat<usize, f64>],
+) -> Result<SparseColMat<usize, f64>, BasisError> {
+    if marginal_sparse.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "TensorBSpline requires at least one marginal basis".to_string(),
+        ));
+    }
+    let n = marginal_sparse[0].nrows();
+    for (i, m) in marginal_sparse.iter().enumerate().skip(1) {
+        if m.nrows() != n {
+            return Err(BasisError::DimensionMismatch(format!(
+                "tensor sparse marginal row mismatch at dim {i}: expected {n}, got {}",
+                m.nrows()
+            )));
+        }
+    }
+    let dims: Vec<usize> = marginal_sparse.iter().map(|m| m.ncols()).collect();
+    let total_cols = dims.iter().try_fold(1usize, |acc, &q| {
+        acc.checked_mul(q)
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+    })?;
+    // Strides such that strides[d] = ∏_{e > d} q_e; first marginal slowest.
+    let mut strides = vec![1usize; dims.len()];
+    for d in (0..dims.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1]
+            .checked_mul(dims[d + 1])
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))?;
+    }
+
+    // Convert each marginal to CSR for O(1) row access (CSC stores by column,
+    // so iterating "all nonzeros in row i" requires a column-major scan; the
+    // CSR conversion is a one-time, linear cost in nnz).
+    use faer::sparse::SparseRowMat;
+    let csrs: Vec<SparseRowMat<usize, f64>> = marginal_sparse
+        .iter()
+        .enumerate()
+        .map(|(d, m)| {
+            m.as_ref().to_row_major().map_err(|e| {
+                BasisError::SparseCreation(format!(
+                    "tensor sparse marginal {d} CSR conversion failed: {e:?}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_ptrs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().row_ptr()).collect();
+    let col_idxs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().col_idx()).collect();
+    let vals: Vec<&[f64]> = csrs.iter().map(|c| c.val()).collect();
+
+    // Per-row Cartesian product of marginal nonzero column lists. Parallelize
+    // across row chunks; each chunk produces a Vec<Triplet> appended together.
+    use rayon::prelude::*;
+    const CHUNK: usize = 1024;
+    let num_chunks = n.div_ceil(CHUNK);
+    let per_chunk: Vec<Vec<Triplet<usize, usize, f64>>> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let row_start = chunk_idx * CHUNK;
+            let row_end = (row_start + CHUNK).min(n);
+            let mut chunk_triplets = Vec::<Triplet<usize, usize, f64>>::new();
+            // Reusable accumulators across rows in this chunk.
+            let mut cur_cols = Vec::<usize>::with_capacity(64);
+            let mut cur_vals = Vec::<f64>::with_capacity(64);
+            let mut next_cols = Vec::<usize>::with_capacity(64);
+            let mut next_vals = Vec::<f64>::with_capacity(64);
+            for i in row_start..row_end {
+                cur_cols.clear();
+                cur_vals.clear();
+                cur_cols.push(0);
+                cur_vals.push(1.0);
+                let mut row_is_zero = false;
+                for d in 0..dims.len() {
+                    let row_start_d = row_ptrs[d][i];
+                    let row_end_d = row_ptrs[d][i + 1];
+                    if row_start_d == row_end_d {
+                        row_is_zero = true;
+                        break;
+                    }
+                    let stride = strides[d];
+                    next_cols.clear();
+                    next_vals.clear();
+                    next_cols.reserve(cur_cols.len() * (row_end_d - row_start_d));
+                    next_vals.reserve(cur_vals.len() * (row_end_d - row_start_d));
+                    for (&prev_col, &prev_val) in cur_cols.iter().zip(cur_vals.iter()) {
+                        for ptr in row_start_d..row_end_d {
+                            let cj = col_idxs[d][ptr];
+                            let vj = vals[d][ptr];
+                            next_cols.push(prev_col + cj * stride);
+                            next_vals.push(prev_val * vj);
+                        }
+                    }
+                    std::mem::swap(&mut cur_cols, &mut next_cols);
+                    std::mem::swap(&mut cur_vals, &mut next_vals);
+                }
+                if row_is_zero {
+                    continue;
+                }
+                for (&col, &val) in cur_cols.iter().zip(cur_vals.iter()) {
+                    chunk_triplets.push(Triplet::new(i, col, val));
+                }
+            }
+            chunk_triplets
+        })
+        .collect();
+    let total_nnz: usize = per_chunk.iter().map(Vec::len).sum();
+    let mut triplets = Vec::<Triplet<usize, usize, f64>>::with_capacity(total_nnz);
+    for chunk in per_chunk {
+        triplets.extend(chunk);
+    }
+    SparseColMat::try_new_from_triplets(n, total_cols, &triplets).map_err(|e| {
+        BasisError::SparseCreation(format!(
+            "failed to assemble sparse tensor product design: {e:?}"
+        ))
+    })
+}
+
 fn tensor_product_design_from_marginals(
     marginal_designs: &[Array2<f64>],
 ) -> Result<Array2<f64>, BasisError> {
