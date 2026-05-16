@@ -14,6 +14,7 @@
 //! same data stay within tolerance.
 
 use csv::StringRecord;
+use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
     init_parallelism,
@@ -92,10 +93,10 @@ fn max_residual_against_truth(theta: &[f64], y_noisy: &[f64], y_truth: &[f64],
         panic!("expected standard Gaussian fit");
     };
     let beta = &fit.fit.beta;
-    let design = &fit.design.x;
+    let design = &fit.design.design;
     assert_eq!(design.ncols(), beta.len(),
                "design width != beta length for `{}`", formula_body);
-    let fitted = design.dot(beta);
+    let fitted = design.apply(beta);
     // Compare fitted values to the clean truth (not the noisy y) — measures
     // how close the smooth's mean is to the underlying signal.
     let mut max_abs = 0.0_f64;
