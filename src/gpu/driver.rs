@@ -71,11 +71,10 @@ impl DriverApi {
 /// (`cublasCreate_v2`, `cusolverDnCreate`, `cusparseCreate`) attach to
 /// the same context instead of building their own.
 pub struct CudaWorkingState {
-    /// Owning handle to the dynamically loaded `libcuda` library.
-    /// `Box::leak`'d so the dlopen mapping outlives the process — the
-    /// driver entry pointers in `api` reference its address space.
-    _library: &'static libloading::Library,
-    /// Resolved CUDA driver entry points.
+    /// Resolved CUDA driver entry points. The underlying dlopen'd
+    /// `libcuda` is `Box::leak`'d inside [`load_static_library`], so the
+    /// fn pointers in `api` stay valid for the process lifetime without
+    /// any owning field here.
     pub api: DriverApi,
     /// Primary CUDA context for the selected device. Library runtimes
     /// must `cuCtxSetCurrent` on it before issuing work.
@@ -88,8 +87,7 @@ impl CudaWorkingState {
     /// missing, or any of `cuInit / cuDeviceGet / cuCtxCreate` fails.
     pub fn init(device_ordinal: usize) -> Option<Self> {
         let ordinal = to_i32(device_ordinal)?;
-        let library = load_library(cuda_library_candidates()).ok()?;
-        let library: &'static Library = Box::leak(Box::new(library));
+        let library = load_static_library(cuda_library_candidates()).ok()?;
         let api = DriverApi::load(library).ok()?;
         unsafe {
             check_cuda((api.cu_init)(0), "cuInit").ok()?;
@@ -101,11 +99,7 @@ impl CudaWorkingState {
                 "cuCtxCreate",
             )
             .ok()?;
-            Some(Self {
-                _library: library,
-                api,
-                context,
-            })
+            Some(Self { api, context })
         }
     }
 
@@ -176,6 +170,14 @@ pub fn load_library(candidates: &[&str]) -> Result<Library, String> {
         }
     }
     Err(format!("could not load any of: {}", candidates.join(", ")))
+}
+
+/// Like [`load_library`] but `Box::leak`s the result so the dlopen mapping
+/// stays alive for the process. Use this when the caller's fn-pointer
+/// table needs to stay valid forever (i.e. for every library binding we
+/// resolve at startup).
+pub fn load_static_library(candidates: &[&str]) -> Result<&'static Library, String> {
+    Ok(Box::leak(Box::new(load_library(candidates)?)))
 }
 
 pub fn cuda_library_candidates() -> &'static [&'static str] {
