@@ -640,13 +640,21 @@ def quality_report(shapes):
     ])
     rows.append(("mobius", "pointwise", *stats(mob_pred, mob_truth)))
 
-    print("[quality] joint-coordinate RMSE / R² vs analytic truth")
-    print("           shape       n_grid        RMSE         R²")
-    for name, rmse, r2 in rows:
-        nrows = {"trefoil": len(T), "loop": len(T),
-                 "cylinder": NTH * NH, "sphere": len(sph_truth),
-                 "torus": len(tor_truth), "mobius": len(mob_truth)}[name]
-        print(f"           {name:9s}   {nrows:6d}    {rmse:8.4f}    {r2:7.4f}")
+    print("[quality] recovery error vs analytic truth")
+    print("           shape        n_grid    metric         error         R²")
+    nrow_lookup = {
+        "trefoil":  len(T),
+        "loop":     len(T),
+        "cylinder": NTH * NH,
+        "sphere":   len(sph_truth),
+        "torus":    len(tor_truth),
+        "mobius":   len(mob_truth),
+    }
+    for name, metric, err, r2 in rows:
+        nrows = nrow_lookup[name]
+        r2_str = "      —" if np.isnan(r2) else f"  {r2:7.4f}"
+        print(f"           {name:9s}    {nrows:6d}    {metric:9s}     "
+              f"{err:8.4f}  {r2_str}")
 
 
 # ---------------------------------------------------------------------------
