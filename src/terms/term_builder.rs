@@ -1038,7 +1038,11 @@ fn parse_math_f64(raw: &str) -> Result<f64, String> {
     if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
         return Err("None/null is not a number".to_string());
     }
-    let lower = t.to_ascii_lowercase().replace(' ', "");
+    let lower = t
+        .to_ascii_lowercase()
+        .replace(' ', "")
+        .replace('π', "pi")
+        .replace('τ', "tau");
     match lower.as_str() {
         "pi" => return Ok(std::f64::consts::PI),
         "tau" | "2pi" | "2*pi" => return Ok(2.0 * std::f64::consts::PI),
@@ -1608,6 +1612,15 @@ mod tests {
         assert_eq!(bc_axes, vec![true, false]);
         assert!((bc_periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
         assert_eq!(bc_periods[1], None);
+
+        let mut unicode_opts = BTreeMap::new();
+        unicode_opts.insert("periodic".to_string(), "[0,1]".to_string());
+        unicode_opts.insert("period".to_string(), "[2π, τ]".to_string());
+        let unicode_axes = parse_periodic_axes(&unicode_opts, 2).expect("unicode axes");
+        let unicode_periods = parse_periods(&unicode_opts, &unicode_axes).expect("unicode periods");
+        assert_eq!(unicode_axes, vec![true, true]);
+        assert!((unicode_periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert!((unicode_periods[1].unwrap() - std::f64::consts::TAU).abs() < 1e-12);
     }
 
     #[test]
