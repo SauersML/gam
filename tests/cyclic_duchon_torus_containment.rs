@@ -12,6 +12,7 @@
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -83,13 +84,27 @@ fn build_dataset(theta: &[f64], y_col: &[f64]) -> gam::data::EncodedDataset {
 /// design at new points, because the bug we're catching shows up identically
 /// at the training points: the LAML optimizer parks at a bad ρ and the
 /// resulting β over- or under-fits visibly even at the training thetas.
+/// Build a (n, 3) data array with columns [ct, st, y_placeholder] matching the
+/// training layout so the frozen `resolvedspec` indexes into the right columns.
+fn predict_data_matrix(theta_grid: &[f64]) -> Array2<f64> {
+    let n = theta_grid.len();
+    let mut m = Array2::<f64>::zeros((n, 3));
+    for (i, &t) in theta_grid.iter().enumerate() {
+        m[[i, 0]] = t.cos();
+        m[[i, 1]] = t.sin();
+        m[[i, 2]] = 0.0; // y placeholder, not used by smooth term
+    }
+    m
+}
+
 fn max_residual_against_truth(
-    theta: &[f64],
+    theta_train: &[f64],
     y_noisy: &[f64],
-    y_truth: &[f64],
+    theta_test: &[f64],
+    y_truth_test: &[f64],
     formula_body: &str,
 ) -> f64 {
-    let data = build_dataset(theta, y_noisy);
+    let data = build_dataset(theta_train, y_noisy);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -100,18 +115,21 @@ fn max_residual_against_truth(
         panic!("expected standard Gaussian fit");
     };
     let beta = &fit.fit.beta;
-    let design = &fit.design.design;
+
+    // Build prediction design at test points using the frozen spec.
+    let new_data = predict_data_matrix(theta_test);
+    let test_design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
+        .expect("rebuild prediction design from frozen spec");
     assert_eq!(
-        design.ncols(),
+        test_design.design.ncols(),
         beta.len(),
-        "design width != beta length for `{}`",
+        "predict design width != beta length for `{}`",
         formula_body
     );
-    let fitted = design.apply(beta);
-    // Compare fitted values to the clean truth (not the noisy y) — measures
-    // how close the smooth's mean is to the underlying signal.
+    let predicted = test_design.design.apply(beta);
+
     let mut max_abs = 0.0_f64;
-    for (yhat, yt) in fitted.iter().zip(y_truth.iter()) {
+    for (yhat, yt) in predicted.iter().zip(y_truth_test.iter()) {
         let r = (yhat - yt).abs();
         if r > max_abs {
             max_abs = r;
@@ -120,16 +138,46 @@ fn max_residual_against_truth(
     max_abs
 }
 
+/// Generate the *clean* circle (with spike) at given thetas — for the truth
+/// at prediction points.
+fn clean_circle_at(theta: &[f64]) -> Array2<f64> {
+    let n = theta.len();
+    let tilt = 30.0_f64.to_radians();
+    let (st, ct) = tilt.sin_cos();
+    let theta_spike = 2.0 * std::f64::consts::PI / 3.0;
+    let spike_sigma = 0.16_f64;
+    let spike_amp = 0.55_f64;
+    let mut clean = Array2::<f64>::zeros((n, 3));
+    for (i, &t) in theta.iter().enumerate() {
+        let dt = (t - theta_spike).sin().atan2((t - theta_spike).cos());
+        let r = 1.0 + spike_amp * (-0.5 * (dt / spike_sigma).powi(2)).exp();
+        let cx = r * t.cos();
+        let cy = r * t.sin();
+        clean[[i, 0]] = cx;
+        clean[[i, 1]] = cy * ct;
+        clean[[i, 2]] = cy * st;
+    }
+    clean
+}
+
 #[test]
 fn cyclic_duchon_centers_80_fit_stays_within_envelope() {
     // 5σ envelope on the noise — a sane fit can never need more than this.
     const TOL: f64 = 0.35;
     init_parallelism();
 
-    let (theta, clean, noisy) = make_noisy_circle(260, 17);
+    let (theta, _clean, noisy) = make_noisy_circle(260, 17);
     // Use the z coordinate (most diagnostic in our investigation)
     let y_noisy: Vec<f64> = noisy.column(2).to_vec();
-    let y_truth: Vec<f64> = clean.column(2).to_vec();
+
+    // Predict on a dense uniform grid spanning [0, 2π) — exposes wandering
+    // between training points that in-sample residuals miss.
+    let n_grid = 400usize;
+    let theta_test: Vec<f64> = (0..n_grid)
+        .map(|i| TAU * (i as f64) / (n_grid as f64))
+        .collect();
+    let clean_test = clean_circle_at(&theta_test);
+    let y_truth_test: Vec<f64> = clean_test.column(2).to_vec();
 
     let cases: &[(&str, &str)] = &[
         ("thinplate", "thinplate(ct, st)"),
@@ -140,8 +188,8 @@ fn cyclic_duchon_centers_80_fit_stays_within_envelope() {
 
     let mut violations = Vec::new();
     for (label, body) in cases {
-        let m = max_residual_against_truth(&theta, &y_noisy, &y_truth, body);
-        eprintln!("[envelope] {label:20} max|fitted - truth| = {m:.4}");
+        let m = max_residual_against_truth(&theta, &y_noisy, &theta_test, &y_truth_test, body);
+        eprintln!("[envelope] {label:20} max|pred - truth| on grid = {m:.4}");
         if m > TOL {
             violations.push(format!("{label} ({body}): {m:.4} > {TOL}"));
         }
