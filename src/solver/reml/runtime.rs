@@ -201,10 +201,7 @@ impl<'a> RemlState<'a> {
         } else if !self.canonical_penalties.is_empty()
             && self.canonical_penalties.len() == rho.len()
         {
-            self.structural_penalty_logdet_derivatives_block_local(
-                &lambdas,
-                ridge,
-            )?
+            self.structural_penalty_logdet_derivatives_block_local(&lambdas, ridge)?
         } else if !penalty_roots.is_empty() {
             self.structural_penalty_logdet_derivatives(penalty_roots, &lambdas, ridge)?
         } else {
