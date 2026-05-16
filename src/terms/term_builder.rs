@@ -376,8 +376,13 @@ pub fn build_smooth_basis(
             }
             let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             let degree = 3usize;
-            let knots_internal = option_usize(options, "knots");
-            let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+            let knots_internal = option_usize_list_any(options, &["knots"])?
+                .map(|v| expand_margin_usize_option("knots", v, cols.len()))
+                .transpose()?;
+            let basis_dim =
+                option_usize_list_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?
+                    .map(|v| expand_margin_usize_option("k", v, cols.len()))
+                    .transpose()?;
             if knots_internal.is_some() && basis_dim.is_some() {
                 return Err(
                     "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
@@ -385,17 +390,19 @@ pub fn build_smooth_basis(
                 );
             }
             let inferred = knots_internal.is_none() && basis_dim.is_none();
-            let mut internal_knots_by_dim = if let Some(k) = basis_dim {
+            let mut internal_knots_by_dim = if let Some(k_values) = basis_dim {
                 let min_k = degree + 1;
-                if k < min_k {
-                    return Err(format!(
-                        "tensor smooth: k={} too small for degree {}; expected k >= {}",
-                        k, degree, min_k
-                    ));
+                for &k in &k_values {
+                    if k < min_k {
+                        return Err(format!(
+                            "tensor smooth: k={} too small for degree {}; expected k >= {}",
+                            k, degree, min_k
+                        ));
+                    }
                 }
-                vec![k - min_k; cols.len()]
+                k_values.into_iter().map(|k| k - min_k).collect()
             } else if let Some(knots) = knots_internal {
-                vec![knots; cols.len()]
+                knots
             } else {
                 cols.iter()
                     .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
@@ -1066,6 +1073,44 @@ fn split_list_option(raw: &str) -> Vec<String> {
     inner.split(',').map(|v| v.trim().to_string()).collect()
 }
 
+fn option_usize_list_any(
+    options: &BTreeMap<String, String>,
+    keys: &[&str],
+) -> Result<Option<Vec<usize>>, String> {
+    for key in keys {
+        if let Some(raw) = options.get(*key) {
+            let vals = split_list_option(raw);
+            if vals.is_empty() {
+                return Err(format!("{key} must contain at least one integer"));
+            }
+            let parsed = vals
+                .iter()
+                .map(|v| {
+                    v.parse::<usize>().map_err(|_| {
+                        format!("{key} entries must be non-negative integers, got '{v}'")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
+}
+
+fn expand_margin_usize_option(
+    name: &str,
+    values: Vec<usize>,
+    ndim: usize,
+) -> Result<Vec<usize>, String> {
+    match values.len() {
+        1 => Ok(vec![values[0]; ndim]),
+        n if n == ndim => Ok(values),
+        n => Err(format!(
+            "{name} must be scalar or have one entry per margin ({ndim}), got {n}"
+        )),
+    }
+}
+
 fn parse_periodic_axes(
     options: &BTreeMap<String, String>,
     ndim: usize,
@@ -1689,6 +1734,49 @@ mod tests {
         assert_eq!(axes, vec![true, true]);
         assert_eq!(periods, vec![Some(7.0), Some(24.0)]);
         assert_eq!(origins, vec![Some(0.0), Some(-12.0)]);
+    }
+
+    #[test]
+    fn tensor_smooth_honors_per_margin_k_list() {
+        let ds = continuous_dataset(
+            &["y", "theta", "h"],
+            (0..20)
+                .map(|i| {
+                    let theta = std::f64::consts::TAU * i as f64 / 20.0;
+                    let h = -1.0 + 2.0 * (i % 5) as f64 / 4.0;
+                    vec![theta.cos() + h, theta, h]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula(
+            "y ~ te(theta, h, periodic=[0], period=[2*pi, None], origin=[0, None], k=[9,5])",
+        )
+        .expect("parse tensor formula");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build tensor terms");
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected tensor B-spline");
+        };
+        let dims = spec
+            .marginalspecs
+            .iter()
+            .map(|m| match m.knotspec {
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + m.degree + 1,
+                _ => panic!("unexpected tensor marginal knotspec"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(dims, vec![9, 5]);
     }
 
     #[test]
