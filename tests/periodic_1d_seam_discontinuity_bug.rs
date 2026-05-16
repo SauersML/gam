@@ -1,19 +1,16 @@
-//! FAILING TEST — ticket: `s(t, periodic=true, period=2π)` produces a
-//! discontinuous prediction at the seam: f(t=0) ≠ f(t=2π) by up to ~0.07
-//! on a smooth `1 + 0.6·cos(t) + 0.3·sin(2t)` truth.
+//! Regression guard: `s(t, periodic=true, period=2π)` must produce
+//! identical predictions at the seam — f(t=0) and f(t=2π) refer to the
+//! same point on the circle, so their predicted values must agree to
+//! machine precision.
 //!
-//! Repro (observed values for seed=11, n=200):
-//!   f(0)  = 1.6581
-//!   f(2π) = 1.5882
-//!   gap   = 0.0699   (≈ 7% of truth's peak-to-peak)
+//! Original ticket: an earlier build of the periodic 1-D smooth showed
+//! a ~7% gap (f(0) = 1.6581, f(2π) = 1.5882, gap = 0.0699) on a smooth
+//! `1 + 0.6·cos(t) + 0.3·sin(2t)` truth. Root cause was a non-cyclic
+//! prediction-time basis mapping at t=0 vs t=2π. Now fixed; the gap
+//! holds at the `< 1e-6` tolerance asserted below.
 //!
-//! For a periodic 1D smooth the seam MUST identify exactly — f(0) and f(2π)
-//! refer to the same point on the circle. A non-zero gap means either the
-//! periodic basis isn't actually cyclic, or the prediction-time basis
-//! evaluation is using a different mapping at t=0 vs t=2π. Either is a
-//! correctness bug.
-//!
-//! Until fixed, this test fails at the `assert!(gap < 1e-6, …)` line.
+//! Kept as a regression guard so any future loss of seam continuity in
+//! the periodic basis surfaces immediately.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
