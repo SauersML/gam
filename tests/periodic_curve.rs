@@ -234,4 +234,102 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
         },
         _ => panic!("formula alias did not create 1D periodic smooth"),
     }
+
+    let cyclic = gam::inference::formula_dsl::parse_formula(
+        "y ~ cyclic(u, k=9, period_start=0, period_end=1)",
+    )
+    .unwrap();
+    let cyclic_terms = build_termspec(
+        &cyclic.terms,
+        &ds,
+        &cmap,
+        &mut notes,
+        &ResourcePolicy::default_library(),
+    )
+    .unwrap();
+    match &cyclic_terms.smooth_terms[0].basis {
+        SmoothBasisSpec::BSpline1D { spec, .. } => match spec.knotspec {
+            BSplineKnotSpec::PeriodicUniform {
+                data_range,
+                num_basis,
+            } => {
+                assert_eq!(num_basis, 9);
+                assert_eq!(data_range, (0.0, 1.0));
+            }
+            _ => panic!("cyclic() did not create periodic knotspec"),
+        },
+        _ => panic!("cyclic() did not create 1D periodic smooth"),
+    }
+}
+
+#[test]
+fn cylinder_formula_builds_tensor_with_periodic_margin() {
+    let two_pi = std::f64::consts::TAU;
+    let data = EncodedDataset {
+        headers: vec!["y".to_string(), "theta".to_string(), "h".to_string()],
+        values: array![
+            [0.0, 0.0, 0.25],
+            [0.0, two_pi, 0.25],
+            [0.0, two_pi / 2.0, 0.75],
+        ],
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "theta".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "h".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ],
+    };
+    let parsed = gam::inference::formula_dsl::parse_formula(
+        "y ~ s(theta, h, periodic=[0], period=[2*pi, None], k=8)",
+    )
+    .unwrap();
+    let cmap = data.column_map();
+    let mut notes = Vec::new();
+    let terms = build_termspec(
+        &parsed.terms,
+        &data,
+        &cmap,
+        &mut notes,
+        &ResourcePolicy::default_library(),
+    )
+    .unwrap();
+    match &terms.smooth_terms[0].basis {
+        SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            assert!(matches!(
+                spec.marginalspecs[0].knotspec,
+                BSplineKnotSpec::PeriodicUniform { .. }
+            ));
+            assert!(matches!(
+                spec.marginalspecs[1].knotspec,
+                BSplineKnotSpec::Generate { .. }
+            ));
+        }
+        _ => panic!("mixed periodic s(theta,h) should build a tensor smooth"),
+    }
+    let design = build_term_collection_design(data.values.view(), &terms).unwrap();
+    let dense = design.smooth.term_designs[0].to_dense();
+    for col in 0..dense.ncols() {
+        assert!(
+            (dense[[0, col]] - dense[[1, col]]).abs() < 1e-12,
+            "periodic tensor margin differs across seam at column {col}"
+        );
+    }
 }

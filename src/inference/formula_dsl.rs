@@ -252,7 +252,7 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
+        CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
         parsed_terms_reference_column, validate_marginal_slope_z_column_exclusion,
     };
 
@@ -308,6 +308,21 @@ mod tests {
                 value: "[7, 24]".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_cyclic_smooth_aliases() {
+        let parsed = parse_formula("y ~ cyclic(theta, period_start=0, period_end=6.283)")
+            .expect("parse cyclic formula");
+        match &parsed.terms[0] {
+            ParsedTerm::Smooth { vars, options, .. } => {
+                assert_eq!(vars, &vec!["theta".to_string()]);
+                assert_eq!(options.get("type").map(String::as_str), Some("cyclic"));
+                assert_eq!(options.get("period_start").map(String::as_str), Some("0"));
+                assert_eq!(options.get("period_end").map(String::as_str), Some("6.283"));
+            }
+            other => panic!("expected cyclic smooth term, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1242,11 +1257,14 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" => {
+            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" => {
                 if vars.is_empty() {
                     return Err(format!(
                         "smooth()/s() requires at least one variable: {raw}"
                     ));
+                }
+                if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
+                    options.insert("type".to_string(), "cyclic".to_string());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
@@ -1341,7 +1359,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), sphere(), sos(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), cyclic(), thinplate(), tensor(), group(), sphere(), sos(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
