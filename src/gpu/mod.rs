@@ -21,6 +21,8 @@ pub mod dispatch;
 pub mod kernels;
 pub mod policy;
 pub mod runtime;
+pub mod solver;
+pub mod sparse;
 
 pub use device::{GpuCapability, GpuDeviceInfo};
 pub use dispatch::{
@@ -28,3 +30,5 @@ pub use dispatch::{
 };
 pub use policy::DispatchPolicy;
 pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info};
+pub use solver::{try_potrf_inplace, try_potrs_inplace, try_syevd_inplace};
+pub use sparse::try_csr_spmv;
