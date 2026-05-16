@@ -52,6 +52,7 @@ scripts/latest_benchmark_summary.md
 scripts/codex_nightrun.sh
 *.png
 !bench/aniso_demo/*.png
+bench/aniso_demo/fit_*.log
 !docs/images/*.png
 src/rust_digest.txt
 
