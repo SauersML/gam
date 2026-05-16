@@ -10,8 +10,7 @@ use ndarray::{Array1, ArrayBase, Data, Ix1};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
-    DeviceAllocation, DriverApi, bytes_len, check_cuda, cuda_library_candidates, load_library,
-    to_i32, to_i64,
+    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, load_static_library, to_i32, to_i64,
 };
 use super::runtime::GpuRuntime;
 
@@ -93,7 +92,10 @@ fn route_csr_spmv(rows: usize, cols: usize, nnz: usize) -> bool {
 fn with_runtime<T>(f: impl FnOnce(&mut CusparseRuntime) -> Option<T>) -> Option<T> {
     static RUNTIME: OnceLock<Option<Mutex<CusparseRuntime>>> = OnceLock::new();
     RUNTIME
-        .get_or_init(|| CusparseRuntime::new().ok().map(Mutex::new))
+        .get_or_init(|| {
+            let cuda = GpuRuntime::global().cuda_working_state()?;
+            CusparseRuntime::new(cuda).ok().map(Mutex::new)
+        })
         .as_ref()?
         .lock()
         .ok()
@@ -101,49 +103,28 @@ fn with_runtime<T>(f: impl FnOnce(&mut CusparseRuntime) -> Option<T>) -> Option<
 }
 
 struct CusparseRuntime {
-    _cuda_lib: Library,
-    _cusparse_lib: Library,
-    driver: DriverApi,
+    cuda: &'static CudaWorkingState,
+    /// cuSPARSE entry points; the dlopen'd library is leaked into a
+    /// `&'static` so these pointers stay valid for the process.
     sparse: CusparseApi,
-    context: usize,
     handle: usize,
 }
 
 impl CusparseRuntime {
-    fn new() -> Result<Self, String> {
-        let selected = GpuRuntime::global()
-            .selected_device()
-            .ok_or_else(|| "no CUDA device selected".to_string())?;
-        let cuda_lib = load_library(cuda_library_candidates())?;
-        let sparse_lib = load_library(cusparse_library_candidates())?;
-        let driver = DriverApi::load(&cuda_lib)?;
-        let sparse = CusparseApi::load(&sparse_lib)?;
-        unsafe {
-            check_cuda((driver.cu_init)(0), "cuInit")?;
-            let mut device = 0;
-            let ordinal = to_i32(selected.ordinal)
-                .ok_or_else(|| "CUDA device ordinal exceeds i32".to_string())?;
-            check_cuda((driver.cu_device_get)(&mut device, ordinal), "cuDeviceGet")?;
-            let mut context = 0usize;
-            check_cuda(
-                (driver.cu_ctx_create)(&mut context, 0, device),
-                "cuCtxCreate",
-            )?;
-            let mut handle = 0usize;
-            let status = (sparse.cusparse_create)(&mut handle);
-            if status != CUSPARSE_STATUS_SUCCESS {
-                let _ = (driver.cu_ctx_destroy)(context);
-                return Err(format!("cusparseCreate failed with status {status}"));
-            }
-            Ok(Self {
-                _cuda_lib: cuda_lib,
-                _cusparse_lib: sparse_lib,
-                driver,
-                sparse,
-                context,
-                handle,
-            })
+    fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
+        let sparse_lib = load_static_library(cusparse_library_candidates())?;
+        let sparse = CusparseApi::load(sparse_lib)?;
+        cuda.set_current()?;
+        let mut handle = 0_usize;
+        let status = unsafe { (sparse.cusparse_create)(&mut handle) };
+        if status != CUSPARSE_STATUS_SUCCESS {
+            return Err(format!("cusparseCreate failed with status {status}"));
         }
+        Ok(Self {
+            cuda,
+            sparse,
+            handle,
+        })
     }
 
     fn csr_spmv<S: Data<Elem = f64>>(
@@ -185,12 +166,12 @@ impl CusparseRuntime {
         let bytes_y = bytes_len::<f64>(y_len)?;
 
         unsafe {
-            self.set_current().ok()?;
+            self.cuda.set_current().ok()?;
             let rowptr_dev = self.alloc_copy_bytes(rowptr.as_ptr().cast(), bytes_rowptr)?;
             let colidx_dev = self.alloc_copy_bytes(colidx.as_ptr().cast(), bytes_colidx)?;
             let values_dev = self.alloc_copy_bytes(values.as_ptr().cast(), bytes_values)?;
             let x_dev = self.alloc_copy_bytes(x_slice.as_ptr().cast(), bytes_x)?;
-            let y_dev = DeviceAllocation::new(&self.driver, bytes_y)?;
+            let y_dev = DeviceAllocation::new(&self.cuda.api, bytes_y)?;
 
             let mut spmat: usize = 0;
             if (self.sparse.cusparse_create_csr)(
@@ -247,7 +228,7 @@ impl CusparseRuntime {
                 return None;
             }
             let scratch = if buffer_size > 0 {
-                Some(DeviceAllocation::new(&self.driver, buffer_size)?)
+                Some(DeviceAllocation::new(&self.cuda.api, buffer_size)?)
             } else {
                 None
             };
@@ -271,7 +252,7 @@ impl CusparseRuntime {
                 return None;
             }
             check_cuda(
-                (self.driver.cu_memcpy_dtoh)(y_host.as_mut_ptr().cast(), y_dev.ptr, bytes_y),
+                (self.cuda.api.cu_memcpy_dtoh)(y_host.as_mut_ptr().cast(), y_dev.ptr, bytes_y),
                 "cuMemcpyDtoH",
             )
             .ok()?;
@@ -279,21 +260,14 @@ impl CusparseRuntime {
         Some(Array1::from_vec(y_host))
     }
 
-    unsafe fn set_current(&self) -> Result<(), String> {
-        check_cuda(
-            unsafe { (self.driver.cu_ctx_set_current)(self.context) },
-            "cuCtxSetCurrent",
-        )
-    }
-
     unsafe fn alloc_copy_bytes<'a>(
         &'a self,
         src: *const std::ffi::c_void,
         bytes: usize,
     ) -> Option<DeviceAllocation<'a>> {
-        let alloc = unsafe { DeviceAllocation::new(&self.driver, bytes) }?;
+        let alloc = unsafe { DeviceAllocation::new(&self.cuda.api, bytes) }?;
         check_cuda(
-            unsafe { (self.driver.cu_memcpy_htod)(alloc.ptr, src, bytes) },
+            unsafe { (self.cuda.api.cu_memcpy_htod)(alloc.ptr, src, bytes) },
             "cuMemcpyHtoD",
         )
         .ok()?;
@@ -304,9 +278,8 @@ impl CusparseRuntime {
 impl Drop for CusparseRuntime {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.driver.cu_ctx_set_current)(self.context);
+            let _ = self.cuda.set_current();
             let _ = (self.sparse.cusparse_destroy)(self.handle);
-            let _ = (self.driver.cu_ctx_destroy)(self.context);
         }
     }
 }

@@ -17,7 +17,7 @@ use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major_inplace,
-    load_library, to_col_major, to_i32,
+    load_static_library, to_col_major, to_i32,
 };
 use super::runtime::GpuRuntime;
 
@@ -73,15 +73,16 @@ fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<
 
 struct CusolverRuntime {
     cuda: &'static CudaWorkingState,
-    _cusolver_lib: Library,
+    /// cuSOLVER entry points; the dlopen'd library is leaked into a
+    /// `&'static` so these pointers stay valid for the process.
     solver: CusolverApi,
     handle: usize,
 }
 
 impl CusolverRuntime {
     fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
-        let solver_lib = load_library(cusolver_library_candidates())?;
-        let solver = CusolverApi::load(&solver_lib)?;
+        let solver_lib = load_static_library(cusolver_library_candidates())?;
+        let solver = CusolverApi::load(solver_lib)?;
         cuda.set_current()?;
         let mut handle = 0_usize;
         let status = unsafe { (solver.create)(&mut handle) };
@@ -90,7 +91,6 @@ impl CusolverRuntime {
         }
         Ok(Self {
             cuda,
-            _cusolver_lib: solver_lib,
             solver,
             handle,
         })
