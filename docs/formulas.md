@@ -314,9 +314,9 @@ y ~ x + link(type=flexible(probit))
 | `link(type=...)` | What you get |
 | --- | --- |
 | `identity` | `g⁻¹(η) = η`. Default for Gaussian. |
-| `logit` | `g⁻¹(η) = 1/(1+e^{-η})`. Default for binomial. |
-| `probit` | `g⁻¹(η) = Φ(η)`. |
-| `cloglog` | `g⁻¹(η) = 1 − e^{−e^{η}}`. |
+| `logit` | `g⁻¹(η) = 1/(1+e^{-η})`. Default for binomial. Alias: `binomial-logit`. |
+| `probit` | `g⁻¹(η) = Φ(η)`. Alias: `binomial-probit`. |
+| `cloglog` | `g⁻¹(η) = 1 − e^{−e^{η}}`. Alias: `binomial-cloglog`. |
 | `log` | `g⁻¹(η) = e^η`. For counts and positive-continuous. |
 | `sas` | Sinh-arcsinh skewed link. Don't combine with `linkwiggle`. |
 | `beta-logistic` | Bounded link. Don't combine with `linkwiggle`. |
