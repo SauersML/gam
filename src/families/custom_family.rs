@@ -9915,52 +9915,61 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // The maintainer's argument for removing the
-                    // `joint_newton_max_step_inf` cap from the per-attempt
-                    // path — that the L2 trust radius is strictly tighter
-                    // than an inf-norm cap of the same magnitude — is
-                    // correct only while the trust radius is at its small
-                    // default (1.0). Bumping it to the unconstrained
-                    // Newton-step 2-norm here can push it to 1e6+ on an
-                    // ill-conditioned cycle 0, after which the inf-norm
-                    // cap is no longer redundant.
+                    // Cycle-0 trust-radius bump.  Three competing caps:
                     //
-                    // Root cause of the explosion: the joint Hessian H+S
-                    // is SPD by construction (via `stabilized_joint_solver_diagonal_ridge`)
-                    // but its condition number is *not* bounded — for a
-                    // GAMLSS Duchon basis whose polynomial null-space has
-                    // no penalty coverage, with quasi-saturated starting
-                    // probabilities making `μ(1−μ)` tiny on most rows, H+S
-                    // can have a 1e-14 eigenvalue and Newton's `H⁻¹·g`
-                    // explodes to ~1e14 in that null direction. Bumping
-                    // the trust radius to 1e14 then wastes ~10 attempts at
-                    // progressively-shrinking radii (each rejected as a
-                    // NaN/diverging likelihood) before the trust region
-                    // adaptively recovers a sane scale.
+                    //   (a) the unconstrained Newton step's L2 norm — so a
+                    //       well-conditioned problem gets a single full
+                    //       quadratic step rather than ten shrunk halves.
+                    //   (b) 1.0e6, matching the upper clamp in
+                    //       `update_joint_trust_region_radius` so a sane
+                    //       Newton step never pays for an attempt the next
+                    //       update would immediately re-clamp.
+                    //   (c) `max_step_inf · L2 / inf` — the largest L2
+                    //       radius for which rescaling the Newton step to
+                    //       length r still keeps every coordinate inside
+                    //       the family's per-coordinate sanity bound
+                    //       `joint_newton_max_step_inf`. Beyond this, the
+                    //       step's largest entry exceeds what the family
+                    //       declared physically meaningful in β space
+                    //       (e.g. for a Probit family, the magnitude of a
+                    //       single `η` change beyond which `μ(1−μ)` falls
+                    //       below numerical precision and triggers an
+                    //       IRLS-style divergence).
                     //
-                    // Family-supplied `joint_newton_max_step_inf` is the
-                    // family's own statement of what step magnitude is
-                    // physically meaningful in β space. If Newton's
-                    // proposal already exceeds that, the step direction is
-                    // dominated by the near-null eigenvector and bumping
-                    // the trust radius is counterproductive — keep the
-                    // default radius and let the trust region adapt from
-                    // a sane starting point. The 1e6 ceiling here matches
-                    // the existing clamp inside
-                    // `update_joint_trust_region_radius` so a sane Newton
-                    // step never pays for an attempt that would be
-                    // immediately clamped.
+                    // The earlier all-or-nothing gate (`newton_step_is_sane
+                    // = initial_step_inf <= max_step_inf`) discarded the
+                    // bump entirely whenever the *uncapped* inf-norm
+                    // exceeded `max_step_inf`. That measured the wrong
+                    // step: the trust region never accepts a step longer
+                    // than its radius, so the relevant inf-norm is the
+                    // inf-norm of `delta * r/L2`, not of `delta` itself.
+                    // For modestly out-of-bound Newton steps (e.g.
+                    // inf=97.4 vs max=20, L2=135, p=18 — the wiggle Probit
+                    // case pinned by
+                    // `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
+                    // the all-or-nothing gate stranded the trust radius at
+                    // the default 1.0 and inner failed to converge within
+                    // the cycle budget. Cap (c) instead bumps to r_safe ≈
+                    // 27.7 — large enough to make rapid progress, small
+                    // enough that no β coordinate moves further than the
+                    // family allows.
                     let initial_step_inf = delta
                         .iter()
                         .copied()
                         .map(f64::abs)
                         .fold(0.0_f64, f64::max);
                     let max_step_inf = family.joint_newton_max_step_inf(specs);
-                    let newton_step_is_sane = initial_step_inf.is_finite()
+                    let r_safe = if initial_step_inf > 0.0
                         && max_step_inf.is_finite()
-                        && initial_step_inf <= max_step_inf;
-                    if newton_step_is_sane {
-                        joint_trust_radius = initial_step_norm.min(1.0e6);
+                        && max_step_inf > 0.0
+                    {
+                        max_step_inf * initial_step_norm / initial_step_inf
+                    } else {
+                        f64::INFINITY
+                    };
+                    let bumped = initial_step_norm.min(1.0e6).min(r_safe);
+                    if bumped > joint_trust_radius {
+                        joint_trust_radius = bumped;
                     }
                 }
             }
