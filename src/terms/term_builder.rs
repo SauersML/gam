@@ -851,6 +851,7 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
+            let centers_explicit = has_explicit_countwith_basis_alias(options, "centers");
             let requested_centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
             let polynomial_cols = match nullspace_order {
                 DuchonNullspaceOrder::Zero => 1,
@@ -871,10 +872,10 @@ pub fn build_smooth_basis(
                 ));
             }
             let mut centers = requested_centers;
-            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+            if !centers_explicit && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 centers = centers.max(polynomial_cols + 4);
             }
-            let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
+            let center_strategy = if centers_explicit {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
                 auto_spatial_center_strategy(centers, cols.len())
@@ -1886,6 +1887,39 @@ mod tests {
                 num_internal_knots: 6,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn explicit_duchon_centers_are_not_small_n_bumped() {
+        let ds = continuous_dataset(
+            &["y", "x1", "x2", "x3", "x4", "x5"],
+            (0..12)
+                .map(|i| {
+                    let x = i as f64 / 11.0;
+                    vec![x.sin(), x, x * x, x + 0.1, 1.0 - x, (2.0 * x).sin()]
+                })
+                .collect(),
+        );
+        let parsed =
+            parse_formula("y ~ duchon(x1, centers=2) + s(x2) + s(x3) + s(x4) + s(x5)")
+                .expect("parse multi-smooth formula");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build multi-smooth terms");
+        let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected first smooth to be Duchon");
+        };
+        assert!(matches!(
+            spec.center_strategy,
+            CenterStrategy::EqualMass { num_centers: 2 }
         ));
     }
 
