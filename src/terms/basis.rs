@@ -1966,20 +1966,40 @@ pub fn create_periodic_bspline_basis_dense(
     }
     let h = period / num_basis as f64;
     let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
-    for (row, &x) in data.iter().enumerate() {
-        if !x.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "periodic B-spline data contains non-finite coordinate".to_string(),
-            ));
-        }
-        let tau = ((x - data_range.0) / h).rem_euclid(num_basis as f64);
-        let base = tau.floor() as isize;
-        for local in 0..=degree {
-            let j_unwrapped = base - degree as isize + local as isize;
-            let value = cardinal_bspline_value(tau - j_unwrapped as f64, degree);
-            let j = j_unwrapped.rem_euclid(num_basis as isize) as usize;
-            basis[[row, j]] += value;
-        }
+    let nb_isize = num_basis as isize;
+    let nb_f = num_basis as f64;
+    let origin = data_range.0;
+    let inv_h = 1.0 / h;
+    // Parallelize across row chunks. Each row touches exactly `degree + 1`
+    // columns wrapped mod `num_basis`, so chunks don't conflict on writes.
+    let nan_flag = std::sync::atomic::AtomicBool::new(false);
+    basis
+        .axis_chunks_iter_mut(ndarray::Axis(0), 4096)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 4096;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let x = data[i];
+                if !x.is_finite() {
+                    nan_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                let tau = ((x - origin) * inv_h).rem_euclid(nb_f);
+                let base = tau.floor() as isize;
+                for local in 0..=degree {
+                    let j_unwrapped = base - degree as isize + local as isize;
+                    let value = cardinal_bspline_value(tau - j_unwrapped as f64, degree);
+                    let j = j_unwrapped.rem_euclid(nb_isize) as usize;
+                    out_row[j] += value;
+                }
+            }
+        });
+    if nan_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BasisError::InvalidInput(
+            "periodic B-spline data contains non-finite coordinate".to_string(),
+        ));
     }
     Ok(basis)
 }
@@ -1999,20 +2019,39 @@ pub fn create_periodic_bspline_derivative_dense(
     }
     let h = period / num_basis as f64;
     let inv_h = 1.0 / h;
+    let nb_isize = num_basis as isize;
+    let nb_f = num_basis as f64;
+    let origin = data_range.0;
     let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
-    for (row, &x) in data.iter().enumerate() {
-        if !x.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "periodic B-spline data contains non-finite coordinate".to_string(),
-            ));
-        }
-        let tau = ((x - data_range.0) / h).rem_euclid(num_basis as f64);
-        let base = tau.floor() as isize;
-        for local in 0..=(degree + 1) {
-            let j_unwrapped = base - degree as isize + local as isize;
-            let value = cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree) * inv_h;
-            let j = j_unwrapped.rem_euclid(num_basis as isize) as usize;
-            basis[[row, j]] += value;
+    let nan_flag = std::sync::atomic::AtomicBool::new(false);
+    basis
+        .axis_chunks_iter_mut(ndarray::Axis(0), 4096)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 4096;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let x = data[i];
+                if !x.is_finite() {
+                    nan_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                let tau = ((x - origin) * inv_h).rem_euclid(nb_f);
+                let base = tau.floor() as isize;
+                for local in 0..=(degree + 1) {
+                    let j_unwrapped = base - degree as isize + local as isize;
+                    let value = cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree)
+                        * inv_h;
+                    let j = j_unwrapped.rem_euclid(nb_isize) as usize;
+                    out_row[j] += value;
+                }
+            }
+        });
+    if nan_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(BasisError::InvalidInput(
+            "periodic B-spline data contains non-finite coordinate".to_string(),
+        ));
         }
     }
     Ok(basis)
@@ -13645,63 +13684,101 @@ pub fn build_spherical_spline_basis(
     })
 }
 
-/// Spherical-harmonic norm √((2l+1)/(4π) · (l-m)!/(l+m)!) computed via a
-/// stable ratio loop to avoid factorial overflow even at L ≥ 20.
-fn spherical_harmonic_norm(l: usize, m: usize) -> f64 {
-    let mut ratio = 1.0f64;
-    if m > 0 {
-        for k in (l - m + 1)..=(l + m) {
-            ratio /= k as f64;
+/// Precomputed √(2)·N(l,m) coefficients for the real spherical-harmonic
+/// real-orthonormal basis (m=0 row uses N(l,0) without the √2 factor).
+///
+/// Layout: index `[l * (l_cap) + m]` with l_cap = max_degree + 1; entry
+/// for m = 0 is stored without the √2 prefactor (since cos(0·φ) = 1 has
+/// no twin term to share normalization with).
+fn precompute_harmonic_norms(max_degree: usize) -> Vec<f64> {
+    let l_cap = max_degree + 1;
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let mut out = vec![0.0_f64; l_cap * l_cap];
+    for l in 0..=max_degree {
+        let mut ratio = 1.0_f64;
+        let base = ((2 * l + 1) as f64) / (4.0 * std::f64::consts::PI);
+        out[l * l_cap] = base.sqrt(); // m = 0
+        for m in 1..=l {
+            ratio /= ((l - m + 1) * (l + m)) as f64;
+            out[l * l_cap + m] = sqrt2 * (base * ratio).sqrt();
         }
     }
-    (((2 * l + 1) as f64) / (4.0 * std::f64::consts::PI) * ratio).sqrt()
+    out
 }
 
 /// Fill one row of the real-spherical-harmonic design at (lat, lon) in
-/// radians, columns ordered by degree l = 1..=L with m running
-/// -l, -l+1, ..., -1, 0, 1, ..., l (Condon-Shortley convention dropped via
-/// no extra sign).
+/// radians. `p_buf` is a scratch buffer of length `(max_degree + 1) ^ 2`
+/// owned by the caller; `norms` is the precomputed √2·N(l, m) table
+/// produced by `precompute_harmonic_norms`.
+///
+/// Column order per degree l = 1..=L is:
+///   sin(l·φ)·P_{l,l}, sin((l-1)φ)·P_{l,l-1}, …, sin(φ)·P_{l,1},
+///   P_{l,0}, cos(φ)·P_{l,1}, …, cos(l·φ)·P_{l,l}
+/// times the precomputed norm factor.
 fn fill_real_spherical_harmonics_row(
     lat: f64,
     lon: f64,
     max_degree: usize,
+    p_buf: &mut [f64],
+    norms: &[f64],
     mut row: ndarray::ArrayViewMut1<'_, f64>,
 ) {
-    let x = lat.sin(); // cos(colatitude) = sin(lat)
     let l_cap = max_degree + 1;
-    let mut p_lm = vec![vec![0.0f64; l_cap]; l_cap];
-    p_lm[0][0] = 1.0;
+    debug_assert_eq!(p_buf.len(), l_cap * l_cap);
+    debug_assert_eq!(norms.len(), l_cap * l_cap);
+    // Recurrence for associated Legendre P_{l,m}(sin(lat)) — standard
+    // formulation (no Condon-Shortley phase, since we apply the (-1)^m
+    // factor implicitly through cos(m·φ)/sin(m·φ) sign cancellation).
+    let x = lat.sin();
     let somx2 = (1.0 - x * x).max(0.0).sqrt();
+    for slot in p_buf.iter_mut() {
+        *slot = 0.0;
+    }
+    let idx = |l: usize, m: usize| l * l_cap + m;
+    p_buf[idx(0, 0)] = 1.0;
     for m in 1..=max_degree {
-        p_lm[m][m] = -((2 * m - 1) as f64) * somx2 * p_lm[m - 1][m - 1];
+        p_buf[idx(m, m)] = -((2 * m - 1) as f64) * somx2 * p_buf[idx(m - 1, m - 1)];
     }
     for m in 0..max_degree {
-        p_lm[m + 1][m] = ((2 * m + 1) as f64) * x * p_lm[m][m];
+        p_buf[idx(m + 1, m)] = ((2 * m + 1) as f64) * x * p_buf[idx(m, m)];
     }
     for m in 0..=max_degree {
         for l in (m + 2)..=max_degree {
-            p_lm[l][m] = (((2 * l - 1) as f64) * x * p_lm[l - 1][m]
-                - ((l + m - 1) as f64) * p_lm[l - 2][m])
+            p_buf[idx(l, m)] = (((2 * l - 1) as f64) * x * p_buf[idx(l - 1, m)]
+                - ((l + m - 1) as f64) * p_buf[idx(l - 2, m)])
                 / ((l - m) as f64);
         }
     }
-    let sqrt2 = std::f64::consts::SQRT_2;
+    // sin(m·φ), cos(m·φ) via Chebyshev recurrence — one sin/cos call per
+    // row total, instead of 2L.
+    let (sin1, cos1) = lon.sin_cos();
+    // sin/cos buffers indexed 0..=max_degree; index 0 stores (sin0, cos0).
+    let mut sin_buf = [0.0_f64; 33];
+    let mut cos_buf = [0.0_f64; 33];
+    sin_buf[0] = 0.0;
+    cos_buf[0] = 1.0;
+    if max_degree >= 1 {
+        sin_buf[1] = sin1;
+        cos_buf[1] = cos1;
+    }
+    let two_cos1 = 2.0 * cos1;
+    for m in 2..=max_degree {
+        sin_buf[m] = two_cos1 * sin_buf[m - 1] - sin_buf[m - 2];
+        cos_buf[m] = two_cos1 * cos_buf[m - 1] - cos_buf[m - 2];
+    }
     let mut col = 0usize;
     for l in 1..=max_degree {
-        // sin(m·lon) for m = l, l-1, ..., 1
+        // sin(m·φ) factor for m = l, l-1, ..., 1
         for m_pos in (1..=l).rev() {
-            let m = m_pos;
-            let norm = spherical_harmonic_norm(l, m);
-            row[col] = sqrt2 * norm * p_lm[l][m] * (m as f64 * lon).sin();
+            row[col] = norms[idx(l, m_pos)] * p_buf[idx(l, m_pos)] * sin_buf[m_pos];
             col += 1;
         }
-        // m = 0
-        row[col] = spherical_harmonic_norm(l, 0) * p_lm[l][0];
+        // m = 0 (no trig factor)
+        row[col] = norms[idx(l, 0)] * p_buf[idx(l, 0)];
         col += 1;
-        // cos(m·lon) for m = 1, ..., l
+        // cos(m·φ) factor for m = 1, ..., l
         for m in 1..=l {
-            let norm = spherical_harmonic_norm(l, m);
-            row[col] = sqrt2 * norm * p_lm[l][m] * (m as f64 * lon).cos();
+            row[col] = norms[idx(l, m)] * p_buf[idx(l, m)] * cos_buf[m];
             col += 1;
         }
     }
@@ -13739,18 +13816,51 @@ fn build_spherical_harmonic_basis(
         )));
     }
     let p = l_max * (l_max + 2);
-    let mut design = Array2::<f64>::zeros((n, p));
     let to_rad = if spec.radians {
         1.0
     } else {
         std::f64::consts::PI / 180.0
     };
-    for (i, r) in data.outer_iter().enumerate() {
-        let lat = (r[0] * to_rad).clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-        let lon = r[1] * to_rad;
-        fill_real_spherical_harmonics_row(lat, lon, l_max, design.row_mut(i));
+    let norms = precompute_harmonic_norms(l_max);
+    let l_cap = l_max + 1;
+    let mut design = Array2::<f64>::zeros((n, p));
+    // Per-row buffer is small (≤ 33² ≈ 1KB at L=32), so per-thread allocation
+    // dominates only at tiny n. For biobank n we want rows to fan out across
+    // threads; rayon::par_iter over a row range with thread-local scratch.
+    {
+        let data_slice = data.as_slice().expect("contiguous lat/lon data");
+        let mut row_blocks = design
+            .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+            .collect::<Vec<_>>();
+        let chunks_iter = row_blocks.par_iter_mut().enumerate();
+        let chunk_size = 1024usize;
+        chunks_iter.try_for_each(|(chunk_idx, block)| -> Result<(), BasisError> {
+            let mut p_buf = vec![0.0_f64; l_cap * l_cap];
+            let row_offset = chunk_idx * chunk_size;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let lat_raw = data_slice[i * 2] * to_rad;
+                let lat = lat_raw.clamp(
+                    -std::f64::consts::FRAC_PI_2,
+                    std::f64::consts::FRAC_PI_2,
+                );
+                let lon = data_slice[i * 2 + 1] * to_rad;
+                fill_real_spherical_harmonics_row(
+                    lat,
+                    lon,
+                    l_max,
+                    p_buf.as_mut_slice(),
+                    norms.as_slice(),
+                    out_row.view_mut(),
+                );
+            }
+            Ok(())
+        })?;
     }
-    // Diagonal eigenvalue penalty [l(l+1)]^2 per (l, m).
+    // Diagonal eigenvalue penalty [l(l+1)]^2 per (l, m). Build as a dense
+    // matrix because downstream consumers (`normalize_penalty`, REML kernel
+    // selection) currently expect dense storage; the diagonal pattern keeps
+    // the matvec cheap (p ≤ L(L+2) ≤ 32·34 = 1088 even at the L=32 cap).
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
