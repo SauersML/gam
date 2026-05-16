@@ -12987,8 +12987,6 @@ pub fn create_matern_spline_basiswithworkspace(
     })
 }
 
-/// Generic Matérn builder returning design + penalty list.
-
 #[inline]
 fn validate_lat_lon_matrix(
     data: ArrayView2<'_, f64>,
