@@ -66,6 +66,7 @@ arrow = { version = "54", default-features = false, features = ["ffi"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 wide = "0.7"
 smallvec = "1"
+libloading = "0.8"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
