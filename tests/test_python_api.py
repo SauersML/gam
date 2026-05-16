@@ -710,3 +710,56 @@ def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: path
     text = pathlib.Path(out).read_text(encoding="utf-8").splitlines()
     assert text[0] == "row,time,survival"
     assert len(text) == 1 + 1_001 * 2
+
+
+def _geometric_smoke_dataset(seed: int = 0, n: int = 200) -> pd.DataFrame:
+    """Latents that cover the geometric-smooth formula surface.
+
+    `theta` / `lon` wrap around 2π; `h` is an open height in [0, 1];
+    `lat` is on the open arc-sine sphere. `x` is a generic [0, 1]
+    covariate for the BC smooths. `y` is a plausible scalar response —
+    no analytic structure is required because this is a smoke test of
+    the FFI path, not a quality check."""
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({
+        "theta": rng.uniform(0.0, 2.0 * np.pi, n),
+        "h":     rng.uniform(0.0, 1.0, n),
+        "lat":   np.arcsin(rng.uniform(-1.0, 1.0, n)),
+        "lon":   rng.uniform(0.0, 2.0 * np.pi, n),
+        "x":     rng.uniform(0.0, 1.0, n),
+        "y":     rng.standard_normal(n),
+    })
+
+
+@pytest.mark.parametrize(
+    "formula",
+    [
+        # 1-D periodic (cyclic) P-spline
+        "y ~ s(theta, periodic=true, period=6.283185307)",
+        # 2-D tensor with one periodic margin (cylinder topology)
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307, None])",
+        # Intrinsic S² via Wahba's reproducing kernel
+        "y ~ sphere(lat, lon, radians=true)",
+        # Intrinsic S² via spherical harmonics
+        "y ~ sphere(lat, lon, method=harmonic, max_degree=4, radians=true)",
+        # Boundary-conditioned 1-D B-spline (zero slope at both endpoints)
+        "y ~ s(x, bc=clamped)",
+    ],
+)
+def test_geometric_smooths_round_trip_via_python_binding(formula: str) -> None:
+    """Smoke test: every geometric-smooth variety must fit *and* predict
+    through the Python FFI on a dense-enough grid. Catches FFI-level
+    breakage (formula not recognised, predict design mismatch, NaN /
+    Inf propagation) without making any quality claim."""
+    df = _geometric_smoke_dataset(seed=0, n=200)
+    model = gamfit.fit(df, formula)
+    preds = model.predict(df, interval=0.95)
+    mean = np.asarray(preds["mean"], dtype=float)
+    lo = np.asarray(preds["mean_lower"], dtype=float)
+    hi = np.asarray(preds["mean_upper"], dtype=float)
+    assert mean.shape == (len(df),), f"row count mismatch for {formula!r}"
+    assert np.isfinite(mean).all(), f"NaN/Inf in mean for {formula!r}"
+    assert np.isfinite(lo).all() and np.isfinite(hi).all(), \
+        f"NaN/Inf in interval for {formula!r}"
+    assert (lo <= mean + 1e-9).all() and (mean <= hi + 1e-9).all(), \
+        f"point estimate outside CI for {formula!r}"
