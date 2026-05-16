@@ -581,7 +581,10 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: ThinPlateBasisSpec {
                     center_strategy,
-                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
+                    // 0.0 = "auto"; replaced with a data-driven init at planning
+                    // time. The default 1.0 was a basin from which REML cannot
+                    // escape for high-ν / high-frequency truths.
+                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                     radial_reparam: None,
@@ -697,7 +700,10 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: MaternBasisSpec {
                     center_strategy,
-                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
+                    // 0.0 = "auto"; replaced with a data-driven init at planning
+                    // time. The default 1.0 was a basin from which REML cannot
+                    // escape for ν ≥ 5/2 on high-frequency truths.
+                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -715,17 +721,12 @@ pub fn build_smooth_basis(
                 ));
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
-            let pure_duchon = option_bool(options, "pure").unwrap_or(false);
-            if pure_duchon && options.contains_key("length_scale") {
+            if options.contains_key("pure") {
                 return Err(
-                    "duchon() accepts either pure=true or length_scale=..., not both".to_string(),
+                    "duchon() is pure scale-free Duchon by default; remove pure=... or specify length_scale=... for hybrid Duchon".to_string(),
                 );
             }
-            let length_scale = if pure_duchon {
-                None
-            } else {
-                option_f64(options, "length_scale")
-            };
+            let length_scale = option_f64(options, "length_scale");
             // Resolve `(nullspace_order, power)` against the joint constraints
             // (operator collocation + pure-mode CPD). Explicit power keeps the
             // user's nullspace as-is (validator will reject inconsistent combos);
