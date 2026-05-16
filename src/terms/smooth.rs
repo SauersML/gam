@@ -2252,7 +2252,80 @@ fn plan_joint_spatial_centers_for_term_blocks(
         }
     }
 
+    // Sentinel auto-init: term builder writes length_scale = 0.0 when the user
+    // didn't pass `length_scale=...`. Replace those with a data-driven
+    // initialization here so REML starts in a regime where it can escape; the
+    // hard-coded 1.0 default was a basin from which ν ≥ 5/2 Matern could not
+    // recover on high-frequency truths, silently collapsing the fit to a
+    // near-constant prediction.
+    for block in planned_blocks.iter_mut() {
+        for term in block.iter_mut() {
+            auto_init_length_scale_in_place(data, term);
+        }
+    }
+
     Ok(planned_blocks)
+}
+
+/// Compute a data-driven initial length scale from the per-axis range of the
+/// feature columns. The heuristic `max_range / sqrt(n)` puts the kernel on
+/// the wiggly side of REML's basin so the optimizer can grow it back if the
+/// signal is smooth, but is small enough that high-frequency truths remain
+/// reachable for smoother kernels (ν ≥ 5/2). Clamped to a tiny positive
+/// floor so degenerate constant-input columns can't produce 0.
+fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> f64 {
+    let n = data.nrows();
+    if n == 0 || feature_cols.is_empty() {
+        return 1.0;
+    }
+    let mut max_range = 0.0_f64;
+    for &c in feature_cols {
+        if c >= data.ncols() {
+            continue;
+        }
+        let col = data.column(c);
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &v in col.iter() {
+            if v.is_finite() {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
+        }
+        if hi > lo {
+            let r = hi - lo;
+            if r > max_range {
+                max_range = r;
+            }
+        }
+    }
+    if !max_range.is_finite() || max_range <= 0.0 {
+        return 1.0;
+    }
+    let init = max_range / (n as f64).sqrt();
+    init.max(1e-6).min(max_range)
+}
+
+/// Walk a term and, if it is a spatial smooth whose length_scale was left at
+/// the auto sentinel (`0.0`), overwrite it with [`auto_initial_length_scale`].
+fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
+    match &mut term.basis {
+        SmoothBasisSpec::Matern { feature_cols, spec, .. } => {
+            if spec.length_scale == 0.0 {
+                spec.length_scale = auto_initial_length_scale(data, feature_cols);
+            }
+        }
+        SmoothBasisSpec::ThinPlate { feature_cols, spec, .. } => {
+            if spec.length_scale == 0.0 {
+                spec.length_scale = auto_initial_length_scale(data, feature_cols);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn linear_conditioning_chunk_rows(n: usize, p: usize) -> usize {
