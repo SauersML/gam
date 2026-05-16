@@ -317,39 +317,13 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
-<<<<<<< HEAD
-            let bc = parse_boundary_conditions(options, cols.len())?;
-            let periods = parse_periods(options, cols.len())?;
-=======
             let periodic_axes = parse_periodic_axes(options, cols.len())?;
             let periods = parse_periods(options, &periodic_axes)?;
->>>>>>> origin/pr-42
             let specs = cols
                 .iter()
                 .enumerate()
                 .map(|(dim, &c)| {
                     let (minv, maxv) = col_minmax(ds.values.column(c))?;
-<<<<<<< HEAD
-                    let knotspec = if bc[dim].as_deref() == Some("periodic") {
-                        let period = periods
-                            .as_ref()
-                            .and_then(|p| p.get(dim).copied())
-                            .ok_or_else(|| {
-                                format!(
-                                    "periodic tensor margin '{}' requires period=[...] with one positive period per margin",
-                                    vars[dim]
-                                )
-                            })?;
-                        if !period.is_finite() || period <= 0.0 {
-                            return Err(format!(
-                                "periodic tensor margin '{}' requires a finite positive period, got {}",
-                                vars[dim], period
-                            ));
-                        }
-                        BSplineKnotSpec::PeriodicUniform {
-                            data_range: (minv, minv + period),
-                            num_basis: n_knots + degree + 1,
-=======
                     let knotspec = if periodic_axes[dim] {
                         let period = periods[dim].ok_or_else(|| {
                             format!(
@@ -358,11 +332,9 @@ pub fn build_smooth_basis(
                             )
                         })?;
                         BSplineKnotSpec::Periodic {
-                            origin: minv,
+                            domain_start: minv,
                             period,
-                            num_internal_knots: n_knots,
-                            knots: None,
->>>>>>> origin/pr-42
+                            num_basis: n_knots + degree + 1,
                         }
                     } else {
                         BSplineKnotSpec::Generate {
@@ -453,30 +425,25 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
-<<<<<<< HEAD
-            let periodic = option_bool(options, "cyclic").unwrap_or(false)
-                || option_bool(options, "periodic").unwrap_or(false);
             let boundary_conditions = parse_bspline_boundary_conditions(options)?;
-            if periodic && !boundary_conditions.is_free() {
-                return Err(
-                    "periodic B-splines cannot also declare endpoint boundary conditions"
-                        .to_string(),
-                );
-            }
-=======
             let periodic_axes = parse_periodic_axes(options, 1)?;
             let periods = parse_periods(options, &periodic_axes)?;
             let knotspec = if periodic_axes[0] {
+                if !boundary_conditions.is_free() {
+                    return Err(
+                        "periodic B-splines cannot also declare endpoint boundary conditions"
+                            .to_string(),
+                    );
+                }
                 BSplineKnotSpec::Periodic {
-                    origin: minv,
+                    domain_start: minv,
                     period: periods[0].ok_or_else(|| {
                         format!(
                             "periodic smooth '{}' requires period=<value> or period=[value]",
                             vars.join(",")
                         )
                     })?,
-                    num_internal_knots: n_knots,
-                    knots: None,
+                    num_basis: n_knots + degree + 1,
                 }
             } else {
                 BSplineKnotSpec::Generate {
@@ -484,28 +451,12 @@ pub fn build_smooth_basis(
                     num_internal_knots: n_knots,
                 }
             };
->>>>>>> origin/pr-42
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
                     penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-<<<<<<< HEAD
-                    knotspec: if periodic {
-                        BSplineKnotSpec::Periodic {
-                            domain_start: minv,
-                            period: maxv - minv,
-                            num_basis: n_knots + degree + 1,
-                        }
-                    } else {
-                        BSplineKnotSpec::Generate {
-                            data_range: (minv, maxv),
-                            num_internal_knots: n_knots,
-                        }
-                    },
-=======
                     knotspec,
->>>>>>> origin/pr-42
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                     boundary_conditions,
@@ -854,49 +805,6 @@ pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
 }
 
-<<<<<<< HEAD
-fn split_option_list(raw: &str) -> Vec<String> {
-    let trimmed = raw.trim();
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|v| v.strip_suffix(']'))
-        .unwrap_or(trimmed);
-    inner
-        .split(',')
-        .map(|part| {
-            part.trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_ascii_lowercase()
-        })
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn parse_boundary_conditions(
-    options: &BTreeMap<String, String>,
-    dims: usize,
-) -> Result<Vec<Option<String>>, String> {
-    let Some(raw) = options.get("bc").or_else(|| options.get("boundary")) else {
-        return Ok(vec![None; dims]);
-    };
-    let values = split_option_list(raw);
-    if values.len() != dims {
-        return Err(format!(
-            "bc must provide one boundary condition per tensor margin (expected {dims}, got {})",
-            values.len()
-        ));
-    }
-    values
-        .into_iter()
-        .map(|v| match v.as_str() {
-            "periodic" | "cyclic" | "cycle" => Ok(Some("periodic".to_string())),
-            "none" | "open" | "natural" => Ok(None),
-            other => Err(format!(
-                "unsupported tensor boundary condition '{other}'; supported values are 'periodic' and 'none'"
-            )),
-        })
-        .collect()
-=======
 fn parse_math_f64(raw: &str) -> Result<f64, String> {
     let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
@@ -987,33 +895,10 @@ fn parse_periodic_axes(
         }
     }
     Ok(out)
->>>>>>> origin/pr-42
 }
 
 fn parse_periods(
     options: &BTreeMap<String, String>,
-<<<<<<< HEAD
-    dims: usize,
-) -> Result<Option<Vec<f64>>, String> {
-    let Some(raw) = options.get("period").or_else(|| options.get("periods")) else {
-        return Ok(None);
-    };
-    let values = split_option_list(raw);
-    if values.len() != dims {
-        return Err(format!(
-            "period must provide one numeric period per tensor margin (expected {dims}, got {})",
-            values.len()
-        ));
-    }
-    values
-        .into_iter()
-        .map(|v| {
-            v.parse::<f64>()
-                .map_err(|_| format!("invalid period value '{v}'; expected a number"))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
-=======
     periodic: &[bool],
 ) -> Result<Vec<Option<f64>>, String> {
     let ndim = periodic.len();
@@ -1050,7 +935,6 @@ fn parse_periods(
         out[i] = Some(value);
     }
     Ok(out)
->>>>>>> origin/pr-42
 }
 
 // ---------------------------------------------------------------------------
