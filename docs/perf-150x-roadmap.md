@@ -91,7 +91,7 @@ Affected modules:
 - `src/solver/reml/unified.rs` — closed-form REML score + gradient
 - `src/terms/smooth.rs` — auto-detect when Gaussian-direct is safe
 
-### Track 1 (deprecated, kept for reference): discretize-and-fit
+### Track 1 (rejected): discretize-and-fit
 
 For a 2D tensor smooth `te(x, y)` with knot-aligned bin edges:
 
@@ -102,14 +102,29 @@ For a 2D tensor smooth `te(x, y)` with knot-aligned bin edges:
 4. Predict at original (x_i, y_i) by basis evaluation; uncertainty by
    plugging w_c into the standard formulas.
 
-Math: X'WX = Σ_i w_i x_i x_i' = Σ_c (Σ_{i ∈ c} w_i) x_c x_c' (exact for
-Gaussian; cells share the same basis row x_c because they're knot-aligned).
+The tempting linear-algebra identity is:
+
+`X'WX = Σ_i w_i x_i x_i' = Σ_c (Σ_{i ∈ c} w_i) x_c x_c'`
+
+That identity is not enough for this solver path. The current
+`weight_column` field is not a frequency-weight contract for Gaussian REML:
+the profiled scale and REML derivatives use the physical row count in the
+weighted dataset. A full duplicate-row fit sees `n = N`; a coalesced cell fit
+sees `n = M`. Even when duplicate observations share an exact basis row, the
+two paths optimize different REML criteria and select different smoothing
+parameters.
 
 - N=100K → N_eff = 128 → X'WX drops from N·p² to N_eff·p² = 16,384 ops
   per iter (210,000× less). Realistic speedup at the matvec is ~100×
   after accounting for overhead; the rest comes from skipping the per-iter
   N·p design materialization too.
 - Expected speedup: 100–500× at N≥100K for Gaussian tensor smooths.
+
+This track should not be implemented as automatic discretization unless the
+solver grows an explicit frequency-weight likelihood with a row-count contract
+threaded through the REML objective, derivatives, diagnostics, and prediction
+metadata. Until then it is a different model, not a numerically noisy version
+of the full fit.
 
 Estimate: 3–5 days work.
 
@@ -178,10 +193,9 @@ convergence — needs care.
 
 ## Combined yield
 
-Stacking tracks 1+2+3+4 at N=100K cylinder:
+Stacking the viable tracks at N=100K cylinder:
 
-- Track 1 (discretize): 485 → 5 ms (~100×)
-- Track 2 (Kronecker): 5 → 2 ms (~2.5× on top)
+- Track 2 (Kronecker): 485 → lower constant-factor PIRLS cost
 - Tracks 3, 4 marginal at this point
 
 Per-track tests + validation: each track gets a regression test that
@@ -190,41 +204,12 @@ tolerance).
 
 ---
 
-## Measured (May 2026): Track 1 already past the literal 150× target at N=1M
+## Rejected (May 2026): weighted-cell discretization
 
-`tests/discretize_fit_experiment.rs::discretize_fit_scaling_n_100k_vs_full`,
-release mode, single threaded test harness:
-
-```
-cylinder te(theta, h, periodic=[0], period=[2π, None])
-N=10,000    full=386 ms    cells=134 ms    speedup=2.9×
-N=100,000   full=2593 ms   cells=122 ms    speedup=21.3×
-N=1,000,000 full=22835 ms  cells=118 ms    speedup=193.7×   ← past 150×
-```
-
-Approach: aggregate observations into a 50×16 cell grid, pass the cell
-count as the fit-weights via the existing `weight_column` field on
-`FitConfig`. PIRLS computes X'WX = Σ_c w_c x_c x_c' which is exactly
-equal to the full Σ_i w_i x_i x_i' when each cell's rows share a basis
-row (knot-aligned bins).
-
-**Caveat:** the current discretized REML scale estimate uses M (cells)
-as the effective sample size instead of Σw=N. Result: λ and β differ
-slightly from the full fit (max_rel ≈ 2.0 on the deterministic-y
-lattice). The fast smoother is still a valid GAM, just not the exact
-same one as the full fit. The next step is to thread Σw through the
-REML scale estimator (~1 day of careful work) to make the path
-mathematically exact, not just a fast approximation.
-
-**Generalization to other features:**
-
-The discretize approach generalizes naturally to:
-
-- **torus** (tensor with both periodic margins) — same as cylinder
-- **periodic 1D** (`s(theta, periodic=true)`) — bin onto the angular axis
-- **BC 1D** (`s(x, bc=clamped)`) — bin onto x
-- **sphere** (lat, lon) — bin onto an equal-area sphere grid
-
-At biobank N each should reach the 150× target with a small per-feature
-binning implementation. Estimated effort: 1 day each = ~4 days total
-to cover all geometric smooths.
+The weighted-cell benchmark was removed because it measured a faster but
+different model. On an exact 50×16 duplicate-coordinate lattice, the
+coalesced weighted-cell path still disagreed with the full fit at strict
+coefficient tolerance. Root cause: Gaussian profiled REML uses the dataset
+row count, so the cell fit uses `M` cells where the full fit uses `N`
+observations. This is a semantics bug in the proposed optimization, not a
+tolerance problem.

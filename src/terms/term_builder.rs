@@ -1402,7 +1402,64 @@ fn parse_tensor_identifiability(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::formula_dsl::parse_formula;
+    use crate::inference::model::{DataSchema, SchemaColumn};
+    use ndarray::Array2;
     use std::collections::BTreeMap;
+
+    fn continuous_dataset(headers: &[&str], rows: Vec<Vec<f64>>) -> Dataset {
+        let nrows = rows.len();
+        let ncols = headers.len();
+        let values = Array2::from_shape_vec(
+            (nrows, ncols),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular test data");
+        Dataset {
+            headers: headers.iter().map(|name| name.to_string()).collect(),
+            values,
+            schema: DataSchema {
+                columns: headers
+                    .iter()
+                    .map(|name| SchemaColumn {
+                        name: name.to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: vec![ColumnKindTag::Continuous; ncols],
+        }
+    }
+
+    fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
+        let parsed = parse_formula("y ~ te(theta, h)").expect("parse tensor formula");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            ds,
+            &col_map,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+        )
+        .expect("build tensor termspec");
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected tensor smooth");
+        };
+        spec.marginalspecs
+            .iter()
+            .map(|marginal| match marginal.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + marginal.degree + 1,
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
+                BSplineKnotSpec::Explicit { ref knots, .. } => {
+                    knots.len().saturating_sub(marginal.degree + 1)
+                }
+            })
+            .product()
+    }
 
     #[test]
     fn parse_cylinder_periodic_options_match_requested_forms() {
@@ -1451,6 +1508,34 @@ mod tests {
         assert_eq!(axes, vec![true, true]);
         assert_eq!(periods, vec![Some(7.0), Some(24.0)]);
         assert_eq!(origins, vec![Some(0.0), Some(-12.0)]);
+    }
+
+    #[test]
+    fn inferred_tensor_basis_cap_uses_coordinate_support_not_duplicate_rows() {
+        let mut unique_rows = Vec::new();
+        for i in 0..50 {
+            let theta = i as f64 / 50.0;
+            for j in 0..16 {
+                let h = -1.0 + 2.0 * (j as f64) / 15.0;
+                let y = theta.cos() + h;
+                unique_rows.push(vec![y, theta, h]);
+            }
+        }
+        let mut repeated_rows = Vec::new();
+        for _ in 0..12 {
+            repeated_rows.extend(unique_rows.iter().cloned());
+        }
+
+        let unique = continuous_dataset(&["y", "theta", "h"], unique_rows);
+        let repeated = continuous_dataset(&["y", "theta", "h"], repeated_rows);
+
+        let unique_basis = inferred_tensor_basis_product(&unique);
+        let repeated_basis = inferred_tensor_basis_product(&repeated);
+
+        assert_eq!(
+            unique_basis, repeated_basis,
+            "duplicating existing tensor coordinates must not inflate inferred basis width"
+        );
     }
 
     #[test]
