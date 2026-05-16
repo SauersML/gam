@@ -357,20 +357,53 @@ pub fn build_smooth_basis(
                 ));
             }
             let degree = 3usize;
-            let default_internal = cols
-                .iter()
-                .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
-                .max()
-                .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
-            let (mut n_knots, inferred) =
-                parse_ps_internal_knots(options, degree, default_internal)?;
+            let knots_internal = option_usize(options, "knots");
+            let basis_dim =
+                option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+            if knots_internal.is_some() && basis_dim.is_some() {
+                return Err(
+                    "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
+                        .to_string(),
+                );
+            }
+            let inferred = knots_internal.is_none() && basis_dim.is_none();
+            let mut internal_knots_by_dim = if let Some(k) = basis_dim {
+                let min_k = degree + 1;
+                if k < min_k {
+                    return Err(format!(
+                        "tensor smooth: k={} too small for degree {}; expected k >= {}",
+                        k, degree, min_k
+                    ));
+                }
+                vec![k - min_k; cols.len()]
+            } else if let Some(knots) = knots_internal {
+                vec![knots; cols.len()]
+            } else {
+                cols.iter()
+                    .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
+                    .collect()
+            };
+            if inferred {
+                cap_inferred_tensor_internal_knots(
+                    &mut internal_knots_by_dim,
+                    degree,
+                    ds.values.nrows(),
+                );
+            }
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
-                n_knots = n_knots.min(1);
+                for n_knots in &mut internal_knots_by_dim {
+                    *n_knots = (*n_knots).min(1);
+                }
             }
             if inferred {
                 inference_notes.push(format!(
-                    "Automatically set {} internal knots per margin for tensor smooth '{}' (max unique/4 rule across margins, clamped to [4,20]). Override with knots=... or k=....",
-                    n_knots,
+                    "Automatically set tensor smooth '{}' internal knots per margin to [{}] from per-axis cardinality and rank-product limits. Override with knots=... or k=....",
+                    vars.join(","),
+                    internal_knots_by_dim
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     vars.join(",")
                 ));
             }
@@ -381,6 +414,7 @@ pub fn build_smooth_basis(
                 .enumerate()
                 .map(|(dim, &c)| {
                     let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                    let n_knots = internal_knots_by_dim[dim];
                     let knotspec = if periodic_axes[dim] {
                         let period = periods[dim].ok_or_else(|| {
                             format!(
