@@ -1230,6 +1230,21 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "sphere" | "sos" | "spherical" => {
+                if vars.len() != 2 {
+                    return Err(format!(
+                        "sphere()/sos() expects exactly two variables: latitude and longitude; got {} in {raw}",
+                        vars.len()
+                    ));
+                }
+                options.insert("type".to_string(), "sphere".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "matern" => {
                 if vars.is_empty() {
                     return Err(format!("matern() requires at least one variable: {raw}"));
@@ -1301,7 +1316,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), thinplate(), tensor(), group(), sphere(), sos(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
