@@ -60,11 +60,37 @@ fn cylinder_fit_n_10k_stages() {
         FitResult::Standard(fit) => {
             eprintln!("[info] p (ncols)={}", fit.fit.beta.len());
             eprintln!(
+                "[info] outer_iters={} pirls_status={:?}",
+                fit.fit.outer_iterations, fit.fit.pirls_status
+            );
+            eprintln!(
                 "[info] coef[0..5]={:?}",
                 &fit.fit.beta.as_slice().unwrap()[..5.min(fit.fit.beta.len())]
             );
         }
         _ => panic!("expected standard fit"),
+    }
+}
+
+#[test]
+fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
+    // Measure 5 sequential fits at N=10K to see if there's any one-time
+    // setup cost that the first fit pays for (rayon pool, BLAS init, etc.)
+    init_parallelism();
+    let formula = "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])";
+    let data = dataset(10_000);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    for i in 0..5 {
+        let t = Instant::now();
+        let _ = fit_from_formula(formula, &data, &cfg).expect("fit");
+        eprintln!(
+            "[scale] cylinder te N=10000 iter {}: {:.3} ms",
+            i,
+            t.elapsed().as_secs_f64() * 1e3
+        );
     }
 }
 
