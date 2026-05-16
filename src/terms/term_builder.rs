@@ -956,9 +956,10 @@ fn cap_inferred_tensor_internal_knots(internal_knots: &mut [usize], degree: usiz
 }
 
 fn inferred_tensor_basis_product_cap(n: usize, ndim: usize) -> usize {
+    let upper = 128usize;
     let n_cap = (4.0 * (n.max(1) as f64).sqrt()).round() as usize;
-    let dim_floor = 8usize.saturating_pow(ndim as u32).max(96).min(400);
-    n_cap.clamp(dim_floor, 400)
+    let dim_floor = 4usize.saturating_pow(ndim as u32).max(64).min(upper);
+    n_cap.clamp(dim_floor, upper)
 }
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {
