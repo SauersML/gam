@@ -36,6 +36,8 @@ use thiserror::Error;
 
 pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
+const JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF: f64 = 20.0;
+
 /// A penalty matrix that may be stored in Kronecker-factored form.
 ///
 /// For tensor-product terms (e.g. time-varying survival covariates), the penalty
@@ -1105,15 +1107,6 @@ pub trait CustomFamily {
         _: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         Ok(None)
-    }
-
-    /// Family-specific infinity-norm cap for exact joint-Newton coefficient steps.
-    ///
-    /// The solver still applies the trust-region accept/reject test against the
-    /// exact penalized objective. This cap only prevents a single ill-conditioned
-    /// Newton proposal from dominating the trust-region model before that test.
-    fn joint_newton_max_step_inf(&self, _specs: &[ParameterBlockSpec]) -> f64 {
-        20.0
     }
 
     /// Optional linear inequality constraints for a block update:
@@ -9393,26 +9386,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 0.0
             };
 
-        // The inf-norm β-space cap is intentionally not applied as a
-        // per-attempt hard clamp. That old behavior conflated two distinct
-        // concerns and bound the step on every cycle of quasi-saturated
-        // problems where the optimum sits at large |β|:
-        //   (a) η-overflow safety — a physical limit specific to the
-        //       family's likelihood evaluator. Owned by the family via
-        //       `max_feasible_step_size`, called by the line search.
-        //   (b) Newton-model trust — an algorithmic limit that adapts
-        //       via rho. Owned by `joint_trust_radius` below, updated
-        //       by `update_joint_trust_region_radius` on every attempt.
-        // The trait value still has one narrow role below: it gates the
-        // cycle-0 trust-radius expansion so an ill-conditioned Newton vector
-        // cannot seed a huge initial radius. Validate it early to surface
-        // family-side bugs before optimization starts.
-        let _initial_max_joint_step_unused = family.joint_newton_max_step_inf(specs);
-        if !_initial_max_joint_step_unused.is_finite() || _initial_max_joint_step_unused <= 0.0 {
-            return Err(format!(
-                "joint Newton max step cap must be finite and positive, got {_initial_max_joint_step_unused}"
-            ));
-        }
+        // Exact joint Newton steps are guarded by two independent mechanisms:
+        // family-owned feasibility (`max_feasible_step_size`) and the adaptive
+        // trust region below. There is intentionally no family hook for a
+        // hard per-attempt coefficient-space clamp; keeping the policy local
+        // avoids stale no-op configuration and makes the trust-region behavior
+        // explicit at the only place it is used.
 
         // Cross-cycle convergence carry-over: set at the end of every
         // accepted cycle so the next cycle can distinguish a true KKT
@@ -9863,15 +9842,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // The maintainer's argument for removing the
-                    // `joint_newton_max_step_inf` cap from the per-attempt
-                    // path — that the L2 trust radius is strictly tighter
-                    // than an inf-norm cap of the same magnitude — is
-                    // correct only while the trust radius is at its small
-                    // default (1.0). Bumping it to the unconstrained
-                    // Newton-step 2-norm here can push it to 1e6+ on an
-                    // ill-conditioned cycle 0, after which the inf-norm
-                    // cap is no longer redundant.
+                    // Bumping the radius to the unconstrained Newton-step
+                    // 2-norm can push it to 1e6+ on an ill-conditioned
+                    // cycle 0, so use a local sanity threshold before
+                    // expanding the trust region.
                     //
                     // Root cause of the explosion: the joint Hessian H+S
                     // is SPD by construction (via `stabilized_joint_solver_diagonal_ridge`)
@@ -9886,11 +9860,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // NaN/diverging likelihood) before the trust region
                     // adaptively recovers a sane scale.
                     //
-                    // Family-supplied `joint_newton_max_step_inf` is the
-                    // family's own statement of what step magnitude is
-                    // physically meaningful in β space. If Newton's
-                    // proposal already exceeds that, the step direction is
-                    // dominated by the near-null eigenvector and bumping
+                    // If Newton's proposal already exceeds the local
+                    // coefficient-space sanity threshold, the step direction
+                    // is dominated by the near-null eigenvector and bumping
                     // the trust radius is counterproductive — keep the
                     // default radius and let the trust region adapt from
                     // a sane starting point. The 1e6 ceiling here matches
@@ -9900,7 +9872,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // immediately clamped.
                     let initial_step_inf =
                         delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                    let max_step_inf = family.joint_newton_max_step_inf(specs);
+                    let max_step_inf = JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
                     let newton_step_is_sane = initial_step_inf.is_finite()
                         && max_step_inf.is_finite()
                         && initial_step_inf <= max_step_inf;
