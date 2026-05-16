@@ -2318,8 +2318,8 @@ impl<'a> RemlState<'a> {
     /// `hop.logdet() + hessian_logdet_correction` (the latter carries the
     /// `log|H_proj| − hop.logdet()` correction from the dense_assembly
     /// rank-deficiency fix).  Returning the same sum here gives tests a
-    /// matching finite-difference oracle: probing the projected logdet at
-    /// `theta ± h · e_ψ` and centered-differencing produces the analytic
+    /// matching derivative oracle: probing the projected logdet at
+    /// nearby `theta` values produces the analytic
     /// `d/dψ log|H_proj|` that production's trace formula computes — *not*
     /// the full-space `d/dψ log|H_full|`, which differs by the `null(S)`
     /// directions' contribution and is the wrong oracle for the projected
@@ -5539,11 +5539,11 @@ impl<'a> RemlState<'a> {
         // `D_β H ≡ 0` — there is no leakage to project away. Activating
         // the projection there would silently switch the cost identity
         // from `log|H|` to `log|H_proj|`, putting the analytic ψ-gradient
-        // on a different cost surface than the FD-from-cost oracle (the
+        // on a different cost surface than the direct cost-slope oracle (the
         // missing `dU_S/dψ` contribution shows up as a ~6e-3 rel error in
-        // `iso_kappa_duchon_gaussian_identity_fd`). Skipping the projection
+        // the Gaussian identity projection test). Skipping the projection
         // when `c ≡ 0` preserves the classical Gaussian REML cost identity
-        // (`log|H|`) and keeps that FD test on its analytic match.  For
+        // (`log|H|`) and keeps that test on its analytic match.  For
         // every c-nontrivial family (Probit / Logit / cloglog / Poisson /
         // Gamma / SAS / GAMLSS noise blocks / etc.) the projection is
         // still built unconditionally — that is the rank-deficient LAML
@@ -5841,9 +5841,9 @@ impl<'a> RemlState<'a> {
         // canonical Gaussian (Identity link, `c ≡ 0`): the cost identity
         // then silently shifts from `log|H|` to `log|H_proj|`, and the
         // analytic ψ-gradient (still computed via `K · op_total`) no
-        // longer matches the FD-from-cost oracle within the projection's
+        // longer matches the direct cost-slope oracle within the projection's
         // numerical roundoff — surfacing as a ~6e-3 rel error in
-        // `iso_kappa_duchon_gaussian_identity_fd`. The `c_nontrivial`
+        // the Gaussian identity projection test. The `c_nontrivial`
         // gate keeps the rank-deficient LAML fix active for every
         // non-Gaussian-Identity family (where the leakage is real and
         // the projected kernel is the only formula that matches the

@@ -7041,7 +7041,7 @@ impl BernoulliMarginalSlopeFamily {
             // exact-zero path above avoids all cell machinery, while this
             // near-zero path spends one evaluator call to guarantee that every
             // accepted row satisfies the same residual contract as the solver.
-            // The extra `sqrt(eps)` coefficient cap keeps finite-difference
+            // The extra `sqrt(eps)` coefficient cap keeps numerical
             // derivative probes out of this value-only acceptance path;
             // mathematically nonzero deviations still fall through unless they
             // are too small to carry stable derivative information.

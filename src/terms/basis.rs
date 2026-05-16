@@ -2108,7 +2108,7 @@ pub fn create_periodic_bspline_derivative_dense(
     Ok(basis)
 }
 
-/// Build a cyclic finite-difference penalty `D' D` with wrap-around rows.
+/// Build a cyclic discrete-difference penalty `D' D` with wrap-around rows.
 pub fn create_cyclic_difference_penalty_matrix(
     num_basis: usize,
     order: usize,

@@ -7,10 +7,11 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, SphereMethod,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, SphereMethod,
     SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
     create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, spherical_wahba_kernel_matrix,
+    create_periodic_bspline_derivative_dense, evaluate_bspline_derivative_scalar,
+    spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::f64::consts::{PI, TAU};
@@ -160,28 +161,40 @@ fn cyclic_difference_penalty_constant_in_nullspace_across_orders_and_k() {
 }
 
 #[test]
-fn periodic_bspline_derivative_matches_finite_difference_at_interior() {
-    // Sanity check derivative formula against centered FD on dense values.
-    // (NOT for ground truth; this is a self-consistency sweep.)
+fn periodic_bspline_derivative_preserves_analytic_periodic_invariants() {
     let period = TAU;
     let k = 12;
     let degree = 3;
-    let h = 1e-4;
-    let xs = ndarray::array![0.5, 1.7, 3.14, 4.2, 5.5];
-    let xs_plus = &xs + h;
-    let xs_minus = &xs - h;
-    let bp = create_periodic_bspline_basis_dense(xs_plus.view(), (0.0, period), degree, k).unwrap();
-    let bm =
-        create_periodic_bspline_basis_dense(xs_minus.view(), (0.0, period), degree, k).unwrap();
+    let xs = ndarray::array![0.0, 0.5, 1.7, 3.14, 4.2, 5.5, period];
     let d = create_periodic_bspline_derivative_dense(xs.view(), (0.0, period), degree, k).unwrap();
+
+    for (i, row) in d.outer_iter().enumerate() {
+        let row_sum = row.iter().sum::<f64>();
+        assert!(
+            row_sum.abs() < 1e-10,
+            "derivative row {i} must annihilate constants, got {row_sum}"
+        );
+    }
+
+    for j in 0..k {
+        assert!(
+            near(d[(0, j)], d[(xs.len() - 1, j)], 1e-12),
+            "periodic derivative seam mismatch at column {j}: left={}, right={}",
+            d[(0, j)],
+            d[(xs.len() - 1, j)]
+        );
+    }
+
+    let shifted = &xs + period;
+    let d_shifted =
+        create_periodic_bspline_derivative_dense(shifted.view(), (0.0, period), degree, k).unwrap();
     for i in 0..xs.len() {
         for j in 0..k {
-            let fd = (bp[(i, j)] - bm[(i, j)]) / (2.0 * h);
             assert!(
-                near(d[(i, j)], fd, 1e-5),
-                "deriv mismatch i={i} j={j}: analytic={} fd={}",
+                near(d[(i, j)], d_shifted[(i, j)], 1e-12),
+                "period-shifted derivative mismatch i={i} j={j}: base={} shifted={}",
                 d[(i, j)],
-                fd
+                d_shifted[(i, j)]
             );
         }
     }
@@ -258,10 +271,7 @@ fn bc_bspline_anchored_at_left_vanishes_at_x_zero() {
 #[test]
 fn bc_bspline_clamped_at_right_has_zero_derivative_at_x_one() {
     use BSplineEndpointBoundaryCondition::{Clamped, Free};
-    // The clamped BC enforces f'(1) = 0; we verify by finite-difference
-    // on the design: (f(1) - f(1-h)) / h should approach 0 as h → 0.
-    let h = 1e-5;
-    let xs = ndarray::array![1.0_f64, 1.0 - h];
+    let xs = ndarray::array![1.0_f64];
     let spec = BSplineBasisSpec {
         degree: 3,
         penalty_order: 2,
@@ -277,13 +287,21 @@ fn bc_bspline_clamped_at_right_has_zero_derivative_at_x_one() {
         },
     };
     let built = build_bspline_basis_1d(xs.view(), &spec).unwrap();
-    let d = built.design.to_dense();
-    // For each column, the slope at x=1 from (d[0]-d[1])/h should be ~0
-    for j in 0..d.ncols() {
-        let slope = (d[(0, j)] - d[(1, j)]) / h;
+    let BasisMetadata::BSpline1D {
+        knots,
+        identifiability_transform: Some(transform),
+        ..
+    } = built.metadata
+    else {
+        panic!("clamped B-spline should expose its boundary transform");
+    };
+    let mut raw = vec![0.0; transform.nrows()];
+    evaluate_bspline_derivative_scalar(1.0, knots.view(), spec.degree, &mut raw).unwrap();
+    let constrained = Array1::from_vec(raw).dot(&transform);
+    for (j, &slope) in constrained.iter().enumerate() {
         assert!(
-            slope.abs() < 1e-2,
-            "clamped right: column {j} slope at x=1 should be ~0, got {slope}"
+            slope.abs() < 1e-10,
+            "clamped right: analytic column {j} slope at x=1 should be 0, got {slope}"
         );
     }
 }
