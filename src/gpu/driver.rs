@@ -1,11 +1,15 @@
 //! Shared CUDA driver bindings used by every cuBLAS / cuSPARSE / cuSOLVER
 //! routing module.
 //!
-//! Each library binding (`blas`, `sparse`, `solver`) previously carried its
-//! own copy of [`DriverApi`], [`DeviceAllocation`], [`load_library`],
-//! [`check_cuda`], and the column-major / byte-length helpers. They are
-//! consolidated here so future runtimes (e.g. cuRAND, cuFFT, NVRTC) can
-//! reuse exactly the same primitives.
+//! All library bindings share:
+//!
+//! * one [`DriverApi`] (resolved once from the dlopen'd `libcuda` handle),
+//! * one CUDA context created against the selected device at first use,
+//! * the helpers below for byte-size math, column-major layout, and the
+//!   RAII [`DeviceAllocation`] wrapper.
+//!
+//! Future runtimes (cuRAND, cuFFT, NVRTC) borrow the same triple instead
+//! of re-initializing the driver and creating another context.
 
 use libloading::Library;
 use ndarray::{Array2, ArrayBase, Data, Ix2};
@@ -58,6 +62,72 @@ impl DriverApi {
                     .get(b"cuMemcpyDtoH_v2\0")
                     .map_err(|e| e.to_string())?,
             })
+        }
+    }
+}
+
+/// Shared CUDA driver + selected-device context used by every library
+/// runtime. Created once per process; subsequent library handles
+/// (`cublasCreate_v2`, `cusolverDnCreate`, `cusparseCreate`) attach to
+/// the same context instead of building their own.
+pub struct CudaWorkingState {
+    /// Owning handle to the dynamically loaded `libcuda` library.
+    /// `Box::leak`'d so the dlopen mapping outlives the process — the
+    /// driver entry pointers in `api` reference its address space.
+    _library: &'static libloading::Library,
+    /// Resolved CUDA driver entry points.
+    pub api: DriverApi,
+    /// Primary CUDA context for the selected device. Library runtimes
+    /// must `cuCtxSetCurrent` on it before issuing work.
+    pub context: usize,
+}
+
+impl CudaWorkingState {
+    /// Initialize the driver and create one context against `device_ordinal`.
+    /// Returns `None` if libcuda can't be loaded, a required symbol is
+    /// missing, or any of `cuInit / cuDeviceGet / cuCtxCreate` fails.
+    pub fn init(device_ordinal: usize) -> Option<Self> {
+        let ordinal = to_i32(device_ordinal)?;
+        let library = load_library(cuda_library_candidates()).ok()?;
+        let library: &'static Library = Box::leak(Box::new(library));
+        let api = DriverApi::load(library).ok()?;
+        unsafe {
+            check_cuda((api.cu_init)(0), "cuInit").ok()?;
+            let mut device = 0_i32;
+            check_cuda((api.cu_device_get)(&mut device, ordinal), "cuDeviceGet").ok()?;
+            let mut context = 0_usize;
+            check_cuda(
+                (api.cu_ctx_create)(&mut context, 0, device),
+                "cuCtxCreate",
+            )
+            .ok()?;
+            Some(Self {
+                _library: library,
+                api,
+                context,
+            })
+        }
+    }
+
+    /// Bind this context to the calling thread. Library runtimes call
+    /// this before issuing work because cuCtxSetCurrent is per-thread.
+    #[inline]
+    pub fn set_current(&self) -> Result<(), String> {
+        check_cuda(
+            unsafe { (self.api.cu_ctx_set_current)(self.context) },
+            "cuCtxSetCurrent",
+        )
+    }
+}
+
+impl Drop for CudaWorkingState {
+    fn drop(&mut self) {
+        // Only fires at process shutdown via the runtime's `OnceLock`;
+        // best-effort cleanup so cuda-gdb / nvidia-smi see no dangling
+        // context. Errors are swallowed because the process is on its
+        // way out anyway.
+        unsafe {
+            let _ = (self.api.cu_ctx_destroy)(self.context);
         }
     }
 }

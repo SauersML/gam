@@ -18,6 +18,7 @@ use std::sync::OnceLock;
 use libloading::Library;
 
 use super::device::GpuDeviceInfo;
+use super::driver::CudaWorkingState;
 use super::policy::DispatchPolicy;
 
 // Minimal CUDA driver ABI surface required for autodetection.
@@ -118,6 +119,21 @@ impl GpuRuntime {
     #[inline]
     pub fn policy(&self) -> &DispatchPolicy {
         &self.policy
+    }
+
+    /// The one shared `(libcuda + DriverApi + context)` used by every
+    /// library runtime. Lazily created on first call so probe-only
+    /// callers (`gpu_available()`, `selected_gpu_info()`) don't pay the
+    /// `cuCtxCreate` cost.
+    ///
+    /// Returns `None` when no CUDA device is selected, or when context
+    /// creation itself fails.
+    pub fn cuda_working_state(&self) -> Option<&'static CudaWorkingState> {
+        static STATE: OnceLock<Option<CudaWorkingState>> = OnceLock::new();
+        let device = self.selected_device.as_ref()?;
+        STATE
+            .get_or_init(|| CudaWorkingState::init(device.ordinal))
+            .as_ref()
     }
 }
 
