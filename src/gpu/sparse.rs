@@ -196,8 +196,12 @@ impl CusparseRuntime {
                 return None;
             }
             let mut x_descr: usize = 0;
-            if (self.sparse.cusparse_create_dnvec)(&mut x_descr, cols as i64, x_dev.ptr, CUDA_R_64F)
-                != CUSPARSE_STATUS_SUCCESS
+            if (self.sparse.cusparse_create_dnvec)(
+                &mut x_descr,
+                x_len as i64,
+                x_dev.ptr,
+                CUDA_R_64F,
+            ) != CUSPARSE_STATUS_SUCCESS
             {
                 let _ = (self.sparse.cusparse_destroy_spmat)(spmat);
                 return None;
@@ -471,7 +475,7 @@ impl CusparseApi {
 const CUSPARSE_STATUS_SUCCESS: CusparseStatus = 0;
 const CUSPARSE_OP_N: i32 = 0;
 const CUSPARSE_OP_T: i32 = 1;
-const CUSPARSE_INDEX_32I: i32 = 1;
+const CUSPARSE_INDEX_32I: i32 = 2;
 const CUSPARSE_INDEX_BASE_ZERO: i32 = 0;
 const CUSPARSE_SPMV_ALG_DEFAULT: i32 = 0;
 const CUDA_R_64F: i32 = 1; // matches CUDA's cudaDataType enum value for double.
