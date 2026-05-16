@@ -60,7 +60,9 @@ fn periodic_bspline_1d_seam_predictions_match_at_zero_and_two_pi() {
         &cfg,
     )
     .expect("periodic 1D fit should succeed");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
 
     // Predict at exactly t=0 and t=2π (also a near-seam pair to confirm
     // local continuity vs the seam jump).
