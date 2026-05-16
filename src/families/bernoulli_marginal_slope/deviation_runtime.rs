@@ -602,6 +602,16 @@ impl DeviationRuntime {
         self.anchor_rows_at_training = Some(rows);
     }
 
+    /// Cached parametric-anchor matrix at training rows, installed by
+    /// `enforce_cross_block_identifiability_for_flex_block` when the
+    /// runtime is reparameterised against the parametric anchor union.
+    /// Used by per-row link-deviation evaluators that need the row's
+    /// anchor slice to apply `design_with_anchor_rows` correctly. Returns
+    /// `None` for runtimes that have not been reparameterised.
+    pub fn anchor_rows_at_training(&self) -> Option<&Array2<f64>> {
+        self.anchor_rows_at_training.as_ref()
+    }
+
     /// Evaluate `design(values) - anchor_rows · M` where `anchor_rows` is
     /// the n × d parametric-anchor matrix at the same rows as `values`.
     /// Mandatory when `anchor_residual` is set; for runtimes without a
