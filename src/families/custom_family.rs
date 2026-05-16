@@ -9959,13 +9959,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let newton_step_is_sane = initial_step_inf.is_finite()
                         && max_step_inf.is_finite()
                         && initial_step_inf <= max_step_inf;
-                    eprintln!(
-                        "[PROBE-TR] cycle0 initial_step_norm={:.4e} initial_step_inf={:.4e} max_step_inf={:.4e} sane={} prev_tr={:.4e}",
-                        initial_step_norm, initial_step_inf, max_step_inf, newton_step_is_sane, joint_trust_radius
-                    );
-                    // ROOT-CAUSE PROBE: temporarily always bump like pre-1065a429
-                    joint_trust_radius = initial_step_norm.min(1.0e6);
-                    let _ = newton_step_is_sane;
+                    if newton_step_is_sane {
+                        joint_trust_radius = initial_step_norm.min(1.0e6);
+                    }
                 }
             }
 
@@ -12238,12 +12234,6 @@ fn joint_outer_evaluate(
             .map(|bundle| bundle.coords.len())
             .unwrap_or(0);
 
-    eprintln!(
-        "[PROBE-JOE] joint_outer_evaluate mode={:?} ext_bundle={} rho.len={}",
-        eval_mode,
-        ext_bundle.is_some(),
-        rho.len()
-    );
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
         specs,
@@ -12286,16 +12276,6 @@ fn joint_outer_evaluate(
             expected_theta_dim
         ));
     }
-    eprintln!(
-        "[PROBE-JOE] joint_outer_evaluate result kind={} grad.len={} expected={}",
-        match &outer_hessian {
-            crate::solver::outer_strategy::HessianResult::Analytic(_) => "Analytic",
-            crate::solver::outer_strategy::HessianResult::Operator(_) => "Operator",
-            crate::solver::outer_strategy::HessianResult::Unavailable => "Unavailable",
-        },
-        grad.len(),
-        expected_theta_dim
-    );
     match &outer_hessian {
         crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
@@ -13781,10 +13761,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
-    eprintln!(
-        "[PROBE-CFHI2] inner.converged={} cycles={} rho_dim={} psi_dim={}",
-        inner.converged, inner.cycles, rho_dim, psi_dim
-    );
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         log::warn!(
