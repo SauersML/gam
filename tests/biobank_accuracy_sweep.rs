@@ -92,7 +92,11 @@ fn poisson_cfg() -> FitConfig {
 
 /// Build an EncodedDataset from named columns of equal length.
 fn encode_columns(headers: &[&str], columns: &[&[f64]]) -> gam::data::EncodedDataset {
-    assert_eq!(headers.len(), columns.len(), "headers/columns count mismatch");
+    assert_eq!(
+        headers.len(),
+        columns.len(),
+        "headers/columns count mismatch"
+    );
     let n = columns[0].len();
     for c in columns.iter() {
         assert_eq!(c.len(), n, "all columns must have the same length");
@@ -186,8 +190,9 @@ fn recovery_periodic_1d_cyclic_cos_noise_01() {
 
     // Evaluate on a dense grid distinct from training nodes.
     let n_grid = 200usize;
-    let theta_g: Vec<f64> =
-        (0..n_grid).map(|i| TAU * (i as f64 + 0.37) / (n_grid as f64)).collect();
+    let theta_g: Vec<f64> = (0..n_grid)
+        .map(|i| TAU * (i as f64 + 0.37) / (n_grid as f64))
+        .collect();
     let truth_g: Array1<f64> = theta_g.iter().map(|t| t.cos()).collect();
     let test = predict_matrix(2, &[&theta_g, &vec![0.0; n_grid]]);
 
@@ -199,9 +204,7 @@ fn recovery_periodic_1d_cyclic_cos_noise_01() {
     );
     let mse = mean_squared_error(&pred, &truth_g);
     let tol = 1.2 * noise_var;
-    eprintln!(
-        "[recovery-cyclic-1d] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}"
-    );
+    eprintln!("[recovery-cyclic-1d] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
     assert!(
         mse <= tol,
         "cyclic(theta) MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
@@ -246,9 +249,7 @@ fn recovery_cylinder_te_periodic_natural() {
     );
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
-    eprintln!(
-        "[recovery-cylinder] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}"
-    );
+    eprintln!("[recovery-cylinder] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
     assert!(
         mse <= tol,
         "te(theta,h periodic) MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
@@ -295,9 +296,7 @@ fn recovery_sphere_harmonic_low_degree_signal() {
     );
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
-    eprintln!(
-        "[recovery-sphere-harm] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}"
-    );
+    eprintln!("[recovery-sphere-harm] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
     assert!(
         mse <= tol,
         "sphere(harmonic) MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
@@ -314,7 +313,10 @@ fn recovery_bc_anchored_left_endpoint_recovery() {
     let noise_var = noise_sd * noise_sd;
     let mut rng = LcgNormal::new(0x1234_5678_u64);
     let x: Vec<f64> = (0..n).map(|i| (i as f64) / (n as f64 - 1.0)).collect();
-    let truth: Vec<f64> = x.iter().map(|xi| xi * (1.0 - xi) * (PI * xi).sin()).collect();
+    let truth: Vec<f64> = x
+        .iter()
+        .map(|xi| xi * (1.0 - xi) * (PI * xi).sin())
+        .collect();
     let y: Vec<f64> = truth
         .iter()
         .map(|t| t + noise_sd * rng.next_normal())
@@ -332,9 +334,7 @@ fn recovery_bc_anchored_left_endpoint_recovery() {
     );
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
-    eprintln!(
-        "[recovery-bc-anchored] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}"
-    );
+    eprintln!("[recovery-bc-anchored] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
     assert!(
         mse <= tol,
         "bc-anchored MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
@@ -495,10 +495,7 @@ fn compound_cyclic_plus_anchored_plus_sphere_fits_jointly() {
         &["theta", "x", "lat", "lon", "y"],
         &[&theta, &x, &lat, &lon, &y],
     );
-    let test = predict_matrix(
-        5,
-        &[&theta, &x, &lat, &lon, &vec![0.0; n]],
-    );
+    let test = predict_matrix(5, &[&theta, &x, &lat, &lon, &vec![0.0; n]]);
     let truth_arr: Array1<f64> = Array1::from(truth);
     let pred = fit_and_predict_eta(
         "y ~ cyclic(theta) + s(x, bc_left=anchored, anchor_left=0) + sphere(lat, lon, method=harmonic, max_degree=3)",
@@ -511,13 +508,8 @@ fn compound_cyclic_plus_anchored_plus_sphere_fits_jointly() {
     // larger.  Allow 2 × noise variance for the compound aggregate — still
     // strict (it rejects pathologies that double the noise floor).
     let tol = 2.0 * noise_var;
-    eprintln!(
-        "[compound] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}"
-    );
-    assert!(
-        mse <= tol,
-        "compound MSPE {mse:.5e} > 2·σ² = {tol:.5e}"
-    );
+    eprintln!("[compound] N={n} MSE={mse:.5e} noise_var={noise_var:.5e} tol={tol:.5e}");
+    assert!(mse <= tol, "compound MSPE {mse:.5e} > 2·σ² = {tol:.5e}");
 }
 
 // =============================================================================
@@ -570,9 +562,7 @@ fn family_binomial_cylinder_recovers_probability_surface() {
     let p_pred: Array1<f64> = eta_pred.mapv(logistic);
     let mse_p = mean_squared_error(&p_pred, &p_true_arr);
     let tol = 0.02;
-    eprintln!(
-        "[family-binomial] N={n} MSE(p_pred, p_true)={mse_p:.4e} tol={tol:.4e}"
-    );
+    eprintln!("[family-binomial] N={n} MSE(p_pred, p_true)={mse_p:.4e} tol={tol:.4e}");
     assert!(
         mse_p <= tol,
         "binomial cylinder probability MSPE {mse_p:.4e} > {tol:.4e}"
@@ -684,9 +674,7 @@ fn family_gaussian_cylinder_recovers_with_tight_tolerance() {
     );
     let mse = mean_squared_error(&pred, &truth_arr);
     let tol = 1.2 * noise_var;
-    eprintln!(
-        "[family-gaussian] N={n} MSE={mse:.5e} tol={tol:.5e}"
-    );
+    eprintln!("[family-gaussian] N={n} MSE={mse:.5e} tol={tol:.5e}");
     assert!(
         mse <= tol,
         "gaussian cylinder MSPE {mse:.5e} > 1.2·σ² = {tol:.5e}"
@@ -718,12 +706,13 @@ fn edge_all_same_y_yields_constant_prediction() {
     );
     let mut max_dev = 0.0_f64;
     for v in pred.iter() {
-        assert!(v.is_finite(), "non-finite prediction in zero-variance fit: {v}");
+        assert!(
+            v.is_finite(),
+            "non-finite prediction in zero-variance fit: {v}"
+        );
         max_dev = max_dev.max((v - y_const).abs());
     }
-    eprintln!(
-        "[edge-zero-variance] max |pred - {y_const}| = {max_dev:.3e}"
-    );
+    eprintln!("[edge-zero-variance] max |pred - {y_const}| = {max_dev:.3e}");
     // The mean-only solution is exact; allow only floating-point noise.
     // (The smooth nullspace contains the constant, so smoothing -> ∞ recovers
     // the mean exactly.)
@@ -754,9 +743,7 @@ fn edge_n_eq_ten_p_overdetermined_fit_within_envelope() {
     let test = predict_matrix(2, &[&theta, &vec![0.0; n]]);
     let truth_arr: Array1<f64> = Array1::from(truth);
     let pred = fit_and_predict_eta(
-        &format!(
-            "y ~ cyclic(theta, k={k}, period_start=0, period_end=6.283185307179586)"
-        ),
+        &format!("y ~ cyclic(theta, k={k}, period_start=0, period_end=6.283185307179586)"),
         &data,
         &gaussian_cfg(),
         &test,
@@ -765,13 +752,8 @@ fn edge_n_eq_ten_p_overdetermined_fit_within_envelope() {
     // At N = 10·p the bias-variance budget loosens by a factor of ~10/inf-ratio,
     // but the true noise is still σ² so we allow up to 1.5·σ².
     let tol = 1.5 * noise_var;
-    eprintln!(
-        "[edge-N10p] N={n} k={k} MSE={mse:.5e} tol={tol:.5e}"
-    );
-    assert!(
-        mse <= tol,
-        "N=10p fit MSPE {mse:.5e} > 1.5·σ² = {tol:.5e}"
-    );
+    eprintln!("[edge-N10p] N={n} k={k} MSE={mse:.5e} tol={tol:.5e}");
+    assert!(mse <= tol, "N=10p fit MSPE {mse:.5e} > 1.5·σ² = {tol:.5e}");
 }
 
 /// Single category in a non-fit covariate: include a constant column that the
@@ -791,14 +773,10 @@ fn edge_single_category_unused_covariate_does_not_affect_fit() {
         .collect();
     // Unused covariate is constant (single category as a numeric).
     let unused = vec![7.0_f64; n];
-    let data_with = encode_columns(
-        &["theta", "unused", "y"],
-        &[&theta, &unused, &y],
-    );
+    let data_with = encode_columns(&["theta", "unused", "y"], &[&theta, &unused, &y]);
     let data_without = encode_columns(&["theta", "y"], &[&theta, &y]);
 
-    let theta_grid: Vec<f64> =
-        (0..50).map(|i| TAU * (i as f64 + 0.23) / 50.0).collect();
+    let theta_grid: Vec<f64> = (0..50).map(|i| TAU * (i as f64 + 0.23) / 50.0).collect();
     let test_with = predict_matrix(3, &[&theta_grid, &vec![7.0; 50], &vec![0.0; 50]]);
     let test_without = predict_matrix(2, &[&theta_grid, &vec![0.0; 50]]);
 
@@ -818,9 +796,7 @@ fn edge_single_category_unused_covariate_does_not_affect_fit() {
     for (a, b) in pred_with.iter().zip(pred_without.iter()) {
         max_diff = max_diff.max((a - b).abs());
     }
-    eprintln!(
-        "[edge-unused-covariate] max |pred_with - pred_without| = {max_diff:.3e}"
-    );
+    eprintln!("[edge-unused-covariate] max |pred_with - pred_without| = {max_diff:.3e}");
     // The unused covariate has no statistical role; fits must be identical
     // up to floating-point noise.
     assert!(
