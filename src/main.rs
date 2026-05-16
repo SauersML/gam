@@ -616,6 +616,9 @@ fn main() {
 }
 
 fn run() -> CliResult<()> {
+    // Parse first so `--help` / `--version` exit cleanly without spawning the
+    // runtime-threads INFO line clap can't suppress.
+    let cli = Cli::parse();
     gam::visualizer::init_logging();
     log::info!(
         "[STAGE] runtime threads | rayon_current_num_threads={} | std_available_parallelism={}",
@@ -624,7 +627,6 @@ fn run() -> CliResult<()> {
             .map(|n| n.get())
             .unwrap_or(0),
     );
-    let cli = Cli::parse();
     match cli.command {
         Command::Fit(args) => run_fit(args).map_err(CliError::from),
         Command::Report(args) => run_report(args).map_err(CliError::from),
