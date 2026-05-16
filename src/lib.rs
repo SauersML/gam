@@ -1,3 +1,45 @@
+//! `gam` is a formula-first generalized additive model engine.
+//!
+//! Models are specified with a Wilkinson-style formula DSL and fit by
+//! REML / LAML over Gaussian, binomial, Poisson, and Gamma GLMs, plus
+//! location-scale, survival, marginal-slope, and response-geometry
+//! extensions. Smoothing parameters are selected automatically;
+//! posterior sampling uses NUTS where supported with a Gaussian Laplace
+//! fallback elsewhere.
+//!
+//! ## Two interfaces
+//!
+//! - **Rust CLI (`gam`)** — fit, predict, report, diagnose, sample,
+//!   generate. Built from `src/main.rs`.
+//! - **Python library (`gamfit`)** — PyO3 bindings on top of this
+//!   crate. See <https://gamfit.readthedocs.io/>.
+//!
+//! ## Smooth zoo
+//!
+//! Univariate P-splines, multivariate thin-plate, Matérn, and Duchon
+//! radial bases, tensor products, and a family of **geometric smooths**
+//! for predictor spaces that are not flat ℝᵈ:
+//!
+//! - 1-D cyclic / periodic B-splines and periodic Duchon
+//! - Tensor products with one or more periodic margins (cylinder,
+//!   torus, Möbius)
+//! - Intrinsic S² smooths (Wahba reproducing kernel + spherical
+//!   harmonics)
+//! - Boundary-conditioned (clamped / anchored) 1-D B-splines
+//!
+//! `scripts/geometric_shapes_demo.py` showcases six topologies
+//! (trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere,
+//! bumpy torus, Möbius strip) recovered from noisy 3-D point clouds,
+//! including a self-validating quality report against analytic truth.
+//!
+//! ## Crate layout
+//!
+//! - [`families`] — likelihoods + their analytic gradients / Hessians
+//! - [`solver`] — PIRLS, REML/LAML, and the joint blockwise optimiser
+//! - [`terms`] — formula terms, basis construction, smooth specs
+//! - [`inference`] — prediction, posterior sampling, diagnostics
+//! - [`linalg`] — faer ↔ ndarray bridges + numerics helpers
+//! - [`gpu`] — runtime CUDA dispatch for hot linear algebra paths
 #![deny(dead_code)]
 #![deny(unused_variables)]
 #![deny(unused_imports)]
