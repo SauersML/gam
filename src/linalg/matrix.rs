@@ -4942,6 +4942,19 @@ impl LinearOperator for DesignMatrix {
         match self {
             Self::Dense(matrix) => matrix.apply(vector),
             Self::Sparse(matrix) => {
+                if let Some(csr) = matrix.to_csr_arc() {
+                    let sym = csr.symbolic();
+                    if let Some(output) = crate::gpu::try_csr_spmv_usize(
+                        sym.row_ptr(),
+                        sym.col_idx(),
+                        csr.val(),
+                        matrix.nrows(),
+                        matrix.ncols(),
+                        vector,
+                    ) {
+                        return output;
+                    }
+                }
                 let mut output = Array1::<f64>::zeros(matrix.nrows());
                 let (symbolic, values) = matrix.parts();
                 let col_ptr = symbolic.col_ptr();
@@ -5024,6 +5037,19 @@ impl LinearOperator for DesignMatrix {
         match self {
             Self::Dense(matrix) => matrix.apply_transpose(vector),
             Self::Sparse(matrix) => {
+                if let Some(csr) = matrix.to_csr_arc() {
+                    let sym = csr.symbolic();
+                    if let Some(output) = crate::gpu::try_csr_t_spmv_usize(
+                        sym.row_ptr(),
+                        sym.col_idx(),
+                        csr.val(),
+                        matrix.nrows(),
+                        matrix.ncols(),
+                        vector,
+                    ) {
+                        return output;
+                    }
+                }
                 let mut output = Array1::<f64>::zeros(matrix.ncols());
                 let (symbolic, values) = matrix.parts();
                 let col_ptr = symbolic.col_ptr();
