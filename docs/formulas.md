@@ -199,6 +199,66 @@ the truth is reasonable, but they take different paths to get there:
 | You want to control wiggliness directly | `matern(...)` with `nu`. |
 | You want scale-free behaviour | `duchon(...)` without `length_scale`. |
 
+### Periodic / cyclic smooths
+
+```
+y ~ s(theta, periodic=true, period=6.283)             # cyclic 1D B-spline
+y ~ cyclic(theta, period_start=0, period_end=6.283)   # equivalent alias
+y ~ cc(day_of_week, period=7)                         # mgcv `bs="cc"` alias
+y ~ duchon(theta, periodic=true)                      # cyclic Duchon (1D)
+
+# Tensor with one or more periodic margins (cylinder, torus, …)
+y ~ te(theta, h,  periodic=[0], period=[2*pi, None])
+y ~ te(theta, phi, periodic=[0, 1], period=[2*pi, 2*pi])
+y ~ te(day, hour, bc=['periodic','periodic'], period=[7, 24])
+```
+
+`periodic=[axes]` lists zero-based axis indices that wrap around; `period=`
+holds one positive period per margin (`None` for non-periodic). The
+periodic margin uses a folded cardinal-cubic B-spline and a cyclic
+difference penalty. `period_start`/`period_end` (1D) override the data range
+when the angular domain is wider than the observed sample.
+
+### Boundary-conditioned 1D smooths
+
+```
+y ~ s(x, bc=clamped)                       # zero first derivative at both ends
+y ~ s(x, bc=clamped, side=left)            # zero first derivative at the start
+y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
+y ~ s(x, start_bc=clamped, end_bc=anchored, end_anchor=0)
+```
+
+Endpoint conditions are imposed by projecting onto the null space of the
+boundary-condition rows (Wood §5.4.1), so the constrained smooth honours
+the condition exactly. Aliases: `bc_left|left_bc|start_bc`, plus
+`bc_right|right_bc|end_bc`. Values: `free|none|open`, `clamped|zero_derivative`,
+`anchored|zero|zero_value`. Per-side anchor overrides: `anchor_<side>`,
+`<side>_anchor`, falling back to global `anchor`/`anchor_value`/`value`.
+
+### Intrinsic S² (sphere) smooth
+
+```
+y ~ sphere(lat, lon)                                    # Wahba kernel, m=2
+y ~ s(lat, lon, type=sphere)                            # equivalent
+y ~ s(lat, lon, bs=sos)                                 # mgcv alias
+y ~ sphere(lat, lon, m=3, radians=true, k=64)           # m∈{1..4}; centers=k
+y ~ sphere(lat, lon, method=harmonic, max_degree=6)     # spherical-harmonic
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `method` | `wahba` | `wahba` (reproducing kernel) or `harmonic` (spherical harmonics). |
+| `m` (`order`, `penalty_order`) | 2 | Wahba pseudo-spline order (1..4). |
+| `max_degree` (`L`, `harmonic_degree`) | auto | Maximum harmonic degree L; basis dim = L(L+2). |
+| `centers` (`k`) | auto | Wahba center count. |
+| `radians` (`units=radians`) | `false` | Treat lat/lon as radians (default: degrees). |
+| `double_penalty` | `true` | Add a ridge-like null-space shrinkage penalty. |
+
+The Wahba and harmonic constructions are both intrinsic on the sphere
+(rotation-invariant). Harmonic is fixed-rank and has a diagonal Laplace-
+Beltrami squared penalty; Wahba uses centers via the closed-form
+reproducing kernel.
+
 ## Adaptive anisotropy
 
 For multi-d smooths that support it, add `scale_dims=true` (or set
