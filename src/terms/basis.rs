@@ -14081,7 +14081,7 @@ fn build_spherical_harmonic_basis(
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
-            let eig = (l as f64 * (l as f64 + 1.0)).powi(spec.penalty_order as i32);
+        let eig = (l as f64 * (l as f64 + 1.0)).powi(spec.penalty_order as i32);
         for _ in 0..(2 * l + 1) {
             penalty[[col, col]] = eig;
             col += 1;

@@ -219,6 +219,59 @@ fn spherical_harmonic_basis_builds_with_correct_width_and_diagonal_penalty() {
 }
 
 #[test]
+fn spherical_harmonic_penalty_order_changes_penalty_shape() {
+    use gam::basis::SphereMethod;
+    let data = array![
+        [-80.0, -170.0],
+        [-40.0, -60.0],
+        [0.0, 0.0],
+        [35.0, 80.0],
+        [70.0, 160.0]
+    ];
+    let mut spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+        penalty_order: 1,
+        double_penalty: false,
+        radians: false,
+        method: SphereMethod::Harmonic,
+        max_degree: Some(3),
+    };
+    let p1 = build_spherical_spline_basis(data.view(), &spec)
+        .expect("m=1 harmonic basis")
+        .penalties[0]
+        .clone();
+    spec.penalty_order = 4;
+    let p4 = build_spherical_spline_basis(data.view(), &spec)
+        .expect("m=4 harmonic basis")
+        .penalties[0]
+        .clone();
+
+    let low_degree_ratio_m1 = p1[(3, 3)] / p1[(0, 0)];
+    let low_degree_ratio_m4 = p4[(3, 3)] / p4[(0, 0)];
+    assert!(
+        low_degree_ratio_m4 > 10.0 * low_degree_ratio_m1,
+        "harmonic penalty_order should steepen high-degree shrinkage: m1 ratio={low_degree_ratio_m1}, m4 ratio={low_degree_ratio_m4}"
+    );
+}
+
+#[test]
+fn spherical_harmonic_rejects_invalid_penalty_order() {
+    use gam::basis::SphereMethod;
+    let data = array![[0.0, 0.0], [10.0, 20.0]];
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
+        penalty_order: 0,
+        double_penalty: false,
+        radians: false,
+        method: SphereMethod::Harmonic,
+        max_degree: Some(2),
+    };
+    let err = build_spherical_spline_basis(data.view(), &spec)
+        .expect_err("invalid harmonic penalty order");
+    assert!(err.to_string().contains("penalty_order"));
+}
+
+#[test]
 fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
     use gam::basis::SphereMethod;
     let data = array![
