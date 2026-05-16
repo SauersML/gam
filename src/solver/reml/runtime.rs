@@ -2306,6 +2306,35 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
+    /// Debug-only: return `log|U_Sᵀ H U_S|_+` — the *projected* Hessian
+    /// log-determinant on the identified `range(S_+)` subspace, evaluated
+    /// at the PIRLS state driven to convergence at this `rho`.
+    ///
+    /// Production REML/LAML cost reads this quantity via
+    /// `hop.logdet() + hessian_logdet_correction` (the latter carries the
+    /// `log|H_proj| − hop.logdet()` correction from the dense_assembly
+    /// rank-deficiency fix).  Returning the same sum here gives tests a
+    /// matching finite-difference oracle: probing the projected logdet at
+    /// `theta ± h · e_ψ` and centered-differencing produces the analytic
+    /// `d/dψ log|H_proj|` that production's trace formula computes — *not*
+    /// the full-space `d/dψ log|H_full|`, which differs by the `null(S)`
+    /// directions' contribution and is the wrong oracle for the projected
+    /// LAML cost identity.  Used by
+    /// `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
+    /// INVARIANT 2.
+    #[cfg(test)]
+    pub(crate) fn objective_logdet_h_proj(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        use super::unified::HessianOperator;
+        let bundle = self.obtain_eval_bundle(rho)?;
+        let assembly =
+            self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly, false)?;
+        let logdet = assembly.hessian_op.logdet() + assembly.hessian_logdet_correction;
+        Ok(logdet)
+    }
+
     /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at the
     /// PIRLS state produced by driving the solver to convergence at this `rho`.
     /// Used by the iso-κ Duchon FD probe to test whether the analytic
