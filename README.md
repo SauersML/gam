@@ -230,6 +230,7 @@ est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 | `docs/` | MkDocs/Material documentation sources (built to RTD). |
 | `tests/` | Rust + Python integration tests. |
 | `bench/` | Benchmark harness, scenario configs, datasets, plots. |
+| `scripts/` | Runnable demo / diagnostic / utility scripts (the manifold smooths gallery lives here). |
 
 ## Development
 
