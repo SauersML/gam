@@ -62,8 +62,10 @@ fn fit_from_formula_rejects_2d_matern_nu_half_decimal_alias_before_pirls() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let err = fit_from_formula("y ~ matern(x, z, nu=.50)", &data, &config)
-        .expect_err("2D Matern nu=1/2 should be rejected before fit");
+    let err = match fit_from_formula("y ~ matern(x, z, nu=.50)", &data, &config) {
+        Ok(_) => panic!("2D Matern nu=1/2 should be rejected before fit"),
+        Err(err) => err,
+    };
     assert!(
         err.to_string().contains("nu=1/2 is not supported for d>=2"),
         "unexpected error: {err}"
