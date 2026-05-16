@@ -47,6 +47,8 @@ This site is the Python documentation. For a short overview, see the
   a calibrated risk score; the two-stage transformation-normal pipeline.
 - [Location-scale models](location-scale.md) — jointly modelling mean and
   variance.
+- [Response geometry](response-geometry.md) — spherical and compositional
+  responses via Fréchet-mean tangent-space GAMs.
 
 **Using a fitted model**
 
