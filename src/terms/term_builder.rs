@@ -412,7 +412,7 @@ pub fn build_smooth_basis(
                 let effective_n = tensor_effective_support_count(ds, cols);
                 cap_inferred_tensor_internal_knots(&mut internal_knots_by_dim, degree, effective_n);
             }
-            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+            if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 for n_knots in &mut internal_knots_by_dim {
                     *n_knots = (*n_knots).min(1);
                 }
@@ -528,7 +528,7 @@ pub fn build_smooth_basis(
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
             let (mut n_knots, inferred) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
-            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+            if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 n_knots = n_knots.min(1);
             }
             if inferred {
@@ -1790,6 +1790,41 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(dims, vec![9, 5]);
+    }
+
+    #[test]
+    fn explicit_basis_sizes_are_not_small_n_clamped() {
+        let ds = continuous_dataset(
+            &["y", "x1", "x2", "x3", "x4", "x5"],
+            (0..12)
+                .map(|i| {
+                    let x = i as f64 / 11.0;
+                    vec![x.sin(), x, x * x, x + 0.1, 1.0 - x, (2.0 * x).sin()]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ s(x1, k=10) + s(x2) + s(x3) + s(x4) + s(x5)")
+            .expect("parse multi-smooth formula");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("build multi-smooth terms");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected first smooth to be B-spline");
+        };
+        assert!(matches!(
+            &spec.knotspec,
+            BSplineKnotSpec::Generate {
+                num_internal_knots: 6,
+                ..
+            }
+        ));
     }
 
     #[test]
