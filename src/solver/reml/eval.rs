@@ -4,6 +4,23 @@ use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
 impl<'a> RemlState<'a> {
+    fn cached_penalty_block_structural_nullities(
+        &self,
+    ) -> Result<super::penalty_logdet::PenaltyBlockStructuralNullities, EstimationError> {
+        if let Some(cached) = self
+            .penalty_block_structural_nullities
+            .read()
+            .unwrap()
+            .clone()
+        {
+            return Ok(cached);
+        }
+        let computed = PenaltyPseudologdet::structural_block_nullities(&self.canonical_penalties)
+            .map_err(EstimationError::LayoutError)?;
+        *self.penalty_block_structural_nullities.write().unwrap() = Some(computed.clone());
+        Ok(computed)
+    }
+
     /// Compute first and second derivatives of the exact pseudo-logdet
     /// log|S|₊ with respect to ρ.
     ///
@@ -73,13 +90,19 @@ impl<'a> RemlState<'a> {
 
         let lambdas_slice = lambdas.as_slice().unwrap();
 
-        let pld = PenaltyPseudologdet::from_penalties(
+        let cached_block_nullities = if ridge > 0.0 {
+            Some(self.cached_penalty_block_structural_nullities()?)
+        } else {
+            None
+        };
+        let pld = PenaltyPseudologdet::from_penalties_with_cached_block_nullities(
             &self.canonical_penalties,
             lambdas_slice,
             ridge,
             self.p,
+            cached_block_nullities.as_ref(),
         )
-        .map_err(|e| EstimationError::LayoutError(e))?;
+        .map_err(EstimationError::LayoutError)?;
 
         let (det1, det2) =
             pld.rho_derivatives_from_penalties(&self.canonical_penalties, lambdas_slice);
