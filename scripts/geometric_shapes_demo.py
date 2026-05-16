@@ -631,6 +631,7 @@ def main():
             print("[3/3] all predictions cached")
 
     shapes = build_shapes()
+    quality_report(shapes)
     base = SCRIPT.parent / "geometric_shapes_demo"
     if args.still:
         print("[render] still PNG (4000×3000)")
