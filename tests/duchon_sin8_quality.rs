@@ -23,12 +23,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
-fn make_sin_dataset(
-    freq: f64,
-    sigma: f64,
-    n: usize,
-    seed: u64,
-) -> gam::data::EncodedDataset {
+fn make_sin_dataset(freq: f64, sigma: f64, n: usize, seed: u64) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let ux = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, sigma).expect("normal");
@@ -49,11 +44,7 @@ fn make_sin_dataset(
     encode_recordswith_inferred_schema(headers, rows).expect("encode sin dataset")
 }
 
-fn fit_and_predict(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    x_test: &[f64],
-) -> Vec<f64> {
+fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()

@@ -40,11 +40,7 @@ fn make_step_dataset(sigma: f64, n: usize, seed: u64) -> gam::data::EncodedDatas
     encode_recordswith_inferred_schema(headers, rows).expect("encode step dataset")
 }
 
-fn fit_and_predict(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    x_test: &[f64],
-) -> Vec<f64> {
+fn fit_and_predict(formula: &str, data: &gam::data::EncodedDataset, x_test: &[f64]) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()

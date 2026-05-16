@@ -18,12 +18,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
-fn fit_predict(
-    formula: &str,
-    x_train: &[f64],
-    y_train: &[f64],
-    x_test: &[f64],
-) -> Vec<f64> {
+fn fit_predict(formula: &str, x_train: &[f64], y_train: &[f64], x_test: &[f64]) -> Vec<f64> {
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = x_train
         .iter()
@@ -36,15 +31,17 @@ fn fit_predict(
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let n = x_test.len();
     let mut m = Array2::<f64>::zeros((n, 2));
     for (i, &v) in x_test.iter().enumerate() {
         m[[i, 0]] = v;
         m[[i, 1]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -76,9 +73,11 @@ fn smooth_predictions_just_outside_training_range_stay_bounded() {
     ];
     for (label, body) in cases {
         let pred = fit_predict(&format!("y ~ {body}"), &x, &y, &x_test);
-        let abs_max = pred.iter().cloned().fold(0.0_f64, f64::max).max(
-            pred.iter().cloned().fold(0.0_f64, |a, v| a.max(v.abs())),
-        );
+        let abs_max = pred
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max)
+            .max(pred.iter().cloned().fold(0.0_f64, |a, v| a.max(v.abs())));
         eprintln!(
             "[extrap] {label:10}  preds={:?}  abs_max={abs_max:.3}",
             pred
