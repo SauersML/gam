@@ -3,7 +3,10 @@
 Fit Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms, random
 effects, location-scale extensions, survival likelihoods, and learnable
 links. Smoothing parameters are selected by REML or LAML; posterior
-sampling uses NUTS.
+sampling uses NUTS. Geometric / manifold smooths (cyclic 1-D, cylinder
+/ torus tensor, intrinsic sphere, boundary-conditioned B-splines) make
+predictor spaces that wrap or close first-class — no seams, no pole
+artefacts.
 
 Quick start::
 
