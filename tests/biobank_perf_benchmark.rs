@@ -10,9 +10,6 @@
 //! numbers are visible in CI logs without breaking the build.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
 use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec};
 use gam::linalg::matrix::DesignMatrix;
 use gam::smooth::{
@@ -20,6 +17,9 @@ use gam::smooth::{
     TensorBSplineSpec, TermCollectionSpec,
 };
 use gam::terms::smooth::build_term_collection_design;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 use std::f64::consts::{PI, TAU};
 use std::time::Instant;
@@ -312,7 +312,11 @@ fn biobank_perf_binomial_cylinder_n100k() {
 // `n × ∏ q_j` `Array2` is filled. Times are reported via eprintln so they
 // show up in CI logs without gating CI on a hard latency budget.
 
-fn te_xh_design_spec(num_x: usize, num_h: usize, identifiability: TensorBSplineIdentifiability) -> TermCollectionSpec {
+fn te_xh_design_spec(
+    num_x: usize,
+    num_h: usize,
+    identifiability: TensorBSplineIdentifiability,
+) -> TermCollectionSpec {
     let spec_x = BSplineBasisSpec {
         degree: 3,
         penalty_order: 2,
@@ -378,8 +382,7 @@ fn time_design_build_and_apply(
     use rand_distr::{Distribution, Normal};
 
     let t_build = Instant::now();
-    let design = build_term_collection_design(data.view(), spec)
-        .expect("te(x, h) design build");
+    let design = build_term_collection_design(data.view(), spec).expect("te(x, h) design build");
     let ms_build = t_build.elapsed().as_secs_f64() * 1e3;
     let term = &design.smooth.term_designs[0];
     let p = term.ncols();
@@ -452,8 +455,7 @@ fn biobank_perf_sparse_vs_dense_te_n100k_p128() {
     assert!(is_sparse);
 
     let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
-    let (ms_build_d, ms_apply_d, p_dense, _) =
-        time_design_build_and_apply(&spec_dense, &data, 8);
+    let (ms_build_d, ms_apply_d, p_dense, _) = time_design_build_and_apply(&spec_dense, &data, 8);
 
     let build_speedup = ms_build_d / ms_build_s.max(1e-6);
     let apply_speedup = ms_apply_d / ms_apply_s.max(1e-6);

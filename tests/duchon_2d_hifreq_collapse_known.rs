@@ -26,9 +26,11 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
-fn make_hifreq_2d(n: usize, sigma: f64, seed: u64)
-    -> (Vec<f64>, Vec<f64>, Vec<f64>, gam::data::EncodedDataset)
-{
+fn make_hifreq_2d(
+    n: usize,
+    sigma: f64,
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, gam::data::EncodedDataset) {
     let mut rng = StdRng::seed_from_u64(seed);
     let u = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, sigma).expect("normal");
@@ -51,22 +53,26 @@ fn make_hifreq_2d(n: usize, sigma: f64, seed: u64)
         .iter()
         .zip(x2.iter())
         .zip(y_noisy.iter())
-        .map(|((a, b), c)| {
-            StringRecord::from(vec![a.to_string(), b.to_string(), c.to_string()])
-        })
+        .map(|((a, b), c)| StringRecord::from(vec![a.to_string(), b.to_string(), c.to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     (x1, x2, y_truth, data)
 }
 
-fn fit_predict(formula: &str, data: &gam::data::EncodedDataset,
-               x1t: &[f64], x2t: &[f64]) -> Vec<f64> {
+fn fit_predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    x1t: &[f64],
+    x2t: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("fit succeeded");
-    let FitResult::Standard(fit) = result else { panic!("expected standard fit") };
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit")
+    };
     let n = x1t.len();
     let mut m = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
@@ -74,8 +80,8 @@ fn fit_predict(formula: &str, data: &gam::data::EncodedDataset,
         m[[i, 1]] = x2t[i];
         m[[i, 2]] = 0.0;
     }
-    let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let test_design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     test_design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -126,9 +132,7 @@ fn pure_duchon_2d_hifreq_collapse_currently_observed() {
     let yhat = fit_predict("y ~ duchon(x1, x2)", &data, &x1t, &x2t);
     let (rmse, span) = metrics(&yhat, &truth);
     let truth_span = 2.0_f64;
-    eprintln!(
-        "[duchon-2d-hifreq pure] rmse={rmse:.4} span={span:.3} truth_span={truth_span:.3}"
-    );
+    eprintln!("[duchon-2d-hifreq pure] rmse={rmse:.4} span={span:.3} truth_span={truth_span:.3}");
     // These two upper bounds together capture the current collapsed regime.
     // Flip them to lower bounds (and tighten) when the underlying fix lands.
     assert!(
