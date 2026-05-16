@@ -282,6 +282,18 @@ fn parse_bspline_endpoint_condition(
         }
         "anchored" | "anchor" | "zero" | "zero_value" | "zero-value" => {
             let value = endpoint_anchor_value(options, side).unwrap_or(0.0);
+            // Nonzero anchor values aren't supported by the basis builder yet
+            // (it would need an affine offset term). Reject upfront with a
+            // clear actionable message instead of letting the user see a
+            // generic "Matrix conditioning issue / basis function generation
+            // failed" wrapped error during fit.
+            if value != 0.0 {
+                return Err(format!(
+                    "anchored {side} endpoint with non-zero value {value} is not supported yet; \
+                     pass anchor value 0 (or omit `anchor_{side}=`) and subtract the offset from \
+                     `y` before fitting if you need to pin the boundary at a non-zero level."
+                ));
+            }
             Ok(BSplineEndpointBoundaryCondition::Anchored { value })
         }
         other => Err(format!(
