@@ -148,6 +148,8 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: Some(vec![0.0; pc_dim]),
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
+
+                    periodic: false,
                 },
                 input_scales: None,
             },
