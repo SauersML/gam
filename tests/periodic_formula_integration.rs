@@ -58,6 +58,14 @@ fn fit_from_formula_accepts_tensor_cylinder_periodic_margin() {
 }
 
 #[test]
+fn fit_from_formula_accepts_tensor_period_origin_aliases() {
+    assert_standard_fit_has_finite_coefficients(
+        "y ~ te(theta, h, bc=['periodic', 'natural'], periods=[2*pi, None], origins=[0, None], k=5)",
+        1,
+    );
+}
+
+#[test]
 fn fit_from_formula_accepts_cyclic_duchon_smooth() {
     assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
 }
