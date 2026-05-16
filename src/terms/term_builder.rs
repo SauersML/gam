@@ -1901,9 +1901,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed =
-            parse_formula("y ~ duchon(x1, centers=2) + s(x2) + s(x3) + s(x4) + s(x5)")
-                .expect("parse multi-smooth formula");
+        let parsed = parse_formula("y ~ duchon(x1, centers=2) + s(x2) + s(x3) + s(x4) + s(x5)")
+            .expect("parse multi-smooth formula");
         let col_map = ds.column_map();
         let mut notes = Vec::new();
         let terms = build_termspec(
