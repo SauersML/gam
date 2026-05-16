@@ -12154,6 +12154,13 @@ pub fn freeze_term_collection_from_design(
                     },
                     None => BSplineIdentifiability::None,
                 };
+                // Boundary projections are folded into `identifiability_transform`
+                // by `build_bspline_basis_1d`. A frozen prediction spec must
+                // rebuild the same raw knot basis and apply the captured
+                // transform exactly once; keeping the original boundary
+                // conditions would project the raw basis a second time and
+                // shrink its width before `FrozenTransform` is applied.
+                s.boundary_conditions = Default::default();
             }
             (
                 SmoothBasisSpec::ThinPlate {
