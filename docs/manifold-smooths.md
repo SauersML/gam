@@ -35,12 +35,15 @@ The same shapes, rendered higher-resolution as a static still:
 
 ![still version](images/geometric_shapes_demo.png){ width="100%" }
 
-A slower, higher-bitrate MP4 (first half of the loop, played at 2/3
-speed) is also available for closer inspection:
+A slower MP4 (first half of the loop, played at 2/3 speed) for
+closer inspection:
 
 <video controls autoplay loop muted playsinline width="100%">
-  <source src="images/geometric_shapes_demo.mp4" type="video/mp4">
+  <source src="images/geometric_shapes_demo_slow.mp4" type="video/mp4">
 </video>
+
+The full-length, full-speed MP4 lives at
+[`images/geometric_shapes_demo.mp4`](images/geometric_shapes_demo.mp4).
 
 ## The six shapes and the formulas behind them
 
