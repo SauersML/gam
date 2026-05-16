@@ -5,6 +5,25 @@ smooth features (periodic 1D, cylinder/torus tensor, BC clamped/anchored,
 intrinsic S² sphere). Tracks current baseline, identified bottlenecks,
 and the algorithmic / SIMD / structural changes that have to land.
 
+## Status (May 2026)
+
+| Track                                             | State                |
+| ------------------------------------------------- | -------------------- |
+| Parallel basis builds (periodic / sphere / BC)    | **done** (rayon)     |
+| Track 3 — SIMD `wahba_sphere_kernel_from_cos`     | **done**             |
+| GPU fast-paths for PIRLS XtWX / Cholesky / SpMV   | **done** (cuBLAS, cuSOLVER, cuSPARSE) |
+| Discretize-and-fit (rejected, see end of doc)     | not landing          |
+| Track 0 — analytic closed-form Gaussian REML      | **TODO** (headline win, ~1 week) |
+| Track 2 — Kronecker matvec in PIRLS               | TODO                 |
+| Track 4 — stochastic / subsampled REML            | TODO                 |
+
+Track 3 landed in commits `049965af` and `98baab92`; the GPU
+fast-paths landed in `29b066fc` (XtWX), `73f8bc6b` (Cholesky), and
+`30386254` (sparse mat-vec). Parallel basis fills landed across
+`794d424e`, `a8d9e763`, `4fe84de5`, `56ba568f`. The
+[manifold smooths gallery](manifold-smooths.md) is a self-validating
+end-to-end demo of the geometric features the roadmap targets.
+
 ## Current baseline (release, serial, warm — May 2026)
 
 Basis builds (already ≥ parallel, near-linear in N):
