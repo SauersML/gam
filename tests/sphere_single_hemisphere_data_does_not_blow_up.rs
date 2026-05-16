@@ -1,11 +1,13 @@
-//! FAILING TEST (potentially) — ticket: when sphere training data is
-//! concentrated in one hemisphere, predictions in the *opposite* hemisphere
-//! (where there is no data) should fall back to something sane — at minimum
-//! bounded and not orders of magnitude beyond the training y range.
+//! Regression guard: when sphere training data is concentrated in one
+//! hemisphere, predictions in the *opposite* hemisphere (where there
+//! is no data) must stay bounded and within a sane multiple of the
+//! training y range.
 //!
 //! Mathematical kernels on the sphere can produce extrapolation
 //! artifacts in data-sparse regions; this catches the case where the
-//! Wahba / harmonic basis amplifies far away from data.
+//! Wahba / harmonic basis amplifies far away from data. Currently
+//! passing — kept as a regression guard so any future loss of
+//! far-side stability fails loudly.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
