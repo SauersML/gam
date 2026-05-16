@@ -1,10 +1,13 @@
-//! FAILING TEST (potentially) — ticket: `group(g)` random effects should
-//! recover known per-group means when n_per_group is large.
+//! Regression guard: `group(g)` random effects must recover the known
+//! per-group means when n_per_group is large.
 //!
-//! Generate G=8 groups with distinct true means in [-1.5, 1.5], 50 samples per
-//! group with σ=0.20. Fit `y ~ group(g)`. Predict for each group's "anchor"
-//! sample; assert the predicted per-group mean is within 0.25 of the true
-//! mean (much larger than σ/√50 ≈ 0.028, so this only fails on real bugs).
+//! Generate G=8 groups with distinct true means in [-1.5, 1.5], 50 samples
+//! per group with σ=0.20. Fit `y ~ group(g)`. Predict for each group's
+//! "anchor" sample; assert the predicted per-group mean is within 0.25 of
+//! the true mean (much larger than σ/√50 ≈ 0.028, so this only fails on
+//! real bugs).
+//!
+//! Currently passing — kept as a regression guard.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
