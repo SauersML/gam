@@ -1374,6 +1374,403 @@ struct DuchonBasisDesign {
     nullspace_order: DuchonNullspaceOrder,
 }
 
+/// Options for fitting an interpolating closed one-dimensional spline curve.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PeriodicSpline1DOptions {
+    /// Period of the scalar parameter. For angles in radians this is usually `2*pi`.
+    pub period: f64,
+    /// Origin used for wrapping. Values differing by integer multiples of `period`
+    /// are identified after subtracting this origin.
+    pub origin: f64,
+    /// Absolute tolerance used when coalescing duplicate wrapped sites.
+    pub duplicate_tolerance: f64,
+}
+
+impl PeriodicSpline1DOptions {
+    pub fn new(period: f64) -> Self {
+        Self {
+            period,
+            origin: 0.0,
+            duplicate_tolerance: 1e-10,
+        }
+    }
+}
+
+/// A C2 periodic cubic interpolant from a scalar parameter into R^d.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicSpline1D {
+    options: PeriodicSpline1DOptions,
+    sites: Array1<f64>,
+    values: Array2<f64>,
+    second_derivatives: Array2<f64>,
+}
+
+impl PeriodicSpline1D {
+    pub fn fit(
+        u: ArrayView1<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        options: PeriodicSpline1DOptions,
+    ) -> Result<Self, BasisError> {
+        validate_periodic_spline_1d_options(options)?;
+        if y.nrows() != u.len() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "periodic spline parameter length {} does not match output row count {}",
+                u.len(),
+                y.nrows()
+            )));
+        }
+        if u.len() < 3 {
+            return Err(BasisError::InvalidInput(
+                "periodic spline requires at least three samples".to_string(),
+            ));
+        }
+        if y.ncols() == 0 {
+            return Err(BasisError::InvalidInput(
+                "periodic spline requires at least one output dimension".to_string(),
+            ));
+        }
+        if u.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
+            return Err(BasisError::InvalidInput(
+                "periodic spline inputs must be finite".to_string(),
+            ));
+        }
+
+        let (sites, values) = coalesce_periodic_spline_samples(u, y, options)?;
+        let n = sites.len();
+        if n < 3 {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic spline requires at least three distinct sites after wrapping; found {n}"
+            )));
+        }
+        let h = periodic_spline_spacings(sites.view(), options);
+        if h.iter().any(|v| *v <= 0.0 || !v.is_finite()) {
+            return Err(BasisError::InvalidInput(
+                "periodic spline wrapped sites must be strictly increasing over one period"
+                    .to_string(),
+            ));
+        }
+        let second_derivatives = solve_periodic_cubic_second_derivatives(values.view(), &h)?;
+        Ok(Self {
+            options,
+            sites,
+            values,
+            second_derivatives,
+        })
+    }
+
+    pub fn period(&self) -> f64 {
+        self.options.period
+    }
+
+    pub fn origin(&self) -> f64 {
+        self.options.origin
+    }
+
+    pub fn ambient_dim(&self) -> usize {
+        self.values.ncols()
+    }
+
+    pub fn num_sites(&self) -> usize {
+        self.sites.len()
+    }
+
+    pub fn sites(&self) -> ArrayView1<'_, f64> {
+        self.sites.view()
+    }
+
+    pub fn values(&self) -> ArrayView2<'_, f64> {
+        self.values.view()
+    }
+
+    pub fn evaluate(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+        self.evaluate_derivative_order(u, 0)
+    }
+
+    pub fn evaluate_derivative(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+        self.evaluate_derivative_order(u, 1)
+    }
+
+    pub fn evaluate_second_derivative(
+        &self,
+        u: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, BasisError> {
+        self.evaluate_derivative_order(u, 2)
+    }
+
+    fn evaluate_derivative_order(
+        &self,
+        u: ArrayView1<'_, f64>,
+        derivative_order: usize,
+    ) -> Result<Array2<f64>, BasisError> {
+        if derivative_order > 2 {
+            return Err(BasisError::InvalidInput(format!(
+                "unsupported periodic spline derivative order {derivative_order}; only 0, 1, and 2 are supported"
+            )));
+        }
+        if u.iter().any(|v| !v.is_finite()) {
+            return Err(BasisError::InvalidInput(
+                "periodic spline evaluation points must be finite".to_string(),
+            ));
+        }
+
+        let n = self.sites.len();
+        let d = self.ambient_dim();
+        let mut out = Array2::<f64>::zeros((u.len(), d));
+        for (row, &raw) in u.iter().enumerate() {
+            let x_wrapped = wrap_periodic_spline_coordinate(raw, self.options);
+            let i = periodic_spline_interval_index(self.sites.view(), x_wrapped);
+            let j = if i + 1 == n { 0 } else { i + 1 };
+            let x_i = self.sites[i];
+            let h = if i + 1 == n {
+                self.sites[0] + self.options.period - x_i
+            } else {
+                self.sites[i + 1] - x_i
+            };
+            let x_eval = if i + 1 == n && x_wrapped < x_i {
+                x_wrapped + self.options.period
+            } else {
+                x_wrapped
+            };
+            let a = (x_i + h - x_eval) / h;
+            let b = (x_eval - x_i) / h;
+            for col in 0..d {
+                let y_i = self.values[[i, col]];
+                let y_j = self.values[[j, col]];
+                let m_i = self.second_derivatives[[i, col]];
+                let m_j = self.second_derivatives[[j, col]];
+                out[[row, col]] = match derivative_order {
+                    0 => {
+                        a * y_i
+                            + b * y_j
+                            + ((a * a * a - a) * m_i + (b * b * b - b) * m_j) * h * h / 6.0
+                    }
+                    1 => {
+                        (y_j - y_i) / h
+                            + ((-3.0 * a * a + 1.0) * m_i + (3.0 * b * b - 1.0) * m_j) * h / 6.0
+                    }
+                    2 => a * m_i + b * m_j,
+                    _ => unreachable!(),
+                };
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub fn fit_periodic_spline_1d(
+    u: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    options: PeriodicSpline1DOptions,
+) -> Result<PeriodicSpline1D, BasisError> {
+    PeriodicSpline1D::fit(u, y, options)
+}
+
+fn validate_periodic_spline_1d_options(options: PeriodicSpline1DOptions) -> Result<(), BasisError> {
+    if !options.period.is_finite() || options.period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic spline period must be finite and positive; got {}",
+            options.period
+        )));
+    }
+    if !options.origin.is_finite() {
+        return Err(BasisError::InvalidInput(
+            "periodic spline origin must be finite".to_string(),
+        ));
+    }
+    if !options.duplicate_tolerance.is_finite() || options.duplicate_tolerance < 0.0 {
+        return Err(BasisError::InvalidInput(
+            "periodic spline duplicate_tolerance must be finite and non-negative".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn wrap_periodic_spline_coordinate(x: f64, options: PeriodicSpline1DOptions) -> f64 {
+    options.origin + (x - options.origin).rem_euclid(options.period)
+}
+
+fn coalesce_periodic_spline_samples(
+    u: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    options: PeriodicSpline1DOptions,
+) -> Result<(Array1<f64>, Array2<f64>), BasisError> {
+    let mut rows = u
+        .iter()
+        .enumerate()
+        .map(|(i, &ui)| (wrap_periodic_spline_coordinate(ui, options), y.row(i).to_vec()))
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let tol = options
+        .duplicate_tolerance
+        .max(64.0 * f64::EPSILON * options.period.abs());
+    let d = y.ncols();
+    let mut sites = Vec::<f64>::new();
+    let mut values = Vec::<Vec<f64>>::new();
+    let mut counts = Vec::<usize>::new();
+
+    for (site, value) in rows {
+        if let Some(last_site) = sites.last_mut()
+            && (site - *last_site).abs() <= tol
+        {
+            let count = *counts.last().expect("group count exists") as f64;
+            let target = values.last_mut().expect("group value exists");
+            for col in 0..d {
+                target[col] = (target[col] * count + value[col]) / (count + 1.0);
+            }
+            *last_site = (*last_site * count + site) / (count + 1.0);
+            *counts.last_mut().expect("group count exists") += 1;
+            continue;
+        }
+        sites.push(site);
+        values.push(value);
+        counts.push(1);
+    }
+
+    if sites.len() >= 2 {
+        let first = sites[0];
+        let last_idx = sites.len() - 1;
+        let last_equivalent = sites[last_idx] - options.period;
+        if (first - last_equivalent).abs() <= tol {
+            let first_count = counts[0] as f64;
+            let last_count = counts[last_idx] as f64;
+            let total = first_count + last_count;
+            for col in 0..d {
+                values[0][col] =
+                    (values[0][col] * first_count + values[last_idx][col] * last_count) / total;
+            }
+            counts[0] += counts[last_idx];
+            sites.remove(last_idx);
+            values.remove(last_idx);
+            counts.remove(last_idx);
+        }
+    }
+
+    let n = sites.len();
+    let flat = values.into_iter().flatten().collect::<Vec<_>>();
+    let values = Array2::from_shape_vec((n, d), flat).map_err(|e| {
+        BasisError::InvalidInput(format!("failed to construct periodic spline value matrix: {e}"))
+    })?;
+    Ok((Array1::from_vec(sites), values))
+}
+
+fn periodic_spline_spacings(
+    sites: ArrayView1<'_, f64>,
+    options: PeriodicSpline1DOptions,
+) -> Vec<f64> {
+    let n = sites.len();
+    (0..n)
+        .map(|i| {
+            let next = if i + 1 == n {
+                sites[0] + options.period
+            } else {
+                sites[i + 1]
+            };
+            next - sites[i]
+        })
+        .collect()
+}
+
+fn periodic_spline_interval_index(sites: ArrayView1<'_, f64>, x: f64) -> usize {
+    let n = sites.len();
+    match sites
+        .as_slice()
+        .expect("periodic spline sites are contiguous")
+        .binary_search_by(|v| v.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Less))
+    {
+        Ok(idx) => idx.min(n - 1),
+        Err(0) => n - 1,
+        Err(idx) => idx - 1,
+    }
+}
+
+fn solve_periodic_cubic_second_derivatives(
+    values: ArrayView2<'_, f64>,
+    h: &[f64],
+) -> Result<Array2<f64>, BasisError> {
+    let n = values.nrows();
+    let d = values.ncols();
+    if h.len() != n {
+        return Err(BasisError::DimensionMismatch(
+            "periodic spacing count must match value rows".to_string(),
+        ));
+    }
+    let mut a = Array2::<f64>::zeros((n, n));
+    let mut rhs = Array2::<f64>::zeros((n, d));
+    for i in 0..n {
+        let prev = if i == 0 { n - 1 } else { i - 1 };
+        let next = if i + 1 == n { 0 } else { i + 1 };
+        a[[i, prev]] = h[prev];
+        a[[i, i]] = 2.0 * (h[prev] + h[i]);
+        a[[i, next]] = h[i];
+        for col in 0..d {
+            let slope_next = (values[[next, col]] - values[[i, col]]) / h[i];
+            let slope_prev = (values[[i, col]] - values[[prev, col]]) / h[prev];
+            rhs[[i, col]] = 6.0 * (slope_next - slope_prev);
+        }
+    }
+    solve_dense_multi_rhs(a, rhs, "periodic cubic spline system is singular")
+}
+
+fn solve_dense_multi_rhs(
+    mut a: Array2<f64>,
+    mut b: Array2<f64>,
+    singular_message: &str,
+) -> Result<Array2<f64>, BasisError> {
+    let n = a.nrows();
+    if a.ncols() != n || b.nrows() != n {
+        return Err(BasisError::DimensionMismatch(
+            "dense linear solve shape mismatch".to_string(),
+        ));
+    }
+    let nrhs = b.ncols();
+    for k in 0..n {
+        let mut pivot = k;
+        let mut pivot_abs = a[[k, k]].abs();
+        for r in (k + 1)..n {
+            let candidate = a[[r, k]].abs();
+            if candidate > pivot_abs {
+                pivot = r;
+                pivot_abs = candidate;
+            }
+        }
+        if pivot_abs <= 1e-14 {
+            return Err(BasisError::InvalidInput(singular_message.to_string()));
+        }
+        if pivot != k {
+            for c in k..n {
+                a.swap((k, c), (pivot, c));
+            }
+            for c in 0..nrhs {
+                b.swap((k, c), (pivot, c));
+            }
+        }
+        for r in (k + 1)..n {
+            let factor = a[[r, k]] / a[[k, k]];
+            a[[r, k]] = 0.0;
+            for c in (k + 1)..n {
+                a[[r, c]] -= factor * a[[k, c]];
+            }
+            for c in 0..nrhs {
+                b[[r, c]] -= factor * b[[k, c]];
+            }
+        }
+    }
+
+    let mut x = Array2::<f64>::zeros((n, nrhs));
+    for rhs_col in 0..nrhs {
+        for i_rev in 0..n {
+            let i = n - 1 - i_rev;
+            let mut sum = b[[i, rhs_col]];
+            for c in (i + 1)..n {
+                sum -= a[[i, c]] * x[[c, rhs_col]];
+            }
+            x[[i, rhs_col]] = sum / a[[i, i]];
+        }
+    }
+    Ok(x)
+}
+
 /// Which knot strategy to use for 1D B-spline bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineKnotSpec {
