@@ -90,12 +90,12 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
 
 #[inline]
 fn route_gemm(m: usize, n: usize, k: usize) -> bool {
-    m > 0 && n > 0 && k > 0 && 2.0 * m as f64 * n as f64 * k as f64 >= 300_000_000.0
+    m > 0 && n > 0 && k > 0 && GpuRuntime::global().policy().route_gemm(m, n, k)
 }
 
 #[inline]
 fn route_gemv(rows: usize, cols: usize) -> bool {
-    rows > 0 && cols > 0 && 2.0 * rows as f64 * cols as f64 >= 80_000_000.0
+    rows > 0 && cols > 0 && GpuRuntime::global().policy().route_gemv(rows, cols)
 }
 
 #[inline]
@@ -103,8 +103,9 @@ fn route_xtwx(rows: usize, lhs_cols: usize, rhs_cols: usize) -> bool {
     rows > 0
         && lhs_cols > 0
         && rhs_cols > 0
-        && rows >= 8_192
-        && 2.0 * rows as f64 * lhs_cols as f64 * rhs_cols as f64 >= 300_000_000.0
+        && GpuRuntime::global()
+            .policy()
+            .route_xt_diag_y(rows, lhs_cols, rhs_cols)
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T> {
