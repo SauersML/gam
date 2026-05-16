@@ -17342,7 +17342,27 @@ mod tests {
             "Duchon ψ axis must route the trace through penalty_subspace_trace"
         );
 
-        // INVARIANT 2: Production trace agrees with FD ∂log|H|/∂ψ.
+        // INVARIANT 2: Production trace agrees with FD ∂log|H_proj|/∂ψ —
+        // i.e. the centered derivative of the **projected** Hessian
+        // log-determinant `log|U_Sᵀ H U_S|_+`, evaluated through the same
+        // assembly path the outer cost identity uses.
+        //
+        // Why the projected logdet, not the full one: under the
+        // rank-deficient LAML fix the REML/LAML cost reads
+        // `log|H_proj|`, not `log|H_full|`.  These two scalars differ by
+        // the `null(S)` directions' contribution to `log|X'WX|` — visible
+        // here as `hop_logdet ≠ log_det_h_proj` whenever
+        // `range(S_+)` is a strict subspace (for this 1-D Duchon test
+        // `S_λ` has rank 5 in a 7-dim transformed basis, so two
+        // directions of H sit outside `range(S)` and contribute their
+        // own ψ-dependence to `log|H_full|`).  FD'ing the full-space
+        // logdet picks up that extra contribution; FD'ing the projected
+        // logdet exposes exactly what the analytic trace formula
+        // `kernel.trace_projected_logdet(op_total)` computes.  Pinning
+        // against the wrong oracle made this invariant fire even on
+        // mathematically-correct production output, so the test pinned
+        // an impossible identity.  The corrected oracle is the only one
+        // the production code actually claims to satisfy.
         let h = 1e-5_f64;
         let psi_idx = rho_dim;
         let mut theta_p = theta_zero.clone();
@@ -17351,8 +17371,8 @@ mod tests {
         theta_m[psi_idx] -= h;
         cache.ensure_theta(&theta_p).expect("ensure +h");
         let dp = cache.design().clone();
-        let h_plus = evaluator
-            .debug_full_h(
+        let log_det_p = evaluator
+            .debug_logdet_h_proj(
                 &dp.design,
                 &dp.penalties,
                 &dp.nullspace_dims,
@@ -17361,11 +17381,11 @@ mod tests {
                 rho_dim,
                 "subspace-pin +h",
             )
-            .expect("debug_full_h +h");
+            .expect("debug_logdet_h_proj +h");
         cache.ensure_theta(&theta_m).expect("ensure -h");
         let dm = cache.design().clone();
-        let h_minus = evaluator
-            .debug_full_h(
+        let log_det_m = evaluator
+            .debug_logdet_h_proj(
                 &dm.design,
                 &dm.penalties,
                 &dm.nullspace_dims,
@@ -17374,20 +17394,16 @@ mod tests {
                 rho_dim,
                 "subspace-pin -h",
             )
-            .expect("debug_full_h -h");
-        use crate::faer_ndarray::FaerEigh;
-        let (eig_p, _) = h_plus.eigh(faer::Side::Lower).expect("eigh +h");
-        let (eig_m, _) = h_minus.eigh(faer::Side::Lower).expect("eigh -h");
-        let log_det_p: f64 = eig_p.iter().map(|&s| s.ln()).sum();
-        let log_det_m: f64 = eig_m.iter().map(|&s| s.ln()).sum();
-        let fd_d_logdet_h = (log_det_p - log_det_m) / (2.0 * h);
-        let rel_to_fd = (production_tr - fd_d_logdet_h).abs() / fd_d_logdet_h.abs().max(1e-30);
+            .expect("debug_logdet_h_proj -h");
+        let fd_d_logdet_h_proj = (log_det_p - log_det_m) / (2.0 * h);
+        let rel_to_fd =
+            (production_tr - fd_d_logdet_h_proj).abs() / fd_d_logdet_h_proj.abs().max(1e-30);
         assert!(
             rel_to_fd < 1e-2,
-            "production trace must match FD ∂log|H|/∂ψ: production_tr={:+.4e} \
-             fd_d_logdet_h={:+.4e} rel={:+.3e}",
+            "production trace must match FD ∂log|H_proj|/∂ψ: production_tr={:+.4e} \
+             fd_d_logdet_h_proj={:+.4e} rel={:+.3e}",
             production_tr,
-            fd_d_logdet_h,
+            fd_d_logdet_h_proj,
             rel_to_fd
         );
 
