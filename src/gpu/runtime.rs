@@ -38,10 +38,7 @@ pub enum GpuProbeError {
     /// `libcuda` was found but a required entry point is missing.
     MissingSymbol(&'static str),
     /// A driver call returned a non-zero error code.
-    DriverCall {
-        call: &'static str,
-        code: CuResult,
-    },
+    DriverCall { call: &'static str, code: CuResult },
     /// The driver reports zero usable devices.
     NoDevices,
 }
@@ -69,7 +66,7 @@ pub struct GpuRuntime {
 
 #[derive(Debug)]
 enum Selection {
-    CpuOnly(GpuProbeError),
+    CpuOnly(#[allow(dead_code)] GpuProbeError),
     Cuda {
         device: GpuDeviceInfo,
         // Owning handle to the dynamically loaded CUDA driver. Backends that
@@ -119,7 +116,13 @@ impl GpuRuntime {
     /// True when a CUDA device was successfully selected.
     #[inline]
     pub fn is_available(&self) -> bool {
-        matches!(self.selection, Selection::Cuda { .. })
+        match &self.selection {
+            Selection::Cuda { .. } => true,
+            Selection::CpuOnly(err) => {
+                let _ = err;
+                false
+            }
+        }
     }
 
     /// Selected device descriptor, or `None` for CPU-only hosts.
@@ -153,8 +156,8 @@ pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
 fn probe_cuda_devices() -> Result<(&'static Library, Vec<GpuDeviceInfo>), GpuProbeError> {
     let library = load_cuda_driver()?;
 
-    let cu_init: libloading::Symbol<'_, CuInit> = unsafe { library.get(b"cuInit\0") }
-        .map_err(|_| GpuProbeError::MissingSymbol("cuInit"))?;
+    let cu_init: libloading::Symbol<'_, CuInit> =
+        unsafe { library.get(b"cuInit\0") }.map_err(|_| GpuProbeError::MissingSymbol("cuInit"))?;
     let cu_device_get_count: libloading::Symbol<'_, CuDeviceGetCount> =
         unsafe { library.get(b"cuDeviceGetCount\0") }
             .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGetCount"))?;
