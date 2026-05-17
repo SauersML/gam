@@ -272,6 +272,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_weighted_ridge_batch",
             "gaussian_reml_fit",
             "gaussian_reml_fit_batched",
+            "gaussian_reml_fit_formula_table",
         ],
     )?;
     info.set_item(
@@ -559,10 +560,6 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", fit.lambda)?;
             out.set_item("rho", fit.rho)?;
             out.set_item("reml_score", fit.reml_score)?;
-            out.set_item("reml_grad_lambda", fit.reml_grad_lambda)?;
-            out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
-            out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
-            out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
             out.set_item("edf", fit.edf)?;
             out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
             out.set_item("fitted", fit.fitted.into_pyarray(py))?;
@@ -573,10 +570,6 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", f64::NAN)?;
             out.set_item("rho", f64::NAN)?;
             out.set_item("reml_score", f64::NAN)?;
-            out.set_item("reml_grad_lambda", f64::NAN)?;
-            out.set_item("reml_hess_lambda", f64::NAN)?;
-            out.set_item("reml_grad_rho", f64::NAN)?;
-            out.set_item("reml_hess_rho", f64::NAN)?;
             out.set_item("edf", 0.0)?;
             out.set_item(
                 "coefficients",
@@ -594,6 +587,30 @@ fn gaussian_reml_fit<'py>(
         Err(err) => return Err(py_value_error(err.to_string())),
     }
     Ok(out.unbind())
+}
+
+#[pyfunction(signature = (headers, rows, formula, y, config_json = None))]
+fn gaussian_reml_fit_formula_table<'py>(
+    py: Python<'py>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    formula: String,
+    y: PyReadonlyArray2<'py, f64>,
+    config_json: Option<String>,
+) -> PyResult<Py<PyDict>> {
+    let y_values = y.as_array().to_owned();
+    let result = py
+        .detach(move || {
+            gaussian_reml_fit_formula_table_impl(
+                headers,
+                rows,
+                formula,
+                y_values.view(),
+                config_json.as_deref(),
+            )
+        })
+        .map_err(py_value_error)?;
+    gaussian_reml_result_to_pydict(py, result)
 }
 
 #[pyfunction(signature = (x, y, row_offsets, penalty, weights = None, init_lambda = None))]
@@ -621,20 +638,26 @@ fn gaussian_reml_fit_batched<'py>(
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
     out.set_item("rho", result.rhos.into_pyarray(py))?;
     out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
-    out.set_item(
-        "reml_grad_lambda",
-        result.reml_grad_lambdas.into_pyarray(py),
-    )?;
-    out.set_item(
-        "reml_hess_lambda",
-        result.reml_hess_lambdas.into_pyarray(py),
-    )?;
-    out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
-    out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
     out.set_item("edf", result.edf.into_pyarray(py))?;
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;
     out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+fn gaussian_reml_result_to_pydict<'py>(
+    py: Python<'py>,
+    fit: gam::gaussian_reml::GaussianRemlMultiResult,
+) -> PyResult<Py<PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("status", "ok")?;
+    out.set_item("lambda", fit.lambda)?;
+    out.set_item("rho", fit.rho)?;
+    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("edf", fit.edf)?;
+    out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -643,14 +666,83 @@ struct BatchedGaussianRemlResult {
     lambdas: Array1<f64>,
     rhos: Array1<f64>,
     reml_scores: Array1<f64>,
-    reml_grad_lambdas: Array1<f64>,
-    reml_hess_lambdas: Array1<f64>,
-    reml_grad_rhos: Array1<f64>,
-    reml_hess_rhos: Array1<f64>,
     edf: Array1<f64>,
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
     sigma2: Array2<f64>,
+}
+
+fn gaussian_reml_fit_formula_table_impl(
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    formula: String,
+    y: ArrayView2<'_, f64>,
+    config_json: Option<&str>,
+) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let mut fit_config = parse_fit_config(config_json)?;
+    fit_config.family = Some("gaussian".to_string());
+    fit_config.link = Some("identity".to_string());
+    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    let standard = match materialized.request {
+        FitRequest::Standard(request) => request,
+        _ => {
+            return Err(
+                "closed-form Gaussian REML formula fitting requires a standard Gaussian formula"
+                    .to_string(),
+            );
+        }
+    };
+    if standard.family != LikelihoodFamily::GaussianIdentity {
+        return Err("closed-form Gaussian REML formula fitting requires Gaussian identity".to_string());
+    }
+    if standard.wiggle.is_some() {
+        return Err("closed-form Gaussian REML formula fitting does not support link wiggle".to_string());
+    }
+    if standard.offset.iter().any(|value| value.abs() > 0.0) {
+        return Err("closed-form Gaussian REML formula fitting does not support offsets".to_string());
+    }
+    let design = gam::smooth::build_term_collection_design(standard.data, &standard.spec)
+        .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
+    let x = design.design.to_dense();
+    if y.nrows() != x.nrows() {
+        return Err(format!(
+            "closed-form Gaussian REML response row mismatch: formula design has {} rows but Y has {}",
+            x.nrows(),
+            y.nrows()
+        ));
+    }
+    if design.penalties.len() != 1 {
+        return Err(format!(
+            "closed-form Gaussian REML formula fitting requires exactly one smoothing penalty; got {}",
+            design.penalties.len()
+        ));
+    }
+    let penalty = global_penalty_from_block(x.ncols(), &design.penalties[0])?;
+    gam::gaussian_reml::gaussian_reml_multi_closed_form(
+        x.view(),
+        y,
+        penalty.view(),
+        Some(standard.weights.view()),
+        None,
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn global_penalty_from_block(
+    p: usize,
+    penalty: &gam::smooth::BlockwisePenalty,
+) -> Result<Array2<f64>, String> {
+    if penalty.col_range.end > p || penalty.col_range.len() != penalty.local.nrows() {
+        return Err(format!(
+            "formula penalty range {:?} is incompatible with design width {p}",
+            penalty.col_range
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((p, p));
+    out.slice_mut(s![penalty.col_range.clone(), penalty.col_range.clone()])
+        .assign(&penalty.local);
+    Ok(out)
 }
 
 fn gaussian_reml_fit_batched_impl(
@@ -762,10 +854,6 @@ fn gaussian_reml_fit_batched_impl(
     let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut reml_grad_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut edf = Array1::<f64>::zeros(batch);
     let mut coefficients = Array3::<f64>::zeros((batch, p, d));
     let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
@@ -781,10 +869,6 @@ fn gaussian_reml_fit_batched_impl(
             lambdas[b] = fit.lambda;
             rhos[b] = fit.rho;
             reml_scores[b] = fit.reml_score;
-            reml_grad_lambdas[b] = fit.reml_grad_lambda;
-            reml_hess_lambdas[b] = fit.reml_hess_lambda;
-            reml_grad_rhos[b] = fit.reml_grad_rho;
-            reml_hess_rhos[b] = fit.reml_hess_rho;
             edf[b] = fit.edf;
             coefficients
                 .slice_mut(s![b, .., ..])
@@ -799,10 +883,6 @@ fn gaussian_reml_fit_batched_impl(
         lambdas,
         rhos,
         reml_scores,
-        reml_grad_lambdas,
-        reml_hess_lambdas,
-        reml_grad_rhos,
-        reml_hess_rhos,
         edf,
         coefficients,
         fitted,
@@ -907,6 +987,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
