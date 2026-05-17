@@ -5977,6 +5977,53 @@ pub struct GaussianFixedCache {
     pub xtwx_orig: Array2<f64>,
     /// `XᵀW(y − offset)` in the original basis. Length p.
     pub xtwy_orig: Array1<f64>,
+    /// `XᵀWX` precomputed for the sparse path, aligned with the symbolic
+    /// pattern of `SparseXtWxCache::new(x)` on the original sparse design.
+    /// `None` when the design has no sparse form (e.g. dense-only fits).
+    ///
+    /// The sparse REML path rebuilds `H = XᵀWX + Sλ + δI` per outer
+    /// evaluation. For Gaussian-Identity the weights never change, so the
+    /// `XᵀWX` contribution is invariant across the outer loop and can be
+    /// scattered from this cached values vector instead of re-doing the
+    /// O(nnz²/n) SpGEMM each call.
+    pub xtwx_sparse_orig: Option<Arc<SparseXtwxPrecomputed>>,
+}
+
+/// Precomputed numerical values of `XᵀWX` aligned with the symbolic pattern
+/// that `SparseXtWxCache::new(x)` produces on its first call. Two such caches
+/// built from the same sparse `x` produce byte-identical symbolic patterns
+/// (faer's `sparse_sparse_matmul_symbolic` is deterministic), so the cached
+/// values can be installed back into a fresh `SparseXtWxCache` for the same
+/// `x` without rerunning the SpGEMM.
+///
+/// We snapshot the symbolic pattern (`col_ptr` / `row_idx`) alongside the
+/// values so the consumer can verify pattern equivalence and fall through to
+/// the per-call recomputation if anything diverges (e.g. an `x` with a
+/// different symbolic shape sneaks in).
+#[derive(Debug, Clone)]
+pub struct SparseXtwxPrecomputed {
+    pub xtwx_symbolic_col_ptr: Vec<usize>,
+    pub xtwx_symbolic_row_idx: Vec<usize>,
+    pub xtwxvalues: Vec<f64>,
+}
+
+impl SparseXtwxPrecomputed {
+    /// Build the precomputed `XᵀWX` value layout for `x` at the given
+    /// `weights`. The output reuses the same construction path the inner
+    /// PIRLS workspace uses, so it lands in exactly the symbolic pattern
+    /// the consumer expects.
+    pub fn build(
+        x: &SparseColMat<usize, f64>,
+        weights: &Array1<f64>,
+    ) -> Result<Self, EstimationError> {
+        let mut cache = SparseXtWxCache::new(x)?;
+        cache.compute_numeric(x, weights)?;
+        Ok(Self {
+            xtwx_symbolic_col_ptr: cache.xtwx_symbolic.col_ptr().to_vec(),
+            xtwx_symbolic_row_idx: cache.xtwx_symbolic.row_idx().to_vec(),
+            xtwxvalues: cache.xtwxvalues,
+        })
+    }
 }
 
 pub struct PenaltyConfig<'a> {
