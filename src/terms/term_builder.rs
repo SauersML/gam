@@ -18,8 +18,8 @@ use crate::basis::{
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
-    ParsedTerm, SmoothKind, option_bool, option_f64, option_usize, option_usize_any,
-    option_usize_any_strict, option_usize_strict,
+    ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
+    option_usize_any, option_usize_any_strict, option_usize_strict,
 };
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
@@ -800,7 +800,7 @@ length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                 );
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
-            let length_scale = option_f64(options, "length_scale");
+            let length_scale = option_f64_strict(options, "length_scale")?;
             // Resolve `(nullspace_order, power)` against the joint constraints
             // (operator collocation + scale-free CPD). Explicit power keeps the
             // user's nullspace as-is (validator will reject inconsistent combos);
@@ -1405,11 +1405,15 @@ pub fn parse_countwith_basis_alias(
     primarykey: &str,
     default_count: usize,
 ) -> Result<usize, String> {
-    let primary = option_usize(options, primarykey);
-    let basis_dim = option_usize_any(
+    // Strict: reject unparseable values (e.g. `centers=many`, `centers=-1`,
+    // `centers=1.5`) instead of silently dropping them and falling through
+    // to the default. Without this the user gets the auto-inferred count
+    // silently and never realizes their explicit option was ignored.
+    let primary = option_usize_strict(options, primarykey)?;
+    let basis_dim = option_usize_any_strict(
         options,
         &["k", "basis_dim", "basis-dim", "basisdim", "knots"],
-    );
+    )?;
     if primary.is_some() && basis_dim.is_some() {
         return Err(format!(
             "specify either {}=<count> or k=<basis_dim> (not both)",
