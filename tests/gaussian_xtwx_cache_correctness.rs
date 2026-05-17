@@ -98,6 +98,7 @@ fn build_cache(
     GaussianFixedCache {
         xtwx_orig: xtwx,
         xtwy_orig: xtwy,
+        xtwx_sparse_orig: None,
     }
 }
 
