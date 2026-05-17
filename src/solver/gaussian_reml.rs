@@ -812,7 +812,7 @@ fn validate_gaussian_reml_forward_fit(
         ));
     }
     let weight = gaussian_reml_weights(n, weights)?;
-    let xtwx = dense_xt_diag_y(x, weight.view(), x);
+    let xtwx = dense_xt_diag_x(x, weight.view());
     if fit.cache.xtwx_fingerprint != matrix_fingerprint(xtwx.view()) {
         return Err(EstimationError::InvalidInput(
             "Gaussian REML backward forward-state X'WX mismatch".to_string(),
@@ -831,16 +831,14 @@ fn gaussian_reml_inverse_hessian_from_cache(
         )));
     }
     let p = cache.penalty_eigenvalues.len();
-    let mut inverse = Array2::<f64>::zeros((p, p));
+    let mut scaled_basis = cache.coefficient_basis.clone();
     for eig in 0..p {
         let scale = 1.0 / (1.0 + lambda * cache.penalty_eigenvalues[eig]);
         for row in 0..p {
-            let left = cache.coefficient_basis[[row, eig]] * scale;
-            for col in 0..p {
-                inverse[[row, col]] += left * cache.coefficient_basis[[col, eig]];
-            }
+            scaled_basis[[row, eig]] *= scale;
         }
     }
+    let inverse = dense_ab(scaled_basis.view(), cache.coefficient_basis.t());
     if inverse.iter().any(|value| !value.is_finite()) {
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
@@ -1097,7 +1095,7 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     validate_gaussian_reml_design(x, penalty, weights)?;
     let weight = gaussian_reml_weights(n, weights)?;
 
-    let xtwx = dense_xt_diag_y(x, weight.view(), x);
+    let xtwx = dense_xt_diag_x(x, weight.view());
     gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)
 }
 
@@ -1180,7 +1178,8 @@ fn gaussian_reml_eigen_cache_from_xtwx(
     let lower = chol.lower_triangular();
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     let l_inv = invert_lower_triangular(&lower)?;
-    let transformed_penalty = l_inv.dot(&penalty.to_owned()).dot(&l_inv.t());
+    let penalty_in_metric = dense_ab(l_inv.view(), penalty);
+    let transformed_penalty = dense_ab(penalty_in_metric.view(), l_inv.t());
     let (mut penalty_eigenvalues, eigenvectors) =
         transformed_penalty.eigh(Side::Lower).map_err(|_| {
             EstimationError::ModelIsIllConditioned {
@@ -1343,7 +1342,7 @@ fn prepare_gaussian_reml(
         }
         value
     }));
-    let xtwx = dense_xt_diag_y(x, weight.view(), x);
+    let xtwx = dense_xt_diag_x(x, weight.view());
 
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
