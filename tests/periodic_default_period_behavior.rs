@@ -40,34 +40,18 @@ fn periodic_without_explicit_period_behavior_consistent() {
     let data = make_data_on((0.0, TAU), TAU, 200, 11);
     let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
     // Try periodic=true with no period= argument.
-    let r = fit_from_formula("y ~ s(t, periodic=true)", &data, &cfg);
-    match r {
-        Ok(FitResult::Standard(fit)) => {
-            // Acceptable: succeeded with some default period.
-            // Verify the fit is periodic at SOME period — sample at t=0 and t=2π
-            // and t=4π. If the inferred period is 2π (matches truth), all
-            // three predictions should agree. If inferred period is something
-            // else, at least f(0) == f(0 + N·period_inferred) must hold for
-            // some N — we don't know what it inferred.
-            let probes = vec![0.0_f64, TAU, 2.0 * TAU, 3.14, 6.28];
-            let mut m = Array2::<f64>::zeros((probes.len(), 2));
-            for (i, &v) in probes.iter().enumerate() { m[[i, 0]] = v; m[[i, 1]] = 0.0; }
-            let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
-            let pred = design.design.apply(&fit.fit.beta).to_vec();
-            assert!(pred.iter().all(|v| v.is_finite()), "non-finite predictions");
-            eprintln!("[per-default] preds: {pred:?}");
-        }
-        Ok(_) => panic!("expected standard fit"),
-        Err(e) => {
-            // Acceptable: rejected with actionable message.
-            let lower = e.to_string().to_lowercase();
-            assert!(
-                lower.contains("period"),
-                "if rejecting periodic without period=, must say so; got: {e}",
-            );
-            eprintln!("[per-default] rejected with: {e}");
-        }
-    }
+    let err = fit_from_formula("y ~ s(t, periodic=true)", &data, &cfg)
+        .err()
+        .expect(
+            "periodic=true without explicit period= must be rejected (silent inference from data range \
+             is a user-facing footgun: uniform draws on [0, 2π] give period ≈ 2π − 2ε, not 2π).",
+        );
+    let lower = err.to_string().to_lowercase();
+    assert!(
+        lower.contains("period") && lower.contains("explicit"),
+        "rejection must name `period` and be actionable; got: {err}",
+    );
+    eprintln!("[per-default] correctly rejected: {err}");
 }
 
 #[test]
