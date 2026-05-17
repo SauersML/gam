@@ -52,6 +52,10 @@ pub struct GaussianRemlResult {
     pub coefficients: Array1<f64>,
     pub fitted: Array1<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: f64,
     pub cache: GaussianRemlEigenCache,
@@ -64,9 +68,24 @@ pub struct GaussianRemlMultiResult {
     pub coefficients: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlScoreDerivatives {
+    pub reml_score: f64,
+    pub grad_lambda: f64,
+    pub hess_lambda: f64,
+    pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub sigma2: Array1<f64>,
+    pub edf: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +193,10 @@ fn scalar_result_from_multi(
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
+        reml_grad_lambda: result.reml_grad_lambda,
+        reml_hess_lambda: result.reml_hess_lambda,
+        reml_grad_rho: result.reml_grad_rho,
+        reml_hess_rho: result.reml_hess_rho,
         edf: result.edf,
         sigma2: result.sigma2[0],
         cache: result.cache,
@@ -324,16 +347,55 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
+    let (reml_grad_lambda, reml_hess_lambda) =
+        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
         coefficients,
         fitted,
         reml_score: eval.cost,
+        reml_grad_lambda,
+        reml_hess_lambda,
+        reml_grad_rho: eval.grad,
+        reml_hess_rho: eval.hess,
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
     })
+}
+
+pub fn gaussian_reml_score_derivatives(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    lambda: f64,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML lambda must be finite and positive; got {lambda}"
+        )));
+    }
+    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
+    let eval = prepared.evaluate(lambda.ln());
+    let coefficients = prepared.coefficients(lambda);
+    let fitted = x.dot(&coefficients);
+    let sigma2 = prepared.sigma2(lambda);
+    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
+    Ok(GaussianRemlScoreDerivatives {
+        reml_score: eval.cost,
+        grad_lambda,
+        hess_lambda,
+        coefficients,
+        fitted,
+        sigma2,
+        edf: eval.edf,
+    })
+}
+
+fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
+    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
 }
 
 fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
