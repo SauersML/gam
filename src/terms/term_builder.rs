@@ -787,23 +787,18 @@ pub fn build_smooth_basis(
                     vars.join(", ")
                 ));
             }
-            let requested_nullspace_order = parse_duchon_order(options)?;
-            let pure = option_bool(options, "pure").unwrap_or(false);
-            if pure && options.contains_key("length_scale") {
+            if options.contains_key("pure") {
                 return Err(
-                    "duchon() cannot combine pure=true with length_scale=...; pure Duchon is scale-free"
+                    "duchon() is pure scale-free Duchon by default; remove pure=... or specify length_scale=... for the hybrid Duchon-Matern kernel"
                         .to_string(),
                 );
             }
-            let length_scale = if pure {
-                None
-            } else {
-                Some(option_f64(options, "length_scale").unwrap_or(0.0))
-            };
+            let requested_nullspace_order = parse_duchon_order(options)?;
+            let length_scale = option_f64(options, "length_scale");
             // Resolve `(nullspace_order, power)` against the joint constraints
-            // (operator collocation + pure-mode CPD). Explicit power keeps the
+            // (operator collocation + scale-free CPD). Explicit power keeps the
             // user's nullspace as-is (validator will reject inconsistent combos);
-            // the policy path may auto-escalate the nullspace order in pure mode
+            // the policy path may auto-escalate the nullspace order in scale-free mode
             // when CPD requires a richer polynomial absorption space.
             let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
                 DuchonPowerPolicy::Explicit(req_power) => {
@@ -858,9 +853,9 @@ pub fn build_smooth_basis(
                     );
                     if resolved.0 != requested_nullspace_order {
                         inference_notes.push(format!(
-                            "Note: pure Duchon CPD against polynomial nullspace requires order ≥ {:?} \
+                            "Note: scale-free Duchon CPD against polynomial nullspace requires order ≥ {:?} \
                              at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
-                             Use the default hybrid Duchon or specify length_scale=... to bypass this constraint.",
+                             Specify length_scale=... to use the hybrid Duchon-Matern kernel.",
                             resolved.0,
                             cols.len(),
                             requested_nullspace_order,
@@ -1375,8 +1370,7 @@ pub fn parse_ps_internal_knots(
     // unparseable values, which leaves the user thinking they configured
     // something when they did not.
     let knots_internal = option_usize_strict(options, "knots")?;
-    let basis_dim =
-        option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
+    let basis_dim = option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
     if knots_internal.is_some() && basis_dim.is_some() {
         return Err(
             "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
@@ -1769,7 +1763,7 @@ mod tests {
     }
 
     #[test]
-    fn one_dimensional_duchon_defaults_to_auto_hybrid_length_scale() {
+    fn one_dimensional_duchon_defaults_to_scale_free_length_scale() {
         let ds = continuous_dataset(
             &["y", "x"],
             (0..32)
@@ -1793,11 +1787,11 @@ mod tests {
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
             panic!("expected Duchon term");
         };
-        assert_eq!(spec.length_scale, Some(0.0));
+        assert_eq!(spec.length_scale, None);
     }
 
     #[test]
-    fn duchon_pure_true_keeps_scale_free_mode() {
+    fn one_dimensional_duchon_length_scale_opts_into_hybrid_mode() {
         let ds = continuous_dataset(
             &["y", "x"],
             (0..32)
@@ -1807,7 +1801,7 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed = parse_formula("y ~ duchon(x, pure=true)").expect("parse");
+        let parsed = parse_formula("y ~ duchon(x, length_scale=0.25)").expect("parse");
         let col_map = ds.column_map();
         let mut notes = Vec::new();
         let terms = build_termspec(
@@ -1817,11 +1811,11 @@ mod tests {
             &mut notes,
             &crate::resource::ResourcePolicy::default_library(),
         )
-        .expect("build pure duchon termspec");
+        .expect("build hybrid duchon termspec");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
             panic!("expected Duchon term");
         };
-        assert_eq!(spec.length_scale, None);
+        assert_eq!(spec.length_scale, Some(0.25));
     }
 
     #[test]
