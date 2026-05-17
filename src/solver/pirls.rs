@@ -370,6 +370,7 @@ impl SparsePenalizedSystemCache {
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
         ridge: f64,
+        precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
         if weights.len() != self.xtwx_cache.nrows {
             return Err(EstimationError::InvalidInput(format!(
@@ -378,7 +379,37 @@ impl SparsePenalizedSystemCache {
                 self.xtwx_cache.nrows
             )));
         }
-        self.xtwx_cache.compute_numeric(x, weights)?;
+        // Gaussian-Identity fast path: when the caller has pre-built the
+        // `XᵀWX` numerical values (weights are constant across the outer
+        // loop), install them into the inner cache and skip the SpGEMM.
+        // We verify symbolic-pattern equivalence first; on mismatch we
+        // fall back to the regular per-call recomputation rather than
+        // installing values keyed to a different sparsity layout.
+        let use_precomputed = match precomputed_xtwx {
+            Some(pre) => {
+                let col_ptr_ok =
+                    pre.xtwx_symbolic_col_ptr.as_slice() == self.xtwx_cache.xtwx_symbolic.col_ptr();
+                let row_idx_ok =
+                    pre.xtwx_symbolic_row_idx.as_slice() == self.xtwx_cache.xtwx_symbolic.row_idx();
+                let values_ok = pre.xtwxvalues.len() == self.xtwx_cache.xtwxvalues.len();
+                if col_ptr_ok && row_idx_ok && values_ok {
+                    self.xtwx_cache
+                        .xtwxvalues
+                        .copy_from_slice(&pre.xtwxvalues);
+                    true
+                } else {
+                    log::warn!(
+                        "[sparse-xtwx-cache] precomputed XᵀWX pattern mismatch; \
+                         falling back to per-call recompute"
+                    );
+                    false
+                }
+            }
+            None => false,
+        };
+        if !use_precomputed {
+            self.xtwx_cache.compute_numeric(x, weights)?;
+        }
         self.h_uppervalues.fill(0.0);
 
         let mut cursor = self.h_upper_col_ptr[..self.p].to_vec();
@@ -1136,12 +1167,13 @@ impl PirlsWorkspace {
         weights: &Array1<f64>,
         s_lambda: &Array2<f64>,
         ridge: f64,
+        precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
         self.ensure_sparse_penalty_cache(x, s_lambda)?;
         self.sparse_penalized_system_cache
             .as_mut()
             .unwrap()
-            .assemble_upper(x, weights, ridge)
+            .assemble_upper(x, weights, ridge, precomputed_xtwx)
     }
 }
 
@@ -1786,7 +1818,7 @@ impl<'a> GamWorkingModel<'a> {
             ));
         };
         self.workspace
-            .assemble_sparse_penalized_hessian(x_sparse, weights, s_transformed, ridge)
+            .assemble_sparse_penalized_hessian(x_sparse, weights, s_transformed, ridge, None)
     }
 
     /// LM-screen helper: evaluates a candidate β by reusing the previous
@@ -3292,8 +3324,9 @@ pub(crate) fn sparse_reml_penalized_hessian(
     weights: &Array1<f64>,
     s_lambda: &Array2<f64>,
     ridge: f64,
+    precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
 ) -> Result<SparseColMat<usize, f64>, EstimationError> {
-    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge)
+    workspace.assemble_sparse_penalized_hessian(x, weights, s_lambda, ridge, precomputed_xtwx)
 }
 
 /// Assemble a sparse SPD Hessian with adaptive diagonal ridge, returning the
@@ -6813,6 +6846,13 @@ fn solve_penalized_least_squares_implicit(
             };
             let weights_owned = weights.to_owned();
 
+            // Gaussian-Identity fast path: the inner sparse `XᵀWX` is invariant
+            // across the outer REML loop because the IRLS weights are constant
+            // (W = priorweights). The cached values land in the inner workspace
+            // and bypass the per-eval SpGEMM.
+            let precomputed_xtwx = gaussian_fixed_cache
+                .and_then(|c| c.xtwx_sparse_orig.as_ref().map(|arc| arc.as_ref()));
+
             // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I.
             //    The Cholesky factor is reused from the SPD check so we avoid
             //    factorizing the same matrix twice.
@@ -6828,6 +6868,7 @@ fn solve_penalized_least_squares_implicit(
                         &weights_owned,
                         s_transformed,
                         ridge,
+                        precomputed_xtwx,
                     )
                 })?;
 
@@ -10043,7 +10084,7 @@ mod tests {
         let ridge = 1e-8;
         let mut workspace = PirlsWorkspace::new(3, 3, 0, 0);
         let assembled =
-            super::sparse_reml_penalized_hessian(&mut workspace, &x, &weights, &s_lambda, ridge)
+            super::sparse_reml_penalized_hessian(&mut workspace, &x, &weights, &s_lambda, ridge, None)
                 .expect("sparse penalized assembly should succeed");
         let dense = DesignMatrix::from(x.clone()).to_dense();
         let mut expected = dense.t().dot(&Array2::from_diag(&weights)).dot(&dense);
