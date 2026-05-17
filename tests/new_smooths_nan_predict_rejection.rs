@@ -74,7 +74,11 @@ fn make_cylinder_dataset() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode")
 }
 
-fn predict_with_nan(formula: &str, data: &gam::data::EncodedDataset, nan_inputs: Vec<(f64, f64)>) -> Result<Vec<f64>, String> {
+fn predict_with_nan(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    nan_inputs: Vec<(f64, f64)>,
+) -> Result<Vec<f64>, String> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -95,8 +99,16 @@ fn predict_with_nan(formula: &str, data: &gam::data::EncodedDataset, nan_inputs:
     Ok(design.design.apply(&fit.fit.beta).to_vec())
 }
 
+fn assert_clear_nonfinite_error(label: &str, err: &str) {
+    let lower = err.to_lowercase();
+    assert!(
+        lower.contains("nan") || lower.contains("inf") || lower.contains("finite"),
+        "{label} rejected non-finite input without a clear message: {err}",
+    );
+}
+
 #[test]
-fn sphere_wahba_predict_nan_rejected_or_nonpropagated() {
+fn sphere_wahba_predict_nan_rejected() {
     init_parallelism();
     let data = make_sphere_dataset();
     let r = predict_with_nan(
@@ -104,26 +116,12 @@ fn sphere_wahba_predict_nan_rejected_or_nonpropagated() {
         &data,
         vec![(f64::NAN, 0.0), (45.0, f64::NAN), (0.0, 0.0)],
     );
-    match r {
-        Ok(pred) => {
-            // If accepted, must NOT silently NaN the OK row.
-            assert!(
-                pred[2].is_finite(),
-                "Wahba propagated NaN to OK row: {pred:?}",
-            );
-        }
-        Err(e) => {
-            let lower = e.to_lowercase();
-            assert!(
-                lower.contains("nan") || lower.contains("finite") || lower.contains("latitude") || lower.contains("longitude"),
-                "Wahba rejected NaN without a clear message: {e}",
-            );
-        }
-    }
+    let err = r.expect_err("Wahba sphere predict design must reject NaN inputs");
+    assert_clear_nonfinite_error("Wahba sphere", &err);
 }
 
 #[test]
-fn sphere_harmonic_predict_nan_rejected_or_nonpropagated() {
+fn sphere_harmonic_predict_nan_rejected() {
     init_parallelism();
     let data = make_sphere_dataset();
     let r = predict_with_nan(
@@ -131,22 +129,12 @@ fn sphere_harmonic_predict_nan_rejected_or_nonpropagated() {
         &data,
         vec![(f64::NAN, 0.0), (45.0, f64::NAN), (0.0, 0.0)],
     );
-    match r {
-        Ok(pred) => {
-            assert!(pred[2].is_finite(), "harmonic propagated NaN: {pred:?}");
-        }
-        Err(e) => {
-            let lower = e.to_lowercase();
-            assert!(
-                lower.contains("nan") || lower.contains("finite") || lower.contains("latitude") || lower.contains("longitude"),
-                "harmonic rejected NaN without clear message: {e}",
-            );
-        }
-    }
+    let err = r.expect_err("harmonic sphere predict design must reject NaN inputs");
+    assert_clear_nonfinite_error("harmonic sphere", &err);
 }
 
 #[test]
-fn periodic_1d_predict_nan_rejected_or_nonpropagated() {
+fn periodic_1d_predict_nan_rejected() {
     init_parallelism();
     let data = make_periodic_dataset();
     let cfg = FitConfig {
@@ -159,29 +147,20 @@ fn periodic_1d_predict_nan_rejected_or_nonpropagated() {
         &cfg,
     )
     .expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((3, 2));
     m[[0, 0]] = f64::NAN;
     m[[1, 0]] = f64::INFINITY;
     m[[2, 0]] = 1.5;
     let design = build_term_collection_design(m.view(), &fit.resolvedspec);
-    match design {
-        Ok(d) => {
-            let pred = d.design.apply(&fit.fit.beta);
-            assert!(pred[2].is_finite(), "periodic 1D propagated NaN: {pred:?}");
-        }
-        Err(e) => {
-            let lower = e.to_string().to_lowercase();
-            assert!(
-                lower.contains("nan") || lower.contains("inf") || lower.contains("finite"),
-                "periodic 1D rejected without clear message: {e}",
-            );
-        }
-    }
+    let err = design.expect_err("periodic 1D predict design must reject NaN/Inf inputs");
+    assert_clear_nonfinite_error("periodic 1D", &err.to_string());
 }
 
 #[test]
-fn cylinder_te_predict_nan_rejected_or_nonpropagated() {
+fn cylinder_te_predict_nan_rejected() {
     init_parallelism();
     let data = make_cylinder_dataset();
     let r = predict_with_nan(
@@ -189,16 +168,6 @@ fn cylinder_te_predict_nan_rejected_or_nonpropagated() {
         &data,
         vec![(f64::NAN, 0.0), (1.5, f64::NAN), (1.5, 0.0)],
     );
-    match r {
-        Ok(pred) => {
-            assert!(pred[2].is_finite(), "cylinder te propagated NaN: {pred:?}");
-        }
-        Err(e) => {
-            let lower = e.to_lowercase();
-            assert!(
-                lower.contains("nan") || lower.contains("finite") || lower.contains("inf"),
-                "cylinder rejected NaN without clear message: {e}",
-            );
-        }
-    }
+    let err = r.expect_err("cylinder tensor predict design must reject NaN inputs");
+    assert_clear_nonfinite_error("cylinder tensor", &err);
 }
