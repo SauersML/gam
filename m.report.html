@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>GAM Report</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+:root {
+  --bg: #f8fafc; --card: #fff; --border: #e2e8f0;
+  --accent: #6366f1; --accent-light: #eef2ff; --accent-dark: #4f46e5;
+  --text: #1e293b; --text2: #475569; --text3: #94a3b8;
+  --font: 'Inter',ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  --mono: 'SF Mono','JetBrains Mono','Fira Code',ui-monospace,monospace;
+  --shadow: 0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --radius: 10px;
+}
+*,*::before,*::after { margin:0;padding:0;box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body { font-family:var(--font);background:var(--bg);color:var(--text);line-height:1.6;-webkit-font-smoothing:antialiased; }
+
+.header {
+  background:linear-gradient(135deg,#1e293b 0%,#334155 100%);
+  color:#f8fafc; padding:28px 32px 20px;
+}
+.header h1 { font-size:24px;font-weight:700;letter-spacing:-.03em; }
+.header .subtitle { color:var(--text3);font-size:13px;margin-top:2px; }
+.nav {
+  display:flex;gap:2px;margin-top:16px;flex-wrap:wrap;
+}
+.nav a {
+  color:#cbd5e1;text-decoration:none;font-size:12px;font-weight:500;
+  padding:5px 12px;border-radius:6px;transition:all .15s;
+}
+.nav a:hover { background:rgba(255,255,255,.1);color:#f1f5f9; }
+
+.container { max-width:1200px;margin:0 auto;padding:20px 24px 48px; }
+
+.card {
+  background:var(--card);border:1px solid var(--border);
+  border-radius:var(--radius);padding:24px;margin-bottom:16px;
+  box-shadow:var(--shadow);
+}
+.card h2 {
+  font-size:15px;font-weight:600;color:var(--text);
+  margin-bottom:16px;padding-bottom:10px;
+  border-bottom:2px solid var(--accent-light);
+  display:flex;align-items:center;gap:8px;
+}
+
+.formula {
+  font-family:var(--mono);font-size:13px;
+  background:var(--accent-light);color:var(--accent-dark);
+  padding:8px 14px;border-radius:6px;display:block;
+  margin-bottom:4px;word-break:break-word;line-height:1.8;
+}
+
+.stat-grid {
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;
+}
+.stat-item {
+  display:flex;flex-direction:column;padding:10px 14px;
+  border-radius:8px;background:var(--bg);border:1px solid var(--border);
+}
+.stat-label { font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.05em; }
+.stat-value { font-size:15px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums;margin-top:2px; }
+
+.alert {
+  background:#fffbeb;border:1px solid #fde68a;border-radius:var(--radius);
+  padding:12px 16px;margin-bottom:16px;font-size:13px;color:#92400e;line-height:1.5;
+}
+
+.table-wrap { overflow-x:auto;border-radius:8px;border:1px solid var(--border); }
+table { border-collapse:collapse;width:100%;font-size:13px; }
+thead th {
+  background:var(--accent-light);color:var(--accent-dark);
+  font-weight:600;text-align:left;padding:9px 12px;
+  border-bottom:2px solid var(--border);white-space:nowrap;
+  position:sticky;top:0;
+}
+tbody td { padding:7px 12px;border-bottom:1px solid #f1f5f9; }
+tbody tr:last-child td { border-bottom:none; }
+tbody tr:hover { background:#fafbfc; }
+td.num { text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono);font-size:12px; }
+td.mono,.mono { font-family:var(--mono);font-size:12px; }
+td.status {
+  font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;
+  color:var(--accent);
+}
+
+.plot-grid { display:grid;grid-template-columns:repeat(2,1fr);gap:12px; }
+.plot {
+  width:100%;height:340px;border-radius:8px;
+  border:1px solid var(--border);background:white;
+}
+
+.toggle {
+  cursor:pointer;font-size:13px;font-weight:500;color:var(--accent);
+  padding:8px 0;list-style:none;user-select:none;
+}
+.toggle::-webkit-details-marker { display:none; }
+.toggle::before { content:'\25B6\FE0E  ';font-size:10px;transition:transform .2s; }
+details[open] .toggle::before { content:'\25BC\FE0E  '; }
+
+.muted { color:var(--text3);font-size:12px;margin-bottom:8px; }
+
+.footer {
+  text-align:center;padding:32px 0 8px;color:var(--text3);font-size:11px;
+  border-top:1px solid var(--border);margin-top:24px;
+}
+.footer strong { color:var(--text2);font-weight:600; }
+
+@media (max-width:768px) {
+  .plot-grid { grid-template-columns:1fr; }
+  .stat-grid { grid-template-columns:1fr 1fr; }
+  .container { padding:12px 12px 24px; }
+  .nav { display:none; }
+}
+@media print {
+  .header { background:#1e293b !important;-webkit-print-color-adjust:exact;print-color-adjust:exact; }
+  .card { break-inside:avoid;box-shadow:none; }
+  .plot { height:280px; }
+  .nav { display:none; }
+}
+</style></head>
+<body>
+<div class="header">
+  <h1>GAM Report</h1>
+  <p class="subtitle">/var/folders/17/cyjcfr616sl88q3g1zv_s__80000gn/T/tmp.b3CA2s1aKK/m.bin</p>
+  <nav class="nav"><a href="#sec-summary">Summary</a><a href="#sec-coef">Coefficients</a><a href="#sec-edf">EDF</a></nav>
+</div>
+<div class="container">
+<div class="alert">Outer iterations: 6 (converged: true)<br/>Log-likelihood: -0.8678, penalized objective: -145.1207<br/>No data provided — diagnostics are omitted. Pass training data as the second positional argument.</div>
+
+<section class="card" id="sec-summary">
+<h2>Model Summary</h2>
+<code class="formula">y ~ smooth(x)</code>
+<div class="stat-grid">
+<div class="stat-item"><span class="stat-label">Family</span><span class="stat-value">Gaussian Identity</span></div>
+<div class="stat-item"><span class="stat-label">Model Class</span><span class="stat-value">Standard</span></div>
+<div class="stat-item"><span class="stat-label">Deviance</span><span class="stat-value">1.7355</span></div>
+<div class="stat-item"><span class="stat-label">REML / LAML</span><span class="stat-value">-145.1207</span></div>
+<div class="stat-item"><span class="stat-label">EDF (total)</span><span class="stat-value">0.0000</span></div>
+<div class="stat-item"><span class="stat-label">Outer Iterations</span><span class="stat-value">6</span></div>
+</div>
+</section>
+
+<section class="card" id="sec-coef">
+<h2>Coefficients</h2>
+<details><summary class="toggle">24 coefficients (click to expand)</summary>
+<div class="table-wrap"><table>
+<thead><tr><th>#</th><th>Estimate</th><th>Std. Error</th><th>z</th></tr></thead>
+<tbody>
+<tr><td class="mono">0</td><td class="num">-1.873344e-2</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">1</td><td class="num">1.103612e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">2</td><td class="num">1.436804e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">3</td><td class="num">2.913833e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">4</td><td class="num">5.580683e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">5</td><td class="num">8.081094e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">6</td><td class="num">9.502495e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">7</td><td class="num">1.042104e0</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">8</td><td class="num">1.022391e0</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">9</td><td class="num">9.094003e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">10</td><td class="num">6.953831e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">11</td><td class="num">4.529571e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">12</td><td class="num">1.362686e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">13</td><td class="num">-1.752504e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">14</td><td class="num">-4.134969e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">15</td><td class="num">-8.812290e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">16</td><td class="num">-9.803578e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">17</td><td class="num">-9.658845e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">18</td><td class="num">-9.050385e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">19</td><td class="num">-7.798632e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">20</td><td class="num">-5.663851e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">21</td><td class="num">-3.170032e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">22</td><td class="num">-1.540095e-1</td><td class="num">—</td><td class="num">—</td></tr>
+<tr><td class="mono">23</td><td class="num">-9.387644e-2</td><td class="num">—</td><td class="num">—</td></tr>
+</tbody>
+</table></div>
+</details>
+</section>
+
+<section class="card" id="sec-edf">
+<h2>EDF by Penalty Block</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Block</th><th>Role</th><th>EDF</th></tr></thead>
+<tbody><tr><td class="mono">0</td><td>mean</td><td class="num">0.0000</td></tr></tbody>
+</table></div>
+</section>
+
+
+
+
+
+
+
+<div class="footer">
+  Generated by <strong>gam</strong>
+</div>
+</div>
+<script>
+
+</script>
+</body></html>
