@@ -637,11 +637,26 @@ fn gaussian_penalty_positive_logdet(
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
         .max(1.0);
     let pen_tol = pen_scale * EIGEN_REL_TOL;
-    Ok(pen_eigs
+    let mut positive_eigs: Vec<f64> = pen_eigs
         .iter()
-        .filter(|&&value| value > pen_tol)
-        .map(|value| value.ln())
-        .sum())
+        .copied()
+        .filter(|&value| value > pen_tol)
+        .collect();
+    if positive_eigs.len() != penalty_rank {
+        positive_eigs = pen_eigs
+            .iter()
+            .copied()
+            .filter(|&value| value > 0.0)
+            .collect();
+        positive_eigs.sort_by(|a, b| b.total_cmp(a));
+        if positive_eigs.len() < penalty_rank {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        positive_eigs.truncate(penalty_rank);
+    }
+    Ok(positive_eigs.iter().map(|value| value.ln()).sum())
 }
 
 fn validate_gaussian_reml_eigen_cache(
@@ -720,23 +735,8 @@ fn prepare_gaussian_reml(
     let xtwy = x.t().dot(&wy);
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
 
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
-
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
-        let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
-        if cache.xtwx_fingerprint != xtwx_fingerprint {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML eigen cache X'WX mismatch".to_string(),
-            ));
-        }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
             return Err(EstimationError::InvalidInput(
@@ -751,6 +751,12 @@ fn prepare_gaussian_reml(
                 )));
             }
         }
+        if n <= cache.nullity {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+                cache.nullity
+            )));
+        }
         let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
         let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
         return Ok(GaussianRemlPrepared {
@@ -763,7 +769,21 @@ fn prepare_gaussian_reml(
         });
     }
 
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
+    if n <= cache.nullity {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+            cache.nullity
+        )));
+    }
     let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
 
@@ -779,7 +799,7 @@ fn prepare_gaussian_reml(
 
 impl GaussianRemlPrepared {
     fn nu(&self) -> f64 {
-        (self.n_observations as f64 - self.cache.nullity as f64).max(1.0)
+        self.n_observations as f64 - self.cache.nullity as f64
     }
 
     fn evaluate(&self, rho: f64) -> ObjectiveEval {
