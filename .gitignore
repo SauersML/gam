@@ -53,6 +53,8 @@ scripts/codex_nightrun.sh
 *.png
 !bench/aniso_demo/*.png
 bench/aniso_demo/fit_*.log
+bench/aniso_demo/model_*.json
+bench/aniso_demo/pred_*.csv
 !docs/images/*.png
 src/rust_digest.txt
 
