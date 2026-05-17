@@ -944,7 +944,9 @@ impl CanonicalPenalty {
 /// Two penalties `S_i`, `S_j` with the same `col_range` are compared by their
 /// matrix cosine:
 ///
-///     cos(S_i, S_j) = tr(S_i S_j) / sqrt(tr(S_i^2) * tr(S_j^2))
+/// ```text
+/// cos(S_i, S_j) = tr(S_i S_j) / sqrt(tr(S_i^2) * tr(S_j^2))
+/// ```
 ///
 /// Because `local` is symmetric, `tr(A·B) = sum_{r,c} A[r,c] * B[r,c]` — i.e.,
 /// the Frobenius inner product. Pairs with different `col_range` cannot be
