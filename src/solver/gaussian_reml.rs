@@ -1646,33 +1646,15 @@ fn optimize_rho_no_alloc(
         n_outputs,
         RHO_LOWER,
     );
-    let mut best_rho = RHO_LOWER;
-    let mut best_cost = lower_eval.cost;
 
-    consider_rho_no_alloc(
-        cache,
-        ywy,
-        projected_rhs_squared,
-        n_observations,
-        n_outputs,
-        RHO_UPPER,
-        &mut best_rho,
-        &mut best_cost,
-    );
-    if let Some(rho0) = init_rho {
-        consider_rho_no_alloc(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            n_observations,
-            n_outputs,
-            rho0,
-            &mut best_rho,
-            &mut best_cost,
-        );
-    }
-
+    // Pass 1: scan grid for sign changes and refine each bracket to a
+    // stationary point. Grid costs are not eligible candidates — they would
+    // create a non-smooth `min`-over-tied-costs that breaks analytic-vs-FD
+    // agreement under small X perturbations.
     const GRID_INTERVALS: usize = 96;
+    let mut best_rho = f64::NAN;
+    let mut best_cost = f64::INFINITY;
+    let mut found_stationary = false;
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = lower_eval;
     for i in 1..=GRID_INTERVALS {
@@ -1685,10 +1667,6 @@ fn optimize_rho_no_alloc(
             n_outputs,
             rho,
         );
-        if eval.cost < best_cost {
-            best_rho = rho;
-            best_cost = eval.cost;
-        }
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
             let stationary = refine_stationary_rho_no_alloc(
                 cache,
@@ -1710,9 +1688,38 @@ fn optimize_rho_no_alloc(
                 &mut best_rho,
                 &mut best_cost,
             );
+            found_stationary = true;
         }
         prev_rho = rho;
         prev_eval = eval;
+    }
+
+    // Fallback: no interior stationary point — evaluate boundaries and init.
+    if !found_stationary {
+        best_rho = RHO_LOWER;
+        best_cost = lower_eval.cost;
+        consider_rho_no_alloc(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            n_observations,
+            n_outputs,
+            RHO_UPPER,
+            &mut best_rho,
+            &mut best_cost,
+        );
+        if let Some(rho0) = init_rho {
+            consider_rho_no_alloc(
+                cache,
+                ywy,
+                projected_rhs_squared,
+                n_observations,
+                n_outputs,
+                rho0,
+                &mut best_rho,
+                &mut best_cost,
+            );
+        }
     }
 
     if best_cost.is_finite() {
@@ -2193,6 +2200,8 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum ForwardScalar {
+        Lambda,
+        RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
     }
@@ -2248,6 +2257,8 @@ mod tests {
         )
         .expect("finite-difference forward fit");
         match target {
+            ForwardScalar::Lambda => fit.lambda,
+            ForwardScalar::RemlScore => fit.reml_score,
             ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
         }
