@@ -25,20 +25,31 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 fn try_predict(formula: &str, n: usize) -> Result<(f64, f64), String> {
     let data = make_dataset(n);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
-    let probes: Vec<(f64, f64)> = (0..50).flat_map(|i| {
-        let lat = -75.0 + 150.0 * (i as f64) / 49.0;
-        vec![(lat, 0.0), (lat, 90.0), (lat, -90.0)]
-    }).collect();
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
+    let probes: Vec<(f64, f64)> = (0..50)
+        .flat_map(|i| {
+            let lat = -75.0 + 150.0 * (i as f64) / 49.0;
+            vec![(lat, 0.0), (lat, 90.0), (lat, -90.0)]
+        })
+        .collect();
     let np = probes.len();
     let mut m = Array2::<f64>::zeros((np, 3));
     for (i, (lat, lon)) in probes.iter().enumerate() {
@@ -68,7 +79,9 @@ fn sphere_wahba_over_resourced_does_not_explode() {
             Ok((mn, mx)) => {
                 eprintln!("[overres-w] k={k} n={n}: range [{mn:.3}, {mx:.3}]");
                 if mn < -10.0 || mx > 10.0 {
-                    failures.push(format!("k={k} n={n} range out of bounds: [{mn:.3}, {mx:.3}]"));
+                    failures.push(format!(
+                        "k={k} n={n} range out of bounds: [{mn:.3}, {mx:.3}]"
+                    ));
                 }
             }
             Err(e) => {
@@ -81,7 +94,11 @@ fn sphere_wahba_over_resourced_does_not_explode() {
             }
         }
     }
-    assert!(failures.is_empty(), "wahba over-resourced failures:\n  - {}", failures.join("\n  - "));
+    assert!(
+        failures.is_empty(),
+        "wahba over-resourced failures:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
 
 #[test]
@@ -95,7 +112,9 @@ fn sphere_harmonic_over_resourced_does_not_explode() {
             Ok((mn, mx)) => {
                 eprintln!("[overres-h] L={l} n={n}: range [{mn:.3}, {mx:.3}]");
                 if mn < -10.0 || mx > 10.0 {
-                    failures.push(format!("L={l} n={n} range out of bounds: [{mn:.3}, {mx:.3}]"));
+                    failures.push(format!(
+                        "L={l} n={n} range out of bounds: [{mn:.3}, {mx:.3}]"
+                    ));
                 }
             }
             Err(e) => {
@@ -108,5 +127,9 @@ fn sphere_harmonic_over_resourced_does_not_explode() {
             }
         }
     }
-    assert!(failures.is_empty(), "harmonic over-resourced failures:\n  - {}", failures.join("\n  - "));
+    assert!(
+        failures.is_empty(),
+        "harmonic over-resourced failures:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
