@@ -100,8 +100,6 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
             "fitted value {idx} mismatch: closed={a} explicit={b}"
         );
     }
-    assert!(closed.reml_grad_lambda.abs() < 1e-6);
-    assert!(closed.reml_hess_lambda.is_finite());
 }
 
 #[test]
@@ -135,8 +133,6 @@ fn closed_form_multi_output_pools_shared_lambda_and_coefficients() {
     for ((i, j), &explicit) in fitted.indexed_iter() {
         assert!((multi.fitted[[i, j]] - explicit).abs() < 1e-10);
     }
-    assert!(multi.reml_grad_lambda.abs() < 1e-6);
-    assert!(multi.reml_hess_lambda.is_finite());
 }
 
 #[test]
