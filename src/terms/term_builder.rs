@@ -825,23 +825,79 @@ pub fn build_smooth_basis(
                     })
                     .unwrap_or(false)
             });
-            let method = match options
+            // Parse `method=`. The Wahba-family kernel choice (Sobolev vs
+            // pseudo-spline) is also accepted via `method=`: passing
+            // `wahba_sobolev` / `wahba_pseudo` is equivalent to
+            // `method=wahba, kernel=sobolev` / `method=wahba, kernel=pseudo`.
+            // Plain `wahba` defaults to the Sobolev kernel (more correct).
+            let (method, method_kernel) = match options
                 .get("method")
                 .map(|s| s.trim().to_ascii_lowercase())
                 .as_deref()
             {
-                None | Some("wahba") | Some("kernel") => crate::basis::SphereMethod::Wahba,
+                None | Some("wahba") | Some("kernel") => (
+                    crate::basis::SphereMethod::Wahba,
+                    Option::<crate::basis::SphereWahbaKernel>::None,
+                ),
+                Some("wahba_sobolev")
+                | Some("wahba-sobolev")
+                | Some("sobolev")
+                | Some("sobolev_wahba")
+                | Some("sobolev-wahba") => (
+                    crate::basis::SphereMethod::Wahba,
+                    Some(crate::basis::SphereWahbaKernel::Sobolev),
+                ),
+                Some("wahba_pseudo")
+                | Some("wahba-pseudo")
+                | Some("pseudo")
+                | Some("pseudo_wahba")
+                | Some("pseudo-wahba")
+                | Some("mgcv")
+                | Some("sos") => (
+                    crate::basis::SphereMethod::Wahba,
+                    Some(crate::basis::SphereWahbaKernel::Pseudo),
+                ),
                 Some("harmonic")
                 | Some("harmonics")
                 | Some("spherical_harmonics")
                 | Some("spherical-harmonics")
-                | Some("sh") => crate::basis::SphereMethod::Harmonic,
+                | Some("sh") => (crate::basis::SphereMethod::Harmonic, None),
                 Some(other) => {
                     return Err(format!(
-                        "unsupported sphere method '{other}'; use wahba or harmonic"
+                        "unsupported sphere method '{other}'; use one of: \
+                         wahba | wahba_sobolev (default Wahba) | wahba_pseudo (mgcv `bs=\"sos\"` compatible) | harmonic"
                     ));
                 }
             };
+            // Also accept an explicit `kernel=` option for users who set
+            // `method=wahba` and want to pick the underlying kernel
+            // separately. `kernel=` overrides any implicit choice from
+            // `method=wahba_<kind>`. Defaults to Sobolev.
+            let explicit_kernel = match options
+                .get("kernel")
+                .or_else(|| options.get("wahba_kernel"))
+                .or_else(|| options.get("wahba-kernel"))
+                .map(|s| s.trim().to_ascii_lowercase())
+                .as_deref()
+            {
+                None => None,
+                Some("sobolev") | Some("true") | Some("h") | Some("hm") => {
+                    Some(crate::basis::SphereWahbaKernel::Sobolev)
+                }
+                Some("pseudo")
+                | Some("pseudo_spline")
+                | Some("pseudo-spline")
+                | Some("mgcv")
+                | Some("sos") => Some(crate::basis::SphereWahbaKernel::Pseudo),
+                Some(other) => {
+                    return Err(format!(
+                        "unsupported sphere kernel '{other}'; use one of: sobolev | pseudo"
+                    ));
+                }
+            };
+            let wahba_kernel = explicit_kernel
+                .or(method_kernel)
+                .unwrap_or(crate::basis::SphereWahbaKernel::Sobolev);
             let max_degree = option_usize_any(
                 options,
                 &[
@@ -862,6 +918,7 @@ pub fn build_smooth_basis(
                     radians,
                     method,
                     max_degree,
+                    wahba_kernel,
                 },
             })
         }
