@@ -1420,7 +1420,7 @@ fn option_math_f64_any(
 fn parse_periodic_domain_1d(
     options: &BTreeMap<String, String>,
     data_min: f64,
-    data_max: f64,
+    _data_max: f64,
 ) -> Result<(f64, f64), String> {
     let start = option_math_f64_any(
         options,
@@ -1457,13 +1457,32 @@ fn parse_periodic_domain_1d(
                 .to_string(),
         ),
         (None, None) => {
-            let period = parse_periods(options, &[true])?[0].unwrap_or(data_max - data_min);
-            let origin = option_math_f64_any(
+            let explicit_period = parse_periods(options, &[true])?[0];
+            let explicit_origin = option_math_f64_any(
                 options,
                 &["origin", "period_origin", "period-origin", "domain_origin"],
-            )?
-            .unwrap_or(data_min);
-            Ok((origin, period))
+            )?;
+            match (explicit_period, explicit_origin) {
+                (Some(period), origin) => {
+                    Ok((origin.unwrap_or(data_min), period))
+                }
+                (None, _) => {
+                    // Silently inferring period from data range is a user-facing
+                    // footgun: if data on [0, 2π] is sampled uniformly the empirical
+                    // range is [ε, 2π−ε], so the inferred period is slightly less
+                    // than 2π and predictions at t=0 vs t=2π reach different points
+                    // on the inferred circle. Force the user to be explicit.
+                    Err(
+                        "periodic=true requires an explicit `period=<value>` (or \
+                         `period_start=<lo>, period_end=<hi>`). Silent inference \
+                         from data range would set period = data_max − data_min, \
+                         which is sample-dependent and rarely what users mean \
+                         (e.g. uniform draws on [0, 2π] give period ≈ 2π − 2ε, \
+                         not 2π, leading to off-by-ε wrap discontinuities)."
+                            .to_string(),
+                    )
+                }
+            }
         }
     }
 }
