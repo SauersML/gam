@@ -79,8 +79,11 @@ fn periodic_1d_very_fine_k_stable() {
 }
 
 #[test]
-fn sphere_rejects_nan_y_clearly() {
+fn sphere_rejects_nan_y_clearly_at_encode() {
     init_parallelism();
+    // NaN in the response column is caught by the encoder before any fit
+    // attempt. Verify the encoder error names the row index and the
+    // offending column so the user can locate the bad row.
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
@@ -97,22 +100,17 @@ fn sphere_rejects_nan_y_clearly() {
         };
         rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let r = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg);
-    match r {
-        Ok(_) => {
-            // Acceptable: rows with NaN may be silently dropped by some
-            // ingest paths. If the fit succeeded, predictions must be finite.
-            eprintln!("[nan-y] accepted NaN y (likely dropped)");
-        }
-        Err(e) => {
-            let lower = e.to_string().to_lowercase();
-            assert!(
-                lower.contains("nan") || lower.contains("finite") || lower.contains("y"),
-                "NaN y rejection must mention nan/finite/y: {e}",
-            );
-            eprintln!("[nan-y] rejected: {e}");
-        }
-    }
+    let r = encode_recordswith_inferred_schema(headers, rows);
+    let err = r.err().expect("encoder must reject NaN in y column");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("non-finite") || msg.contains("nan") || msg.contains("finite"),
+        "encoder NaN error must say finite/nan: {err:?}",
+    );
+    // Must name the column so the user can find the bad row.
+    assert!(
+        msg.contains("y"),
+        "encoder NaN error must name the offending column: {err:?}",
+    );
+    eprintln!("[nan-y-encode] rejected: {err:?}");
 }
