@@ -956,18 +956,16 @@ class Model:
         X_arr = _numeric_matrix(X, "X")
         payload: dict[str, Any] = {"interval": interval}
         try:
-            raw = rust_module().predict_array(
-                self._model_bytes,
-                X_arr,
-                json.dumps(payload),
+            return np.asarray(
+                rust_module().predict_array(
+                    self._model_bytes,
+                    X_arr,
+                    json.dumps(payload),
+                ),
+                dtype=float,
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        parsed = json.loads(raw)
-        if parsed.get("class") == "survival_prediction":
-            raise ValueError("predict_array does not support survival prediction payloads")
-        columns = _ordered_prediction_columns(parsed["columns"])
-        return np.column_stack([np.asarray(values, dtype=float) for values in columns.values()])
 
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score).
@@ -1184,19 +1182,12 @@ class Model:
 
         X_arr = _numeric_matrix(X, "X")
         try:
-            raw = rust_module().design_matrix_array(self._model_bytes, X_arr)
+            return np.asarray(
+                rust_module().design_matrix_array(self._model_bytes, X_arr),
+                dtype=float,
+            )
         except Exception as exc:
             raise map_exception(exc) from exc
-        parsed = json.loads(raw)
-        n_rows = int(parsed["n_rows"])
-        n_cols = int(parsed["n_cols"])
-        flat = np.asarray(parsed.get("x_flat", []), dtype=float)
-        if flat.size != n_rows * n_cols:
-            raise ValueError(
-                "design matrix FFI payload shape mismatch: "
-                f"got {flat.size} floats, expected {n_rows} * {n_cols}"
-            )
-        return flat.reshape(n_rows, n_cols)
 
     def save(self, path: str | Path) -> None:
         """Serialise the fitted model to ``path``.
