@@ -215,8 +215,13 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
         },
         column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
     };
-    let parsed =
-        gam::inference::formula_dsl::parse_formula("y ~ s(u, type=periodic, k=9)").unwrap();
+    // periodic smooths require explicit `period=` (cycle 27): silent
+    // inference from data range is sample-dependent and rarely matches
+    // user intent (e.g. uniform draws on [0, 1] give period < 1).
+    let parsed = gam::inference::formula_dsl::parse_formula(
+        "y ~ s(u, type=periodic, k=9, period=1)",
+    )
+    .unwrap();
     let cmap = ds.column_map();
     let mut notes = Vec::new();
     let terms = build_termspec(
