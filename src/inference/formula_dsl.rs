@@ -1575,7 +1575,9 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
         "sas" => Ok(LinkFunction::Sas),
         "beta-logistic" => Ok(LinkFunction::BetaLogistic),
         other => Err(format!(
-            "unsupported --link '{other}'; use identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...)"
+            "unsupported link type '{other}'; \
+             use one of identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
+             Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
         )),
     }
 }
