@@ -22,17 +22,26 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
 use gam::inference::model::{
-    FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
-    PredictModelClass, SavedAnchoredDeviationRuntime, SavedLatentZNormalization,
+    ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
+    SavedLatentZNormalization, SchemaColumn,
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
+use gam::terms::basis::{
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense,
+    DuchonBasisSpec, DuchonNullspaceOrder, SpatialIdentifiability, build_bspline_basis_1d,
+    build_duchon_basis, create_basis, create_cyclic_difference_penalty_matrix,
+    create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense,
+};
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -289,6 +298,22 @@ fn fit_table(
 }
 
 #[pyfunction]
+fn fit_array(
+    py: Python<'_>,
+    x: PyReadonlyArray2<'_, f64>,
+    y: PyReadonlyArray2<'_, f64>,
+    formula: String,
+    config_json: Option<String>,
+) -> PyResult<Py<PyBytes>> {
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let model_bytes = py
+        .detach(move || fit_array_impl(x_values, y_values, formula, config_json.as_deref()))
+        .map_err(py_value_error)?;
+    Ok(PyBytes::new(py, &model_bytes).unbind())
+}
+
+#[pyfunction]
 fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
     py.detach(move || load_model_impl(&model_bytes))
         .map_err(py_value_error)?;
@@ -320,6 +345,18 @@ fn predict_table(
 }
 
 #[pyfunction]
+fn predict_array(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    x: PyReadonlyArray2<'_, f64>,
+    options_json: Option<String>,
+) -> PyResult<String> {
+    let x_values = x.as_array().to_owned();
+    py.detach(move || predict_array_impl(&model_bytes, x_values, options_json.as_deref()))
+        .map_err(py_value_error)
+}
+
+#[pyfunction]
 fn sample_table(
     py: Python<'_>,
     model_bytes: Vec<u8>,
@@ -340,6 +377,116 @@ fn design_matrix_table(
 ) -> PyResult<String> {
     py.detach(move || design_matrix_table_impl(&model_bytes, headers, rows))
         .map_err(py_value_error)
+}
+
+#[pyfunction]
+fn design_matrix_array(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    x: PyReadonlyArray2<'_, f64>,
+) -> PyResult<String> {
+    let x_values = x.as_array().to_owned();
+    py.detach(move || design_matrix_array_impl(&model_bytes, x_values))
+        .map_err(py_value_error)
+}
+
+#[pyfunction(signature = (t, knots, degree = 3, periodic = false))]
+fn bspline_basis<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    knots: PyReadonlyArray1<'py, f64>,
+    degree: usize,
+    periodic: bool,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_values = t.as_array().to_owned();
+    let knot_values = knots.as_array().to_owned();
+    let basis = py
+        .detach(move || bspline_basis_impl(t_values.view(), knot_values.view(), degree, periodic))
+        .map_err(py_value_error)?;
+    Ok(basis.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (t, knots, degree = 3, order = 1, periodic = false))]
+fn bspline_basis_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    knots: PyReadonlyArray1<'py, f64>,
+    degree: usize,
+    order: usize,
+    periodic: bool,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_values = t.as_array().to_owned();
+    let knot_values = knots.as_array().to_owned();
+    let basis = py
+        .detach(move || {
+            bspline_basis_derivative_impl(
+                t_values.view(),
+                knot_values.view(),
+                degree,
+                order,
+                periodic,
+            )
+        })
+        .map_err(py_value_error)?;
+    Ok(basis.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (t, centers, m = 2, periodic = false))]
+fn duchon_basis_1d<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    centers: PyReadonlyArray1<'py, f64>,
+    m: usize,
+    periodic: bool,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_values = t.as_array().to_owned();
+    let center_values = centers.as_array().to_owned();
+    let basis = py
+        .detach(move || duchon_basis_1d_impl(t_values.view(), center_values.view(), m, periodic))
+        .map_err(py_value_error)?;
+    Ok(basis.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (t, centers, m = 2, order = 1, periodic = false))]
+fn duchon_basis_1d_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    centers: PyReadonlyArray1<'py, f64>,
+    m: usize,
+    order: usize,
+    periodic: bool,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_values = t.as_array().to_owned();
+    let center_values = centers.as_array().to_owned();
+    let basis = py
+        .detach(move || {
+            duchon_basis_1d_derivative_impl(
+                t_values.view(),
+                center_values.view(),
+                m,
+                order,
+                periodic,
+            )
+        })
+        .map_err(py_value_error)?;
+    Ok(basis.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (knots, degree = 3, order = 2))]
+fn smoothness_penalty<'py>(
+    py: Python<'py>,
+    knots: PyReadonlyArray1<'py, f64>,
+    degree: usize,
+    order: usize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let knot_values = knots.as_array().to_owned();
+    let (penalty, null_basis) = py
+        .detach(move || smoothness_penalty_impl(knot_values.view(), degree, order))
+        .map_err(py_value_error)?;
+    Ok((
+        penalty.into_pyarray(py).unbind(),
+        null_basis.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction]
