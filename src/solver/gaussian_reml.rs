@@ -1240,12 +1240,17 @@ fn gaussian_reml_eigen_cache_from_xtwx(
 }
 
 fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    let mut gpu_xtwx = xtwx.clone();
-    if crate::gpu::try_cholesky_lower_inplace(&mut gpu_xtwx).is_some()
-        && gpu_xtwx.iter().all(|value| value.is_finite())
-        && gpu_xtwx.diag().iter().all(|value| *value > 0.0)
+    if crate::gpu::GpuRuntime::global()
+        .policy()
+        .route_chol_solve(xtwx.nrows())
     {
-        return Ok(gpu_xtwx);
+        let mut gpu_xtwx = xtwx.clone();
+        if crate::gpu::try_cholesky_lower_inplace(&mut gpu_xtwx).is_some()
+            && gpu_xtwx.iter().all(|value| value.is_finite())
+            && gpu_xtwx.diag().iter().all(|value| *value > 0.0)
+        {
+            return Ok(gpu_xtwx);
+        }
     }
     let chol = xtwx
         .cholesky(Side::Lower)
