@@ -18,9 +18,14 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut x: Vec<f64> = (0..n).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = x.iter().map(|t| (2.0 * std::f64::consts::PI * 2.0 * t).sin() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|t| (2.0 * std::f64::consts::PI * 2.0 * t).sin() + noise.sample(&mut rng))
+        .collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -28,12 +33,20 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
 
 fn try_fit(formula: &str) -> Result<(f64, f64), String> {
     let data = make_dataset(300);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
     let xg: Vec<f64> = (0..30).map(|i| 0.02 + 0.96 * (i as f64) / 29.0).collect();
     let mut m = Array2::<f64>::zeros((xg.len(), 2));
-    for (i, &v) in xg.iter().enumerate() { m[[i, 0]] = v; m[[i, 1]] = 0.0; }
+    for (i, &v) in xg.iter().enumerate() {
+        m[[i, 0]] = v;
+        m[[i, 1]] = 0.0;
+    }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .map_err(|e| format!("design: {e:?}"))?;
     let pred = design.design.apply(&fit.fit.beta).to_vec();
@@ -68,7 +81,10 @@ fn matern_very_small_length_scale_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "matern small ls failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "matern small ls failures: {failures:?}"
+    );
 }
 
 #[test]
@@ -94,14 +110,20 @@ fn matern_very_large_length_scale_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "matern large ls failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "matern large ls failures: {failures:?}"
+    );
 }
 
 #[test]
 fn matern_negative_or_zero_length_scale_rejected() {
     init_parallelism();
     let data = make_dataset(100);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     for bad_ls in [-1.0_f64, -0.5] {
         let formula = format!("y ~ matern(x, length_scale={bad_ls})");
         let r = fit_from_formula(&formula, &data, &cfg);
@@ -110,7 +132,9 @@ fn matern_negative_or_zero_length_scale_rejected() {
             Err(e) => {
                 let lower = e.to_string().to_lowercase();
                 assert!(
-                    lower.contains("length") || lower.contains("scale") || lower.contains("positive"),
+                    lower.contains("length")
+                        || lower.contains("scale")
+                        || lower.contains("positive"),
                     "ls={bad_ls} reject must mention length_scale; got: {e}",
                 );
                 eprintln!("[matern-neg-ls] ls={bad_ls}: clean error: {e}");

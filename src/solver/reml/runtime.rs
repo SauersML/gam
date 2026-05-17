@@ -3510,7 +3510,10 @@ impl<'a> RemlState<'a> {
             return Ok(None);
         };
         let lambdas = rho.mapv(f64::exp);
-        if lambdas.iter().any(|&lambda| !lambda.is_finite() || lambda <= 0.0) {
+        if lambdas
+            .iter()
+            .any(|&lambda| !lambda.is_finite() || lambda <= 0.0)
+        {
             return Ok(None);
         }
 
@@ -3563,11 +3566,11 @@ impl<'a> RemlState<'a> {
             0
         } else {
             use crate::faer_ndarray::FaerEigh;
-            let (evals, _) = s_lambda
-                .eigh(faer::Side::Lower)
-                .map_err(|e| EstimationError::InvalidInput(format!(
+            let (evals, _) = s_lambda.eigh(faer::Side::Lower).map_err(|e| {
+                EstimationError::InvalidInput(format!(
                     "Gaussian closed-form penalty eigendecomposition failed: {e}"
-                )))?;
+                ))
+            })?;
             let threshold =
                 super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
             evals.iter().filter(|&&value| value > threshold).count()
@@ -3588,13 +3591,9 @@ impl<'a> RemlState<'a> {
         .build();
 
         let prior = self.build_prior(rho, mode);
-        let result = super::assembly::evaluate_solution(
-            &solution,
-            rho.as_slice().unwrap(),
-            mode,
-            prior,
-        )
-        .map_err(EstimationError::InvalidInput)?;
+        let result =
+            super::assembly::evaluate_solution(&solution, rho.as_slice().unwrap(), mode, prior)
+                .map_err(EstimationError::InvalidInput)?;
         log::debug!(
             "[gaussian-closed-form-reml] evaluated k={} p={} mode={:?}",
             rho.len(),

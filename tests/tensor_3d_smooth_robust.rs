@@ -26,7 +26,10 @@ fn build_3d_dataset(n_a: usize, n_b: usize, n_c: usize) -> gam::data::EncodedDat
                 let w = -1.0 + 2.0 * (k as f64) / ((n_c - 1).max(1) as f64);
                 let y = u.cos() + 0.3 * v.sin() + 0.2 * w + 0.1 * u.cos() * v.sin();
                 rows.push(StringRecord::from(vec![
-                    u.to_string(), v.to_string(), w.to_string(), y.to_string(),
+                    u.to_string(),
+                    v.to_string(),
+                    w.to_string(),
+                    y.to_string(),
                 ]));
             }
         }
@@ -36,9 +39,14 @@ fn build_3d_dataset(n_a: usize, n_b: usize, n_c: usize) -> gam::data::EncodedDat
 
 fn try_fit(formula: &str, n_a: usize, n_b: usize, n_c: usize) -> Result<(f64, f64), String> {
     let data = build_3d_dataset(n_a, n_b, n_c);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
     let probes = [
         (0.0_f64, 0.0_f64, 0.0_f64),
         (1.5, 2.5, 0.5),
@@ -89,7 +97,9 @@ fn tensor_3d_one_periodic_margin_works() {
     init_parallelism();
     let r = try_fit(
         "y ~ te(u, v, w, bc=['periodic', 'natural', 'natural'], period=[2*pi, None, None], k=4)",
-        12, 8, 5,
+        12,
+        8,
+        5,
     );
     match r {
         Ok((mn, mx)) => {
@@ -112,7 +122,9 @@ fn tensor_3d_two_periodic_margins_works() {
     init_parallelism();
     let r = try_fit(
         "y ~ te(u, v, w, bc=['periodic', 'periodic', 'natural'], period=[2*pi, 2*pi, None], k=4)",
-        12, 12, 5,
+        12,
+        12,
+        5,
     );
     match r {
         Ok((mn, mx)) => {
@@ -135,8 +147,12 @@ fn tensor_3d_seam_continuity_one_periodic_margin() {
     init_parallelism();
     // Verify that with periodic on the FIRST margin only, f(0, v, w) = f(2π, v, w)
     let data = build_3d_dataset(12, 8, 5);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let formula = "y ~ te(u, v, w, bc=['periodic', 'natural', 'natural'], period=[2*pi, None, None], k=4)";
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let formula =
+        "y ~ te(u, v, w, bc=['periodic', 'natural', 'natural'], period=[2*pi, None, None], k=4)";
     let result = match fit_from_formula(formula, &data, &cfg) {
         Ok(r) => r,
         Err(_) => {
@@ -144,7 +160,9 @@ fn tensor_3d_seam_continuity_one_periodic_margin() {
             return;
         }
     };
-    let FitResult::Standard(fit) = result else { return; };
+    let FitResult::Standard(fit) = result else {
+        return;
+    };
     let probes = [
         (0.0_f64, 1.0_f64, 0.5_f64),
         (TAU, 1.0, 0.5),
@@ -154,13 +172,21 @@ fn tensor_3d_seam_continuity_one_periodic_margin() {
     let n = probes.len();
     let mut m = Array2::<f64>::zeros((n, 4));
     for (i, (u, v, w)) in probes.iter().enumerate() {
-        m[[i, 0]] = *u; m[[i, 1]] = *v; m[[i, 2]] = *w;
+        m[[i, 0]] = *u;
+        m[[i, 1]] = *v;
+        m[[i, 2]] = *w;
     }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let gap1 = (pred[0] - pred[1]).abs();
     let gap2 = (pred[2] - pred[3]).abs();
     eprintln!("[te3d-seam] gap1={gap1:.3e} gap2={gap2:.3e}");
-    assert!(gap1 < 1e-6, "te-3D u-seam discontinuous at (v=1, w=0.5): {gap1:.3e}");
-    assert!(gap2 < 1e-6, "te-3D u-seam discontinuous at (v=-0.5, w=-0.3): {gap2:.3e}");
+    assert!(
+        gap1 < 1e-6,
+        "te-3D u-seam discontinuous at (v=1, w=0.5): {gap1:.3e}"
+    );
+    assert!(
+        gap2 < 1e-6,
+        "te-3D u-seam discontinuous at (v=-0.5, w=-0.3): {gap2:.3e}"
+    );
 }

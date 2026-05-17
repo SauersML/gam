@@ -14,29 +14,52 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
-fn dataset_with_replicates_at(lat: f64, lon: f64, n_rep: usize, n_other: usize) -> gam::data::EncodedDataset {
+fn dataset_with_replicates_at(
+    lat: f64,
+    lon: f64,
+    n_rep: usize,
+    n_other: usize,
+) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n_rep + n_other);
     for _ in 0..n_rep {
         let y = 1.0 + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     for i in 0..n_other {
         let other_lat = -70.0 + 140.0 * (i as f64) / ((n_other - 1).max(1) as f64);
         let other_lon = -170.0 + 340.0 * (i as f64) / ((n_other - 1).max(1) as f64);
         let y = 0.5 + 0.3 * other_lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![other_lat.to_string(), other_lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            other_lat.to_string(),
+            other_lon.to_string(),
+            y.to_string(),
+        ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 fn try_fit(formula: &str, data: gam::data::EncodedDataset) -> Result<Vec<f64>, String> {
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
-    let probes = [(0.0_f64, 0.0_f64), (45.0, 90.0), (-30.0, -60.0), (60.0, 120.0)];
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
+    let probes = [
+        (0.0_f64, 0.0_f64),
+        (45.0, 90.0),
+        (-30.0, -60.0),
+        (60.0, 120.0),
+    ];
     let n = probes.len();
     let mut m = Array2::<f64>::zeros((n, 3));
     for (i, (lat, lon)) in probes.iter().enumerate() {

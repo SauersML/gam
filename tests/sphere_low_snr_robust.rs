@@ -25,17 +25,26 @@ fn make_low_snr_dataset(n: usize, sigma: f64) -> gam::data::EncodedDataset {
         let lon = u_lon.sample(&mut rng);
         // True signal: amplitude 0.5, noise σ varies.
         let y = 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 fn pred_stats(formula: &str, sigma: f64) -> (f64, f64, f64) {
     let data = make_low_snr_dataset(500, sigma);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg)
         .unwrap_or_else(|e| panic!("fit failed for `{formula}` σ={sigma}: {e}"));
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut pts = Vec::new();
     for i in 0..15 {
         let lat = -70.0 + 140.0 * (i as f64) / 14.0;
@@ -52,13 +61,18 @@ fn pred_stats(formula: &str, sigma: f64) -> (f64, f64, f64) {
     }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
-    assert!(pred.iter().all(|v| v.is_finite()), "non-finite at σ={sigma}");
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "non-finite at σ={sigma}"
+    );
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
     let var: f64 = pred.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / pred.len() as f64;
     let std = var.sqrt();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!("[low-snr] `{formula}` σ={sigma} mean={mean:.4} std={std:.4} range=[{mn:.3}, {mx:.3}]");
+    eprintln!(
+        "[low-snr] `{formula}` σ={sigma} mean={mean:.4} std={std:.4} range=[{mn:.3}, {mx:.3}]"
+    );
     (mean, std, mx - mn)
 }
 
@@ -70,13 +84,17 @@ fn sphere_wahba_extreme_noise_predicts_flat() {
     // With heavy noise, REML should drive λ up and predictions should be
     // nearly flat — std of pred across the sphere should be << signal
     // amplitude.
-    assert!(std < 0.3, "Wahba overfit at low SNR: pred std={std:.4} (signal amp 0.3)");
+    assert!(
+        std < 0.3,
+        "Wahba overfit at low SNR: pred std={std:.4} (signal amp 0.3)"
+    );
 }
 
 #[test]
 fn sphere_harmonic_extreme_noise_predicts_flat() {
     init_parallelism();
-    let (_mean, std, _range) = pred_stats("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 2.0);
+    let (_mean, std, _range) =
+        pred_stats("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 2.0);
     assert!(std < 0.3, "harmonic overfit at low SNR: pred std={std:.4}");
 }
 
@@ -85,6 +103,9 @@ fn sphere_modest_noise_recovers_signal_structure() {
     init_parallelism();
     // σ=0.1 vs signal 0.3 → SNR ≈ 3. Should capture some structure.
     let (_mean, std, _range) = pred_stats("y ~ sphere(lat, lon, k=20)", 0.1);
-    assert!(std > 0.05, "modest noise should still see signal: std={std:.4}");
+    assert!(
+        std > 0.05,
+        "modest noise should still see signal: std={std:.4}"
+    );
     assert!(std < 0.3, "but not over-amplify: std={std:.4}");
 }

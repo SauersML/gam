@@ -4,9 +4,7 @@
 //! application would be the bug to guard against.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -22,7 +20,11 @@ fn make_dataset() -> gam::data::EncodedDataset {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
@@ -31,7 +33,10 @@ fn make_dataset() -> gam::data::EncodedDataset {
 fn sphere_rejects_bc_option() {
     init_parallelism();
     let data = make_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     for opt in [
         "bc=clamped",
         "bc=anchored",
@@ -41,15 +46,19 @@ fn sphere_rejects_bc_option() {
         let f = format!("y ~ sphere(lat, lon, k=10, {opt})");
         let r = fit_from_formula(&f, &data, &cfg);
         match r {
-            Ok(_) => panic!(
-                "sphere accepted meaningless `{opt}` silently — must reject or document",
-            ),
+            Ok(_) => {
+                panic!("sphere accepted meaningless `{opt}` silently — must reject or document",)
+            }
             Err(e) => {
                 let lower = e.to_string().to_lowercase();
                 // Acceptable: option-validation error that names the bad option,
                 // OR a sphere-doesn't-have-endpoints diagnostic.
                 assert!(
-                    lower.contains("bc") || lower.contains("unknown") || lower.contains("sphere") || lower.contains("not supported") || lower.contains("unsupported"),
+                    lower.contains("bc")
+                        || lower.contains("unknown")
+                        || lower.contains("sphere")
+                        || lower.contains("not supported")
+                        || lower.contains("unsupported"),
                     "sphere bc rejection must name the option / sphere / unknown: {e}",
                 );
                 eprintln!("[sphere-bc] `{opt}`: clean rejection: {e}");
