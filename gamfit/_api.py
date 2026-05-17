@@ -699,6 +699,37 @@ def gaussian_weighted_ridge(
     return np.asarray(coefficients, dtype=float), np.asarray(fitted, dtype=float)
 
 
+def gaussian_weighted_ridge_batch(
+    X: Any,
+    Y: Any,
+    penalty: Any,
+    weights: Any,
+    *,
+    ridge_lambda: float,
+    row_counts: Any | None = None,
+) -> tuple[Any, Any]:
+    """Batched closed-form Gaussian row-weighted ridge.
+
+    ``X`` has shape ``(K, Nmax, M)``, ``Y`` has shape ``(K, Nmax, D)``, and
+    ``weights`` has shape ``(K, Nmax)``. ``row_counts`` optionally marks the
+    active row prefix for each problem in a padded ragged batch.
+    """
+    import numpy as np
+
+    try:
+        coefficients, fitted = rust_module().gaussian_weighted_ridge_batch(
+            _numeric_tensor3(X, "X"),
+            _numeric_tensor3(Y, "Y"),
+            _numeric_matrix(penalty, "penalty"),
+            _numeric_matrix(weights, "weights"),
+            float(ridge_lambda),
+            None if row_counts is None else _index_vector(row_counts, "row_counts"),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(coefficients, dtype=float), np.asarray(fitted, dtype=float)
+
+
 def gaussian_reml_fit(
     x: Any,
     y: Any,
@@ -739,14 +770,11 @@ def gaussian_reml_fit_batched(
     """Fit K closed-form Gaussian REML problems packed by row offsets."""
     import numpy as np
 
-    offsets = np.asarray(row_offsets, dtype=np.uintp)
-    if offsets.ndim != 1:
-        raise ValueError("row_offsets must be a 1D integer array")
     try:
         out = rust_module().gaussian_reml_fit_batched(
             _numeric_matrix(x, "x"),
             _numeric_matrix(y, "y"),
-            np.ascontiguousarray(offsets),
+            _index_vector(row_offsets, "row_offsets"),
             _numeric_matrix(penalty, "penalty"),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
@@ -762,6 +790,17 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
         if key in out:
             out[key] = np.asarray(out[key], dtype=float)
     return out
+
+
+def _index_vector(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=np.uintp)
+    if arr.ndim != 1:
+        raise ValueError(f"{label} must be a 1D integer array")
+    if arr.size == 0:
+        raise ValueError(f"{label} cannot be empty")
+    return np.ascontiguousarray(arr)
 
 
 def _numeric_vector(values: Any, label: str) -> Any:
@@ -784,5 +823,16 @@ def _numeric_matrix(values: Any, label: str) -> Any:
     if arr.ndim != 2:
         raise ValueError(f"{label} must be a 1D or 2D numeric array")
     if arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError(f"{label} cannot be empty")
+    return np.ascontiguousarray(arr)
+
+
+def _numeric_tensor3(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 3:
+        raise ValueError(f"{label} must be a 3D numeric array")
+    if 0 in arr.shape:
         raise ValueError(f"{label} cannot be empty")
     return np.ascontiguousarray(arr)
