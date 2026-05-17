@@ -2452,17 +2452,20 @@ fn duchon_basis_1d_derivative_impl(
     order: usize,
     periodic: bool,
 ) -> Result<Array2<f64>, String> {
-    if order == 0 {
-        return duchon_basis_1d_impl(t, centers, m, periodic);
+    validate_vector("t", t)?;
+    validate_vector("centers", centers)?;
+    if m == 0 {
+        return Err("Duchon m must be at least 1".to_string());
     }
-    if order == 1 || order == 2 {
-        return Err(
-            "Duchon basis derivatives of order 1 and 2 need an analytic implementation; finite-difference discretization is intentionally disabled".to_string(),
-        );
-    }
-    Err(format!(
-        "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
-    ))
+    create_duchon_basis_1d_derivative_dense(
+        t,
+        centers,
+        0,
+        duchon_nullspace_from_m(m),
+        periodic,
+        order,
+    )
+    .map_err(|err| format!("failed to evaluate Duchon basis derivative: {err}"))
 }
 
 fn smoothness_penalty_impl(
