@@ -13596,11 +13596,11 @@ fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
     e * ln2_hi + (e * ln2_lo + ln_m)
 }
 
-/// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
-/// `cos_gamma` produces one kernel value. Numerical agreement with the
-/// scalar path is exercised by the in-file unit test
-/// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance` —
-/// max abs/rel diff stays below 1e-12 across the full domain.
+/// Spectral Wahba kernel for m=4.
+///
+/// The Legendre series decays as `l^-7`, so 96 terms are comfortably below
+/// the spectral regression tolerance while avoiding the previously incorrect
+/// closed-form polynomial.
 #[inline]
 fn wahba_sphere_kernel_m4_spectral(cos_gamma: f64) -> f64 {
     const L_MAX: usize = 96;
@@ -13626,6 +13626,10 @@ fn wahba_sphere_kernel_m4_spectral_simd(cos_gamma: wide::f64x4) -> wide::f64x4 {
     wide::f64x4::from(cos_gamma.to_array().map(wahba_sphere_kernel_m4_spectral))
 }
 
+/// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
+/// `cos_gamma` produces one kernel value. Numerical agreement with the
+/// scalar path is exercised by the in-file unit test
+/// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance`.
 #[inline]
 fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
     use wide::f64x4;
