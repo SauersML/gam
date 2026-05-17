@@ -3392,6 +3392,16 @@ impl<'a> RemlState<'a> {
         let mut wz = self.y.to_owned();
         wz -= &self.offset;
         wz *= &weights_owned;
+        let centered_weighted_y_sq = self
+            .y
+            .iter()
+            .zip(self.offset.iter())
+            .zip(weights_owned.iter())
+            .map(|((&y, &offset), &w)| {
+                let centered = y - offset;
+                w * centered * centered
+            })
+            .sum::<f64>();
         let xtwx = match self.x.compute_xtwx(&weights_owned) {
             Ok(m) => m,
             Err(e) => {
@@ -3429,6 +3439,7 @@ impl<'a> RemlState<'a> {
         let cache = Arc::new(crate::pirls::GaussianFixedCache {
             xtwx_orig: xtwx,
             xtwy_orig: xtwy,
+            centered_weighted_y_sq,
             xtwx_sparse_orig,
         });
         log::info!(
