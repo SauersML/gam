@@ -5834,7 +5834,7 @@ mod tests {
         )
         .expect("position analytic backward");
         let grad_by = backward.grad_by.expect("by gradient");
-        let eps = 1.0e-5;
+        let eps = 1.0e-4;
 
         for row in [2_usize, 8, 15] {
             let fd = five_point_finite_difference(t[row], eps, |candidate| {
@@ -5938,7 +5938,7 @@ mod tests {
             RemlForwardScalar::Coefficient(4, 2),
             RemlForwardScalar::Fitted(11, 1),
         ];
-        let eps = 1.0e-5;
+        let eps = 1.0e-4;
         let gated_x = apply_by_gate(x.view(), by.view(), 1).expect("by-gated design");
         let base_fit = gaussian_reml_multi_closed_form_with_cache(
             gated_x.view(),

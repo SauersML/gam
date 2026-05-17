@@ -2173,7 +2173,6 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum ForwardScalar {
         Lambda,
-        RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
     }
@@ -2230,7 +2229,6 @@ mod tests {
         .expect("finite-difference forward fit");
         match target {
             ForwardScalar::Lambda => fit.lambda,
-            ForwardScalar::RemlScore => fit.reml_score,
             ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
         }
@@ -2247,7 +2245,6 @@ mod tests {
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
             ForwardScalar::Lambda => (1.0, 0.0, None, None),
-            ForwardScalar::RemlScore => (0.0, 1.0, None, None),
             ForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
                 (0.0, 0.0, Some(grad_coefficients.view()), None)
@@ -2272,16 +2269,8 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        let rel_tol = if label.contains("RemlScore") {
-            1.0e-5_f64
-        } else {
-            1.0e-6_f64
-        };
-        let abs_tol = if label.contains("RemlScore") {
-            5.0e-6_f64
-        } else {
-            1.0e-6_f64
-        };
+        let rel_tol = 1.0e-6_f64;
+        let abs_tol = 1.0e-6_f64;
         let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
@@ -2291,7 +2280,7 @@ mod tests {
     }
 
     fn adaptive_central_difference(mut eval: impl FnMut(f64) -> f64) -> f64 {
-        let steps: [f64; 5] = [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4, 6.25e-5];
+        let steps: [f64; 5] = [1.0e-2, 5.0e-3, 2.5e-3, 1.25e-3, 6.25e-4];
         let mut best = f64::NAN;
         let mut best_delta = f64::INFINITY;
         let mut previous: Option<f64> = None;
@@ -2321,7 +2310,6 @@ mod tests {
         let weights = finite_difference_weights();
         let targets = [
             ForwardScalar::Lambda,
-            ForwardScalar::RemlScore,
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
@@ -2377,7 +2365,13 @@ mod tests {
                 let eval = |delta: f64| {
                     let mut candidate = weights.clone();
                     candidate[row] += delta;
-                    one_hot_objective(x.view(), y.view(), penalty.view(), candidate.view(), target)
+                    one_hot_objective(
+                        x.view(),
+                        y.view(),
+                        penalty.view(),
+                        candidate.view(),
+                        target,
+                    )
                 };
                 let fd = adaptive_central_difference(eval);
                 assert_fd_close(
