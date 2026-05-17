@@ -88,14 +88,26 @@ pub fn missing_column_message(
         || format!("column '{name}'"),
         |role| format!("{role} column '{name}'"),
     );
+    // Detect TSV-instead-of-CSV: when there's exactly one header and it
+    // contains tab characters, the user's file is almost certainly
+    // tab-separated. Without this hint the message reads
+    //   "column 'x' not found in data. Did you mean one of [x\ty]?"
+    // which leaves the user staring at a literal tab inside what looks
+    // like a column name.
+    let tsv_hint = if all.len() == 1 && all[0].contains('\t') {
+        " — your file appears to be tab-separated; gam expects comma-separated CSV. \
+         Replace tabs with commas, or pre-convert with `tr '\\t' ',' < file.tsv > file.csv`."
+    } else {
+        ""
+    };
     if similar.is_empty() {
         format!(
-            "{label} not found in data. Available columns: [{}]",
+            "{label} not found in data. Available columns: [{}]{tsv_hint}",
             all.join(", ")
         )
     } else {
         format!(
-            "{label} not found in data. Did you mean one of [{}]? Full list: [{}]",
+            "{label} not found in data. Did you mean one of [{}]? Full list: [{}]{tsv_hint}",
             similar.join(", "),
             all.join(", ")
         )
