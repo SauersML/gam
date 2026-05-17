@@ -393,9 +393,7 @@ impl SparsePenalizedSystemCache {
                     pre.xtwx_symbolic_row_idx.as_slice() == self.xtwx_cache.xtwx_symbolic.row_idx();
                 let values_ok = pre.xtwxvalues.len() == self.xtwx_cache.xtwxvalues.len();
                 if col_ptr_ok && row_idx_ok && values_ok {
-                    self.xtwx_cache
-                        .xtwxvalues
-                        .copy_from_slice(&pre.xtwxvalues);
+                    self.xtwx_cache.xtwxvalues.copy_from_slice(&pre.xtwxvalues);
                     true
                 } else {
                     log::warn!(
@@ -1817,8 +1815,13 @@ impl<'a> GamWorkingModel<'a> {
                 "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
             ));
         };
-        self.workspace
-            .assemble_sparse_penalized_hessian(x_sparse, weights, s_transformed, ridge, None)
+        self.workspace.assemble_sparse_penalized_hessian(
+            x_sparse,
+            weights,
+            s_transformed,
+            ridge,
+            None,
+        )
     }
 
     /// LM-screen helper: evaluates a candidate β by reusing the previous
@@ -10083,9 +10086,15 @@ mod tests {
         let s_lambda = array![[4.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 8.0]];
         let ridge = 1e-8;
         let mut workspace = PirlsWorkspace::new(3, 3, 0, 0);
-        let assembled =
-            super::sparse_reml_penalized_hessian(&mut workspace, &x, &weights, &s_lambda, ridge, None)
-                .expect("sparse penalized assembly should succeed");
+        let assembled = super::sparse_reml_penalized_hessian(
+            &mut workspace,
+            &x,
+            &weights,
+            &s_lambda,
+            ridge,
+            None,
+        )
+        .expect("sparse penalized assembly should succeed");
         let dense = DesignMatrix::from(x.clone()).to_dense();
         let mut expected = dense.t().dot(&Array2::from_diag(&weights)).dot(&dense);
         expected += &s_lambda;

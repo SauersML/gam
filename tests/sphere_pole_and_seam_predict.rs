@@ -63,8 +63,8 @@ fn predict_all(formula: &str, points: &[(f64, f64)]) -> Vec<f64> {
         m[[i, 1]] = *lon;
         m[[i, 2]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -121,7 +121,9 @@ fn sphere_wahba_pole_predict_lon_invariant() {
             assert!(
                 diff < 1e-6,
                 "Wahba pole predict longitude-dependent: lat={} lons {} vs {} → {p:.6} vs {base:.6} diff={diff:.3e}",
-                lats[lat_idx], lons[0], lons[lon_idx],
+                lats[lat_idx],
+                lons[0],
+                lons[lon_idx],
             );
         }
     }
@@ -147,7 +149,9 @@ fn sphere_harmonic_pole_predict_lon_invariant() {
             assert!(
                 diff < 1e-6,
                 "harmonic pole predict longitude-dependent: lat={} lons {} vs {} → {p:.6} vs {base:.6} diff={diff:.3e}",
-                lats[lat_idx], lons[0], lons[lon_idx],
+                lats[lat_idx],
+                lons[0],
+                lons[lon_idx],
             );
         }
     }

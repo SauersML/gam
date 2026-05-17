@@ -32,7 +32,8 @@ fn make_dataset(n_lat: usize, n_lon: usize, sigma: f64, seed: u64) -> gam::data:
             let lon = -170.0 + 340.0 * (j as f64) / (n_lon as f64);
             let lat_r = lat.to_radians();
             let lon_r = lon.to_radians();
-            let y = 0.5 + 0.7 * lat_r.sin()
+            let y = 0.5
+                + 0.7 * lat_r.sin()
                 + 0.4 * lat_r.cos() * (2.0 * lon_r).cos()
                 + noise.sample(&mut rng);
             rows.push(StringRecord::from(vec![
@@ -71,8 +72,8 @@ fn fit_and_grid_predict(formula: &str) -> (Vec<f64>, f64, f64) {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("predict design ok");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("predict design ok");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let pred_min = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let pred_max = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -82,9 +83,8 @@ fn fit_and_grid_predict(formula: &str) -> (Vec<f64>, f64, f64) {
 #[test]
 fn sphere_harmonic_l10_stable_finite_bounded() {
     init_parallelism();
-    let (pred, mn, mx) = fit_and_grid_predict(
-        "y ~ sphere(lat, lon, method=harmonic, max_degree=10)",
-    );
+    let (pred, mn, mx) =
+        fit_and_grid_predict("y ~ sphere(lat, lon, method=harmonic, max_degree=10)");
     assert!(
         pred.iter().all(|v| v.is_finite()),
         "harmonic L=10 produced non-finite predictions",
@@ -100,9 +100,8 @@ fn sphere_harmonic_l10_stable_finite_bounded() {
 #[test]
 fn sphere_harmonic_l12_stable_finite_bounded() {
     init_parallelism();
-    let (pred, mn, mx) = fit_and_grid_predict(
-        "y ~ sphere(lat, lon, method=harmonic, max_degree=12)",
-    );
+    let (pred, mn, mx) =
+        fit_and_grid_predict("y ~ sphere(lat, lon, method=harmonic, max_degree=12)");
     assert!(
         pred.iter().all(|v| v.is_finite()),
         "harmonic L=12 produced non-finite predictions",

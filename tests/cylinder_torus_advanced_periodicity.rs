@@ -45,10 +45,7 @@ fn torus_dataset(n_a: usize, n_b: usize) -> gam::data::EncodedDataset {
         let u = TAU * (i as f64) / (n_a as f64);
         for j in 0..n_b {
             let v = TAU * (j as f64) / (n_b as f64);
-            let y = 1.0
-                + 0.5 * u.cos()
-                + 0.3 * v.sin()
-                + 0.2 * (u + v).cos();
+            let y = 1.0 + 0.5 * u.cos() + 0.3 * v.sin() + 0.2 * (u + v).cos();
             records.push(StringRecord::from(vec![
                 u.to_string(),
                 v.to_string(),
@@ -59,11 +56,7 @@ fn torus_dataset(n_a: usize, n_b: usize) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode torus dataset")
 }
 
-fn predict(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    pts: &[(f64, f64)],
-) -> Vec<f64> {
+fn predict(formula: &str, data: &gam::data::EncodedDataset, pts: &[(f64, f64)]) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -131,12 +124,7 @@ fn cylinder_seam_derivative_continuous() {
     // Sample f at (2π−ε, h) and (ε, h) — these are infinitesimally close
     // on the cylinder. The pointwise gap must vanish as ε → 0.
     let h = 0.25_f64;
-    let probes: Vec<(f64, f64)> = vec![
-        (TAU - 1e-3, h),
-        (1e-3, h),
-        (TAU - 1e-5, h),
-        (1e-5, h),
-    ];
+    let probes: Vec<(f64, f64)> = vec![(TAU - 1e-3, h), (1e-3, h), (TAU - 1e-5, h), (1e-5, h)];
     let pred = predict(
         "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=5)",
         &data,
@@ -144,9 +132,7 @@ fn cylinder_seam_derivative_continuous() {
     );
     let gap_loose = (pred[0] - pred[1]).abs();
     let gap_tight = (pred[2] - pred[3]).abs();
-    eprintln!(
-        "[cyl-deriv] gap @ ε=1e-3: {gap_loose:.6e}  gap @ ε=1e-5: {gap_tight:.6e}",
-    );
+    eprintln!("[cyl-deriv] gap @ ε=1e-3: {gap_loose:.6e}  gap @ ε=1e-5: {gap_tight:.6e}",);
     // C⁰ continuity guarantees the gap is O(ε); a discontinuous join would
     // leave a finite gap independent of ε. Concretely: when ε shrinks by
     // 100×, the gap must shrink by at least 50× (some factor of slack for
@@ -161,13 +147,7 @@ fn cylinder_seam_derivative_continuous() {
 fn torus_two_axis_wrap_invariance() {
     init_parallelism();
     let data = torus_dataset(16, 16);
-    let bases: Vec<(f64, f64)> = vec![
-        (0.0, 0.0),
-        (0.4, 1.8),
-        (1.7, 4.2),
-        (3.0, 0.6),
-        (5.1, 2.3),
-    ];
+    let bases: Vec<(f64, f64)> = vec![(0.0, 0.0), (0.4, 1.8), (1.7, 4.2), (3.0, 0.6), (5.1, 2.3)];
     let mut pts = bases.clone();
     // Independent wraps on each axis.
     for (k, m) in [(1, 0), (0, 1), (1, 1), (-1, -1), (2, -2)] {
