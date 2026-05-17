@@ -1486,24 +1486,24 @@ fn optimize_rho(
         prev_eval = eval;
     }
 
-    // Prefer interior stationary points (smooth under X perturbation). Only fall
-    // back to boundaries when no stationary point exists — this avoids a kink
-    // where a grid candidate's cost crosses below a refined stationary point's
-    // cost, which would make d(reml_score, lambda)/dX discontinuous and break
-    // analytic-vs-FD agreement at strict tolerance.
-    let candidates = if stationary.is_empty() {
-        let mut boundary = Vec::<f64>::new();
-        push_candidate(&mut boundary, RHO_LOWER);
-        push_candidate(&mut boundary, RHO_UPPER);
-        if let Some(rho0) = init_rho {
-            push_candidate(&mut boundary, rho0);
-        }
-        boundary
-    } else {
-        stationary
-    };
+    // Pick a deterministic stationary point that varies smoothly with X. The
+    // smallest-rho refined stationary point is the canonical choice: stationary
+    // points move continuously with X under generic perturbations (no fold
+    // catastrophes), so the smallest-rho one stays the smallest-rho one and the
+    // returned value is smooth. Choosing by cost would re-introduce a kink at
+    // every level set where two stationary points trade ranks.
+    if let Some(&first) = stationary.first() {
+        return Ok(first);
+    }
 
-    candidates
+    // No interior stationary point: fall back to the lowest-cost boundary.
+    let mut boundary = Vec::<f64>::new();
+    push_candidate(&mut boundary, RHO_LOWER);
+    push_candidate(&mut boundary, RHO_UPPER);
+    if let Some(rho0) = init_rho {
+        push_candidate(&mut boundary, rho0);
+    }
+    boundary
         .into_iter()
         .min_by(|&a, &b| {
             prepared
