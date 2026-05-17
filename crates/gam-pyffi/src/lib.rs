@@ -1436,22 +1436,42 @@ fn design_matrix_table_impl(
     design_matrix_dataset_impl(&model, dataset)
 }
 
-fn design_matrix_array_impl(model_bytes: &[u8], x: Array2<f64>) -> Result<String, String> {
+fn design_matrix_array_impl(model_bytes: &[u8], x: Array2<f64>) -> Result<Array2<f64>, String> {
     let model = load_model_impl(model_bytes)?;
     let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
-    design_matrix_dataset_impl(&model, dataset)
+    design_matrix_dense(&model, dataset)
 }
 
 fn design_matrix_dataset_impl(
     model: &FittedModel,
     dataset: EncodedDataset,
 ) -> Result<String, String> {
+    let dense = design_matrix_dense(model, dataset)?;
+    let n_rows = dense.nrows();
+    let n_cols = dense.ncols();
+    // Row-major flatten matches numpy's default reshape order.
+    let x_flat: Vec<f64> = dense.iter().copied().collect();
+    let payload = DesignMatrixPayload {
+        x_flat,
+        n_rows,
+        n_cols,
+        family_kind: family_link_kind(model.likelihood()).to_string(),
+        model_class: prediction_model_class_label(model),
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize design matrix payload: {err}"))
+}
+
+fn design_matrix_dense(
+    model: &FittedModel,
+    dataset: EncodedDataset,
+) -> Result<Array2<f64>, String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "design_matrix currently supports only standard GAM models; got '{}'. \
              For other classes use Model.predict / posterior.predict, which dispatch \
              through the saved-model predictor.",
-            prediction_model_class_label(&model)
+            prediction_model_class_label(model)
         ));
     }
     if model.has_link_wiggle() {
@@ -1472,20 +1492,7 @@ fn design_matrix_dataset_impl(
     )?;
     let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    let dense = design.design.to_dense();
-    let n_rows = dense.nrows();
-    let n_cols = dense.ncols();
-    // Row-major flatten matches numpy's default reshape order.
-    let x_flat: Vec<f64> = dense.iter().copied().collect();
-    let payload = DesignMatrixPayload {
-        x_flat,
-        n_rows,
-        n_cols,
-        family_kind: family_link_kind(model.likelihood()).to_string(),
-        model_class: prediction_model_class_label(&model),
-    };
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize design matrix payload: {err}"))
+    Ok(design.design.to_dense())
 }
 
 #[derive(Serialize)]
