@@ -7,6 +7,8 @@
 //! * [`try_chol_solve_inplace`] — fused dense Cholesky factor + triangular
 //!   solve (`A = LLᵀ`, then `A X = B`) in a single host↔device round-trip,
 //!   matching the PIRLS Newton-direction solve and ridge-retry pattern.
+//! * [`try_cholesky_lower_inplace`] — dense Cholesky factorization for callers
+//!   that need the lower factor itself.
 //!
 //! Smaller matrices stay on faer's CPU path because the host/device round
 //! trip dominates there. Thresholds live in the helper functions below.
@@ -46,6 +48,16 @@ pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Opt
         return None;
     }
     with_runtime(|rt| rt.chol_solve_inplace(a, rhs))
+}
+
+/// In-place lower Cholesky factorization: `a` becomes `L` for `A = L L^T`.
+#[inline]
+pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
+    let p = a.nrows();
+    if p != a.ncols() || !route_chol_solve(p) {
+        return None;
+    }
+    with_runtime(|rt| rt.cholesky_lower_inplace(a))
 }
 
 #[inline]
@@ -284,6 +296,80 @@ impl CusolverRuntime {
         }
         from_col_major_inplace(&a_col, a);
         from_col_major_inplace(&rhs_col, rhs);
+        Some(())
+    }
+
+    fn cholesky_lower_inplace(&mut self, a: &mut Array2<f64>) -> Option<()> {
+        let p = a.nrows();
+        let p_i32 = to_i32(p)?;
+        let mut a_col = to_col_major(a);
+        let bytes_a = bytes_len::<f64>(a_col.len())?;
+        let bytes_info = bytes_len::<i32>(1)?;
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let a_dev = self.alloc_copy(&a_col, bytes_a)?;
+            let info_dev = DeviceAllocation::new(&self.cuda.api, bytes_info)?;
+            let mut work_size: i32 = 0;
+            if (self.solver.dpotrf_buffersize)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p_i32,
+                a_dev.ptr,
+                p_i32,
+                &mut work_size,
+            ) != CUSOLVER_STATUS_SUCCESS
+            {
+                return None;
+            }
+            let scratch = if work_size > 0 {
+                let work_elems = usize::try_from(work_size).ok()?;
+                Some(DeviceAllocation::new(
+                    &self.cuda.api,
+                    bytes_len::<f64>(work_elems)?,
+                )?)
+            } else {
+                None
+            };
+            let scratch_ptr = scratch.as_ref().map(|s| s.ptr).unwrap_or(0);
+            let factor_status = (self.solver.dpotrf)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p_i32,
+                a_dev.ptr,
+                p_i32,
+                scratch_ptr,
+                work_size,
+                info_dev.ptr,
+            );
+            if factor_status != CUSOLVER_STATUS_SUCCESS {
+                return None;
+            }
+            let mut info: i32 = 0;
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(
+                    (&mut info) as *mut i32 as *mut std::ffi::c_void,
+                    info_dev.ptr,
+                    bytes_info,
+                ),
+                "cuMemcpyDtoH potrf info",
+            )
+            .ok()?;
+            if info != 0 {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(a_col.as_mut_ptr().cast(), a_dev.ptr, bytes_a),
+                "cuMemcpyDtoH A",
+            )
+            .ok()?;
+        }
+        from_col_major_inplace(&a_col, a);
+        for row in 0..p {
+            for col in (row + 1)..p {
+                a[[row, col]] = 0.0;
+            }
+        }
         Some(())
     }
 
