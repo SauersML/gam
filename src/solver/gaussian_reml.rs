@@ -2279,8 +2279,11 @@ mod tests {
         );
     }
 
-    fn adaptive_central_difference(mut eval: impl FnMut(f64) -> f64) -> f64 {
-        let steps: [f64; 5] = [1.0e-2, 5.0e-3, 2.5e-3, 1.25e-3, 6.25e-4];
+    fn adaptive_central_difference(mut eval: impl FnMut(f64) -> f64, target: ForwardScalar) -> f64 {
+        let steps: [f64; 5] = match target {
+            ForwardScalar::RemlScore => [1.0e-2, 5.0e-3, 2.5e-3, 1.25e-3, 6.25e-4],
+            _ => [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4, 6.25e-5],
+        };
         let mut best = f64::NAN;
         let mut best_delta = f64::INFINITY;
         let mut previous: Option<f64> = None;
@@ -2330,7 +2333,7 @@ mod tests {
                             target,
                         )
                     };
-                    let fd = adaptive_central_difference(eval);
+                    let fd = adaptive_central_difference(eval, target);
                     assert_fd_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         backward.grad_x[[row, col]],
@@ -2352,7 +2355,7 @@ mod tests {
                             target,
                         )
                     };
-                    let fd = adaptive_central_difference(eval);
+                    let fd = adaptive_central_difference(eval, target);
                     assert_fd_close(
                         &format!("target={target:?} y[{row},{col}]"),
                         backward.grad_y[[row, col]],
@@ -2365,15 +2368,9 @@ mod tests {
                 let eval = |delta: f64| {
                     let mut candidate = weights.clone();
                     candidate[row] += delta;
-                    one_hot_objective(
-                        x.view(),
-                        y.view(),
-                        penalty.view(),
-                        candidate.view(),
-                        target,
-                    )
+                    one_hot_objective(x.view(), y.view(), penalty.view(), candidate.view(), target)
                 };
-                let fd = adaptive_central_difference(eval);
+                let fd = adaptive_central_difference(eval, target);
                 assert_fd_close(
                     &format!("target={target:?} weights[{row}]"),
                     backward.grad_weights[row],
