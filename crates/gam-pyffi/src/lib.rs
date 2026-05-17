@@ -639,94 +639,32 @@ fn gaussian_reml_fit_batched<'py>(
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
-    let x_view = x.as_array();
-    let y_view = y.as_array();
-    let offsets = row_offsets.as_array();
-    let penalty_view = penalty.as_array();
-    let weight_view = weights.as_ref().map(|w| w.as_array());
-    if offsets.len() < 2 {
-        return Err(py_value_error(
-            "row_offsets must contain at least [0, n]".to_string(),
-        ));
-    }
-    if offsets[0] != 0 || offsets[offsets.len() - 1] != x_view.nrows() {
-        return Err(py_value_error(format!(
-            "row_offsets must start at 0 and end at X.nrows(); got start={}, end={}, n={}",
-            offsets[0],
-            offsets[offsets.len() - 1],
-            x_view.nrows()
-        )));
-    }
-    if y_view.nrows() != x_view.nrows() {
-        return Err(py_value_error(format!(
-            "batched Gaussian REML row mismatch: X has {} rows but Y has {}",
-            x_view.nrows(),
-            y_view.nrows()
-        )));
-    }
-    for idx in 0..offsets.len() - 1 {
-        if offsets[idx] > offsets[idx + 1] {
-            return Err(py_value_error(
-                "row_offsets must be non-decreasing".to_string(),
-            ));
-        }
-    }
-    let batch = offsets.len() - 1;
-    let p = penalty_view.nrows();
-    let d = y_view.ncols();
-    let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
-    let mut edf = Array1::<f64>::zeros(batch);
-    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
-    let mut fitted = Array2::<f64>::zeros((x_view.nrows(), d));
-    let mut sigma2 = Array2::<f64>::from_elem((batch, d), f64::NAN);
-    let mut statuses = Vec::<String>::with_capacity(batch);
-    let mut previous_cache = None;
-    for b in 0..batch {
-        let start = offsets[b];
-        let end = offsets[b + 1];
-        let x_block = x_view.slice(s![start..end, ..]);
-        let y_block = y_view.slice(s![start..end, ..]);
-        let w_block = weight_view.as_ref().map(|w| w.slice(s![start..end]));
-        let fit = gaussian_reml_multi_closed_form_with_cache(
-            x_block,
-            y_block,
-            penalty_view,
-            w_block,
-            init_lambda,
-            previous_cache.as_ref(),
-        );
-        match fit {
-            Ok(result) => {
-                lambdas[b] = result.lambda;
-                rhos[b] = result.rho;
-                reml_scores[b] = result.reml_score;
-                edf[b] = result.edf;
-                coefficients
-                    .slice_mut(s![b, .., ..])
-                    .assign(&result.coefficients);
-                fitted.slice_mut(s![start..end, ..]).assign(&result.fitted);
-                sigma2.slice_mut(s![b, ..]).assign(&result.sigma2);
-                previous_cache = Some(result.cache);
-                statuses.push("ok".to_string());
-            }
-            Err(EstimationError::ModelIsIllConditioned { .. }) => {
-                previous_cache = None;
-                statuses.push("degenerate".to_string());
-            }
-            Err(err) => return Err(py_value_error(err.to_string())),
-        }
-    }
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let offset_values = row_offsets.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.map(|w| w.as_array().to_owned());
+    let result = py
+        .detach(move || {
+            gaussian_reml_fit_batched_impl(
+                x_values.view(),
+                y_values.view(),
+                offset_values.view(),
+                penalty_values.view(),
+                weight_values.as_ref().map(|w| w.view()),
+                init_lambda,
+            )
+        })
+        .map_err(py_value_error)?;
     let out = PyDict::new(py);
-    out.set_item("status", statuses)?;
-    out.set_item("lambda", lambdas.into_pyarray(py))?;
-    out.set_item("rho", rhos.into_pyarray(py))?;
-    out.set_item("reml_score", reml_scores.into_pyarray(py))?;
-    out.set_item("edf", edf.into_pyarray(py))?;
-    out.set_item("coefficients", coefficients.into_pyarray(py))?;
-    out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("sigma2", sigma2.into_pyarray(py))?;
+    out.set_item("status", result.statuses)?;
+    out.set_item("lambda", result.lambdas.into_pyarray(py))?;
+    out.set_item("rho", result.rhos.into_pyarray(py))?;
+    out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
+    out.set_item("edf", result.edf.into_pyarray(py))?;
+    out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", result.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
     Ok(out.unbind())
 }
 

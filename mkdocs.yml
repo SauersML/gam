@@ -131,3 +131,4 @@ nav:
     - API reference: api-reference.md
     - Exceptions: exceptions.md
     - Cookbook: cookbook.md
+    - Performance roadmap: perf-150x-roadmap.md
