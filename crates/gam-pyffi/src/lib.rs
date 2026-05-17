@@ -6,6 +6,7 @@ use gam::estimate::{
     BlockRole, EstimationError, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
     saved_sas_state_from_fit,
 };
+use gam::faer_ndarray::{array2_to_matmut, factorize_symmetricwith_fallback};
 use gam::families::family_meta::{
     family_to_link, inverse_link_to_binomial_family, pretty_familyname,
 };
@@ -15,7 +16,7 @@ use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
-use gam::gaussian_reml::{gaussian_reml_multi_closed_form, gaussian_reml_score_derivatives};
+use gam::gaussian_reml::gaussian_reml_multi_closed_form_with_cache;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -39,8 +40,10 @@ use gam::terms::basis::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
+use numpy::{
+    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -264,8 +267,9 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "design_matrix_array",
             "basis",
             "gaussian_weighted_ridge_array",
+            "gaussian_weighted_ridge_batch",
             "gaussian_reml_fit",
-            "gaussian_reml_score",
+            "gaussian_reml_fit_batched",
         ],
     )?;
     info.set_item(
@@ -522,31 +526,73 @@ fn gaussian_weighted_ridge_array<'py>(
     ))
 }
 
-#[pyfunction(signature = (x, y, penalty, weights = None, init_rho = None))]
+#[pyfunction(signature = (x, y, penalty, weights, ridge_lambda, row_counts = None))]
+fn gaussian_weighted_ridge_batch<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray3<'py, f64>,
+    y: PyReadonlyArray3<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray2<'py, f64>,
+    ridge_lambda: f64,
+    row_counts: Option<PyReadonlyArray1<'py, usize>>,
+) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray3<f64>>)> {
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_array().to_owned();
+    let row_count_values = row_counts.map(|counts| counts.as_array().to_owned());
+    let (coefficients, fitted) = py
+        .detach(move || {
+            gaussian_weighted_ridge_batch_impl(
+                x_values.view(),
+                y_values.view(),
+                penalty_values.view(),
+                weight_values.view(),
+                ridge_lambda,
+                row_count_values.as_ref().map(|counts| counts.view()),
+            )
+        })
+        .map_err(py_value_error)?;
+    Ok((
+        coefficients.into_pyarray(py).unbind(),
+        fitted.into_pyarray(py).unbind(),
+    ))
+}
+
+#[pyfunction(signature = (x, y, penalty, weights = None, init_lambda = None, by = None, by_start_col = 0))]
 fn gaussian_reml_fit<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     penalty: PyReadonlyArray2<'py, f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
-    init_rho: Option<f64>,
+    init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let n_rows = x.as_array().nrows();
-    let n_outputs = y.as_array().ncols();
-    let n_coefficients = penalty.as_array().nrows();
-    let x_values = x.as_array().to_owned();
-    let y_values = y.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
-    let weight_values = weights.map(|w| w.as_array().to_owned());
-    let result = py.detach(move || {
-        gaussian_reml_multi_closed_form(
-            x_values.view(),
-            y_values.view(),
-            penalty_values.view(),
-            weight_values.as_ref().map(|w| w.view()),
-            init_rho,
-        )
-    });
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+    let n_rows = x_view.nrows();
+    let n_outputs = y_view.ncols();
+    let n_coefficients = penalty_view.nrows();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x_view
+    };
+    let result = gaussian_reml_multi_closed_form_with_cache(
+        fit_x,
+        y_view,
+        penalty_view,
+        weight_view,
+        init_lambda,
+        None,
+    );
     let out = PyDict::new(py);
     match result {
         Ok(fit) => {
@@ -554,10 +600,6 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", fit.lambda)?;
             out.set_item("rho", fit.rho)?;
             out.set_item("reml_score", fit.reml_score)?;
-            out.set_item("reml_grad_lambda", fit.reml_grad_lambda)?;
-            out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
-            out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
-            out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
             out.set_item("edf", fit.edf)?;
             out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
             out.set_item("fitted", fit.fitted.into_pyarray(py))?;
@@ -568,10 +610,6 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", f64::NAN)?;
             out.set_item("rho", f64::NAN)?;
             out.set_item("reml_score", f64::NAN)?;
-            out.set_item("reml_grad_lambda", f64::NAN)?;
-            out.set_item("reml_hess_lambda", f64::NAN)?;
-            out.set_item("reml_grad_rho", f64::NAN)?;
-            out.set_item("reml_hess_rho", f64::NAN)?;
             out.set_item("edf", 0.0)?;
             out.set_item(
                 "coefficients",
@@ -591,41 +629,136 @@ fn gaussian_reml_fit<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (x, y, lambda, penalty, weights = None))]
-fn gaussian_reml_score<'py>(
+#[pyfunction(signature = (x, y, row_offsets, penalty, weights = None, init_lambda = None))]
+fn gaussian_reml_fit_batched<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
-    lambda: f64,
+    row_offsets: PyReadonlyArray1<'py, usize>,
     penalty: PyReadonlyArray2<'py, f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
-    let x_values = x.as_array().to_owned();
-    let y_values = y.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
-    let weight_values = weights.map(|w| w.as_array().to_owned());
-    let derivs = py
-        .detach(move || {
-            gaussian_reml_score_derivatives(
-                x_values.view(),
-                y_values.view(),
-                lambda,
-                penalty_values.view(),
-                weight_values.as_ref().map(|w| w.view()),
-            )
-        })
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let offsets = row_offsets.as_array();
+    let penalty_view = penalty.as_array();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    if offsets.len() < 2 {
+        return Err(py_value_error(
+            "row_offsets must contain at least [0, n]".to_string(),
+        ));
+    }
+    if offsets[0] != 0 || offsets[offsets.len() - 1] != x_view.nrows() {
+        return Err(py_value_error(format!(
+            "row_offsets must start at 0 and end at X.nrows(); got start={}, end={}, n={}",
+            offsets[0],
+            offsets[offsets.len() - 1],
+            x_view.nrows()
+        )));
+    }
+    if y_view.nrows() != x_view.nrows() {
+        return Err(py_value_error(format!(
+            "batched Gaussian REML row mismatch: X has {} rows but Y has {}",
+            x_view.nrows(),
+            y_view.nrows()
+        )));
+    }
+    for idx in 0..offsets.len() - 1 {
+        if offsets[idx] > offsets[idx + 1] {
+            return Err(py_value_error(
+                "row_offsets must be non-decreasing".to_string(),
+            ));
+        }
+    }
+    let batch = offsets.len() - 1;
+    let p = penalty_view.nrows();
+    let d = y_view.ncols();
+    let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut edf = Array1::<f64>::zeros(batch);
+    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
+    let mut fitted = Array2::<f64>::zeros((x_view.nrows(), d));
+    let mut sigma2 = Array2::<f64>::from_elem((batch, d), f64::NAN);
+    let mut statuses = Vec::<String>::with_capacity(batch);
+    let mut previous_cache = None;
+    for b in 0..batch {
+        let start = offsets[b];
+        let end = offsets[b + 1];
+        let x_block = x_view.slice(s![start..end, ..]);
+        let y_block = y_view.slice(s![start..end, ..]);
+        let w_block = weight_view.as_ref().map(|w| w.slice(s![start..end]));
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            x_block,
+            y_block,
+            penalty_view,
+            w_block,
+            init_lambda,
+            previous_cache.as_ref(),
+        );
+        match fit {
+            Ok(result) => {
+                lambdas[b] = result.lambda;
+                rhos[b] = result.rho;
+                reml_scores[b] = result.reml_score;
+                edf[b] = result.edf;
+                coefficients
+                    .slice_mut(s![b, .., ..])
+                    .assign(&result.coefficients);
+                fitted.slice_mut(s![start..end, ..]).assign(&result.fitted);
+                sigma2.slice_mut(s![b, ..]).assign(&result.sigma2);
+                previous_cache = Some(result.cache);
+                statuses.push("ok".to_string());
+            }
+            Err(EstimationError::ModelIsIllConditioned { .. }) => {
+                previous_cache = None;
+                statuses.push("degenerate".to_string());
+            }
+            Err(err) => return Err(py_value_error(err.to_string())),
+        }
+    }
     let out = PyDict::new(py);
-    out.set_item("reml_score", derivs.reml_score)?;
-    out.set_item("grad_lambda", derivs.grad_lambda)?;
-    out.set_item("hess_lambda", derivs.hess_lambda)?;
-    out.set_item("edf", derivs.edf)?;
-    out.set_item("grad_x", derivs.grad_x.into_pyarray(py))?;
-    out.set_item("grad_y", derivs.grad_y.into_pyarray(py))?;
-    out.set_item("coefficients", derivs.coefficients.into_pyarray(py))?;
-    out.set_item("fitted", derivs.fitted.into_pyarray(py))?;
-    out.set_item("sigma2", derivs.sigma2.into_pyarray(py))?;
+    out.set_item("status", statuses)?;
+    out.set_item("lambda", lambdas.into_pyarray(py))?;
+    out.set_item("rho", rhos.into_pyarray(py))?;
+    out.set_item("reml_score", reml_scores.into_pyarray(py))?;
+    out.set_item("edf", edf.into_pyarray(py))?;
+    out.set_item("coefficients", coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("sigma2", sigma2.into_pyarray(py))?;
     Ok(out.unbind())
+}
+
+fn apply_by_gate(
+    x: ArrayView2<'_, f64>,
+    by: ArrayView1<'_, f64>,
+    start_col: usize,
+) -> Result<Array2<f64>, String> {
+    if by.len() != x.nrows() {
+        return Err(format!(
+            "by gate length mismatch: expected {}, got {}",
+            x.nrows(),
+            by.len()
+        ));
+    }
+    if start_col > x.ncols() {
+        return Err(format!(
+            "by_start_col must be <= number of columns; got {start_col} for {} columns",
+            x.ncols()
+        ));
+    }
+    if by.iter().any(|value| !value.is_finite()) {
+        return Err("by gate must contain only finite values".to_string());
+    }
+    let mut out = x.to_owned();
+    for row in 0..out.nrows() {
+        let gate = by[row];
+        for col in start_col..out.ncols() {
+            out[[row, col]] *= gate;
+        }
+    }
+    Ok(out)
 }
 
 #[pyfunction]
@@ -692,8 +825,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
@@ -2364,6 +2498,116 @@ fn gaussian_weighted_ridge_array_impl(
         return Err("weighted ridge solve produced non-finite coefficients".to_string());
     }
     let fitted = x.dot(&coefficients);
+    Ok((coefficients, fitted))
+}
+
+fn gaussian_weighted_ridge_batch_impl(
+    x: ArrayView3<'_, f64>,
+    y: ArrayView3<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView2<'_, f64>,
+    ridge_lambda: f64,
+    row_counts: Option<ArrayView1<'_, usize>>,
+) -> Result<(Array3<f64>, Array3<f64>), String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let (batch, n_max, p) = x.dim();
+    let (y_batch, y_n_max, d) = y.dim();
+    if batch == 0 || n_max == 0 || p == 0 {
+        return Err("batched X must have non-empty K, N, and coefficient dimensions".to_string());
+    }
+    if y_batch != batch || y_n_max != n_max {
+        return Err(format!(
+            "batched X/Y shape mismatch: X is ({batch}, {n_max}, {p}) but Y is ({y_batch}, {y_n_max}, {d})"
+        ));
+    }
+    if d == 0 {
+        return Err("batched Y must have at least one output column".to_string());
+    }
+    if weights.nrows() != batch || weights.ncols() != n_max {
+        return Err(format!(
+            "batched weights shape mismatch: expected ({batch}, {n_max}), got ({}, {})",
+            weights.nrows(),
+            weights.ncols()
+        ));
+    }
+    if penalty.nrows() != p || penalty.ncols() != p {
+        return Err(format!(
+            "penalty shape mismatch: expected {p}x{p}, got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if !ridge_lambda.is_finite() || ridge_lambda < 0.0 {
+        return Err(format!(
+            "ridge_lambda must be finite and non-negative; got {ridge_lambda}"
+        ));
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .chain(weights.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("batched weighted ridge inputs must be finite".to_string());
+    }
+    if weights.iter().any(|value| *value < 0.0) {
+        return Err("batched weights must be non-negative likelihood row weights".to_string());
+    }
+
+    let active_rows: Vec<usize> = match row_counts {
+        Some(counts) => {
+            if counts.len() != batch {
+                return Err(format!(
+                    "row_counts length mismatch: expected {batch}, got {}",
+                    counts.len()
+                ));
+            }
+            counts.to_vec()
+        }
+        None => vec![n_max; batch],
+    };
+    for (b, &n_rows) in active_rows.iter().enumerate() {
+        if n_rows > n_max {
+            return Err(format!(
+                "row_counts[{b}]={n_rows} exceeds padded row count {n_max}"
+            ));
+        }
+    }
+
+    let results: Vec<Result<(usize, Array2<f64>, Array2<f64>), String>> = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let n_rows = active_rows[b];
+            if n_rows == 0 {
+                return Ok((b, Array2::<f64>::zeros((p, d)), Array2::<f64>::zeros((0, d))));
+            }
+            gaussian_weighted_ridge_array_impl(
+                x.slice(s![b, 0..n_rows, ..]),
+                y.slice(s![b, 0..n_rows, ..]),
+                penalty,
+                weights.slice(s![b, 0..n_rows]),
+                ridge_lambda,
+            )
+            .map(|(coefficients, fitted)| (b, coefficients, fitted))
+            .map_err(|err| format!("batched weighted ridge fit {b} failed: {err}"))
+        })
+        .collect();
+
+    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
+    let mut fitted = Array3::<f64>::zeros((batch, n_max, d));
+    for result in results {
+        let (b, fit_coefficients, fit_fitted) = result?;
+        coefficients
+            .slice_mut(s![b, .., ..])
+            .assign(&fit_coefficients);
+        let n_rows = fit_fitted.nrows();
+        if n_rows > 0 {
+            fitted
+                .slice_mut(s![b, 0..n_rows, ..])
+                .assign(&fit_fitted);
+        }
+    }
     Ok((coefficients, fitted))
 }
 
