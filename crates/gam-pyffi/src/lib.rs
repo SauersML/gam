@@ -494,7 +494,7 @@ fn gaussian_weighted_ridge_array<'py>(
         weights.as_array(),
         ridge_lambda,
     )
-    .map_err(py_value_error)?;
+    .map_err(|err| py_value_error(err.to_string()))?;
     Ok((
         coefficients.into_pyarray(py).unbind(),
         fitted.into_pyarray(py).unbind(),
@@ -795,8 +795,11 @@ fn gaussian_reml_fit_batched_backward<'py>(
     penalty,
     basis_order = 3,
     periodic = false,
+    period = None,
     weights = None,
-    init_lambda = None
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
 ))]
 fn gaussian_reml_fit_positions<'py>(
     py: Python<'py>,
@@ -807,8 +810,11 @@ fn gaussian_reml_fit_positions<'py>(
     penalty: PyReadonlyArray2<'py, f64>,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
     let x = position_basis_design(
         t.as_array(),
@@ -816,13 +822,22 @@ fn gaussian_reml_fit_positions<'py>(
         &basis_kind,
         basis_order,
         periodic,
+        period,
     )
     .map_err(py_value_error)?;
     let y_view = y.as_array();
     let penalty_view = penalty.as_array();
     let weight_view = weights.as_ref().map(|w| w.as_array());
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x.view(), by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x.view()
+    };
     let result = gaussian_reml_multi_closed_form_with_cache(
-        x.view(),
+        fit_x,
         y_view,
         penalty_view,
         weight_view,
@@ -858,8 +873,11 @@ fn gaussian_reml_fit_positions<'py>(
     grad_reml_score = 0.0,
     basis_order = 3,
     periodic = false,
+    period = None,
     weights = None,
-    init_lambda = None
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
 ))]
 fn gaussian_reml_fit_positions_backward<'py>(
     py: Python<'py>,
@@ -874,8 +892,11 @@ fn gaussian_reml_fit_positions_backward<'py>(
     grad_reml_score: f64,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
     let backward = gaussian_reml_fit_positions_backward_impl(
         t.as_array(),
@@ -884,6 +905,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
         &basis_kind,
         basis_order,
         periodic,
+        period,
         penalty.as_array(),
         weights.as_ref().map(|w| w.as_array()),
         init_lambda,
@@ -891,6 +913,8 @@ fn gaussian_reml_fit_positions_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score,
+        by.as_ref().map(|b| b.as_array()),
+        by_start_col,
     )
     .map_err(py_value_error)?;
 
@@ -898,6 +922,11 @@ fn gaussian_reml_fit_positions_backward<'py>(
     out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    if let Some(grad_by) = backward.grad_by {
+        out.set_item("grad_by", grad_by.into_pyarray(py))?;
+    } else {
+        out.set_item("grad_by", py.None())?;
+    }
     Ok(out.unbind())
 }
 
@@ -910,8 +939,11 @@ fn gaussian_reml_fit_positions_backward<'py>(
     penalty,
     basis_order = 3,
     periodic = false,
+    period = None,
     weights = None,
-    init_lambda = None
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
 ))]
 fn gaussian_reml_fit_positions_batched<'py>(
     py: Python<'py>,
@@ -923,8 +955,11 @@ fn gaussian_reml_fit_positions_batched<'py>(
     penalty: PyReadonlyArray2<'py, f64>,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
     let result = gaussian_reml_fit_positions_batched_impl(
         t.as_array(),
@@ -934,9 +969,12 @@ fn gaussian_reml_fit_positions_batched<'py>(
         &basis_kind,
         basis_order,
         periodic,
+        period,
         penalty.as_array(),
         weights.as_ref().map(|w| w.as_array()),
         init_lambda,
+        by.as_ref().map(|b| b.as_array()),
+        by_start_col,
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
@@ -974,8 +1012,11 @@ fn gaussian_reml_fit_positions_batched<'py>(
     grad_reml_score = None,
     basis_order = 3,
     periodic = false,
+    period = None,
     weights = None,
-    init_lambda = None
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
 ))]
 fn gaussian_reml_fit_positions_batched_backward<'py>(
     py: Python<'py>,
@@ -991,8 +1032,11 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
     let backward = gaussian_reml_fit_positions_batched_backward_impl(
         t.as_array(),
@@ -1002,6 +1046,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         &basis_kind,
         basis_order,
         periodic,
+        period,
         penalty.as_array(),
         weights.as_ref().map(|w| w.as_array()),
         init_lambda,
@@ -1009,6 +1054,8 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score.as_ref().map(|g| g.as_array()),
+        by.as_ref().map(|b| b.as_array()),
+        by_start_col,
     )
     .map_err(py_value_error)?;
 
@@ -1017,6 +1064,11 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    if let Some(grad_by) = backward.grad_by {
+        out.set_item("grad_by", grad_by.into_pyarray(py))?;
+    } else {
+        out.set_item("grad_by", py.None())?;
+    }
     Ok(out.unbind())
 }
 
@@ -1106,6 +1158,7 @@ struct PositionGaussianRemlBackwardResult {
     grad_t: Array1<f64>,
     grad_y: Array2<f64>,
     grad_weights: Array1<f64>,
+    grad_by: Option<Array1<f64>>,
 }
 
 struct BatchedPositionGaussianRemlBackwardResult {
@@ -1113,6 +1166,7 @@ struct BatchedPositionGaussianRemlBackwardResult {
     grad_t: Array1<f64>,
     grad_y: Array2<f64>,
     grad_weights: Array1<f64>,
+    grad_by: Option<Array1<f64>>,
 }
 
 fn gaussian_reml_fit_formula_table_impl(
@@ -1592,6 +1646,7 @@ fn gaussian_reml_fit_positions_backward_impl(
     basis_kind: &str,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
@@ -1599,12 +1654,34 @@ fn gaussian_reml_fit_positions_backward_impl(
     grad_coefficients: Option<ArrayView2<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: f64,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
 ) -> Result<PositionGaussianRemlBackwardResult, String> {
-    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
-    let basis_derivative =
-        position_basis_derivative(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    let x = position_basis_design(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    let basis_derivative = position_basis_derivative(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    let gated_x;
+    let fit_x = if let Some(by_values) = by {
+        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
+        gated_x.view()
+    } else {
+        x.view()
+    };
     let backward = gaussian_reml_multi_closed_form_backward(
-        x.view(),
+        fit_x,
         y,
         penalty,
         weights,
@@ -1615,11 +1692,19 @@ fn gaussian_reml_fit_positions_backward_impl(
         grad_reml_score,
     )
     .map_err(|err| err.to_string())?;
-    let grad_t = contract_position_gradient(backward.grad_x.view(), basis_derivative.view())?;
+    let (grad_x, grad_by) = if let Some(by_values) = by {
+        let (grad_x, grad_by) =
+            apply_by_gate_backward(x.view(), by_values, by_start_col, backward.grad_x.view())?;
+        (grad_x, Some(grad_by))
+    } else {
+        (backward.grad_x, None)
+    };
+    let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
     Ok(PositionGaussianRemlBackwardResult {
         grad_t,
         grad_y: backward.grad_y,
         grad_weights: backward.grad_weights,
+        grad_by,
     })
 }
 
@@ -1631,12 +1716,29 @@ fn gaussian_reml_fit_positions_batched_impl(
     basis_kind: &str,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
 ) -> Result<BatchedGaussianRemlResult, String> {
-    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
-    gaussian_reml_fit_batched_impl(x.view(), y, row_offsets, penalty, weights, init_lambda)
+    let x = position_basis_design(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    let gated_x;
+    let fit_x = if let Some(by_values) = by {
+        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
+        gated_x.view()
+    } else {
+        x.view()
+    };
+    gaussian_reml_fit_batched_impl(fit_x, y, row_offsets, penalty, weights, init_lambda)
 }
 
 fn gaussian_reml_fit_positions_batched_backward_impl(
@@ -1647,6 +1749,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     basis_kind: &str,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
@@ -1654,6 +1757,8 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     grad_coefficients: Option<ArrayView3<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
 ) -> Result<BatchedPositionGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -1690,9 +1795,29 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         }
     }
 
-    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
-    let basis_derivative =
-        position_basis_derivative(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    let x = position_basis_design(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    let basis_derivative = position_basis_derivative(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    let gated_x;
+    let fit_x = if let Some(by_values) = by {
+        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
+        gated_x.view()
+    } else {
+        x.view()
+    };
     if penalty.dim() != (x.ncols(), x.ncols()) {
         return Err(format!(
             "penalty shape mismatch: expected {}x{}, got {}x{}",
@@ -1754,7 +1879,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         }
     }
 
-    let results: Vec<Result<(usize, Option<PositionGaussianRemlBackwardResult>), String>> = (0
+    let results: Vec<Result<(usize, Option<(Array2<f64>, Array2<f64>, Array1<f64>)>), String>> = (0
         ..batch)
         .into_par_iter()
         .map(|b| {
@@ -1769,7 +1894,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
             match gaussian_reml_multi_closed_form_backward(
-                x.slice(s![start..end, ..]),
+                fit_x.slice(s![start..end, ..]),
                 y.slice(s![start..end, ..]),
                 penalty,
                 weight_slice,
@@ -1779,20 +1904,10 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                 upstream_fitted,
                 upstream_reml_score,
             ) {
-                Ok(backward) => {
-                    let grad_t = contract_position_gradient(
-                        backward.grad_x.view(),
-                        basis_derivative.slice(s![start..end, ..]),
-                    )?;
-                    Ok((
-                        b,
-                        Some(PositionGaussianRemlBackwardResult {
-                            grad_t,
-                            grad_y: backward.grad_y,
-                            grad_weights: backward.grad_weights,
-                        }),
-                    ))
-                }
+                Ok(backward) => Ok((
+                    b,
+                    Some((backward.grad_x, backward.grad_y, backward.grad_weights)),
+                )),
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
                 Err(err) => Err(format!(
                     "batched position Gaussian REML backward {b} failed: {err}"
@@ -1802,30 +1917,39 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         .collect();
 
     let mut statuses = vec!["degenerate".to_string(); batch];
-    let mut grad_t = Array1::<f64>::zeros(t.len());
+    let mut grad_fit_x = Array2::<f64>::zeros(x.dim());
     let mut grad_y = Array2::<f64>::zeros(y.dim());
     let mut grad_weights = Array1::<f64>::zeros(t.len());
     for result in results {
         let (b, backward) = result?;
-        if let Some(backward) = backward {
+        if let Some((batch_grad_x, batch_grad_y, batch_grad_weights)) = backward {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
             statuses[b] = "ok".to_string();
-            grad_t.slice_mut(s![start..end]).assign(&backward.grad_t);
-            grad_y
+            grad_fit_x
                 .slice_mut(s![start..end, ..])
-                .assign(&backward.grad_y);
+                .assign(&batch_grad_x);
+            grad_y.slice_mut(s![start..end, ..]).assign(&batch_grad_y);
             grad_weights
                 .slice_mut(s![start..end])
-                .assign(&backward.grad_weights);
+                .assign(&batch_grad_weights);
         }
     }
+    let (grad_x, grad_by) = if let Some(by_values) = by {
+        let (grad_x, grad_by) =
+            apply_by_gate_backward(x.view(), by_values, by_start_col, grad_fit_x.view())?;
+        (grad_x, Some(grad_by))
+    } else {
+        (grad_fit_x, None)
+    };
+    let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
 
     Ok(BatchedPositionGaussianRemlBackwardResult {
         statuses,
         grad_t,
         grad_y,
         grad_weights,
+        grad_by,
     })
 }
 
@@ -1835,10 +1959,16 @@ fn position_basis_design(
     basis_kind: &str,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
     match normalized_position_basis_kind(basis_kind)?.as_str() {
-        "bspline" => bspline_basis_impl(t, knots_or_centers, basis_order, periodic),
-        "duchon" => duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic),
+        "bspline" => {
+            bspline_position_basis_impl(t, knots_or_centers, basis_order, periodic, period)
+        }
+        "duchon" => {
+            validate_position_period("duchon", knots_or_centers, periodic, period)?;
+            duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic)
+        }
         _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
     }
 }
@@ -1849,12 +1979,121 @@ fn position_basis_derivative(
     basis_kind: &str,
     basis_order: usize,
     periodic: bool,
+    period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
     match normalized_position_basis_kind(basis_kind)?.as_str() {
-        "bspline" => bspline_basis_derivative_impl(t, knots_or_centers, basis_order, 1, periodic),
-        "duchon" => duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic),
+        "bspline" => {
+            bspline_position_derivative_impl(t, knots_or_centers, basis_order, 1, periodic, period)
+        }
+        "duchon" => {
+            validate_position_period("duchon", knots_or_centers, periodic, period)?;
+            duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic)
+        }
         _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
     }
+}
+
+fn bspline_position_basis_impl(
+    t: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    periodic: bool,
+    period: Option<f64>,
+) -> Result<Array2<f64>, String> {
+    if !periodic {
+        validate_position_period("B-spline", knots, periodic, period)?;
+        return bspline_basis_impl(t, knots, degree, false);
+    }
+    let (left, right, num_basis) = periodic_position_domain(knots, period)?;
+    validate_vector("t", t)?;
+    create_periodic_bspline_basis_dense(t, (left, right), degree, num_basis)
+        .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
+}
+
+fn bspline_position_derivative_impl(
+    t: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    order: usize,
+    periodic: bool,
+    period: Option<f64>,
+) -> Result<Array2<f64>, String> {
+    if !periodic {
+        validate_position_period("B-spline", knots, periodic, period)?;
+        return bspline_basis_derivative_impl(t, knots, degree, order, false);
+    }
+    if order != 1 {
+        return Err(format!(
+            "periodic B-spline derivative supports order=1; got order={order}"
+        ));
+    }
+    let (left, right, num_basis) = periodic_position_domain(knots, period)?;
+    validate_vector("t", t)?;
+    create_periodic_bspline_derivative_dense(t, (left, right), degree, num_basis)
+        .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))
+}
+
+fn periodic_position_domain(
+    knots_or_centers: ArrayView1<'_, f64>,
+    period: Option<f64>,
+) -> Result<(f64, f64, usize), String> {
+    validate_vector("knots_or_centers", knots_or_centers)?;
+    if knots_or_centers.len() < 2 {
+        return Err("periodic position basis requires at least two knots or centers".to_string());
+    }
+    let Some(period) = period else {
+        return Err(
+            "periodic position basis requires an explicit finite positive period".to_string(),
+        );
+    };
+    if !period.is_finite() || period <= 0.0 {
+        return Err(format!(
+            "periodic position basis period must be finite and positive; got {period}"
+        ));
+    }
+    let left = knots_or_centers[0];
+    let right = left + period;
+    Ok((left, right, knots_or_centers.len() - 1))
+}
+
+fn validate_position_period(
+    label: &str,
+    knots_or_centers: ArrayView1<'_, f64>,
+    periodic: bool,
+    period: Option<f64>,
+) -> Result<(), String> {
+    if periodic {
+        let Some(period) = period else {
+            return Err(format!(
+                "{label} periodic position basis requires an explicit period"
+            ));
+        };
+        if !period.is_finite() || period <= 0.0 {
+            return Err(format!(
+                "{label} period must be finite and positive; got {period}"
+            ));
+        }
+        let left = knots_or_centers
+            .iter()
+            .fold(f64::INFINITY, |a, &b| a.min(b));
+        let right = knots_or_centers
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        if !left.is_finite() || !right.is_finite() || left >= right {
+            return Err(format!(
+                "{label} periodic support must have increasing finite endpoints"
+            ));
+        }
+        let implied = right - left;
+        if (implied - period).abs() > 1.0e-10 * period.max(1.0) {
+            return Err(format!(
+                "{label} periodic support range ({implied}) must match explicit period ({period})"
+            ));
+        }
+    } else if period.is_some() {
+        return Err(format!("{label} period is only valid when periodic=true"));
+    }
+    Ok(())
 }
 
 fn normalized_position_basis_kind(basis_kind: &str) -> Result<String, String> {
@@ -4005,8 +4244,7 @@ mod batch_tests {
             );
             for row in start..end {
                 assert!(
-                    (batched.grad_weights[row] - single.grad_weights[row - start]).abs()
-                        <= 1.0e-10
+                    (batched.grad_weights[row] - single.grad_weights[row - start]).abs() <= 1.0e-10
                 );
             }
         }
@@ -5071,6 +5309,7 @@ fn predict_table_survival(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
     #[test]
     fn model_version_matches_canonical_payload_version() {
@@ -5103,5 +5342,213 @@ mod tests {
             err.contains("saved model payload schema mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RemlForwardScalar {
+        Lambda,
+        RemlScore,
+        Coefficient(usize, usize),
+        Fitted(usize, usize),
+    }
+
+    fn by_gate_fd_design() -> Array2<f64> {
+        Array2::from_shape_fn((20, 5), |(row, col)| {
+            let t = (row as f64 - 9.5) / 8.0;
+            match col {
+                0 => 1.0,
+                1 => t,
+                2 => t * t - 0.45,
+                3 => (0.9 * t).sin() + 0.05 * t,
+                4 => (1.2 * t).cos() - 0.15 * t * t,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn by_gate_fd_response() -> Array2<f64> {
+        Array2::from_shape_fn((20, 3), |(row, output)| {
+            let t = (row as f64 - 9.5) / 8.0;
+            let phase = output as f64 + 1.0;
+            0.2 + 0.35 * phase * t
+                + 0.18 * t * t
+                + (0.4 + 0.1 * phase) * (0.8 * t + 0.25 * phase).cos()
+        })
+    }
+
+    fn by_gate_fd_values() -> Array1<f64> {
+        Array1::from_shape_fn(20, |row| {
+            let t = (row as f64 - 9.5) / 8.0;
+            0.85 + 0.12 * (0.7 * t).sin() + 0.03 * t
+        })
+    }
+
+    fn by_gate_fd_penalty() -> Array2<f64> {
+        Array2::from_diag(&array![0.0, 0.4, 1.1, 1.9, 3.0])
+    }
+
+    fn by_gate_objective(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        by: ArrayView1<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        target: RemlForwardScalar,
+    ) -> f64 {
+        let gated_x = apply_by_gate(x, by, 1).expect("by-gated design");
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            gated_x.view(),
+            y,
+            penalty,
+            None,
+            Some(0.85),
+            None,
+        )
+        .expect("by-gated finite-difference forward fit");
+        match target {
+            RemlForwardScalar::Lambda => fit.lambda,
+            RemlForwardScalar::RemlScore => fit.reml_score,
+            RemlForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
+            RemlForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
+        }
+    }
+
+    fn by_gate_backward(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        by: ArrayView1<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        target: RemlForwardScalar,
+    ) -> (Array2<f64>, Array2<f64>, Array1<f64>) {
+        let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        let mut grad_fitted = Array2::<f64>::zeros(y.dim());
+        let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
+            RemlForwardScalar::Lambda => (1.0, 0.0, None, None),
+            RemlForwardScalar::RemlScore => (0.0, 1.0, None, None),
+            RemlForwardScalar::Coefficient(row, col) => {
+                grad_coefficients[[row, col]] = 1.0;
+                (0.0, 0.0, Some(grad_coefficients.view()), None)
+            }
+            RemlForwardScalar::Fitted(row, col) => {
+                grad_fitted[[row, col]] = 1.0;
+                (0.0, 0.0, None, Some(grad_fitted.view()))
+            }
+        };
+        let gated_x = apply_by_gate(x, by, 1).expect("by-gated design");
+        let backward = gaussian_reml_multi_closed_form_backward(
+            gated_x.view(),
+            y,
+            penalty,
+            None,
+            Some(0.85),
+            grad_lambda,
+            coefficient_upstream,
+            fitted_upstream,
+            grad_score,
+        )
+        .expect("by-gated analytic backward");
+        let (grad_x, grad_by) =
+            apply_by_gate_backward(x, by, 1, backward.grad_x.view()).expect("by-gate backward");
+        (grad_x, backward.grad_y, grad_by)
+    }
+
+    fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
+        let tol = 1.0e-6_f64.max(1.0e-6 * analytic.abs().max(finite_difference.abs()));
+        let diff = (analytic - finite_difference).abs();
+        assert!(
+            diff <= tol,
+            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
+        );
+    }
+
+    #[test]
+    fn by_gate_backward_matches_forward_finite_difference_for_all_x_y_and_gate_entries() {
+        let x = by_gate_fd_design();
+        let y = by_gate_fd_response();
+        let by = by_gate_fd_values();
+        let penalty = by_gate_fd_penalty();
+        let targets = [
+            RemlForwardScalar::Lambda,
+            RemlForwardScalar::RemlScore,
+            RemlForwardScalar::Coefficient(4, 2),
+            RemlForwardScalar::Fitted(11, 1),
+        ];
+        let eps = 1.0e-5;
+
+        for target in targets {
+            let (grad_x, grad_y, grad_by) =
+                by_gate_backward(x.view(), y.view(), by.view(), penalty.view(), target);
+
+            for row in 0..x.nrows() {
+                for col in 0..x.ncols() {
+                    let mut plus = x.clone();
+                    let mut minus = x.clone();
+                    plus[[row, col]] += eps;
+                    minus[[row, col]] -= eps;
+                    let fd = (by_gate_objective(
+                        plus.view(),
+                        y.view(),
+                        by.view(),
+                        penalty.view(),
+                        target,
+                    ) - by_gate_objective(
+                        minus.view(),
+                        y.view(),
+                        by.view(),
+                        penalty.view(),
+                        target,
+                    )) / (2.0 * eps);
+                    assert_fd_close(
+                        &format!("target={target:?} x[{row},{col}]"),
+                        grad_x[[row, col]],
+                        fd,
+                    );
+                }
+            }
+
+            for row in 0..y.nrows() {
+                for col in 0..y.ncols() {
+                    let mut plus = y.clone();
+                    let mut minus = y.clone();
+                    plus[[row, col]] += eps;
+                    minus[[row, col]] -= eps;
+                    let fd = (by_gate_objective(
+                        x.view(),
+                        plus.view(),
+                        by.view(),
+                        penalty.view(),
+                        target,
+                    ) - by_gate_objective(
+                        x.view(),
+                        minus.view(),
+                        by.view(),
+                        penalty.view(),
+                        target,
+                    )) / (2.0 * eps);
+                    assert_fd_close(
+                        &format!("target={target:?} y[{row},{col}]"),
+                        grad_y[[row, col]],
+                        fd,
+                    );
+                }
+            }
+
+            for row in 0..by.len() {
+                let mut plus = by.clone();
+                let mut minus = by.clone();
+                plus[row] += eps;
+                minus[row] -= eps;
+                let fd =
+                    (by_gate_objective(x.view(), y.view(), plus.view(), penalty.view(), target)
+                        - by_gate_objective(
+                            x.view(),
+                            y.view(),
+                            minus.view(),
+                            penalty.view(),
+                            target,
+                        ))
+                        / (2.0 * eps);
+                assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
+            }
+        }
     }
 }

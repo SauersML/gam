@@ -2195,9 +2195,7 @@ mod tests {
         Array2::from_shape_fn((20, outputs), |(row, output)| {
             let t = (row as f64 - 9.5) / 8.0;
             let phase = output as f64 + 1.0;
-            0.4
-                + 0.7 * phase * t
-                - 0.25 * t * t
+            0.4 + 0.7 * phase * t - 0.25 * t * t
                 + (0.5 + 0.2 * phase) * (1.1 * t + 0.3 * phase).sin()
         })
     }
@@ -2212,15 +2210,8 @@ mod tests {
         penalty: ArrayView2<'_, f64>,
         target: ForwardScalar,
     ) -> f64 {
-        let fit = gaussian_reml_multi_closed_form_with_cache(
-            x,
-            y,
-            penalty,
-            None,
-            Some(0.85),
-            None,
-        )
-        .expect("finite-difference forward fit");
+        let fit = gaussian_reml_multi_closed_form_with_cache(x, y, penalty, None, Some(0.85), None)
+            .expect("finite-difference forward fit");
         match target {
             ForwardScalar::Lambda => fit.lambda,
             ForwardScalar::RemlScore => fit.reml_score,
