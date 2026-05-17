@@ -624,7 +624,7 @@ fn gaussian_reml_fit_backward<'py>(
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score,
     )
-    .map_err(py_value_error)?;
+    .map_err(|err| py_value_error(err.to_string()))?;
 
     let out = PyDict::new(py);
     let (grad_x, grad_by) = if let Some(by_values) = by_view {
@@ -4249,6 +4249,106 @@ mod batch_tests {
             }
         }
     }
+
+    #[test]
+    fn position_batched_backward_grad_t_matches_direct_t_finite_difference() {
+        let t = array![
+            0.08, 0.16, 0.27, 0.39, 0.51, 0.64, 0.76, 0.14, 0.24, 0.36, 0.52, 0.68, 0.84
+        ];
+        let y = Array2::from_shape_fn((t.len(), 2), |(row, output)| {
+            let u = t[row];
+            let scale = output as f64 + 1.0;
+            0.3 + 0.4 * scale * u + 0.15 * (2.0 * u + 0.2 * scale).sin()
+        });
+        let offsets = array![0_usize, 7_usize, 13_usize];
+        let knots = array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
+        let penalty = Array2::from_diag(&array![0.0, 0.35, 0.8, 1.4, 2.2, 3.1, 4.0]);
+        let weights = array![
+            1.0, 0.9, 1.1, 1.2, 0.85, 1.05, 0.95, 1.0, 1.15, 0.88, 1.04, 0.93, 1.08
+        ];
+        let grad_lambda = array![0.07, -0.04];
+        let grad_reml_score = array![0.11, -0.06];
+        let grad_coefficients =
+            Array3::from_shape_fn((2, penalty.nrows(), y.ncols()), |(b, i, j)| {
+                0.015 * (b as f64 + 1.0) * (i as f64 - 2.0) + 0.01 * (j as f64 + 1.0)
+            });
+        let grad_fitted = Array2::from_shape_fn(y.dim(), |(row, output)| {
+            0.02 * ((row as f64 + 1.0) * (output as f64 + 1.5)).sin()
+        });
+
+        let analytic = gaussian_reml_fit_positions_batched_backward_impl(
+            t.view(),
+            y.view(),
+            offsets.view(),
+            knots.view(),
+            "bspline",
+            3,
+            false,
+            None,
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.7),
+            Some(grad_lambda.view()),
+            Some(grad_coefficients.view()),
+            Some(grad_fitted.view()),
+            Some(grad_reml_score.view()),
+            None,
+            0,
+        )
+        .expect("position batched backward");
+
+        let loss = |candidate_t: ArrayView1<'_, f64>| -> f64 {
+            let fit = gaussian_reml_fit_positions_batched_impl(
+                candidate_t,
+                y.view(),
+                offsets.view(),
+                knots.view(),
+                "bspline",
+                3,
+                false,
+                None,
+                penalty.view(),
+                Some(weights.view()),
+                Some(0.7),
+                None,
+                0,
+            )
+            .expect("position batched forward");
+            let mut value = 0.0;
+            for b in 0..offsets.len() - 1 {
+                value += grad_lambda[b] * fit.lambdas[b];
+                value += grad_reml_score[b] * fit.reml_scores[b];
+                for i in 0..penalty.nrows() {
+                    for j in 0..y.ncols() {
+                        value += grad_coefficients[[b, i, j]] * fit.coefficients[[b, i, j]];
+                    }
+                }
+            }
+            for row in 0..y.nrows() {
+                for j in 0..y.ncols() {
+                    value += grad_fitted[[row, j]] * fit.fitted[[row, j]];
+                }
+            }
+            value
+        };
+
+        let eps = 1.0e-6;
+        for row in 0..t.len() {
+            let mut plus = t.clone();
+            let mut minus = t.clone();
+            plus[row] += eps;
+            minus[row] -= eps;
+            let fd = (loss(plus.view()) - loss(minus.view())) / (2.0 * eps);
+            let diff = (analytic.grad_t[row] - fd).abs();
+            let tol = 5.0e-5_f64.max(5.0e-5 * analytic.grad_t[row].abs().max(fd.abs()));
+            assert!(
+                diff <= tol,
+                "grad_t[{row}] mismatch: analytic={:.12e}, finite_difference={:.12e}, diff={diff:.3e}, tol={tol:.3e}",
+                analytic.grad_t[row],
+                fd
+            );
+        }
+    }
 }
 
 fn validate_vector(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String> {
@@ -5458,6 +5558,227 @@ mod tests {
             diff <= tol,
             "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
         );
+    }
+
+    fn position_fd_inputs() -> (
+        Array1<f64>,
+        Array2<f64>,
+        Array1<f64>,
+        Array2<f64>,
+        Array1<f64>,
+    ) {
+        let t = Array1::linspace(0.07, 0.93, 18);
+        let y = Array2::from_shape_fn((18, 2), |(row, col)| {
+            let x = t[row];
+            let phase = col as f64 + 1.0;
+            0.1 + 0.4 * phase * x + (1.2 * x + 0.3 * phase).sin() * 0.25
+        });
+        let knots = Array1::linspace(0.0, 1.0, 7);
+        let penalty = Array2::from_diag(&array![0.0, 0.8, 1.1, 1.5, 2.0, 2.8]);
+        let by = Array1::from_shape_fn(18, |row| 0.9 + 0.1 * (2.0 * t[row]).cos());
+        (t, y, knots, penalty, by)
+    }
+
+    fn position_objective(
+        t: ArrayView1<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        by: ArrayView1<'_, f64>,
+        knots: ArrayView1<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        grad_lambda: f64,
+        grad_coefficients: ArrayView2<'_, f64>,
+        grad_fitted: ArrayView2<'_, f64>,
+        grad_reml_score: f64,
+    ) -> f64 {
+        let x =
+            position_basis_design(t, knots, "bspline", 3, true, Some(1.0)).expect("position basis");
+        let gated_x = apply_by_gate(x.view(), by, 0).expect("by gate");
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            gated_x.view(),
+            y,
+            penalty,
+            None,
+            Some(0.7),
+            None,
+        )
+        .expect("position finite-difference fit");
+        grad_lambda * fit.lambda
+            + grad_reml_score * fit.reml_score
+            + (&fit.coefficients * &grad_coefficients).sum()
+            + (&fit.fitted * &grad_fitted).sum()
+    }
+
+    #[test]
+    fn position_batched_forward_matches_prebuilt_by_gated_design() {
+        let (t, y, knots, penalty, by) = position_fd_inputs();
+        let offsets = array![0_usize, 9_usize, 18_usize];
+        let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
+            .expect("position basis");
+        let gated_x = apply_by_gate(x.view(), by.view(), 0).expect("by gate");
+
+        let expected = gaussian_reml_fit_batched_impl(
+            gated_x.view(),
+            y.view(),
+            offsets.view(),
+            penalty.view(),
+            None,
+            Some(0.7),
+        )
+        .expect("prebuilt batched fit");
+        let actual = gaussian_reml_fit_positions_batched_impl(
+            t.view(),
+            y.view(),
+            offsets.view(),
+            knots.view(),
+            "bspline",
+            3,
+            true,
+            Some(1.0),
+            penalty.view(),
+            None,
+            Some(0.7),
+            Some(by.view()),
+            0,
+        )
+        .expect("position batched fit");
+
+        assert_eq!(actual.statuses, expected.statuses);
+        for b in 0..2 {
+            assert!((actual.lambdas[b] - expected.lambdas[b]).abs() < 1.0e-12);
+            assert!((actual.reml_scores[b] - expected.reml_scores[b]).abs() < 1.0e-12);
+        }
+        for (actual, expected) in actual.coefficients.iter().zip(expected.coefficients.iter()) {
+            assert!((*actual - *expected).abs() < 1.0e-12);
+        }
+        for (actual, expected) in actual.fitted.iter().zip(expected.fitted.iter()) {
+            assert!((*actual - *expected).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn position_backward_grad_t_y_and_by_match_finite_difference() {
+        let (t, y, knots, penalty, by) = position_fd_inputs();
+        let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
+            .expect("position basis");
+        let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        grad_coefficients[[3, 1]] = -0.25;
+        let grad_fitted = Array2::from_shape_fn(y.dim(), |(row, col)| {
+            0.02 * (row as f64 + 1.0) - 0.03 * (col as f64 + 1.0)
+        });
+        let grad_lambda = 0.17;
+        let grad_reml_score = -0.11;
+        let backward = gaussian_reml_fit_positions_backward_impl(
+            t.view(),
+            y.view(),
+            knots.view(),
+            "bspline",
+            3,
+            true,
+            Some(1.0),
+            penalty.view(),
+            None,
+            Some(0.7),
+            grad_lambda,
+            Some(grad_coefficients.view()),
+            Some(grad_fitted.view()),
+            grad_reml_score,
+            Some(by.view()),
+            0,
+        )
+        .expect("position analytic backward");
+        let grad_by = backward.grad_by.expect("by gradient");
+        let eps = 1.0e-5;
+
+        for row in [2_usize, 8, 15] {
+            let mut plus = t.clone();
+            let mut minus = t.clone();
+            plus[row] += eps;
+            minus[row] -= eps;
+            let fd = (position_objective(
+                plus.view(),
+                y.view(),
+                by.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            ) - position_objective(
+                minus.view(),
+                y.view(),
+                by.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )) / (2.0 * eps);
+            assert_fd_close(&format!("position t[{row}]"), backward.grad_t[row], fd);
+        }
+
+        for (row, col) in [(1_usize, 0_usize), (10, 1)] {
+            let mut plus = y.clone();
+            let mut minus = y.clone();
+            plus[[row, col]] += eps;
+            minus[[row, col]] -= eps;
+            let fd = (position_objective(
+                t.view(),
+                plus.view(),
+                by.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            ) - position_objective(
+                t.view(),
+                minus.view(),
+                by.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )) / (2.0 * eps);
+            assert_fd_close(
+                &format!("position y[{row},{col}]"),
+                backward.grad_y[[row, col]],
+                fd,
+            );
+        }
+
+        for row in [0_usize, 9, 17] {
+            let mut plus = by.clone();
+            let mut minus = by.clone();
+            plus[row] += eps;
+            minus[row] -= eps;
+            let fd = (position_objective(
+                t.view(),
+                y.view(),
+                plus.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            ) - position_objective(
+                t.view(),
+                y.view(),
+                minus.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )) / (2.0 * eps);
+            assert_fd_close(&format!("position by[{row}]"), grad_by[row], fd);
+        }
     }
 
     #[test]
