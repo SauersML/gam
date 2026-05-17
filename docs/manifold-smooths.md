@@ -39,7 +39,7 @@ A slower MP4 (first half of the loop, played at 2/3 speed) for
 closer inspection:
 
 <video controls autoplay loop muted playsinline width="100%">
-  <source src="images/geometric_shapes_demo_slow.mp4" type="video/mp4">
+  <source src="../images/geometric_shapes_demo_slow.mp4" type="video/mp4">
 </video>
 
 The script regenerates a full-length, full-speed MP4 alongside the
