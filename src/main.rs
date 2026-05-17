@@ -1111,11 +1111,14 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 effective_link,
                 LinkFunction::Sas | LinkFunction::BetaLogistic
             ),
-        // Nonlinear families require posterior covariance for prediction.
-        // Always compute inference for non-Gaussian models so that saved
-        // models contain the covariance matrix needed by posterior-mean
-        // prediction.
-        compute_inference: !matches!(family, LikelihoodFamily::GaussianIdentity),
+        // Posterior covariance is needed by `predict --uncertainty` for ALL
+        // families, not just non-Gaussian. Previously Gaussian skipped it as
+        // a perf optimization, which made `gam predict --uncertainty` error
+        // with "fit result does not contain conditional covariance or a
+        // usable penalized Hessian" on any standard Gaussian fit. The
+        // existing `COV_MAX_P=5000` diagonal-fallback guard in
+        // `solver/estimate.rs::3252` already caps the cost on huge models.
+        compute_inference: true,
         max_iter: fit_max_iter,
         tol: fit_tol,
         nullspace_dims: vec![],
@@ -1185,7 +1188,9 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 optimize_mixture: true,
                 sas_link: None,
                 optimize_sas: false,
-                compute_inference: !matches!(family, LikelihoodFamily::GaussianIdentity),
+                // Always compute inference so `predict --uncertainty` works
+                // for Gaussian fits too (see comment near the other compute_inference site).
+                compute_inference: true,
                 max_iter: fit_max_iter,
                 tol: fit_tol,
                 nullspace_dims: design.nullspace_dims.clone(),
