@@ -46,7 +46,9 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
-use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
+use numpy::{
+    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict};
@@ -1181,30 +1183,30 @@ fn gaussian_reml_fit_state_from_pydict(
 
     Ok(gam::gaussian_reml::GaussianRemlMultiResult {
         lambda: get(state, "lambda")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         rho: get(state, "rho")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         coefficients,
         fitted,
         reml_score: get(state, "reml_score")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         reml_grad_lambda: get(state, "reml_grad_lambda")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         reml_hess_lambda: get(state, "reml_hess_lambda")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         reml_grad_rho: get(state, "reml_grad_rho")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         reml_hess_rho: get(state, "reml_hess_rho")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         edf: get(state, "edf")?
-            .extract()
+            .extract::<f64>()
             .map_err(|err| err.to_string())?,
         sigma2,
         cache: gam::gaussian_reml::GaussianRemlEigenCache {
@@ -1212,22 +1214,22 @@ fn gaussian_reml_fit_state_from_pydict(
             eigenvectors,
             coefficient_basis,
             xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
-                .extract()
+                .extract::<u64>()
                 .map_err(|err| err.to_string())?,
             penalty_fingerprint: get(state, "cache_penalty_fingerprint")?
-                .extract()
+                .extract::<u64>()
                 .map_err(|err| err.to_string())?,
             logdet_xtwx: get(state, "cache_logdet_xtwx")?
-                .extract()
+                .extract::<f64>()
                 .map_err(|err| err.to_string())?,
             logdet_penalty_positive: get(state, "cache_logdet_penalty_positive")?
-                .extract()
+                .extract::<f64>()
                 .map_err(|err| err.to_string())?,
             penalty_rank: get(state, "cache_penalty_rank")?
-                .extract()
+                .extract::<usize>()
                 .map_err(|err| err.to_string())?,
             nullity: get(state, "cache_nullity")?
-                .extract()
+                .extract::<usize>()
                 .map_err(|err| err.to_string())?,
         },
     })
