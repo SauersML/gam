@@ -1468,29 +1468,40 @@ fn optimize_rho(
     if prepared.cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
-    let mut candidates = Vec::<f64>::new();
-    push_candidate(&mut candidates, RHO_LOWER);
-    push_candidate(&mut candidates, RHO_UPPER);
-    if let Some(rho0) = init_rho {
-        push_candidate(&mut candidates, rho0);
-    }
 
     const GRID_INTERVALS: usize = 96;
+    let mut stationary = Vec::<f64>::new();
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = prepared.evaluate(prev_rho);
     for i in 1..=GRID_INTERVALS {
         let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
         let eval = prepared.evaluate(rho);
-        push_candidate(&mut candidates, rho);
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
             push_candidate(
-                &mut candidates,
+                &mut stationary,
                 refine_stationary_rho(prepared, prev_rho, rho, 0.5 * (prev_rho + rho)),
             );
         }
         prev_rho = rho;
         prev_eval = eval;
     }
+
+    // Prefer interior stationary points (smooth under X perturbation). Only fall
+    // back to boundaries when no stationary point exists — this avoids a kink
+    // where a grid candidate's cost crosses below a refined stationary point's
+    // cost, which would make d(reml_score, lambda)/dX discontinuous and break
+    // analytic-vs-FD agreement at strict tolerance.
+    let candidates = if stationary.is_empty() {
+        let mut boundary = Vec::<f64>::new();
+        push_candidate(&mut boundary, RHO_LOWER);
+        push_candidate(&mut boundary, RHO_UPPER);
+        if let Some(rho0) = init_rho {
+            push_candidate(&mut boundary, rho0);
+        }
+        boundary
+    } else {
+        stationary
+    };
 
     candidates
         .into_iter()
