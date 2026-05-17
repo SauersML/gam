@@ -3400,9 +3400,38 @@ impl<'a> RemlState<'a> {
             }
         };
         let xtwy = self.x.transpose_vector_multiply(&wz);
+        // Build the matching sparse-path XᵀWX as well, when the design
+        // exposes a sparse form. The sparse REML path rebuilds
+        // H = XᵀWX + Sλ + δI per outer eval, so caching the constant
+        // XᵀWX contribution lets the inner assemble skip the SpGEMM.
+        let xtwx_sparse_orig = if let Some(sparse_design) = self.x.as_sparse() {
+            let sparse_start = std::time::Instant::now();
+            match crate::pirls::SparseXtwxPrecomputed::build(
+                sparse_design.as_ref(),
+                &weights_owned,
+            ) {
+                Ok(precomp) => {
+                    log::info!(
+                        "[gaussian-fixed-cache] sparse XᵀWX nnz={} built in {:.3} ms",
+                        precomp.xtwxvalues.len(),
+                        sparse_start.elapsed().as_secs_f64() * 1e3
+                    );
+                    Some(Arc::new(precomp))
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[gaussian-fixed-cache] sparse XᵀWX build failed; falling back: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let cache = Arc::new(crate::pirls::GaussianFixedCache {
             xtwx_orig: xtwx,
             xtwy_orig: xtwy,
+            xtwx_sparse_orig,
         });
         log::info!(
             "[gaussian-fixed-cache] built p={} n={} in {:.3} ms",
