@@ -52,6 +52,10 @@ pub struct GaussianRemlResult {
     pub coefficients: Array1<f64>,
     pub fitted: Array1<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: f64,
     pub cache: GaussianRemlEigenCache,
@@ -64,9 +68,26 @@ pub struct GaussianRemlMultiResult {
     pub coefficients: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlScoreDerivatives {
+    pub reml_score: f64,
+    pub grad_lambda: f64,
+    pub hess_lambda: f64,
+    pub grad_x: Array2<f64>,
+    pub grad_y: Array2<f64>,
+    pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub sigma2: Array1<f64>,
+    pub edf: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +195,10 @@ fn scalar_result_from_multi(
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
+        reml_grad_lambda: result.reml_grad_lambda,
+        reml_hess_lambda: result.reml_hess_lambda,
+        reml_grad_rho: result.reml_grad_rho,
+        reml_hess_rho: result.reml_hess_rho,
         edf: result.edf,
         sigma2: result.sigma2[0],
         cache: result.cache,
@@ -330,9 +355,80 @@ fn gaussian_reml_multi_closed_form_from_parts(
         coefficients,
         fitted,
         reml_score: eval.cost,
+        reml_grad_lambda,
+        reml_hess_lambda,
+        reml_grad_rho: eval.grad,
+        reml_hess_rho: eval.hess,
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
+    })
+}
+
+pub fn gaussian_reml_score_derivatives(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    lambda: f64,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML lambda must be finite and positive; got {lambda}"
+        )));
+    }
+    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
+    let eval = prepared.evaluate(lambda.ln());
+    let coefficients = prepared.coefficients(lambda);
+    let fitted = x.dot(&coefficients);
+    let sigma2 = prepared.sigma2(lambda);
+    let grad_lambda = eval.grad / lambda;
+    let hess_lambda = (eval.hess - eval.grad) / (lambda * lambda);
+
+    let n = x.nrows();
+    let d = y.ncols();
+    let weight = gaussian_reml_weights(n, weights)?;
+
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        for value in wx.row_mut(i) {
+            *value *= weight[i];
+        }
+    }
+    let mut hessian = x.t().dot(&wx);
+    hessian += &(penalty.to_owned() * lambda);
+    let chol = hessian
+        .cholesky(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    let lower = chol.lower_triangular();
+    let h_inv = solve_upper_triangular_matrix(
+        &lower.t().to_owned(),
+        &solve_lower_triangular_matrix(&lower, &Array2::eye(hessian.nrows()))?,
+    )?;
+
+    let residual = y.to_owned() - &fitted;
+    let mut grad_y = residual;
+    for j in 0..d {
+        for i in 0..n {
+            grad_y[[i, j]] *= weight[i] / sigma2[j];
+        }
+    }
+    let mut logdet_grad_x = wx.dot(&h_inv);
+    logdet_grad_x *= d as f64;
+    let grad_x = logdet_grad_x - grad_y.dot(&coefficients.t());
+
+    Ok(GaussianRemlScoreDerivatives {
+        reml_score: eval.cost,
+        grad_lambda,
+        hess_lambda,
+        grad_x,
+        grad_y,
+        coefficients,
+        fitted,
+        sigma2,
+        edf: eval.edf,
     })
 }
 
