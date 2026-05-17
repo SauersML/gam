@@ -11,13 +11,25 @@ Observed error message:
   custom-family optimization error: outer smoothing optimization final
   inner refit did not converge after 100 cycles.
 
-Hypotheses to investigate (root cause):
-1. Inner-solve PIRLS step too aggressive on skewed Gamma-distributed y;
-   needs smaller initial step / better warm start.
-2. Initial monotone response basis is unstable when y has a heavy
-   right tail (max(y) >> mean(y)).
-3. Optimization tolerance is too tight relative to the achievable
-   precision on the response-side basis for this distribution.
+Updated diagnosis (after probing): bumping inner_max_cycles from 100 to
+300 does NOT fix the failure — at cycle 299 the inner Newton is still
+proposing step 0.9 (vs tol 0.004) with `beta_inf` ≈ 3713 (way beyond
+the y range 0–6). The joint Newton is oscillating, not slowly
+converging, almost certainly because the joint Hessian over
+(β, monotone-ψ) is rank-deficient in some direction at extreme β.
+
+Real root cause candidates (open for the next cycle):
+1. Joint inner Hessian needs Levenberg–Marquardt damping in the joint
+   Newton when ‖β‖ grows past a sane bound. Currently the step
+   acceptance has no LM guard — every full step is accepted even when
+   obj barely moves.
+2. Initial response-basis ψ⁰ is mis-scaled when `max(y) ≫ mean(y)` —
+   the monotone basis evaluated on the heavy tail produces extreme
+   leverage rows. A heavy-tail-aware ψ⁰ (e.g. quantile-spaced knots
+   from `log(1 + y)` rather than from raw y) would damp this.
+3. Outer REML strategy is asking for ρ values that force β extreme;
+   a ρ box-constraint or step trust radius would prevent the inner
+   from being asked to solve an ill-posed sub-problem.
 
 Once fixed, run this script and expect a successful fit + sensible
 predictions.
