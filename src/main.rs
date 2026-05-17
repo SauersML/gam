@@ -3556,7 +3556,12 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         let eta = design.design.dot(&fit_saved.beta);
-        let alo_design_dense = design.design.as_dense_cow();
+        // ALO needs a dense X — materialize from row chunks when the design
+        // is an operator-backed (lazy) one. `as_dense_cow` panicked on lazy
+        // designs ("called on operator-backed design; use row chunks or
+        // matrix-vector products"), which broke `diagnose --alo` for every
+        // matern/duchon/sphere fit since those default to lazy storage.
+        let alo_design_dense = design.design.to_dense();
         let input =
             gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, 1.0);
         progress.advance_workflow(4);
