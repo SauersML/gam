@@ -487,6 +487,7 @@ pub fn build_smooth_basis(
                         .join(", ")
                 ));
             }
+            validate_tensor_bc_entries(options, cols.len())?;
             let periodic_axes = parse_periodic_axes(options, cols.len())?;
             let periods = parse_periods(options, &periodic_axes)?;
             let origins = parse_period_origins(options, &periodic_axes)?;
@@ -1401,6 +1402,38 @@ fn parse_periodic_axes(
         }
     }
     Ok(out)
+}
+
+fn validate_tensor_bc_entries(
+    options: &BTreeMap<String, String>,
+    ndim: usize,
+) -> Result<(), String> {
+    let Some(raw_bc) = options.get("bc") else {
+        return Ok(());
+    };
+    let vals = split_list_option(raw_bc);
+    if vals.len() != ndim {
+        return Err(format!(
+            "bc must have one entry per margin ({ndim}), got {}",
+            vals.len()
+        ));
+    }
+    for (dim, value) in vals.iter().enumerate() {
+        let l = value
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase();
+        if matches!(
+            l.as_str(),
+            "periodic" | "cyclic" | "cc" | "natural" | "free" | "none"
+        ) {
+            continue;
+        }
+        return Err(format!(
+            "tensor smooth bc entry {dim}={value:?} is not supported. Tensor margins currently support only periodic/cyclic/cc or natural/free/none; use separate s(..., bc=...) terms for endpoint clamped/anchored 1D boundary conditions."
+        ));
+    }
+    Ok(())
 }
 
 fn parse_periods(
