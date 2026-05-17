@@ -349,6 +349,8 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
+    let (reml_grad_lambda, reml_hess_lambda) =
+        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
@@ -471,7 +473,6 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
     let n = x.nrows();
-    let p = x.ncols();
     validate_gaussian_reml_design(x, penalty, weights)?;
     let weight = gaussian_reml_weights(n, weights)?;
 
@@ -680,30 +681,6 @@ fn validate_gaussian_reml_eigen_cache(
     Ok(())
 }
 
-fn gaussian_reml_eigen_cache_matches(
-    cache: &GaussianRemlEigenCache,
-    p: usize,
-    xtwx_fingerprint: u64,
-    penalty_fingerprint: u64,
-    nullspace_dim: Option<usize>,
-) -> Result<bool, EstimationError> {
-    validate_gaussian_reml_eigen_cache(cache, p)?;
-    if cache.xtwx_fingerprint != xtwx_fingerprint
-        || cache.penalty_fingerprint != penalty_fingerprint
-    {
-        return Ok(false);
-    }
-    if let Some(expected_nullity) = nullspace_dim {
-        if expected_nullity != cache.nullity {
-            return Err(EstimationError::InvalidInput(format!(
-                "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
-                cache.nullity
-            )));
-        }
-    }
-    Ok(true)
-}
-
 fn prepare_gaussian_reml(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -729,17 +706,6 @@ fn prepare_gaussian_reml(
     }
     let weight = gaussian_reml_weights(n, weights)?;
 
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
-    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
-    let penalty_fingerprint = matrix_fingerprint(penalty);
-
     let mut wy = y.to_owned();
     for i in 0..n {
         let wi = weight[i];
@@ -751,26 +717,41 @@ fn prepare_gaussian_reml(
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
 
     if let Some(cache) = eigen_cache {
-        if gaussian_reml_eigen_cache_matches(
-            cache,
-            p,
-            xtwx_fingerprint,
-            penalty_fingerprint,
-            nullspace_dim,
-        )? {
-            let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
-            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
-            return Ok(GaussianRemlPrepared {
-                cache: cache.clone(),
-                ywy,
-                projected_rhs_squared,
-                projected_rhs,
-                n_observations: n,
-                n_outputs: d,
-            });
+        validate_gaussian_reml_eigen_cache(cache, p)?;
+        let penalty_fingerprint = matrix_fingerprint(penalty);
+        if cache.penalty_fingerprint != penalty_fingerprint {
+            return Err(EstimationError::InvalidInput(
+                "Gaussian REML eigen cache penalty mismatch".to_string(),
+            ));
         }
+        if let Some(expected_nullity) = nullspace_dim {
+            if expected_nullity != cache.nullity {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
+                    cache.nullity
+                )));
+            }
+        }
+        let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+        let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+        return Ok(GaussianRemlPrepared {
+            cache: cache.clone(),
+            ywy,
+            projected_rhs_squared,
+            projected_rhs,
+            n_observations: n,
+            n_outputs: d,
+        });
     }
 
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
