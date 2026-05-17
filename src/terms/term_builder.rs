@@ -399,6 +399,21 @@ pub fn build_smooth_basis(
 
     match type_opt.as_str() {
         "tensor" | "te" | "tensor-bspline" => {
+            validate_known_options(
+                "te",
+                options,
+                &[
+                    "type", "bs",
+                    "k", "basis_dim", "basis-dim", "basisdim",
+                    "knots", "degree", "penalty_order",
+                    "bc",
+                    "periodic", "period", "periods",
+                    "period_start", "period_end",
+                    "origin", "origins", "period_origin", "period-origin", "domain_origin",
+                    "double_penalty",
+                    "identifiability",
+                ],
+            )?;
             if cols.len() < 2 {
                 return Err(format!(
                     "tensor smooth requires >=2 variables: {}",
@@ -506,6 +521,17 @@ pub fn build_smooth_basis(
             })
         }
         "periodic" | "cyclic" | "periodic-bspline" | "cc" => {
+            validate_known_options(
+                "periodic",
+                options,
+                &[
+                    "type", "bs",
+                    "k", "basis_dim", "basis-dim", "basisdim", "degree", "penalty_order",
+                    "period", "periods", "period_start", "period_end",
+                    "origin", "period_origin", "period-origin", "domain_origin",
+                    "double_penalty",
+                ],
+            )?;
             if cols.len() != 1 {
                 return Err(format!(
                     "periodic smooth expects one variable, got {}",
@@ -547,6 +573,23 @@ pub fn build_smooth_basis(
             })
         }
         "bspline" | "ps" | "p-spline" => {
+            validate_known_options(
+                "bspline",
+                options,
+                &[
+                    "type", "bs",
+                    "k", "basis_dim", "basis-dim", "basisdim", "knots", "degree",
+                    "penalty_order",
+                    "bc", "bc_left", "bc_right", "left_bc", "right_bc",
+                    "start_bc", "end_bc",
+                    "anchor", "anchor_value", "value",
+                    "anchor_left", "left_anchor", "anchor_right", "right_anchor",
+                    "periodic", "period", "periods",
+                    "period_start", "period_end", "origin",
+                    "double_penalty",
+                    "identifiability",
+                ],
+            )?;
             if cols.len() != 1 {
                 return Err(format!(
                     "bspline smooth expects one variable, got {}",
