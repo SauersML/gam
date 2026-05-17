@@ -6013,6 +6013,12 @@ pub struct GaussianFixedCache {
     pub xtwx_orig: Array2<f64>,
     /// `XᵀW(y − offset)` in the original basis. Length p.
     pub xtwy_orig: Array1<f64>,
+    /// `(y − offset)ᵀW(y − offset)`.
+    ///
+    /// Together with `xtwx_orig` and `xtwy_orig`, this is the last scalar
+    /// sufficient statistic needed to evaluate the Gaussian penalized RSS
+    /// exactly at any λ without re-streaming the rows.
+    pub centered_weighted_y_sq: f64,
     /// `XᵀWX` precomputed for the sparse path, aligned with the symbolic
     /// pattern of `SparseXtWxCache::new(x)` on the original sparse design.
     /// `None` when the design has no sparse form (e.g. dense-only fits).
