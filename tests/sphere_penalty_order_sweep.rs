@@ -129,8 +129,8 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
     // someone derives the correct m=4 kernel constants. Don't silence
     // it — that's the whole point of failing here.
     init_parallelism();
-    let (rmse, mn, mx) = run("y ~ sphere(lat, lon, k=30, m=4)")
-        .expect("wahba m=4 fit must succeed");
+    let (rmse, mn, mx) =
+        run("y ~ sphere(lat, lon, k=30, m=4)").expect("wahba m=4 fit must succeed");
     // The other Wahba orders (m=1, 2, 3) all hit rmse ≤ 0.018 on the
     // same data. Require m=4 to be in the same ballpark — generous 5×
     // budget = 0.10.

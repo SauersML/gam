@@ -25,7 +25,6 @@ pub struct GaussianRemlResult {
     pub lambda: f64,
     pub rho: f64,
     pub coefficients: Array1<f64>,
-    pub fitted: Array1<f64>,
     pub reml_score: f64,
     pub reml_grad_rho: f64,
     pub reml_hess_rho: f64,
@@ -39,7 +38,6 @@ pub struct GaussianRemlMultiResult {
     pub lambda: f64,
     pub rho: f64,
     pub coefficients: Array2<f64>,
-    pub fitted: Array2<f64>,
     pub reml_score: f64,
     pub reml_grad_rho: f64,
     pub reml_hess_rho: f64,
@@ -79,7 +77,6 @@ pub fn gaussian_reml_closed_form(
         lambda: result.lambda,
         rho: result.rho,
         coefficients: result.coefficients.column(0).to_owned(),
-        fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
         reml_grad_rho: result.reml_grad_rho,
         reml_hess_rho: result.reml_hess_rho,
@@ -101,13 +98,11 @@ pub fn gaussian_reml_multi_closed_form(
     let eval = prepared.evaluate(rho);
     let lambda = rho.exp();
     let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
         coefficients,
-        fitted,
         reml_score: eval.cost,
         reml_grad_rho: eval.grad,
         reml_hess_rho: eval.hess,
@@ -139,7 +134,11 @@ fn prepare_gaussian_reml(
             penalty.ncols()
         )));
     }
-    if x.iter().chain(y.iter()).chain(penalty.iter()).any(|v| !v.is_finite()) {
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .any(|v| !v.is_finite())
+    {
         return Err(EstimationError::InvalidInput(
             "Gaussian REML inputs must be finite".to_string(),
         ));
@@ -186,10 +185,11 @@ fn prepare_gaussian_reml(
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     let l_inv = invert_lower_triangular(&lower)?;
     let transformed_penalty = l_inv.dot(&penalty.to_owned()).dot(&l_inv.t());
-    let (mut penalty_eigenvalues, eigenvectors) = transformed_penalty
-        .eigh(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+    let (mut penalty_eigenvalues, eigenvectors) =
+        transformed_penalty.eigh(Side::Lower).map_err(|_| {
+            EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            }
         })?;
     let scale = penalty_eigenvalues
         .iter()
@@ -214,12 +214,11 @@ fn prepare_gaussian_reml(
     let logdet_penalty_positive = if penalty_rank == 0 {
         0.0
     } else {
-        let (pen_eigs, _) = penalty
-            .to_owned()
-            .eigh(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
+        let (pen_eigs, _) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
+            EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
-            })?;
+            }
+        })?;
         let pen_scale = pen_eigs
             .iter()
             .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
@@ -267,7 +266,7 @@ impl GaussianRemlPrepared {
         let mut logdet_h = self.cache.logdet_xtwx;
         let mut trace_h = 0.0;
         let mut trace_h_deriv = 0.0;
-        let mut edf = self.cache.nullity as f64;
+        let mut edf = 0.0;
         for &delta in &self.cache.penalty_eigenvalues {
             let t = lambda * delta;
             logdet_h += (1.0 + t).ln();
@@ -277,8 +276,7 @@ impl GaussianRemlPrepared {
             }
             edf += 1.0 / (1.0 + t);
         }
-        let logdet_s = self.cache.logdet_penalty_positive
-            + (self.cache.penalty_rank as f64) * rho;
+        let logdet_s = self.cache.logdet_penalty_positive + (self.cache.penalty_rank as f64) * rho;
 
         let mut cost = 0.5 * d * (logdet_h - logdet_s);
         let mut grad = 0.5 * d * (trace_h - self.cache.penalty_rank as f64);
@@ -339,39 +337,93 @@ fn optimize_rho(
     if prepared.cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
     }
-    let mut lo = RHO_LOWER;
-    let mut hi = RHO_UPPER;
-    let grad_lo = prepared.evaluate(lo).grad;
-    let grad_hi = prepared.evaluate(hi).grad;
-    if grad_lo >= 0.0 {
-        return Ok(lo);
+    let mut candidates = Vec::<f64>::new();
+    push_candidate(&mut candidates, RHO_LOWER);
+    push_candidate(&mut candidates, RHO_UPPER);
+    if let Some(rho0) = init_rho {
+        push_candidate(&mut candidates, rho0.clamp(RHO_LOWER, RHO_UPPER));
     }
-    if grad_hi <= 0.0 {
-        return Ok(hi);
-    }
-    let mut rho = init_rho.unwrap_or(0.0).clamp(lo, hi);
-    for _ in 0..80 {
+
+    const GRID_INTERVALS: usize = 96;
+    let mut prev_rho = RHO_LOWER;
+    let mut prev_eval = prepared.evaluate(prev_rho);
+    for i in 1..=GRID_INTERVALS {
+        let rho = RHO_LOWER + (RHO_UPPER - RHO_LOWER) * (i as f64) / (GRID_INTERVALS as f64);
         let eval = prepared.evaluate(rho);
-        if eval.grad.abs() <= GRAD_TOL * (1.0 + eval.cost.abs()) {
-            return Ok(rho);
+        push_candidate(&mut candidates, rho);
+        if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
+            push_candidate(
+                &mut candidates,
+                refine_stationary_rho(prepared, prev_rho, rho, prev_eval.grad, eval.grad),
+            );
         }
-        if eval.grad > 0.0 {
-            hi = rho;
-        } else {
-            lo = rho;
-        }
-        let newton = if eval.hess > 0.0 {
-            let candidate = rho - eval.grad / eval.hess;
+        prev_rho = rho;
+        prev_eval = eval;
+    }
+
+    candidates
+        .into_iter()
+        .min_by(|&a, &b| {
+            prepared
+                .evaluate(a)
+                .cost
+                .total_cmp(&prepared.evaluate(b).cost)
+        })
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "Gaussian REML optimizer produced no candidates".to_string(),
+            )
+        })
+}
+
+fn push_candidate(candidates: &mut Vec<f64>, rho: f64) {
+    if rho.is_finite() {
+        candidates.push(rho.clamp(RHO_LOWER, RHO_UPPER));
+    }
+}
+
+fn refine_stationary_rho(
+    prepared: &GaussianRemlPrepared,
+    mut lo: f64,
+    mut hi: f64,
+    mut grad_lo: f64,
+    mut grad_hi: f64,
+) -> f64 {
+    if grad_lo == 0.0 {
+        return lo;
+    }
+    if grad_hi == 0.0 {
+        return hi;
+    }
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        let eval_mid = prepared.evaluate(mid);
+        let newton = if eval_mid.hess > 0.0 {
+            let candidate = mid - eval_mid.grad / eval_mid.hess;
             (candidate > lo && candidate < hi).then_some(candidate)
         } else {
             None
         };
-        rho = newton.unwrap_or(0.5 * (lo + hi));
+        let rho = newton.unwrap_or(mid);
+        let eval = prepared.evaluate(rho);
+        if eval.grad.abs() <= GRAD_TOL * (1.0 + eval.cost.abs()) {
+            return rho;
+        }
+        if eval.grad >= 0.0 {
+            hi = rho;
+            grad_hi = eval.grad;
+        } else {
+            lo = rho;
+            grad_lo = eval.grad;
+        }
         if (hi - lo).abs() <= 1e-12 * (1.0 + rho.abs()) {
-            return Ok(rho);
+            break;
+        }
+        if !(grad_lo <= 0.0 && grad_hi >= 0.0) {
+            break;
         }
     }
-    Ok(rho)
+    0.5 * (lo + hi)
 }
 
 fn invert_lower_triangular(lower: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
@@ -442,4 +494,54 @@ fn solve_upper_triangular_matrix(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn edf_does_not_double_count_penalty_nullspace() {
+        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0],];
+        let y = array![[0.0], [1.0], [1.8], [3.2], [4.1]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let result =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty.view(), None, Some(0.0))
+                .expect("small full-rank Gaussian REML fit");
+
+        assert!(result.edf >= result.cache.nullity as f64);
+        assert!(result.edf <= x.ncols() as f64 + 1.0e-10);
+    }
+
+    #[test]
+    fn multi_output_duplicate_columns_match_scalar_fit() {
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.5],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 1.0],
+            [1.0, 1.5],
+        ];
+        let y1 = array![0.5, 0.2, 0.0, 0.3, 1.1, 2.0];
+        let y = Array2::from_shape_fn(
+            (y1.len(), 2),
+            |(i, j)| if j == 0 { y1[i] } else { 2.0 * y1[i] },
+        );
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+
+        let scalar =
+            gaussian_reml_closed_form(x.view(), y1.view(), penalty.view(), None, Some(0.0))
+                .expect("scalar Gaussian REML fit");
+        let multi =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty.view(), None, Some(0.0))
+                .expect("multi-output Gaussian REML fit");
+
+        assert!((multi.rho - scalar.rho).abs() <= 1.0e-8);
+        for i in 0..x.ncols() {
+            assert!((multi.coefficients[[i, 0]] - scalar.coefficients[i]).abs() <= 1.0e-8);
+            assert!((multi.coefficients[[i, 1]] - 2.0 * scalar.coefficients[i]).abs() <= 1.0e-8);
+        }
+    }
 }
