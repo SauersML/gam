@@ -354,6 +354,24 @@ pub fn build_smooth_basis(
     policy: &ResourcePolicy,
     smooth_coordinate_count: usize,
 ) -> Result<SmoothBasisSpec, String> {
+    // Fail fast on degenerate input columns: a smooth over a column that takes
+    // only one finite value can only ever fit the response mean — the design
+    // matrix is rank-1, and the user almost certainly didn't mean to model a
+    // constant predictor as a smooth. Without this guard, `smooth(x)` and
+    // `matern(x)` silently fit the mean of `y` regardless of `x`, and the
+    // user has no way to tell from looking at the predictions (they're all
+    // the same number). Duchon already errors loudly via the basis layer
+    // ("smooth basis collapses onto the parametric block"); this lift makes
+    // the same diagnosis explicit and uniform across smooth families.
+    for (var, &col) in vars.iter().zip(cols.iter()) {
+        if unique_count_column(ds.values.column(col)) <= 1 {
+            return Err(format!(
+                "smooth term over '{var}' has only one unique value in the training data \
+                 — a smooth on a constant column is degenerate and would only fit the response mean. \
+                 Remove `{var}` from the smooth, drop the term, or check the data."
+            ));
+        }
+    }
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let has_periodic_option = options.contains_key("periodic")
         || options.contains_key("cyclic")
