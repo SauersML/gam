@@ -1158,6 +1158,12 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     let mut timewiggle: Option<LinkWiggleFormulaSpec> = None;
     let mut linkspec: Option<LinkFormulaSpec> = None;
     let mut survivalspec: Option<SurvivalFormulaSpec> = None;
+    // Track seen-term-keys so we can reject exact duplicates like
+    // `y ~ smooth(x) + smooth(x)` upfront — without this the duplicate
+    // produces a rank-deficient design and the user has no idea why their
+    // fit is over-parameterized.
+    let mut seen_term_keys: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
     for raw in parsed_dsl.rhs_terms {
         let t = raw.trim();
         if t.is_empty() || t == "1" {
@@ -1167,6 +1173,15 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
             return Err(
                 "formula terms '0'/'-1' (intercept removal) are not supported yet".to_string(),
             );
+        }
+        // Normalize whitespace so `smooth(x)` and `smooth( x )` match.
+        let key: String = t.split_whitespace().collect::<Vec<_>>().join("");
+        if !seen_term_keys.insert(key.clone()) {
+            return Err(format!(
+                "formula `{formula}` lists term `{t}` more than once. \
+                 Duplicate terms produce a rank-deficient design; \
+                 keep one copy or differentiate them (e.g. distinct k=, bs= options)."
+            ));
         }
         match parse_term(t)? {
             ParsedTerm::LinkWiggle { options } => {
