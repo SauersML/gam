@@ -767,6 +767,7 @@ def gaussian_reml_fit_backward(
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
     grad_reml_score: float = 0.0,
+    forward_state: dict[str, Any] | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
     by: Any | None = None,
@@ -786,6 +787,7 @@ def gaussian_reml_fit_backward(
             else _numeric_matrix(grad_coefficients, "grad_coefficients"),
             None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
             float(grad_reml_score),
+            forward_state,
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -1107,6 +1109,9 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
         "reml_grad_rho",
         "reml_hess_rho",
         "edf",
+        "cache_penalty_eigenvalues",
+        "cache_eigenvectors",
+        "cache_coefficient_basis",
     ):
         if key in out:
             out[key] = np.asarray(out[key], dtype=float)
