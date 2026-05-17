@@ -699,6 +699,71 @@ def gaussian_weighted_ridge(
     return np.asarray(coefficients, dtype=float), np.asarray(fitted, dtype=float)
 
 
+def gaussian_reml_fit(
+    x: Any,
+    y: Any,
+    penalty: Any,
+    *,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
+) -> dict[str, Any]:
+    """Fit a closed-form Gaussian REML problem from NumPy-compatible arrays."""
+    import numpy as np
+
+    try:
+        out = rust_module().gaussian_reml_fit(
+            _numeric_matrix(x, "x"),
+            _numeric_matrix(y, "y"),
+            _numeric_matrix(penalty, "penalty"),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _coerce_gaussian_reml_payload(out, np)
+
+
+def gaussian_reml_fit_batched(
+    x: Any,
+    y: Any,
+    row_offsets: Any,
+    penalty: Any,
+    *,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Fit K closed-form Gaussian REML problems packed by row offsets."""
+    import numpy as np
+
+    offsets = np.asarray(row_offsets, dtype=np.uintp)
+    if offsets.ndim != 1:
+        raise ValueError("row_offsets must be a 1D integer array")
+    try:
+        out = rust_module().gaussian_reml_fit_batched(
+            _numeric_matrix(x, "x"),
+            _numeric_matrix(y, "y"),
+            np.ascontiguousarray(offsets),
+            _numeric_matrix(penalty, "penalty"),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _coerce_gaussian_reml_payload(out, np)
+
+
+def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
+    out = dict(payload)
+    for key in ("coefficients", "fitted", "sigma2", "lambda", "rho", "reml_score", "edf"):
+        if key in out:
+            out[key] = np.asarray(out[key], dtype=float)
+    return out
+
+
 def _numeric_vector(values: Any, label: str) -> Any:
     import numpy as np
 
