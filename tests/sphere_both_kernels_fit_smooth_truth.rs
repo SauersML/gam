@@ -34,11 +34,14 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     for _ in 0..n {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
-        let y = 0.5 + 0.6 * lat.to_radians().sin()
+        let y = 0.5
+            + 0.6 * lat.to_radians().sin()
             + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
-            lat.to_string(), lon.to_string(), y.to_string(),
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
         ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -75,7 +78,9 @@ fn rmse_against_truth(formula: &str) -> Result<f64, String> {
     let design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .map_err(|e| format!("design: {e:?}"))?;
     let pred = design.design.apply(&fit.fit.beta).to_vec();
-    let sumsq: f64 = pred.iter().zip(pts.iter())
+    let sumsq: f64 = pred
+        .iter()
+        .zip(pts.iter())
         .map(|(p, (lat, lon))| (p - truth(*lat, *lon)).powi(2))
         .sum();
     Ok((sumsq / n as f64).sqrt())
@@ -139,7 +144,7 @@ fn sphere_method_aliases_route_to_correct_kernel() {
     };
     let data = make_dataset(200);
     for method in [
-        "wahba",          // default → sobolev
+        "wahba", // default → sobolev
         "wahba_sobolev",
         "wahba_pseudo",
         "sobolev",
