@@ -2,6 +2,7 @@ use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use rayon::prelude::*;
 
 const RHO_LOWER: f64 = -30.0;
 const RHO_UPPER: f64 = 30.0;
@@ -14,10 +15,34 @@ pub struct GaussianRemlEigenCache {
     pub penalty_eigenvalues: Array1<f64>,
     pub eigenvectors: Array2<f64>,
     pub coefficient_basis: Array2<f64>,
+    pub xtwx_fingerprint: u64,
+    pub penalty_fingerprint: u64,
     pub logdet_xtwx: f64,
     pub logdet_penalty_positive: f64,
     pub penalty_rank: usize,
     pub nullity: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GaussianRemlWarmStart {
+    pub lambda: Option<f64>,
+    pub eigen_cache: Option<GaussianRemlEigenCache>,
+}
+
+impl GaussianRemlWarmStart {
+    pub fn from_result(result: &GaussianRemlResult) -> Self {
+        Self {
+            lambda: Some(result.lambda),
+            eigen_cache: Some(result.cache.clone()),
+        }
+    }
+
+    pub fn from_multi_result(result: &GaussianRemlMultiResult) -> Self {
+        Self {
+            lambda: Some(result.lambda),
+            eigen_cache: Some(result.cache.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -25,11 +50,8 @@ pub struct GaussianRemlResult {
     pub lambda: f64,
     pub rho: f64,
     pub coefficients: Array1<f64>,
+    pub fitted: Array1<f64>,
     pub reml_score: f64,
-    pub reml_grad_lambda: f64,
-    pub reml_hess_lambda: f64,
-    pub reml_grad_rho: f64,
-    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: f64,
     pub cache: GaussianRemlEigenCache,
@@ -40,27 +62,27 @@ pub struct GaussianRemlMultiResult {
     pub lambda: f64,
     pub rho: f64,
     pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
     pub reml_score: f64,
-    pub reml_grad_lambda: f64,
-    pub reml_hess_lambda: f64,
-    pub reml_grad_rho: f64,
-    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
 }
 
 #[derive(Clone, Debug)]
-pub struct GaussianRemlScoreDerivatives {
-    pub reml_score: f64,
-    pub grad_lambda: f64,
-    pub hess_lambda: f64,
-    pub grad_x: Array2<f64>,
-    pub grad_y: Array2<f64>,
-    pub coefficients: Array2<f64>,
-    pub fitted: Array2<f64>,
-    pub sigma2: Array1<f64>,
-    pub edf: f64,
+pub struct GaussianRemlScalarBatchProblem<'a> {
+    pub x: ArrayView2<'a, f64>,
+    pub y: ArrayView1<'a, f64>,
+    pub weights: Option<ArrayView1<'a, f64>>,
+    pub init_rho: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlMultiBatchProblem<'a> {
+    pub x: ArrayView2<'a, f64>,
+    pub y: ArrayView2<'a, f64>,
+    pub weights: Option<ArrayView1<'a, f64>>,
+    pub init_rho: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -88,12 +110,63 @@ pub fn gaussian_reml_closed_form(
     weights: Option<ArrayView1<'_, f64>>,
     init_rho: Option<f64>,
 ) -> Result<GaussianRemlResult, EstimationError> {
+    gaussian_reml_closed_form_with_nullspace_dim(x, y, penalty, None, weights, init_rho)
+}
+
+pub fn gaussian_reml_closed_form_with_nullspace_dim(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlResult, EstimationError> {
     let y2 = y.insert_axis(Axis(1));
-    let result = gaussian_reml_multi_closed_form(x, y2, penalty, weights, init_rho)?;
+    let result =
+        gaussian_reml_multi_closed_form_with_nullspace_dim(x, y2, penalty, nullspace_dim, weights, init_rho)?;
+    scalar_result_from_multi(result)
+}
+
+pub fn gaussian_reml_closed_form_warm_started(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    warm_start: Option<&GaussianRemlWarmStart>,
+) -> Result<GaussianRemlResult, EstimationError> {
+    gaussian_reml_closed_form_warm_started_with_nullspace_dim(
+        x, y, penalty, None, weights, warm_start,
+    )
+}
+
+pub fn gaussian_reml_closed_form_warm_started_with_nullspace_dim(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    warm_start: Option<&GaussianRemlWarmStart>,
+) -> Result<GaussianRemlResult, EstimationError> {
+    let y2 = y.insert_axis(Axis(1));
+    let result = gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
+        x,
+        y2,
+        penalty,
+        nullspace_dim,
+        weights,
+        warm_start,
+    )?;
+    scalar_result_from_multi(result)
+}
+
+fn scalar_result_from_multi(
+    result: GaussianRemlMultiResult,
+) -> Result<GaussianRemlResult, EstimationError> {
     Ok(GaussianRemlResult {
         lambda: result.lambda,
         rho: result.rho,
         coefficients: result.coefficients.column(0).to_owned(),
+        fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
         reml_grad_lambda: result.reml_grad_lambda,
         reml_hess_lambda: result.reml_hess_lambda,
@@ -112,11 +185,142 @@ pub fn gaussian_reml_multi_closed_form(
     weights: Option<ArrayView1<'_, f64>>,
     init_rho: Option<f64>,
 ) -> Result<GaussianRemlMultiResult, EstimationError> {
-    let prepared = prepare_gaussian_reml(x, y, penalty, weights)?;
+    gaussian_reml_multi_closed_form_with_nullspace_dim(x, y, penalty, None, weights, init_rho)
+}
+
+pub fn gaussian_reml_multi_closed_form_with_nullspace_dim(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    let init_lambda = init_rho.map(f64::exp);
+    gaussian_reml_multi_closed_form_from_parts(
+        x,
+        y,
+        penalty,
+        nullspace_dim,
+        weights,
+        init_lambda,
+        None,
+    )
+}
+
+pub fn gaussian_reml_multi_closed_form_warm_started(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    warm_start: Option<&GaussianRemlWarmStart>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
+        x, y, penalty, None, weights, warm_start,
+    )
+}
+
+pub fn gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    warm_start: Option<&GaussianRemlWarmStart>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    let init_lambda = warm_start.and_then(|start| start.lambda);
+    let eigen_cache = warm_start.and_then(|start| start.eigen_cache.as_ref());
+    gaussian_reml_multi_closed_form_from_parts(
+        x,
+        y,
+        penalty,
+        nullspace_dim,
+        weights,
+        init_lambda,
+        eigen_cache,
+    )
+}
+
+pub fn gaussian_reml_multi_closed_form_with_cache(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    eigen_cache: Option<&GaussianRemlEigenCache>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    gaussian_reml_multi_closed_form_from_parts(
+        x,
+        y,
+        penalty,
+        None,
+        weights,
+        init_lambda,
+        eigen_cache,
+    )
+}
+
+pub fn gaussian_reml_closed_form_batch<'a>(
+    problems: &[GaussianRemlScalarBatchProblem<'a>],
+    penalty: ArrayView2<'a, f64>,
+    nullspace_dim: Option<usize>,
+) -> Result<Vec<GaussianRemlResult>, EstimationError> {
+    let fits: Vec<Result<GaussianRemlResult, EstimationError>> = problems
+        .par_iter()
+        .map(|problem| {
+            gaussian_reml_closed_form_with_nullspace_dim(
+                problem.x.view(),
+                problem.y.view(),
+                penalty.view(),
+                nullspace_dim,
+                problem.weights.as_ref().map(|weights| weights.view()),
+                problem.init_rho,
+            )
+        })
+        .collect();
+    fits.into_iter().collect()
+}
+
+pub fn gaussian_reml_multi_closed_form_batch<'a>(
+    problems: &[GaussianRemlMultiBatchProblem<'a>],
+    penalty: ArrayView2<'a, f64>,
+    nullspace_dim: Option<usize>,
+) -> Result<Vec<GaussianRemlMultiResult>, EstimationError> {
+    let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
+        .par_iter()
+        .map(|problem| {
+            gaussian_reml_multi_closed_form_with_nullspace_dim(
+                problem.x.view(),
+                problem.y.view(),
+                penalty.view(),
+                nullspace_dim,
+                problem.weights.as_ref().map(|weights| weights.view()),
+                problem.init_rho,
+            )
+        })
+        .collect();
+    fits.into_iter().collect()
+}
+
+fn gaussian_reml_multi_closed_form_from_parts(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    eigen_cache: Option<&GaussianRemlEigenCache>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    let prepared = prepare_gaussian_reml(x, y, penalty, nullspace_dim, weights, eigen_cache)?;
+    let init_rho = init_lambda
+        .map(validate_initial_lambda)
+        .transpose()?
+        .map(f64::ln);
     let rho = optimize_rho(&prepared, init_rho)?;
     let eval = prepared.evaluate(rho);
     let lambda = rho.exp();
     let coefficients = prepared.coefficients(lambda);
+    let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
     let (reml_grad_lambda, reml_hess_lambda) =
         rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
@@ -124,6 +328,7 @@ pub fn gaussian_reml_multi_closed_form(
         lambda,
         rho,
         coefficients,
+        fitted,
         reml_score: eval.cost,
         reml_grad_lambda,
         reml_hess_lambda,
@@ -147,7 +352,7 @@ pub fn gaussian_reml_score_derivatives(
             "Gaussian REML lambda must be finite and positive; got {lambda}"
         )));
     }
-    let prepared = prepare_gaussian_reml(x, y, penalty, weights)?;
+    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
     let eval = prepared.evaluate(lambda.ln());
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
@@ -169,11 +374,12 @@ pub fn gaussian_reml_score_derivatives(
     }
     let mut hessian = x.t().dot(&wx);
     hessian += &(penalty.to_owned() * lambda);
-    let chol = hessian
-        .cholesky(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
+    let chol =
+        hessian
+            .cholesky(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let lower = chol.lower_triangular();
     let h_inv = solve_upper_triangular_matrix(
         &lower.t().to_owned(),
@@ -205,17 +411,70 @@ pub fn gaussian_reml_score_derivatives(
 }
 
 fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
-    (
-        grad_rho / lambda,
-        (hess_rho - grad_rho) / (lambda * lambda),
-    )
+    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
+}
+
+fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
+    if lambda.is_finite() && lambda > 0.0 {
+        Ok(lambda)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML initial lambda must be finite and positive; got {lambda}"
+        )))
+    }
+}
+
+fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    hash = fnv1a_mix(hash, matrix.nrows() as u64);
+    hash = fnv1a_mix(hash, matrix.ncols() as u64);
+    for &value in matrix {
+        hash = fnv1a_mix(hash, value.to_bits());
+    }
+    hash
+}
+
+fn fnv1a_mix(hash: u64, value: u64) -> u64 {
+    (hash ^ value).wrapping_mul(0x100000001b3)
+}
+
+pub fn build_gaussian_reml_eigen_cache(
+    x: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
+    build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, None, weights)
+}
+
+pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
+    x: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
+    let n = x.nrows();
+    let p = x.ncols();
+    validate_gaussian_reml_design(x, penalty, weights)?;
+    let weight = gaussian_reml_weights(n, weights)?;
+
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
+    gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)
 }
 
 fn prepare_gaussian_reml(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
     weights: Option<ArrayView1<'_, f64>>,
+    eigen_cache: Option<&GaussianRemlEigenCache>,
 ) -> Result<GaussianRemlPrepared, EstimationError> {
     let n = x.nrows();
     let p = x.ncols();
@@ -274,6 +533,30 @@ fn prepare_gaussian_reml(
     let xtwx = x.t().dot(&wx);
     let xtwy = x.t().dot(&wy);
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
+    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+    let penalty_fingerprint = matrix_fingerprint(penalty);
+
+    if let Some(cache) = eigen_cache {
+        if cache.penalty_eigenvalues.len() == p
+            && cache.eigenvectors.nrows() == p
+            && cache.eigenvectors.ncols() == p
+            && cache.coefficient_basis.nrows() == p
+            && cache.coefficient_basis.ncols() == p
+            && cache.xtwx_fingerprint == xtwx_fingerprint
+            && cache.penalty_fingerprint == penalty_fingerprint
+        {
+            let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+            return Ok(GaussianRemlPrepared {
+                cache: cache.clone(),
+                ywy,
+                projected_rhs_squared,
+                projected_rhs,
+                n_observations: n,
+                n_outputs: d,
+            });
+        }
+    }
 
     let chol = xtwx
         .cholesky(Side::Lower)
@@ -340,6 +623,8 @@ fn prepare_gaussian_reml(
             penalty_eigenvalues,
             eigenvectors,
             coefficient_basis,
+            xtwx_fingerprint,
+            penalty_fingerprint,
             logdet_xtwx,
             logdet_penalty_positive,
             penalty_rank,
@@ -627,6 +912,41 @@ mod tests {
         for i in 0..x.ncols() {
             assert!((multi.coefficients[[i, 0]] - scalar.coefficients[i]).abs() <= 1.0e-8);
             assert!((multi.coefficients[[i, 1]] - 2.0 * scalar.coefficients[i]).abs() <= 1.0e-8);
+        }
+    }
+
+    #[test]
+    fn warm_start_cache_rejects_different_penalty_geometry() {
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.25],
+            [1.0, 0.5],
+            [1.0, 1.25],
+            [1.0, 2.0],
+        ];
+        let y = array![[0.1], [0.4], [0.7], [1.4], [2.2]];
+        let penalty_a = array![[0.0, 0.0], [0.0, 1.0]];
+        let penalty_b = array![[0.0, 0.0], [0.0, 4.0]];
+
+        let first =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty_a.view(), None, Some(0.0))
+                .expect("first fit");
+        let warm_start = GaussianRemlWarmStart::from_multi_result(&first);
+        let fresh =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty_b.view(), None, Some(0.0))
+                .expect("fresh second fit");
+        let warm = gaussian_reml_multi_closed_form_warm_started(
+            x.view(),
+            y.view(),
+            penalty_b.view(),
+            None,
+            Some(&warm_start),
+        )
+        .expect("warm-started second fit");
+
+        assert!((fresh.lambda - warm.lambda).abs() <= 1.0e-8);
+        for i in 0..x.ncols() {
+            assert!((fresh.coefficients[[i, 0]] - warm.coefficients[[i, 0]]).abs() <= 1.0e-8);
         }
     }
 }
