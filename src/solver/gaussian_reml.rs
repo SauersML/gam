@@ -52,10 +52,6 @@ pub struct GaussianRemlResult {
     pub coefficients: Array1<f64>,
     pub fitted: Array1<f64>,
     pub reml_score: f64,
-    pub reml_grad_lambda: f64,
-    pub reml_hess_lambda: f64,
-    pub reml_grad_rho: f64,
-    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: f64,
     pub cache: GaussianRemlEigenCache,
@@ -68,10 +64,6 @@ pub struct GaussianRemlMultiResult {
     pub coefficients: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reml_score: f64,
-    pub reml_grad_lambda: f64,
-    pub reml_hess_lambda: f64,
-    pub reml_grad_rho: f64,
-    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
@@ -182,10 +174,6 @@ fn scalar_result_from_multi(
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
-        reml_grad_lambda: result.reml_grad_lambda,
-        reml_hess_lambda: result.reml_hess_lambda,
-        reml_grad_rho: result.reml_grad_rho,
-        reml_hess_rho: result.reml_hess_rho,
         edf: result.edf,
         sigma2: result.sigma2[0],
         cache: result.cache,
@@ -336,26 +324,16 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
-    let (reml_grad_lambda, reml_hess_lambda) =
-        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
         coefficients,
         fitted,
         reml_score: eval.cost,
-        reml_grad_lambda,
-        reml_hess_lambda,
-        reml_grad_rho: eval.grad,
-        reml_hess_rho: eval.hess,
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
     })
-}
-
-fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
-    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
 }
 
 fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
