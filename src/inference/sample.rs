@@ -355,7 +355,15 @@ fn sample_standard(
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            compute_inference: false,
+            // NUTS whitening (line below) calls
+            // `explicit_fit_hessian_for_whitening`, which reads
+            // `fit.penalized_hessian()` from the inference output. With
+            // `compute_inference: false` the refit returns no inference and
+            // sampling fails with "fit result is missing an explicit
+            // penalized Hessian for HMC/NUTS whitening". The fit IS the
+            // upstream whose curvature we then whiten by, so the inference
+            // path is non-optional here.
+            compute_inference: true,
             max_iter: 80,
             tol: 1e-6,
             nullspace_dims: design.nullspace_dims.clone(),
