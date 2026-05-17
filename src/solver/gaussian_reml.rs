@@ -668,8 +668,9 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
         );
     }
 
-    if lambda_adjoint != 0.0 {
-        let root_scale = -lambda_adjoint * lambda / fit.reml_hess_rho;
+    let rho_adjoint = lambda_adjoint * lambda + upstream_reml_score * fit.reml_grad_rho;
+    if rho_adjoint != 0.0 {
+        let root_scale = -rho_adjoint / fit.reml_hess_rho;
         add_reml_rho_gradient_vjp(
             root_scale,
             x,
