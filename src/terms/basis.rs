@@ -18022,7 +18022,8 @@ pub fn create_duchon_basis_1d_derivative_dense(
     let p_order = duchon_p_from_nullspace_order(effective_order);
     let s_order = power;
     validate_duchon_kernel_orders(None, p_order, s_order, 1)?;
-    let z = kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
+    let z =
+        kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
     let kernel_cols = z.ncols();
     let poly_cols = if periodic {
         1
@@ -18094,13 +18095,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&design_kernel);
     if !periodic {
-        fill_duchon_1d_polynomial_derivative(
-            &mut basis,
-            kernel_cols,
-            t,
-            effective_order,
-            order,
-        );
+        fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
     }
     Ok(basis)
 }
@@ -18115,9 +18110,10 @@ fn fill_duchon_1d_polynomial_derivative(
     let exponents: Vec<usize> = match nullspace_order {
         DuchonNullspaceOrder::Zero => vec![0],
         DuchonNullspaceOrder::Linear => vec![0, 1],
-        DuchonNullspaceOrder::Degree(degree) => {
-            monomial_exponents(1, degree).into_iter().map(|e| e[0]).collect()
-        }
+        DuchonNullspaceOrder::Degree(degree) => monomial_exponents(1, degree)
+            .into_iter()
+            .map(|e| e[0])
+            .collect(),
     };
     for (offset, exponent) in exponents.into_iter().enumerate() {
         let col = start_col + offset;
