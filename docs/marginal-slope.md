@@ -83,6 +83,14 @@ The main formula (`case ~ s(age) + matern(pc1, pc2, pc3)`) controls the
 **baseline risk landscape**. The `logslope_formula` controls how strongly
 `z` modifies that risk at each point in covariate space.
 
+From the CLI the same fit is `--logslope-formula '...'` plus `--z-column z`:
+
+```bash
+gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
+    --logslope-formula 'matern(pc1, pc2, pc3)' --z-column z \
+    --scale-dimensions --out model.gam
+```
+
 ## Stage 2b: Survival marginal-slope
 
 ```python
