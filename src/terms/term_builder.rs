@@ -641,7 +641,10 @@ pub fn build_smooth_basis(
                     // 0.0 = "auto"; replaced with a data-driven init at planning
                     // time. The default 1.0 was a basin from which REML cannot
                     // escape for high-ν / high-frequency truths.
-                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
+                    // Strict: reject unparseable values like `length_scale=abc`
+// upfront instead of silently dropping them and using the auto
+// init sentinel.
+length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                     radial_reparam: None,
@@ -770,7 +773,10 @@ pub fn build_smooth_basis(
                     // 0.0 = "auto"; replaced with a data-driven init at planning
                     // time. The default 1.0 was a basin from which REML cannot
                     // escape for ν ≥ 5/2 on high-frequency truths.
-                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
+                    // Strict: reject unparseable values like `length_scale=abc`
+// upfront instead of silently dropping them and using the auto
+// init sentinel.
+length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,

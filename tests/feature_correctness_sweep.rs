@@ -311,17 +311,27 @@ fn bc_bspline_columns_drop_by_constraint_count() {
     use BSplineEndpointBoundaryCondition::{Anchored, Clamped, Free};
     let baseline = build_bc(100, 8, Free, Free).unwrap();
     let p0 = baseline.design.ncols();
-    let one_side = build_bc(100, 8, Anchored { value: 0.0 }, Free).unwrap();
+    // `Clamped` adds one constraint (zero slope) per side; `Anchored` adds
+    // two (zero value AND zero slope — Hermite-style C¹ pin introduced in
+    // cycle 18 to eliminate the basis swing-direction DoF that produced
+    // the sparse_dense_imbalance COLLAPSED fit).
+    let one_clamped = build_bc(100, 8, Clamped, Free).unwrap();
     assert_eq!(
-        one_side.design.ncols() + 1,
+        one_clamped.design.ncols() + 1,
         p0,
-        "single anchored BC should reduce ncols by 1"
+        "single clamped BC should reduce ncols by 1",
     );
-    let both_sides = build_bc(100, 8, Anchored { value: 0.0 }, Clamped).unwrap();
+    let one_anchored = build_bc(100, 8, Anchored { value: 0.0 }, Free).unwrap();
     assert_eq!(
-        both_sides.design.ncols() + 2,
+        one_anchored.design.ncols() + 2,
         p0,
-        "two BCs should reduce ncols by 2"
+        "single anchored BC (Hermite: value + slope) should reduce ncols by 2",
+    );
+    let mixed = build_bc(100, 8, Anchored { value: 0.0 }, Clamped).unwrap();
+    assert_eq!(
+        mixed.design.ncols() + 3,
+        p0,
+        "anchored (2 constraints) + clamped (1 constraint) should reduce ncols by 3",
     );
 }
 
