@@ -2587,8 +2587,10 @@ impl Default for SpatialIdentifiability {
 
 /// Which intrinsic S² smooth construction to use.
 ///
-/// - `Wahba`: closed-form reproducing-kernel pseudo-spline (Wahba 1981) on
-///   a center set selected by `center_strategy`.
+/// - `Wahba`: reproducing-kernel basis on a center set selected by
+///   `center_strategy`. The kernel function itself is chosen via
+///   `wahba_kernel` (Sobolev = true Σ [l(l+1)]^{-m} P_l kernel,
+///   Pseudo = Wahba's 1981 closed-form pseudo-spline).
 /// - `Harmonic`: real spherical-harmonic truncation up to `max_degree` with
 ///   the Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. Basis
 ///   dimension is `max_degree * (max_degree + 2)`; centers are ignored.
@@ -2601,6 +2603,50 @@ pub enum SphereMethod {
 impl Default for SphereMethod {
     fn default() -> Self {
         SphereMethod::Wahba
+    }
+}
+
+/// Which reproducing kernel to use for `SphereMethod::Wahba`.
+///
+/// Both options yield positive-definite reproducing kernels on S² with
+/// the same family of `penalty_order m ∈ {1, 2, 3, 4}`. They define
+/// *different* RKHS, however:
+///
+/// - **Sobolev** (default, more correct): true Wahba/Sobolev kernel
+///   `K_m(γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{-m} · P_l(cos γ)`,
+///   the reproducing kernel of `H^m(S²)` under the Laplace–Beltrami
+///   inner product. Penalty quadratic form recovers
+///   `‖f‖²_{H^m} = Σ_l [l(l+1)]^m · |f̂_l|²`.
+///   For m=1, 2, 3 this is evaluated via the closed forms from
+///   Beatson & zu Castell (2018) "Thinplate Splines on the Sphere"
+///   (SIGMA 14 (2018), 083) using elementary functions plus the
+///   di/trilogarithm. For m=4 we fall back to the spectral Legendre
+///   series (96 terms ⇒ truncation error ≲ 1e-12).
+///
+/// - **Pseudo**: Wahba 1981's "pseudo-spline" kernel with Legendre
+///   weights `2 / [(l+1)(l+2)···(l+m+1)]` (decaying as `l^{-(m+1)}`,
+///   different from Sobolev's `l^{-2m}`). Faster to evaluate (one
+///   elementary polynomial in `sin(γ/2)`, `log`), and matches mgcv's
+///   `bs="sos"` exactly. At `m=4` the pseudo-spline produces
+///   numerically tiny kernel values (`K(p,p) ≈ 3e-4`) and the basis
+///   pipeline historically collapsed the smooth contribution to zero
+///   — the cure is the REML scale-invariance fix in the solver, not
+///   the kernel itself.
+///
+/// Default is **Sobolev** because it matches the canonical "Wahba
+/// spline of order m on S²" interpretation. Use `Pseudo` for exact
+/// mgcv compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SphereWahbaKernel {
+    /// True Sobolev `H^m(S²)` reproducing kernel.
+    Sobolev,
+    /// Wahba 1981 closed-form pseudo-spline (mgcv `bs="sos"` compatible).
+    Pseudo,
+}
+
+impl Default for SphereWahbaKernel {
+    fn default() -> Self {
+        SphereWahbaKernel::Sobolev
     }
 }
 
@@ -2630,6 +2676,11 @@ pub struct SphericalSplineBasisSpec {
     /// dimension is `L * (L + 2)`. Ignored for Wahba.
     #[serde(default)]
     pub max_degree: Option<usize>,
+    /// When `method == Wahba`, which reproducing kernel to use:
+    /// Sobolev (true `H^m(S²)`, default) or Pseudo (Wahba 1981 / mgcv
+    /// `bs="sos"`). See `SphereWahbaKernel` docs.
+    #[serde(default)]
+    pub wahba_kernel: SphereWahbaKernel,
 }
 
 impl Default for SphericalSplineBasisSpec {
@@ -2641,6 +2692,7 @@ impl Default for SphericalSplineBasisSpec {
             radians: false,
             method: SphereMethod::Wahba,
             max_degree: None,
+            wahba_kernel: SphereWahbaKernel::Sobolev,
         }
     }
 }
