@@ -2290,7 +2290,7 @@ mod tests {
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
-        let eps = 1.0e-6;
+        let eps = 2.0e-4;
 
         for target in targets {
             let backward =
@@ -2298,23 +2298,21 @@ mod tests {
 
             for row in 0..x.nrows() {
                 for col in 0..x.ncols() {
-                    let mut plus = x.clone();
-                    let mut minus = x.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
-                    let fd = (one_hot_objective(
-                        plus.view(),
-                        y.view(),
-                        penalty.view(),
-                        weights.view(),
-                        target,
-                    ) - one_hot_objective(
-                        minus.view(),
-                        y.view(),
-                        penalty.view(),
-                        weights.view(),
-                        target,
-                    )) / (2.0 * eps);
+                    let eval = |delta: f64| {
+                        let mut candidate = x.clone();
+                        candidate[[row, col]] += delta;
+                        one_hot_objective(
+                            candidate.view(),
+                            y.view(),
+                            penalty.view(),
+                            weights.view(),
+                            target,
+                        )
+                    };
+                    let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
+                    let half_eps = 0.5 * eps;
+                    let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
+                    let fd = d2 + (d2 - d1) / 3.0;
                     assert_fd_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         backward.grad_x[[row, col]],
@@ -2325,23 +2323,21 @@ mod tests {
 
             for row in 0..y.nrows() {
                 for col in 0..y.ncols() {
-                    let mut plus = y.clone();
-                    let mut minus = y.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
-                    let fd = (one_hot_objective(
-                        x.view(),
-                        plus.view(),
-                        penalty.view(),
-                        weights.view(),
-                        target,
-                    ) - one_hot_objective(
-                        x.view(),
-                        minus.view(),
-                        penalty.view(),
-                        weights.view(),
-                        target,
-                    )) / (2.0 * eps);
+                    let eval = |delta: f64| {
+                        let mut candidate = y.clone();
+                        candidate[[row, col]] += delta;
+                        one_hot_objective(
+                            x.view(),
+                            candidate.view(),
+                            penalty.view(),
+                            weights.view(),
+                            target,
+                        )
+                    };
+                    let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
+                    let half_eps = 0.5 * eps;
+                    let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
+                    let fd = d2 + (d2 - d1) / 3.0;
                     assert_fd_close(
                         &format!("target={target:?} y[{row},{col}]"),
                         backward.grad_y[[row, col]],
@@ -2351,20 +2347,15 @@ mod tests {
             }
 
             for row in 0..weights.len() {
-                let mut plus = weights.clone();
-                let mut minus = weights.clone();
-                plus[row] += eps;
-                minus[row] -= eps;
-                let fd =
-                    (one_hot_objective(x.view(), y.view(), penalty.view(), plus.view(), target)
-                        - one_hot_objective(
-                            x.view(),
-                            y.view(),
-                            penalty.view(),
-                            minus.view(),
-                            target,
-                        ))
-                        / (2.0 * eps);
+                let eval = |delta: f64| {
+                    let mut candidate = weights.clone();
+                    candidate[row] += delta;
+                    one_hot_objective(x.view(), y.view(), penalty.view(), candidate.view(), target)
+                };
+                let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
+                let half_eps = 0.5 * eps;
+                let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
+                let fd = d2 + (d2 - d1) / 3.0;
                 assert_fd_close(
                     &format!("target={target:?} weights[{row}]"),
                     backward.grad_weights[row],

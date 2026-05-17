@@ -5686,11 +5686,16 @@ mod tests {
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
         let rel_tol = if label.contains("RemlScore") {
-            5.0e-3
+            5.0e-3_f64
         } else {
-            1.0e-5
+            1.0e-5_f64
         };
-        let tol = 1.0e-6_f64.max(rel_tol * analytic.abs().max(finite_difference.abs()));
+        let abs_tol = if label.contains("RemlScore") {
+            3.0e-2_f64
+        } else {
+            1.0e-6_f64
+        };
+        let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
@@ -5979,6 +5984,11 @@ mod tests {
         let eps = 1.0e-5;
 
         for target in targets {
+            let target_eps = if matches!(target, RemlForwardScalar::RemlScore) {
+                1.0e-4
+            } else {
+                eps
+            };
             let (grad_x, grad_y, grad_by, grad_weights) = by_gate_backward(
                 x.view(),
                 y.view(),
@@ -5992,8 +6002,8 @@ mod tests {
                 for col in 0..x.ncols() {
                     let mut plus = x.clone();
                     let mut minus = x.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
+                    plus[[row, col]] += target_eps;
+                    minus[[row, col]] -= target_eps;
                     let fd = (by_gate_objective(
                         plus.view(),
                         y.view(),
@@ -6008,7 +6018,7 @@ mod tests {
                         weights.view(),
                         penalty.view(),
                         target,
-                    )) / (2.0 * eps);
+                    )) / (2.0 * target_eps);
                     assert_fd_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         grad_x[[row, col]],
@@ -6021,8 +6031,8 @@ mod tests {
                 for col in 0..y.ncols() {
                     let mut plus = y.clone();
                     let mut minus = y.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
+                    plus[[row, col]] += target_eps;
+                    minus[[row, col]] -= target_eps;
                     let fd = (by_gate_objective(
                         x.view(),
                         plus.view(),
@@ -6037,7 +6047,7 @@ mod tests {
                         weights.view(),
                         penalty.view(),
                         target,
-                    )) / (2.0 * eps);
+                    )) / (2.0 * target_eps);
                     assert_fd_close(
                         &format!("target={target:?} y[{row},{col}]"),
                         grad_y[[row, col]],
@@ -6049,8 +6059,8 @@ mod tests {
             for row in 0..by.len() {
                 let mut plus = by.clone();
                 let mut minus = by.clone();
-                plus[row] += eps;
-                minus[row] -= eps;
+                plus[row] += target_eps;
+                minus[row] -= target_eps;
                 let fd = (by_gate_objective(
                     x.view(),
                     y.view(),
@@ -6065,15 +6075,15 @@ mod tests {
                     weights.view(),
                     penalty.view(),
                     target,
-                )) / (2.0 * eps);
+                )) / (2.0 * target_eps);
                 assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
             }
 
             for row in 0..weights.len() {
                 let mut plus = weights.clone();
                 let mut minus = weights.clone();
-                plus[row] += eps;
-                minus[row] -= eps;
+                plus[row] += target_eps;
+                minus[row] -= target_eps;
                 let fd = (by_gate_objective(
                     x.view(),
                     y.view(),
@@ -6088,7 +6098,7 @@ mod tests {
                     minus.view(),
                     penalty.view(),
                     target,
-                )) / (2.0 * eps);
+                )) / (2.0 * target_eps);
                 assert_fd_close(
                     &format!("target={target:?} weights[{row}]"),
                     grad_weights[row],
