@@ -138,7 +138,7 @@ Radial-basis surface smooth with thin-plate kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (or `k`) | auto | Number of radial basis centres. |
-| `length_scale` | 1.0 | Global length scale. |
+| `length_scale` | auto | Data-derived global length-scale initialization. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `scale_dims` | `false` | Standardize inputs per-axis before kernel eval. |
 
@@ -149,7 +149,7 @@ Radial basis with Matérn covariance kernel.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `centers` (or `k`) | auto | Number of centres. |
-| `length_scale` | 1.0 | Global length scale. |
+| `length_scale` | auto | Data-derived global length-scale initialization. |
 | `nu` | `5/2` | Smoothness. Options: `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
 | `double_penalty` | `true` | Ridge + main penalty. |
