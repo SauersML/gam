@@ -784,6 +784,37 @@ def gaussian_reml_fit_batched(
     return _coerce_gaussian_reml_payload(out, np)
 
 
+def gaussian_reml_fit_formula(
+    data: Any,
+    formula: str,
+    y: Any,
+    *,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fit closed-form Gaussian REML after materialising a formula design."""
+    import numpy as np
+
+    headers, rows, _kind = normalize_table(data)
+    y_arr = np.asarray(y, dtype=float)
+    if y_arr.ndim == 1:
+        y_arr = y_arr.reshape(-1, 1)
+    if y_arr.ndim != 2:
+        raise ValueError("y must be a 1D or 2D numeric array")
+    if not np.all(np.isfinite(y_arr)):
+        raise ValueError("y must contain only finite values")
+    try:
+        out = rust_module().gaussian_reml_fit_formula_table(
+            headers,
+            rows,
+            formula,
+            np.ascontiguousarray(y_arr, dtype=np.float64),
+            None if config is None else json.dumps(config),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _coerce_gaussian_reml_payload(out, np)
+
+
 def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     out = dict(payload)
     for key in (
@@ -793,10 +824,6 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
         "lambda",
         "rho",
         "reml_score",
-        "reml_grad_lambda",
-        "reml_hess_lambda",
-        "reml_grad_rho",
-        "reml_hess_rho",
         "edf",
     ):
         if key in out:
