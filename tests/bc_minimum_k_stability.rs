@@ -21,17 +21,25 @@ fn make_smooth_dataset(n: usize) -> gam::data::EncodedDataset {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut x: Vec<f64> = (0..n).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = x.iter().map(|t| (std::f64::consts::PI * t).sin() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|t| (std::f64::consts::PI * t).sin() + noise.sample(&mut rng))
+        .collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y.iter())
-        .map(|(a,b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 fn run_or_error(formula: &str) -> Result<Vec<f64>, String> {
     let data = make_smooth_dataset(200);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
     let FitResult::Standard(fit) = result else {
         return Err("non-standard".into());

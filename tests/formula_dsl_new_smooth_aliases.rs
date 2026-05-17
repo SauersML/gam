@@ -2,9 +2,9 @@
 
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 
-fn smooth_options(parsed: &gam::inference::formula_dsl::ParsedFormula)
-    -> &std::collections::BTreeMap<String, String>
-{
+fn smooth_options(
+    parsed: &gam::inference::formula_dsl::ParsedFormula,
+) -> &std::collections::BTreeMap<String, String> {
     for term in &parsed.terms {
         if let ParsedTerm::Smooth { options, .. } = term {
             return options;
@@ -31,19 +31,31 @@ fn periodic_alias_names_all_parse_to_cyclic_type() {
         let parsed = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
         let opts = smooth_options(&parsed);
         let ty = opts.get("type").map(String::as_str).unwrap_or("");
-        assert_eq!(ty, "cyclic", "periodic alias `{name}` parsed to type=`{ty}`");
+        assert_eq!(
+            ty, "cyclic",
+            "periodic alias `{name}` parsed to type=`{ty}`"
+        );
     }
 }
 
 #[test]
 fn sphere_method_aliases_parse_consistently() {
-    for raw_method in ["wahba", "kernel", "harmonic", "harmonics", "spherical_harmonics",
-                       "spherical-harmonics", "sh"]
-    {
+    for raw_method in [
+        "wahba",
+        "kernel",
+        "harmonic",
+        "harmonics",
+        "spherical_harmonics",
+        "spherical-harmonics",
+        "sh",
+    ] {
         let f = format!("y ~ sphere(lat, lon, k=10, method={raw_method})");
         let parsed = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
         let opts = smooth_options(&parsed);
-        assert!(opts.get("method").is_some(), "method= dropped at parse for `{f}`");
+        assert!(
+            opts.get("method").is_some(),
+            "method= dropped at parse for `{f}`"
+        );
     }
 }
 

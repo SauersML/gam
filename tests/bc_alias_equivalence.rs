@@ -19,9 +19,14 @@ fn make_dataset() -> gam::data::EncodedDataset {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut x: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = x.iter().map(|t| (std::f64::consts::PI * t).sin() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|t| (std::f64::consts::PI * t).sin() + noise.sample(&mut rng))
+        .collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -29,12 +34,20 @@ fn make_dataset() -> gam::data::EncodedDataset {
 
 fn fit_predict(formula: &str) -> Vec<f64> {
     let data = make_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let probes: Vec<f64> = (0..20).map(|i| 0.05 + 0.9 * (i as f64) / 19.0).collect();
     let mut m = Array2::<f64>::zeros((probes.len(), 2));
-    for (i, &v) in probes.iter().enumerate() { m[[i, 0]] = v; m[[i, 1]] = 0.0; }
+    for (i, &v) in probes.iter().enumerate() {
+        m[[i, 0]] = v;
+        m[[i, 1]] = 0.0;
+    }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
@@ -43,7 +56,9 @@ fn assert_equiv(reference: &str, alternatives: &[&str]) {
     let ref_pred = fit_predict(reference);
     for alt in alternatives {
         let pred = fit_predict(alt);
-        let max_diff: f64 = ref_pred.iter().zip(pred.iter())
+        let max_diff: f64 = ref_pred
+            .iter()
+            .zip(pred.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         assert!(

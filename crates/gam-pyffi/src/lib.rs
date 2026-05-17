@@ -28,10 +28,7 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
-use gam::smooth::{
-    BlockwisePenalty, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design,
-};
+use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
@@ -41,7 +38,6 @@ use gam::terms::basis::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
-use gam::{faer_ndarray::FaerEigh, matrix::SymmetricMatrix};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -304,36 +300,6 @@ fn fit_table(
 }
 
 #[pyfunction]
-fn fit_gaussian_multi_output_table(
-    py: Python<'_>,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    formula: String,
-    target_columns: Vec<String>,
-    config_json: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    let result = py
-        .detach(move || {
-            fit_gaussian_multi_output_table_impl(
-                headers,
-                rows,
-                formula,
-                target_columns,
-                config_json.as_deref(),
-            )
-        })
-        .map_err(py_value_error)?;
-    let out = PyDict::new(py);
-    out.set_item("model", PyBytes::new(py, &result.model_bytes))?;
-    out.set_item("coefficients_flat", result.coefficients_flat)?;
-    out.set_item("n_coefficients", result.n_coefficients)?;
-    out.set_item("n_outputs", result.n_outputs)?;
-    out.set_item("lambdas", result.lambdas)?;
-    out.set_item("reml_score", result.reml_score)?;
-    Ok(out.unbind())
-}
-
-#[pyfunction]
 fn fit_array(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f64>,
@@ -381,15 +347,17 @@ fn predict_table(
 }
 
 #[pyfunction]
-fn predict_array(
-    py: Python<'_>,
+fn predict_array<'py>(
+    py: Python<'py>,
     model_bytes: Vec<u8>,
-    x: PyReadonlyArray2<'_, f64>,
+    x: PyReadonlyArray2<'py, f64>,
     options_json: Option<String>,
-) -> PyResult<String> {
+) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
-    py.detach(move || predict_array_impl(&model_bytes, x_values, options_json.as_deref()))
-        .map_err(py_value_error)
+    let out = py
+        .detach(move || predict_array_impl(&model_bytes, x_values, options_json.as_deref()))
+        .map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -416,14 +384,16 @@ fn design_matrix_table(
 }
 
 #[pyfunction]
-fn design_matrix_array(
-    py: Python<'_>,
+fn design_matrix_array<'py>(
+    py: Python<'py>,
     model_bytes: Vec<u8>,
-    x: PyReadonlyArray2<'_, f64>,
-) -> PyResult<String> {
+    x: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
-    py.detach(move || design_matrix_array_impl(&model_bytes, x_values))
-        .map_err(py_value_error)
+    let out = py
+        .detach(move || design_matrix_array_impl(&model_bytes, x_values))
+        .map_err(py_value_error)?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (t, knots, degree = 3, periodic = false))]
@@ -575,7 +545,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
-    module.add_function(wrap_pyfunction!(fit_gaussian_multi_output_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
@@ -1304,11 +1273,16 @@ fn predict_array_impl(
     model_bytes: &[u8],
     x: Array2<f64>,
     options_json: Option<&str>,
-) -> Result<String, String> {
+) -> Result<Array2<f64>, String> {
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
     let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
-    predict_dataset_impl(&model, model_class, dataset, options_json)
+    if matches!(model_class, PredictModelClass::Survival) {
+        return Err("predict_array does not support survival prediction payloads".to_string());
+    }
+    let options = parse_predict_options(options_json)?;
+    let columns = predict_columns(&model, dataset, &options)?;
+    columns_to_array(columns)
 }
 
 fn predict_dataset_impl(
@@ -1321,6 +1295,16 @@ fn predict_dataset_impl(
     if matches!(model_class, PredictModelClass::Survival) {
         return predict_table_survival(model, &dataset, &options);
     }
+    let columns = predict_columns(model, dataset, &options)?;
+    serde_json::to_string(&PredictionPayload { columns })
+        .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+}
+
+fn predict_columns(
+    model: &FittedModel,
+    dataset: EncodedDataset,
+    options: &PyPredictOptions,
+) -> Result<BTreeMap<String, Vec<f64>>, String> {
     let col_map = dataset.column_map();
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
     let offset_noise =
@@ -1369,8 +1353,41 @@ fn predict_dataset_impl(
         columns.insert("mean".to_string(), prediction.mean.to_vec());
     }
 
-    serde_json::to_string(&PredictionPayload { columns })
-        .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+    Ok(columns)
+}
+
+fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
+    let ordered = ordered_prediction_column_values(&columns);
+    let n_cols = ordered.len();
+    let n_rows = ordered.first().map(|values| values.len()).unwrap_or(0);
+    let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+    for (j, values) in ordered.into_iter().enumerate() {
+        if values.len() != n_rows {
+            return Err("prediction columns have inconsistent lengths".to_string());
+        }
+        for (i, value) in values.into_iter().enumerate() {
+            out[[i, j]] = value;
+        }
+    }
+    Ok(out)
+}
+
+fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
+    let preferred = ["eta", "mean", "effective_se", "mean_lower", "mean_upper"];
+    let mut out = Vec::<Vec<f64>>::new();
+    let mut seen = BTreeSet::<&str>::new();
+    for key in preferred {
+        if let Some(values) = columns.get(key) {
+            out.push(values.clone());
+            seen.insert(key);
+        }
+    }
+    for (key, values) in columns {
+        if !seen.contains(key.as_str()) {
+            out.push(values.clone());
+        }
+    }
+    out
 }
 
 fn parse_sample_options(options_json: Option<&str>) -> Result<PySampleOptions, String> {

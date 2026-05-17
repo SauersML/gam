@@ -23,7 +23,10 @@ fn build_dataset() -> gam::data::EncodedDataset {
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
     let noise = Normal::new(0.0, 0.05).expect("normal");
-    let headers = ["x", "theta", "lat", "lon", "y"].into_iter().map(String::from).collect();
+    let headers = ["x", "theta", "lat", "lon", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let mut rows = Vec::with_capacity(500);
     for _ in 0..500 {
         let x = u_x.sample(&mut rng);
@@ -36,7 +39,11 @@ fn build_dataset() -> gam::data::EncodedDataset {
             + 0.2 * lat.to_radians().sin()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
-            x.to_string(), theta.to_string(), lat.to_string(), lon.to_string(), y.to_string(),
+            x.to_string(),
+            theta.to_string(),
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
         ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -44,9 +51,14 @@ fn build_dataset() -> gam::data::EncodedDataset {
 
 fn try_fit_predict(formula: &str) -> Result<(f64, f64), String> {
     let data = build_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
     // Sample predict points
     let n = 50;
     let mut m = Array2::<f64>::zeros((n, 5));
@@ -101,7 +113,8 @@ fn additive_bc_clamped_plus_sphere_harmonic() {
     init_parallelism();
     let (mn, mx) = try_fit_predict(
         "y ~ s(x, k=10, bc=clamped) + sphere(lat, lon, method=harmonic, max_degree=4)",
-    ).expect("ok");
+    )
+    .expect("ok");
     eprintln!("[additive] bc-clamped+sphere-h: [{mn:.3}, {mx:.3}]");
     assert!(mn > -3.0 && mx < 3.0, "additive out of bounds");
 }
@@ -111,7 +124,8 @@ fn additive_bc_anchored_plus_periodic() {
     init_parallelism();
     let (mn, mx) = try_fit_predict(
         "y ~ s(x, k=10, bc=anchored) + s(theta, periodic=true, period=6.283185307179586)",
-    ).expect("ok");
+    )
+    .expect("ok");
     eprintln!("[additive] bc-anchored+per: [{mn:.3}, {mx:.3}]");
     assert!(mn > -3.0 && mx < 3.0, "additive out of bounds");
 }
