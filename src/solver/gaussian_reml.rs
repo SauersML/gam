@@ -78,19 +78,6 @@ pub struct GaussianRemlMultiResult {
 }
 
 #[derive(Clone, Debug)]
-pub struct GaussianRemlScoreDerivatives {
-    pub reml_score: f64,
-    pub grad_lambda: f64,
-    pub hess_lambda: f64,
-    pub grad_x: Array2<f64>,
-    pub grad_y: Array2<f64>,
-    pub coefficients: Array2<f64>,
-    pub fitted: Array2<f64>,
-    pub sigma2: Array1<f64>,
-    pub edf: f64,
-}
-
-#[derive(Clone, Debug)]
 pub struct GaussianRemlScalarBatchProblem<'a> {
     pub x: ArrayView2<'a, f64>,
     pub y: ArrayView1<'a, f64>,
@@ -364,72 +351,6 @@ fn gaussian_reml_multi_closed_form_from_parts(
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
-    })
-}
-
-pub fn gaussian_reml_score_derivatives(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    lambda: f64,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
-    if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML lambda must be finite and positive; got {lambda}"
-        )));
-    }
-    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
-    let eval = prepared.evaluate(lambda.ln());
-    let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
-    let sigma2 = prepared.sigma2(lambda);
-    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
-
-    let n = x.nrows();
-    let d = y.ncols();
-    let weight = gaussian_reml_weights(n, weights)?;
-
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        for value in wx.row_mut(i) {
-            *value *= weight[i];
-        }
-    }
-    let mut hessian = x.t().dot(&wx);
-    hessian += &(penalty.to_owned() * lambda);
-    let chol = hessian
-        .cholesky(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
-    let lower = chol.lower_triangular();
-    let h_inv = solve_upper_triangular_matrix(
-        &lower.t().to_owned(),
-        &solve_lower_triangular_matrix(&lower, &Array2::eye(hessian.nrows()))?,
-    )?;
-
-    let residual = y.to_owned() - &fitted;
-    let mut grad_y = residual;
-    for j in 0..d {
-        for i in 0..n {
-            grad_y[[i, j]] *= weight[i] / sigma2[j];
-        }
-    }
-    let mut logdet_grad_x = wx.dot(&h_inv);
-    logdet_grad_x *= d as f64;
-    let grad_x = logdet_grad_x - grad_y.dot(&coefficients.t());
-
-    Ok(GaussianRemlScoreDerivatives {
-        reml_score: eval.cost,
-        grad_lambda,
-        hess_lambda,
-        grad_x,
-        grad_y,
-        coefficients,
-        fitted,
-        sigma2,
-        edf: eval.edf,
     })
 }
 
@@ -734,8 +655,23 @@ fn prepare_gaussian_reml(
     let xtwy = x.t().dot(&wy);
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
 
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
+
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
+        let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+        if cache.xtwx_fingerprint != xtwx_fingerprint {
+            return Err(EstimationError::InvalidInput(
+                "Gaussian REML eigen cache X'WX mismatch".to_string(),
+            ));
+        }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
             return Err(EstimationError::InvalidInput(
@@ -768,14 +704,6 @@ fn prepare_gaussian_reml(
         });
     }
 
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     if n <= cache.nullity {
         return Err(EstimationError::InvalidInput(format!(
