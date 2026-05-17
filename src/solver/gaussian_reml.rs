@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_y};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
 use rayon::prelude::*;
@@ -93,6 +93,18 @@ pub struct GaussianRemlBackwardResult {
     pub grad_x: Array2<f64>,
     pub grad_y: Array2<f64>,
     pub grad_weights: Array1<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlMultiBackwardProblem<'a> {
+    pub x: ArrayView2<'a, f64>,
+    pub y: ArrayView2<'a, f64>,
+    pub weights: Option<ArrayView1<'a, f64>>,
+    pub fit: &'a GaussianRemlMultiResult,
+    pub grad_lambda: f64,
+    pub grad_coefficients: Option<ArrayView2<'a, f64>>,
+    pub grad_fitted: Option<ArrayView2<'a, f64>>,
+    pub grad_reml_score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -495,7 +507,7 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let eval = prepared.evaluate(rho);
     let lambda = rho.exp();
     let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
+    let fitted = dense_ab(x, coefficients.view());
     let sigma2 = prepared.sigma2(lambda);
     let (reml_grad_lambda, reml_hess_lambda) =
         rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
@@ -530,7 +542,7 @@ pub fn gaussian_reml_score_derivatives(
     let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
     let eval = prepared.evaluate(lambda.ln());
     let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
+    let fitted = dense_ab(x, coefficients.view());
     let sigma2 = prepared.sigma2(lambda);
     let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlScoreDerivatives {
@@ -555,6 +567,33 @@ pub fn gaussian_reml_multi_closed_form_backward(
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
 ) -> Result<GaussianRemlBackwardResult, EstimationError> {
+    let fit =
+        gaussian_reml_multi_closed_form_with_cache(x, y, penalty, weights, init_lambda, None)?;
+    gaussian_reml_multi_closed_form_backward_from_fit(
+        x,
+        y,
+        penalty,
+        weights,
+        &fit,
+        upstream_lambda,
+        upstream_coefficients,
+        upstream_fitted,
+        upstream_reml_score,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gaussian_reml_multi_closed_form_backward_from_fit(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fit: &GaussianRemlMultiResult,
+    upstream_lambda: f64,
+    upstream_coefficients: Option<ArrayView2<'_, f64>>,
+    upstream_fitted: Option<ArrayView2<'_, f64>>,
+    upstream_reml_score: f64,
+) -> Result<GaussianRemlBackwardResult, EstimationError> {
     validate_gaussian_reml_backward_upstreams(
         x,
         y,
@@ -564,8 +603,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
         upstream_fitted,
         upstream_reml_score,
     )?;
-    let fit =
-        gaussian_reml_multi_closed_form_with_cache(x, y, penalty, weights, init_lambda, None)?;
+    validate_gaussian_reml_forward_fit(x, y, penalty, weights, fit)?;
     let lambda = fit.lambda;
     if !(fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14) {
         return Err(EstimationError::ModelIsIllConditioned {
@@ -577,11 +615,9 @@ pub fn gaussian_reml_multi_closed_form_backward(
     let p = x.ncols();
     let d = y.ncols();
     let weight = gaussian_reml_weights(n, weights)?;
-    let (_, inverse_hessian) =
-        gaussian_reml_penalized_hessian_inverse(x, penalty, &weight, lambda)?;
-    let beta = fit.coefficients;
-    let fitted = fit.fitted;
-    let residual = y.to_owned() - &fitted;
+    let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?;
+    let beta = &fit.coefficients;
+    let residual = y.to_owned() - &fit.fitted;
     let nu = n as f64 - fit.cache.nullity as f64;
 
     let mut grad_x = Array2::<f64>::zeros((n, p));
@@ -593,8 +629,8 @@ pub fn gaussian_reml_multi_closed_form_backward(
         upstream_beta += &upstream_coefficients;
     }
     if let Some(upstream_fitted) = upstream_fitted {
-        upstream_beta += &x.t().dot(&upstream_fitted);
-        grad_x += &upstream_fitted.dot(&beta.t());
+        upstream_beta += &dense_atb(x, upstream_fitted);
+        grad_x += &dense_ab(upstream_fitted, beta.t());
     }
 
     let mut lambda_adjoint = upstream_lambda;
@@ -606,7 +642,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
             penalty,
             &weight,
             &inverse_hessian,
-            &beta,
+            beta,
             upstream_beta.view(),
             &mut grad_x,
             &mut grad_y,
@@ -620,7 +656,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
             x,
             &weight,
             &inverse_hessian,
-            &beta,
+            beta,
             &residual,
             &fit.sigma2,
             nu,
@@ -640,7 +676,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
             &weight,
             lambda,
             &inverse_hessian,
-            &beta,
+            beta,
             &residual,
             &fit.sigma2,
             nu,
@@ -655,6 +691,29 @@ pub fn gaussian_reml_multi_closed_form_backward(
         grad_y,
         grad_weights,
     })
+}
+
+pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
+    problems: &[GaussianRemlMultiBackwardProblem<'a>],
+    penalty: ArrayView2<'a, f64>,
+) -> Result<Vec<GaussianRemlBackwardResult>, EstimationError> {
+    let results: Vec<Result<GaussianRemlBackwardResult, EstimationError>> = problems
+        .par_iter()
+        .map(|problem| {
+            gaussian_reml_multi_closed_form_backward_from_fit(
+                problem.x.view(),
+                problem.y.view(),
+                penalty,
+                problem.weights.as_ref().map(|weights| weights.view()),
+                problem.fit,
+                problem.grad_lambda,
+                problem.grad_coefficients.as_ref().map(|grad| grad.view()),
+                problem.grad_fitted.as_ref().map(|grad| grad.view()),
+                problem.grad_reml_score,
+            )
+        })
+        .collect();
+    results.into_iter().collect()
 }
 
 fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
@@ -711,32 +770,83 @@ fn validate_gaussian_reml_backward_upstreams(
     Ok(())
 }
 
-fn gaussian_reml_penalized_hessian_inverse(
+fn validate_gaussian_reml_forward_fit(
     x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
-    weights: &Array1<f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fit: &GaussianRemlMultiResult,
+) -> Result<(), EstimationError> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let d = y.ncols();
+    validate_gaussian_reml_design(x, penalty, weights)?;
+    validate_gaussian_reml_eigen_cache(&fit.cache, p)?;
+    if y.nrows() != n
+        || fit.coefficients.dim() != (p, d)
+        || fit.fitted.dim() != (n, d)
+        || fit.sigma2.len() != d
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML backward forward-state shape mismatch: expected coefficients=({p},{d}), fitted=({n},{d}), sigma2={d}"
+        )));
+    }
+    if !(fit.lambda.is_finite()
+        && fit.lambda > 0.0
+        && fit.rho.is_finite()
+        && fit.reml_score.is_finite()
+        && fit.reml_hess_rho.is_finite()
+        && fit.edf.is_finite())
+        || fit.coefficients.iter().any(|value| !value.is_finite())
+        || fit.fitted.iter().any(|value| !value.is_finite())
+        || fit.sigma2.iter().any(|value| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML backward forward state must be finite".to_string(),
+        ));
+    }
+    let penalty_fingerprint = matrix_fingerprint(penalty);
+    if fit.cache.penalty_fingerprint != penalty_fingerprint {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML backward forward-state penalty mismatch".to_string(),
+        ));
+    }
+    let weight = gaussian_reml_weights(n, weights)?;
+    let xtwx = dense_xt_diag_y(x, weight.view(), x);
+    if fit.cache.xtwx_fingerprint != matrix_fingerprint(xtwx.view()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML backward forward-state X'WX mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn gaussian_reml_inverse_hessian_from_cache(
+    cache: &GaussianRemlEigenCache,
     lambda: f64,
-) -> Result<(Array2<f64>, Array2<f64>), EstimationError> {
-    let mut wx = x.to_owned();
-    for i in 0..x.nrows() {
-        for value in wx.row_mut(i) {
-            *value *= weights[i];
+) -> Result<Array2<f64>, EstimationError> {
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML lambda must be finite and positive; got {lambda}"
+        )));
+    }
+    let p = cache.penalty_eigenvalues.len();
+    let mut inverse = Array2::<f64>::zeros((p, p));
+    for eig in 0..p {
+        let scale = 1.0 / (1.0 + lambda * cache.penalty_eigenvalues[eig]);
+        for row in 0..p {
+            let left = cache.coefficient_basis[[row, eig]] * scale;
+            for col in 0..p {
+                inverse[[row, col]] += left * cache.coefficient_basis[[col, eig]];
+            }
         }
     }
-    let mut hessian = x.t().dot(&wx);
-    hessian += &(penalty.to_owned() * lambda);
-    let chol =
-        hessian
-            .cholesky(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let lower = chol.lower_triangular();
-    let inverse = solve_upper_triangular_matrix(
-        &lower.t().to_owned(),
-        &solve_lower_triangular_matrix(&lower, &Array2::eye(hessian.nrows()))?,
-    )?;
-    Ok((hessian, inverse))
+    if inverse.iter().any(|value| !value.is_finite()) {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    Ok(inverse)
 }
 
 fn add_ridge_profile_vjp(
@@ -752,11 +862,11 @@ fn add_ridge_profile_vjp(
     grad_y: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
 ) -> f64 {
-    let m = inverse_hessian.dot(&upstream_beta);
-    let c = m.dot(&beta.t());
+    let m = dense_ab(inverse_hessian.view(), upstream_beta);
+    let c = dense_ab(m.view(), beta.t());
     let c_sym = &c + &c.t();
-    let ymt = y.dot(&m.t());
-    let xcs = x.dot(&c_sym);
+    let ymt = dense_ab(y, m.t());
+    let xcs = dense_ab(x, c_sym.view());
     for i in 0..x.nrows() {
         let wi = weights[i] * scale;
         for k in 0..x.ncols() {
@@ -764,7 +874,7 @@ fn add_ridge_profile_vjp(
         }
     }
 
-    let xm = x.dot(&m);
+    let xm = dense_ab(x, m.view());
     for i in 0..x.nrows() {
         let wi = weights[i] * scale;
         for j in 0..y.ncols() {
@@ -772,7 +882,7 @@ fn add_ridge_profile_vjp(
         }
     }
 
-    let xc = x.dot(&c);
+    let xc = dense_ab(x, c.view());
     for i in 0..x.nrows() {
         let mut from_b = 0.0;
         for j in 0..y.ncols() {
@@ -785,7 +895,7 @@ fn add_ridge_profile_vjp(
         grad_weights[i] += scale * (from_b - from_a);
     }
 
-    let penalty_beta = penalty.dot(beta);
+    let penalty_beta = dense_ab(penalty, beta.view());
     -scale
         * m.iter()
             .zip(penalty_beta.iter())
@@ -807,7 +917,7 @@ fn add_reml_score_vjp(
     grad_weights: &mut Array1<f64>,
 ) {
     let d = beta.ncols() as f64;
-    let xp = x.dot(inverse_hessian);
+    let xp = dense_ab(x, inverse_hessian.view());
     for i in 0..x.nrows() {
         let wi = weights[i] * scale * d;
         for k in 0..x.ncols() {
@@ -855,8 +965,9 @@ fn add_reml_rho_gradient_vjp(
 ) {
     let d = beta.ncols() as f64;
     let k_matrix = penalty.to_owned() * lambda;
-    let trace_kernel = inverse_hessian.dot(&k_matrix).dot(inverse_hessian);
-    let xt = x.dot(&trace_kernel);
+    let inverse_k = dense_ab(inverse_hessian.view(), k_matrix.view());
+    let trace_kernel = dense_ab(inverse_k.view(), inverse_hessian.view());
+    let xt = dense_ab(x, trace_kernel.view());
     for i in 0..x.nrows() {
         let wi = -scale * d * weights[i];
         for k in 0..x.ncols() {
@@ -869,7 +980,7 @@ fn add_reml_rho_gradient_vjp(
         grad_weights[i] -= scale * 0.5 * d * quad;
     }
 
-    let k_beta = k_matrix.dot(beta);
+    let k_beta = dense_ab(k_matrix.view(), beta.view());
     let mut upstream_beta = Array2::<f64>::zeros(beta.dim());
     for j in 0..beta.ncols() {
         let dp = (sigma2[j] * nu).max(MIN_DEVIANCE);
@@ -938,6 +1049,22 @@ fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
     }
 }
 
+fn dense_ab(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+    fast_ab(&a, &b)
+}
+
+fn dense_atb(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+    fast_atb(&a, &b)
+}
+
+fn dense_xt_diag_y(
+    x: ArrayView2<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+) -> Array2<f64> {
+    fast_xt_diag_y(&x, &w, &y)
+}
+
 fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     hash = fnv1a_mix(hash, matrix.nrows() as u64);
@@ -970,14 +1097,7 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     validate_gaussian_reml_design(x, penalty, weights)?;
     let weight = gaussian_reml_weights(n, weights)?;
 
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
+    let xtwx = dense_xt_diag_y(x, weight.view(), x);
     gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)
 }
 
@@ -1215,24 +1335,15 @@ fn prepare_gaussian_reml(
     }
     let weight = gaussian_reml_weights(n, weights)?;
 
-    let mut wy = y.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wy.row_mut(i) {
-            *value *= wi;
+    let xtwy = dense_xt_diag_y(x, weight.view(), y);
+    let ywy = Array1::from_iter((0..d).map(|j| {
+        let mut value = 0.0;
+        for row in 0..n {
+            value += weight[row] * y[[row, j]] * y[[row, j]];
         }
-    }
-    let xtwy = x.t().dot(&wy);
-    let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
-
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
+        value
+    }));
+    let xtwx = dense_xt_diag_y(x, weight.view(), x);
 
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
@@ -1262,7 +1373,7 @@ fn prepare_gaussian_reml(
                 cache.nullity
             )));
         }
-        let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+        let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
         let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
         return Ok(GaussianRemlPrepared {
             cache: cache.clone(),
@@ -1281,7 +1392,7 @@ fn prepare_gaussian_reml(
             cache.nullity
         )));
     }
-    let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+    let projected_rhs = dense_atb(cache.coefficient_basis.view(), xtwy.view());
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
 
     Ok(GaussianRemlPrepared {
@@ -1318,7 +1429,7 @@ impl GaussianRemlPrepared {
                 *value *= scale;
             }
         }
-        self.cache.coefficient_basis.dot(&scaled)
+        dense_ab(self.cache.coefficient_basis.view(), scaled.view())
     }
 
     fn sigma2(&self, lambda: f64) -> Array1<f64> {
@@ -2120,8 +2231,8 @@ mod tests {
         let mut x_minus = x.clone();
         x_plus[[3, 2]] += eps;
         x_minus[[3, 2]] -= eps;
-        let fd_x = (objective(&x_plus, &y, &weights) - objective(&x_minus, &y, &weights))
-            / (2.0 * eps);
+        let fd_x =
+            (objective(&x_plus, &y, &weights) - objective(&x_minus, &y, &weights)) / (2.0 * eps);
         assert!(
             (fd_x - backward.grad_x[[3, 2]]).abs() <= 2.0e-4,
             "grad_x mismatch: analytic={} fd={}",
@@ -2133,8 +2244,8 @@ mod tests {
         let mut y_minus = y.clone();
         y_plus[[4, 1]] += eps;
         y_minus[[4, 1]] -= eps;
-        let fd_y = (objective(&x, &y_plus, &weights) - objective(&x, &y_minus, &weights))
-            / (2.0 * eps);
+        let fd_y =
+            (objective(&x, &y_plus, &weights) - objective(&x, &y_minus, &weights)) / (2.0 * eps);
         assert!(
             (fd_y - backward.grad_y[[4, 1]]).abs() <= 2.0e-4,
             "grad_y mismatch: analytic={} fd={}",

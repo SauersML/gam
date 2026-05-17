@@ -46,7 +46,7 @@ use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -275,6 +275,10 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit",
             "gaussian_reml_fit_backward",
             "gaussian_reml_fit_batched",
+            "gaussian_reml_fit_positions",
+            "gaussian_reml_fit_positions_backward",
+            "gaussian_reml_fit_positions_batched",
+            "gaussian_reml_fit_positions_batched_backward",
             "gaussian_reml_fit_formula_table",
         ],
     )?;
@@ -559,33 +563,10 @@ fn gaussian_reml_fit<'py>(
     let out = PyDict::new(py);
     match result {
         Ok(fit) => {
-            out.set_item("status", "ok")?;
-            out.set_item("lambda", fit.lambda)?;
-            out.set_item("rho", fit.rho)?;
-            out.set_item("reml_score", fit.reml_score)?;
-            out.set_item("edf", fit.edf)?;
-            out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
-            out.set_item("fitted", fit.fitted.into_pyarray(py))?;
-            out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
+            set_ok_gaussian_reml_items(py, &out, fit)?;
         }
         Err(EstimationError::ModelIsIllConditioned { .. }) => {
-            out.set_item("status", "degenerate")?;
-            out.set_item("lambda", f64::NAN)?;
-            out.set_item("rho", f64::NAN)?;
-            out.set_item("reml_score", f64::NAN)?;
-            out.set_item("edf", 0.0)?;
-            out.set_item(
-                "coefficients",
-                Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
-            )?;
-            out.set_item(
-                "fitted",
-                Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
-            )?;
-            out.set_item(
-                "sigma2",
-                Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
-            )?;
+            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
         }
         Err(err) => return Err(py_value_error(err.to_string())),
     }
@@ -720,20 +701,287 @@ fn gaussian_reml_fit_batched<'py>(
     Ok(out.unbind())
 }
 
+#[pyfunction(signature = (
+    t,
+    y,
+    basis_kind,
+    knots_or_centers,
+    penalty,
+    basis_order = 3,
+    periodic = false,
+    weights = None,
+    init_lambda = None
+))]
+fn gaussian_reml_fit_positions<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    basis_kind: String,
+    knots_or_centers: PyReadonlyArray1<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    basis_order: usize,
+    periodic: bool,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let x = position_basis_design(
+        t.as_array(),
+        knots_or_centers.as_array(),
+        &basis_kind,
+        basis_order,
+        periodic,
+    )
+    .map_err(py_value_error)?;
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    let result = gaussian_reml_multi_closed_form_with_cache(
+        x.view(),
+        y_view,
+        penalty_view,
+        weight_view,
+        init_lambda,
+        None,
+    );
+    let out = PyDict::new(py);
+    match result {
+        Ok(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
+        Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            set_degenerate_gaussian_reml_items(
+                py,
+                &out,
+                x.nrows(),
+                y_view.ncols(),
+                penalty_view.nrows(),
+            )?;
+        }
+        Err(err) => return Err(py_value_error(err.to_string())),
+    }
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    t,
+    y,
+    basis_kind,
+    knots_or_centers,
+    penalty,
+    grad_lambda = 0.0,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_reml_score = 0.0,
+    basis_order = 3,
+    periodic = false,
+    weights = None,
+    init_lambda = None
+))]
+fn gaussian_reml_fit_positions_backward<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    basis_kind: String,
+    knots_or_centers: PyReadonlyArray1<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    grad_lambda: f64,
+    grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_reml_score: f64,
+    basis_order: usize,
+    periodic: bool,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let backward = gaussian_reml_fit_positions_backward_impl(
+        t.as_array(),
+        y.as_array(),
+        knots_or_centers.as_array(),
+        &basis_kind,
+        basis_order,
+        periodic,
+        penalty.as_array(),
+        weights.as_ref().map(|w| w.as_array()),
+        init_lambda,
+        grad_lambda,
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score,
+    )
+    .map_err(py_value_error)?;
+
+    let out = PyDict::new(py);
+    out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    t,
+    y,
+    row_offsets,
+    basis_kind,
+    knots_or_centers,
+    penalty,
+    basis_order = 3,
+    periodic = false,
+    weights = None,
+    init_lambda = None
+))]
+fn gaussian_reml_fit_positions_batched<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    row_offsets: PyReadonlyArray1<'py, usize>,
+    basis_kind: String,
+    knots_or_centers: PyReadonlyArray1<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    basis_order: usize,
+    periodic: bool,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let result = gaussian_reml_fit_positions_batched_impl(
+        t.as_array(),
+        y.as_array(),
+        row_offsets.as_array(),
+        knots_or_centers.as_array(),
+        &basis_kind,
+        basis_order,
+        periodic,
+        penalty.as_array(),
+        weights.as_ref().map(|w| w.as_array()),
+        init_lambda,
+    )
+    .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("status", result.statuses)?;
+    out.set_item("lambda", result.lambdas.into_pyarray(py))?;
+    out.set_item("rho", result.rhos.into_pyarray(py))?;
+    out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
+    out.set_item("edf", result.edf.into_pyarray(py))?;
+    out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", result.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    t,
+    y,
+    row_offsets,
+    basis_kind,
+    knots_or_centers,
+    penalty,
+    grad_lambda = None,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_reml_score = None,
+    basis_order = 3,
+    periodic = false,
+    weights = None,
+    init_lambda = None
+))]
+fn gaussian_reml_fit_positions_batched_backward<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    row_offsets: PyReadonlyArray1<'py, usize>,
+    basis_kind: String,
+    knots_or_centers: PyReadonlyArray1<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    grad_lambda: Option<PyReadonlyArray1<'py, f64>>,
+    grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    basis_order: usize,
+    periodic: bool,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let backward = gaussian_reml_fit_positions_batched_backward_impl(
+        t.as_array(),
+        y.as_array(),
+        row_offsets.as_array(),
+        knots_or_centers.as_array(),
+        &basis_kind,
+        basis_order,
+        periodic,
+        penalty.as_array(),
+        weights.as_ref().map(|w| w.as_array()),
+        init_lambda,
+        grad_lambda.as_ref().map(|g| g.as_array()),
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score.as_ref().map(|g| g.as_array()),
+    )
+    .map_err(py_value_error)?;
+
+    let out = PyDict::new(py);
+    out.set_item("status", backward.statuses)?;
+    out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
 fn gaussian_reml_result_to_pydict<'py>(
     py: Python<'py>,
     fit: gam::gaussian_reml::GaussianRemlMultiResult,
 ) -> PyResult<Py<PyDict>> {
     let out = PyDict::new(py);
+    set_ok_gaussian_reml_items(py, &out, fit)?;
+    Ok(out.unbind())
+}
+
+fn set_ok_gaussian_reml_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    fit: gam::gaussian_reml::GaussianRemlMultiResult,
+) -> PyResult<()> {
     out.set_item("status", "ok")?;
     out.set_item("lambda", fit.lambda)?;
     out.set_item("rho", fit.rho)?;
     out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("reml_grad_lambda", fit.reml_grad_lambda)?;
+    out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
+    out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
+    out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
     out.set_item("edf", fit.edf)?;
     out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
     out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
-    Ok(out.unbind())
+    Ok(())
+}
+
+fn set_degenerate_gaussian_reml_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    n_rows: usize,
+    n_outputs: usize,
+    n_coefficients: usize,
+) -> PyResult<()> {
+    out.set_item("status", "degenerate")?;
+    out.set_item("lambda", f64::NAN)?;
+    out.set_item("rho", f64::NAN)?;
+    out.set_item("reml_score", f64::NAN)?;
+    out.set_item("reml_grad_lambda", f64::NAN)?;
+    out.set_item("reml_hess_lambda", f64::NAN)?;
+    out.set_item("reml_grad_rho", f64::NAN)?;
+    out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("edf", 0.0)?;
+    out.set_item(
+        "coefficients",
+        Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "fitted",
+        Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "sigma2",
+        Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
+    )?;
+    Ok(())
 }
 
 struct BatchedGaussianRemlResult {
@@ -745,6 +993,19 @@ struct BatchedGaussianRemlResult {
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
     sigma2: Array2<f64>,
+}
+
+struct PositionGaussianRemlBackwardResult {
+    grad_t: Array1<f64>,
+    grad_y: Array2<f64>,
+    grad_weights: Array1<f64>,
+}
+
+struct BatchedPositionGaussianRemlBackwardResult {
+    statuses: Vec<String>,
+    grad_t: Array1<f64>,
+    grad_y: Array2<f64>,
+    grad_weights: Array1<f64>,
 }
 
 fn gaussian_reml_fit_formula_table_impl(
