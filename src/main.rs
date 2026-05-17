@@ -15150,7 +15150,16 @@ mod tests {
 
     #[test]
     fn parse_surv_response_rejectswrong_arity() {
-        let err = parse_surv_response("Surv(entry_time, exit_time)")
+        // 2-arg case: should give the actionable migration hint message
+        // showing the user the exact 3-arg rewrite.
+        let err = parse_surv_response("Surv(exit_time, event)")
+            .expect_err("invalid Surv arity should fail");
+        assert!(
+            err.contains("needs three columns") && err.contains("entry"),
+            "expected actionable 2-arg error, got: {err}"
+        );
+        // 1-arg, 4-arg, etc still get the generic message
+        let err = parse_surv_response("Surv(entry_time)")
             .expect_err("invalid Surv arity should fail");
         assert!(err.contains("expects exactly three columns"));
     }
