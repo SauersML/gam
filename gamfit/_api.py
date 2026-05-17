@@ -786,7 +786,19 @@ def gaussian_reml_fit_batched(
 
 def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     out = dict(payload)
-    for key in ("coefficients", "fitted", "sigma2", "lambda", "rho", "reml_score", "edf"):
+    for key in (
+        "coefficients",
+        "fitted",
+        "sigma2",
+        "lambda",
+        "rho",
+        "reml_score",
+        "reml_grad_lambda",
+        "reml_hess_lambda",
+        "reml_grad_rho",
+        "reml_hess_rho",
+        "edf",
+    ):
         if key in out:
             out[key] = np.asarray(out[key], dtype=float)
     return out

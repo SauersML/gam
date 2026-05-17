@@ -17988,6 +17988,153 @@ pub fn build_duchon_basis(
     build_duchon_basiswithworkspace(data, spec, &mut workspace)
 }
 
+pub fn create_duchon_basis_1d_derivative_dense(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    periodic: bool,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order > 2 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
+        )));
+    }
+    if t.is_empty() || centers.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis derivative requires non-empty t and centers".to_string(),
+        ));
+    }
+    if t.iter().any(|v| !v.is_finite()) || centers.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis derivative requires finite t and center values".to_string(),
+        ));
+    }
+
+    let data = t.to_owned().insert_axis(Axis(1));
+    let center_matrix = centers.to_owned().insert_axis(Axis(1));
+    let mut workspace = BasisWorkspace::default();
+    let effective_order = if periodic {
+        DuchonNullspaceOrder::Zero
+    } else {
+        duchon_effective_nullspace_order(center_matrix.view(), nullspace_order)
+    };
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order = power;
+    validate_duchon_kernel_orders(None, p_order, s_order, 1)?;
+    let z =
+        kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
+    let kernel_cols = z.ncols();
+    let poly_cols = if periodic {
+        1
+    } else {
+        polynomial_block_from_order(data.view(), effective_order).ncols()
+    };
+
+    let pure_coeff = PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), 1);
+    let kernel_amp = duchon_kernel_amplification(
+        center_matrix.view(),
+        None,
+        p_order,
+        s_order,
+        1,
+        None,
+        None,
+        Some(&pure_coeff),
+        effective_order,
+        &mut workspace.cache,
+    )?;
+    let periodic_domain = if periodic {
+        let left = centers.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let right = centers.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        if !left.is_finite() || !right.is_finite() || left >= right {
+            return Err(BasisError::InvalidRange(left, right));
+        }
+        Some((left, right - left))
+    } else {
+        None
+    };
+
+    let mut raw_kernel = Array2::<f64>::zeros((t.len(), centers.len()));
+    for i in 0..t.len() {
+        let x = if let Some((left, period)) = periodic_domain {
+            wrap_to_period(t[i], left, period)
+        } else {
+            t[i]
+        };
+        for j in 0..centers.len() {
+            let delta = if let Some((_left, period)) = periodic_domain {
+                let mut wrapped = (x - centers[j]).rem_euclid(period);
+                if wrapped > 0.5 * period {
+                    wrapped -= period;
+                }
+                wrapped
+            } else {
+                x - centers[j]
+            };
+            let r = delta.abs();
+            let sign = if delta > 0.0 {
+                1.0
+            } else if delta < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            let (phi, phi_r, phi_rr) =
+                duchon_kernel_radial_triplet(r, None, p_order, s_order, 1, None)?;
+            raw_kernel[[i, j]] = match order {
+                0 => phi,
+                1 => phi_r * sign,
+                2 => phi_rr,
+                _ => unreachable!("order checked above"),
+            } * kernel_amp;
+        }
+    }
+
+    let mut basis = Array2::<f64>::zeros((t.len(), kernel_cols + poly_cols));
+    let design_kernel = fast_ab(&raw_kernel, &z);
+    basis
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&design_kernel);
+    if !periodic {
+        fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
+    }
+    Ok(basis)
+}
+
+fn fill_duchon_1d_polynomial_derivative(
+    basis: &mut Array2<f64>,
+    start_col: usize,
+    t: ArrayView1<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    derivative_order: usize,
+) {
+    let exponents: Vec<usize> = match nullspace_order {
+        DuchonNullspaceOrder::Zero => vec![0],
+        DuchonNullspaceOrder::Linear => vec![0, 1],
+        DuchonNullspaceOrder::Degree(degree) => monomial_exponents(1, degree)
+            .into_iter()
+            .map(|exponent| exponent[0])
+            .collect(),
+    };
+    for (offset, exponent) in exponents.into_iter().enumerate() {
+        if exponent < derivative_order {
+            continue;
+        }
+        let coefficient =
+            (0..derivative_order).fold(1.0, |acc, step| acc * (exponent - step) as f64);
+        let remaining = exponent - derivative_order;
+        for row in 0..t.len() {
+            basis[[row, start_col + offset]] = if remaining == 0 {
+                coefficient
+            } else {
+                coefficient * t[row].powi(remaining as i32)
+            };
+        }
+    }
+}
+
 #[inline]
 fn periodic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     let dx = (x - c).rem_euclid(period).abs();
