@@ -107,8 +107,8 @@ fn sphere_m_sweep_lambda_diagnostic() {
             design_input[[i, 0]] = *lat;
             design_input[[i, 1]] = *lon;
         }
-        let design = build_term_collection_design(design_input.view(), &fit.resolvedspec)
-            .expect("design");
+        let design =
+            build_term_collection_design(design_input.view(), &fit.resolvedspec).expect("design");
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         let mean_pred = pred.iter().sum::<f64>() / pred.len() as f64;
         let var_pred =

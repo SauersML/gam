@@ -13602,6 +13602,31 @@ fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
 /// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance` —
 /// max abs/rel diff stays below 1e-12 across the full domain.
 #[inline]
+fn wahba_sphere_kernel_m4_spectral(cos_gamma: f64) -> f64 {
+    const L_MAX: usize = 96;
+    let x = cos_gamma.clamp(-1.0, 1.0);
+    let mut p_l_minus_1 = 1.0;
+    let mut p_l = x;
+    let mut sum = 3.0 * p_l / (4.0 * std::f64::consts::PI * 2.0_f64.powi(4));
+    for l in 1..L_MAX {
+        let p_l_plus_1 =
+            ((2 * l + 1) as f64 * x * p_l - (l as f64) * p_l_minus_1) / ((l + 1) as f64);
+        let ell = (l + 1) as f64;
+        let eigen = (ell * (ell + 1.0)).powi(4);
+        let weight = (2.0 * ell + 1.0) / (4.0 * std::f64::consts::PI);
+        sum += weight * p_l_plus_1 / eigen;
+        p_l_minus_1 = p_l;
+        p_l = p_l_plus_1;
+    }
+    sum
+}
+
+#[inline]
+fn wahba_sphere_kernel_m4_spectral_simd(cos_gamma: wide::f64x4) -> wide::f64x4 {
+    wide::f64x4::from(cos_gamma.to_array().map(wahba_sphere_kernel_m4_spectral))
+}
+
+#[inline]
 fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
     use wide::f64x4;
     let one = f64x4::ONE;
@@ -13639,16 +13664,8 @@ fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usiz
             (q3 / f64x4::from(6.0) - f64x4::from(1.0 / 24.0)) / two_pi
         }
         4 => {
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let w4 = w3 * w;
-            let q4 = a * (f64x4::from(70.0) * w4 - f64x4::from(60.0) * w3 + f64x4::from(6.0) * w2)
-                + f64x4::from(35.0) * w3 * (one - c)
-                + c * f64x4::from(55.0) * w2 / f64x4::from(3.0)
-                - f64x4::from(12.5) * w2
-                - w / f64x4::from(3.0)
-                + f64x4::from(0.25);
-            (q4 / f64x4::from(24.0) - f64x4::from(1.0 / 120.0)) / two_pi
+            let _ = (w, c, two_pi);
+            wahba_sphere_kernel_m4_spectral_simd(cg)
         }
         _ => f64x4::from(f64::NAN),
     }
@@ -13683,16 +13700,8 @@ fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<
             (q3 / 6.0 - 1.0 / 24.0) / two_pi
         }
         4 => {
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let w4 = w3 * w;
-            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
-                + 35.0 * w3 * (1.0 - c)
-                + c * 55.0 * w2 / 3.0
-                - 12.5 * w2
-                - w / 3.0
-                + 0.25;
-            (q4 / 24.0 - 1.0 / 120.0) / two_pi
+            let _ = (w, c, two_pi);
+            wahba_sphere_kernel_m4_spectral(cos_gamma)
         }
         other => {
             return Err(BasisError::InvalidInput(format!(

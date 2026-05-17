@@ -694,13 +694,19 @@ fn gaussian_reml_fit_formula_table_impl(
         }
     };
     if standard.family != LikelihoodFamily::GaussianIdentity {
-        return Err("closed-form Gaussian REML formula fitting requires Gaussian identity".to_string());
+        return Err(
+            "closed-form Gaussian REML formula fitting requires Gaussian identity".to_string(),
+        );
     }
     if standard.wiggle.is_some() {
-        return Err("closed-form Gaussian REML formula fitting does not support link wiggle".to_string());
+        return Err(
+            "closed-form Gaussian REML formula fitting does not support link wiggle".to_string(),
+        );
     }
     if standard.offset.iter().any(|value| value.abs() > 0.0) {
-        return Err("closed-form Gaussian REML formula fitting does not support offsets".to_string());
+        return Err(
+            "closed-form Gaussian REML formula fitting does not support offsets".to_string(),
+        );
     }
     let design = gam::smooth::build_term_collection_design(standard.data, &standard.spec)
         .map_err(|err| format!("failed to build formula design matrix: {err}"))?;

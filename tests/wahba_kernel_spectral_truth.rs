@@ -12,10 +12,7 @@
 //! For each m ∈ {1, 2, 3, 4} we evaluate at several γ angles and compare
 //!   closed_form(γ) − closed_form(π/2)  vs  spectral(γ) − spectral(π/2)
 //! The π/2 offset cancels any additive constant difference, isolating
-//! the shape-only error of the closed form.
-//!
-//! At HEAD this test PASSES for m=1, 2, 3 and FAILS for m=4 — that
-//! failure is the m=4 bug.
+//! the shape-only error of the kernel implementation.
 
 use gam::basis::spherical_wahba_kernel_matrix;
 use ndarray::array;
@@ -128,7 +125,6 @@ fn wahba_m4_closed_matches_spectral_truth() {
     let err = run_compare(4);
     assert!(
         err < 1e-8,
-        "Wahba m=4 closed-form disagrees with spectral truth by {err:.3e} — \
-         closed-form polynomial in wahba_sphere_kernel_from_cos has an error",
+        "Wahba m=4 kernel disagrees with spectral truth by {err:.3e}",
     );
 }
