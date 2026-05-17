@@ -15,8 +15,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 fn truth(lat: f64, lon: f64) -> f64 {
-    0.5 + 0.6 * lat.to_radians().sin()
-        + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
+    0.5 + 0.6 * lat.to_radians().sin() + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
 }
 
 fn make_dataset(n: usize, seed: u64) -> gam::data::EncodedDataset {
@@ -68,15 +67,16 @@ fn sphere_fit_predictions_stay_finite_and_close_to_truth_across_seeds() {
             &cfg,
         )
         .unwrap_or_else(|e| panic!("seed={seed} fit: {e}"));
-        let FitResult::Standard(fit) = result else { panic!() };
+        let FitResult::Standard(fit) = result else {
+            panic!()
+        };
         let n = probes.len();
         let mut m = Array2::<f64>::zeros((n, 3));
         for (i, (lat, lon)) in probes.iter().enumerate() {
             m[[i, 0]] = *lat;
             m[[i, 1]] = *lon;
         }
-        let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-            .expect("design");
+        let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         assert!(
             pred.iter().all(|v| v.is_finite()),

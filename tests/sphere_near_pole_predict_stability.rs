@@ -50,8 +50,7 @@ fn predict_at(formula: &str, lats: &[f64], lons: &[f64]) -> Vec<f64> {
         m[[i, 0]] = lats[i];
         m[[i, 1]] = lons[i];
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 

@@ -50,8 +50,8 @@ fn fit_predict(formula: &str) -> (f64, f64, f64) {
         family: Some("binomial(logit)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg)
-        .unwrap_or_else(|e| panic!("fit `{formula}`: {e}"));
+    let result =
+        fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("fit `{formula}`: {e}"));
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
@@ -69,8 +69,7 @@ fn fit_predict(formula: &str) -> (f64, f64, f64) {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
     let mut var = 0.0_f64;
@@ -98,14 +97,20 @@ fn binomial_logit_sphere_pseudo_m4_does_not_collapse() {
          The smooth contribution is essentially zero — REML still has a \
          scale-sensitivity bug for the Bernoulli inner loop.",
     );
-    assert!(range > 0.5, "pred range {range:.3} too small for truth eta-range ~4");
+    assert!(
+        range > 0.5,
+        "pred range {range:.3} too small for truth eta-range ~4"
+    );
 }
 
 #[test]
 fn binomial_logit_sphere_sobolev_m4_does_not_collapse() {
     init_parallelism();
     let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    assert!(std > 0.1, "binomial sobolev m=4 collapsed: pred std={std:.3}");
+    assert!(
+        std > 0.1,
+        "binomial sobolev m=4 collapsed: pred std={std:.3}"
+    );
     assert!(range > 0.5, "pred range {range:.3} too small");
 }
 
@@ -114,10 +119,8 @@ fn binomial_logit_sphere_both_kernels_agree_under_reml() {
     // If REML is truly scale-invariant, both kernels should produce
     // similar logit predictions (different λ, but identical smoother).
     init_parallelism();
-    let (mean_sob, std_sob, _) =
-        fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let (mean_pse, std_pse, _) =
-        fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=pseudo)");
+    let (mean_sob, std_sob, _) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
+    let (mean_pse, std_pse, _) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=pseudo)");
     // Means should match to a couple decimals; stds within ~30% of each
     // other (allow some divergence because Bernoulli REML adds PIRLS
     // inner-loop nonlinearity on top).
