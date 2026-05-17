@@ -2771,7 +2771,7 @@ fn gaussian_weighted_ridge_batch_impl(
 }
 
 #[cfg(test)]
-mod tests {
+mod batch_tests {
     use super::*;
     use ndarray::{array, s};
 
