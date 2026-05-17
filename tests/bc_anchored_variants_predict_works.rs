@@ -125,10 +125,12 @@ fn bc_nonzero_anchor_rejected_with_clear_error_at_term_build() {
                 // error that names `anchor` and the unsupported `value`.
                 let lower = e.to_lowercase();
                 let mentions_anchor = lower.contains("anchor");
-                let mentions_remedy =
-                    lower.contains("value 0") || lower.contains("anchor value 0")
-                    || lower.contains("subtract") || lower.contains("offset");
-                if !mentions_anchor || !mentions_remedy
+                let mentions_remedy = lower.contains("value 0")
+                    || lower.contains("anchor value 0")
+                    || lower.contains("subtract")
+                    || lower.contains("offset");
+                if !mentions_anchor
+                    || !mentions_remedy
                     || lower.contains("matrix conditioning")
                     || lower.contains("basis function generation")
                 {

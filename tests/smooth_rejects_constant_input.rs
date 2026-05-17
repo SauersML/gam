@@ -9,17 +9,13 @@
 //! naming the offending variable.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 
 fn try_fit(formula: &str) -> Result<(), String> {
     let n = 50usize;
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
-            StringRecord::from(vec!["0.5".to_string(), format!("{:.4}", 0.1 * i as f64)])
-        })
+        .map(|i| StringRecord::from(vec!["0.5".to_string(), format!("{:.4}", 0.1 * i as f64)]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     let cfg = FitConfig {
@@ -43,7 +39,8 @@ fn smooth_on_constant_column_errors_with_clear_message() {
             "expected `{f}` to error on constant-x training data, but fit succeeded"
         ));
         let lower = err.to_lowercase();
-        let names_var = lower.contains("'x'") || lower.contains(" x ") || lower.contains("variable 'x'");
+        let names_var =
+            lower.contains("'x'") || lower.contains(" x ") || lower.contains("variable 'x'");
         let names_problem = lower.contains("constant")
             || lower.contains("one unique value")
             || lower.contains("degenerate");
@@ -51,6 +48,9 @@ fn smooth_on_constant_column_errors_with_clear_message() {
             names_var && names_problem,
             "`{f}` errored but the message is not user-friendly — missing var name or 'constant/degenerate' diagnosis: {err}",
         );
-        eprintln!("[smooth-constant] OK   {f} -> {}", err.lines().next().unwrap_or(""));
+        eprintln!(
+            "[smooth-constant] OK   {f} -> {}",
+            err.lines().next().unwrap_or("")
+        );
     }
 }
