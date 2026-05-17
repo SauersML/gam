@@ -3452,6 +3452,158 @@ impl<'a> RemlState<'a> {
         Some(cache)
     }
 
+    fn gaussian_closed_form_reml_eligible(&self, rho: &Array1<f64>) -> bool {
+        if rho.len() != self.canonical_penalties.len() {
+            return false;
+        }
+        let family_ok = matches!(
+            self.config.likelihood.family,
+            crate::types::GlmLikelihoodFamily::GaussianIdentity
+        );
+        let link_ok = matches!(
+            self.config.link_kind,
+            crate::types::InverseLink::Standard(LinkFunction::Identity)
+        );
+        family_ok
+            && link_ok
+            && !self.config.firth_bias_reduction
+            && self.coefficient_lower_bounds.is_none()
+            && self.linear_constraints.is_none()
+            && self.penalty_shrinkage_floor.is_none()
+            && rho.iter().all(|&r| r.is_finite())
+    }
+
+    fn canonical_penalty_full_matrices(&self) -> Vec<Array2<f64>> {
+        self.canonical_penalties
+            .iter()
+            .map(|cp| {
+                let mut dense = Array2::<f64>::zeros((self.p, self.p));
+                cp.accumulate_weighted(&mut dense, 1.0);
+                dense
+            })
+            .collect()
+    }
+
+    /// Evaluate Gaussian identity-link REML directly from sufficient statistics.
+    ///
+    /// When the Gaussian fixed-cache preconditions hold, the inner mode has the
+    /// closed form
+    ///
+    /// ```text
+    /// β̂(ρ) = (XᵀWX + S(ρ))⁻¹ XᵀW(y - offset).
+    /// ```
+    ///
+    /// The REML determinant terms are exactly the pair the objective requires:
+    /// `log|XᵀWX + S(ρ)|` and `log|S(ρ)|_+`.  This path therefore bypasses
+    /// PIRLS iteration entirely, while still routing the resulting sufficient
+    /// statistics through the unified analytic REML evaluator so the gradient
+    /// and outer Hessian stay paired with the same cost.
+    fn try_gaussian_closed_form_reml_eval(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+    ) -> Result<Option<super::unified::RemlLamlResult>, EstimationError> {
+        if !self.gaussian_closed_form_reml_eligible(rho) {
+            return Ok(None);
+        }
+        let Some(cache) = self.gaussian_fixed_cache_if_eligible() else {
+            return Ok(None);
+        };
+        let lambdas = rho.mapv(f64::exp);
+        if lambdas.iter().any(|&lambda| !lambda.is_finite() || lambda <= 0.0) {
+            return Ok(None);
+        }
+
+        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
+        for (k, cp) in self.canonical_penalties.iter().enumerate() {
+            cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
+        }
+
+        let mut h = cache.xtwx_orig.clone();
+        h += &s_lambda;
+        let hessian_op = match super::unified::DenseSpectralOperator::from_symmetric(&h) {
+            Ok(op) => Arc::new(op),
+            Err(err) => {
+                log::debug!("[gaussian-closed-form-reml] declined: Hessian factor failed: {err}");
+                return Ok(None);
+            }
+        };
+        let beta = super::unified::HessianOperator::solve(hessian_op.as_ref(), &cache.xtwy_orig);
+        if beta.iter().any(|&value| !value.is_finite()) {
+            return Ok(None);
+        }
+
+        let xtwx_beta = cache.xtwx_orig.dot(&beta);
+        let rss = (cache.centered_weighted_y_sq - 2.0 * beta.dot(&cache.xtwy_orig)
+            + beta.dot(&xtwx_beta))
+        .max(0.0);
+        let penalty_quadratic = beta.dot(&s_lambda.dot(&beta));
+
+        let penalty_matrices = self.canonical_penalty_full_matrices();
+        let penalty_logdet = if penalty_matrices.is_empty() {
+            super::unified::PenaltyLogdetDerivs {
+                value: 0.0,
+                first: Array1::zeros(0),
+                second: Some(Array2::zeros((0, 0))),
+            }
+        } else {
+            let per_block_rho = vec![rho.clone()];
+            let per_block_penalties = vec![penalty_matrices.as_slice()];
+            let per_block_nullspace_dims = vec![self.nullspace_dims.as_slice()];
+            super::unified::compute_block_penalty_logdet_derivs(
+                &per_block_rho,
+                &per_block_penalties,
+                &per_block_nullspace_dims,
+                0.0,
+            )
+            .map_err(EstimationError::InvalidInput)?
+        };
+
+        let penalty_rank = if self.canonical_penalties.is_empty() {
+            0
+        } else {
+            use crate::faer_ndarray::FaerEigh;
+            let (evals, _) = s_lambda
+                .eigh(faer::Side::Lower)
+                .map_err(|e| EstimationError::InvalidInput(format!(
+                    "Gaussian closed-form penalty eigendecomposition failed: {e}"
+                )))?;
+            let threshold =
+                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+            evals.iter().filter(|&&value| value > threshold).count()
+        };
+        let nullspace_dim = self.p.saturating_sub(penalty_rank) as f64;
+
+        let solution = super::unified::InnerSolutionBuilder::new(
+            -0.5 * rss,
+            penalty_quadratic,
+            beta,
+            self.y.len(),
+            hessian_op,
+            self.build_penalty_coords(),
+            penalty_logdet,
+            super::unified::DispersionHandling::ProfiledGaussian,
+        )
+        .nullspace_dim_override(nullspace_dim)
+        .build();
+
+        let prior = self.build_prior(rho, mode);
+        let result = super::assembly::evaluate_solution(
+            &solution,
+            rho.as_slice().unwrap(),
+            mode,
+            prior,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        log::debug!(
+            "[gaussian-closed-form-reml] evaluated k={} p={} mode={:?}",
+            rho.len(),
+            self.p,
+            mode
+        );
+        Ok(Some(result))
+    }
+
     pub(crate) fn canonical_penalties(&self) -> &[crate::construction::CanonicalPenalty] {
         &self.canonical_penalties
     }
@@ -4815,6 +4967,17 @@ impl<'a> RemlState<'a> {
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
             return Ok(eval.cost);
+        }
+        if let Some(result) =
+            self.try_gaussian_closed_form_reml_eval(p, super::unified::EvalMode::ValueOnly)?
+        {
+            log::debug!(
+                "[REML] eval#{} gaussian closed-form cost {:.6e} | total {:.1}ms",
+                cost_call_idx,
+                result.cost,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+            return Ok(result.cost);
         }
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {

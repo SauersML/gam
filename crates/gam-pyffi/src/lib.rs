@@ -577,6 +577,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_gaussian_multi_output_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
@@ -1588,6 +1589,212 @@ fn dataset_with_model_schema(
     let schema = model.require_data_schema()?;
     let records = string_records_from_rows(&headers, rows)?;
     encode_recordswith_schema(headers, records, schema, UnseenCategoryPolicy::Error)
+}
+
+fn dataset_from_xy_arrays(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    formula: &str,
+) -> Result<EncodedDataset, String> {
+    if x.nrows() == 0 || y.nrows() == 0 {
+        return Err("array data cannot be empty".to_string());
+    }
+    if x.nrows() != y.nrows() {
+        return Err(format!(
+            "X/Y row mismatch: X has {} rows but Y has {} rows",
+            x.nrows(),
+            y.nrows()
+        ));
+    }
+    if x.ncols() == 0 {
+        return Err("X must have at least one column".to_string());
+    }
+    if y.ncols() == 0 {
+        return Err("Y must have at least one column".to_string());
+    }
+    let response_name = response_column_name(formula).unwrap_or_else(|| "y".to_string());
+    let mut headers = Vec::<String>::with_capacity(y.ncols() + x.ncols());
+    if y.ncols() == 1 {
+        headers.push(response_name);
+    } else {
+        headers.extend((0..y.ncols()).map(|index| format!("y{index}")));
+    }
+    headers.extend((0..x.ncols()).map(|index| format!("x{index}")));
+    ensure_unique_headers(&headers)?;
+
+    let mut values = Array2::<f64>::zeros((x.nrows(), headers.len()));
+    values
+        .slice_mut(ndarray::s![.., 0..y.ncols()])
+        .assign(&y);
+    values
+        .slice_mut(ndarray::s![.., y.ncols()..])
+        .assign(&x);
+    dataset_from_numeric_array(headers, values)
+}
+
+fn dataset_from_x_array_with_model_schema(
+    model: &FittedModel,
+    x: ArrayView2<'_, f64>,
+) -> Result<EncodedDataset, String> {
+    if x.nrows() == 0 {
+        return Err("array data cannot be empty".to_string());
+    }
+    if x.ncols() == 0 {
+        return Err("X must have at least one column".to_string());
+    }
+    let headers = (0..x.ncols())
+        .map(|index| format!("x{index}"))
+        .collect::<Vec<_>>();
+    ensure_required_numeric_array_columns(model, &headers)?;
+    let schema = model.require_data_schema()?;
+    dataset_from_numeric_array_with_schema(headers, x.to_owned(), schema)
+}
+
+fn dataset_from_numeric_array(
+    headers: Vec<String>,
+    values: Array2<f64>,
+) -> Result<EncodedDataset, String> {
+    ensure_unique_headers(&headers)?;
+    validate_numeric_array_values(&headers, values.view())?;
+    let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
+    let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(headers.len());
+    for (j, name) in headers.iter().enumerate() {
+        let kind = infer_numeric_array_column_kind(values.column(j));
+        column_kinds.push(kind);
+        schema_cols.push(SchemaColumn {
+            name: name.clone(),
+            kind,
+            levels: Vec::new(),
+        });
+    }
+    Ok(EncodedDataset {
+        headers,
+        values,
+        schema: DataSchema {
+            columns: schema_cols,
+        },
+        column_kinds,
+    })
+}
+
+fn dataset_from_numeric_array_with_schema(
+    headers: Vec<String>,
+    values: Array2<f64>,
+    schema: &DataSchema,
+) -> Result<EncodedDataset, String> {
+    ensure_unique_headers(&headers)?;
+    validate_numeric_array_values(&headers, values.view())?;
+    let schema_byname = schema
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), column))
+        .collect::<HashMap<_, _>>();
+    let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
+    let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(headers.len());
+    for (j, name) in headers.iter().enumerate() {
+        let column = schema_byname
+            .get(name.as_str())
+            .ok_or_else(|| format!("array column '{name}' was not present in the training schema"))?;
+        match column.kind {
+            ColumnKindTag::Categorical => {
+                return Err(format!(
+                    "array FFI only supports numeric continuous/binary columns; column '{name}' is categorical in the training schema"
+                ));
+            }
+            ColumnKindTag::Binary => {
+                for (row, value) in values.column(j).iter().enumerate() {
+                    if (*value - 0.0).abs() >= 1e-12 && (*value - 1.0).abs() >= 1e-12 {
+                        return Err(format!(
+                            "column '{name}' is binary in schema but row {} has value {}; expected 0 or 1",
+                            row + 1,
+                            value
+                        ));
+                    }
+                }
+            }
+            ColumnKindTag::Continuous => {}
+        }
+        column_kinds.push(column.kind);
+        schema_cols.push((*column).clone());
+    }
+    Ok(EncodedDataset {
+        headers,
+        values,
+        schema: DataSchema {
+            columns: schema_cols,
+        },
+        column_kinds,
+    })
+}
+
+fn ensure_required_numeric_array_columns(
+    model: &FittedModel,
+    headers: &[String],
+) -> Result<(), String> {
+    let expected_names = required_prediction_columns(model)?;
+    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_names
+        .difference(&present_names)
+        .map(|name| format!("missing required column '{name}'"))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing.join(" "))
+    }
+}
+
+fn ensure_unique_headers(headers: &[String]) -> Result<(), String> {
+    if headers.is_empty() {
+        return Err("table must have at least one column".to_string());
+    }
+    if headers.iter().any(|header| header.trim().is_empty()) {
+        return Err("table headers must be non-empty strings".to_string());
+    }
+    let mut unique_headers = BTreeSet::<String>::new();
+    for header in headers {
+        if !unique_headers.insert(header.clone()) {
+            return Err(format!("duplicate column name '{header}'"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_numeric_array_values(
+    headers: &[String],
+    values: ArrayView2<'_, f64>,
+) -> Result<(), String> {
+    if values.nrows() == 0 {
+        return Err("array data cannot be empty".to_string());
+    }
+    if values.ncols() != headers.len() {
+        return Err(format!(
+            "array column count {} does not match header count {}",
+            values.ncols(),
+            headers.len()
+        ));
+    }
+    for ((row, col), value) in values.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "non-finite value at row {}, column '{}'",
+                row + 1,
+                headers[col]
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn infer_numeric_array_column_kind(column: ArrayView1<'_, f64>) -> ColumnKindTag {
+    if column
+        .iter()
+        .all(|value| (*value - 0.0).abs() < 1e-12 || (*value - 1.0).abs() < 1e-12)
+    {
+        ColumnKindTag::Binary
+    } else {
+        ColumnKindTag::Continuous
+    }
 }
 
 fn schema_check(
