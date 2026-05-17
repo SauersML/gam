@@ -28,7 +28,10 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
-use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
+use gam::smooth::{
+    BlockwisePenalty, TermCollectionSpec, build_term_collection_design,
+    freeze_term_collection_from_design,
+};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense,
@@ -39,6 +42,7 @@ use gam::terms::basis::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
+use gam::{faer_ndarray::FaerEigh, matrix::SymmetricMatrix};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -252,14 +256,18 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
         "capabilities",
         vec![
             "fit",
+            "fit_array",
             "load",
             "predict",
+            "predict_array",
             "sample",
             "summary",
             "check",
             "report",
             "save",
             "validate_formula",
+            "design_matrix_array",
+            "basis",
         ],
     )?;
     info.set_item(
@@ -295,6 +303,36 @@ fn fit_table(
         .detach(move || fit_table_impl(headers, rows, formula, config_json.as_deref()))
         .map_err(py_value_error)?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
+}
+
+#[pyfunction]
+fn fit_gaussian_multi_output_table(
+    py: Python<'_>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    formula: String,
+    target_columns: Vec<String>,
+    config_json: Option<String>,
+) -> PyResult<Py<PyDict>> {
+    let result = py
+        .detach(move || {
+            fit_gaussian_multi_output_table_impl(
+                headers,
+                rows,
+                formula,
+                target_columns,
+                config_json.as_deref(),
+            )
+        })
+        .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("model", PyBytes::new(py, &result.model_bytes))?;
+    out.set_item("coefficients_flat", result.coefficients_flat)?;
+    out.set_item("n_coefficients", result.n_coefficients)?;
+    out.set_item("n_outputs", result.n_outputs)?;
+    out.set_item("lambdas", result.lambdas)?;
+    out.set_item("reml_score", result.reml_score)?;
+    Ok(out.unbind())
 }
 
 #[pyfunction]
@@ -539,11 +577,19 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
+    module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
+    module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
+    module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
@@ -591,6 +637,24 @@ fn fit_table_impl(
     config_json: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
+    fit_dataset_impl(dataset, formula, config_json)
+}
+
+fn fit_array_impl(
+    x: Array2<f64>,
+    y: Array2<f64>,
+    formula: String,
+    config_json: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    let dataset = dataset_from_xy_arrays(x.view(), y.view(), &formula)?;
+    fit_dataset_impl(dataset, formula, config_json)
+}
+
+fn fit_dataset_impl(
+    dataset: EncodedDataset,
+    formula: String,
+    config_json: Option<&str>,
+) -> Result<Vec<u8>, String> {
     let fit_config = parse_fit_config(config_json)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
@@ -825,9 +889,29 @@ fn predict_table_impl(
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
     let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    predict_dataset_impl(&model, model_class, dataset, options_json)
+}
+
+fn predict_array_impl(
+    model_bytes: &[u8],
+    x: Array2<f64>,
+    options_json: Option<&str>,
+) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let model_class = model.predict_model_class();
+    let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
+    predict_dataset_impl(&model, model_class, dataset, options_json)
+}
+
+fn predict_dataset_impl(
+    model: &FittedModel,
+    model_class: PredictModelClass,
+    dataset: EncodedDataset,
+    options_json: Option<&str>,
+) -> Result<String, String> {
     let options = parse_predict_options(options_json)?;
     if matches!(model_class, PredictModelClass::Survival) {
-        return predict_table_survival(&model, &dataset, &options);
+        return predict_table_survival(model, &dataset, &options);
     }
     let col_map = dataset.column_map();
     let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
@@ -845,7 +929,7 @@ fn predict_table_impl(
     let predictor = model
         .predictor()
         .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
-    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     if let Some(interval) = options.interval {
@@ -923,6 +1007,17 @@ fn design_matrix_table_impl(
     rows: Vec<Vec<String>>,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    design_matrix_dataset_impl(&model, dataset)
+}
+
+fn design_matrix_array_impl(model_bytes: &[u8], x: Array2<f64>) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
+    design_matrix_dataset_impl(&model, dataset)
+}
+
+fn design_matrix_dataset_impl(model: &FittedModel, dataset: EncodedDataset) -> Result<String, String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "design_matrix currently supports only standard GAM models; got '{}'. \
@@ -939,7 +1034,6 @@ fn design_matrix_table_impl(
                 .to_string(),
         );
     }
-    let dataset = dataset_with_model_schema(&model, headers, rows)?;
     let col_map = dataset.column_map();
     let training_headers = model.training_headers.as_ref();
     let spec = gam::survival_predict::resolve_termspec_for_prediction(
