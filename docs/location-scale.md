@@ -24,7 +24,12 @@ gamfit.fit(
 ```
 
 The main formula models the location (mean). The `noise_formula` models
-log-scale. Both share the same covariate table.
+log-scale. Both share the same covariate table. From the CLI the same
+submodel is supplied via `--predict-noise`:
+
+```bash
+gam fit data.csv 'y ~ s(x1) + s(x2)' --predict-noise 's(x1)' --out model.gam
+```
 
 This works for:
 
