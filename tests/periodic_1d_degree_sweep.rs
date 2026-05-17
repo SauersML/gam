@@ -116,7 +116,10 @@ fn periodic_1d_degree_0_rejected_cleanly() {
         &data,
         &cfg,
     );
-    let err = r.expect_err("periodic B-spline degree=0 must be rejected");
+    let err = match r {
+        Ok(_) => panic!("periodic B-spline degree=0 must be rejected"),
+        Err(e) => e,
+    };
     let lower = err.to_string().to_lowercase();
     assert!(
         lower.contains("degree") || lower.contains("k") || lower.contains("at least"),

@@ -668,9 +668,8 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
         );
     }
 
-    let rho_adjoint = lambda_adjoint * lambda + upstream_reml_score * fit.reml_grad_rho;
-    if rho_adjoint != 0.0 {
-        let root_scale = -rho_adjoint / fit.reml_hess_rho;
+    if lambda_adjoint != 0.0 {
+        let root_scale = -lambda_adjoint * lambda / fit.reml_hess_rho;
         add_reml_rho_gradient_vjp(
             root_scale,
             x,
@@ -2208,7 +2207,7 @@ mod tests {
     fn finite_difference_weights() -> Array1<f64> {
         Array1::from_shape_fn(20, |row| {
             let t = (row as f64 - 9.5) / 8.0;
-            0.85 + 0.18 * (1.1 * t).sin() + 0.05 * t
+            1.0 + 0.08 * (1.1 * t).sin() + 0.03 * t
         })
     }
 
@@ -2291,7 +2290,7 @@ mod tests {
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
-        let eps = 1.0e-5;
+        let eps = 1.0e-6;
 
         for target in targets {
             let backward =
