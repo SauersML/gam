@@ -2274,6 +2274,8 @@ mod tests {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
+            ForwardScalar::Lambda => (1.0, 0.0, None, None),
+            ForwardScalar::RemlScore => (0.0, 1.0, None, None),
             ForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
                 (0.0, 0.0, Some(grad_coefficients.view()), None)
@@ -2338,6 +2340,8 @@ mod tests {
         let penalty = finite_difference_penalty();
         let weights = finite_difference_weights();
         let targets = [
+            ForwardScalar::Lambda,
+            ForwardScalar::RemlScore,
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
