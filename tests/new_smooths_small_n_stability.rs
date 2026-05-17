@@ -15,8 +15,16 @@ use rand_distr::{Distribution, Normal, Uniform};
 
 const TAU: f64 = std::f64::consts::TAU;
 
-fn try_fit_predict(formula: &str, data: &gam::data::EncodedDataset, ncols: usize, probes: &[Vec<f64>]) -> Result<Vec<f64>, String> {
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+fn try_fit_predict(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    ncols: usize,
+    probes: &[Vec<f64>],
+) -> Result<Vec<f64>, String> {
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, data, &cfg).map_err(|e| format!("fit: {e}"))?;
     let FitResult::Standard(fit) = result else {
         return Err("non-standard".into());
@@ -43,10 +51,15 @@ fn make_1d_periodic(n: usize, seed: u64) -> gam::data::EncodedDataset {
     let noise = Normal::new(0.0, 0.1).expect("normal");
     let mut t: Vec<f64> = (0..n).map(|_| u.sample(&mut rng)).collect();
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = t.iter().map(|theta| theta.cos() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = t
+        .iter()
+        .map(|theta| theta.cos() + noise.sample(&mut rng))
+        .collect();
     let headers = ["t", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = t.iter().zip(y.iter())
-        .map(|(a,b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+    let rows: Vec<StringRecord> = t
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
@@ -62,7 +75,11 @@ fn make_sphere(n: usize, seed: u64) -> gam::data::EncodedDataset {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
@@ -75,7 +92,11 @@ fn make_cylinder(n_theta: usize, n_h: usize) -> gam::data::EncodedDataset {
         for j in 0..n_h {
             let h = -1.0 + 2.0 * (j as f64) / (n_h as f64 - 1.0).max(1.0);
             let y = theta.cos() + 0.3 * h;
-            records.push(StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()]));
+            records.push(StringRecord::from(vec![
+                theta.to_string(),
+                h.to_string(),
+                y.to_string(),
+            ]));
         }
     }
     encode_recordswith_inferred_schema(headers, records).expect("encode")
@@ -101,7 +122,10 @@ fn periodic_1d_small_n_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "periodic 1D small-N failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "periodic 1D small-N failures: {failures:?}"
+    );
 }
 
 #[test]
@@ -128,7 +152,10 @@ fn sphere_wahba_small_n_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "sphere wahba small-N failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "sphere wahba small-N failures: {failures:?}"
+    );
 }
 
 #[test]
@@ -137,10 +164,7 @@ fn sphere_harmonic_small_n_stable() {
     let mut failures = Vec::new();
     for n in [20usize, 50, 100, 200] {
         let data = make_sphere(n, 7);
-        let probes: Vec<Vec<f64>> = vec![
-            vec![0.0, 0.0, 0.0],
-            vec![45.0, 90.0, 0.0],
-        ];
+        let probes: Vec<Vec<f64>> = vec![vec![0.0, 0.0, 0.0], vec![45.0, 90.0, 0.0]];
         let formula = "y ~ sphere(lat, lon, method=harmonic, max_degree=2)";
         match try_fit_predict(formula, &data, 3, &probes) {
             Ok(_) => eprintln!("[smallN] sphere-harm n={n}: OK"),
@@ -154,7 +178,10 @@ fn sphere_harmonic_small_n_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "sphere harmonic small-N failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "sphere harmonic small-N failures: {failures:?}"
+    );
 }
 
 #[test]
@@ -181,5 +208,8 @@ fn cylinder_te_small_n_stable() {
             }
         }
     }
-    assert!(failures.is_empty(), "cylinder te small-N failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "cylinder te small-N failures: {failures:?}"
+    );
 }
