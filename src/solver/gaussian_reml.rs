@@ -399,11 +399,12 @@ pub fn gaussian_reml_score_derivatives(
     }
     let mut hessian = x.t().dot(&wx);
     hessian += &(penalty.to_owned() * lambda);
-    let chol = hessian
-        .cholesky(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
+    let chol =
+        hessian
+            .cholesky(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let lower = chol.lower_triangular();
     let h_inv = solve_upper_triangular_matrix(
         &lower.t().to_owned(),
@@ -1044,6 +1045,38 @@ mod tests {
     }
 
     #[test]
+    fn warm_start_reuses_cache_and_lambda_seed() {
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.25],
+            [1.0, 0.5],
+            [1.0, 1.25],
+            [1.0, 2.0],
+        ];
+        let y = array![[0.1], [0.4], [0.7], [1.4], [2.2]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+
+        let cold =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty.view(), None, Some(0.0))
+                .expect("cold fit");
+        let warm_start = GaussianRemlWarmStart::from_multi_result(&cold);
+        let warm = gaussian_reml_multi_closed_form_warm_started(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            Some(&warm_start),
+        )
+        .expect("warm-started fit");
+
+        assert!((cold.lambda - warm.lambda).abs() <= 1.0e-10);
+        assert_eq!(cold.cache.xtwx_fingerprint, warm.cache.xtwx_fingerprint);
+        for i in 0..x.ncols() {
+            assert!((cold.coefficients[[i, 0]] - warm.coefficients[[i, 0]]).abs() <= 1.0e-10);
+        }
+    }
+
+    #[test]
     fn warm_start_cache_rejects_different_penalty_geometry() {
         let x = array![
             [1.0, -1.0],
@@ -1060,21 +1093,15 @@ mod tests {
             gaussian_reml_multi_closed_form(x.view(), y.view(), penalty_a.view(), None, Some(0.0))
                 .expect("first fit");
         let warm_start = GaussianRemlWarmStart::from_multi_result(&first);
-        let fresh =
-            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty_b.view(), None, Some(0.0))
-                .expect("fresh second fit");
-        let warm = gaussian_reml_multi_closed_form_warm_started(
+        let err = gaussian_reml_multi_closed_form_warm_started(
             x.view(),
             y.view(),
             penalty_b.view(),
             None,
             Some(&warm_start),
         )
-        .expect("warm-started second fit");
+        .expect_err("penalty-mismatched cache must be rejected");
 
-        assert!((fresh.lambda - warm.lambda).abs() <= 1.0e-8);
-        for i in 0..x.ncols() {
-            assert!((fresh.coefficients[[i, 0]] - warm.coefficients[[i, 0]]).abs() <= 1.0e-8);
-        }
+        assert!(err.to_string().contains("penalty mismatch"));
     }
 }
