@@ -706,6 +706,27 @@ pub fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
     map.get(key).and_then(|v| v.parse::<f64>().ok())
 }
 
+/// Strict float option: `Ok(None)` if absent, `Ok(Some(n))` if parses as a
+/// finite f64, `Err` if the user passed an unparseable value (rather than
+/// silently dropping it like the lenient `option_f64`).
+pub fn option_f64_strict(
+    map: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<f64>, String> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(raw) => match raw.parse::<f64>() {
+            Ok(v) if v.is_finite() => Ok(Some(v)),
+            Ok(v) => Err(format!(
+                "option `{key}={raw}` parses as {v} which is not a finite number"
+            )),
+            Err(_) => Err(format!(
+                "option `{key}={raw}` is not a valid number; expected a finite decimal"
+            )),
+        },
+    }
+}
+
 pub fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
     map.get(key)
         .and_then(|v| match v.trim().to_ascii_lowercase().as_str() {
