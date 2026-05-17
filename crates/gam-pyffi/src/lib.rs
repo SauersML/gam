@@ -315,10 +315,7 @@ fn fit_array(
     formula: String,
     config_json: Option<String>,
 ) -> PyResult<Py<PyBytes>> {
-    let x_values = x.as_array().to_owned();
-    let y_values = y.as_array().to_owned();
-    let model_bytes = py
-        .detach(move || fit_array_impl(x_values, y_values, formula, config_json.as_deref()))
+    let model_bytes = fit_array_impl(x.as_array(), y.as_array(), formula, config_json.as_deref())
         .map_err(py_value_error)?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
@@ -361,9 +358,7 @@ fn predict_array<'py>(
     x: PyReadonlyArray2<'py, f64>,
     options_json: Option<String>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let x_values = x.as_array().to_owned();
-    let out = py
-        .detach(move || predict_array_impl(&model_bytes, x_values, options_json.as_deref()))
+    let out = predict_array_impl(&model_bytes, x.as_array(), options_json.as_deref())
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -397,10 +392,7 @@ fn design_matrix_array<'py>(
     model_bytes: Vec<u8>,
     x: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let x_values = x.as_array().to_owned();
-    let out = py
-        .detach(move || design_matrix_array_impl(&model_bytes, x_values))
-        .map_err(py_value_error)?;
+    let out = design_matrix_array_impl(&model_bytes, x.as_array()).map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -412,10 +404,7 @@ fn bspline_basis<'py>(
     degree: usize,
     periodic: bool,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let t_values = t.as_array().to_owned();
-    let knot_values = knots.as_array().to_owned();
-    let basis = py
-        .detach(move || bspline_basis_impl(t_values.view(), knot_values.view(), degree, periodic))
+    let basis = bspline_basis_impl(t.as_array(), knots.as_array(), degree, periodic)
         .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
@@ -429,19 +418,9 @@ fn bspline_basis_derivative<'py>(
     order: usize,
     periodic: bool,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let t_values = t.as_array().to_owned();
-    let knot_values = knots.as_array().to_owned();
-    let basis = py
-        .detach(move || {
-            bspline_basis_derivative_impl(
-                t_values.view(),
-                knot_values.view(),
-                degree,
-                order,
-                periodic,
-            )
-        })
-        .map_err(py_value_error)?;
+    let basis =
+        bspline_basis_derivative_impl(t.as_array(), knots.as_array(), degree, order, periodic)
+            .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
 
@@ -453,10 +432,7 @@ fn duchon_basis_1d<'py>(
     m: usize,
     periodic: bool,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let t_values = t.as_array().to_owned();
-    let center_values = centers.as_array().to_owned();
-    let basis = py
-        .detach(move || duchon_basis_1d_impl(t_values.view(), center_values.view(), m, periodic))
+    let basis = duchon_basis_1d_impl(t.as_array(), centers.as_array(), m, periodic)
         .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
@@ -470,19 +446,9 @@ fn duchon_basis_1d_derivative<'py>(
     order: usize,
     periodic: bool,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let t_values = t.as_array().to_owned();
-    let center_values = centers.as_array().to_owned();
-    let basis = py
-        .detach(move || {
-            duchon_basis_1d_derivative_impl(
-                t_values.view(),
-                center_values.view(),
-                m,
-                order,
-                periodic,
-            )
-        })
-        .map_err(py_value_error)?;
+    let basis =
+        duchon_basis_1d_derivative_impl(t.as_array(), centers.as_array(), m, order, periodic)
+            .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
 }
 
@@ -493,10 +459,8 @@ fn smoothness_penalty<'py>(
     degree: usize,
     order: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let knot_values = knots.as_array().to_owned();
-    let (penalty, null_basis) = py
-        .detach(move || smoothness_penalty_impl(knot_values.view(), degree, order))
-        .map_err(py_value_error)?;
+    let (penalty, null_basis) =
+        smoothness_penalty_impl(knots.as_array(), degree, order).map_err(py_value_error)?;
     Ok((
         penalty.into_pyarray(py).unbind(),
         null_basis.into_pyarray(py).unbind(),
@@ -536,23 +500,16 @@ fn gaussian_weighted_ridge_batch<'py>(
     ridge_lambda: f64,
     row_counts: Option<PyReadonlyArray1<'py, usize>>,
 ) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray3<f64>>)> {
-    let x_values = x.as_array().to_owned();
-    let y_values = y.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
-    let weight_values = weights.as_array().to_owned();
-    let row_count_values = row_counts.map(|counts| counts.as_array().to_owned());
-    let (coefficients, fitted) = py
-        .detach(move || {
-            gaussian_weighted_ridge_batch_impl(
-                x_values.view(),
-                y_values.view(),
-                penalty_values.view(),
-                weight_values.view(),
-                ridge_lambda,
-                row_count_values.as_ref().map(|counts| counts.view()),
-            )
-        })
-        .map_err(py_value_error)?;
+    let row_count_view = row_counts.as_ref().map(|counts| counts.as_array());
+    let (coefficients, fitted) = gaussian_weighted_ridge_batch_impl(
+        x.as_array(),
+        y.as_array(),
+        penalty.as_array(),
+        weights.as_array(),
+        ridge_lambda,
+        row_count_view,
+    )
+    .map_err(py_value_error)?;
     Ok((
         coefficients.into_pyarray(py).unbind(),
         fitted.into_pyarray(py).unbind(),
@@ -972,12 +929,12 @@ fn fit_table_impl(
 }
 
 fn fit_array_impl(
-    x: Array2<f64>,
-    y: Array2<f64>,
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
     formula: String,
     config_json: Option<&str>,
 ) -> Result<Vec<u8>, String> {
-    let dataset = dataset_from_xy_arrays(x.view(), y.view(), &formula)?;
+    let dataset = dataset_from_xy_arrays(x, y, &formula)?;
     fit_dataset_impl(dataset, formula, config_json)
 }
 
@@ -1225,12 +1182,12 @@ fn predict_table_impl(
 
 fn predict_array_impl(
     model_bytes: &[u8],
-    x: Array2<f64>,
+    x: ArrayView2<'_, f64>,
     options_json: Option<&str>,
 ) -> Result<Array2<f64>, String> {
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
-    let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
+    let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
     if matches!(model_class, PredictModelClass::Survival) {
         return Err("predict_array does not support survival prediction payloads".to_string());
     }
@@ -1390,9 +1347,12 @@ fn design_matrix_table_impl(
     design_matrix_dataset_impl(&model, dataset)
 }
 
-fn design_matrix_array_impl(model_bytes: &[u8], x: Array2<f64>) -> Result<Array2<f64>, String> {
+fn design_matrix_array_impl(
+    model_bytes: &[u8],
+    x: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
     let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_from_x_array_with_model_schema(&model, x.view())?;
+    let dataset = dataset_from_x_array_with_model_schema(&model, x)?;
     design_matrix_dense(&model, dataset)
 }
 
