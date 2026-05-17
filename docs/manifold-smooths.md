@@ -42,8 +42,9 @@ closer inspection:
   <source src="images/geometric_shapes_demo_slow.mp4" type="video/mp4">
 </video>
 
-The full-length, full-speed MP4 lives at
-[`images/geometric_shapes_demo.mp4`](images/geometric_shapes_demo.mp4).
+The script regenerates a full-length, full-speed MP4 alongside the
+GIF and PNG — run the [reproduction recipe](#reproducing-the-demo)
+below to get it locally.
 
 ## The six shapes and the formulas behind them
 
