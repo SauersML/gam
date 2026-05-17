@@ -2679,6 +2679,123 @@ fn gaussian_weighted_ridge_batch_impl(
     Ok((coefficients, fitted))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, s};
+
+    fn assert_close(lhs: ArrayView2<'_, f64>, rhs: ArrayView2<'_, f64>, tol: f64) {
+        assert_eq!(lhs.dim(), rhs.dim());
+        for ((i, j), value) in lhs.indexed_iter() {
+            let diff = (*value - rhs[[i, j]]).abs();
+            assert!(
+                diff <= tol,
+                "matrix mismatch at ({i}, {j}): lhs={}, rhs={}, diff={diff}",
+                value,
+                rhs[[i, j]]
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_ridge_batch_matches_single_fit_on_active_rows() {
+        let x = Array3::from_shape_vec(
+            (2, 3, 2),
+            vec![1.0, 0.0, 1.0, 1.0, 0.5, 1.0, 2.0, 1.0, 0.0, 1.0, 9.0, 9.0],
+        )
+        .unwrap();
+        let y = Array3::from_shape_vec((2, 3, 1), vec![1.0, 2.0, 1.5, 2.5, -0.5, 99.0]).unwrap();
+        let weights = array![[1.0, 0.5, 2.0], [1.0, 3.0, 0.0]];
+        let penalty = Array2::eye(2);
+        let row_counts = array![3_usize, 2_usize];
+
+        let (coefficients, fitted) = gaussian_weighted_ridge_batch_impl(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            weights.view(),
+            0.25,
+            Some(row_counts.view()),
+        )
+        .unwrap();
+
+        for b in 0..2 {
+            let n = row_counts[b];
+            let (expected_coefficients, expected_fitted) = gaussian_weighted_ridge_array_impl(
+                x.slice(s![b, 0..n, ..]),
+                y.slice(s![b, 0..n, ..]),
+                penalty.view(),
+                weights.slice(s![b, 0..n]),
+                0.25,
+            )
+            .unwrap();
+            assert_close(
+                coefficients.slice(s![b, .., ..]),
+                expected_coefficients.view(),
+                1.0e-10,
+            );
+            assert_close(
+                fitted.slice(s![b, 0..n, ..]),
+                expected_fitted.view(),
+                1.0e-10,
+            );
+        }
+        assert_eq!(fitted[[1, 2, 0]], 0.0);
+    }
+
+    #[test]
+    fn gaussian_reml_batched_matches_single_fit_on_ragged_offsets() {
+        let x = array![
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [1.0, -1.0],
+            [1.0, 0.5],
+            [1.0, 1.5],
+        ];
+        let y = array![[0.0], [1.0], [1.8], [-1.0], [0.2], [1.1]];
+        let weights = array![1.0, 0.7, 1.3, 1.0, 1.1, 0.9];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let offsets = array![0_usize, 3_usize, 6_usize];
+
+        let batched = gaussian_reml_fit_batched_impl(
+            x.view(),
+            y.view(),
+            offsets.view(),
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.5),
+        )
+        .unwrap();
+
+        for b in 0..2 {
+            let start = offsets[b];
+            let end = offsets[b + 1];
+            let single = gaussian_reml_multi_closed_form_with_cache(
+                x.slice(s![start..end, ..]),
+                y.slice(s![start..end, ..]),
+                penalty.view(),
+                Some(weights.slice(s![start..end])),
+                Some(0.5),
+                None,
+            )
+            .unwrap();
+            assert_eq!(batched.statuses[b], "ok");
+            assert!((batched.lambdas[b] - single.lambda).abs() < 1.0e-10);
+            assert_close(
+                batched.coefficients.slice(s![b, .., ..]),
+                single.coefficients.view(),
+                1.0e-10,
+            );
+            assert_close(
+                batched.fitted.slice(s![start..end, ..]),
+                single.fitted.view(),
+                1.0e-10,
+            );
+        }
+    }
+}
+
 fn validate_vector(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String> {
     if values.is_empty() {
         return Err(format!("{name} cannot be empty"));
