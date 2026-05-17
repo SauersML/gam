@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ._tables import restore_output_table, table_columns
+from ._binding import rust_module
+from ._exceptions import map_exception
+from ._tables import normalize_table, restore_output_table, table_columns
 
 
 def _as_array(values: Any, *, label: str) -> Any:
@@ -304,8 +306,34 @@ def geometry_exp_map(
 
 
 @dataclass
+class SharedGaussianRemlTangentFit:
+    template_model: Any
+    coefficients: Any
+    fit: dict[str, Any]
+
+    @property
+    def tangent_dimension(self) -> int:
+        return int(self.coefficients.shape[1])
+
+    def predict_tangent(self, data: Any) -> Any:
+        x = self.template_model.design_matrix(data)
+        return x @ self.coefficients
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "model_class": "shared-gaussian-reml",
+            "lambda": float(self.fit["lambda"]),
+            "rho": float(self.fit["rho"]),
+            "reml_score": float(self.fit["reml_score"]),
+            "edf": float(self.fit["edf"]),
+            "sigma2": self.fit["sigma2"].tolist(),
+            "template": self.template_model.summary(),
+        }
+
+
+@dataclass
 class ResponseGeometryModel:
-    """A fitted response-geometry GAM backed by one scalar GAM per tangent coordinate."""
+    """A fitted response-geometry GAM with shared smoothing across tangent coordinates."""
 
     models: Sequence[Any]
     response_geometry: str
@@ -314,9 +342,12 @@ class ResponseGeometryModel:
     coordinates: str
     reference: int = -1
     training_table_kind: str | None = None
+    shared_tangent_fit: SharedGaussianRemlTangentFit | None = None
 
     @property
     def tangent_dimension(self) -> int:
+        if self.shared_tangent_fit is not None:
+            return self.shared_tangent_fit.tangent_dimension
         return len(self.models)
 
     def predict(
@@ -330,11 +361,14 @@ class ResponseGeometryModel:
         import numpy as np
 
         _columns, input_kind = table_columns(data)
-        tangent_cols: list[Any] = []
-        for model in self.models:
-            pred = model.predict(data, return_type="dict", **kwargs)
-            tangent_cols.append(np.asarray(pred["mean"], dtype=float))
-        tangent = np.column_stack(tangent_cols)
+        if self.shared_tangent_fit is not None:
+            tangent = np.asarray(self.shared_tangent_fit.predict_tangent(data), dtype=float)
+        else:
+            tangent_cols: list[Any] = []
+            for model in self.models:
+                pred = model.predict(data, return_type="dict", **kwargs)
+                tangent_cols.append(np.asarray(pred["mean"], dtype=float))
+            tangent = np.column_stack(tangent_cols)
         response = geometry_exp_map(
             tangent,
             geometry=self.response_geometry,
@@ -363,7 +397,11 @@ class ResponseGeometryModel:
             "base_point": list(map(float, self.base_point)),
             "coordinates": self.coordinates,
             "tangent_dimension": self.tangent_dimension,
+            "shared_smoothing": self.shared_tangent_fit is not None,
             "coordinate_summaries": [m.summary() for m in self.models],
+            "shared_fit": None
+            if self.shared_tangent_fit is None
+            else self.shared_tangent_fit.summary(),
         }
 
 
@@ -398,20 +436,27 @@ def fit_response_geometry(
     kwargs["frailty_kind"] = None
     kwargs["frailty_sd"] = None
     kwargs["hazard_loading"] = None
-    models = []
-    for idx in range(tangent.shape[1]):
-        target = f"__gamfit_response_geometry_{idx}"
-        augmented = {name: list(values) for name, values in columns.items()}
-        augmented[target] = tangent[:, idx].tolist()
-        models.append(fit_func(augmented, f"{target} ~ {rhs}", **kwargs))
+    target = "__gamfit_response_geometry_shared"
+    if target in columns:
+        raise ValueError(f"response geometry reserved column already exists: {target}")
+    augmented = {name: list(values) for name, values in columns.items()}
+    augmented[target] = tangent[:, 0].tolist()
+    template_formula = f"{target} ~ {rhs}"
+    template_model = fit_func(augmented, template_formula, **kwargs)
+    shared_fit = _fit_shared_tangent_reml(augmented, template_formula, tangent, kwargs)
     return ResponseGeometryModel(
-        models=models,
+        models=(),
         response_geometry=response_geometry.lower(),
         response_columns=tuple(response_columns),
         base_point=base,
         coordinates=resolved_coordinates,
         reference=reference,
         training_table_kind=table_kind,
+        shared_tangent_fit=SharedGaussianRemlTangentFit(
+            template_model=template_model,
+            coefficients=shared_fit["coefficients"],
+            fit=shared_fit,
+        ),
     )
 
 
@@ -422,3 +467,48 @@ def _formula_rhs(formula: str) -> str:
             "response-geometry formula must have the form 'response ~ terms'"
         )
     return parts[1].strip()
+
+
+def _fit_shared_tangent_reml(
+    data: Any,
+    formula: str,
+    tangent: Any,
+    fit_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    import json
+    import numpy as np
+
+    if fit_kwargs.get("offset") is not None:
+        raise ValueError("response geometry shared REML does not support offsets")
+    headers, rows, _kind = normalize_table(data)
+    config = {
+        "family": "gaussian",
+        "link": "identity",
+        "weights": fit_kwargs.get("weights"),
+    }
+    y = np.ascontiguousarray(np.asarray(tangent, dtype=float))
+    try:
+        payload = rust_module().gaussian_reml_fit_formula_table(
+            headers,
+            rows,
+            formula,
+            y,
+            json.dumps(config),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    out = dict(payload)
+    for key in (
+        "coefficients",
+        "fitted",
+        "sigma2",
+        "lambda",
+        "rho",
+        "reml_score",
+        "edf",
+    ):
+        if key in out:
+            out[key] = np.asarray(out[key], dtype=float)
+    if str(payload.get("status", "ok")) != "ok":
+        raise ValueError(f"shared Gaussian REML failed with status={payload.get('status')!r}")
+    return out

@@ -733,28 +733,9 @@ fn prepare_gaussian_reml(
     }
     let xtwy = x.t().dot(&wy);
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
-    let cached_xtwx = if eigen_cache.is_some() {
-        let mut wx = x.to_owned();
-        for i in 0..n {
-            let wi = weight[i];
-            for value in wx.row_mut(i) {
-                *value *= wi;
-            }
-        }
-        Some(x.t().dot(&wx))
-    } else {
-        None
-    };
 
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
-        let xtwx_fingerprint =
-            matrix_fingerprint(cached_xtwx.as_ref().expect("cached X'WX").view());
-        if cache.xtwx_fingerprint != xtwx_fingerprint {
-            return Err(EstimationError::InvalidInput(
-                "Gaussian REML eigen cache X'WX mismatch".to_string(),
-            ));
-        }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
             return Err(EstimationError::InvalidInput(
@@ -787,19 +768,14 @@ fn prepare_gaussian_reml(
         });
     }
 
-    let xtwx = match cached_xtwx {
-        Some(xtwx) => xtwx,
-        None => {
-            let mut wx = x.to_owned();
-            for i in 0..n {
-                let wi = weight[i];
-                for value in wx.row_mut(i) {
-                    *value *= wi;
-                }
-            }
-            x.t().dot(&wx)
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
         }
-    };
+    }
+    let xtwx = x.t().dot(&wx);
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     if n <= cache.nullity {
         return Err(EstimationError::InvalidInput(format!(
