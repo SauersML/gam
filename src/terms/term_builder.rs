@@ -619,6 +619,18 @@ pub fn build_smooth_basis(
             })
         }
         "tps" | "thinplate" | "thin-plate" => {
+            validate_known_options(
+                "thinplate",
+                options,
+                &[
+                    "type", "bs",
+                    "length_scale",
+                    "centers", "k", "basis_dim", "basis-dim", "basisdim", "knots",
+                    "include_intercept", "double_penalty",
+                    "identifiability",
+                    "scale_dims",
+                ],
+            )?;
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
@@ -653,6 +665,19 @@ pub fn build_smooth_basis(
             })
         }
         "sphere" | "sos" | "spherical" => {
+            validate_known_options(
+                "sphere",
+                options,
+                &[
+                    "type", "bs",
+                    "method",
+                    "m", "order", "penalty_order",
+                    "radians", "units",
+                    "max_degree", "max-degree", "max_l", "max-l", "harmonic_degree", "l",
+                    "centers", "k", "basis_dim", "basis-dim", "basisdim", "knots",
+                    "double_penalty",
+                ],
+            )?;
             if cols.len() != 2 {
                 return Err(format!(
                     "sphere smooth expects exactly two variables (latitude, longitude), got {}",
@@ -811,6 +836,22 @@ pub fn build_smooth_basis(
             })
         }
         "duchon" => {
+            validate_known_options(
+                "duchon",
+                options,
+                &[
+                    "type", "bs",
+                    "length_scale",
+                    "centers", "k", "basis_dim", "basis-dim", "basisdim", "knots",
+                    "power", "p",
+                    "nullspace_order", "order",
+                    "identifiability",
+                    "pure",
+                    "periodic", "period", "period_start", "period_end",
+                    "scale_dims",
+                    "double_penalty",
+                ],
+            )?;
             if options.contains_key("double_penalty") {
                 return Err(format!(
                     "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
