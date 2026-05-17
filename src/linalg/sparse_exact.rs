@@ -424,6 +424,7 @@ pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SparseExactFactor, EstimationError> {
+    eprintln!("[PROF-ENTRY] factorize_sparse_spd n={}", h.ncols());
     // Canonicalize to symmetric-upper storage before factorization.
     //
     // Math contract:
