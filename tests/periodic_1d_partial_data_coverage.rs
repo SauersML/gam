@@ -67,10 +67,13 @@ fn periodic_1d_partial_data_predicts_finite_over_full_period() {
                 m[[i, 0]] = probes[i];
                 m[[i, 1]] = 0.0;
             }
-            let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-                .expect("rebuild design");
+            let design =
+                build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
             let pred = design.design.apply(&fit.fit.beta).to_vec();
-            assert!(pred.iter().all(|v| v.is_finite()), "non-finite predictions: {pred:?}");
+            assert!(
+                pred.iter().all(|v| v.is_finite()),
+                "non-finite predictions: {pred:?}"
+            );
             let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
             let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             eprintln!("[per-1d-half] full-period pred range [{mn:.3}, {mx:.3}]");

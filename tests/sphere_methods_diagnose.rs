@@ -76,8 +76,8 @@ fn predict_at(
         m[[i, 1]] = lons[i];
         m[[i, 2]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 

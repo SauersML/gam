@@ -24,7 +24,8 @@ fn make_dataset(n_lat: usize, n_lon: usize, sigma: f64, seed: u64) -> gam::data:
             let lon = -170.0 + 340.0 * (j as f64) / (n_lon as f64);
             let lat_r = lat.to_radians();
             let lon_r = lon.to_radians();
-            let y = 0.5 + 0.7 * lat_r.sin()
+            let y = 0.5
+                + 0.7 * lat_r.sin()
                 + 0.4 * lat_r.cos() * (2.0 * lon_r).cos()
                 + noise.sample(&mut rng);
             rows.push(StringRecord::from(vec![
@@ -78,7 +79,8 @@ fn sphere_wahba_small_k_does_not_crash_or_nan() {
         let formula = format!("y ~ sphere(lat, lon, k={k})");
         match try_fit_and_predict(&formula) {
             Ok(pred) => {
-                eprintln!("[sphere-small-k] k={k}: pred range [{:.3}, {:.3}]",
+                eprintln!(
+                    "[sphere-small-k] k={k}: pred range [{:.3}, {:.3}]",
                     pred.iter().cloned().fold(f64::INFINITY, f64::min),
                     pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                 );
@@ -109,7 +111,8 @@ fn sphere_harmonic_small_max_degree_does_not_crash_or_nan() {
         let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree={l})");
         match try_fit_and_predict(&formula) {
             Ok(pred) => {
-                eprintln!("[sphere-small-L] L={l}: pred range [{:.3}, {:.3}]",
+                eprintln!(
+                    "[sphere-small-L] L={l}: pred range [{:.3}, {:.3}]",
                     pred.iter().cloned().fold(f64::INFINITY, f64::min),
                     pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
                 );

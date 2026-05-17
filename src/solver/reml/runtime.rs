@@ -3406,10 +3406,8 @@ impl<'a> RemlState<'a> {
         // XᵀWX contribution lets the inner assemble skip the SpGEMM.
         let xtwx_sparse_orig = if let Some(sparse_design) = self.x.as_sparse() {
             let sparse_start = std::time::Instant::now();
-            match crate::pirls::SparseXtwxPrecomputed::build(
-                sparse_design.as_ref(),
-                &weights_owned,
-            ) {
+            match crate::pirls::SparseXtwxPrecomputed::build(sparse_design.as_ref(), &weights_owned)
+            {
                 Ok(precomp) => {
                     log::info!(
                         "[gaussian-fixed-cache] sparse XᵀWX nnz={} built in {:.3} ms",

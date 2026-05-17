@@ -16,7 +16,12 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
-fn make_high_freq_dataset(n_lat: usize, n_lon: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
+fn make_high_freq_dataset(
+    n_lat: usize,
+    n_lon: usize,
+    sigma: f64,
+    seed: u64,
+) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = Normal::new(0.0, sigma).expect("normal");
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
@@ -64,8 +69,7 @@ fn fit_pred(formula: &str) -> (Vec<f64>, f64, f64) {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -76,7 +80,10 @@ fn fit_pred(formula: &str) -> (Vec<f64>, f64, f64) {
 fn sphere_wahba_high_freq_truth_stays_bounded_no_nan() {
     init_parallelism();
     let (pred, mn, mx) = fit_pred("y ~ sphere(lat, lon, k=20)");
-    assert!(pred.iter().all(|v| v.is_finite()), "Wahba NaN on high-freq truth");
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "Wahba NaN on high-freq truth"
+    );
     eprintln!("[high-freq-wahba] pred range [{mn:.3}, {mx:.3}]");
     // Truth range [-1, 1] + σ=0.05 noise ⇒ y in roughly [-1.2, 1.2]. Fit
     // must not exceed ~[-3, 3] (2.5× envelope) even when undersized basis.
@@ -87,9 +94,15 @@ fn sphere_wahba_high_freq_truth_stays_bounded_no_nan() {
 fn sphere_harmonic_high_freq_truth_stays_bounded_no_nan() {
     init_parallelism();
     let (pred, mn, mx) = fit_pred("y ~ sphere(lat, lon, method=harmonic, max_degree=6)");
-    assert!(pred.iter().all(|v| v.is_finite()), "harmonic NaN on high-freq truth");
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "harmonic NaN on high-freq truth"
+    );
     eprintln!("[high-freq-harm] pred range [{mn:.3}, {mx:.3}]");
-    assert!(mn > -3.0 && mx < 3.0, "harmonic blew up: [{mn:.3}, {mx:.3}]");
+    assert!(
+        mn > -3.0 && mx < 3.0,
+        "harmonic blew up: [{mn:.3}, {mx:.3}]"
+    );
 }
 
 #[test]
@@ -100,5 +113,8 @@ fn sphere_harmonic_high_freq_truth_l12_stays_bounded() {
     let (pred, mn, mx) = fit_pred("y ~ sphere(lat, lon, method=harmonic, max_degree=12)");
     assert!(pred.iter().all(|v| v.is_finite()), "harmonic L=12 NaN");
     eprintln!("[high-freq-harm-l12] pred range [{mn:.3}, {mx:.3}]");
-    assert!(mn > -3.0 && mx < 3.0, "harmonic L=12 blew up: [{mn:.3}, {mx:.3}]");
+    assert!(
+        mn > -3.0 && mx < 3.0,
+        "harmonic L=12 blew up: [{mn:.3}, {mx:.3}]"
+    );
 }
