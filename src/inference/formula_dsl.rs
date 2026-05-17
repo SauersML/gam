@@ -1280,6 +1280,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         "constrain()/constraint()/box() expects exactly one variable: {raw}"
                     ));
                 }
+                validate_known_term_options(
+                    "constrain",
+                    &options,
+                    &["min", "lower", "max", "upper"],
+                    raw,
+                )?;
                 let (coefficient_min, coefficient_max) =
                     parse_linear_constraint_bounds(&options, raw)?;
                 if coefficient_min.is_none() && coefficient_max.is_none() {
@@ -1298,6 +1304,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 if vars.len() != 1 {
                     return Err(format!("nonnegative() expects exactly one variable: {raw}"));
                 }
+                validate_known_term_options("nonnegative", &options, &[], raw)?;
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
@@ -1309,6 +1316,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 if vars.len() != 1 {
                     return Err(format!("nonpositive() expects exactly one variable: {raw}"));
                 }
+                validate_known_term_options("nonpositive", &options, &[], raw)?;
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
                     explicit: true,
@@ -1320,6 +1328,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 if vars.len() != 1 {
                     return Err(format!("bounded() expects exactly one variable: {raw}"));
                 }
+                validate_known_term_options(
+                    "bounded",
+                    &options,
+                    &["min", "max", "prior", "target", "strength"],
+                    raw,
+                )?;
                 let min = parse_required_f64_option(&options, "min", raw)?;
                 let max = parse_required_f64_option(&options, "max", raw)?;
                 if !min.is_finite() || !max.is_finite() || min >= max {
@@ -1464,6 +1478,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 if vars.len() != 1 {
                     return Err(format!("linear() expects exactly one variable: {raw}"));
                 }
+                validate_known_term_options(
+                    "linear",
+                    &options,
+                    &["min", "lower", "max", "upper"],
+                    raw,
+                )?;
                 let (coefficient_min, coefficient_max) =
                     parse_linear_constraint_bounds(&options, raw)?;
                 return Ok(ParsedTerm::Linear {
