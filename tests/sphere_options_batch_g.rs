@@ -61,7 +61,7 @@ fn fit_predict(formula: &str, data: gam::data::EncodedDataset, lats: &[f64], lon
 
 /// Cycle 75: sphere with radians=true input.
 #[test]
-fn cycle_75_sphere_radians_mode() {
+fn sphere_radians_mode() {
     init_parallelism();
     let data = make_dataset(400, 7, true);
     let lats = vec![0.0_f64, 0.5, 1.0, 1.3, -0.5, -1.0];
@@ -76,7 +76,7 @@ fn cycle_75_sphere_radians_mode() {
 
 /// Cycle 76: sphere harmonic with various L values.
 #[test]
-fn cycle_76_sphere_harmonic_l_sweep() {
+fn sphere_harmonic_l_sweep() {
     init_parallelism();
     let mut failures = Vec::new();
     for l in [2usize, 4, 6, 8, 10] {
@@ -98,7 +98,7 @@ fn cycle_76_sphere_harmonic_l_sweep() {
 
 /// Cycle 77: sphere with double_penalty=false (ridge dropped).
 #[test]
-fn cycle_77_sphere_no_double_penalty() {
+fn sphere_no_double_penalty() {
     init_parallelism();
     let data = make_dataset(400, 7, false);
     let lats = vec![45.0_f64, 0.0, -45.0];
@@ -113,7 +113,7 @@ fn cycle_77_sphere_no_double_penalty() {
 
 /// Cycle 78: sphere with explicit knots= alias.
 #[test]
-fn cycle_78_sphere_explicit_centers_via_alias() {
+fn sphere_explicit_centers_via_alias() {
     init_parallelism();
     // Sphere accepts both `k` and `centers` (parse_countwith_basis_alias).
     let data = make_dataset(400, 7, false);

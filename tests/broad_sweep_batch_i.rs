@@ -65,7 +65,7 @@ fn fit_predict_2col(
 }
 
 #[test]
-fn cycle_91_te_single_period_broadcasts_to_periodic_axis() {
+fn te_single_period_broadcasts_to_periodic_axis() {
     // The DSL parser broadcasts a single-element `period=[2*pi]` onto the
     // single periodic axis when exactly one margin is periodic. Verify
     // that path fits cleanly (does not error).
@@ -85,7 +85,7 @@ fn cycle_91_te_single_period_broadcasts_to_periodic_axis() {
 }
 
 #[test]
-fn cycle_92_te_periodic_data_outside_period_works() {
+fn te_periodic_data_outside_period_works() {
     init_parallelism();
     let data = mk_2col(
         300, "th", "h", (0.0, 4.0 * PI), (-1.0, 1.0),
@@ -100,7 +100,7 @@ fn cycle_92_te_periodic_data_outside_period_works() {
 }
 
 #[test]
-fn cycle_93_cylinder_clean_seam_with_negative_h() {
+fn cylinder_clean_seam_with_negative_h() {
     init_parallelism();
     let data = mk_2col(
         300, "th", "h", (0.0, TAU), (-2.0, 2.0),
@@ -115,7 +115,7 @@ fn cycle_93_cylinder_clean_seam_with_negative_h() {
 }
 
 #[test]
-fn cycle_94_sphere_handles_lat_at_minus_90() {
+fn sphere_handles_lat_at_minus_90() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -142,7 +142,7 @@ fn cycle_94_sphere_handles_lat_at_minus_90() {
 }
 
 #[test]
-fn cycle_95_periodic_with_offset_data_range() {
+fn periodic_with_offset_data_range() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u = Uniform::new(10.0_f64, 10.0 + TAU).expect("uniform");
@@ -170,7 +170,7 @@ fn cycle_95_periodic_with_offset_data_range() {
 }
 
 #[test]
-fn cycle_96_bc_clamped_at_high_k_smooths_correctly() {
+fn bc_clamped_at_high_k_smooths_correctly() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform");
@@ -198,7 +198,7 @@ fn cycle_96_bc_clamped_at_high_k_smooths_correctly() {
 }
 
 #[test]
-fn cycle_97_sphere_pseudo_with_small_n() {
+fn sphere_pseudo_with_small_n() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -226,7 +226,7 @@ fn cycle_97_sphere_pseudo_with_small_n() {
 }
 
 #[test]
-fn cycle_98_sphere_sobolev_with_small_n() {
+fn sphere_sobolev_with_small_n() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -254,7 +254,7 @@ fn cycle_98_sphere_sobolev_with_small_n() {
 }
 
 #[test]
-fn cycle_99_sphere_rejects_constant_lon_column() {
+fn sphere_rejects_constant_lon_column() {
     // A sphere smooth over a constant longitude column is degenerate —
     // the smooth has only one unique input — and gam correctly rejects
     // it with an actionable error.
@@ -282,7 +282,7 @@ fn cycle_99_sphere_rejects_constant_lon_column() {
 }
 
 #[test]
-fn cycle_100_periodic_1d_zero_amplitude_truth() {
+fn periodic_1d_zero_amplitude_truth() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u = Uniform::new(0.0_f64, TAU).expect("uniform");
@@ -314,7 +314,7 @@ fn cycle_100_periodic_1d_zero_amplitude_truth() {
 }
 
 #[test]
-fn cycle_101_sphere_logit_predict_finite_at_pole() {
+fn sphere_logit_predict_finite_at_pole() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -341,7 +341,7 @@ fn cycle_101_sphere_logit_predict_finite_at_pole() {
 }
 
 #[test]
-fn cycle_102_sphere_with_method_alias_sos() {
+fn sphere_with_method_alias_sos() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
