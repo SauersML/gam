@@ -46,12 +46,10 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
-use numpy::{
-    IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
-};
+use numpy::{IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyAny, PyBytes, PyDict};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -1120,7 +1118,10 @@ fn set_ok_gaussian_reml_items<'py>(
         "cache_penalty_eigenvalues",
         fit.cache.penalty_eigenvalues.into_pyarray(py),
     )?;
-    out.set_item("cache_eigenvectors", fit.cache.eigenvectors.into_pyarray(py))?;
+    out.set_item(
+        "cache_eigenvectors",
+        fit.cache.eigenvectors.into_pyarray(py),
+    )?;
     out.set_item(
         "cache_coefficient_basis",
         fit.cache.coefficient_basis.into_pyarray(py),
@@ -1179,8 +1180,12 @@ fn gaussian_reml_fit_state_from_pydict(
         .to_owned();
 
     Ok(gam::gaussian_reml::GaussianRemlMultiResult {
-        lambda: get(state, "lambda")?.extract().map_err(|err| err.to_string())?,
-        rho: get(state, "rho")?.extract().map_err(|err| err.to_string())?,
+        lambda: get(state, "lambda")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        rho: get(state, "rho")?
+            .extract()
+            .map_err(|err| err.to_string())?,
         coefficients,
         fitted,
         reml_score: get(state, "reml_score")?
@@ -1198,7 +1203,9 @@ fn gaussian_reml_fit_state_from_pydict(
         reml_hess_rho: get(state, "reml_hess_rho")?
             .extract()
             .map_err(|err| err.to_string())?,
-        edf: get(state, "edf")?.extract().map_err(|err| err.to_string())?,
+        edf: get(state, "edf")?
+            .extract()
+            .map_err(|err| err.to_string())?,
         sigma2,
         cache: gam::gaussian_reml::GaussianRemlEigenCache {
             penalty_eigenvalues,
