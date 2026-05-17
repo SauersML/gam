@@ -786,6 +786,11 @@ pub fn build_smooth_basis(
                     "basisdim",
                     "knots",
                     "double_penalty",
+                    // Wahba-kernel selector: pick Sobolev (default) or
+                    // pseudo-spline (mgcv-compat). `kernel=sobolev|pseudo|mgcv|sos`.
+                    "kernel",
+                    "wahba_kernel",
+                    "wahba-kernel",
                 ],
             )?;
             if cols.len() != 2 {
