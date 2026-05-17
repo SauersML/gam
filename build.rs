@@ -257,6 +257,7 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
             || name == "venv"
             || name == "dist"
             || name == "build"
+            || name == "site"
         {
             continue;
         }

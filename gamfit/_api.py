@@ -795,44 +795,52 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
 def _index_vector(values: Any, label: str) -> Any:
     import numpy as np
 
-    arr = np.asarray(values, dtype=np.uintp)
+    arr = np.asarray(values)
     if arr.ndim != 1:
         raise ValueError(f"{label} must be a 1D integer array")
     if arr.size == 0:
         raise ValueError(f"{label} cannot be empty")
-    return np.ascontiguousarray(arr)
+    if arr.dtype != np.dtype(np.uintp):
+        raise TypeError(f"{label} must be a numpy uintp array for zero-copy FFI")
+    return arr
 
 
 def _numeric_vector(values: Any, label: str) -> Any:
     import numpy as np
 
-    arr = np.asarray(values, dtype=np.float64)
+    arr = np.asarray(values)
     if arr.ndim != 1:
         raise ValueError(f"{label} must be a 1D numeric array")
     if arr.size == 0:
         raise ValueError(f"{label} cannot be empty")
-    return np.ascontiguousarray(arr)
+    if arr.dtype != np.float64:
+        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    return arr
 
 
 def _numeric_matrix(values: Any, label: str) -> Any:
     import numpy as np
 
-    arr = np.asarray(values, dtype=np.float64)
+    arr = np.asarray(values)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     if arr.ndim != 2:
         raise ValueError(f"{label} must be a 1D or 2D numeric array")
     if arr.shape[0] == 0 or arr.shape[1] == 0:
         raise ValueError(f"{label} cannot be empty")
-    return np.ascontiguousarray(arr)
+    if arr.dtype != np.float64:
+        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    return arr
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:
     import numpy as np
 
-    arr = np.asarray(values, dtype=np.float64)
+    arr = np.asarray(values)
     if arr.ndim != 3:
         raise ValueError(f"{label} must be a 3D numeric array")
     if 0 in arr.shape:
         raise ValueError(f"{label} cannot be empty")
-    return np.ascontiguousarray(arr)
+    if arr.dtype != np.float64:
+        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    return arr
