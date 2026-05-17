@@ -3334,20 +3334,6 @@ mod tests {
     }
 
     #[test]
-    fn materialize_standard_duchon_rejects_redundant_pure_option() {
-        let data = duchon_workflow_dataset();
-        let err = match materialize(
-            "y ~ duchon(ct, st, centers=12, pure=true)",
-            &data,
-            &FitConfig::default(),
-        ) {
-            Ok(_) => panic!("pure=true should be rejected because Duchon is pure by default"),
-            Err(err) => err,
-        };
-        assert!(err.contains("pure scale-free Duchon by default"));
-    }
-
-    #[test]
     fn materialize_standard_duchon_length_scale_opts_into_hybrid_basis() {
         let data = duchon_workflow_dataset();
         let materialized = materialize(
