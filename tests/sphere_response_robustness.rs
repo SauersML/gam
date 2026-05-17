@@ -45,8 +45,8 @@ fn fit_predict(formula: &str, data: gam::data::EncodedDataset) -> (f64, f64, f64
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg)
-        .unwrap_or_else(|e| panic!("fit `{formula}`: {e}"));
+    let result =
+        fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("fit `{formula}`: {e}"));
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
@@ -64,8 +64,7 @@ fn fit_predict(formula: &str, data: gam::data::EncodedDataset) -> (f64, f64, f64
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     assert!(pred.iter().all(|v| v.is_finite()), "non-finite preds");
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
@@ -82,7 +81,10 @@ fn sphere_all_negative_response_fits_correctly() {
     let data = make_dataset(400, -10.0, 0.6, 0.05, 7);
     eprintln!("[sphere-neg]");
     let (mean, mn, _mx) = fit_predict("y ~ sphere(lat, lon, k=20)", data);
-    assert!(mean < -9.0 && mean > -11.0, "mean {mean:.3} should center around -10");
+    assert!(
+        mean < -9.0 && mean > -11.0,
+        "mean {mean:.3} should center around -10"
+    );
     assert!(mn < -9.0, "should reach negative values");
 }
 

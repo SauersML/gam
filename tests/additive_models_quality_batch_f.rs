@@ -24,15 +24,16 @@ fn fit_predict_rows(
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((rows.len(), ncols));
     for (i, row) in rows.iter().enumerate() {
         for (j, &v) in row.iter().enumerate() {
             m[[i, j]] = v;
         }
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -73,7 +74,10 @@ fn cycle_71_smooth_plus_periodic() {
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     eprintln!("[smooth+per] range=[{mn:.3}, {mx:.3}]");
-    assert!(mn > -1.0 && mx < 2.0, "additive smooth+periodic out of envelope");
+    assert!(
+        mn > -1.0 && mx < 2.0,
+        "additive smooth+periodic out of envelope"
+    );
 }
 
 /// Cycle 72: s(x) + sphere(lat, lon).
@@ -85,7 +89,10 @@ fn cycle_72_smooth_plus_sphere() {
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
     let noise = Normal::new(0.0, 0.05).expect("normal");
-    let headers = ["x", "lat", "lon", "y"].into_iter().map(String::from).collect();
+    let headers = ["x", "lat", "lon", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let mut rows = Vec::with_capacity(400);
     for _ in 0..400 {
         let x = u_x.sample(&mut rng);
@@ -107,12 +114,7 @@ fn cycle_72_smooth_plus_sphere() {
         vec![0.1, 30.0, 0.0, 0.0],
         vec![0.9, -30.0, 0.0, 0.0],
     ];
-    let pred = fit_predict_rows(
-        "y ~ s(x, k=8) + sphere(lat, lon, k=15)",
-        data,
-        &probes,
-        4,
-    );
+    let pred = fit_predict_rows("y ~ s(x, k=8) + sphere(lat, lon, k=15)", data, &probes, 4);
     assert!(pred.iter().all(|v| v.is_finite()));
     eprintln!("[smooth+sphere] preds: {pred:?}");
 }
@@ -126,13 +128,17 @@ fn cycle_73_bc_clamped_plus_sphere_harmonic() {
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
     let noise = Normal::new(0.0, 0.05).expect("normal");
-    let headers = ["x", "lat", "lon", "y"].into_iter().map(String::from).collect();
+    let headers = ["x", "lat", "lon", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let mut rows = Vec::with_capacity(400);
     for _ in 0..400 {
         let x = u_x.sample(&mut rng);
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
-        let y = (std::f64::consts::PI * x).sin() + 0.3 * lat.to_radians().sin()
+        let y = (std::f64::consts::PI * x).sin()
+            + 0.3 * lat.to_radians().sin()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
             x.to_string(),
@@ -166,13 +172,18 @@ fn cycle_74_three_smooth_terms() {
     let u_y = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let u_theta = Uniform::new(0.0_f64, TAU).expect("uniform");
     let noise = Normal::new(0.0, 0.05).expect("normal");
-    let headers = ["x", "y_var", "theta", "z"].into_iter().map(String::from).collect();
+    let headers = ["x", "y_var", "theta", "z"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let mut rows = Vec::with_capacity(400);
     for _ in 0..400 {
         let x = u_x.sample(&mut rng);
         let y_var = u_y.sample(&mut rng);
         let theta = u_theta.sample(&mut rng);
-        let z = 0.3 * x + 0.4 * (std::f64::consts::PI * y_var).sin() + 0.5 * theta.cos()
+        let z = 0.3 * x
+            + 0.4 * (std::f64::consts::PI * y_var).sin()
+            + 0.5 * theta.cos()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
             x.to_string(),

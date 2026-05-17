@@ -42,20 +42,26 @@ fn make_dataset(n: usize, seed: u64, radians: bool) -> gam::data::EncodedDataset
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn fit_predict(formula: &str, data: gam::data::EncodedDataset, lats: &[f64], lons: &[f64]) -> Vec<f64> {
+fn fit_predict(
+    formula: &str,
+    data: gam::data::EncodedDataset,
+    lats: &[f64],
+    lons: &[f64],
+) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((lats.len(), 3));
     for i in 0..lats.len() {
         m[[i, 0]] = lats[i];
         m[[i, 1]] = lons[i];
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -66,7 +72,12 @@ fn sphere_radians_mode() {
     let data = make_dataset(400, 7, true);
     let lats = vec![0.0_f64, 0.5, 1.0, 1.3, -0.5, -1.0];
     let lons = vec![0.0; lats.len()];
-    let pred = fit_predict("y ~ sphere(lat, lon, radians=true, k=20)", data, &lats, &lons);
+    let pred = fit_predict(
+        "y ~ sphere(lat, lon, radians=true, k=20)",
+        data,
+        &lats,
+        &lons,
+    );
     assert!(pred.iter().all(|v| v.is_finite()));
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -103,7 +114,12 @@ fn sphere_no_double_penalty() {
     let data = make_dataset(400, 7, false);
     let lats = vec![45.0_f64, 0.0, -45.0];
     let lons = vec![0.0; 3];
-    let pred = fit_predict("y ~ sphere(lat, lon, k=20, double_penalty=false)", data, &lats, &lons);
+    let pred = fit_predict(
+        "y ~ sphere(lat, lon, k=20, double_penalty=false)",
+        data,
+        &lats,
+        &lons,
+    );
     assert!(pred.iter().all(|v| v.is_finite()));
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
