@@ -52,7 +52,7 @@ fn fit_predict_1d(formula: &str, data: gam::data::EncodedDataset, xs: &[f64]) ->
 }
 
 #[test]
-fn cycle_79_smooth_recovers_step_continuously() {
+fn smooth_recovers_step_continuously() {
     init_parallelism();
     let data = mk_1d_data(300, |t| if t < 0.5 { 0.0 } else { 1.0 }, 0.05, 7);
     let xs: Vec<f64> = (0..40).map(|i| 0.02 + 0.96 * (i as f64) / 39.0).collect();
@@ -63,7 +63,7 @@ fn cycle_79_smooth_recovers_step_continuously() {
 }
 
 #[test]
-fn cycle_80_periodic_handles_negative_origin() {
+fn periodic_handles_negative_origin() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u = Uniform::new(-PI, PI).expect("uniform");
@@ -88,7 +88,7 @@ fn cycle_80_periodic_handles_negative_origin() {
 }
 
 #[test]
-fn cycle_81_bc_anchored_pins_predictions_at_data_extremes() {
+fn bc_anchored_pins_predictions_at_data_extremes() {
     init_parallelism();
     let data = mk_1d_data(300, |t| (PI * t).sin(), 0.05, 7);
     let xs = vec![0.001, 0.5, 0.999];
@@ -102,7 +102,7 @@ fn cycle_81_bc_anchored_pins_predictions_at_data_extremes() {
 }
 
 #[test]
-fn cycle_82_sphere_predict_zero_lat_lon_finite() {
+fn sphere_predict_zero_lat_lon_finite() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -127,7 +127,7 @@ fn cycle_82_sphere_predict_zero_lat_lon_finite() {
 }
 
 #[test]
-fn cycle_83_sphere_predict_north_pole_with_random_lon() {
+fn sphere_predict_north_pole_with_random_lon() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
@@ -159,7 +159,7 @@ fn cycle_83_sphere_predict_north_pole_with_random_lon() {
 }
 
 #[test]
-fn cycle_84_periodic_1d_high_amplitude_sin() {
+fn periodic_1d_high_amplitude_sin() {
     init_parallelism();
     let data = mk_1d_data(200, |t: f64| 100.0 * (TAU * t).cos(), 1.0, 7);
     let probes: Vec<f64> = (0..20).map(|i| (i as f64) / 19.0).collect();
@@ -175,7 +175,7 @@ fn cycle_84_periodic_1d_high_amplitude_sin() {
 }
 
 #[test]
-fn cycle_85_bc_clamped_with_constant_truth_stays_flat() {
+fn bc_clamped_with_constant_truth_stays_flat() {
     init_parallelism();
     let data = mk_1d_data(200, |_| 2.5, 0.05, 7);
     let xs: Vec<f64> = (0..20).map(|i| 0.05 + 0.9 * (i as f64) / 19.0).collect();
@@ -188,7 +188,7 @@ fn cycle_85_bc_clamped_with_constant_truth_stays_flat() {
 }
 
 #[test]
-fn cycle_86_tensor_2d_smooth_truth_recovery() {
+fn tensor_2d_smooth_truth_recovery() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_x = Uniform::new(0.0_f64, 1.0).expect("uniform");
@@ -216,7 +216,7 @@ fn cycle_86_tensor_2d_smooth_truth_recovery() {
 }
 
 #[test]
-fn cycle_87_matern_low_n_does_not_crash() {
+fn matern_low_n_does_not_crash() {
     init_parallelism();
     let data = mk_1d_data(15, |t| t.powi(2), 0.05, 7);
     let xs = vec![0.2_f64, 0.5, 0.8];
@@ -225,7 +225,7 @@ fn cycle_87_matern_low_n_does_not_crash() {
 }
 
 #[test]
-fn cycle_88_sphere_extrapolation_far_from_data_bounded() {
+fn sphere_extrapolation_far_from_data_bounded() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(0.0_f64, 30.0).expect("uniform"); // only northern band
@@ -261,7 +261,7 @@ fn cycle_88_sphere_extrapolation_far_from_data_bounded() {
 }
 
 #[test]
-fn cycle_89_periodic_with_only_few_points() {
+fn periodic_with_only_few_points() {
     init_parallelism();
     // mk_1d_data emits columns ["x", "y"] on input domain [0, 1]; use a
     // scaled-cos truth and pass column `x` (not `t`) to the periodic
@@ -277,7 +277,7 @@ fn cycle_89_periodic_with_only_few_points() {
 }
 
 #[test]
-fn cycle_90_bc_anchored_with_data_far_from_zero() {
+fn bc_anchored_with_data_far_from_zero() {
     init_parallelism();
     // Truth y = 5 + sin(πx): boundary value ≈ 5, but bc=anchored forces 0.
     // Fit should still succeed with bias near boundary.
