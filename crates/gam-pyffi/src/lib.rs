@@ -19,7 +19,8 @@ use gam::families::survival_predict::{
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::gaussian_reml::{
-    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_with_cache,
+    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_from_fit,
+    gaussian_reml_multi_closed_form_with_cache,
 };
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
@@ -46,7 +47,7 @@ use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -582,6 +583,7 @@ fn gaussian_reml_fit<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
+    forward_state = None,
     weights = None,
     init_lambda = None,
     by = None,
@@ -596,6 +598,7 @@ fn gaussian_reml_fit_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
+    forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
     by: Option<PyReadonlyArray1<'py, f64>>,
@@ -613,17 +616,32 @@ fn gaussian_reml_fit_backward<'py>(
     } else {
         x_view
     };
-    let backward = gaussian_reml_multi_closed_form_backward(
-        fit_x,
-        y_view,
-        penalty_view,
-        weight_view,
-        init_lambda,
-        grad_lambda,
-        grad_coefficients.as_ref().map(|g| g.as_array()),
-        grad_fitted.as_ref().map(|g| g.as_array()),
-        grad_reml_score,
-    )
+    let backward = if let Some(state) = forward_state {
+        let fit = gaussian_reml_fit_state_from_pydict(state).map_err(py_value_error)?;
+        gaussian_reml_multi_closed_form_backward_from_fit(
+            fit_x,
+            y_view,
+            penalty_view,
+            weight_view,
+            &fit,
+            grad_lambda,
+            grad_coefficients.as_ref().map(|g| g.as_array()),
+            grad_fitted.as_ref().map(|g| g.as_array()),
+            grad_reml_score,
+        )
+    } else {
+        gaussian_reml_multi_closed_form_backward(
+            fit_x,
+            y_view,
+            penalty_view,
+            weight_view,
+            init_lambda,
+            grad_lambda,
+            grad_coefficients.as_ref().map(|g| g.as_array()),
+            grad_fitted.as_ref().map(|g| g.as_array()),
+            grad_reml_score,
+        )
+    }
     .map_err(|err| py_value_error(err.to_string()))?;
 
     let out = PyDict::new(py);
