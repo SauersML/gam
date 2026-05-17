@@ -1167,11 +1167,20 @@ impl PirlsWorkspace {
         ridge: f64,
         precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
     ) -> Result<SparseColMat<usize, f64>, EstimationError> {
+        let t = std::time::Instant::now();
         self.ensure_sparse_penalty_cache(x, s_lambda)?;
-        self.sparse_penalized_system_cache
+        let ms_cache = t.elapsed().as_secs_f64() * 1e3;
+        let t2 = std::time::Instant::now();
+        let result = self.sparse_penalized_system_cache
             .as_mut()
             .unwrap()
-            .assemble_upper(x, weights, ridge, precomputed_xtwx)
+            .assemble_upper(x, weights, ridge, precomputed_xtwx);
+        let ms_asm = t2.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "[PROF] asm_sparse_pen_hess p={} pre_cache_ms={:.1} asm_ms={:.1} (precomputed_xtwx={})",
+            x.ncols(), ms_cache, ms_asm, precomputed_xtwx.is_some()
+        );
+        result
     }
 }
 
