@@ -1550,14 +1550,16 @@ def _ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, li
 def _numeric_matrix(values: Any, label: str) -> Any:
     import numpy as np
 
-    arr = np.asarray(values, dtype=np.float64)
+    arr = np.asarray(values)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
     if arr.ndim != 2:
         raise ValueError(f"{label} must be a 1D or 2D numeric array")
     if arr.shape[0] == 0 or arr.shape[1] == 0:
         raise ValueError(f"{label} cannot be empty")
-    return np.ascontiguousarray(arr)
+    if arr.dtype != np.float64:
+        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    return arr
 
 
 def _transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:

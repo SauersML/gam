@@ -596,23 +596,16 @@ fn gaussian_reml_fit_batched<'py>(
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
-    let x_values = x.as_array().to_owned();
-    let y_values = y.as_array().to_owned();
-    let offset_values = row_offsets.as_array().to_owned();
-    let penalty_values = penalty.as_array().to_owned();
-    let weight_values = weights.map(|w| w.as_array().to_owned());
-    let result = py
-        .detach(move || {
-            gaussian_reml_fit_batched_impl(
-                x_values.view(),
-                y_values.view(),
-                offset_values.view(),
-                penalty_values.view(),
-                weight_values.as_ref().map(|w| w.view()),
-                init_lambda,
-            )
-        })
-        .map_err(py_value_error)?;
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    let result = gaussian_reml_fit_batched_impl(
+        x.as_array(),
+        y.as_array(),
+        row_offsets.as_array(),
+        penalty.as_array(),
+        weight_view,
+        init_lambda,
+    )
+    .map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("status", result.statuses)?;
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
