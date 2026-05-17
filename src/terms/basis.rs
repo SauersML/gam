@@ -2656,10 +2656,16 @@ pub struct SphericalSplineBasisSpec {
     /// Center/knot selection strategy in latitude/longitude coordinates
     /// (used only when `method == Wahba`).
     pub center_strategy: CenterStrategy,
-    /// Sphere roughness penalty order m. For Wahba this selects the closed-form
-    /// pseudo-spline kernel order; for Harmonic this raises the
-    /// Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. m=2 is the usual
-    /// curvature penalty.
+    /// Sphere roughness penalty order m ∈ {1, 2, 3, 4}.
+    ///
+    /// - **Wahba method, Sobolev kernel (default)**: the reproducing-kernel
+    ///   norm is `Σ_l [l(l+1)]^m · |f̂_l|²` — the canonical `H^m(S²)` Sobolev
+    ///   norm. `m=2` is the usual curvature (thin-plate analogue) penalty.
+    /// - **Wahba method, Pseudo kernel**: the order maps to the Wahba 1981
+    ///   pseudo-spline kernel with Legendre weights
+    ///   `2 / [(l+1)(l+2)···(l+m+1)]`. Same `m=2` is the TPS pseudo-spline.
+    /// - **Harmonic method**: raises the Laplace-Beltrami eigenvalue
+    ///   penalty to `[l(l+1)]^m` (same as the Sobolev kernel norm above).
     pub penalty_order: usize,
     /// Add a ridge-like shrinkage penalty.
     pub double_penalty: bool,

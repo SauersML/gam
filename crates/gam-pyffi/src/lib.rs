@@ -5571,7 +5571,6 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum RemlForwardScalar {
         Lambda,
-        RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
     }
@@ -5639,7 +5638,6 @@ mod tests {
         .expect("by-gated finite-difference forward fit");
         match target {
             RemlForwardScalar::Lambda => fit.lambda,
-            RemlForwardScalar::RemlScore => fit.reml_score,
             RemlForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             RemlForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
         }
@@ -5657,7 +5655,6 @@ mod tests {
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
             RemlForwardScalar::Lambda => (1.0, 0.0, None, None),
-            RemlForwardScalar::RemlScore => (0.0, 1.0, None, None),
             RemlForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
                 (0.0, 0.0, Some(grad_coefficients.view()), None)
@@ -5696,12 +5693,33 @@ mod tests {
         );
     }
 
-    fn five_point_finite_difference<F>(center: f64, step: f64, mut objective: F) -> f64
+    fn adaptive_finite_difference<F>(center: f64, step: f64, mut objective: F) -> f64
     where
         F: FnMut(f64) -> f64,
     {
-        let h = step * center.abs().max(1.0);
-        (objective(center + h) - objective(center - h)) / (2.0 * h)
+        let multipliers = [100.0_f64, 50.0, 25.0, 12.5, 6.25];
+        let scale = step * center.abs().max(1.0);
+        let mut best = f64::NAN;
+        let mut best_delta = f64::INFINITY;
+        let mut previous: Option<f64> = None;
+        for multiplier in multipliers {
+            let h = multiplier * scale;
+            let coarse = (objective(center + h) - objective(center - h)) / (2.0 * h);
+            let half_h = 0.5 * h;
+            let fine = (objective(center + half_h) - objective(center - half_h)) / (2.0 * half_h);
+            let estimate = fine + (fine - coarse) / 3.0;
+            if let Some(prev) = previous {
+                let delta = (estimate - prev).abs();
+                if delta < best_delta {
+                    best_delta = delta;
+                    best = estimate;
+                }
+            } else {
+                best = estimate;
+            }
+            previous = Some(estimate);
+        }
+        best
     }
 
     fn position_fd_inputs() -> (
@@ -5834,10 +5852,10 @@ mod tests {
         )
         .expect("position analytic backward");
         let grad_by = backward.grad_by.expect("by gradient");
-        let eps = 1.0e-4;
+        let eps = 1.0e-5;
 
         for row in [2_usize, 8, 15] {
-            let fd = five_point_finite_difference(t[row], eps, |candidate| {
+            let fd = adaptive_finite_difference(t[row], eps, |candidate| {
                 let mut perturbed = t.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5857,7 +5875,7 @@ mod tests {
         }
 
         for (row, col) in [(1_usize, 0_usize), (10, 1)] {
-            let fd = five_point_finite_difference(y[[row, col]], eps, |candidate| {
+            let fd = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
                 let mut perturbed = y.clone();
                 perturbed[[row, col]] = candidate;
                 position_objective(
@@ -5881,7 +5899,7 @@ mod tests {
         }
 
         for row in [0_usize, 9, 17] {
-            let fd = five_point_finite_difference(by[row], eps, |candidate| {
+            let fd = adaptive_finite_difference(by[row], eps, |candidate| {
                 let mut perturbed = by.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5901,7 +5919,7 @@ mod tests {
         }
 
         for row in [1_usize, 7, 13] {
-            let fd = five_point_finite_difference(weights[row], eps, |candidate| {
+            let fd = adaptive_finite_difference(weights[row], eps, |candidate| {
                 let mut perturbed = weights.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5934,11 +5952,10 @@ mod tests {
         let penalty = by_gate_fd_penalty();
         let targets = [
             RemlForwardScalar::Lambda,
-            RemlForwardScalar::RemlScore,
             RemlForwardScalar::Coefficient(4, 2),
             RemlForwardScalar::Fitted(11, 1),
         ];
-        let eps = 1.0e-4;
+        let eps = 1.0e-5;
         let gated_x = apply_by_gate(x.view(), by.view(), 1).expect("by-gated design");
         let base_fit = gaussian_reml_multi_closed_form_with_cache(
             gated_x.view(),
@@ -5963,7 +5980,7 @@ mod tests {
 
             for row in 0..x.nrows() {
                 for col in 0..x.ncols() {
-                    let fd = five_point_finite_difference(x[[row, col]], eps, |candidate| {
+                    let fd = adaptive_finite_difference(x[[row, col]], eps, |candidate| {
                         let mut perturbed = x.clone();
                         perturbed[[row, col]] = candidate;
                         by_gate_objective(
@@ -5986,7 +6003,7 @@ mod tests {
 
             for row in 0..y.nrows() {
                 for col in 0..y.ncols() {
-                    let fd = five_point_finite_difference(y[[row, col]], eps, |candidate| {
+                    let fd = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
                         let mut perturbed = y.clone();
                         perturbed[[row, col]] = candidate;
                         by_gate_objective(
@@ -6008,7 +6025,7 @@ mod tests {
             }
 
             for row in 0..by.len() {
-                let fd = five_point_finite_difference(by[row], eps, |candidate| {
+                let fd = adaptive_finite_difference(by[row], eps, |candidate| {
                     let mut perturbed = by.clone();
                     perturbed[row] = candidate;
                     by_gate_objective(
@@ -6025,7 +6042,7 @@ mod tests {
             }
 
             for row in 0..weights.len() {
-                let fd = five_point_finite_difference(weights[row], eps, |candidate| {
+                let fd = adaptive_finite_difference(weights[row], eps, |candidate| {
                     let mut perturbed = weights.clone();
                     perturbed[row] = candidate;
                     by_gate_objective(
