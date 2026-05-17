@@ -1,5 +1,9 @@
 use gam::estimate::{FitOptions, fit_gam};
-use gam::gaussian_reml::{gaussian_reml_closed_form, gaussian_reml_multi_closed_form};
+use gam::gaussian_reml::{
+    GaussianRemlMultiBatchProblem, GaussianRemlScalarBatchProblem, gaussian_reml_closed_form,
+    gaussian_reml_closed_form_batch, gaussian_reml_closed_form_with_nullspace_dim,
+    gaussian_reml_multi_closed_form, gaussian_reml_multi_closed_form_batch,
+};
 use gam::smooth::BlockwisePenalty;
 use gam::types::LikelihoodFamily;
 use ndarray::{Array1, Array2};
@@ -89,11 +93,13 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
         closed.reml_score,
         existing.reml_score
     );
-    assert!(
-        closed.reml_grad_rho.abs() < 1e-6,
-        "closed-form rho gradient not stationary: {}",
-        closed.reml_grad_rho
-    );
+    let fitted = x.dot(&closed.coefficients);
+    for (idx, (&a, &b)) in closed.fitted.iter().zip(fitted.iter()).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-10,
+            "fitted value {idx} mismatch: closed={a} explicit={b}"
+        );
+    }
 }
 
 #[test]
@@ -123,9 +129,106 @@ fn closed_form_multi_output_pools_shared_lambda_and_coefficients() {
         assert!((multi.coefficients[[j, 1]] - 2.0 * scalar.coefficients[j]).abs() < 1e-10);
         assert!((multi.coefficients[[j, 2]] + 0.5 * scalar.coefficients[j]).abs() < 1e-10);
     }
-    assert!(
-        multi.reml_grad_rho.abs() < 1e-6,
-        "pooled rho gradient not stationary: {}",
-        multi.reml_grad_rho
-    );
+    let fitted = x.dot(&multi.coefficients);
+    for ((i, j), &explicit) in fitted.indexed_iter() {
+        assert!((multi.fitted[[i, j]] - explicit).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn closed_form_accepts_and_validates_penalty_nullspace() {
+    let (x, y, s) = fixture();
+    gaussian_reml_closed_form_with_nullspace_dim(x.view(), y.view(), s.view(), Some(0), None, None)
+        .expect("matching nullspace dimension");
+    let err = gaussian_reml_closed_form_with_nullspace_dim(
+        x.view(),
+        y.view(),
+        s.view(),
+        Some(1),
+        None,
+        None,
+    )
+    .expect_err("mismatched nullspace dimension should fail");
+    assert!(format!("{err:?}").contains("nullspace mismatch"));
+}
+
+#[test]
+fn closed_form_batches_ragged_scalar_and_multi_problems() {
+    let (x, y, s) = fixture();
+    let x_short = x.slice(ndarray::s![..48, ..]);
+    let y_short = y.slice(ndarray::s![..48]);
+    let weights = Array1::from_iter((0..x.nrows()).map(|i| 0.75 + 0.01 * (i as f64)));
+    let weights_short = weights.slice(ndarray::s![..48]);
+
+    let scalar_problems = vec![
+        GaussianRemlScalarBatchProblem {
+            x: x.view(),
+            y: y.view(),
+            weights: Some(weights.view()),
+            init_rho: Some(0.0),
+        },
+        GaussianRemlScalarBatchProblem {
+            x: x_short,
+            y: y_short,
+            weights: Some(weights_short),
+            init_rho: None,
+        },
+    ];
+    let scalar_batch =
+        gaussian_reml_closed_form_batch(&scalar_problems, s.view(), Some(0)).expect("scalar batch");
+    for (problem, batched) in scalar_problems.iter().zip(scalar_batch.iter()) {
+        let individual = gaussian_reml_closed_form(
+            problem.x.view(),
+            problem.y.view(),
+            s.view(),
+            problem.weights.as_ref().map(|weights| weights.view()),
+            problem.init_rho,
+        )
+        .expect("individual scalar fit");
+        assert!((batched.lambda - individual.lambda).abs() < 1e-10);
+        assert!(
+            (&batched.coefficients - &individual.coefficients)
+                .mapv(f64::abs)
+                .sum()
+                < 1e-9
+        );
+    }
+
+    let mut y_multi = Array2::<f64>::zeros((x.nrows(), 2));
+    y_multi.column_mut(0).assign(&y);
+    y_multi.column_mut(1).assign(&y.mapv(|value| -1.5 * value));
+    let y_multi_short = y_multi.slice(ndarray::s![..48, ..]);
+    let multi_problems = vec![
+        GaussianRemlMultiBatchProblem {
+            x: x.view(),
+            y: y_multi.view(),
+            weights: Some(weights.view()),
+            init_rho: Some(0.0),
+        },
+        GaussianRemlMultiBatchProblem {
+            x: x.slice(ndarray::s![..48, ..]),
+            y: y_multi_short,
+            weights: Some(weights.slice(ndarray::s![..48])),
+            init_rho: None,
+        },
+    ];
+    let multi_batch = gaussian_reml_multi_closed_form_batch(&multi_problems, s.view(), Some(0))
+        .expect("multi batch");
+    for (problem, batched) in multi_problems.iter().zip(multi_batch.iter()) {
+        let individual = gaussian_reml_multi_closed_form(
+            problem.x.view(),
+            problem.y.view(),
+            s.view(),
+            problem.weights.as_ref().map(|weights| weights.view()),
+            problem.init_rho,
+        )
+        .expect("individual multi fit");
+        assert!((batched.lambda - individual.lambda).abs() < 1e-10);
+        assert!(
+            (&batched.coefficients - &individual.coefficients)
+                .mapv(f64::abs)
+                .sum()
+                < 1e-9
+        );
+    }
 }
