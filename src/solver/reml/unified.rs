@@ -4003,13 +4003,22 @@ pub(crate) fn exact_intersection_nullity(
 ///
 /// Uses `p × ε_mach × max(|eigenvalues|, 1)` with a safety factor,
 /// giving ~1e-13 × max_ev for typical sizes (p ≤ 1000).
+///
+/// Threshold is RELATIVE to `max|eigenvalue|` — never floored at an
+/// absolute value. Earlier this function clamped `max_ev` to at least
+/// `1.0`, which silently classified genuine positive modes of
+/// small-scale penalties (Wahba pseudo-spline `m=4` Gram had
+/// `max|eig| ≈ 5e-3`) as numerical zero. That corrupted the
+/// pseudo-logdet and broke REML's invariance under `S → c·S`, causing
+/// the m=4 smooth contribution to collapse to ~0. When `max_ev == 0`
+/// (no positive modes) the threshold collapses to 0 too, which is the
+/// only correct answer.
 pub(crate) fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
     let p = eigenvalues.len();
     let max_ev = eigenvalues
         .iter()
         .copied()
-        .fold(0.0_f64, |a, b| a.max(b.abs()))
-        .max(1.0);
+        .fold(0.0_f64, |a, b| a.max(b.abs()));
     // Safety factor of 100 above the theoretical noise floor p × ε_mach × ‖S‖.
     let safety = 100.0;
     safety * (p as f64) * f64::EPSILON * max_ev
