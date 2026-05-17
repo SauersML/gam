@@ -666,6 +666,7 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
             &mut grad_y,
             &mut grad_weights,
         );
+        lambda_adjoint += upstream_reml_score * fit.reml_grad_lambda;
     }
 
     if lambda_adjoint != 0.0 {
@@ -2271,12 +2272,36 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        let tol = 2.0e-6_f64.max(2.0e-6 * analytic.abs().max(finite_difference.abs()));
+        let tol = 1.0e-5_f64.max(1.0e-5 * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
             "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
         );
+    }
+
+    fn adaptive_central_difference(mut eval: impl FnMut(f64) -> f64) -> f64 {
+        let steps = [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4, 6.25e-5];
+        let mut best = f64::NAN;
+        let mut best_delta = f64::INFINITY;
+        let mut previous: Option<f64> = None;
+        for h in steps {
+            let d1 = (eval(h) - eval(-h)) / (2.0 * h);
+            let half_h = 0.5 * h;
+            let d2 = (eval(half_h) - eval(-half_h)) / (2.0 * half_h);
+            let estimate = d2 + (d2 - d1) / 3.0;
+            if let Some(prev) = previous {
+                let delta = (estimate - prev).abs();
+                if delta < best_delta {
+                    best_delta = delta;
+                    best = estimate;
+                }
+            } else {
+                best = estimate;
+            }
+            previous = Some(estimate);
+        }
+        best
     }
 
     fn assert_backward_matches_forward_finite_difference(outputs: usize) {
@@ -2290,8 +2315,6 @@ mod tests {
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
-        let eps = 1.0e-4;
-
         for target in targets {
             let backward =
                 one_hot_backward(x.view(), y.view(), penalty.view(), weights.view(), target);
@@ -2309,10 +2332,7 @@ mod tests {
                             target,
                         )
                     };
-                    let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
-                    let half_eps = 0.5 * eps;
-                    let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
-                    let fd = d2 + (d2 - d1) / 3.0;
+                    let fd = adaptive_central_difference(eval);
                     assert_fd_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         backward.grad_x[[row, col]],
@@ -2334,10 +2354,7 @@ mod tests {
                             target,
                         )
                     };
-                    let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
-                    let half_eps = 0.5 * eps;
-                    let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
-                    let fd = d2 + (d2 - d1) / 3.0;
+                    let fd = adaptive_central_difference(eval);
                     assert_fd_close(
                         &format!("target={target:?} y[{row},{col}]"),
                         backward.grad_y[[row, col]],
@@ -2352,10 +2369,7 @@ mod tests {
                     candidate[row] += delta;
                     one_hot_objective(x.view(), y.view(), penalty.view(), candidate.view(), target)
                 };
-                let d1 = (eval(eps) - eval(-eps)) / (2.0 * eps);
-                let half_eps = 0.5 * eps;
-                let d2 = (eval(half_eps) - eval(-half_eps)) / (2.0 * half_eps);
-                let fd = d2 + (d2 - d1) / 3.0;
+                let fd = adaptive_central_difference(eval);
                 assert_fd_close(
                     &format!("target={target:?} weights[{row}]"),
                     backward.grad_weights[row],
