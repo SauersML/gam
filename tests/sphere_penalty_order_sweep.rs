@@ -23,11 +23,14 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     for _ in 0..n {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
-        let y = 0.5 + 0.6 * lat.to_radians().sin()
+        let y = 0.5
+            + 0.6 * lat.to_radians().sin()
             + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
-            lat.to_string(), lon.to_string(), y.to_string(),
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
         ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -35,9 +38,14 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
 
 fn run(formula: &str) -> Result<(f64, f64, f64), String> {
     let data = make_dataset(400);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, &data, &cfg).map_err(|e| format!("fit: {e}"))?;
-    let FitResult::Standard(fit) = result else { return Err("non-standard".into()); };
+    let FitResult::Standard(fit) = result else {
+        return Err("non-standard".into());
+    };
     let mut pts = Vec::new();
     for i in 0..15 {
         let lat = -75.0 + 150.0 * (i as f64) / 14.0;
@@ -58,11 +66,18 @@ fn run(formula: &str) -> Result<(f64, f64, f64), String> {
     if !pred.iter().all(|v| v.is_finite()) {
         return Err(format!("non-finite: range"));
     }
-    let truth: Vec<f64> = pts.iter().map(|(lat, lon)| {
-        0.5 + 0.6 * lat.to_radians().sin()
-            + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
-    }).collect();
-    let sumsq: f64 = pred.iter().zip(truth.iter()).map(|(p, t)| (p - t).powi(2)).sum();
+    let truth: Vec<f64> = pts
+        .iter()
+        .map(|(lat, lon)| {
+            0.5 + 0.6 * lat.to_radians().sin()
+                + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
+        })
+        .collect();
+    let sumsq: f64 = pred
+        .iter()
+        .zip(truth.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
     let rmse = (sumsq / pred.len() as f64).sqrt();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -90,7 +105,11 @@ fn sphere_wahba_penalty_order_sweep_low_orders() {
             Err(e) => failures.push(format!("m={m}: {e}")),
         }
     }
-    assert!(failures.is_empty(), "wahba m sweep failures:\n  - {}", failures.join("\n  - "));
+    assert!(
+        failures.is_empty(),
+        "wahba m sweep failures:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
 
 #[test]
@@ -131,14 +150,21 @@ fn sphere_harmonic_penalty_order_sweep() {
             Err(e) => failures.push(format!("m={m}: {e}")),
         }
     }
-    assert!(failures.is_empty(), "harmonic m sweep failures:\n  - {}", failures.join("\n  - "));
+    assert!(
+        failures.is_empty(),
+        "harmonic m sweep failures:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
 
 #[test]
 fn sphere_invalid_penalty_order_rejected_cleanly() {
     init_parallelism();
     let data = make_dataset(100);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     for bad_m in [0usize, 5, 10, 99] {
         let formula = format!("y ~ sphere(lat, lon, k=20, m={bad_m})");
         let r = fit_from_formula(&formula, &data, &cfg);

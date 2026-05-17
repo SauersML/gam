@@ -23,21 +23,34 @@ fn make_dataset(origin: f64, period: f64, n: usize, seed: u64) -> gam::data::Enc
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
     // Truth: cos((t - origin) * 2π / period) — periodic in t with the
     // declared period and origin.
-    let y: Vec<f64> = t.iter().map(|x| ((x - origin) * 2.0 * PI / period).cos() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = t
+        .iter()
+        .map(|x| ((x - origin) * 2.0 * PI / period).cos() + noise.sample(&mut rng))
+        .collect();
     let headers = ["t", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = t.iter().zip(y.iter())
-        .map(|(a,b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+    let rows: Vec<StringRecord> = t
+        .iter()
+        .zip(y.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
 fn predict(formula: &str, data: &gam::data::EncodedDataset, ts: &[f64]) -> Vec<f64> {
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(formula, data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let n = ts.len();
     let mut m = Array2::<f64>::zeros((n, 2));
-    for (i, &v) in ts.iter().enumerate() { m[[i, 0]] = v; m[[i, 1]] = 0.0; }
+    for (i, &v) in ts.iter().enumerate() {
+        m[[i, 0]] = v;
+        m[[i, 1]] = 0.0;
+    }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
@@ -49,13 +62,22 @@ fn periodic_1d_origin_5_wraps_at_seam() {
     let period = 7.0_f64;
     let data = make_dataset(origin, period, 200, 11);
     // Probe pairs straddling the seam at t = origin + period = 12.0.
-    let probes = vec![origin, origin + period, origin + period - 1e-9, origin + 1e-9];
+    let probes = vec![
+        origin,
+        origin + period,
+        origin + period - 1e-9,
+        origin + 1e-9,
+    ];
     let pred = predict(
         &format!("y ~ s(t, periodic=true, period={period}, origin={origin})"),
-        &data, &probes,
+        &data,
+        &probes,
     );
     let gap = (pred[0] - pred[1]).abs();
-    eprintln!("[per-origin] f(o)={:.6} f(o+P)={:.6} gap={:.3e}", pred[0], pred[1], gap);
+    eprintln!(
+        "[per-origin] f(o)={:.6} f(o+P)={:.6} gap={:.3e}",
+        pred[0], pred[1], gap
+    );
     assert!(
         gap < 1e-6,
         "non-zero origin seam discontinuous: |f({origin}) - f({})| = {gap:.3e}",
@@ -70,13 +92,22 @@ fn periodic_1d_origin_neg_pi_wraps_at_seam() {
     let origin = -PI;
     let period = 2.0 * PI;
     let data = make_dataset(origin, period, 200, 11);
-    let probes = vec![origin, origin + period, origin + period - 1e-9, origin + 1e-9];
+    let probes = vec![
+        origin,
+        origin + period,
+        origin + period - 1e-9,
+        origin + 1e-9,
+    ];
     let pred = predict(
         &format!("y ~ s(t, periodic=true, period={period}, origin={origin})"),
-        &data, &probes,
+        &data,
+        &probes,
     );
     let gap = (pred[0] - pred[1]).abs();
-    eprintln!("[per-neg-origin] f(o)={:.6} f(o+P)={:.6} gap={:.3e}", pred[0], pred[1], gap);
+    eprintln!(
+        "[per-neg-origin] f(o)={:.6} f(o+P)={:.6} gap={:.3e}",
+        pred[0], pred[1], gap
+    );
     assert!(gap < 1e-6, "negative origin seam discontinuous: {gap:.3e}");
 }
 
@@ -97,7 +128,8 @@ fn periodic_1d_origin_wrap_invariance() {
     }
     let pred = predict(
         &format!("y ~ s(t, periodic=true, period={period}, origin={origin})"),
-        &data, &probes,
+        &data,
+        &probes,
     );
     let n = bases.len();
     for (band, _k) in [-1i32, 1, 2].iter().enumerate() {
