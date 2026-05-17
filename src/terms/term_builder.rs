@@ -889,7 +889,6 @@ pub fn build_smooth_basis(
                     "power", "p",
                     "nullspace_order", "order",
                     "identifiability",
-                    "pure",
                     "periodic", "period", "period_start", "period_end",
                     "scale_dims",
                     "double_penalty",
@@ -900,12 +899,6 @@ pub fn build_smooth_basis(
                     "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
                     vars.join(", ")
                 ));
-            }
-            if options.contains_key("pure") {
-                return Err(
-                    "duchon() is pure scale-free Duchon by default; remove pure=... or specify length_scale=... for the hybrid Duchon-Matern kernel"
-                        .to_string(),
-                );
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64_strict(options, "length_scale")?;

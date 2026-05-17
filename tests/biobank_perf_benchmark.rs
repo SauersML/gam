@@ -257,7 +257,7 @@ fn biobank_perf_mixed_three_smooths_n100k() {
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("mixed");
     let (ms, p) = time_fit(
-        "y ~ cyclic(theta) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
+        "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
         &data,
         &cfg,
     );

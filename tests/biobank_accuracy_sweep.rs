@@ -498,7 +498,7 @@ fn compound_cyclic_plus_anchored_plus_sphere_fits_jointly() {
     let test = predict_matrix(5, &[&theta, &x, &lat, &lon, &vec![0.0; n]]);
     let truth_arr: Array1<f64> = Array1::from(truth);
     let pred = fit_and_predict_eta(
-        "y ~ cyclic(theta) + s(x, bc_left=anchored, anchor_left=0) + sphere(lat, lon, method=harmonic, max_degree=3)",
+        "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc_left=anchored, anchor_left=0) + sphere(lat, lon, method=harmonic, max_degree=3)",
         &data,
         &gaussian_cfg(),
         &test,
