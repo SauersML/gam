@@ -275,6 +275,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit",
             "gaussian_reml_fit_backward",
             "gaussian_reml_fit_batched",
+            "gaussian_reml_fit_batched_backward",
             "gaussian_reml_fit_positions",
             "gaussian_reml_fit_positions_backward",
             "gaussian_reml_fit_positions_batched",
@@ -694,10 +695,95 @@ fn gaussian_reml_fit_batched<'py>(
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
     out.set_item("rho", result.rhos.into_pyarray(py))?;
     out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
+    out.set_item(
+        "reml_grad_lambda",
+        result.reml_grad_lambdas.into_pyarray(py),
+    )?;
+    out.set_item(
+        "reml_hess_lambda",
+        result.reml_hess_lambdas.into_pyarray(py),
+    )?;
+    out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
+    out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
     out.set_item("edf", result.edf.into_pyarray(py))?;
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;
     out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    x,
+    y,
+    row_offsets,
+    penalty,
+    grad_lambda = None,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_reml_score = None,
+    weights = None,
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
+))]
+fn gaussian_reml_fit_batched_backward<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    row_offsets: PyReadonlyArray1<'py, usize>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    grad_lambda: Option<PyReadonlyArray1<'py, f64>>,
+    grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
+) -> PyResult<Py<PyDict>> {
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x_view
+    };
+    let backward = gaussian_reml_fit_batched_backward_impl(
+        fit_x,
+        y_view,
+        row_offsets.as_array(),
+        penalty.as_array(),
+        weight_view,
+        init_lambda,
+        grad_lambda.as_ref().map(|g| g.as_array()),
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score.as_ref().map(|g| g.as_array()),
+    )
+    .map_err(py_value_error)?;
+
+    let out = PyDict::new(py);
+    let (grad_x, grad_by) = if let Some(by_values) = by_view {
+        let (grad_x, grad_by) =
+            apply_by_gate_backward(x_view, by_values, by_start_col, backward.grad_x.view())
+                .map_err(py_value_error)?;
+        (grad_x, Some(grad_by))
+    } else {
+        (backward.grad_x, None)
+    };
+    out.set_item("status", backward.statuses)?;
+    out.set_item("grad_x", grad_x.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    if let Some(grad_by) = grad_by {
+        out.set_item("grad_by", grad_by.into_pyarray(py))?;
+    } else {
+        out.set_item("grad_by", py.None())?;
+    }
     Ok(out.unbind())
 }
 
@@ -858,6 +944,16 @@ fn gaussian_reml_fit_positions_batched<'py>(
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
     out.set_item("rho", result.rhos.into_pyarray(py))?;
     out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
+    out.set_item(
+        "reml_grad_lambda",
+        result.reml_grad_lambdas.into_pyarray(py),
+    )?;
+    out.set_item(
+        "reml_hess_lambda",
+        result.reml_hess_lambdas.into_pyarray(py),
+    )?;
+    out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
+    out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
     out.set_item("edf", result.edf.into_pyarray(py))?;
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;
@@ -989,10 +1085,21 @@ struct BatchedGaussianRemlResult {
     lambdas: Array1<f64>,
     rhos: Array1<f64>,
     reml_scores: Array1<f64>,
+    reml_grad_lambdas: Array1<f64>,
+    reml_hess_lambdas: Array1<f64>,
+    reml_grad_rhos: Array1<f64>,
+    reml_hess_rhos: Array1<f64>,
     edf: Array1<f64>,
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
     sigma2: Array2<f64>,
+}
+
+struct BatchedGaussianRemlBackwardResult {
+    statuses: Vec<String>,
+    grad_x: Array2<f64>,
+    grad_y: Array2<f64>,
+    grad_weights: Array1<f64>,
 }
 
 struct PositionGaussianRemlBackwardResult {
@@ -1196,6 +1303,10 @@ fn gaussian_reml_fit_batched_impl(
     let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut edf = Array1::<f64>::zeros(batch);
     let mut coefficients = Array3::<f64>::zeros((batch, p, d));
     let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
@@ -1211,6 +1322,10 @@ fn gaussian_reml_fit_batched_impl(
             lambdas[b] = fit.lambda;
             rhos[b] = fit.rho;
             reml_scores[b] = fit.reml_score;
+            reml_grad_lambdas[b] = fit.reml_grad_lambda;
+            reml_hess_lambdas[b] = fit.reml_hess_lambda;
+            reml_grad_rhos[b] = fit.reml_grad_rho;
+            reml_hess_rhos[b] = fit.reml_hess_rho;
             edf[b] = fit.edf;
             coefficients
                 .slice_mut(s![b, .., ..])
@@ -1225,11 +1340,249 @@ fn gaussian_reml_fit_batched_impl(
         lambdas,
         rhos,
         reml_scores,
+        reml_grad_lambdas,
+        reml_hess_lambdas,
+        reml_grad_rhos,
+        reml_hess_rhos,
         edf,
         coefficients,
         fitted,
         sigma2,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_batched_backward_impl(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    grad_lambda: Option<ArrayView1<'_, f64>>,
+    grad_coefficients: Option<ArrayView3<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_reml_score: Option<ArrayView1<'_, f64>>,
+) -> Result<BatchedGaussianRemlBackwardResult, String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    validate_batched_reml_common(x, y, row_offsets, penalty, weights, init_lambda)?;
+    let batch = row_offsets.len() - 1;
+    let p = x.ncols();
+    let d = y.ncols();
+    validate_batched_reml_upstreams(
+        batch,
+        p,
+        d,
+        y.nrows(),
+        grad_lambda,
+        grad_coefficients,
+        grad_fitted,
+        grad_reml_score,
+    )?;
+
+    let results: Vec<
+        Result<
+            (
+                usize,
+                Option<gam::gaussian_reml::GaussianRemlBackwardResult>,
+            ),
+            String,
+        >,
+    > = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return Ok((b, None));
+            }
+            let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
+            let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
+            let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
+            let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
+            let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
+            match gaussian_reml_multi_closed_form_backward(
+                x.slice(s![start..end, ..]),
+                y.slice(s![start..end, ..]),
+                penalty,
+                weight_slice,
+                init_lambda,
+                upstream_lambda,
+                upstream_coefficients,
+                upstream_fitted,
+                upstream_reml_score,
+            ) {
+                Ok(backward) => Ok((b, Some(backward))),
+                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
+            }
+        })
+        .collect();
+
+    let mut statuses = vec!["degenerate".to_string(); batch];
+    let mut grad_x = Array2::<f64>::zeros(x.dim());
+    let mut grad_y = Array2::<f64>::zeros(y.dim());
+    let mut grad_weights = Array1::<f64>::zeros(x.nrows());
+    for result in results {
+        let (b, backward) = result?;
+        if let Some(backward) = backward {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            statuses[b] = "ok".to_string();
+            grad_x
+                .slice_mut(s![start..end, ..])
+                .assign(&backward.grad_x);
+            grad_y
+                .slice_mut(s![start..end, ..])
+                .assign(&backward.grad_y);
+            grad_weights
+                .slice_mut(s![start..end])
+                .assign(&backward.grad_weights);
+        }
+    }
+
+    Ok(BatchedGaussianRemlBackwardResult {
+        statuses,
+        grad_x,
+        grad_y,
+        grad_weights,
+    })
+}
+
+fn validate_batched_reml_common(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+) -> Result<(), String> {
+    if row_offsets.len() < 2 {
+        return Err("row_offsets must contain at least [0, n]".to_string());
+    }
+    if row_offsets[0] != 0 || row_offsets[row_offsets.len() - 1] != x.nrows() {
+        return Err(format!(
+            "row_offsets must start at 0 and end at X.nrows(); got start={}, end={}, n={}",
+            row_offsets[0],
+            row_offsets[row_offsets.len() - 1],
+            x.nrows()
+        ));
+    }
+    for idx in 0..row_offsets.len() - 1 {
+        if row_offsets[idx] > row_offsets[idx + 1] {
+            return Err("row_offsets must be non-decreasing".to_string());
+        }
+    }
+    if y.nrows() != x.nrows() {
+        return Err(format!(
+            "batched Gaussian REML row mismatch: X has {} rows but Y has {}",
+            x.nrows(),
+            y.nrows()
+        ));
+    }
+    if x.ncols() == 0 || y.ncols() == 0 {
+        return Err("batched Gaussian REML requires non-empty X and Y columns".to_string());
+    }
+    if penalty.nrows() != x.ncols() || penalty.ncols() != x.ncols() {
+        return Err(format!(
+            "penalty shape mismatch: expected {}x{}, got {}x{}",
+            x.ncols(),
+            x.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if let Some(weights) = weights {
+        if weights.len() != x.nrows() {
+            return Err(format!(
+                "weights length mismatch: expected {}, got {}",
+                x.nrows(),
+                weights.len()
+            ));
+        }
+        if weights
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(
+                "batched Gaussian REML weights must be finite non-negative values".to_string(),
+            );
+        }
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("batched Gaussian REML inputs must be finite".to_string());
+    }
+    if let Some(lambda) = init_lambda {
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return Err(format!(
+                "init_lambda must be finite and positive when provided; got {lambda}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_batched_reml_upstreams(
+    batch: usize,
+    p: usize,
+    d: usize,
+    n: usize,
+    grad_lambda: Option<ArrayView1<'_, f64>>,
+    grad_coefficients: Option<ArrayView3<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_reml_score: Option<ArrayView1<'_, f64>>,
+) -> Result<(), String> {
+    if let Some(grad_lambda) = grad_lambda {
+        if grad_lambda.len() != batch {
+            return Err(format!(
+                "grad_lambda length mismatch: expected {batch}, got {}",
+                grad_lambda.len()
+            ));
+        }
+        if grad_lambda.iter().any(|value| !value.is_finite()) {
+            return Err("grad_lambda must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_reml_score) = grad_reml_score {
+        if grad_reml_score.len() != batch {
+            return Err(format!(
+                "grad_reml_score length mismatch: expected {batch}, got {}",
+                grad_reml_score.len()
+            ));
+        }
+        if grad_reml_score.iter().any(|value| !value.is_finite()) {
+            return Err("grad_reml_score must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_coefficients) = grad_coefficients {
+        if grad_coefficients.dim() != (batch, p, d) {
+            let (got_b, got_p, got_d) = grad_coefficients.dim();
+            return Err(format!(
+                "grad_coefficients shape mismatch: expected {batch}x{p}x{d}, got {got_b}x{got_p}x{got_d}"
+            ));
+        }
+        if grad_coefficients.iter().any(|value| !value.is_finite()) {
+            return Err("grad_coefficients must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_fitted) = grad_fitted {
+        if grad_fitted.dim() != (n, d) {
+            return Err(format!(
+                "grad_fitted shape mismatch: expected {n}x{d}, got {}x{}",
+                grad_fitted.nrows(),
+                grad_fitted.ncols()
+            ));
+        }
+        if grad_fitted.iter().any(|value| !value.is_finite()) {
+            return Err("grad_fitted must contain only finite values".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn gaussian_reml_fit_positions_backward_impl(
@@ -1678,6 +2031,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_batched_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_positions_backward,
@@ -3569,6 +3926,10 @@ mod batch_tests {
             .unwrap();
             assert_eq!(batched.statuses[b], "ok");
             assert!((batched.lambdas[b] - single.lambda).abs() < 1.0e-10);
+            assert!((batched.reml_grad_lambdas[b] - single.reml_grad_lambda).abs() < 1.0e-10);
+            assert!((batched.reml_hess_lambdas[b] - single.reml_hess_lambda).abs() < 1.0e-10);
+            assert!((batched.reml_grad_rhos[b] - single.reml_grad_rho).abs() < 1.0e-10);
+            assert!((batched.reml_hess_rhos[b] - single.reml_hess_rho).abs() < 1.0e-10);
             assert_close(
                 batched.coefficients.slice(s![b, .., ..]),
                 single.coefficients.view(),
@@ -3579,6 +3940,75 @@ mod batch_tests {
                 single.fitted.view(),
                 1.0e-10,
             );
+        }
+    }
+
+    #[test]
+    fn gaussian_reml_batched_backward_matches_single_backward_on_ragged_offsets() {
+        let x = array![
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [1.0, -1.0],
+            [1.0, 0.5],
+            [1.0, 1.5],
+        ];
+        let y = array![[0.0], [1.0], [1.8], [-1.0], [0.2], [1.1]];
+        let weights = array![1.0, 0.7, 1.3, 1.0, 1.1, 0.9];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let offsets = array![0_usize, 3_usize, 6_usize];
+        let grad_lambda = array![0.17, -0.03];
+        let grad_coefficients =
+            Array3::from_shape_vec((2, 2, 1), vec![0.2, -0.1, 0.05, 0.07]).unwrap();
+        let grad_fitted = array![[0.01], [0.03], [-0.02], [0.04], [-0.01], [0.02]];
+        let grad_reml_score = array![-0.11, 0.09];
+
+        let batched = gaussian_reml_fit_batched_backward_impl(
+            x.view(),
+            y.view(),
+            offsets.view(),
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.5),
+            Some(grad_lambda.view()),
+            Some(grad_coefficients.view()),
+            Some(grad_fitted.view()),
+            Some(grad_reml_score.view()),
+        )
+        .unwrap();
+
+        for b in 0..2 {
+            let start = offsets[b];
+            let end = offsets[b + 1];
+            let single = gaussian_reml_multi_closed_form_backward(
+                x.slice(s![start..end, ..]),
+                y.slice(s![start..end, ..]),
+                penalty.view(),
+                Some(weights.slice(s![start..end])),
+                Some(0.5),
+                grad_lambda[b],
+                Some(grad_coefficients.slice(s![b, .., ..])),
+                Some(grad_fitted.slice(s![start..end, ..])),
+                grad_reml_score[b],
+            )
+            .unwrap();
+            assert_eq!(batched.statuses[b], "ok");
+            assert_close(
+                batched.grad_x.slice(s![start..end, ..]),
+                single.grad_x.view(),
+                1.0e-10,
+            );
+            assert_close(
+                batched.grad_y.slice(s![start..end, ..]),
+                single.grad_y.view(),
+                1.0e-10,
+            );
+            for row in start..end {
+                assert!(
+                    (batched.grad_weights[row] - single.grad_weights[row - start]).abs()
+                        <= 1.0e-10
+                );
+            }
         }
     }
 }
