@@ -559,6 +559,8 @@ mod tests {
         let b = array![[5.0], [6.0]];
         assert!(try_fast_ab(&a, &b).is_none());
         assert!(try_fast_av(&a, &array![1.0, 2.0]).is_none());
+        assert!(try_solve_lower_triangular_matrix(&a, &b).is_none());
+        assert!(try_solve_upper_triangular_matrix(&a, &b).is_none());
     }
 
     #[test]
