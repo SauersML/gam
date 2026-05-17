@@ -9,7 +9,7 @@ use rayon::prelude::*;
 const RHO_LOWER: f64 = -30.0;
 const RHO_UPPER: f64 = 30.0;
 const EIGEN_REL_TOL: f64 = 1.0e-10;
-const GRAD_TOL: f64 = 1.0e-10;
+const GRAD_TOL: f64 = 1.0e-12;
 const MIN_DEVIANCE: f64 = 1.0e-300;
 
 #[derive(Clone, Debug)]
@@ -2180,13 +2180,13 @@ mod tests {
 
     fn finite_difference_design() -> Array2<f64> {
         Array2::from_shape_fn((20, 5), |(row, col)| {
-            let t = (row as f64 - 9.5) / 8.0;
+            let t = (row as f64 - 9.5) / 10.0;
             match col {
                 0 => 1.0,
                 1 => t,
-                2 => t * t - 0.55,
-                3 => (1.3 * t).sin() + 0.1 * t,
-                4 => (0.7 * t).cos() - 0.2 * t * t,
+                2 => 0.5 * (3.0 * t * t - 1.0),
+                3 => 0.5 * (5.0 * t * t * t - 3.0 * t),
+                4 => (35.0 * t.powi(4) - 30.0 * t * t + 3.0) / 8.0,
                 _ => unreachable!(),
             }
         })
@@ -2194,21 +2194,21 @@ mod tests {
 
     fn finite_difference_response(outputs: usize) -> Array2<f64> {
         Array2::from_shape_fn((20, outputs), |(row, output)| {
-            let t = (row as f64 - 9.5) / 8.0;
+            let t = (row as f64 - 9.5) / 10.0;
             let phase = output as f64 + 1.0;
-            0.4 + 0.7 * phase * t - 0.25 * t * t
-                + (0.5 + 0.2 * phase) * (1.1 * t + 0.3 * phase).sin()
+            0.2 + 0.25 * phase * t - 0.12 * t * t
+                + (0.08 + 0.03 * phase) * (1.1 * t + 0.3 * phase).sin()
         })
     }
 
     fn finite_difference_penalty() -> Array2<f64> {
-        Array2::from_diag(&array![0.0, 0.35, 0.9, 1.7, 2.8])
+        Array2::from_diag(&array![0.0, 0.8, 1.2, 1.7, 2.3])
     }
 
     fn finite_difference_weights() -> Array1<f64> {
         Array1::from_shape_fn(20, |row| {
-            let t = (row as f64 - 9.5) / 8.0;
-            1.0 + 0.08 * (1.1 * t).sin() + 0.03 * t
+            let t = (row as f64 - 9.5) / 10.0;
+            1.0 + 0.025 * (1.1 * t).sin() + 0.01 * t
         })
     }
 
@@ -2272,7 +2272,17 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        let tol = 1.0e-5_f64.max(1.0e-5 * analytic.abs().max(finite_difference.abs()));
+        let rel_tol = if label.contains("RemlScore") {
+            1.0e-5_f64
+        } else {
+            1.0e-6_f64
+        };
+        let abs_tol = if label.contains("RemlScore") {
+            5.0e-6_f64
+        } else {
+            1.0e-6_f64
+        };
+        let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
@@ -2281,7 +2291,7 @@ mod tests {
     }
 
     fn adaptive_central_difference(mut eval: impl FnMut(f64) -> f64) -> f64 {
-        let steps = [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4, 6.25e-5];
+        let steps: [f64; 5] = [1.0e-3, 5.0e-4, 2.5e-4, 1.25e-4, 6.25e-5];
         let mut best = f64::NAN;
         let mut best_delta = f64::INFINITY;
         let mut previous: Option<f64> = None;
@@ -2289,7 +2299,7 @@ mod tests {
             let d1 = (eval(h) - eval(-h)) / (2.0 * h);
             let half_h = 0.5 * h;
             let d2 = (eval(half_h) - eval(-half_h)) / (2.0 * half_h);
-            let estimate = d2 + (d2 - d1) / 3.0;
+            let estimate: f64 = d2 + (d2 - d1) / 3.0;
             if let Some(prev) = previous {
                 let delta = (estimate - prev).abs();
                 if delta < best_delta {
