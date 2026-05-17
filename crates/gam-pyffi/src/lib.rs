@@ -1,5 +1,6 @@
 use csv::StringRecord;
 use faer::Side;
+use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };

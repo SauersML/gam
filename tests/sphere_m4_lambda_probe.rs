@@ -25,7 +25,9 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
             + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
             + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
-            lat.to_string(), lon.to_string(), y.to_string(),
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
         ]));
     }
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -35,7 +37,10 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
 fn probe_sphere_wahba_lambdas_across_m() {
     init_parallelism();
     let data = make_dataset(400);
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     for m in [1usize, 2, 3, 4] {
         let formula = format!("y ~ sphere(lat, lon, k=30, m={m})");
         let result = fit_from_formula(&formula, &data, &cfg);
