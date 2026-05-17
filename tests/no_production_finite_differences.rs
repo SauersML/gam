@@ -56,6 +56,54 @@ fn strip_cfg_test_blocks(source: &str) -> String {
     out
 }
 
+/// Replace each Rust line comment (`//...`, `///...`, `//!...`) and block
+/// comment (`/* ... */`, including nested forms) with whitespace so the
+/// downstream marker scan only sees executable code, identifiers, and
+/// string-literal contents. The test's stated rule is "no finite-difference
+/// machinery in production code" — comments are documentation, not code,
+/// and a comment that explains an analytic identity by contrasting it with
+/// a hypothetical numerical probe is not a production finite-difference
+/// path. String literals are preserved so the scan still catches things
+/// like `panic!("central_diff failed")` in real shipped code.
+fn strip_comments(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0usize;
+    let mut keep_start = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                // Flush the run of code-or-string bytes we passed over.
+                out.push_str(&source[keep_start..i]);
+                // Drop everything to (and not including) the newline.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                keep_start = i;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push_str(&source[keep_start..i]);
+                i = skip_block_comment(bytes, i + 2);
+                keep_start = i;
+            }
+            b'"' => {
+                // Cooked string literal: stay inside `[keep_start, i)` and let
+                // the next code path flush it. Just advance past the close.
+                i = skip_cooked_string(bytes, i + 1);
+            }
+            b'r' if raw_string_hashes_at(bytes, i).is_some() => {
+                let hashes = raw_string_hashes_at(bytes, i).expect("checked raw string");
+                i = skip_raw_string(bytes, i + 1 + hashes + 1, hashes);
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out.push_str(&source[keep_start..i.min(source.len())]);
+    out
+}
+
 fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> {
     let bytes = source.as_bytes();
     let mut i = start;
@@ -191,7 +239,7 @@ fn production_code_has_no_finite_difference_markers() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source file");
-        let production = strip_cfg_test_blocks(&source).to_lowercase();
+        let production = strip_comments(&strip_cfg_test_blocks(&source)).to_lowercase();
         for marker in BANNED_PRODUCTION_MARKERS {
             if production.contains(marker) {
                 violations.push(format!("{} contains `{}`", path.display(), marker));
