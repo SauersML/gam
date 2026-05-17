@@ -1,4 +1,5 @@
 use csv::StringRecord;
+use faer::Side;
 use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
@@ -557,6 +558,10 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", fit.lambda)?;
             out.set_item("rho", fit.rho)?;
             out.set_item("reml_score", fit.reml_score)?;
+            out.set_item("reml_grad_lambda", fit.reml_grad_lambda)?;
+            out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
+            out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
+            out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
             out.set_item("edf", fit.edf)?;
             out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
             out.set_item("fitted", fit.fitted.into_pyarray(py))?;
@@ -567,6 +572,10 @@ fn gaussian_reml_fit<'py>(
             out.set_item("lambda", f64::NAN)?;
             out.set_item("rho", f64::NAN)?;
             out.set_item("reml_score", f64::NAN)?;
+            out.set_item("reml_grad_lambda", f64::NAN)?;
+            out.set_item("reml_hess_lambda", f64::NAN)?;
+            out.set_item("reml_grad_rho", f64::NAN)?;
+            out.set_item("reml_hess_rho", f64::NAN)?;
             out.set_item("edf", 0.0)?;
             out.set_item(
                 "coefficients",
@@ -611,6 +620,16 @@ fn gaussian_reml_fit_batched<'py>(
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
     out.set_item("rho", result.rhos.into_pyarray(py))?;
     out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
+    out.set_item(
+        "reml_grad_lambda",
+        result.reml_grad_lambdas.into_pyarray(py),
+    )?;
+    out.set_item(
+        "reml_hess_lambda",
+        result.reml_hess_lambdas.into_pyarray(py),
+    )?;
+    out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
+    out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
     out.set_item("edf", result.edf.into_pyarray(py))?;
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;
@@ -623,6 +642,10 @@ struct BatchedGaussianRemlResult {
     lambdas: Array1<f64>,
     rhos: Array1<f64>,
     reml_scores: Array1<f64>,
+    reml_grad_lambdas: Array1<f64>,
+    reml_hess_lambdas: Array1<f64>,
+    reml_grad_rhos: Array1<f64>,
+    reml_hess_rhos: Array1<f64>,
     edf: Array1<f64>,
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
@@ -719,11 +742,12 @@ fn gaussian_reml_fit_batched_impl(
             if start == end {
                 return Ok((b, None));
             }
+            let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
             match gaussian_reml_multi_closed_form_with_cache(
                 x.slice(s![start..end, ..]),
                 y.slice(s![start..end, ..]),
                 penalty,
-                weights.map(|w| w.slice(s![start..end])),
+                weight_slice,
                 init_lambda,
                 None,
             ) {
@@ -737,6 +761,10 @@ fn gaussian_reml_fit_batched_impl(
     let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
     let mut edf = Array1::<f64>::zeros(batch);
     let mut coefficients = Array3::<f64>::zeros((batch, p, d));
     let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
@@ -752,6 +780,10 @@ fn gaussian_reml_fit_batched_impl(
             lambdas[b] = fit.lambda;
             rhos[b] = fit.rho;
             reml_scores[b] = fit.reml_score;
+            reml_grad_lambdas[b] = fit.reml_grad_lambda;
+            reml_hess_lambdas[b] = fit.reml_hess_lambda;
+            reml_grad_rhos[b] = fit.reml_grad_rho;
+            reml_hess_rhos[b] = fit.reml_hess_rho;
             edf[b] = fit.edf;
             coefficients
                 .slice_mut(s![b, .., ..])
@@ -766,6 +798,10 @@ fn gaussian_reml_fit_batched_impl(
         lambdas,
         rhos,
         reml_scores,
+        reml_grad_lambdas,
+        reml_hess_lambdas,
+        reml_grad_rhos,
+        reml_hess_rhos,
         edf,
         coefficients,
         fitted,
