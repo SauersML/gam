@@ -5570,6 +5570,8 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum RemlForwardScalar {
+        Lambda,
+        RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
     }
@@ -5589,12 +5591,22 @@ mod tests {
     }
 
     fn by_gate_fd_response() -> Array2<f64> {
+        // The truth must NOT lie (essentially) in span(X). The design here is
+        // {1, t, t² - 0.45, sin(0.9t) + 0.05t, cos(1.2t) - 0.15t²}; a smooth
+        // polynomial plus low-frequency cos would be fit nearly to machine
+        // precision, driving σ² → 0 and ∂(score)/∂y ≈ ν w r / dp → ∞, at which
+        // point central FD with Richardson extrapolation cannot resolve the
+        // (analytic, exact) gradient at 1e-6 relative because the truncation
+        // term scales with f⁽⁵⁾(y). The high-frequency sin term below lies
+        // outside that span on t ∈ [-1.19, 1.31] and leaves a genuine residual
+        // so the analytic-vs-FD comparison is meaningful at strict tolerance.
         Array2::from_shape_fn((20, 3), |(row, output)| {
             let t = (row as f64 - 9.5) / 8.0;
             let phase = output as f64 + 1.0;
             0.2 + 0.35 * phase * t
                 + 0.18 * t * t
                 + (0.4 + 0.1 * phase) * (0.8 * t + 0.25 * phase).cos()
+                + 0.07 * (6.5 * t + 0.4 * phase).sin()
         })
     }
 
@@ -5636,6 +5648,8 @@ mod tests {
         )
         .expect("by-gated finite-difference forward fit");
         match target {
+            RemlForwardScalar::Lambda => fit.lambda,
+            RemlForwardScalar::RemlScore => fit.reml_score,
             RemlForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             RemlForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
         }
@@ -5652,6 +5666,8 @@ mod tests {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
+            RemlForwardScalar::Lambda => (1.0, 0.0, None, None),
+            RemlForwardScalar::RemlScore => (0.0, 1.0, None, None),
             RemlForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
                 (0.0, 0.0, Some(grad_coefficients.view()), None)
@@ -5683,15 +5699,15 @@ mod tests {
         label: &str,
         analytic: f64,
         finite_difference: f64,
-        finite_difference_error: f64,
+        _finite_difference_error: f64,
     ) {
-        let rel_tol = 1.0e-5_f64;
-        let base_tol = 1.0e-6_f64.max(rel_tol * analytic.abs().max(finite_difference.abs()));
-        let tol = base_tol.max(8.0 * finite_difference_error);
+        let rel_tol = 1.0e-6_f64;
+        let abs_tol = 1.0e-6_f64;
+        let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
-            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}, finite_difference_error={finite_difference_error:.3e}"
+            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
         );
     }
 
@@ -5733,10 +5749,17 @@ mod tests {
         Array1<f64>,
     ) {
         let t = Array1::linspace(0.07, 0.93, 18);
+        // The truth must NOT lie in the span of the 6-basis periodic B-spline.
+        // A smooth low-frequency component alone would be fit to near machine
+        // precision (σ² → 0), at which point the FD comparison cannot resolve
+        // 1e-6 relative agreement against the analytic ∂(score)/∂y ∝ 1/dp. The
+        // high-frequency component below leaves a genuine residual.
         let y = Array2::from_shape_fn((18, 2), |(row, col)| {
             let x = t[row];
             let phase = col as f64 + 1.0;
-            0.1 + 0.4 * phase * x + (1.2 * x + 0.3 * phase).sin() * 0.25
+            0.1 + 0.4 * phase * x
+                + (1.2 * x + 0.3 * phase).sin() * 0.25
+                + 0.05 * (9.0 * x + 0.4 * phase).sin()
         });
         let knots = Array1::linspace(0.0, 1.0, 7);
         let penalty = Array2::from_diag(&array![0.0, 0.8, 1.1, 1.5, 2.0, 2.8]);
@@ -5960,6 +5983,8 @@ mod tests {
         let weights = by_gate_fd_weights();
         let penalty = by_gate_fd_penalty();
         let targets = [
+            RemlForwardScalar::Lambda,
+            RemlForwardScalar::RemlScore,
             RemlForwardScalar::Coefficient(4, 2),
             RemlForwardScalar::Fitted(11, 1),
         ];
