@@ -414,6 +414,12 @@ pub fn build_smooth_basis(
                     "penalty_order",
                     "bc",
                     "periodic",
+                    // `cyclic` is treated as an alias for `periodic` across the
+                    // rest of the code (`parse_periodic_axes` and
+                    // `has_periodic_option` both read either key). The
+                    // validator must accept both or it rejects valid input
+                    // before the alias-aware code can see it.
+                    "cyclic",
                     "period",
                     "periods",
                     "period_start",
@@ -626,6 +632,11 @@ pub fn build_smooth_basis(
                     "anchor_right",
                     "right_anchor",
                     "periodic",
+                    // Alias of `periodic`. The bspline branch's
+                    // `has_periodic_option` / `parse_periodic_axes` both
+                    // consult either key, so the validator must accept
+                    // both spellings.
+                    "cyclic",
                     "period",
                     "periods",
                     "period_start",
@@ -965,6 +976,12 @@ pub fn build_smooth_basis(
                     "identifiability",
                     "pure",
                     "periodic",
+                    // Alias of `periodic` — the redirect below at
+                    // `option_bool(options, "cyclic")` reads either key,
+                    // so both must pass the validator gate or
+                    // `duchon(t, cyclic=true)` is silently swallowed
+                    // before it can emit the actionable redirect error.
+                    "cyclic",
                     "period",
                     "period_start",
                     "period_end",
