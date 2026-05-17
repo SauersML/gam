@@ -195,10 +195,6 @@ fn scalar_result_from_multi(
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
-        reml_grad_lambda: result.reml_grad_lambda,
-        reml_hess_lambda: result.reml_hess_lambda,
-        reml_grad_rho: result.reml_grad_rho,
-        reml_hess_rho: result.reml_hess_rho,
         edf: result.edf,
         sigma2: result.sigma2[0],
         cache: result.cache,
@@ -349,92 +345,16 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
-    let (reml_grad_lambda, reml_hess_lambda) =
-        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
         coefficients,
         fitted,
         reml_score: eval.cost,
-        reml_grad_lambda,
-        reml_hess_lambda,
-        reml_grad_rho: eval.grad,
-        reml_hess_rho: eval.hess,
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
     })
-}
-
-pub fn gaussian_reml_score_derivatives(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    lambda: f64,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
-    if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML lambda must be finite and positive; got {lambda}"
-        )));
-    }
-    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
-    let eval = prepared.evaluate(lambda.ln());
-    let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
-    let sigma2 = prepared.sigma2(lambda);
-    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
-
-    let n = x.nrows();
-    let d = y.ncols();
-    let weight = gaussian_reml_weights(n, weights)?;
-
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        for value in wx.row_mut(i) {
-            *value *= weight[i];
-        }
-    }
-    let mut hessian = x.t().dot(&wx);
-    hessian += &(penalty.to_owned() * lambda);
-    let chol =
-        hessian
-            .cholesky(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let lower = chol.lower_triangular();
-    let h_inv = solve_upper_triangular_matrix(
-        &lower.t().to_owned(),
-        &solve_lower_triangular_matrix(&lower, &Array2::eye(hessian.nrows()))?,
-    )?;
-
-    let mut grad_y = y.to_owned() - &fitted;
-    for j in 0..d {
-        for i in 0..n {
-            grad_y[[i, j]] *= weight[i] / sigma2[j];
-        }
-    }
-    let mut logdet_grad_x = wx.dot(&h_inv);
-    logdet_grad_x *= d as f64;
-    let grad_x = logdet_grad_x - grad_y.dot(&coefficients.t());
-
-    Ok(GaussianRemlScoreDerivatives {
-        reml_score: eval.cost,
-        grad_lambda,
-        hess_lambda,
-        grad_x,
-        grad_y,
-        coefficients,
-        fitted,
-        sigma2,
-        edf: eval.edf,
-    })
-}
-
-fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
-    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
 }
 
 fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
@@ -685,6 +605,30 @@ fn validate_gaussian_reml_eigen_cache(
     Ok(())
 }
 
+fn gaussian_reml_eigen_cache_matches(
+    cache: &GaussianRemlEigenCache,
+    p: usize,
+    xtwx_fingerprint: u64,
+    penalty_fingerprint: u64,
+    nullspace_dim: Option<usize>,
+) -> Result<bool, EstimationError> {
+    validate_gaussian_reml_eigen_cache(cache, p)?;
+    if cache.xtwx_fingerprint != xtwx_fingerprint
+        || cache.penalty_fingerprint != penalty_fingerprint
+    {
+        return Ok(false);
+    }
+    if let Some(expected_nullity) = nullspace_dim {
+        if expected_nullity != cache.nullity {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
+                cache.nullity
+            )));
+        }
+    }
+    Ok(true)
+}
+
 fn prepare_gaussian_reml(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -710,6 +654,17 @@ fn prepare_gaussian_reml(
     }
     let weight = gaussian_reml_weights(n, weights)?;
 
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
+    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+    let penalty_fingerprint = matrix_fingerprint(penalty);
+
     let mut wy = y.to_owned();
     for i in 0..n {
         let wi = weight[i];
@@ -721,29 +676,27 @@ fn prepare_gaussian_reml(
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
 
     if let Some(cache) = eigen_cache {
-        validate_gaussian_reml_eigen_cache(cache, p)?;
-        if let Some(expected_nullity) = nullspace_dim {
-            if expected_nullity != cache.nullity {
-                return Err(EstimationError::InvalidInput(format!(
-                    "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
-                    cache.nullity
-                )));
-            }
+        if gaussian_reml_eigen_cache_matches(
+            cache,
+            p,
+            xtwx_fingerprint,
+            penalty_fingerprint,
+            nullspace_dim,
+        )? {
+            let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+            return Ok(GaussianRemlPrepared {
+                cache: cache.clone(),
+                ywy,
+                projected_rhs_squared,
+                projected_rhs,
+                n_observations: n,
+                n_outputs: d,
+            });
         }
-        let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
-        let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
-        return Ok(GaussianRemlPrepared {
-            cache: cache.clone(),
-            ywy,
-            projected_rhs_squared,
-            projected_rhs,
-            n_observations: n,
-            n_outputs: d,
-        });
     }
 
-    let cache =
-        build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, nullspace_dim, weights)?;
+    let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
 
@@ -1045,7 +998,7 @@ mod tests {
         ];
         let y = array![[0.1], [0.4], [0.7], [1.4], [2.2]];
         let penalty_a = array![[0.0, 0.0], [0.0, 1.0]];
-        let penalty_b = array![[0.0, 0.0], [0.0, 4.0]];
+        let penalty_b = array![[1.0, -1.0], [-1.0, 1.0]];
 
         let first =
             gaussian_reml_multi_closed_form(x.view(), y.view(), penalty_a.view(), None, Some(0.0))

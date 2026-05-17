@@ -668,6 +668,161 @@ fn gaussian_reml_fit_batched<'py>(
     Ok(out.unbind())
 }
 
+struct BatchedGaussianRemlResult {
+    statuses: Vec<String>,
+    lambdas: Array1<f64>,
+    rhos: Array1<f64>,
+    reml_scores: Array1<f64>,
+    edf: Array1<f64>,
+    coefficients: Array3<f64>,
+    fitted: Array2<f64>,
+    sigma2: Array2<f64>,
+}
+
+fn gaussian_reml_fit_batched_impl(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+) -> Result<BatchedGaussianRemlResult, String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    if row_offsets.len() < 2 {
+        return Err("row_offsets must contain at least [0, n]".to_string());
+    }
+    if row_offsets[0] != 0 || row_offsets[row_offsets.len() - 1] != x.nrows() {
+        return Err(format!(
+            "row_offsets must start at 0 and end at X.nrows(); got start={}, end={}, n={}",
+            row_offsets[0],
+            row_offsets[row_offsets.len() - 1],
+            x.nrows()
+        ));
+    }
+    for idx in 0..row_offsets.len() - 1 {
+        if row_offsets[idx] > row_offsets[idx + 1] {
+            return Err("row_offsets must be non-decreasing".to_string());
+        }
+    }
+    if y.nrows() != x.nrows() {
+        return Err(format!(
+            "batched Gaussian REML row mismatch: X has {} rows but Y has {}",
+            x.nrows(),
+            y.nrows()
+        ));
+    }
+    if x.ncols() == 0 || y.ncols() == 0 {
+        return Err("batched Gaussian REML requires non-empty X and Y columns".to_string());
+    }
+    if penalty.nrows() != x.ncols() || penalty.ncols() != x.ncols() {
+        return Err(format!(
+            "penalty shape mismatch: expected {}x{}, got {}x{}",
+            x.ncols(),
+            x.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if let Some(weights) = weights {
+        if weights.len() != x.nrows() {
+            return Err(format!(
+                "weights length mismatch: expected {}, got {}",
+                x.nrows(),
+                weights.len()
+            ));
+        }
+        if weights
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(
+                "batched Gaussian REML weights must be finite non-negative values".to_string(),
+            );
+        }
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("batched Gaussian REML inputs must be finite".to_string());
+    }
+    if let Some(lambda) = init_lambda {
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return Err(format!(
+                "init_lambda must be finite and positive when provided; got {lambda}"
+            ));
+        }
+    }
+
+    let batch = row_offsets.len() - 1;
+    let p = x.ncols();
+    let d = y.ncols();
+    let fit_results: Vec<
+        Result<(usize, Option<gam::gaussian_reml::GaussianRemlMultiResult>), String>,
+    > = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return Ok((b, None));
+            }
+            match gaussian_reml_multi_closed_form_with_cache(
+                x.slice(s![start..end, ..]),
+                y.slice(s![start..end, ..]),
+                penalty,
+                weights.map(|w| w.slice(s![start..end])),
+                init_lambda,
+                None,
+            ) {
+                Ok(result) => Ok((b, Some(result))),
+                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(err) => Err(format!("batched Gaussian REML fit {b} failed: {err}")),
+            }
+        })
+        .collect();
+
+    let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut edf = Array1::<f64>::zeros(batch);
+    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
+    let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
+    let mut sigma2 = Array2::<f64>::from_elem((batch, d), f64::NAN);
+    let mut statuses = vec!["degenerate".to_string(); batch];
+
+    for result in fit_results {
+        let (b, fit) = result?;
+        if let Some(fit) = fit {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            statuses[b] = "ok".to_string();
+            lambdas[b] = fit.lambda;
+            rhos[b] = fit.rho;
+            reml_scores[b] = fit.reml_score;
+            edf[b] = fit.edf;
+            coefficients
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.coefficients);
+            fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
+            sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+        }
+    }
+
+    Ok(BatchedGaussianRemlResult {
+        statuses,
+        lambdas,
+        rhos,
+        reml_scores,
+        edf,
+        coefficients,
+        fitted,
+        sigma2,
+    })
+}
+
 fn apply_by_gate(
     x: ArrayView2<'_, f64>,
     by: ArrayView1<'_, f64>,
@@ -2518,7 +2673,11 @@ fn gaussian_weighted_ridge_batch_impl(
         .map(|b| {
             let n_rows = active_rows[b];
             if n_rows == 0 {
-                return Ok((b, Array2::<f64>::zeros((p, d)), Array2::<f64>::zeros((0, d))));
+                return Ok((
+                    b,
+                    Array2::<f64>::zeros((p, d)),
+                    Array2::<f64>::zeros((0, d)),
+                ));
             }
             gaussian_weighted_ridge_array_impl(
                 x.slice(s![b, 0..n_rows, ..]),
@@ -2541,9 +2700,7 @@ fn gaussian_weighted_ridge_batch_impl(
             .assign(&fit_coefficients);
         let n_rows = fit_fitted.nrows();
         if n_rows > 0 {
-            fitted
-                .slice_mut(s![b, 0..n_rows, ..])
-                .assign(&fit_fitted);
+            fitted.slice_mut(s![b, 0..n_rows, ..]).assign(&fit_fitted);
         }
     }
     Ok((coefficients, fitted))
