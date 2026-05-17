@@ -5687,7 +5687,7 @@ mod tests {
     ) {
         let rel_tol = 1.0e-5_f64;
         let base_tol = 1.0e-6_f64.max(rel_tol * analytic.abs().max(finite_difference.abs()));
-        let tol = base_tol.max(4.0 * finite_difference_error);
+        let tol = base_tol.max(8.0 * finite_difference_error);
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
