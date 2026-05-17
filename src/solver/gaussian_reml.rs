@@ -384,8 +384,7 @@ pub fn gaussian_reml_score_derivatives(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
-    let grad_lambda = eval.grad / lambda;
-    let hess_lambda = (eval.hess - eval.grad) / (lambda * lambda);
+    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
 
     let n = x.nrows();
     let d = y.ncols();
@@ -433,6 +432,10 @@ pub fn gaussian_reml_score_derivatives(
         sigma2,
         edf: eval.edf,
     })
+}
+
+fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
+    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
 }
 
 fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
@@ -717,8 +720,23 @@ fn prepare_gaussian_reml(
     let xtwy = x.t().dot(&wy);
     let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
 
+    let mut wx = x.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
+
     if let Some(cache) = eigen_cache {
         validate_gaussian_reml_eigen_cache(cache, p)?;
+        let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+        if cache.xtwx_fingerprint != xtwx_fingerprint {
+            return Err(EstimationError::InvalidInput(
+                "Gaussian REML eigen cache X'WX mismatch".to_string(),
+            ));
+        }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
             return Err(EstimationError::InvalidInput(
@@ -745,14 +763,6 @@ fn prepare_gaussian_reml(
         });
     }
 
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-    }
-    let xtwx = x.t().dot(&wx);
     let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
     let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
     let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
