@@ -658,6 +658,39 @@ pub fn option_usize(map: &BTreeMap<String, String>, key: &str) -> Option<usize> 
     map.get(key).and_then(|v| v.parse::<usize>().ok())
 }
 
+/// Local sibling of `term_builder::validate_known_options` used by the
+/// parser-side `linear / bounded / constrain / nonnegative / nonpositive`
+/// branches (which build their `ParsedTerm` here and never enter
+/// `term_builder::build_smooth_basis`). Without this, typos like
+/// `bounded(x, min=0, max=1, foo=bar)` silently succeed because the
+/// `foo` key was just never read.
+fn validate_known_term_options(
+    term_name: &str,
+    options: &BTreeMap<String, String>,
+    known: &[&str],
+    raw: &str,
+) -> Result<(), String> {
+    let known_set: std::collections::BTreeSet<&&str> = known.iter().collect();
+    for key in options.keys() {
+        if !known_set.contains(&key.as_str()) {
+            let known_sorted = {
+                let mut v = known.to_vec();
+                v.sort_unstable();
+                v.join(", ")
+            };
+            let known_hint = if known.is_empty() {
+                "no options".to_string()
+            } else {
+                format!("[{known_sorted}]")
+            };
+            return Err(format!(
+                "{term_name}() does not accept option `{key}` (in `{raw}`); known options: {known_hint}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn option_usize_any(map: &BTreeMap<String, String>, keys: &[&str]) -> Option<usize> {
     for key in keys {
         if let Some(v) = option_usize(map, key) {
