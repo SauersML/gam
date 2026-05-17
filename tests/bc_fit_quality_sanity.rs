@@ -118,38 +118,52 @@ fn bc_anchored_zero_fit_tracks_interior_with_known_bias() {
 }
 
 #[test]
-fn bc_anchored_zero_pins_exact_boundary() {
+fn bc_anchored_zero_pins_smooth_to_constant_intercept_at_basis_boundaries() {
     init_parallelism();
+    // bc=anchored pins the SMOOTH to zero at the *basis* knot boundaries
+    // (knots[degree] and knots[knots.len()-degree-1]), which equal the
+    // min/max of the training data — NOT the user-passed [0, 1] interval.
+    // To verify the pin we probe at the actual training data extremes,
+    // not at 0/1 which may be slightly outside basis support.
+    //
+    // The smooth being zero at both knot boundaries plus a shared intercept
+    // means total predictions at those two probe points must agree to high
+    // precision. If they differ by more than O(1e-6), the BC constraint
+    // is not actually being enforced — the original failing version of
+    // this test probed at x=0/x=1 (extrapolation breaks the pin), giving
+    // a misleading 0.013 diff that looked like a bug but was just
+    // extrapolation outside the BC range.
     let data = make_data(300, 0.05, 7);
+    // Find training data extremes.
+    let values = data.values.column(0);
+    let x_min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let x_max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, k=12, bc=anchored)", &data, &cfg)
-        .expect("anchored fit ok");
+    let result =
+        fit_from_formula("y ~ s(x, k=12, bc=anchored)", &data, &cfg).expect("anchored fit ok");
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
     let mut m = Array2::<f64>::zeros((2, 2));
-    m[[0, 0]] = 0.0;
+    m[[0, 0]] = x_min;
     m[[0, 1]] = 0.0;
-    m[[1, 0]] = 1.0;
+    m[[1, 0]] = x_max;
     m[[1, 1]] = 0.0;
     let design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("predict design ok");
     let pred = design.design.apply(&fit.fit.beta);
-    // bc=anchored constrains the SMOOTH to zero at the endpoints, but the
-    // total fit = intercept + smooth, so the prediction at the boundary
-    // should equal the intercept (i.e., a constant value, not the truth's
-    // 0.3 unless intercept happened to land there).
     eprintln!(
-        "[bc-anchored-pin] f(0)={:.6} f(1)={:.6} (must be equal)",
+        "[bc-anchored-pin] f(x_min={x_min:.6})={:.6} f(x_max={x_max:.6})={:.6}",
         pred[0], pred[1]
     );
     let diff = (pred[0] - pred[1]).abs();
     assert!(
         diff < 1e-6,
-        "BC anchored both must yield f(0)==f(1) (smooth pinned to zero at both ends, plus shared intercept): {:.6} vs {:.6} diff={:.3e}",
+        "BC anchored both must yield f(x_min)==f(x_max) at basis boundaries (smooth pinned to zero plus shared intercept): {:.6} vs {:.6} diff={:.3e}",
         pred[0], pred[1], diff,
     );
 }
