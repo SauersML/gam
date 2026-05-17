@@ -421,10 +421,37 @@ pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     out
 }
 
+// Lightweight aggregate profiler: count calls and accumulate per-stage time
+// across the whole fit, then dump once at the end. Avoids per-call eprintln
+// stderr-lock overhead that would dominate the very thing we're measuring.
+//
+// SAFETY/CORRECTNESS: temporary scaffolding for the symbolic-Cholesky-reuse
+// perf investigation. Atomics are used so the counters work across threads.
+use std::sync::atomic::{AtomicU64, Ordering};
+pub static PROF_FAC_COUNT: AtomicU64 = AtomicU64::new(0);
+pub static PROF_FAC_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_FAC_CHOL_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_FAC_LOGDET_NS: AtomicU64 = AtomicU64::new(0);
+pub static PROF_FAC_CANON_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn prof_fac_dump_and_reset(label: &str) {
+    let calls = PROF_FAC_COUNT.swap(0, Ordering::SeqCst);
+    let total_ns = PROF_FAC_TOTAL_NS.swap(0, Ordering::SeqCst);
+    let chol_ns = PROF_FAC_CHOL_NS.swap(0, Ordering::SeqCst);
+    let logdet_ns = PROF_FAC_LOGDET_NS.swap(0, Ordering::SeqCst);
+    let canon_ns = PROF_FAC_CANON_NS.swap(0, Ordering::SeqCst);
+    eprintln!(
+        "[PROF-AGG {label}] factorize_sparse_spd calls={calls} total={:.3}s canon={:.3}s chol={:.3}s logdet={:.3}s",
+        total_ns as f64 / 1e9,
+        canon_ns as f64 / 1e9,
+        chol_ns as f64 / 1e9,
+        logdet_ns as f64 / 1e9,
+    );
+}
+
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SparseExactFactor, EstimationError> {
-    eprintln!("[PROF-ENTRY] factorize_sparse_spd n={}", h.ncols());
     // Canonicalize to symmetric-upper storage before factorization.
     //
     // Math contract:
@@ -436,16 +463,16 @@ pub fn factorize_sparse_spd(
     // symmetric-upper and makes the sparse factor path robust to caller encoding.
     let t_start = std::time::Instant::now();
     let n_input = h.ncols();
-    let canon_start = std::time::Instant::now();
+    let canon_t = std::time::Instant::now();
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
-    let canon_ms = canon_start.elapsed().as_secs_f64() * 1e3;
-    let chol_start = std::time::Instant::now();
+    PROF_FAC_CANON_NS.fetch_add(canon_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let chol_t = std::time::Instant::now();
     let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
-    let chol_ms = chol_start.elapsed().as_secs_f64() * 1e3;
+    PROF_FAC_CHOL_NS.fetch_add(chol_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Compute logdet via a sparse-native simplicial LLᵀ on the same upper-
     // triangular matrix. Previously we densified `h_upper` and ran a dense
     // Cholesky purely to read its diagonal — an O(n_input³) detour that
@@ -453,19 +480,12 @@ pub fn factorize_sparse_spd(
     // simplicial path uses the same AMD ordering + LLᵀ machinery as the
     // sp_cholesky factor and runs in O(nnz(L)) once the symbolic structure
     // is built.
-    let logdet_start = std::time::Instant::now();
+    let logdet_t = std::time::Instant::now();
     let logdet = sparse_spd_logdet_via_simplicial(&h_upper)?;
-    let logdet_ms = logdet_start.elapsed().as_secs_f64() * 1e3;
+    PROF_FAC_LOGDET_NS.fetch_add(logdet_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!(
-        "[PROF] factorize_sparse_spd n={} nnz_upper={} canon={:.1}ms chol={:.1}ms logdet={:.1}ms total={:.1}ms",
-        n_input,
-        h_upper.compute_nnz(),
-        canon_ms,
-        chol_ms,
-        logdet_ms,
-        elapsed_ms
-    );
+    PROF_FAC_COUNT.fetch_add(1, Ordering::Relaxed);
+    PROF_FAC_TOTAL_NS.fetch_add(t_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if elapsed_ms > 100.0 {
         log::info!(
             "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
@@ -710,22 +730,10 @@ pub fn assemble_and_factor_sparse_penalized_system(
     precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
 ) -> Result<SparsePenalizedSystem, EstimationError> {
     let logdet_h_start = std::time::Instant::now();
-    let asm_start = std::time::Instant::now();
     let h_sparse =
         sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge, precomputed_xtwx)?;
-    let asm_ms = asm_start.elapsed().as_secs_f64() * 1e3;
-    let fac_start = std::time::Instant::now();
     let factor = factorize_sparse_spd(&h_sparse)?;
-    let fac_ms = fac_start.elapsed().as_secs_f64() * 1e3;
     let logdet_h = logdet_from_factor(&factor)?;
-    let total_ms = logdet_h_start.elapsed().as_secs_f64() * 1e3;
-    eprintln!(
-        "[PROF] sparse-asm-fac p={} asm={:.1}ms fac={:.1}ms total={:.1}ms",
-        h_sparse.nrows(),
-        asm_ms,
-        fac_ms,
-        total_ms
-    );
     log::info!(
         "[STAGE] logdet H (sparse Cholesky) p={} elapsed={:.3}s",
         h_sparse.nrows(),
