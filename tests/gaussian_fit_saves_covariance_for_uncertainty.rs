@@ -73,6 +73,7 @@ fn gaussian_smooth_fit_exposes_conditional_covariance() {
     assert!(
         positive_diag_count >= p - 1, // allow one rank-deficient direction (the intercept's identifiability column)
         "covariance has too many zero diagonals ({}/{} positive); fit may have skipped cov computation",
-        positive_diag_count, p,
+        positive_diag_count,
+        p,
     );
 }
