@@ -1116,7 +1116,114 @@ fn set_ok_gaussian_reml_items<'py>(
     out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
     out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
+    out.set_item(
+        "cache_penalty_eigenvalues",
+        fit.cache.penalty_eigenvalues.into_pyarray(py),
+    )?;
+    out.set_item("cache_eigenvectors", fit.cache.eigenvectors.into_pyarray(py))?;
+    out.set_item(
+        "cache_coefficient_basis",
+        fit.cache.coefficient_basis.into_pyarray(py),
+    )?;
+    out.set_item("cache_xtwx_fingerprint", fit.cache.xtwx_fingerprint)?;
+    out.set_item("cache_penalty_fingerprint", fit.cache.penalty_fingerprint)?;
+    out.set_item("cache_logdet_xtwx", fit.cache.logdet_xtwx)?;
+    out.set_item(
+        "cache_logdet_penalty_positive",
+        fit.cache.logdet_penalty_positive,
+    )?;
+    out.set_item("cache_penalty_rank", fit.cache.penalty_rank)?;
+    out.set_item("cache_nullity", fit.cache.nullity)?;
     Ok(())
+}
+
+fn gaussian_reml_fit_state_from_pydict(
+    state: &Bound<'_, PyDict>,
+) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+    fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
+        state
+            .get_item(key)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("forward_state is missing key {key:?}"))
+    }
+
+    let penalty_eigenvalues = get(state, "cache_penalty_eigenvalues")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+    let eigenvectors = get(state, "cache_eigenvectors")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+    let coefficient_basis = get(state, "cache_coefficient_basis")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+    let coefficients = get(state, "coefficients")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+    let fitted = get(state, "fitted")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+    let sigma2 = get(state, "sigma2")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
+
+    Ok(gam::gaussian_reml::GaussianRemlMultiResult {
+        lambda: get(state, "lambda")?.extract().map_err(|err| err.to_string())?,
+        rho: get(state, "rho")?.extract().map_err(|err| err.to_string())?,
+        coefficients,
+        fitted,
+        reml_score: get(state, "reml_score")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        reml_grad_lambda: get(state, "reml_grad_lambda")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        reml_hess_lambda: get(state, "reml_hess_lambda")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        reml_grad_rho: get(state, "reml_grad_rho")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        reml_hess_rho: get(state, "reml_hess_rho")?
+            .extract()
+            .map_err(|err| err.to_string())?,
+        edf: get(state, "edf")?.extract().map_err(|err| err.to_string())?,
+        sigma2,
+        cache: gam::gaussian_reml::GaussianRemlEigenCache {
+            penalty_eigenvalues,
+            eigenvectors,
+            coefficient_basis,
+            xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+            penalty_fingerprint: get(state, "cache_penalty_fingerprint")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+            logdet_xtwx: get(state, "cache_logdet_xtwx")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+            logdet_penalty_positive: get(state, "cache_logdet_penalty_positive")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+            penalty_rank: get(state, "cache_penalty_rank")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+            nullity: get(state, "cache_nullity")?
+                .extract()
+                .map_err(|err| err.to_string())?,
+        },
+    })
 }
 
 fn set_degenerate_gaussian_reml_items<'py>(
