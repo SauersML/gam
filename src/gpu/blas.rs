@@ -363,6 +363,54 @@ impl CublasRuntime {
         Some(from_col_major(&out_host, x_cols, y_cols))
     }
 
+    fn trsm<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+        &mut self,
+        triangular: &ArrayBase<S1, Ix2>,
+        rhs: &ArrayBase<S2, Ix2>,
+        uplo: i32,
+    ) -> Option<Array2<f64>> {
+        let p = triangular.nrows();
+        let rhs_cols = rhs.ncols();
+        let triangular_host = to_col_major(triangular);
+        let mut rhs_host = to_col_major(rhs);
+        let bytes_triangular = bytes_len::<f64>(triangular_host.len())?;
+        let bytes_rhs = bytes_len::<f64>(rhs_host.len())?;
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let triangular_dev = self.alloc_copy(&triangular_host, bytes_triangular)?;
+            let rhs_dev = self.alloc_copy(&rhs_host, bytes_rhs)?;
+            let alpha = 1.0;
+            let status = (self.blas.cublas_dtrsm)(
+                self.handle,
+                CUBLAS_SIDE_LEFT,
+                uplo,
+                CUBLAS_OP_N,
+                CUBLAS_DIAG_NON_UNIT,
+                to_i32(p)?,
+                to_i32(rhs_cols)?,
+                &alpha,
+                triangular_dev.ptr,
+                to_i32(p)?,
+                rhs_dev.ptr,
+                to_i32(p)?,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(
+                    rhs_host.as_mut_ptr().cast(),
+                    rhs_dev.ptr,
+                    bytes_rhs,
+                ),
+                "cuMemcpyDtoH trsm",
+            )
+            .ok()?;
+        }
+        Some(from_col_major(&rhs_host, p, rhs_cols))
+    }
+
     unsafe fn alloc_copy<'a>(
         &'a self,
         values: &[f64],
@@ -428,6 +476,20 @@ type CublasDgemv = unsafe extern "C" fn(
 ) -> CublasStatus;
 type CublasDdgmm =
     unsafe extern "C" fn(usize, i32, i32, i32, u64, i32, u64, i32, u64, i32) -> CublasStatus;
+type CublasDtrsm = unsafe extern "C" fn(
+    usize,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *const f64,
+    u64,
+    i32,
+    u64,
+    i32,
+) -> CublasStatus;
 
 struct CublasApi {
     cublas_create: CublasCreate,
@@ -435,6 +497,7 @@ struct CublasApi {
     cublas_dgemm: CublasDgemm,
     cublas_dgemv: CublasDgemv,
     cublas_ddgmm: CublasDdgmm,
+    cublas_dtrsm: CublasDtrsm,
 }
 
 impl CublasApi {
@@ -454,6 +517,9 @@ impl CublasApi {
                     .get(b"cublasDgemv_v2\0")
                     .map_err(|e| e.to_string())?,
                 cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
+                cublas_dtrsm: *library
+                    .get(b"cublasDtrsm_v2\0")
+                    .map_err(|e| e.to_string())?,
             })
         }
     }
@@ -463,6 +529,9 @@ const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
 const CUBLAS_OP_T: i32 = 1;
 const CUBLAS_SIDE_LEFT: i32 = 0;
+const CUBLAS_FILL_LOWER: i32 = 0;
+const CUBLAS_FILL_UPPER: i32 = 1;
+const CUBLAS_DIAG_NON_UNIT: i32 = 0;
 
 #[inline]
 fn cublas_op(transpose: bool) -> i32 {

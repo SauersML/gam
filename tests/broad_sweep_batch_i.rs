@@ -53,14 +53,15 @@ fn fit_predict_2col(
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((pts.len(), 3));
     for (i, (a, b)) in pts.iter().enumerate() {
         m[[i, 0]] = *a;
         m[[i, 1]] = *b;
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -71,15 +72,23 @@ fn te_single_period_broadcasts_to_periodic_axis() {
     // that path fits cleanly (does not error).
     init_parallelism();
     let data = mk_2col(
-        200, "th", "h",
-        (0.0, TAU), (-1.0, 1.0),
+        200,
+        "th",
+        "h",
+        (0.0, TAU),
+        (-1.0, 1.0),
         |th, h| th.cos() + 0.3 * h,
-        0.05, 7,
+        0.05,
+        7,
     );
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let r = fit_from_formula(
         "y ~ te(th, h, bc=['periodic', 'natural'], period=[2*pi], k=5)",
-        &data, &cfg,
+        &data,
+        &cfg,
     );
     r.unwrap_or_else(|e| panic!("broadcast period: {e}"));
 }
@@ -88,8 +97,14 @@ fn te_single_period_broadcasts_to_periodic_axis() {
 fn te_periodic_data_outside_period_works() {
     init_parallelism();
     let data = mk_2col(
-        300, "th", "h", (0.0, 4.0 * PI), (-1.0, 1.0),
-        |th, h| th.cos() + 0.3 * h, 0.05, 7,
+        300,
+        "th",
+        "h",
+        (0.0, 4.0 * PI),
+        (-1.0, 1.0),
+        |th, h| th.cos() + 0.3 * h,
+        0.05,
+        7,
     );
     let pred = fit_predict_2col(
         "y ~ te(th, h, bc=['periodic', 'natural'], period=[2*pi, None], k=6)",
@@ -103,15 +118,24 @@ fn te_periodic_data_outside_period_works() {
 fn cylinder_clean_seam_with_negative_h() {
     init_parallelism();
     let data = mk_2col(
-        300, "th", "h", (0.0, TAU), (-2.0, 2.0),
-        |th, h| 1.0 + 0.5 * th.cos() + h, 0.05, 7,
+        300,
+        "th",
+        "h",
+        (0.0, TAU),
+        (-2.0, 2.0),
+        |th, h| 1.0 + 0.5 * th.cos() + h,
+        0.05,
+        7,
     );
     let pred = fit_predict_2col(
         "y ~ te(th, h, bc=['periodic', 'natural'], period=[2*pi, None], k=5)",
         data,
         &[(0.0, -1.5), (TAU, -1.5)],
     );
-    assert!((pred[0] - pred[1]).abs() < 1e-6, "seam discontinuous: {pred:?}");
+    assert!(
+        (pred[0] - pred[1]).abs() < 1e-6,
+        "seam discontinuous: {pred:?}"
+    );
 }
 
 #[test]
@@ -127,7 +151,11 @@ fn sphere_handles_lat_at_minus_90() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     let pred = fit_predict_2col(
@@ -149,18 +177,30 @@ fn periodic_with_offset_data_range() {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut t: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = t.iter().map(|&x| (x - 10.0).cos() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = t
+        .iter()
+        .map(|&x| (x - 10.0).cos() + noise.sample(&mut rng))
+        .collect();
     let headers = ["t", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = t.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = t
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(
         "y ~ s(t, periodic=true, period=6.283185307179586, origin=10.0)",
-        &data, &cfg,
-    ).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+        &data,
+        &cfg,
+    )
+    .expect("fit");
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((2, 2));
     m[[0, 0]] = 10.0;
     m[[1, 0]] = 10.0 + TAU;
@@ -177,24 +217,39 @@ fn bc_clamped_at_high_k_smooths_correctly() {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut x: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = x.iter().map(|t| (PI * t).sin() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|t| (PI * t).sin() + noise.sample(&mut rng))
+        .collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ s(x, bc=clamped, k=40)", &data, &cfg).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let xs: Vec<f64> = (0..20).map(|i| 0.05 + 0.9 * (i as f64) / 19.0).collect();
     let mut m = Array2::<f64>::zeros((xs.len(), 2));
-    for (i, &x) in xs.iter().enumerate() { m[[i, 0]] = x; }
+    for (i, &x) in xs.iter().enumerate() {
+        m[[i, 0]] = x;
+    }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     assert!(pred.iter().all(|v| v.is_finite()));
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    assert!(mn > -0.5 && mx < 1.5, "bc=clamped k=40 out: [{mn:.3}, {mx:.3}]");
+    assert!(
+        mn > -0.5 && mx < 1.5,
+        "bc=clamped k=40 out: [{mn:.3}, {mx:.3}]"
+    );
 }
 
 #[test]
@@ -210,15 +265,22 @@ fn sphere_pseudo_with_small_n() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let result = fit_from_formula(
-        "y ~ sphere(lat, lon, k=10, kernel=pseudo)",
-        &data, &cfg,
-    ).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=pseudo)", &data, &cfg).expect("fit");
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).expect("shape");
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta);
@@ -238,15 +300,22 @@ fn sphere_sobolev_with_small_n() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let result = fit_from_formula(
-        "y ~ sphere(lat, lon, k=10, kernel=sobolev)",
-        &data, &cfg,
-    ).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=sobolev)", &data, &cfg).expect("fit");
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).expect("shape");
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta);
@@ -267,10 +336,17 @@ fn sphere_rejects_constant_lon_column() {
     for _ in 0..200 {
         let lat = u_lat.sample(&mut rng);
         let y = 0.5 + 0.6 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), "0.0".to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            "0.0".to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg)
         .err()
         .expect("constant lon should be rejected as degenerate");
@@ -291,19 +367,30 @@ fn periodic_1d_zero_amplitude_truth() {
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let y: Vec<f64> = t.iter().map(|_| noise.sample(&mut rng)).collect();
     let headers = ["t", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = t.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = t
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula(
         "y ~ s(t, periodic=true, period=6.283185307179586)",
-        &data, &cfg,
-    ).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+        &data,
+        &cfg,
+    )
+    .expect("fit");
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let probes: Vec<f64> = (0..10).map(|i| TAU * (i as f64) / 9.0).collect();
     let mut m = Array2::<f64>::zeros((probes.len(), 2));
-    for (i, &t) in probes.iter().enumerate() { m[[i, 0]] = t; }
+    for (i, &t) in probes.iter().enumerate() {
+        m[[i, 0]] = t;
+    }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
@@ -327,12 +414,21 @@ fn sphere_logit_predict_finite_at_pole() {
         let lon = u_lon.sample(&mut rng);
         let p = 1.0 / (1.0 + (-(0.5 * lat.to_radians().sin())).exp());
         let y = if u01.sample(&mut rng) < p { 1.0 } else { 0.0 };
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("binomial(logit)".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("binomial(logit)".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg).expect("fit");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let m = Array2::<f64>::from_shape_vec((2, 3), vec![90.0, 0.0, 0.0, -90.0, 0.0, 0.0])
         .expect("shape");
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
@@ -353,10 +449,17 @@ fn sphere_with_method_alias_sos() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     // sos is an alias for sphere
     let result = fit_from_formula("y ~ sos(lat, lon, k=15)", &data, &cfg).expect("fit ok");
     let _ = result;

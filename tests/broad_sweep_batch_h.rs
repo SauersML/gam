@@ -28,7 +28,9 @@ fn mk_1d_data(
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let y: Vec<f64> = x.iter().map(|&t| f(t) + noise.sample(&mut rng)).collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
@@ -40,14 +42,15 @@ fn fit_predict_1d(formula: &str, data: gam::data::EncodedDataset, xs: &[f64]) ->
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((xs.len(), 2));
     for (i, &x) in xs.iter().enumerate() {
         m[[i, 0]] = x;
         m[[i, 1]] = 0.0;
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -59,7 +62,10 @@ fn smooth_recovers_step_continuously() {
     let pred = fit_predict_1d("y ~ s(x, k=15)", data, &xs);
     assert!(pred.iter().all(|v| v.is_finite()));
     // Should bridge 0 to 1 smoothly; pred(0.1) < 0.5 and pred(0.9) > 0.5.
-    assert!(pred[3] < 0.5 && pred[36] > 0.5, "step boundary wrong: pred={pred:?}");
+    assert!(
+        pred[3] < 0.5 && pred[36] > 0.5,
+        "step boundary wrong: pred={pred:?}"
+    );
 }
 
 #[test]
@@ -70,9 +76,14 @@ fn periodic_handles_negative_origin() {
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let mut t: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = t.iter().map(|&x| x.cos() + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = t
+        .iter()
+        .map(|&x| x.cos() + noise.sample(&mut rng))
+        .collect();
     let headers = ["t", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = t.iter().zip(y.iter())
+    let rows: Vec<StringRecord> = t
+        .iter()
+        .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
@@ -96,7 +107,10 @@ fn bc_anchored_pins_predictions_at_data_extremes() {
     // bc=anchored pins f at x_min, x_max to zero (smooth-side). After
     // intercept centering, both endpoints have the same predicted value.
     let diff = (pred[0] - pred[2]).abs();
-    eprintln!("[bc-anchor-pin] f(0.001)={:.4} f(0.999)={:.4} diff={diff:.3e}", pred[0], pred[2]);
+    eprintln!(
+        "[bc-anchor-pin] f(0.001)={:.4} f(0.999)={:.4} diff={diff:.3e}",
+        pred[0], pred[2]
+    );
     // The difference is dominated by 0.001 vs x_min mismatch; ≤ 0.1.
     assert!(diff < 0.1, "anchored pin loose: diff={diff:.3e}");
 }
@@ -114,12 +128,21 @@ fn sphere_predict_zero_lat_lon_finite() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.6 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let m = Array2::<f64>::zeros((1, 3));
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta);
@@ -139,12 +162,21 @@ fn sphere_predict_north_pole_with_random_lon() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.6 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let lons = [-150.0_f64, -50.0, 0.0, 50.0, 150.0];
     let mut m = Array2::<f64>::zeros((lons.len(), 3));
     for (i, &lon) in lons.iter().enumerate() {
@@ -163,15 +195,14 @@ fn periodic_1d_high_amplitude_sin() {
     init_parallelism();
     let data = mk_1d_data(200, |t: f64| 100.0 * (TAU * t).cos(), 1.0, 7);
     let probes: Vec<f64> = (0..20).map(|i| (i as f64) / 19.0).collect();
-    let pred = fit_predict_1d(
-        "y ~ s(x, periodic=true, period=1.0)",
-        data,
-        &probes,
-    );
+    let pred = fit_predict_1d("y ~ s(x, periodic=true, period=1.0)", data, &probes);
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     eprintln!("[per-large-amp] range=[{mn:.3}, {mx:.3}]");
-    assert!(mx > 50.0 && mn < -50.0, "amplitude not captured: [{mn:.3}, {mx:.3}]");
+    assert!(
+        mx > 50.0 && mn < -50.0,
+        "amplitude not captured: [{mn:.3}, {mx:.3}]"
+    );
 }
 
 #[test]
@@ -183,7 +214,10 @@ fn bc_clamped_with_constant_truth_stays_flat() {
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
     let var: f64 = pred.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / pred.len() as f64;
     let std = var.sqrt();
-    assert!((mean - 2.5).abs() < 0.1, "constant fit drift: mean={mean:.3}");
+    assert!(
+        (mean - 2.5).abs() < 0.1,
+        "constant fit drift: mean={mean:.3}"
+    );
     assert!(std < 0.05, "constant fit overfit: std={std:.4}");
 }
 
@@ -200,12 +234,21 @@ fn tensor_2d_smooth_truth_recovery() {
         let x = u_x.sample(&mut rng);
         let yv = u_y.sample(&mut rng);
         let z = (PI * x).sin() * (PI * yv).sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![x.to_string(), yv.to_string(), z.to_string()]));
+        rows.push(StringRecord::from(vec![
+            x.to_string(),
+            yv.to_string(),
+            z.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("z ~ te(x, yv, k=6)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((1, 3));
     m[[0, 0]] = 0.5;
     m[[0, 1]] = 0.5;
@@ -237,12 +280,21 @@ fn sphere_extrapolation_far_from_data_bounded() {
         let lat = u_lat.sample(&mut rng);
         let lon = u_lon.sample(&mut rng);
         let y = 0.5 + 0.3 * lat.to_radians().sin() + noise.sample(&mut rng);
-        rows.push(StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()]));
+        rows.push(StringRecord::from(vec![
+            lat.to_string(),
+            lon.to_string(),
+            y.to_string(),
+        ]));
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     // Predict far from data: antipodal southern hemisphere.
     let mut m = Array2::<f64>::zeros((3, 3));
     m[[0, 0]] = -60.0;
@@ -268,11 +320,7 @@ fn periodic_with_only_few_points() {
     // smooth.
     let data = mk_1d_data(20, |t: f64| (TAU * t).cos(), 0.05, 7);
     let probes: Vec<f64> = (0..10).map(|i| (i as f64) / 9.0).collect();
-    let pred = fit_predict_1d(
-        "y ~ s(x, periodic=true, period=1.0, k=8)",
-        data,
-        &probes,
-    );
+    let pred = fit_predict_1d("y ~ s(x, periodic=true, period=1.0, k=8)", data, &probes);
     assert!(pred.iter().all(|v| v.is_finite()));
 }
 
@@ -288,5 +336,8 @@ fn bc_anchored_with_data_far_from_zero() {
     // Interior should fit around mean 5.5 (truth midpoint).
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
     eprintln!("[bc-anchored-offset] mean={mean:.3}");
-    assert!((mean - 5.5).abs() < 1.0, "anchored fit drifted: mean={mean:.3}");
+    assert!(
+        (mean - 5.5).abs() < 1.0,
+        "anchored fit drifted: mean={mean:.3}"
+    );
 }

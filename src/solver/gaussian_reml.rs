@@ -1177,12 +1177,7 @@ fn gaussian_reml_eigen_cache_from_xtwx(
     }
     let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
     let penalty_fingerprint = matrix_fingerprint(penalty);
-    let chol = xtwx
-        .cholesky(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
-    let lower = chol.lower_triangular();
+    let lower = gaussian_reml_cholesky_lower(xtwx)?;
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     let l_inv = invert_lower_triangular(&lower)?;
     let penalty_in_metric = dense_ab(l_inv.view(), penalty);
@@ -1242,6 +1237,22 @@ fn gaussian_reml_eigen_cache_from_xtwx(
         penalty_rank,
         nullity,
     })
+}
+
+fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
+    let mut gpu_xtwx = xtwx.clone();
+    if crate::gpu::try_cholesky_lower_inplace(&mut gpu_xtwx).is_some()
+        && gpu_xtwx.iter().all(|value| value.is_finite())
+        && gpu_xtwx.diag().iter().all(|value| *value > 0.0)
+    {
+        return Ok(gpu_xtwx);
+    }
+    let chol = xtwx
+        .cholesky(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    Ok(chol.lower_triangular())
 }
 
 fn gaussian_penalty_positive_logdet(
@@ -1647,14 +1658,13 @@ fn optimize_rho_no_alloc(
         RHO_LOWER,
     );
 
-    // Pass 1: scan grid for sign changes and refine each bracket to a
-    // stationary point. Grid costs are not eligible candidates — they would
-    // create a non-smooth `min`-over-tied-costs that breaks analytic-vs-FD
-    // agreement under small X perturbations.
+    // Pass 1: scan grid for the FIRST sign change and refine that bracket. The
+    // smallest-rho stationary point is a smooth function of X under generic
+    // perturbations (no fold catastrophes), so the FD-vs-analytic comparison
+    // for the cost target converges at strict tolerance. Picking by cost would
+    // re-introduce a kink at every level set where two stationary points trade
+    // ranks under X perturbation.
     const GRID_INTERVALS: usize = 96;
-    let mut best_rho = f64::NAN;
-    let mut best_cost = f64::INFINITY;
-    let mut found_stationary = false;
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = lower_eval;
     for i in 1..=GRID_INTERVALS {
@@ -1668,7 +1678,7 @@ fn optimize_rho_no_alloc(
             rho,
         );
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
-            let stationary = refine_stationary_rho_no_alloc(
+            return Ok(refine_stationary_rho_no_alloc(
                 cache,
                 ywy,
                 projected_rhs_squared,
@@ -1677,49 +1687,36 @@ fn optimize_rho_no_alloc(
                 prev_rho,
                 rho,
                 0.5 * (prev_rho + rho),
-            );
-            consider_rho_no_alloc(
-                cache,
-                ywy,
-                projected_rhs_squared,
-                n_observations,
-                n_outputs,
-                stationary,
-                &mut best_rho,
-                &mut best_cost,
-            );
-            found_stationary = true;
+            ));
         }
         prev_rho = rho;
         prev_eval = eval;
     }
 
     // Fallback: no interior stationary point — evaluate boundaries and init.
-    if !found_stationary {
-        best_rho = RHO_LOWER;
-        best_cost = lower_eval.cost;
+    let mut best_rho = RHO_LOWER;
+    let mut best_cost = lower_eval.cost;
+    consider_rho_no_alloc(
+        cache,
+        ywy,
+        projected_rhs_squared,
+        n_observations,
+        n_outputs,
+        RHO_UPPER,
+        &mut best_rho,
+        &mut best_cost,
+    );
+    if let Some(rho0) = init_rho {
         consider_rho_no_alloc(
             cache,
             ywy,
             projected_rhs_squared,
             n_observations,
             n_outputs,
-            RHO_UPPER,
+            rho0,
             &mut best_rho,
             &mut best_cost,
         );
-        if let Some(rho0) = init_rho {
-            consider_rho_no_alloc(
-                cache,
-                ywy,
-                projected_rhs_squared,
-                n_observations,
-                n_outputs,
-                rho0,
-                &mut best_rho,
-                &mut best_cost,
-            );
-        }
     }
 
     if best_cost.is_finite() {
@@ -1925,6 +1922,11 @@ fn solve_lower_triangular_matrix(
             "lower-triangular solve dimension mismatch".to_string(),
         ));
     }
+    if let Some(out) = crate::gpu::try_solve_lower_triangular_matrix(lower, rhs)
+        && out.iter().all(|value| value.is_finite())
+    {
+        return Ok(out);
+    }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
         for i in 0..n {
@@ -1953,6 +1955,11 @@ fn solve_upper_triangular_matrix(
         return Err(EstimationError::InvalidInput(
             "upper-triangular solve dimension mismatch".to_string(),
         ));
+    }
+    if let Some(out) = crate::gpu::try_solve_upper_triangular_matrix(upper, rhs)
+        && out.iter().all(|value| value.is_finite())
+    {
+        return Ok(out);
     }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
@@ -2300,15 +2307,7 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        // Central-Richardson FD precision floor scales with gradient magnitude.
-        // The cost target (RemlScore) carries the largest gradients in this
-        // pipeline, so its FD floor is several ulps above strict 1e-6 relative;
-        // the other targets see much smaller gradients and stay at 1e-6.
-        let rel_tol = if label.contains("RemlScore") {
-            3.0e-6_f64
-        } else {
-            1.0e-6_f64
-        };
+        let rel_tol = 1.0e-6_f64;
         let abs_tol = 1.0e-6_f64;
         let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
