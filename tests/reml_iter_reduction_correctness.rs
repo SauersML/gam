@@ -206,7 +206,10 @@ fn reml_outer_iter_reduction_cyclic_1d_deterministic_betas_match_tightly() {
 fn reml_outer_iter_reduction_bc_anchored_deterministic_betas_match_tightly() {
     init_parallelism();
     let data = data_bc(N);
-    let formula = "y ~ bc(x, anchor=0)";
+    // `bc` is an option on `s(...)`, not a top-level term. `data_bc` synthesises
+    // y that goes to zero at both endpoints (`x·(1−x)·…`), so `bc=anchored`
+    // (value-pinned-to-zero Hermite at both ends) matches the data.
+    let formula = "y ~ s(x, bc=anchored)";
     let beta_a = fit_beta(formula, &data);
     let beta_b = fit_beta(formula, &data);
     let diff = beta_max_abs_diff(&beta_a, &beta_b);
