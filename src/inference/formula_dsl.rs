@@ -667,6 +667,41 @@ pub fn option_usize_any(map: &BTreeMap<String, String>, keys: &[&str]) -> Option
     None
 }
 
+/// Strict integer option: returns `Ok(None)` if not present, `Ok(Some(n))` if
+/// it parses as a non-negative integer, and `Err(msg)` if the user supplied a
+/// value that isn't a valid usize (negative, decimal, garbage). Without this
+/// the lenient `option_usize` silently drops invalid values and reverts to
+/// the default — `k=-1` and `k=1.5` were both accepted as "k not specified"
+/// instead of being flagged as user mistakes.
+pub fn option_usize_strict(
+    map: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<usize>, String> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(raw) => raw.parse::<usize>().map(Some).map_err(|_| {
+            format!(
+                "option `{key}={raw}` is not a non-negative integer; \
+                 expected a whole number ≥ 0"
+            )
+        }),
+    }
+}
+
+/// Strict variant of `option_usize_any` that errors on the first present-but-
+/// unparseable key rather than silently falling through.
+pub fn option_usize_any_strict(
+    map: &BTreeMap<String, String>,
+    keys: &[&str],
+) -> Result<Option<usize>, String> {
+    for key in keys {
+        if let Some(v) = option_usize_strict(map, key)? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
+}
+
 pub fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
     map.get(key).and_then(|v| v.parse::<f64>().ok())
 }
