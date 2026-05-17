@@ -73,7 +73,7 @@ seam-continuous and singularity-free is entirely a property of the basis
   reproducing kernel on S², which is rotation-invariant and free of
   pole artefacts. A spherical-harmonic alternative is also available
   (`method=harmonic, max_degree=L`); both are documented in
-  [the formula reference](formulas.md#intrinsic-s²-sphere-smooth).
+  [the formula reference](formulas.md#intrinsic-s2-sphere-smooth).
 - **Möbius strip.** The half-twist means you have to go around twice
   before returning to the start, so the period of `u` is `4π`, not
   `2π`. The fitter does not know the strip is non-orientable — it only
@@ -119,9 +119,9 @@ the CLI — see [`scripts/circle_3d_cyclic_demo.py`](https://github.com/SauersML
 
 ## Related reading
 
-- [Formula DSL — periodic / cyclic smooths](formulas.md#periodic--cyclic-smooths)
+- [Formula DSL — periodic / cyclic smooths](formulas.md#periodic-cyclic-smooths)
 - [Formula DSL — boundary-conditioned 1-D smooths](formulas.md#boundary-conditioned-1d-smooths)
-- [Formula DSL — intrinsic S² (sphere) smooth](formulas.md#intrinsic-s²-sphere-smooth)
+- [Formula DSL — intrinsic S² (sphere) smooth](formulas.md#intrinsic-s2-sphere-smooth)
 - [Response geometry](response-geometry.md) — the **response-side**
   manifold story (compositional and unit-sphere outputs), which is a
   different concept: there the response lives on a manifold and the

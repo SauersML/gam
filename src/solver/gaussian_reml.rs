@@ -52,6 +52,10 @@ pub struct GaussianRemlResult {
     pub coefficients: Array1<f64>,
     pub fitted: Array1<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: f64,
     pub cache: GaussianRemlEigenCache,
@@ -64,9 +68,26 @@ pub struct GaussianRemlMultiResult {
     pub coefficients: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reml_score: f64,
+    pub reml_grad_lambda: f64,
+    pub reml_hess_lambda: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlScoreDerivatives {
+    pub reml_score: f64,
+    pub grad_lambda: f64,
+    pub hess_lambda: f64,
+    pub grad_x: Array2<f64>,
+    pub grad_y: Array2<f64>,
+    pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub sigma2: Array1<f64>,
+    pub edf: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -122,8 +143,14 @@ pub fn gaussian_reml_closed_form_with_nullspace_dim(
     init_rho: Option<f64>,
 ) -> Result<GaussianRemlResult, EstimationError> {
     let y2 = y.insert_axis(Axis(1));
-    let result =
-        gaussian_reml_multi_closed_form_with_nullspace_dim(x, y2, penalty, nullspace_dim, weights, init_rho)?;
+    let result = gaussian_reml_multi_closed_form_with_nullspace_dim(
+        x,
+        y2,
+        penalty,
+        nullspace_dim,
+        weights,
+        init_rho,
+    )?;
     scalar_result_from_multi(result)
 }
 
@@ -168,10 +195,6 @@ fn scalar_result_from_multi(
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
-        reml_grad_lambda: result.reml_grad_lambda,
-        reml_hess_lambda: result.reml_hess_lambda,
-        reml_grad_rho: result.reml_grad_rho,
-        reml_hess_rho: result.reml_hess_rho,
         edf: result.edf,
         sigma2: result.sigma2[0],
         cache: result.cache,
@@ -322,96 +345,16 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let coefficients = prepared.coefficients(lambda);
     let fitted = x.dot(&coefficients);
     let sigma2 = prepared.sigma2(lambda);
-    let (reml_grad_lambda, reml_hess_lambda) =
-        rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
         lambda,
         rho,
         coefficients,
         fitted,
         reml_score: eval.cost,
-        reml_grad_lambda,
-        reml_hess_lambda,
-        reml_grad_rho: eval.grad,
-        reml_hess_rho: eval.hess,
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
     })
-}
-
-pub fn gaussian_reml_score_derivatives(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    lambda: f64,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
-    if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML lambda must be finite and positive; got {lambda}"
-        )));
-    }
-    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
-    let eval = prepared.evaluate(lambda.ln());
-    let coefficients = prepared.coefficients(lambda);
-    let fitted = x.dot(&coefficients);
-    let sigma2 = prepared.sigma2(lambda);
-    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
-
-    let n = x.nrows();
-    let d = y.ncols();
-    let weight = match weights {
-        Some(w) => w.to_owned(),
-        None => Array1::ones(n),
-    };
-
-    let mut wx = x.to_owned();
-    for i in 0..n {
-        for value in wx.row_mut(i) {
-            *value *= weight[i];
-        }
-    }
-    let mut hessian = x.t().dot(&wx);
-    hessian += &(penalty.to_owned() * lambda);
-    let chol =
-        hessian
-            .cholesky(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let lower = chol.lower_triangular();
-    let h_inv = solve_upper_triangular_matrix(
-        &lower.t().to_owned(),
-        &solve_lower_triangular_matrix(&lower, &Array2::eye(hessian.nrows()))?,
-    )?;
-
-    let residual = y.to_owned() - &fitted;
-    let mut grad_y = residual;
-    for j in 0..d {
-        for i in 0..n {
-            grad_y[[i, j]] *= weight[i] / sigma2[j];
-        }
-    }
-    let mut logdet_grad_x = wx.dot(&h_inv);
-    logdet_grad_x *= d as f64;
-    let grad_x = logdet_grad_x - grad_y.dot(&coefficients.t());
-
-    Ok(GaussianRemlScoreDerivatives {
-        reml_score: eval.cost,
-        grad_lambda,
-        hess_lambda,
-        grad_x,
-        grad_y,
-        coefficients,
-        fitted,
-        sigma2,
-        edf: eval.edf,
-    })
-}
-
-fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
-    (grad_rho / lambda, (hess_rho - grad_rho) / (lambda * lambda))
 }
 
 fn validate_initial_lambda(lambda: f64) -> Result<f64, EstimationError> {
@@ -468,23 +411,13 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)
 }
 
-fn prepare_gaussian_reml(
+fn validate_gaussian_reml_design(
     x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
-    nullspace_dim: Option<usize>,
     weights: Option<ArrayView1<'_, f64>>,
-    eigen_cache: Option<&GaussianRemlEigenCache>,
-) -> Result<GaussianRemlPrepared, EstimationError> {
+) -> Result<(), EstimationError> {
     let n = x.nrows();
     let p = x.ncols();
-    let d = y.ncols();
-    if y.nrows() != n {
-        return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML row mismatch: X has {n} rows but Y has {}",
-            y.nrows()
-        )));
-    }
     if penalty.nrows() != p || penalty.ncols() != p {
         return Err(EstimationError::InvalidInput(format!(
             "Gaussian REML penalty shape mismatch: expected {p}x{p}, got {}x{}",
@@ -492,16 +425,32 @@ fn prepare_gaussian_reml(
             penalty.ncols()
         )));
     }
-    if x.iter()
-        .chain(y.iter())
-        .chain(penalty.iter())
-        .any(|v| !v.is_finite())
-    {
+    if x.iter().chain(penalty.iter()).any(|v| !v.is_finite()) {
         return Err(EstimationError::InvalidInput(
             "Gaussian REML inputs must be finite".to_string(),
         ));
     }
-    let weight = match weights {
+    if let Some(w) = weights {
+        if w.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML weights length mismatch: expected {n}, got {}",
+                w.len()
+            )));
+        }
+        if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return Err(EstimationError::InvalidInput(
+                "Gaussian REML weights must be finite and non-negative".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn gaussian_reml_weights(
+    n: usize,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array1<f64>, EstimationError> {
+    match weights {
         Some(w) => {
             if w.len() != n {
                 return Err(EstimationError::InvalidInput(format!(
@@ -514,50 +463,25 @@ fn prepare_gaussian_reml(
                     "Gaussian REML weights must be finite and non-negative".to_string(),
                 ));
             }
-            w.to_owned()
+            Ok(w.to_owned())
         }
-        None => Array1::ones(n),
-    };
-
-    let mut wx = x.to_owned();
-    let mut wy = y.to_owned();
-    for i in 0..n {
-        let wi = weight[i];
-        for value in wx.row_mut(i) {
-            *value *= wi;
-        }
-        for value in wy.row_mut(i) {
-            *value *= wi;
-        }
+        None => Ok(Array1::ones(n)),
     }
-    let xtwx = x.t().dot(&wx);
-    let xtwy = x.t().dot(&wy);
-    let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
+}
+
+fn gaussian_reml_eigen_cache_from_xtwx(
+    xtwx: Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
+    let p = xtwx.nrows();
+    if xtwx.ncols() != p {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML X'WX must be square".to_string(),
+        ));
+    }
     let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
     let penalty_fingerprint = matrix_fingerprint(penalty);
-
-    if let Some(cache) = eigen_cache {
-        if cache.penalty_eigenvalues.len() == p
-            && cache.eigenvectors.nrows() == p
-            && cache.eigenvectors.ncols() == p
-            && cache.coefficient_basis.nrows() == p
-            && cache.coefficient_basis.ncols() == p
-            && cache.xtwx_fingerprint == xtwx_fingerprint
-            && cache.penalty_fingerprint == penalty_fingerprint
-        {
-            let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
-            let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
-            return Ok(GaussianRemlPrepared {
-                cache: cache.clone(),
-                ywy,
-                projected_rhs_squared,
-                projected_rhs,
-                n_observations: n,
-                n_outputs: d,
-            });
-        }
-    }
-
     let chol = xtwx
         .cholesky(Side::Lower)
         .map_err(|_| EstimationError::ModelIsIllConditioned {
@@ -593,43 +517,158 @@ fn prepare_gaussian_reml(
         .filter(|&&value| value > eig_tol)
         .count();
     let nullity = p - penalty_rank;
-    let logdet_penalty_positive = if penalty_rank == 0 {
-        0.0
-    } else {
-        let (pen_eigs, _) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            }
-        })?;
-        let pen_scale = pen_eigs
-            .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
-            .max(1.0);
-        let pen_tol = pen_scale * EIGEN_REL_TOL;
-        pen_eigs
-            .iter()
-            .filter(|&&value| value > pen_tol)
-            .map(|value| value.ln())
-            .sum()
-    };
-
-    let z = l_inv.dot(&xtwy);
-    let projected_rhs = eigenvectors.t().dot(&z);
-    let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+    if let Some(expected_nullity) = nullspace_dim {
+        if expected_nullity != nullity {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
+            )));
+        }
+    }
+    let logdet_penalty_positive = gaussian_penalty_positive_logdet(penalty, penalty_rank)?;
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
 
+    Ok(GaussianRemlEigenCache {
+        penalty_eigenvalues,
+        eigenvectors,
+        coefficient_basis,
+        xtwx_fingerprint,
+        penalty_fingerprint,
+        logdet_xtwx,
+        logdet_penalty_positive,
+        penalty_rank,
+        nullity,
+    })
+}
+
+fn gaussian_penalty_positive_logdet(
+    penalty: ArrayView2<'_, f64>,
+    penalty_rank: usize,
+) -> Result<f64, EstimationError> {
+    if penalty_rank == 0 {
+        return Ok(0.0);
+    }
+    let (pen_eigs, _) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let pen_scale = pen_eigs
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+        .max(1.0);
+    let pen_tol = pen_scale * EIGEN_REL_TOL;
+    Ok(pen_eigs
+        .iter()
+        .filter(|&&value| value > pen_tol)
+        .map(|value| value.ln())
+        .sum())
+}
+
+fn validate_gaussian_reml_eigen_cache(
+    cache: &GaussianRemlEigenCache,
+    p: usize,
+) -> Result<(), EstimationError> {
+    if cache.penalty_eigenvalues.len() != p
+        || cache.eigenvectors.dim() != (p, p)
+        || cache.coefficient_basis.dim() != (p, p)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML eigen cache dimension mismatch: expected {p} coefficients"
+        )));
+    }
+    if cache.penalty_rank > p || cache.nullity > p || cache.penalty_rank + cache.nullity != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML eigen cache rank/nullity mismatch: rank={}, nullity={}, p={p}",
+            cache.penalty_rank, cache.nullity
+        )));
+    }
+    if !(cache.logdet_xtwx.is_finite() && cache.logdet_penalty_positive.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML eigen cache log-determinants must be finite".to_string(),
+        ));
+    }
+    if cache
+        .penalty_eigenvalues
+        .iter()
+        .any(|value| !value.is_finite() || *value < 0.0)
+        || cache.eigenvectors.iter().any(|value| !value.is_finite())
+        || cache
+            .coefficient_basis
+            .iter()
+            .any(|value| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML eigen cache entries must be finite with non-negative eigenvalues"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_gaussian_reml(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    weights: Option<ArrayView1<'_, f64>>,
+    eigen_cache: Option<&GaussianRemlEigenCache>,
+) -> Result<GaussianRemlPrepared, EstimationError> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let d = y.ncols();
+    validate_gaussian_reml_design(x, penalty, weights)?;
+    if y.nrows() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML row mismatch: X has {n} rows but Y has {}",
+            y.nrows()
+        )));
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML inputs must be finite".to_string(),
+        ));
+    }
+    let weight = gaussian_reml_weights(n, weights)?;
+
+    let mut wy = y.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wy.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwy = x.t().dot(&wy);
+    let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
+
+    if let Some(cache) = eigen_cache {
+        validate_gaussian_reml_eigen_cache(cache, p)?;
+        if let Some(expected_nullity) = nullspace_dim {
+            if expected_nullity != cache.nullity {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
+                    cache.nullity
+                )));
+            }
+        }
+        let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+        let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+        return Ok(GaussianRemlPrepared {
+            cache: cache.clone(),
+            ywy,
+            projected_rhs_squared,
+            projected_rhs,
+            n_observations: n,
+            n_outputs: d,
+        });
+    }
+
+    let cache =
+        build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, nullspace_dim, weights)?;
+    let projected_rhs = cache.coefficient_basis.t().dot(&xtwy);
+    let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+
     Ok(GaussianRemlPrepared {
-        cache: GaussianRemlEigenCache {
-            penalty_eigenvalues,
-            eigenvectors,
-            coefficient_basis,
-            xtwx_fingerprint,
-            penalty_fingerprint,
-            logdet_xtwx,
-            logdet_penalty_positive,
-            penalty_rank,
-            nullity,
-        },
+        cache,
         ywy,
         projected_rhs_squared,
         projected_rhs,
