@@ -9,8 +9,6 @@ use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 fn normal_pdf_numdual<D: DualNum<f64> + Copy>(x: D) -> D {

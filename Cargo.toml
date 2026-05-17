@@ -4,6 +4,11 @@ version = "0.3.42"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
+# With ~120 `tests/*.rs` files each linking the full dep closure as its
+# own binary, the cumulative link output overflows the CI runner disk.
+# The `[[test]]` entry below routes all of them through one binary
+# (`tests/all.rs`) whose `mod` declarations include each file.
+autotests = false
 default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -83,6 +88,10 @@ criterion = "0.5"
 name = "gam"
 path = "src/main.rs"
 
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
 [[bench]]
 name = "closed_form_pair_block"
 path = "bench/cargo_benches/closed_form_pair_block.rs"
@@ -156,6 +165,14 @@ harness = false
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# `line-tables-only` keeps `file:line` info for panic backtraces while
+# dropping the per-symbol DWARF that bloats `cargo test` link output;
+# `[profile.test]` inherits from `[profile.dev]`, and the dep .rlibs
+# whose DWARF the linker would otherwise copy into every test binary
+# are compiled in this dev profile when running `cargo test`.
+[profile.dev]
+debug = "line-tables-only"
 
 # Iteration profile — drops `lto=thin` and uses 16 codegen units to cut
 # rebuild time from ~5 min to ~90 s while keeping `opt-level = 3`. Use via

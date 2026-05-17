@@ -16,8 +16,6 @@ use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 #[derive(Clone)]
 struct CoupledQuarticExactFamily {
     center: f64,

@@ -6,8 +6,6 @@ use autodiff::{F1, Float, diff};
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 #[derive(Clone, Copy)]
 struct GaussianPsiParams {
     y: f64,

@@ -10,8 +10,6 @@ use gam::matrix::SymmetricMatrix;
 use ndarray::{Array1, Array2, array};
 use num_dual::{DualNum, first_derivative};
 
-mod common;
-
 #[derive(Clone)]
 struct ScalarPseudoLaplaceRhoFamily {
     target: f64,

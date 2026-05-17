@@ -8,8 +8,6 @@ use gam::types::SasLinkState;
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 const SAS_U_CLAMP: f64 = 50.0;
 
