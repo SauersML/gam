@@ -731,6 +731,23 @@ length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
             })
         }
         "matern" => {
+            // Catch typos like `lengt_scale=` / `nyu=` / `centerz=` before
+            // they get silently ignored and the user wonders why their
+            // option had no effect. The matern() term accepts exactly
+            // these options.
+            validate_known_options(
+                "matern",
+                options,
+                &[
+                    "type", "bs",
+                    "nu",
+                    "length_scale",
+                    "centers", "k", "basis_dim", "basis-dim", "basisdim", "knots",
+                    "include_intercept", "double_penalty",
+                    "identifiability",
+                    "scale_dims",
+                ],
+            )?;
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
                 cols.len(),
@@ -1398,6 +1415,52 @@ pub fn parse_ps_internal_knots(
             knots_internal.is_none(),
         ))
     }
+}
+
+/// Reject unknown option keys with a focused error that names the term and
+/// the offending key, plus suggests near-matches from the known-key list.
+/// Without this, typos like `lengt_scale=0.1` or `nyu=5/2` are silently
+/// dropped, the term uses the default, and the user has no idea why their
+/// option had no effect.
+pub fn validate_known_options(
+    term_name: &str,
+    options: &BTreeMap<String, String>,
+    known: &[&str],
+) -> Result<(), String> {
+    let known_set: std::collections::BTreeSet<&&str> = known.iter().collect();
+    for key in options.keys() {
+        if !known_set.contains(&key.as_str()) {
+            // Suggest near-matches (substring or shared prefix ≥ 3).
+            let key_l = key.to_ascii_lowercase();
+            let mut suggestions: Vec<&str> = known
+                .iter()
+                .filter(|k| {
+                    let kl = k.to_ascii_lowercase();
+                    kl.contains(&key_l) || key_l.contains(&kl) || {
+                        let n = kl.chars().zip(key_l.chars()).take_while(|(a, b)| a == b).count();
+                        n >= 3
+                    }
+                })
+                .copied()
+                .collect();
+            suggestions.sort_unstable();
+            suggestions.dedup();
+            let hint = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!(" — did you mean one of [{}]?", suggestions.join(", "))
+            };
+            return Err(format!(
+                "{term_name}() does not accept option `{key}`{hint} Known options: [{}]",
+                {
+                    let mut sorted = known.to_vec();
+                    sorted.sort_unstable();
+                    sorted.join(", ")
+                }
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_countwith_basis_alias(
