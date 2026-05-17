@@ -435,12 +435,16 @@ pub fn factorize_sparse_spd(
     // symmetric-upper and makes the sparse factor path robust to caller encoding.
     let t_start = std::time::Instant::now();
     let n_input = h.ncols();
+    let canon_start = std::time::Instant::now();
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
+    let canon_ms = canon_start.elapsed().as_secs_f64() * 1e3;
+    let chol_start = std::time::Instant::now();
     let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
+    let chol_ms = chol_start.elapsed().as_secs_f64() * 1e3;
     // Compute logdet via a sparse-native simplicial LLᵀ on the same upper-
     // triangular matrix. Previously we densified `h_upper` and ran a dense
     // Cholesky purely to read its diagonal — an O(n_input³) detour that
@@ -448,8 +452,19 @@ pub fn factorize_sparse_spd(
     // simplicial path uses the same AMD ordering + LLᵀ machinery as the
     // sp_cholesky factor and runs in O(nnz(L)) once the symbolic structure
     // is built.
+    let logdet_start = std::time::Instant::now();
     let logdet = sparse_spd_logdet_via_simplicial(&h_upper)?;
+    let logdet_ms = logdet_start.elapsed().as_secs_f64() * 1e3;
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "[PROF] factorize_sparse_spd n={} nnz_upper={} canon={:.1}ms chol={:.1}ms logdet={:.1}ms total={:.1}ms",
+        n_input,
+        h_upper.compute_nnz(),
+        canon_ms,
+        chol_ms,
+        logdet_ms,
+        elapsed_ms
+    );
     if elapsed_ms > 100.0 {
         log::info!(
             "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
