@@ -19,6 +19,7 @@ use crate::basis::{
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_usize, option_usize_any,
+    option_usize_any_strict, option_usize_strict,
 };
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
@@ -1368,8 +1369,14 @@ pub fn parse_ps_internal_knots(
     default_internal_knots: usize,
 ) -> Result<(usize, bool), String> {
     const MIN_EXPRESSIVE_INTERNAL_KNOTS: usize = 2;
-    let knots_internal = option_usize(options, "knots");
-    let basis_dim = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+    // Strict variants: reject `k=-1`, `k=1.5`, `knots=-2` etc. with a
+    // focused error instead of silently dropping the value and using the
+    // default. Lenient `option_usize` / `option_usize_any` silently swallow
+    // unparseable values, which leaves the user thinking they configured
+    // something when they did not.
+    let knots_internal = option_usize_strict(options, "knots")?;
+    let basis_dim =
+        option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
     if knots_internal.is_some() && basis_dim.is_some() {
         return Err(
             "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
