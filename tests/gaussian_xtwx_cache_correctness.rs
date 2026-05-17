@@ -95,9 +95,19 @@ fn build_cache(
         wz[i] *= w[i];
     }
     let xtwy = x.t().dot(&wz);
+    let centered_weighted_y_sq = y
+        .iter()
+        .zip(offset.iter())
+        .zip(w.iter())
+        .map(|((&y, &offset), &wi)| {
+            let centered = y - offset;
+            wi * centered * centered
+        })
+        .sum();
     GaussianFixedCache {
         xtwx_orig: xtwx,
         xtwy_orig: xtwy,
+        centered_weighted_y_sq,
         xtwx_sparse_orig: None,
     }
 }
