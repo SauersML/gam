@@ -1162,6 +1162,21 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
         }
     }
 
+    // Reject self-referential formulas like `y ~ smooth(y)` or `y ~ y`: the
+    // response is its own predictor, which is a trivial identity fit and
+    // almost certainly a user mistake. Only flag the simple-identifier case
+    // (so Surv(entry, exit, event) ~ smooth(time) is left alone — the
+    // response is the Surv triple, not the bare "time" column).
+    if lhs.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !lhs.is_empty()
+        && parsed_terms_reference_column(&terms, lhs)
+    {
+        return Err(format!(
+            "formula `{formula}` uses response column `{lhs}` as its own predictor. \
+             This fits y as a function of itself and is almost certainly a typo. \
+             Drop the term that mentions `{lhs}` from the right-hand side."
+        ));
+    }
     Ok(ParsedFormula {
         response: lhs.to_string(),
         terms,
