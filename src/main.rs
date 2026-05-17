@@ -796,6 +796,36 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")?;
     let y = ds.values.column(y_col).to_owned();
+    // Reject a constant response upfront with a clear message rather than
+    // letting REML fail with the cryptic
+    //   "no candidate seeds passed outer startup validation (standard REML)"
+    // which gave the user no idea what was wrong with their data.
+    {
+        let mut seen_finite: Option<f64> = None;
+        let mut all_one_value = true;
+        for &v in y.iter() {
+            if !v.is_finite() {
+                continue;
+            }
+            match seen_finite {
+                None => seen_finite = Some(v),
+                Some(s) if (s - v).abs() < 1e-12 => {}
+                _ => {
+                    all_one_value = false;
+                    break;
+                }
+            }
+        }
+        if all_one_value && seen_finite.is_some() {
+            let value = seen_finite.unwrap();
+            return Err(format!(
+                "response column '{}' is constant (every finite value equals {value}) — \
+                 there is nothing to fit. Check the data: this is usually a column-mapping mistake \
+                 or a degenerate subset.",
+                parsed.response
+            ));
+        }
+    }
     let mut inference_notes: Vec<String> = Vec::new();
 
     if args.transformation_normal {
