@@ -2038,6 +2038,64 @@ fn select_columns(data: ArrayView2<'_, f64>, cols: &[usize]) -> Result<Array2<f6
     Ok(out)
 }
 
+fn nonfinite_value_label(value: f64) -> &'static str {
+    if value.is_nan() {
+        "NaN"
+    } else if value.is_sign_positive() {
+        "+Inf"
+    } else {
+        "-Inf"
+    }
+}
+
+fn validate_term_feature_column_finite(
+    data: ArrayView2<'_, f64>,
+    term_kind: &str,
+    term_name: &str,
+    feature_col: usize,
+) -> Result<(), BasisError> {
+    let p = data.ncols();
+    if feature_col >= p {
+        return Err(BasisError::DimensionMismatch(format!(
+            "{term_kind} term '{term_name}' feature column {feature_col} out of bounds for {p} columns"
+        )));
+    }
+    for (row, &value) in data.column(feature_col).iter().enumerate() {
+        if !value.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "{term_kind} term '{term_name}' feature column {feature_col} row {row} contains non-finite value {}",
+                nonfinite_value_label(value)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_smooth_terms_finite_inputs(
+    data: ArrayView2<'_, f64>,
+    terms: &[SmoothTermSpec],
+) -> Result<(), BasisError> {
+    for term in terms {
+        for feature_col in smooth_term_feature_cols(term) {
+            validate_term_feature_column_finite(data, "smooth", &term.name, feature_col)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_term_collection_finite_inputs(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+) -> Result<(), BasisError> {
+    for term in &spec.linear_terms {
+        validate_term_feature_column_finite(data, "linear", &term.name, term.feature_col)?;
+    }
+    for term in &spec.random_effect_terms {
+        validate_term_feature_column_finite(data, "random-effect", &term.name, term.feature_col)?;
+    }
+    validate_smooth_terms_finite_inputs(data, &spec.smooth_terms)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct JointSpatialCenterGroupKey {
     feature_cols: Vec<usize>,
@@ -2252,12 +2310,12 @@ fn plan_joint_spatial_centers_for_term_blocks(
         }
     }
 
-    // Sentinel auto-init: term builder writes length_scale = 0.0 when the user
-    // didn't pass `length_scale=...`. Replace those with a data-driven
-    // initialization here so REML starts in a regime where it can escape; the
-    // hard-coded 1.0 default was a basin from which ν ≥ 5/2 Matern could not
-    // recover on high-frequency truths, silently collapsing the fit to a
-    // near-constant prediction.
+    // Sentinel auto-init: Matern and thin-plate builders write length_scale =
+    // 0.0 when the user didn't pass `length_scale=...`. Replace those with a
+    // data-driven initialization here so REML starts in a regime where it can
+    // escape; the hard-coded 1.0 default was a basin from which ν ≥ 5/2 Matern
+    // could not recover on high-frequency truths, silently collapsing the fit
+    // to a near-constant prediction.
     for block in planned_blocks.iter_mut() {
         for term in block.iter_mut() {
             auto_init_length_scale_in_place(data, term);
@@ -2310,8 +2368,9 @@ fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
     init.max(1e-6).min(max_range)
 }
 
-/// Walk a term and, if it is a spatial smooth whose length_scale was left at
-/// the auto sentinel (`0.0`), overwrite it with [`auto_initial_length_scale`].
+/// Walk a term and, if it is a Matern or thin-plate smooth whose length_scale
+/// was left at the auto sentinel (`0.0`), overwrite it with
+/// [`auto_initial_length_scale`].
 fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
     match &mut term.basis {
         SmoothBasisSpec::Matern {
@@ -2326,13 +2385,6 @@ fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothT
         } => {
             if spec.length_scale == 0.0 {
                 spec.length_scale = auto_initial_length_scale(data, feature_cols);
-            }
-        }
-        SmoothBasisSpec::Duchon {
-            feature_cols, spec, ..
-        } => {
-            if spec.length_scale == Some(0.0) {
-                spec.length_scale = Some(auto_initial_length_scale(data, feature_cols));
             }
         }
         _ => {}
@@ -4028,6 +4080,15 @@ pub fn build_smooth_design_withworkspace(
     terms: &[SmoothTermSpec],
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<RawSmoothDesign, BasisError> {
+    validate_smooth_terms_finite_inputs(data, terms)?;
+    build_smooth_design_withworkspace_unvalidated(data, terms, workspace)
+}
+
+fn build_smooth_design_withworkspace_unvalidated(
+    data: ArrayView2<'_, f64>,
+    terms: &[SmoothTermSpec],
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<RawSmoothDesign, BasisError> {
     let mut planned_blocks = plan_joint_spatial_centers_for_term_blocks(data, &[terms.to_vec()])?;
     let planned_terms = planned_blocks.pop().ok_or_else(|| {
         BasisError::InvalidInput(
@@ -4209,7 +4270,10 @@ fn build_term_collection_design_inner(
     // each result in spec order so the final global layout remains stable:
     // [intercept | linear | random_effects | smooth].
     let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
-        || build_smooth_design(data, &spec.smooth_terms),
+        || {
+            let mut ws = crate::basis::BasisWorkspace::new();
+            build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
+        },
         || {
             rayon::join(
                 || {
@@ -4539,6 +4603,7 @@ pub fn build_term_collection_design(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
 ) -> Result<TermCollectionDesign, BasisError> {
+    validate_term_collection_finite_inputs(data, spec)?;
     let mut planned_specs =
         plan_joint_spatial_centers_for_term_blocks(data, &[spec.smooth_terms.clone()])?;
     let planned_smooth_terms = planned_specs.pop().ok_or_else(|| {
@@ -4556,6 +4621,9 @@ pub fn build_term_collection_designs_joint(
     data: ArrayView2<'_, f64>,
     specs: &[TermCollectionSpec],
 ) -> Result<Vec<TermCollectionDesign>, BasisError> {
+    for spec in specs {
+        validate_term_collection_finite_inputs(data, spec)?;
+    }
     let smooth_blocks = specs
         .iter()
         .map(|spec| spec.smooth_terms.clone())
