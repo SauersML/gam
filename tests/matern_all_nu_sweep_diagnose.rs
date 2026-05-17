@@ -57,7 +57,6 @@ fn try_fit(nu: &str) -> (String, Result<f64, String>) {
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     eprintln!("[matern-nu] `{formula}` rmse={rmse:.4} pred_range=[{mn:.3}, {mx:.3}]");
-    Ok::<f64, String>(rmse);
     (formula, Ok(rmse))
 }
 
