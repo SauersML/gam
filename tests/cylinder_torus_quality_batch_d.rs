@@ -11,7 +11,11 @@ use ndarray::Array2;
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
 
-fn cylinder_dataset(n_theta: usize, n_h: usize, f: impl Fn(f64, f64) -> f64) -> gam::data::EncodedDataset {
+fn cylinder_dataset(
+    n_theta: usize,
+    n_h: usize,
+    f: impl Fn(f64, f64) -> f64,
+) -> gam::data::EncodedDataset {
     let headers = ["theta", "h", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n_theta * n_h);
     for i in 0..n_theta {
@@ -29,24 +33,21 @@ fn cylinder_dataset(n_theta: usize, n_h: usize, f: impl Fn(f64, f64) -> f64) -> 
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn predict(
-    formula: &str,
-    data: &gam::data::EncodedDataset,
-    pts: &[(f64, f64)],
-) -> Vec<f64> {
+fn predict(formula: &str, data: &gam::data::EncodedDataset, pts: &[(f64, f64)]) -> Vec<f64> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut m = Array2::<f64>::zeros((pts.len(), 3));
     for (i, (a, b)) in pts.iter().enumerate() {
         m[[i, 0]] = *a;
         m[[i, 1]] = *b;
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -55,9 +56,7 @@ fn predict(
 fn cycle_63_cylinder_theta_only_truth_recovered() {
     init_parallelism();
     let data = cylinder_dataset(20, 6, |theta, _h| theta.cos());
-    let pts: Vec<(f64, f64)> = (0..12)
-        .map(|i| (TAU * (i as f64) / 11.0, 0.0))
-        .collect();
+    let pts: Vec<(f64, f64)> = (0..12).map(|i| (TAU * (i as f64) / 11.0, 0.0)).collect();
     let pred = predict(
         "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=6)",
         &data,
@@ -65,7 +64,11 @@ fn cycle_63_cylinder_theta_only_truth_recovered() {
     );
     assert!(pred.iter().all(|v| v.is_finite()));
     let truth: Vec<f64> = pts.iter().map(|(t, _)| t.cos()).collect();
-    let s: f64 = pred.iter().zip(truth.iter()).map(|(p, t)| (p - t).powi(2)).sum();
+    let s: f64 = pred
+        .iter()
+        .zip(truth.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
     let rmse = (s / pred.len() as f64).sqrt();
     eprintln!("[cyl-theta] rmse={rmse:.4}");
     assert!(rmse < 0.1, "theta-only truth rmse={rmse:.4}");
@@ -85,7 +88,11 @@ fn cycle_64_cylinder_h_only_truth_recovered() {
         &pts,
     );
     let truth: Vec<f64> = pts.iter().map(|(_, h)| 0.5 + 0.4 * h).collect();
-    let s: f64 = pred.iter().zip(truth.iter()).map(|(p, t)| (p - t).powi(2)).sum();
+    let s: f64 = pred
+        .iter()
+        .zip(truth.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
     let rmse = (s / pred.len() as f64).sqrt();
     eprintln!("[cyl-h] rmse={rmse:.4}");
     assert!(rmse < 0.1, "h-only truth rmse={rmse:.4}");
@@ -96,15 +103,25 @@ fn cycle_64_cylinder_h_only_truth_recovered() {
 fn cycle_65_cylinder_interaction_truth() {
     init_parallelism();
     let data = cylinder_dataset(20, 8, |theta, h| theta.cos() * h);
-    let pts: Vec<(f64, f64)> = [(0.0, 0.5), (PI, 0.5), (PI / 2.0, -0.5), (3.0 * PI / 2.0, 0.7)]
-        .into_iter().collect();
+    let pts: Vec<(f64, f64)> = [
+        (0.0, 0.5),
+        (PI, 0.5),
+        (PI / 2.0, -0.5),
+        (3.0 * PI / 2.0, 0.7),
+    ]
+    .into_iter()
+    .collect();
     let pred = predict(
         "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=6)",
         &data,
         &pts,
     );
     let truth: Vec<f64> = pts.iter().map(|(t, h)| t.cos() * h).collect();
-    let s: f64 = pred.iter().zip(truth.iter()).map(|(p, t)| (p - t).powi(2)).sum();
+    let s: f64 = pred
+        .iter()
+        .zip(truth.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
     let rmse = (s / pred.len() as f64).sqrt();
     eprintln!("[cyl-interact] rmse={rmse:.4} preds={pred:?} truth={truth:?}");
     assert!(rmse < 0.1, "interaction truth rmse={rmse:.4}");
@@ -130,14 +147,22 @@ fn cycle_66_torus_double_periodic_interaction() {
     }
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     let pts: Vec<(f64, f64)> = [(0.0, 0.0), (PI, PI), (PI / 2.0, 3.0 * PI / 2.0)]
-        .into_iter().collect();
+        .into_iter()
+        .collect();
     let pred = predict(
         "y ~ te(u, v, bc=['periodic', 'periodic'], period=[2*pi, 2*pi], k=6)",
         &data,
         &pts,
     );
-    let truth: Vec<f64> = pts.iter().map(|(u, v)| (u + v).cos() + 0.3 * u.sin()).collect();
-    let s: f64 = pred.iter().zip(truth.iter()).map(|(p, t)| (p - t).powi(2)).sum();
+    let truth: Vec<f64> = pts
+        .iter()
+        .map(|(u, v)| (u + v).cos() + 0.3 * u.sin())
+        .collect();
+    let s: f64 = pred
+        .iter()
+        .zip(truth.iter())
+        .map(|(p, t)| (p - t).powi(2))
+        .sum();
     let rmse = (s / pred.len() as f64).sqrt();
     eprintln!("[torus] rmse={rmse:.4}");
     assert!(rmse < 0.15, "torus truth rmse={rmse:.4}");

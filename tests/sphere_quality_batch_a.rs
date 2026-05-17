@@ -38,7 +38,9 @@ fn fit_pred(formula: &str, data: gam::data::EncodedDataset) -> Vec<f64> {
         ..FitConfig::default()
     };
     let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let mut pts = Vec::new();
     for i in 0..10 {
         let lat = -70.0 + 140.0 * (i as f64) / 9.0;
@@ -53,8 +55,7 @@ fn fit_pred(formula: &str, data: gam::data::EncodedDataset) -> Vec<f64> {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design =
-        build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -78,7 +79,10 @@ fn cycle_51_nan_lat_rejected_at_encode() {
     let r = encode_recordswith_inferred_schema(headers, rows);
     let err = r.err().expect("encoder must reject NaN lat");
     let msg = err.to_string().to_lowercase();
-    assert!(msg.contains("nan") || msg.contains("non-finite"), "got: {err:?}");
+    assert!(
+        msg.contains("nan") || msg.contains("non-finite"),
+        "got: {err:?}"
+    );
 }
 
 /// Cycle 52: very small N (n=10) should not crash for either kernel.
@@ -91,11 +95,17 @@ fn cycle_52_tiny_n_does_not_crash() {
             &format!("y ~ sphere(lat, lon, k=10, kernel={kernel})"),
             data,
         );
-        assert!(pred.iter().all(|v| v.is_finite()), "[{kernel}] non-finite at n=10");
+        assert!(
+            pred.iter().all(|v| v.is_finite()),
+            "[{kernel}] non-finite at n=10"
+        );
         let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
         let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         eprintln!("[tiny-n {kernel}] pred range [{mn:.3}, {mx:.3}]");
-        assert!(mn > -5.0 && mx < 5.0, "[{kernel}] tiny-N pred exploded: [{mn:.3}, {mx:.3}]");
+        assert!(
+            mn > -5.0 && mx < 5.0,
+            "[{kernel}] tiny-N pred exploded: [{mn:.3}, {mx:.3}]"
+        );
     }
 }
 
