@@ -671,6 +671,34 @@ def smoothness_penalty(
     return np.asarray(penalty, dtype=float), np.asarray(null_basis, dtype=float)
 
 
+def gaussian_weighted_ridge(
+    X: Any,
+    Y: Any,
+    penalty: Any,
+    weights: Any,
+    *,
+    ridge_lambda: float,
+) -> tuple[Any, Any]:
+    """Closed-form Gaussian row-weighted ridge on NumPy-compatible arrays.
+
+    ``weights`` are likelihood row weights. They are not a multiplicative
+    gate on the mean/design row.
+    """
+    import numpy as np
+
+    try:
+        coefficients, fitted = rust_module().gaussian_weighted_ridge_array(
+            _numeric_matrix(X, "X"),
+            _numeric_matrix(Y, "Y"),
+            _numeric_matrix(penalty, "penalty"),
+            _numeric_vector(weights, "weights"),
+            float(ridge_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(coefficients, dtype=float), np.asarray(fitted, dtype=float)
+
+
 def _numeric_vector(values: Any, label: str) -> Any:
     import numpy as np
 

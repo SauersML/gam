@@ -263,6 +263,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "validate_formula",
             "design_matrix_array",
             "basis",
+            "gaussian_weighted_ridge_array",
             "gaussian_reml_fit",
             "gaussian_reml_score",
         ],
@@ -498,6 +499,29 @@ fn smoothness_penalty<'py>(
     ))
 }
 
+#[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
+fn gaussian_weighted_ridge_array<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: PyReadonlyArray1<'py, f64>,
+    ridge_lambda: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let (coefficients, fitted) = gaussian_weighted_ridge_array_impl(
+        x.as_array(),
+        y.as_array(),
+        penalty.as_array(),
+        weights.as_array(),
+        ridge_lambda,
+    )
+    .map_err(py_value_error)?;
+    Ok((
+        coefficients.into_pyarray(py).unbind(),
+        fitted.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction(signature = (x, y, penalty, weights = None, init_rho = None))]
 fn gaussian_reml_fit<'py>(
     py: Python<'py>,
@@ -507,6 +531,9 @@ fn gaussian_reml_fit<'py>(
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_rho: Option<f64>,
 ) -> PyResult<Py<PyDict>> {
+    let n_rows = x.as_array().nrows();
+    let n_outputs = y.as_array().ncols();
+    let n_coefficients = penalty.as_array().nrows();
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let penalty_values = penalty.as_array().to_owned();
@@ -548,36 +575,35 @@ fn gaussian_reml_fit<'py>(
             out.set_item("edf", 0.0)?;
             out.set_item(
                 "coefficients",
-                Array2::<f64>::zeros((penalty.nrows(), y.ncols())).into_pyarray(py),
+                Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
             )?;
             out.set_item(
                 "fitted",
-                Array2::<f64>::zeros((x.nrows(), y.ncols())).into_pyarray(py),
+                Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
             )?;
-            out.set_item("sigma2", Array1::<f64>::from_elem(y.ncols(), f64::NAN).into_pyarray(py))?;
+            out.set_item(
+                "sigma2",
+                Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
+            )?;
         }
         Err(err) => return Err(py_value_error(err.to_string())),
     }
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (x, y, lambda, penalty, null_basis = None, weights = None))]
+#[pyfunction(signature = (x, y, lambda, penalty, weights = None))]
 fn gaussian_reml_score<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     y: PyReadonlyArray2<'py, f64>,
     lambda: f64,
     penalty: PyReadonlyArray2<'py, f64>,
-    null_basis: Option<PyReadonlyArray2<'py, f64>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let penalty_values = penalty.as_array().to_owned();
-    let null_basis_values = null_basis.map(|basis| basis.as_array().to_owned());
     let weight_values = weights.map(|w| w.as_array().to_owned());
-    validate_null_basis_shape(null_basis_values.as_ref(), penalty_values.nrows())
-        .map_err(py_value_error)?;
     let derivs = py
         .detach(move || {
             gaussian_reml_score_derivatives(
@@ -665,6 +691,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
@@ -2258,6 +2287,84 @@ fn smoothness_penalty_impl(
     )
     .map_err(|err| format!("failed to build penalty null basis: {err}"))?;
     Ok((penalty, null_basis))
+}
+
+fn gaussian_weighted_ridge_array_impl(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    ridge_lambda: f64,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if n == 0 || p == 0 {
+        return Err("X cannot be empty".to_string());
+    }
+    if y.nrows() != n {
+        return Err(format!(
+            "X/Y row mismatch: X has {n} rows but Y has {} rows",
+            y.nrows()
+        ));
+    }
+    if y.ncols() == 0 {
+        return Err("Y must have at least one column".to_string());
+    }
+    if weights.len() != n {
+        return Err(format!(
+            "weights length mismatch: expected {n}, got {}",
+            weights.len()
+        ));
+    }
+    if penalty.nrows() != p || penalty.ncols() != p {
+        return Err(format!(
+            "penalty shape mismatch: expected {p}x{p}, got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if !ridge_lambda.is_finite() || ridge_lambda < 0.0 {
+        return Err(format!(
+            "ridge_lambda must be finite and non-negative; got {ridge_lambda}"
+        ));
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .chain(weights.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("weighted ridge inputs must be finite".to_string());
+    }
+    if weights.iter().any(|value| *value < 0.0) {
+        return Err("weights must be non-negative likelihood row weights".to_string());
+    }
+
+    let mut wx = x.to_owned();
+    let mut wy = y.to_owned();
+    for i in 0..n {
+        let wi = weights[i];
+        wx.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+        wy.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+    }
+    let mut system = x.t().dot(&wx);
+    if ridge_lambda > 0.0 {
+        system += &(penalty.to_owned() * ridge_lambda);
+    }
+    let rhs = x.t().dot(&wy);
+    let factor = factorize_symmetricwith_fallback(
+        gam::faer_ndarray::FaerArrayView::new(&system).as_ref(),
+        Side::Lower,
+    )
+    .map_err(|err| format!("weighted ridge factorization failed: {err}"))?;
+    let mut coefficients = rhs;
+    let mut coefficients_view = array2_to_matmut(&mut coefficients);
+    factor.solve_in_place(coefficients_view.as_mut());
+    if coefficients.iter().any(|value| !value.is_finite()) {
+        return Err("weighted ridge solve produced non-finite coefficients".to_string());
+    }
+    let fitted = x.dot(&coefficients);
+    Ok((coefficients, fitted))
 }
 
 fn validate_vector(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String> {
