@@ -18,7 +18,9 @@ use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
-use gam::gaussian_reml::gaussian_reml_multi_closed_form_with_cache;
+use gam::gaussian_reml::{
+    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_with_cache,
+};
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -271,6 +273,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_weighted_ridge_array",
             "gaussian_weighted_ridge_batch",
             "gaussian_reml_fit",
+            "gaussian_reml_fit_backward",
             "gaussian_reml_fit_batched",
             "gaussian_reml_fit_formula_table",
         ],
@@ -585,6 +588,78 @@ fn gaussian_reml_fit<'py>(
             )?;
         }
         Err(err) => return Err(py_value_error(err.to_string())),
+    }
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    x,
+    y,
+    penalty,
+    grad_lambda = 0.0,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_reml_score = 0.0,
+    weights = None,
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
+))]
+fn gaussian_reml_fit_backward<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    grad_lambda: f64,
+    grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_reml_score: f64,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
+) -> PyResult<Py<PyDict>> {
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x_view
+    };
+    let backward = gaussian_reml_multi_closed_form_backward(
+        fit_x,
+        y_view,
+        penalty_view,
+        weight_view,
+        init_lambda,
+        grad_lambda,
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score,
+    )
+    .map_err(py_value_error)?;
+
+    let out = PyDict::new(py);
+    let (grad_x, grad_by) = if let Some(by_values) = by_view {
+        let (grad_x, grad_by) =
+            apply_by_gate_backward(x_view, by_values, by_start_col, backward.grad_x.view())
+                .map_err(py_value_error)?;
+        (grad_x, Some(grad_by))
+    } else {
+        (backward.grad_x, None)
+    };
+    out.set_item("grad_x", grad_x.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    if let Some(grad_by) = grad_by {
+        out.set_item("grad_by", grad_by.into_pyarray(py))?;
+    } else {
+        out.set_item("grad_by", py.None())?;
     }
     Ok(out.unbind())
 }
@@ -927,6 +1002,46 @@ fn apply_by_gate(
     Ok(out)
 }
 
+fn apply_by_gate_backward(
+    x: ArrayView2<'_, f64>,
+    by: ArrayView1<'_, f64>,
+    start_col: usize,
+    grad_gated_x: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array1<f64>), String> {
+    if grad_gated_x.dim() != x.dim() {
+        return Err(format!(
+            "by gate backward gradient shape mismatch: expected {}x{}, got {}x{}",
+            x.nrows(),
+            x.ncols(),
+            grad_gated_x.nrows(),
+            grad_gated_x.ncols()
+        ));
+    }
+    if by.len() != x.nrows() {
+        return Err(format!(
+            "by gate length mismatch: expected {}, got {}",
+            x.nrows(),
+            by.len()
+        ));
+    }
+    if start_col > x.ncols() {
+        return Err(format!(
+            "by_start_col must be <= number of columns; got {start_col} for {} columns",
+            x.ncols()
+        ));
+    }
+    let mut grad_x = grad_gated_x.to_owned();
+    let mut grad_by = Array1::<f64>::zeros(x.nrows());
+    for row in 0..x.nrows() {
+        let gate = by[row];
+        for col in start_col..x.ncols() {
+            grad_x[[row, col]] = grad_gated_x[[row, col]] * gate;
+            grad_by[row] += grad_gated_x[[row, col]] * x[[row, col]];
+        }
+    }
+    Ok((grad_x, grad_by))
+}
+
 #[pyfunction]
 fn posterior_predict_table(
     py: Python<'_>,
@@ -993,6 +1108,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;

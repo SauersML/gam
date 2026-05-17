@@ -758,6 +758,48 @@ def gaussian_reml_fit(
     return _coerce_gaussian_reml_payload(out, np)
 
 
+def gaussian_reml_fit_backward(
+    x: Any,
+    y: Any,
+    penalty: Any,
+    *,
+    grad_lambda: float = 0.0,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_reml_score: float = 0.0,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
+) -> dict[str, Any]:
+    """Run the analytic VJP for ``gaussian_reml_fit`` outputs."""
+    import numpy as np
+
+    try:
+        out = rust_module().gaussian_reml_fit_backward(
+            _numeric_matrix(x, "x"),
+            _numeric_matrix(y, "y"),
+            _numeric_matrix(penalty, "penalty"),
+            float(grad_lambda),
+            None
+            if grad_coefficients is None
+            else _numeric_matrix(grad_coefficients, "grad_coefficients"),
+            None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
+            float(grad_reml_score),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_x", "grad_y", "grad_weights", "grad_by"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def gaussian_reml_fit_batched(
     x: Any,
     y: Any,
