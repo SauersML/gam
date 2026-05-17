@@ -22,8 +22,12 @@ use ndarray::array;
 
 fn legendre_p(l: usize, x: f64) -> f64 {
     // Standard 3-term recurrence: P_0=1, P_1=x, (l+1)P_{l+1} = (2l+1)·x·P_l − l·P_{l-1}
-    if l == 0 { return 1.0; }
-    if l == 1 { return x; }
+    if l == 0 {
+        return 1.0;
+    }
+    if l == 1 {
+        return x;
+    }
     let mut pkm1 = 1.0_f64;
     let mut pk = x;
     for k in 1..l {
@@ -55,8 +59,7 @@ fn closed_form_kernel(cos_gamma: f64, m: usize) -> f64 {
     let lat_b = cos_gamma.asin(); // radians
     let p = array![[std::f64::consts::FRAC_PI_2, 0.0_f64]];
     let q = array![[lat_b, 0.0_f64]];
-    let k = spherical_wahba_kernel_matrix(p.view(), q.view(), m, true)
-        .expect("kernel evaluation");
+    let k = spherical_wahba_kernel_matrix(p.view(), q.view(), m, true).expect("kernel evaluation");
     k[(0, 0)]
 }
 
@@ -64,7 +67,15 @@ fn run_compare(m: usize) -> f64 {
     // Probe angles γ in (0, π); skip γ=0 (closed-form has its log singularity
     // floor, spectral sum diverges as -log for m=1) and γ=π (point of
     // measure zero, exact match anyway).
-    let gammas = [0.3_f64, 0.6, 1.0, std::f64::consts::FRAC_PI_2, 1.8, 2.4, 2.9];
+    let gammas = [
+        0.3_f64,
+        0.6,
+        1.0,
+        std::f64::consts::FRAC_PI_2,
+        1.8,
+        2.4,
+        2.9,
+    ];
     let cos_pi2 = 0.0_f64; // γ = π/2 → cos = 0
     let closed_ref = closed_form_kernel(cos_pi2, m);
     let spectral_ref = spectral_kernel(cos_pi2, m, 200);
@@ -74,7 +85,9 @@ fn run_compare(m: usize) -> f64 {
         let closed_delta = closed_form_kernel(cg, m) - closed_ref;
         let spectral_delta = spectral_kernel(cg, m, 200) - spectral_ref;
         let abs = (closed_delta - spectral_delta).abs();
-        if abs > max_abs { max_abs = abs; }
+        if abs > max_abs {
+            max_abs = abs;
+        }
         eprintln!(
             "[wahba-m{m}] γ={gamma:.3} closed_Δ={closed_delta:+.6e} spectral_Δ={spectral_delta:+.6e} \
              abs_err={abs:.3e}",
@@ -86,19 +99,28 @@ fn run_compare(m: usize) -> f64 {
 #[test]
 fn wahba_m1_closed_matches_spectral_truth() {
     let err = run_compare(1);
-    assert!(err < 1e-6, "Wahba m=1 closed-form disagrees with spectral truth by {err:.3e}");
+    assert!(
+        err < 1e-6,
+        "Wahba m=1 closed-form disagrees with spectral truth by {err:.3e}"
+    );
 }
 
 #[test]
 fn wahba_m2_closed_matches_spectral_truth() {
     let err = run_compare(2);
-    assert!(err < 1e-7, "Wahba m=2 closed-form disagrees with spectral truth by {err:.3e}");
+    assert!(
+        err < 1e-7,
+        "Wahba m=2 closed-form disagrees with spectral truth by {err:.3e}"
+    );
 }
 
 #[test]
 fn wahba_m3_closed_matches_spectral_truth() {
     let err = run_compare(3);
-    assert!(err < 1e-8, "Wahba m=3 closed-form disagrees with spectral truth by {err:.3e}");
+    assert!(
+        err < 1e-8,
+        "Wahba m=3 closed-form disagrees with spectral truth by {err:.3e}"
+    );
 }
 
 #[test]
