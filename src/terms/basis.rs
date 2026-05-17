@@ -2677,10 +2677,26 @@ pub struct SphericalSplineBasisSpec {
     #[serde(default)]
     pub max_degree: Option<usize>,
     /// When `method == Wahba`, which reproducing kernel to use:
-    /// Sobolev (true `H^m(S²)`, default) or Pseudo (Wahba 1981 / mgcv
-    /// `bs="sos"`). See `SphereWahbaKernel` docs.
-    #[serde(default)]
+    /// Sobolev (true `H^m(S²)`, the default for *new* fits) or Pseudo
+    /// (Wahba 1981 / mgcv `bs="sos"`). See `SphereWahbaKernel` docs.
+    ///
+    /// **Serde back-compat**: deserialised specs that pre-date this field
+    /// fall back to `Pseudo`, because every saved model fit before the
+    /// kernel selector was added used the pseudo-spline closed forms.
+    /// Loading such a model with the new default Sobolev kernel would
+    /// silently produce different predictions from the same coefficient
+    /// vector. The `Default::default()` of this enum is `Sobolev`, so
+    /// new code paths (`SphericalSplineBasisSpec::default()`, formula
+    /// DSL via term_builder) still produce Sobolev specs.
+    #[serde(default = "legacy_pseudo_wahba_kernel")]
     pub wahba_kernel: SphereWahbaKernel,
+}
+
+/// Serde-compat default for `SphericalSplineBasisSpec::wahba_kernel`.
+/// Returns `Pseudo`: every saved model fit before the kernel selector
+/// existed used the pseudo-spline kernel.
+fn legacy_pseudo_wahba_kernel() -> SphereWahbaKernel {
+    SphereWahbaKernel::Pseudo
 }
 
 impl Default for SphericalSplineBasisSpec {
