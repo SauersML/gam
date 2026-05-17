@@ -3627,12 +3627,21 @@ impl<'a> RemlState<'a> {
         }
 
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
+        // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
+        // built once from constant weights. The outer REML loop never
+        // mutates W for Gaussian, so the inner sparse assemble can scatter
+        // these values directly instead of re-running the SpGEMM.
+        let gaussian_cache = self.gaussian_fixed_cache_if_eligible();
+        let precomputed_xtwx = gaussian_cache
+            .as_ref()
+            .and_then(|c| c.xtwx_sparse_orig.as_ref().map(|arc| arc.as_ref()));
         let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
             x_sparse,
             &pirls_result.finalweights,
             &s_lambda,
             ridge_passport.delta,
+            precomputed_xtwx,
         )?;
         let (logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
