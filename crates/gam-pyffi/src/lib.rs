@@ -3,7 +3,7 @@ use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
 use gam::estimate::{
-    BlockRole, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
+    BlockRole, EstimationError, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
     saved_sas_state_from_fit,
 };
 use gam::families::family_meta::{
@@ -15,6 +15,7 @@ use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
+use gam::gaussian_reml::{gaussian_reml_multi_closed_form, gaussian_reml_score_derivatives};
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -262,6 +263,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "validate_formula",
             "design_matrix_array",
             "basis",
+            "gaussian_reml_fit",
+            "gaussian_reml_score",
         ],
     )?;
     info.set_item(
@@ -493,6 +496,110 @@ fn smoothness_penalty<'py>(
         penalty.into_pyarray(py).unbind(),
         null_basis.into_pyarray(py).unbind(),
     ))
+}
+
+#[pyfunction(signature = (x, y, penalty, weights = None, init_rho = None))]
+fn gaussian_reml_fit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_rho: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.map(|w| w.as_array().to_owned());
+    let result = py.detach(move || {
+        gaussian_reml_multi_closed_form(
+            x_values.view(),
+            y_values.view(),
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            init_rho,
+        )
+    });
+    let out = PyDict::new(py);
+    match result {
+        Ok(fit) => {
+            out.set_item("status", "ok")?;
+            out.set_item("lambda", fit.lambda)?;
+            out.set_item("rho", fit.rho)?;
+            out.set_item("reml_score", fit.reml_score)?;
+            out.set_item("reml_grad_lambda", fit.reml_grad_lambda)?;
+            out.set_item("reml_hess_lambda", fit.reml_hess_lambda)?;
+            out.set_item("reml_grad_rho", fit.reml_grad_rho)?;
+            out.set_item("reml_hess_rho", fit.reml_hess_rho)?;
+            out.set_item("edf", fit.edf)?;
+            out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+            out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+            out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
+        }
+        Err(EstimationError::ModelIsIllConditioned { .. }) => {
+            out.set_item("status", "degenerate")?;
+            out.set_item("lambda", f64::NAN)?;
+            out.set_item("rho", f64::NAN)?;
+            out.set_item("reml_score", f64::NAN)?;
+            out.set_item("reml_grad_lambda", f64::NAN)?;
+            out.set_item("reml_hess_lambda", f64::NAN)?;
+            out.set_item("reml_grad_rho", f64::NAN)?;
+            out.set_item("reml_hess_rho", f64::NAN)?;
+            out.set_item("edf", 0.0)?;
+            out.set_item(
+                "coefficients",
+                Array2::<f64>::zeros((penalty.nrows(), y.ncols())).into_pyarray(py),
+            )?;
+            out.set_item(
+                "fitted",
+                Array2::<f64>::zeros((x.nrows(), y.ncols())).into_pyarray(py),
+            )?;
+            out.set_item("sigma2", Array1::<f64>::from_elem(y.ncols(), f64::NAN).into_pyarray(py))?;
+        }
+        Err(err) => return Err(py_value_error(err.to_string())),
+    }
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (x, y, lambda, penalty, null_basis = None, weights = None))]
+fn gaussian_reml_score<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    lambda: f64,
+    penalty: PyReadonlyArray2<'py, f64>,
+    null_basis: Option<PyReadonlyArray2<'py, f64>>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let null_basis_values = null_basis.map(|basis| basis.as_array().to_owned());
+    let weight_values = weights.map(|w| w.as_array().to_owned());
+    validate_null_basis_shape(null_basis_values.as_ref(), penalty_values.nrows())
+        .map_err(py_value_error)?;
+    let derivs = py
+        .detach(move || {
+            gaussian_reml_score_derivatives(
+                x_values.view(),
+                y_values.view(),
+                lambda,
+                penalty_values.view(),
+                weight_values.as_ref().map(|w| w.view()),
+            )
+        })
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let out = PyDict::new(py);
+    out.set_item("reml_score", derivs.reml_score)?;
+    out.set_item("grad_lambda", derivs.grad_lambda)?;
+    out.set_item("hess_lambda", derivs.hess_lambda)?;
+    out.set_item("edf", derivs.edf)?;
+    out.set_item("grad_x", derivs.grad_x.into_pyarray(py))?;
+    out.set_item("grad_y", derivs.grad_y.into_pyarray(py))?;
+    out.set_item("coefficients", derivs.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", derivs.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", derivs.sigma2.into_pyarray(py))?;
+    Ok(out.unbind())
 }
 
 #[pyfunction]
