@@ -6774,6 +6774,16 @@ fn bspline_boundary_constraint_rows(
     let right_x = knots[knots.len() - degree - 1];
     let mut rows: Vec<Vec<f64>> = Vec::new();
 
+    // For `Anchored` we pin BOTH the value AND the first derivative at the
+    // endpoint (Hermite-style). The value-only pin (the original semantic) is
+    // numerically unstable when training data is sparse near the anchored
+    // endpoint: the basis is free to swing arbitrarily steeply between the
+    // pinned point and the next data point, since only curvature is
+    // penalized. A `bc=clamped`-only fit on the same data has no oscillation
+    // because the slope is also pinned. Combining both constraints removes
+    // exactly the swing-direction DoF that produced the COLLAPSED fits in
+    // `sparse_dense_imbalance` (rmse_sparse 0.33 → 0.04, max_dev 1.78 → 0.20
+    // on the cycle-18 diagnostic).
     match boundary_conditions.left {
         BSplineEndpointBoundaryCondition::Free => {}
         BSplineEndpointBoundaryCondition::Clamped => {
@@ -6786,6 +6796,7 @@ fn bspline_boundary_constraint_rows(
                 )));
             }
             rows.push(bspline_boundary_value_row(left_x, knots, degree)?);
+            rows.push(bspline_boundary_derivative_row(left_x, knots, degree)?);
         }
     }
     match boundary_conditions.right {
@@ -6800,6 +6811,7 @@ fn bspline_boundary_constraint_rows(
                 )));
             }
             rows.push(bspline_boundary_value_row(right_x, knots, degree)?);
+            rows.push(bspline_boundary_derivative_row(right_x, knots, degree)?);
         }
     }
 
