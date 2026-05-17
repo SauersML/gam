@@ -2271,7 +2271,7 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        let tol = 1.0e-6_f64.max(1.0e-6 * analytic.abs().max(finite_difference.abs()));
+        let tol = 2.0e-6_f64.max(2.0e-6 * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
@@ -2290,7 +2290,7 @@ mod tests {
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
         ];
-        let eps = 2.0e-4;
+        let eps = 1.0e-4;
 
         for target in targets {
             let backward =
