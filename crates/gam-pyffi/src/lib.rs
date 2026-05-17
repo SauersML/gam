@@ -5685,22 +5685,30 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        let rel_tol = if label.contains("RemlScore") {
-            5.0e-3_f64
-        } else {
-            1.0e-5_f64
-        };
-        let abs_tol = if label.contains("RemlScore") {
-            6.0e-2_f64
-        } else {
-            5.0e-6_f64
-        };
+        let rel_tol = 1.0e-5_f64;
+        let abs_tol = 1.0e-6_f64;
         let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
             "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
         );
+    }
+
+    fn five_point_finite_difference<F>(center: f64, step: f64, mut objective: F) -> f64
+    where
+        F: FnMut(f64) -> f64,
+    {
+        let scaled_step = step * center.abs().max(1.0);
+        let mut five_point = |h: f64| {
+            (-objective(center + 2.0 * h) + 8.0 * objective(center + h)
+                - 8.0 * objective(center - h)
+                + objective(center - 2.0 * h))
+                / (12.0 * h)
+        };
+        let coarse = five_point(scaled_step);
+        let fine = five_point(0.5 * scaled_step);
+        (16.0 * fine - coarse) / 15.0
     }
 
     fn position_fd_inputs() -> (
@@ -5836,64 +5844,42 @@ mod tests {
         let eps = 1.0e-5;
 
         for row in [2_usize, 8, 15] {
-            let mut plus = t.clone();
-            let mut minus = t.clone();
-            plus[row] += eps;
-            minus[row] -= eps;
-            let fd = (position_objective(
-                plus.view(),
-                y.view(),
-                by.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            ) - position_objective(
-                minus.view(),
-                y.view(),
-                by.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            )) / (2.0 * eps);
+            let fd = five_point_finite_difference(t[row], eps, |candidate| {
+                let mut perturbed = t.clone();
+                perturbed[row] = candidate;
+                position_objective(
+                    perturbed.view(),
+                    y.view(),
+                    by.view(),
+                    weights.view(),
+                    knots.view(),
+                    penalty.view(),
+                    grad_lambda,
+                    grad_coefficients.view(),
+                    grad_fitted.view(),
+                    grad_reml_score,
+                )
+            });
             assert_fd_close(&format!("position t[{row}]"), backward.grad_t[row], fd);
         }
 
         for (row, col) in [(1_usize, 0_usize), (10, 1)] {
-            let mut plus = y.clone();
-            let mut minus = y.clone();
-            plus[[row, col]] += eps;
-            minus[[row, col]] -= eps;
-            let fd = (position_objective(
-                t.view(),
-                plus.view(),
-                by.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            ) - position_objective(
-                t.view(),
-                minus.view(),
-                by.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            )) / (2.0 * eps);
+            let fd = five_point_finite_difference(y[[row, col]], eps, |candidate| {
+                let mut perturbed = y.clone();
+                perturbed[[row, col]] = candidate;
+                position_objective(
+                    t.view(),
+                    perturbed.view(),
+                    by.view(),
+                    weights.view(),
+                    knots.view(),
+                    penalty.view(),
+                    grad_lambda,
+                    grad_coefficients.view(),
+                    grad_fitted.view(),
+                    grad_reml_score,
+                )
+            });
             assert_fd_close(
                 &format!("position y[{row},{col}]"),
                 backward.grad_y[[row, col]],
@@ -5902,64 +5888,42 @@ mod tests {
         }
 
         for row in [0_usize, 9, 17] {
-            let mut plus = by.clone();
-            let mut minus = by.clone();
-            plus[row] += eps;
-            minus[row] -= eps;
-            let fd = (position_objective(
-                t.view(),
-                y.view(),
-                plus.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            ) - position_objective(
-                t.view(),
-                y.view(),
-                minus.view(),
-                weights.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            )) / (2.0 * eps);
+            let fd = five_point_finite_difference(by[row], eps, |candidate| {
+                let mut perturbed = by.clone();
+                perturbed[row] = candidate;
+                position_objective(
+                    t.view(),
+                    y.view(),
+                    perturbed.view(),
+                    weights.view(),
+                    knots.view(),
+                    penalty.view(),
+                    grad_lambda,
+                    grad_coefficients.view(),
+                    grad_fitted.view(),
+                    grad_reml_score,
+                )
+            });
             assert_fd_close(&format!("position by[{row}]"), grad_by[row], fd);
         }
 
         for row in [1_usize, 7, 13] {
-            let mut plus = weights.clone();
-            let mut minus = weights.clone();
-            plus[row] += eps;
-            minus[row] -= eps;
-            let fd = (position_objective(
-                t.view(),
-                y.view(),
-                by.view(),
-                plus.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            ) - position_objective(
-                t.view(),
-                y.view(),
-                by.view(),
-                minus.view(),
-                knots.view(),
-                penalty.view(),
-                grad_lambda,
-                grad_coefficients.view(),
-                grad_fitted.view(),
-                grad_reml_score,
-            )) / (2.0 * eps);
+            let fd = five_point_finite_difference(weights[row], eps, |candidate| {
+                let mut perturbed = weights.clone();
+                perturbed[row] = candidate;
+                position_objective(
+                    t.view(),
+                    y.view(),
+                    by.view(),
+                    perturbed.view(),
+                    knots.view(),
+                    penalty.view(),
+                    grad_lambda,
+                    grad_coefficients.view(),
+                    grad_fitted.view(),
+                    grad_reml_score,
+                )
+            });
             assert_fd_close(
                 &format!("position weights[{row}]"),
                 backward.grad_weights[row],
@@ -5995,25 +5959,18 @@ mod tests {
 
             for row in 0..x.nrows() {
                 for col in 0..x.ncols() {
-                    let mut plus = x.clone();
-                    let mut minus = x.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
-                    let fd = (by_gate_objective(
-                        plus.view(),
-                        y.view(),
-                        by.view(),
-                        weights.view(),
-                        penalty.view(),
-                        target,
-                    ) - by_gate_objective(
-                        minus.view(),
-                        y.view(),
-                        by.view(),
-                        weights.view(),
-                        penalty.view(),
-                        target,
-                    )) / (2.0 * eps);
+                    let fd = five_point_finite_difference(x[[row, col]], eps, |candidate| {
+                        let mut perturbed = x.clone();
+                        perturbed[[row, col]] = candidate;
+                        by_gate_objective(
+                            perturbed.view(),
+                            y.view(),
+                            by.view(),
+                            weights.view(),
+                            penalty.view(),
+                            target,
+                        )
+                    });
                     assert_fd_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         grad_x[[row, col]],
@@ -6024,25 +5981,18 @@ mod tests {
 
             for row in 0..y.nrows() {
                 for col in 0..y.ncols() {
-                    let mut plus = y.clone();
-                    let mut minus = y.clone();
-                    plus[[row, col]] += eps;
-                    minus[[row, col]] -= eps;
-                    let fd = (by_gate_objective(
-                        x.view(),
-                        plus.view(),
-                        by.view(),
-                        weights.view(),
-                        penalty.view(),
-                        target,
-                    ) - by_gate_objective(
-                        x.view(),
-                        minus.view(),
-                        by.view(),
-                        weights.view(),
-                        penalty.view(),
-                        target,
-                    )) / (2.0 * eps);
+                    let fd = five_point_finite_difference(y[[row, col]], eps, |candidate| {
+                        let mut perturbed = y.clone();
+                        perturbed[[row, col]] = candidate;
+                        by_gate_objective(
+                            x.view(),
+                            perturbed.view(),
+                            by.view(),
+                            weights.view(),
+                            penalty.view(),
+                            target,
+                        )
+                    });
                     assert_fd_close(
                         &format!("target={target:?} y[{row},{col}]"),
                         grad_y[[row, col]],
@@ -6052,48 +6002,34 @@ mod tests {
             }
 
             for row in 0..by.len() {
-                let mut plus = by.clone();
-                let mut minus = by.clone();
-                plus[row] += eps;
-                minus[row] -= eps;
-                let fd = (by_gate_objective(
-                    x.view(),
-                    y.view(),
-                    plus.view(),
-                    weights.view(),
-                    penalty.view(),
-                    target,
-                ) - by_gate_objective(
-                    x.view(),
-                    y.view(),
-                    minus.view(),
-                    weights.view(),
-                    penalty.view(),
-                    target,
-                )) / (2.0 * eps);
+                let fd = five_point_finite_difference(by[row], eps, |candidate| {
+                    let mut perturbed = by.clone();
+                    perturbed[row] = candidate;
+                    by_gate_objective(
+                        x.view(),
+                        y.view(),
+                        perturbed.view(),
+                        weights.view(),
+                        penalty.view(),
+                        target,
+                    )
+                });
                 assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
             }
 
             for row in 0..weights.len() {
-                let mut plus = weights.clone();
-                let mut minus = weights.clone();
-                plus[row] += eps;
-                minus[row] -= eps;
-                let fd = (by_gate_objective(
-                    x.view(),
-                    y.view(),
-                    by.view(),
-                    plus.view(),
-                    penalty.view(),
-                    target,
-                ) - by_gate_objective(
-                    x.view(),
-                    y.view(),
-                    by.view(),
-                    minus.view(),
-                    penalty.view(),
-                    target,
-                )) / (2.0 * eps);
+                let fd = five_point_finite_difference(weights[row], eps, |candidate| {
+                    let mut perturbed = weights.clone();
+                    perturbed[row] = candidate;
+                    by_gate_objective(
+                        x.view(),
+                        y.view(),
+                        by.view(),
+                        perturbed.view(),
+                        penalty.view(),
+                        target,
+                    )
+                });
                 assert_fd_close(
                     &format!("target={target:?} weights[{row}]"),
                     grad_weights[row],
