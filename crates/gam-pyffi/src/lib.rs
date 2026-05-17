@@ -46,7 +46,7 @@ use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -1232,6 +1232,312 @@ fn gaussian_reml_fit_batched_impl(
     })
 }
 
+fn gaussian_reml_fit_positions_backward_impl(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    grad_lambda: f64,
+    grad_coefficients: Option<ArrayView2<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_reml_score: f64,
+) -> Result<PositionGaussianRemlBackwardResult, String> {
+    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    let basis_derivative =
+        position_basis_derivative(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    let backward = gaussian_reml_multi_closed_form_backward(
+        x.view(),
+        y,
+        penalty,
+        weights,
+        init_lambda,
+        grad_lambda,
+        grad_coefficients,
+        grad_fitted,
+        grad_reml_score,
+    )
+    .map_err(|err| err.to_string())?;
+    let grad_t = contract_position_gradient(backward.grad_x.view(), basis_derivative.view())?;
+    Ok(PositionGaussianRemlBackwardResult {
+        grad_t,
+        grad_y: backward.grad_y,
+        grad_weights: backward.grad_weights,
+    })
+}
+
+fn gaussian_reml_fit_positions_batched_impl(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+) -> Result<BatchedGaussianRemlResult, String> {
+    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    gaussian_reml_fit_batched_impl(x.view(), y, row_offsets, penalty, weights, init_lambda)
+}
+
+fn gaussian_reml_fit_positions_batched_backward_impl(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    grad_lambda: Option<ArrayView1<'_, f64>>,
+    grad_coefficients: Option<ArrayView3<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_reml_score: Option<ArrayView1<'_, f64>>,
+) -> Result<BatchedPositionGaussianRemlBackwardResult, String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    if row_offsets.len() < 2 {
+        return Err("row_offsets must contain at least [0, n]".to_string());
+    }
+    if row_offsets[0] != 0 || row_offsets[row_offsets.len() - 1] != t.len() {
+        return Err(format!(
+            "row_offsets must start at 0 and end at t.len(); got start={}, end={}, n={}",
+            row_offsets[0],
+            row_offsets[row_offsets.len() - 1],
+            t.len()
+        ));
+    }
+    for idx in 0..row_offsets.len() - 1 {
+        if row_offsets[idx] > row_offsets[idx + 1] {
+            return Err("row_offsets must be non-decreasing".to_string());
+        }
+    }
+    if y.nrows() != t.len() {
+        return Err(format!(
+            "position batched Gaussian REML row mismatch: t has {} rows but Y has {}",
+            t.len(),
+            y.nrows()
+        ));
+    }
+    if let Some(weights) = weights {
+        if weights.len() != t.len() {
+            return Err(format!(
+                "weights length mismatch: expected {}, got {}",
+                t.len(),
+                weights.len()
+            ));
+        }
+    }
+
+    let x = position_basis_design(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    let basis_derivative =
+        position_basis_derivative(t, knots_or_centers, basis_kind, basis_order, periodic)?;
+    if penalty.dim() != (x.ncols(), x.ncols()) {
+        return Err(format!(
+            "penalty shape mismatch: expected {}x{}, got {}x{}",
+            x.ncols(),
+            x.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+
+    let batch = row_offsets.len() - 1;
+    let p = x.ncols();
+    let d = y.ncols();
+    if let Some(grad_lambda) = grad_lambda {
+        if grad_lambda.len() != batch {
+            return Err(format!(
+                "grad_lambda length mismatch: expected {batch}, got {}",
+                grad_lambda.len()
+            ));
+        }
+        if grad_lambda.iter().any(|value| !value.is_finite()) {
+            return Err("grad_lambda must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_reml_score) = grad_reml_score {
+        if grad_reml_score.len() != batch {
+            return Err(format!(
+                "grad_reml_score length mismatch: expected {batch}, got {}",
+                grad_reml_score.len()
+            ));
+        }
+        if grad_reml_score.iter().any(|value| !value.is_finite()) {
+            return Err("grad_reml_score must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_coefficients) = grad_coefficients {
+        if grad_coefficients.dim() != (batch, p, d) {
+            let (got_b, got_p, got_d) = grad_coefficients.dim();
+            return Err(format!(
+                "grad_coefficients shape mismatch: expected {batch}x{p}x{d}, got {got_b}x{got_p}x{got_d}"
+            ));
+        }
+        if grad_coefficients.iter().any(|value| !value.is_finite()) {
+            return Err("grad_coefficients must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_fitted) = grad_fitted {
+        if grad_fitted.dim() != y.dim() {
+            return Err(format!(
+                "grad_fitted shape mismatch: expected {}x{}, got {}x{}",
+                y.nrows(),
+                y.ncols(),
+                grad_fitted.nrows(),
+                grad_fitted.ncols()
+            ));
+        }
+        if grad_fitted.iter().any(|value| !value.is_finite()) {
+            return Err("grad_fitted must contain only finite values".to_string());
+        }
+    }
+
+    let results: Vec<Result<(usize, Option<PositionGaussianRemlBackwardResult>), String>> = (0
+        ..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return Ok((b, None));
+            }
+            let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
+            let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
+            let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
+            let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
+            let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
+            match gaussian_reml_multi_closed_form_backward(
+                x.slice(s![start..end, ..]),
+                y.slice(s![start..end, ..]),
+                penalty,
+                weight_slice,
+                init_lambda,
+                upstream_lambda,
+                upstream_coefficients,
+                upstream_fitted,
+                upstream_reml_score,
+            ) {
+                Ok(backward) => {
+                    let grad_t = contract_position_gradient(
+                        backward.grad_x.view(),
+                        basis_derivative.slice(s![start..end, ..]),
+                    )?;
+                    Ok((
+                        b,
+                        Some(PositionGaussianRemlBackwardResult {
+                            grad_t,
+                            grad_y: backward.grad_y,
+                            grad_weights: backward.grad_weights,
+                        }),
+                    ))
+                }
+                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(err) => Err(format!(
+                    "batched position Gaussian REML backward {b} failed: {err}"
+                )),
+            }
+        })
+        .collect();
+
+    let mut statuses = vec!["degenerate".to_string(); batch];
+    let mut grad_t = Array1::<f64>::zeros(t.len());
+    let mut grad_y = Array2::<f64>::zeros(y.dim());
+    let mut grad_weights = Array1::<f64>::zeros(t.len());
+    for result in results {
+        let (b, backward) = result?;
+        if let Some(backward) = backward {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            statuses[b] = "ok".to_string();
+            grad_t.slice_mut(s![start..end]).assign(&backward.grad_t);
+            grad_y
+                .slice_mut(s![start..end, ..])
+                .assign(&backward.grad_y);
+            grad_weights
+                .slice_mut(s![start..end])
+                .assign(&backward.grad_weights);
+        }
+    }
+
+    Ok(BatchedPositionGaussianRemlBackwardResult {
+        statuses,
+        grad_t,
+        grad_y,
+        grad_weights,
+    })
+}
+
+fn position_basis_design(
+    t: ArrayView1<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    match normalized_position_basis_kind(basis_kind)?.as_str() {
+        "bspline" => bspline_basis_impl(t, knots_or_centers, basis_order, periodic),
+        "duchon" => duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic),
+        _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
+    }
+}
+
+fn position_basis_derivative(
+    t: ArrayView1<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    match normalized_position_basis_kind(basis_kind)?.as_str() {
+        "bspline" => bspline_basis_derivative_impl(t, knots_or_centers, basis_order, 1, periodic),
+        "duchon" => duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic),
+        _ => unreachable!("normalized_position_basis_kind only returns supported basis names"),
+    }
+}
+
+fn normalized_position_basis_kind(basis_kind: &str) -> Result<String, String> {
+    let normalized = basis_kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', '-'], "");
+    match normalized.as_str() {
+        "bspline" | "spline" => Ok("bspline".to_string()),
+        "duchon" | "duchonspline" => Ok("duchon".to_string()),
+        _ => Err(format!(
+            "basis_kind must be 'bspline' or 'duchon'; got {basis_kind:?}"
+        )),
+    }
+}
+
+fn contract_position_gradient(
+    grad_x: ArrayView2<'_, f64>,
+    basis_derivative: ArrayView2<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    if grad_x.dim() != basis_derivative.dim() {
+        return Err(format!(
+            "basis derivative shape mismatch: grad_x is {}x{} but dX/dt is {}x{}",
+            grad_x.nrows(),
+            grad_x.ncols(),
+            basis_derivative.nrows(),
+            basis_derivative.ncols()
+        ));
+    }
+    let mut grad_t = Array1::<f64>::zeros(grad_x.nrows());
+    for row in 0..grad_x.nrows() {
+        grad_t[row] = grad_x.row(row).dot(&basis_derivative.row(row));
+    }
+    Ok(grad_t)
+}
+
 fn apply_by_gate(
     x: ArrayView2<'_, f64>,
     by: ArrayView1<'_, f64>,
@@ -1372,6 +1678,19 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_positions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_backward,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_batched,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_positions_batched_backward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
