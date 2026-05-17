@@ -1,0 +1,445 @@
+use crate::estimate::EstimationError;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+use faer::Side;
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+
+const RHO_LOWER: f64 = -30.0;
+const RHO_UPPER: f64 = 30.0;
+const EIGEN_REL_TOL: f64 = 1.0e-10;
+const GRAD_TOL: f64 = 1.0e-10;
+const MIN_DEVIANCE: f64 = 1.0e-300;
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlEigenCache {
+    pub penalty_eigenvalues: Array1<f64>,
+    pub eigenvectors: Array2<f64>,
+    pub coefficient_basis: Array2<f64>,
+    pub logdet_xtwx: f64,
+    pub logdet_penalty_positive: f64,
+    pub penalty_rank: usize,
+    pub nullity: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlResult {
+    pub lambda: f64,
+    pub rho: f64,
+    pub coefficients: Array1<f64>,
+    pub fitted: Array1<f64>,
+    pub reml_score: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
+    pub edf: f64,
+    pub sigma2: f64,
+    pub cache: GaussianRemlEigenCache,
+}
+
+#[derive(Clone, Debug)]
+pub struct GaussianRemlMultiResult {
+    pub lambda: f64,
+    pub rho: f64,
+    pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub reml_score: f64,
+    pub reml_grad_rho: f64,
+    pub reml_hess_rho: f64,
+    pub edf: f64,
+    pub sigma2: Array1<f64>,
+    pub cache: GaussianRemlEigenCache,
+}
+
+#[derive(Clone)]
+struct GaussianRemlPrepared {
+    cache: GaussianRemlEigenCache,
+    ywy: Array1<f64>,
+    projected_rhs_squared: Array2<f64>,
+    projected_rhs: Array2<f64>,
+    n_observations: usize,
+    n_outputs: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ObjectiveEval {
+    cost: f64,
+    grad: f64,
+    hess: f64,
+    edf: f64,
+}
+
+pub fn gaussian_reml_closed_form(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlResult, EstimationError> {
+    let y2 = y.insert_axis(Axis(1));
+    let result = gaussian_reml_multi_closed_form(x, y2, penalty, weights, init_rho)?;
+    Ok(GaussianRemlResult {
+        lambda: result.lambda,
+        rho: result.rho,
+        coefficients: result.coefficients.column(0).to_owned(),
+        fitted: result.fitted.column(0).to_owned(),
+        reml_score: result.reml_score,
+        reml_grad_rho: result.reml_grad_rho,
+        reml_hess_rho: result.reml_hess_rho,
+        edf: result.edf,
+        sigma2: result.sigma2[0],
+        cache: result.cache,
+    })
+}
+
+pub fn gaussian_reml_multi_closed_form(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rho: Option<f64>,
+) -> Result<GaussianRemlMultiResult, EstimationError> {
+    let prepared = prepare_gaussian_reml(x, y, penalty, weights)?;
+    let rho = optimize_rho(&prepared, init_rho)?;
+    let eval = prepared.evaluate(rho);
+    let lambda = rho.exp();
+    let coefficients = prepared.coefficients(lambda);
+    let fitted = x.dot(&coefficients);
+    let sigma2 = prepared.sigma2(lambda);
+    Ok(GaussianRemlMultiResult {
+        lambda,
+        rho,
+        coefficients,
+        fitted,
+        reml_score: eval.cost,
+        reml_grad_rho: eval.grad,
+        reml_hess_rho: eval.hess,
+        edf: eval.edf,
+        sigma2,
+        cache: prepared.cache,
+    })
+}
+
+fn prepare_gaussian_reml(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlPrepared, EstimationError> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let d = y.ncols();
+    if y.nrows() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML row mismatch: X has {n} rows but Y has {}",
+            y.nrows()
+        )));
+    }
+    if penalty.nrows() != p || penalty.ncols() != p {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML penalty shape mismatch: expected {p}x{p}, got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        )));
+    }
+    if x.iter().chain(y.iter()).chain(penalty.iter()).any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML inputs must be finite".to_string(),
+        ));
+    }
+    let weight = match weights {
+        Some(w) => {
+            if w.len() != n {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Gaussian REML weights length mismatch: expected {n}, got {}",
+                    w.len()
+                )));
+            }
+            if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
+                return Err(EstimationError::InvalidInput(
+                    "Gaussian REML weights must be finite and non-negative".to_string(),
+                ));
+            }
+            w.to_owned()
+        }
+        None => Array1::ones(n),
+    };
+
+    let mut wx = x.to_owned();
+    let mut wy = y.to_owned();
+    for i in 0..n {
+        let wi = weight[i];
+        for value in wx.row_mut(i) {
+            *value *= wi;
+        }
+        for value in wy.row_mut(i) {
+            *value *= wi;
+        }
+    }
+    let xtwx = x.t().dot(&wx);
+    let xtwy = x.t().dot(&wy);
+    let ywy = Array1::from_iter((0..d).map(|j| y.column(j).dot(&wy.column(j))));
+
+    let chol = xtwx
+        .cholesky(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    let lower = chol.lower_triangular();
+    let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
+    let l_inv = invert_lower_triangular(&lower)?;
+    let transformed_penalty = l_inv.dot(&penalty.to_owned()).dot(&l_inv.t());
+    let (mut penalty_eigenvalues, eigenvectors) = transformed_penalty
+        .eigh(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    let scale = penalty_eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+        .max(1.0);
+    let eig_tol = scale * EIGEN_REL_TOL;
+    for value in &mut penalty_eigenvalues {
+        if *value < 0.0 && value.abs() <= eig_tol {
+            *value = 0.0;
+        }
+        if *value < 0.0 {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML penalty is not positive semidefinite; eigenvalue={value:.3e}"
+            )));
+        }
+    }
+    let penalty_rank = penalty_eigenvalues
+        .iter()
+        .filter(|&&value| value > eig_tol)
+        .count();
+    let nullity = p - penalty_rank;
+    let logdet_penalty_positive = if penalty_rank == 0 {
+        0.0
+    } else {
+        let (pen_eigs, _) = penalty
+            .to_owned()
+            .eigh(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+        let pen_scale = pen_eigs
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+            .max(1.0);
+        let pen_tol = pen_scale * EIGEN_REL_TOL;
+        pen_eigs
+            .iter()
+            .filter(|&&value| value > pen_tol)
+            .map(|value| value.ln())
+            .sum()
+    };
+
+    let z = l_inv.dot(&xtwy);
+    let projected_rhs = eigenvectors.t().dot(&z);
+    let projected_rhs_squared = projected_rhs.mapv(|value| value * value);
+    let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
+
+    Ok(GaussianRemlPrepared {
+        cache: GaussianRemlEigenCache {
+            penalty_eigenvalues,
+            eigenvectors,
+            coefficient_basis,
+            logdet_xtwx,
+            logdet_penalty_positive,
+            penalty_rank,
+            nullity,
+        },
+        ywy,
+        projected_rhs_squared,
+        projected_rhs,
+        n_observations: n,
+        n_outputs: d,
+    })
+}
+
+impl GaussianRemlPrepared {
+    fn nu(&self) -> f64 {
+        (self.n_observations as f64 - self.cache.nullity as f64).max(1.0)
+    }
+
+    fn evaluate(&self, rho: f64) -> ObjectiveEval {
+        let lambda = rho.exp();
+        let nu = self.nu();
+        let d = self.n_outputs as f64;
+        let mut logdet_h = self.cache.logdet_xtwx;
+        let mut trace_h = 0.0;
+        let mut trace_h_deriv = 0.0;
+        let mut edf = self.cache.nullity as f64;
+        for &delta in &self.cache.penalty_eigenvalues {
+            let t = lambda * delta;
+            logdet_h += (1.0 + t).ln();
+            if delta > 0.0 {
+                trace_h += t / (1.0 + t);
+                trace_h_deriv += t / ((1.0 + t) * (1.0 + t));
+            }
+            edf += 1.0 / (1.0 + t);
+        }
+        let logdet_s = self.cache.logdet_penalty_positive
+            + (self.cache.penalty_rank as f64) * rho;
+
+        let mut cost = 0.5 * d * (logdet_h - logdet_s);
+        let mut grad = 0.5 * d * (trace_h - self.cache.penalty_rank as f64);
+        let mut hess = 0.5 * d * trace_h_deriv;
+        for j in 0..self.n_outputs {
+            let mut fitted_quadratic = 0.0;
+            let mut dp_grad = 0.0;
+            let mut dp_hess = 0.0;
+            for i in 0..self.cache.penalty_eigenvalues.len() {
+                let c2 = self.projected_rhs_squared[[i, j]];
+                let t = lambda * self.cache.penalty_eigenvalues[i];
+                let denom = 1.0 + t;
+                fitted_quadratic += c2 / denom;
+                dp_grad += c2 * t / (denom * denom);
+                dp_hess += c2 * t * (1.0 - t) / (denom * denom * denom);
+            }
+            let dp = (self.ywy[j] - fitted_quadratic).max(MIN_DEVIANCE);
+            cost += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
+            grad += 0.5 * nu * dp_grad / dp;
+            hess += 0.5 * nu * (dp_hess / dp - (dp_grad * dp_grad) / (dp * dp));
+        }
+        ObjectiveEval {
+            cost,
+            grad,
+            hess,
+            edf,
+        }
+    }
+
+    fn coefficients(&self, lambda: f64) -> Array2<f64> {
+        let mut scaled = self.projected_rhs.clone();
+        for i in 0..self.cache.penalty_eigenvalues.len() {
+            let scale = 1.0 / (1.0 + lambda * self.cache.penalty_eigenvalues[i]);
+            for value in scaled.row_mut(i) {
+                *value *= scale;
+            }
+        }
+        self.cache.coefficient_basis.dot(&scaled)
+    }
+
+    fn sigma2(&self, lambda: f64) -> Array1<f64> {
+        let nu = self.nu();
+        Array1::from_iter((0..self.n_outputs).map(|j| {
+            let mut fitted_quadratic = 0.0;
+            for i in 0..self.cache.penalty_eigenvalues.len() {
+                let denom = 1.0 + lambda * self.cache.penalty_eigenvalues[i];
+                fitted_quadratic += self.projected_rhs_squared[[i, j]] / denom;
+            }
+            ((self.ywy[j] - fitted_quadratic).max(MIN_DEVIANCE)) / nu
+        }))
+    }
+}
+
+fn optimize_rho(
+    prepared: &GaussianRemlPrepared,
+    init_rho: Option<f64>,
+) -> Result<f64, EstimationError> {
+    if prepared.cache.penalty_rank == 0 {
+        return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
+    }
+    let mut lo = RHO_LOWER;
+    let mut hi = RHO_UPPER;
+    let grad_lo = prepared.evaluate(lo).grad;
+    let grad_hi = prepared.evaluate(hi).grad;
+    if grad_lo >= 0.0 {
+        return Ok(lo);
+    }
+    if grad_hi <= 0.0 {
+        return Ok(hi);
+    }
+    let mut rho = init_rho.unwrap_or(0.0).clamp(lo, hi);
+    for _ in 0..80 {
+        let eval = prepared.evaluate(rho);
+        if eval.grad.abs() <= GRAD_TOL * (1.0 + eval.cost.abs()) {
+            return Ok(rho);
+        }
+        if eval.grad > 0.0 {
+            hi = rho;
+        } else {
+            lo = rho;
+        }
+        let newton = if eval.hess > 0.0 {
+            let candidate = rho - eval.grad / eval.hess;
+            (candidate > lo && candidate < hi).then_some(candidate)
+        } else {
+            None
+        };
+        rho = newton.unwrap_or(0.5 * (lo + hi));
+        if (hi - lo).abs() <= 1e-12 * (1.0 + rho.abs()) {
+            return Ok(rho);
+        }
+    }
+    Ok(rho)
+}
+
+fn invert_lower_triangular(lower: &Array2<f64>) -> Result<Array2<f64>, EstimationError> {
+    let n = lower.nrows();
+    if lower.ncols() != n {
+        return Err(EstimationError::InvalidInput(
+            "lower-triangular solve requires a square matrix".to_string(),
+        ));
+    }
+    let eye = Array2::eye(n);
+    solve_lower_triangular_matrix(lower, &eye)
+}
+
+fn solve_lower_triangular_matrix(
+    lower: &Array2<f64>,
+    rhs: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let n = lower.nrows();
+    if lower.ncols() != n || rhs.nrows() != n {
+        return Err(EstimationError::InvalidInput(
+            "lower-triangular solve dimension mismatch".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros(rhs.dim());
+    for col in 0..rhs.ncols() {
+        for i in 0..n {
+            let mut value = rhs[[i, col]];
+            for k in 0..i {
+                value -= lower[[i, k]] * out[[k, col]];
+            }
+            let diag = lower[[i, i]];
+            if !(diag.is_finite() && diag.abs() > 0.0) {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+            out[[i, col]] = value / diag;
+        }
+    }
+    Ok(out)
+}
+
+fn solve_upper_triangular_matrix(
+    upper: &Array2<f64>,
+    rhs: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let n = upper.nrows();
+    if upper.ncols() != n || rhs.nrows() != n {
+        return Err(EstimationError::InvalidInput(
+            "upper-triangular solve dimension mismatch".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros(rhs.dim());
+    for col in 0..rhs.ncols() {
+        for i_rev in 0..n {
+            let i = n - 1 - i_rev;
+            let mut value = rhs[[i, col]];
+            for k in (i + 1)..n {
+                value -= upper[[i, k]] * out[[k, col]];
+            }
+            let diag = upper[[i, i]];
+            if !(diag.is_finite() && diag.abs() > 0.0) {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+            out[[i, col]] = value / diag;
+        }
+    }
+    Ok(out)
+}
