@@ -1283,6 +1283,30 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             }
             Err(e) => {
                 emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+                // Recognize the common "user's sign / box constraint fights
+                // the data" failure mode and surface a focused hint above
+                // the technical REML / KKT breakdown. Without this the user
+                // sees only:
+                //   "no candidate seeds passed outer startup validation
+                //    (standard REML); ... reasons: [seed 0 (validation):
+                //    Parameter constraint violation: KKT residuals exceed
+                //    tolerance: primal=0.81 ..."
+                // which is incomprehensible jargon for the case where they
+                // wrote `nonpositive(x)` on data where the sign of the
+                // covariate-response correlation is actually positive.
+                let estr = e.to_string();
+                if estr.contains("Parameter constraint violation")
+                    && estr.contains("no candidate seeds")
+                {
+                    return Err(format!(
+                        "standard term fit failed: every candidate fit violates the \
+                         parameter constraint you set (nonpositive() / nonnegative() / \
+                         constrain() / bounded()). The constraint and the data appear to \
+                         disagree about the sign or magnitude of the effect. \
+                         Either remove the constraint, flip its direction, or check the \
+                         data. Underlying error: {e}"
+                    ));
+                }
                 return Err(format!("standard term fit failed: {e}"));
             }
         };
