@@ -826,6 +826,170 @@ def gaussian_reml_fit_batched(
     return _coerce_gaussian_reml_payload(out, np)
 
 
+def gaussian_reml_fit_positions(
+    t: Any,
+    y: Any,
+    basis_kind: str,
+    knots_or_centers: Any,
+    penalty: Any,
+    *,
+    basis_order: int | None = None,
+    periodic: bool = False,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Fit closed-form Gaussian REML from 1D positions and an internal basis."""
+    import numpy as np
+
+    order = _position_basis_order(basis_kind, basis_order)
+    try:
+        out = rust_module().gaussian_reml_fit_positions(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            str(basis_kind),
+            _numeric_vector(knots_or_centers, "knots_or_centers"),
+            _numeric_matrix(penalty, "penalty"),
+            order,
+            bool(periodic),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _coerce_gaussian_reml_payload(out, np)
+
+
+def gaussian_reml_fit_positions_backward(
+    t: Any,
+    y: Any,
+    basis_kind: str,
+    knots_or_centers: Any,
+    penalty: Any,
+    *,
+    grad_lambda: float = 0.0,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_reml_score: float = 0.0,
+    basis_order: int | None = None,
+    periodic: bool = False,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs."""
+    import numpy as np
+
+    order = _position_basis_order(basis_kind, basis_order)
+    try:
+        out = rust_module().gaussian_reml_fit_positions_backward(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            str(basis_kind),
+            _numeric_vector(knots_or_centers, "knots_or_centers"),
+            _numeric_matrix(penalty, "penalty"),
+            float(grad_lambda),
+            None
+            if grad_coefficients is None
+            else _numeric_matrix(grad_coefficients, "grad_coefficients"),
+            None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
+            float(grad_reml_score),
+            order,
+            bool(periodic),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_t", "grad_y", "grad_weights"):
+        result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
+def gaussian_reml_fit_positions_batched(
+    t: Any,
+    y: Any,
+    row_offsets: Any,
+    basis_kind: str,
+    knots_or_centers: Any,
+    penalty: Any,
+    *,
+    basis_order: int | None = None,
+    periodic: bool = False,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Fit packed ragged closed-form Gaussian REML problems from positions."""
+    import numpy as np
+
+    order = _position_basis_order(basis_kind, basis_order)
+    try:
+        out = rust_module().gaussian_reml_fit_positions_batched(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            _index_vector(row_offsets, "row_offsets"),
+            str(basis_kind),
+            _numeric_vector(knots_or_centers, "knots_or_centers"),
+            _numeric_matrix(penalty, "penalty"),
+            order,
+            bool(periodic),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return _coerce_gaussian_reml_payload(out, np)
+
+
+def gaussian_reml_fit_positions_batched_backward(
+    t: Any,
+    y: Any,
+    row_offsets: Any,
+    basis_kind: str,
+    knots_or_centers: Any,
+    penalty: Any,
+    *,
+    grad_lambda: Any | None = None,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_reml_score: Any | None = None,
+    basis_order: int | None = None,
+    periodic: bool = False,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Run the analytic VJP for packed position-based Gaussian REML fits."""
+    import numpy as np
+
+    offsets = _index_vector(row_offsets, "row_offsets")
+    batch = int(offsets.size - 1)
+    order = _position_basis_order(basis_kind, basis_order)
+    try:
+        out = rust_module().gaussian_reml_fit_positions_batched_backward(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            offsets,
+            str(basis_kind),
+            _numeric_vector(knots_or_centers, "knots_or_centers"),
+            _numeric_matrix(penalty, "penalty"),
+            _optional_batch_vector(grad_lambda, batch, "grad_lambda"),
+            None
+            if grad_coefficients is None
+            else _numeric_tensor3(grad_coefficients, "grad_coefficients"),
+            None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
+            _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
+            order,
+            bool(periodic),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_t", "grad_y", "grad_weights"):
+        result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def gaussian_reml_fit_formula(
     data: Any,
     formula: str,
@@ -866,11 +1030,43 @@ def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
         "lambda",
         "rho",
         "reml_score",
+        "reml_grad_lambda",
+        "reml_hess_lambda",
+        "reml_grad_rho",
+        "reml_hess_rho",
         "edf",
     ):
         if key in out:
             out[key] = np.asarray(out[key], dtype=float)
     return out
+
+
+def _position_basis_order(basis_kind: str, basis_order: int | None) -> int:
+    if basis_order is not None:
+        order = int(basis_order)
+    else:
+        normalized = basis_kind.strip().lower().replace("_", "").replace("-", "")
+        order = 2 if normalized in {"duchon", "duchonspline"} else 3
+    if order < 1:
+        raise ValueError("basis_order must be at least 1")
+    return order
+
+
+def _optional_batch_vector(values: Any | None, batch: int, label: str) -> Any | None:
+    import numpy as np
+
+    if values is None:
+        return None
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        arr = np.full(batch, float(arr), dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{label} must be a scalar or 1D numeric array")
+    if arr.size != batch:
+        raise ValueError(f"{label} length mismatch: expected {batch}, got {arr.size}")
+    if arr.dtype != np.float64:
+        raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    return arr
 
 
 def _index_vector(values: Any, label: str) -> Any:
