@@ -166,7 +166,7 @@ fn cylinder_te_small_n_stable() {
         let probes: Vec<Vec<f64>> = vec![
             vec![0.0, 0.0, 0.0],
             vec![1.5, 0.5, 0.0],
-            vec![3.14, -0.5, 0.0],
+            vec![std::f64::consts::PI, -0.5, 0.0],
         ];
         let formula = "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=4)";
         match try_fit_predict(formula, &data, 3, &probes) {
