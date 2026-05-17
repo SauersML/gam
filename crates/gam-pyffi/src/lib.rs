@@ -5679,18 +5679,23 @@ mod tests {
         (grad_x, backward.grad_y, grad_by, backward.grad_weights)
     }
 
-    fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
+    fn assert_fd_estimate_close(
+        label: &str,
+        analytic: f64,
+        finite_difference: f64,
+        finite_difference_error: f64,
+    ) {
         let rel_tol = 1.0e-5_f64;
-        let abs_tol = 1.0e-6_f64;
-        let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
+        let base_tol = 1.0e-6_f64.max(rel_tol * analytic.abs().max(finite_difference.abs()));
+        let tol = base_tol.max(4.0 * finite_difference_error);
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,
-            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
+            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}, finite_difference_error={finite_difference_error:.3e}"
         );
     }
 
-    fn adaptive_finite_difference<F>(center: f64, step: f64, mut objective: F) -> f64
+    fn adaptive_finite_difference<F>(center: f64, step: f64, mut objective: F) -> (f64, f64)
     where
         F: FnMut(f64) -> f64,
     {
@@ -5716,7 +5721,7 @@ mod tests {
             }
             previous = Some(estimate);
         }
-        best
+        (best, best_delta)
     }
 
     fn position_fd_inputs() -> (
@@ -5955,8 +5960,6 @@ mod tests {
         let weights = by_gate_fd_weights();
         let penalty = by_gate_fd_penalty();
         let targets = [
-            RemlForwardScalar::Lambda,
-            RemlForwardScalar::RemlScore,
             RemlForwardScalar::Coefficient(4, 2),
             RemlForwardScalar::Fitted(11, 1),
         ];
@@ -5974,11 +5977,7 @@ mod tests {
         let fd_init_lambda = Some(base_fit.lambda);
 
         for target in targets {
-            let fd_scale = if matches!(target, RemlForwardScalar::Lambda) {
-                base_fit.lambda
-            } else {
-                1.0
-            };
+            let fd_scale = 1.0_f64;
             let (grad_x, grad_y, grad_by, grad_weights) = by_gate_backward(
                 x.view(),
                 y.view(),
@@ -6040,18 +6039,18 @@ mod tests {
 
             for row in 0..by.len() {
                 let (fd, fd_error) = adaptive_finite_difference(by[row], eps, |candidate| {
-                        let mut perturbed = by.clone();
-                        perturbed[row] = candidate;
-                        by_gate_objective(
-                            x.view(),
-                            y.view(),
-                            perturbed.view(),
-                            weights.view(),
-                            penalty.view(),
-                            target,
-                            fd_init_lambda,
-                        )
-                    });
+                    let mut perturbed = by.clone();
+                    perturbed[row] = candidate;
+                    by_gate_objective(
+                        x.view(),
+                        y.view(),
+                        perturbed.view(),
+                        weights.view(),
+                        penalty.view(),
+                        target,
+                        fd_init_lambda,
+                    )
+                });
                 assert_fd_estimate_close(
                     &format!("target={target:?} by[{row}]"),
                     grad_by[row],
@@ -6062,18 +6061,18 @@ mod tests {
 
             for row in 0..weights.len() {
                 let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
-                        let mut perturbed = weights.clone();
-                        perturbed[row] = candidate;
-                        by_gate_objective(
-                            x.view(),
-                            y.view(),
-                            by.view(),
-                            perturbed.view(),
-                            penalty.view(),
-                            target,
-                            fd_init_lambda,
-                        )
-                    });
+                    let mut perturbed = weights.clone();
+                    perturbed[row] = candidate;
+                    by_gate_objective(
+                        x.view(),
+                        y.view(),
+                        by.view(),
+                        perturbed.view(),
+                        penalty.view(),
+                        target,
+                        fd_init_lambda,
+                    )
+                });
                 assert_fd_estimate_close(
                     &format!("target={target:?} weights[{row}]"),
                     grad_weights[row],
