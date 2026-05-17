@@ -1,5 +1,7 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_y};
+use crate::faer_ndarray::{
+    FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
+};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
 use rayon::prelude::*;
@@ -1053,6 +1055,10 @@ fn dense_ab(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
 
 fn dense_atb(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
     fast_atb(&a, &b)
+}
+
+fn dense_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Array2<f64> {
+    fast_xt_diag_x(&x, &w)
 }
 
 fn dense_xt_diag_y(
@@ -2161,6 +2167,170 @@ mod tests {
         )
         .expect_err("penalty mismatch must be rejected");
         assert!(err.to_string().contains("penalty mismatch"));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ForwardScalar {
+        Lambda,
+        RemlScore,
+        Coefficient(usize, usize),
+        Fitted(usize, usize),
+    }
+
+    fn finite_difference_design() -> Array2<f64> {
+        Array2::from_shape_fn((20, 5), |(row, col)| {
+            let t = (row as f64 - 9.5) / 8.0;
+            match col {
+                0 => 1.0,
+                1 => t,
+                2 => t * t - 0.55,
+                3 => (1.3 * t).sin() + 0.1 * t,
+                4 => (0.7 * t).cos() - 0.2 * t * t,
+                _ => unreachable!(),
+            }
+        })
+    }
+
+    fn finite_difference_response(outputs: usize) -> Array2<f64> {
+        Array2::from_shape_fn((20, outputs), |(row, output)| {
+            let t = (row as f64 - 9.5) / 8.0;
+            let phase = output as f64 + 1.0;
+            0.4
+                + 0.7 * phase * t
+                - 0.25 * t * t
+                + (0.5 + 0.2 * phase) * (1.1 * t + 0.3 * phase).sin()
+        })
+    }
+
+    fn finite_difference_penalty() -> Array2<f64> {
+        Array2::from_diag(&array![0.0, 0.35, 0.9, 1.7, 2.8])
+    }
+
+    fn one_hot_objective(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        target: ForwardScalar,
+    ) -> f64 {
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            x,
+            y,
+            penalty,
+            None,
+            Some(0.85),
+            None,
+        )
+        .expect("finite-difference forward fit");
+        match target {
+            ForwardScalar::Lambda => fit.lambda,
+            ForwardScalar::RemlScore => fit.reml_score,
+            ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
+            ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
+        }
+    }
+
+    fn one_hot_backward(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        target: ForwardScalar,
+    ) -> GaussianRemlBackwardResult {
+        let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+        let mut grad_fitted = Array2::<f64>::zeros(y.dim());
+        let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
+            ForwardScalar::Lambda => (1.0, 0.0, None, None),
+            ForwardScalar::RemlScore => (0.0, 1.0, None, None),
+            ForwardScalar::Coefficient(row, col) => {
+                grad_coefficients[[row, col]] = 1.0;
+                (0.0, 0.0, Some(grad_coefficients.view()), None)
+            }
+            ForwardScalar::Fitted(row, col) => {
+                grad_fitted[[row, col]] = 1.0;
+                (0.0, 0.0, None, Some(grad_fitted.view()))
+            }
+        };
+        gaussian_reml_multi_closed_form_backward(
+            x,
+            y,
+            penalty,
+            None,
+            Some(0.85),
+            grad_lambda,
+            coefficient_upstream,
+            fitted_upstream,
+            grad_score,
+        )
+        .expect("analytic backward VJP")
+    }
+
+    fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
+        let tol = 1.0e-6_f64.max(1.0e-6 * analytic.abs().max(finite_difference.abs()));
+        let diff = (analytic - finite_difference).abs();
+        assert!(
+            diff <= tol,
+            "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
+        );
+    }
+
+    fn assert_backward_matches_forward_finite_difference(outputs: usize) {
+        let x = finite_difference_design();
+        let y = finite_difference_response(outputs);
+        let penalty = finite_difference_penalty();
+        let targets = [
+            ForwardScalar::Lambda,
+            ForwardScalar::RemlScore,
+            ForwardScalar::Coefficient(3, outputs - 1),
+            ForwardScalar::Fitted(12, outputs - 1),
+        ];
+        let eps = 1.0e-5;
+
+        for target in targets {
+            let backward = one_hot_backward(x.view(), y.view(), penalty.view(), target);
+
+            for row in 0..x.nrows() {
+                for col in 0..x.ncols() {
+                    let mut plus = x.clone();
+                    let mut minus = x.clone();
+                    plus[[row, col]] += eps;
+                    minus[[row, col]] -= eps;
+                    let fd = (one_hot_objective(plus.view(), y.view(), penalty.view(), target)
+                        - one_hot_objective(minus.view(), y.view(), penalty.view(), target))
+                        / (2.0 * eps);
+                    assert_fd_close(
+                        &format!("target={target:?} x[{row},{col}]"),
+                        backward.grad_x[[row, col]],
+                        fd,
+                    );
+                }
+            }
+
+            for row in 0..y.nrows() {
+                for col in 0..y.ncols() {
+                    let mut plus = y.clone();
+                    let mut minus = y.clone();
+                    plus[[row, col]] += eps;
+                    minus[[row, col]] -= eps;
+                    let fd = (one_hot_objective(x.view(), plus.view(), penalty.view(), target)
+                        - one_hot_objective(x.view(), minus.view(), penalty.view(), target))
+                        / (2.0 * eps);
+                    assert_fd_close(
+                        &format!("target={target:?} y[{row},{col}]"),
+                        backward.grad_y[[row, col]],
+                        fd,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_backward_matches_forward_finite_difference_for_all_x_and_y_entries() {
+        assert_backward_matches_forward_finite_difference(1);
+    }
+
+    #[test]
+    fn multi_output_backward_matches_forward_finite_difference_for_all_x_and_y_entries() {
+        assert_backward_matches_forward_finite_difference(3);
     }
 
     #[test]
