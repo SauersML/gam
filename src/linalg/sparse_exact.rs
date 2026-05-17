@@ -1,6 +1,6 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerArrayView, FaerColView};
-use crate::solver::pirls::{PirlsWorkspace, sparse_reml_penalized_hessian};
+use crate::solver::pirls::{PirlsWorkspace, SparseXtwxPrecomputed, sparse_reml_penalized_hessian};
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
@@ -691,9 +691,11 @@ pub fn assemble_and_factor_sparse_penalized_system(
     weights: &Array1<f64>,
     s_lambda: &Array2<f64>,
     ridge: f64,
+    precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
 ) -> Result<SparsePenalizedSystem, EstimationError> {
     let logdet_h_start = std::time::Instant::now();
-    let h_sparse = sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge)?;
+    let h_sparse =
+        sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge, precomputed_xtwx)?;
     let factor = factorize_sparse_spd(&h_sparse)?;
     let logdet_h = logdet_from_factor(&factor)?;
     log::info!(
