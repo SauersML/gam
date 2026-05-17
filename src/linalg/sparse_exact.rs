@@ -694,10 +694,22 @@ pub fn assemble_and_factor_sparse_penalized_system(
     precomputed_xtwx: Option<&SparseXtwxPrecomputed>,
 ) -> Result<SparsePenalizedSystem, EstimationError> {
     let logdet_h_start = std::time::Instant::now();
+    let asm_start = std::time::Instant::now();
     let h_sparse =
         sparse_reml_penalized_hessian(workspace, x, weights, s_lambda, ridge, precomputed_xtwx)?;
+    let asm_ms = asm_start.elapsed().as_secs_f64() * 1e3;
+    let fac_start = std::time::Instant::now();
     let factor = factorize_sparse_spd(&h_sparse)?;
+    let fac_ms = fac_start.elapsed().as_secs_f64() * 1e3;
     let logdet_h = logdet_from_factor(&factor)?;
+    let total_ms = logdet_h_start.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[PROF] sparse-asm-fac p={} asm={:.1}ms fac={:.1}ms total={:.1}ms",
+        h_sparse.nrows(),
+        asm_ms,
+        fac_ms,
+        total_ms
+    );
     log::info!(
         "[STAGE] logdet H (sparse Cholesky) p={} elapsed={:.3}s",
         h_sparse.nrows(),
