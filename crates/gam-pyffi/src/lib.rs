@@ -2416,33 +2416,17 @@ fn duchon_basis_1d_derivative_impl(
     order: usize,
     periodic: bool,
 ) -> Result<Array2<f64>, String> {
-    match order {
-        0 => return duchon_basis_1d_impl(t, centers, m, periodic),
-        1 | 2 => {}
-        _ => {
-            return Err(format!(
-                "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
-            ));
-        }
+    if order == 0 {
+        return duchon_basis_1d_impl(t, centers, m, periodic);
     }
-    let scale = centers
-        .iter()
-        .copied()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
-            (lo.min(value), hi.max(value))
-        });
-    let width = (scale.1 - scale.0).abs().max(1.0);
-    let h = 1.0e-5 * width;
-    let plus_t = t.mapv(|value| value + h);
-    let minus_t = t.mapv(|value| value - h);
-    let plus = duchon_basis_1d_impl(plus_t.view(), centers, m, periodic)?;
-    let minus = duchon_basis_1d_impl(minus_t.view(), centers, m, periodic)?;
-    if order == 1 {
-        Ok((&plus - &minus) / (2.0 * h))
-    } else {
-        let center = duchon_basis_1d_impl(t, centers, m, periodic)?;
-        Ok((&plus - &(center * 2.0) + &minus) / (h * h))
+    if order == 1 || order == 2 {
+        return Err(
+            "Duchon basis derivatives of order 1 and 2 need an analytic implementation; finite-difference discretization is intentionally disabled".to_string(),
+        );
     }
+    Err(format!(
+        "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
+    ))
 }
 
 fn smoothness_penalty_impl(
