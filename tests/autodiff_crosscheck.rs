@@ -9,8 +9,6 @@ use gam::families::sigma_link::{
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 #[derive(Clone, Debug)]
 struct E2EData {
     a: Vec<f64>,

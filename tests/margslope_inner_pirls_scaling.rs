@@ -54,7 +54,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
-mod common;
+use crate::common;
 
 const SEED: u64 = 0x5CA1_AB1E_5C0F_E5A1;
 

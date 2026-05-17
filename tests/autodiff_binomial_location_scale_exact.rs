@@ -6,8 +6,6 @@ use autodiff::{F1, Float, diff};
 use num_dual::{DualNum, first_derivative, second_derivative, third_derivative};
 use std::marker::PhantomData;
 
-mod common;
-
 const POLY_LOSS_KAPPA: f64 = 0.2;
 
 #[derive(Clone, Copy)]

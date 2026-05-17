@@ -9,7 +9,7 @@
 //! computation) silently lets bad data drive biobank-budget verdicts.
 //! Pin the policy down with these tests.
 
-mod common;
+use crate::common;
 
 use common::{BudgetVerdict, PowerLawFit, fit_power_law, report_power_law_full};
 
