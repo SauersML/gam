@@ -881,8 +881,11 @@ def gaussian_reml_fit_positions(
     *,
     basis_order: int | None = None,
     periodic: bool = False,
+    period: float | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Fit closed-form Gaussian REML from 1D positions and an internal basis."""
     import numpy as np
@@ -897,8 +900,11 @@ def gaussian_reml_fit_positions(
             _numeric_matrix(penalty, "penalty"),
             order,
             bool(periodic),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -918,8 +924,11 @@ def gaussian_reml_fit_positions_backward(
     grad_reml_score: float = 0.0,
     basis_order: int | None = None,
     periodic: bool = False,
+    period: float | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs."""
     import numpy as np
@@ -940,14 +949,18 @@ def gaussian_reml_fit_positions_backward(
             float(grad_reml_score),
             order,
             bool(periodic),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_weights"):
-        result[key] = np.asarray(result[key], dtype=float)
+    for key in ("grad_t", "grad_y", "grad_weights", "grad_by"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
     return result
 
 
@@ -961,8 +974,11 @@ def gaussian_reml_fit_positions_batched(
     *,
     basis_order: int | None = None,
     periodic: bool = False,
+    period: float | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Fit packed ragged closed-form Gaussian REML problems from positions."""
     import numpy as np
@@ -978,8 +994,11 @@ def gaussian_reml_fit_positions_batched(
             _numeric_matrix(penalty, "penalty"),
             order,
             bool(periodic),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -1000,8 +1019,11 @@ def gaussian_reml_fit_positions_batched_backward(
     grad_reml_score: Any | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
+    period: float | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Run the analytic VJP for packed position-based Gaussian REML fits."""
     import numpy as np
@@ -1025,14 +1047,18 @@ def gaussian_reml_fit_positions_batched_backward(
             _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
             order,
             bool(periodic),
+            None if period is None else float(period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_weights"):
-        result[key] = np.asarray(result[key], dtype=float)
+    for key in ("grad_t", "grad_y", "grad_weights", "grad_by"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
     return result
 
 
