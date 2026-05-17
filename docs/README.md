@@ -1,5 +1,3 @@
-# gamfit
-
 <div class="gamfit-hero" markdown>
 
 # gamfit { .gamfit-hero-title }
