@@ -93,6 +93,30 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
 }
 
 #[inline]
+pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    lower: &ArrayBase<S1, Ix2>,
+    rhs: &ArrayBase<S2, Ix2>,
+) -> Option<Array2<f64>> {
+    let p = lower.nrows();
+    if lower.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+        return None;
+    }
+    with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER))
+}
+
+#[inline]
+pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    upper: &ArrayBase<S1, Ix2>,
+    rhs: &ArrayBase<S2, Ix2>,
+) -> Option<Array2<f64>> {
+    let p = upper.nrows();
+    if upper.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+        return None;
+    }
+    with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER))
+}
+
+#[inline]
 fn route_gemm(m: usize, n: usize, k: usize) -> bool {
     m > 0 && n > 0 && k > 0 && GpuRuntime::global().policy().route_gemm(m, n, k)
 }
@@ -110,6 +134,11 @@ fn route_xtwx(rows: usize, lhs_cols: usize, rhs_cols: usize) -> bool {
         && GpuRuntime::global()
             .policy()
             .route_xt_diag_y(rows, lhs_cols, rhs_cols)
+}
+
+#[inline]
+fn route_trsm(p: usize, rhs_cols: usize) -> bool {
+    p > 0 && rhs_cols > 0 && GpuRuntime::global().policy().route_trsm(p, rhs_cols)
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T> {
