@@ -213,13 +213,17 @@ y ~ cyclic(theta, period_start=0, period_end=6.283)   # equivalent alias
 y ~ periodic(theta, period=6.283)                     # alias of `cyclic`
 y ~ cp(theta, period=6.283)                           # alias of `cyclic`
 y ~ cc(day_of_week, period=7)                         # mgcv `bs="cc"` alias
-y ~ duchon(theta, periodic=true)                      # cyclic Duchon (1D)
 
 # Tensor with one or more periodic margins (cylinder, torus, …)
 y ~ te(theta, h,  periodic=[0], period=[2*pi, None])
 y ~ te(theta, phi, periodic=[0, 1], period=[2*pi, 2*pi])
 y ~ te(day, hour, bc=['periodic','periodic'], periods=[7, 24], origins=[0, 0])
 ```
+
+Formula-level `duchon(..., periodic=true)` is intentionally rejected until
+the wrapped-distance Duchon kernel has a REML kappa-derivative path. Use
+`s(x, periodic=true, period=...)` for 1-D cyclic smoothing, or `te(...)`
+with periodic margins for cylinder/torus-style geometries.
 
 `periodic=[axes]` lists zero-based axis indices that wrap around; `period=`
 or `periods=` holds one positive period per margin (`None` for non-periodic).
