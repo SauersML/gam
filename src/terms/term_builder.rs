@@ -847,13 +847,8 @@ pub fn build_smooth_basis(
                     crate::basis::SphereMethod::Wahba,
                     Some(crate::basis::SphereWahbaKernel::Sobolev),
                 ),
-                Some("wahba_pseudo")
-                | Some("wahba-pseudo")
-                | Some("pseudo")
-                | Some("pseudo_wahba")
-                | Some("pseudo-wahba")
-                | Some("mgcv")
-                | Some("sos") => (
+                Some("wahba_pseudo") | Some("wahba-pseudo") | Some("pseudo")
+                | Some("pseudo_wahba") | Some("pseudo-wahba") | Some("mgcv") | Some("sos") => (
                     crate::basis::SphereMethod::Wahba,
                     Some(crate::basis::SphereWahbaKernel::Pseudo),
                 ),

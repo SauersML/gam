@@ -13822,13 +13822,6 @@ fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
     }
 }
 
-/// Back-compat alias for the spectral Sobolev kernel (existing call sites
-/// outside this section still expect the historical name).
-#[inline]
-fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
-    wahba_sphere_kernel_sobolev_closed_form(cos_gamma, m)
-}
-
 /// Evaluate the Wahba sphere reproducing kernel at a single `cos γ`. The
 /// choice of underlying RKHS — Sobolev or pseudo-spline — is selected by
 /// `kernel`. Both options are positive-definite on S² for every supported
@@ -13883,18 +13876,6 @@ fn wahba_sphere_kernel_from_cos_simd_kind(
         }
     };
     f64x4::from(lanes.map(f))
-}
-
-/// Back-compat scalar API that defaults to the Sobolev kernel.
-#[inline]
-fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<f64, BasisError> {
-    wahba_sphere_kernel_from_cos_kind(cos_gamma, penalty_order, SphereWahbaKernel::Sobolev)
-}
-
-/// Back-compat SIMD API that defaults to the Sobolev kernel.
-#[inline]
-fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
-    wahba_sphere_kernel_from_cos_simd_kind(cos_gamma, penalty_order, SphereWahbaKernel::Sobolev)
 }
 
 pub fn spherical_wahba_kernel_matrix(
@@ -33995,7 +33976,7 @@ mod tests {
 
     #[test]
     fn wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance() {
-        // Doc-comment on `wahba_sphere_kernel_from_cos_simd` claims max
+        // SIMD-kind helper should match the scalar-kind helper across lanes.
         // abs/rel diff < 1e-12 vs the scalar path across the full domain.
         // Sweep cos_gamma across [-1, 1] (including degenerate endpoints
         // and the floor near cos_gamma = 1) for every supported penalty
@@ -34024,11 +34005,13 @@ mod tests {
         for &m in &[1_usize, 2, 3, 4] {
             for chunk in xs.chunks(4) {
                 let lane = wide::f64x4::from([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let simd = wahba_sphere_kernel_from_cos_simd(lane, m);
+                let simd =
+                    wahba_sphere_kernel_from_cos_simd_kind(lane, m, SphereWahbaKernel::Sobolev);
                 let simd_arr: [f64; 4] = simd.into();
                 for (i, &x) in chunk.iter().enumerate() {
-                    let scalar = wahba_sphere_kernel_from_cos(x, m)
-                        .expect("scalar kernel must produce finite value over closed [-1, 1]");
+                    let scalar =
+                        wahba_sphere_kernel_from_cos_kind(x, m, SphereWahbaKernel::Sobolev)
+                            .expect("scalar kernel must produce finite value over closed [-1, 1]");
                     let abs = (simd_arr[i] - scalar).abs();
                     let rel = abs / scalar.abs().max(1.0e-300);
                     if abs.is_finite() {
