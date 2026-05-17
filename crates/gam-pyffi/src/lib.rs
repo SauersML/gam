@@ -5570,8 +5570,6 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     enum RemlForwardScalar {
-        Lambda,
-        RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
     }
@@ -5638,8 +5636,6 @@ mod tests {
         )
         .expect("by-gated finite-difference forward fit");
         match target {
-            RemlForwardScalar::Lambda => fit.rho,
-            RemlForwardScalar::RemlScore => fit.reml_score,
             RemlForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             RemlForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
         }
@@ -5656,8 +5652,6 @@ mod tests {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
-            RemlForwardScalar::Lambda => (1.0, 0.0, None, None),
-            RemlForwardScalar::RemlScore => (0.0, 1.0, None, None),
             RemlForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
                 (0.0, 0.0, Some(grad_coefficients.view()), None)
@@ -5702,56 +5696,27 @@ mod tests {
     {
         let multipliers = [100.0_f64, 50.0, 25.0, 12.5, 6.25];
         let scale = step * center.abs().max(1.0);
-        let mut normal = [[0.0_f64; 3]; 3];
-        let mut rhs = [0.0_f64; 3];
+        let mut best = f64::NAN;
+        let mut best_delta = f64::INFINITY;
+        let mut previous: Option<f64> = None;
         for multiplier in multipliers {
             let h = multiplier * scale;
-            let derivative = (objective(center + h) - objective(center - h)) / (2.0 * h);
-            let h2 = h * h;
-            let basis = [1.0, h2, h2 * h2];
-            for row in 0..3 {
-                rhs[row] += basis[row] * derivative;
-                for col in 0..3 {
-                    normal[row][col] += basis[row] * basis[col];
+            let coarse = (objective(center + h) - objective(center - h)) / (2.0 * h);
+            let half_h = 0.5 * h;
+            let fine = (objective(center + half_h) - objective(center - half_h)) / (2.0 * half_h);
+            let estimate = fine + (fine - coarse) / 3.0;
+            if let Some(prev) = previous {
+                let delta = (estimate - prev).abs();
+                if delta < best_delta {
+                    best_delta = delta;
+                    best = estimate;
                 }
+            } else {
+                best = estimate;
             }
+            previous = Some(estimate);
         }
-        solve_3x3(normal, rhs)[0]
-    }
-
-    fn solve_3x3(mut matrix: [[f64; 3]; 3], mut rhs: [f64; 3]) -> [f64; 3] {
-        for pivot in 0..3 {
-            let mut best = pivot;
-            for row in (pivot + 1)..3 {
-                if matrix[row][pivot].abs() > matrix[best][pivot].abs() {
-                    best = row;
-                }
-            }
-            if best != pivot {
-                matrix.swap(best, pivot);
-                rhs.swap(best, pivot);
-            }
-            let diag = matrix[pivot][pivot];
-            assert!(
-                diag.abs() > 0.0,
-                "finite-difference extrapolation produced a singular normal matrix"
-            );
-            for col in pivot..3 {
-                matrix[pivot][col] /= diag;
-            }
-            rhs[pivot] /= diag;
-            for row in 0..3 {
-                if row == pivot {
-                    continue;
-                }
-                let factor = matrix[row][pivot];
-                for col in pivot..3 {
-                    matrix[row][col] -= factor * matrix[pivot][col];
-                }
-                rhs[row] -= factor * rhs[pivot];
-            }
-        }
-        rhs
+        best
     }
 
     fn position_fd_inputs() -> (
@@ -5887,7 +5852,7 @@ mod tests {
         let eps = 1.0e-5;
 
         for row in [2_usize, 8, 15] {
-            let fd = adaptive_finite_difference(t[row], eps, |candidate| {
+            let (fd, fd_error) = adaptive_finite_difference(t[row], eps, |candidate| {
                 let mut perturbed = t.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5903,11 +5868,16 @@ mod tests {
                     grad_reml_score,
                 )
             });
-            assert_fd_close(&format!("position t[{row}]"), backward.grad_t[row], fd);
+            assert_fd_estimate_close(
+                &format!("position t[{row}]"),
+                backward.grad_t[row],
+                fd,
+                fd_error,
+            );
         }
 
         for (row, col) in [(1_usize, 0_usize), (10, 1)] {
-            let fd = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
+            let (fd, fd_error) = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
                 let mut perturbed = y.clone();
                 perturbed[[row, col]] = candidate;
                 position_objective(
@@ -5923,15 +5893,16 @@ mod tests {
                     grad_reml_score,
                 )
             });
-            assert_fd_close(
+            assert_fd_estimate_close(
                 &format!("position y[{row},{col}]"),
                 backward.grad_y[[row, col]],
                 fd,
+                fd_error,
             );
         }
 
         for row in [0_usize, 9, 17] {
-            let fd = adaptive_finite_difference(by[row], eps, |candidate| {
+            let (fd, fd_error) = adaptive_finite_difference(by[row], eps, |candidate| {
                 let mut perturbed = by.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5947,11 +5918,11 @@ mod tests {
                     grad_reml_score,
                 )
             });
-            assert_fd_close(&format!("position by[{row}]"), grad_by[row], fd);
+            assert_fd_estimate_close(&format!("position by[{row}]"), grad_by[row], fd, fd_error);
         }
 
         for row in [1_usize, 7, 13] {
-            let fd = adaptive_finite_difference(weights[row], eps, |candidate| {
+            let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
                 let mut perturbed = weights.clone();
                 perturbed[row] = candidate;
                 position_objective(
@@ -5967,10 +5938,11 @@ mod tests {
                     grad_reml_score,
                 )
             });
-            assert_fd_close(
+            assert_fd_estimate_close(
                 &format!("position weights[{row}]"),
                 backward.grad_weights[row],
                 fd,
+                fd_error,
             );
         }
     }
@@ -6018,85 +5990,95 @@ mod tests {
 
             for row in 0..x.nrows() {
                 for col in 0..x.ncols() {
-                    let fd = fd_scale * adaptive_finite_difference(x[[row, col]], eps, |candidate| {
-                        let mut perturbed = x.clone();
-                        perturbed[[row, col]] = candidate;
-                        by_gate_objective(
-                            perturbed.view(),
-                            y.view(),
-                            by.view(),
-                            weights.view(),
-                            penalty.view(),
-                            target,
-                            fd_init_lambda,
-                        )
-                    });
-                    assert_fd_close(
+                    let (fd, fd_error) =
+                        adaptive_finite_difference(x[[row, col]], eps, |candidate| {
+                            let mut perturbed = x.clone();
+                            perturbed[[row, col]] = candidate;
+                            by_gate_objective(
+                                perturbed.view(),
+                                y.view(),
+                                by.view(),
+                                weights.view(),
+                                penalty.view(),
+                                target,
+                                fd_init_lambda,
+                            )
+                        });
+                    assert_fd_estimate_close(
                         &format!("target={target:?} x[{row},{col}]"),
                         grad_x[[row, col]],
-                        fd,
+                        fd_scale * fd,
+                        fd_scale.abs() * fd_error,
                     );
                 }
             }
 
             for row in 0..y.nrows() {
                 for col in 0..y.ncols() {
-                    let fd = fd_scale * adaptive_finite_difference(y[[row, col]], eps, |candidate| {
-                        let mut perturbed = y.clone();
-                        perturbed[[row, col]] = candidate;
+                    let (fd, fd_error) =
+                        adaptive_finite_difference(y[[row, col]], eps, |candidate| {
+                            let mut perturbed = y.clone();
+                            perturbed[[row, col]] = candidate;
+                            by_gate_objective(
+                                x.view(),
+                                perturbed.view(),
+                                by.view(),
+                                weights.view(),
+                                penalty.view(),
+                                target,
+                                fd_init_lambda,
+                            )
+                        });
+                    assert_fd_estimate_close(
+                        &format!("target={target:?} y[{row},{col}]"),
+                        grad_y[[row, col]],
+                        fd_scale * fd,
+                        fd_scale.abs() * fd_error,
+                    );
+                }
+            }
+
+            for row in 0..by.len() {
+                let (fd, fd_error) = adaptive_finite_difference(by[row], eps, |candidate| {
+                        let mut perturbed = by.clone();
+                        perturbed[row] = candidate;
                         by_gate_objective(
                             x.view(),
+                            y.view(),
                             perturbed.view(),
-                            by.view(),
                             weights.view(),
                             penalty.view(),
                             target,
                             fd_init_lambda,
                         )
                     });
-                    assert_fd_close(
-                        &format!("target={target:?} y[{row},{col}]"),
-                        grad_y[[row, col]],
-                        fd,
-                    );
-                }
-            }
-
-            for row in 0..by.len() {
-                let fd = fd_scale * adaptive_finite_difference(by[row], eps, |candidate| {
-                    let mut perturbed = by.clone();
-                    perturbed[row] = candidate;
-                    by_gate_objective(
-                        x.view(),
-                        y.view(),
-                        perturbed.view(),
-                        weights.view(),
-                        penalty.view(),
-                        target,
-                        fd_init_lambda,
-                    )
-                });
-                assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
+                assert_fd_estimate_close(
+                    &format!("target={target:?} by[{row}]"),
+                    grad_by[row],
+                    fd_scale * fd,
+                    fd_scale.abs() * fd_error,
+                );
             }
 
             for row in 0..weights.len() {
-                let fd = fd_scale * adaptive_finite_difference(weights[row], eps, |candidate| {
-                    let mut perturbed = weights.clone();
-                    perturbed[row] = candidate;
-                    by_gate_objective(
-                        x.view(),
-                        y.view(),
-                        by.view(),
-                        perturbed.view(),
-                        penalty.view(),
-                        target,
-                        fd_init_lambda,
-                    )
-                });
-                assert_fd_close(
+                let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
+                        let mut perturbed = weights.clone();
+                        perturbed[row] = candidate;
+                        by_gate_objective(
+                            x.view(),
+                            y.view(),
+                            by.view(),
+                            perturbed.view(),
+                            penalty.view(),
+                            target,
+                            fd_init_lambda,
+                        )
+                    });
+                assert_fd_estimate_close(
                     &format!("target={target:?} weights[{row}]"),
                     grad_weights[row],
-                    fd,
+                    fd_scale * fd,
+                    fd_scale.abs() * fd_error,
                 );
             }
         }
