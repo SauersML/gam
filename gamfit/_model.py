@@ -939,6 +939,36 @@ class Model:
             training_kind=self._training_table_kind,
         )
 
+    def predict_array(
+        self,
+        X: Any,
+        *,
+        interval: float | None = None,
+    ) -> Any:
+        """Predict directly from a numeric NumPy-compatible feature matrix.
+
+        Columns are named ``x0``, ``x1``, ... at the Rust formula boundary.
+        The return value is a dense NumPy array with columns ordered as
+        ``eta``, ``mean``, then any uncertainty columns.
+        """
+        import numpy as np
+
+        X_arr = _numeric_matrix(X, "X")
+        payload: dict[str, Any] = {"interval": interval}
+        try:
+            raw = rust_module().predict_array(
+                self._model_bytes,
+                X_arr,
+                json.dumps(payload),
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        parsed = json.loads(raw)
+        if parsed.get("class") == "survival_prediction":
+            raise ValueError("predict_array does not support survival prediction payloads")
+        columns = _ordered_prediction_columns(parsed["columns"])
+        return np.column_stack([np.asarray(values, dtype=float) for values in columns.values()])
+
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score).
 
@@ -1135,6 +1165,26 @@ class Model:
         headers, rows, _ = normalize_table(data)
         try:
             raw = rust_module().design_matrix_table(self._model_bytes, headers, rows)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        parsed = json.loads(raw)
+        n_rows = int(parsed["n_rows"])
+        n_cols = int(parsed["n_cols"])
+        flat = np.asarray(parsed.get("x_flat", []), dtype=float)
+        if flat.size != n_rows * n_cols:
+            raise ValueError(
+                "design matrix FFI payload shape mismatch: "
+                f"got {flat.size} floats, expected {n_rows} * {n_cols}"
+            )
+        return flat.reshape(n_rows, n_cols)
+
+    def design_matrix_array(self, X: Any) -> Any:
+        """Materialised design matrix for a numeric feature matrix."""
+        import numpy as np
+
+        X_arr = _numeric_matrix(X, "X")
+        try:
+            raw = rust_module().design_matrix_array(self._model_bytes, X_arr)
         except Exception as exc:
             raise map_exception(exc) from exc
         parsed = json.loads(raw)
@@ -1504,6 +1554,19 @@ def _ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, li
         if key not in ordered:
             ordered[key] = value
     return ordered
+
+
+def _numeric_matrix(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"{label} must be a 1D or 2D numeric array")
+    if arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError(f"{label} cannot be empty")
+    return np.ascontiguousarray(arr)
 
 
 def _transformation_normal_z(columns: dict[str, list[float]]) -> list[float]:

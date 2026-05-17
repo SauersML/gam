@@ -24,7 +24,20 @@ See https://github.com/SauersML/gam for the full guide.
 
 from importlib import metadata as _metadata
 
-from ._api import build_info, explain_error, fit, load, loads, validate_formula
+from ._api import (
+    bspline_basis,
+    bspline_basis_derivative,
+    build_info,
+    duchon_basis_1d,
+    duchon_basis_1d_derivative,
+    explain_error,
+    fit,
+    fit_array,
+    load,
+    loads,
+    smoothness_penalty,
+    validate_formula,
+)
 from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
@@ -93,14 +106,20 @@ __all__ = [
     "__version__",
     "alr",
     "build_info",
+    "bspline_basis",
+    "bspline_basis_derivative",
     "closure",
     "clr",
+    "duchon_basis_1d",
+    "duchon_basis_1d_derivative",
     "explain_error",
     "fit",
+    "fit_array",
     "load",
     "load_posterior",
     "loads",
     "simplex_frechet_mean",
+    "smoothness_penalty",
     "sphere_frechet_mean",
     "validate_formula",
 ]

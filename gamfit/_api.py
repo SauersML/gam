@@ -311,6 +311,71 @@ def fit(
     return Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
 
 
+def fit_array(
+    X: Any,
+    Y: Any,
+    formula: str,
+    *,
+    family: str = "auto",
+    offset: str | None = None,
+    weights: str | None = None,
+    transformation_normal: bool | None = None,
+    survival_likelihood: str | None = None,
+    baseline_target: str | None = None,
+    baseline_scale: float | None = None,
+    baseline_shape: float | None = None,
+    baseline_rate: float | None = None,
+    baseline_makeham: float | None = None,
+    z_column: str | None = None,
+    link: str | None = None,
+    logslope_formula: str | None = None,
+    frailty_kind: str | None = None,
+    frailty_sd: float | None = None,
+    hazard_loading: str | None = None,
+    scale_dimensions: bool | None = None,
+    adaptive_regularization: bool | None = None,
+    firth: bool | None = None,
+    config: dict[str, Any] | None = None,
+) -> Model:
+    """Fit directly from numeric NumPy-compatible arrays.
+
+    ``X`` is named ``x0``, ``x1``, ... at the formula boundary. A one-column
+    ``Y`` is named from the formula response; multi-column ``Y`` is named
+    ``y0``, ``y1``, ...
+    """
+    X_arr = _numeric_matrix(X, "X")
+    Y_arr = _numeric_matrix(Y, "Y")
+    payload = _build_fit_payload(
+        family=family,
+        offset=offset,
+        weights=weights,
+        transformation_normal=transformation_normal,
+        survival_likelihood=survival_likelihood,
+        baseline_target=baseline_target,
+        baseline_scale=baseline_scale,
+        baseline_shape=baseline_shape,
+        baseline_rate=baseline_rate,
+        baseline_makeham=baseline_makeham,
+        z_column=z_column,
+        link=link,
+        logslope_formula=logslope_formula,
+        frailty_kind=frailty_kind,
+        frailty_sd=frailty_sd,
+        hazard_loading=hazard_loading,
+        scale_dimensions=scale_dimensions,
+        adaptive_regularization=adaptive_regularization,
+        firth=firth,
+        config=dict(config or {}) or None,
+    )
+    try:
+        model_bytes = bytes(
+            rust_module().fit_array(X_arr, Y_arr, formula, json.dumps(payload))
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return Model(_model_bytes=model_bytes, _training_table_kind="numpy")
+
+
 def load(path: str | Path) -> Model:
     """Load a fitted :class:`Model` previously written with :meth:`Model.save`.
 
@@ -484,3 +549,147 @@ def explain_error(exc: BaseException) -> str:
     if isinstance(exc, GamError):
         return "The Rust engine returned an error. Inspect the exception message for the underlying failure detail."
     return "Unexpected error. Inspect the full traceback and the original exception message."
+
+
+def bspline_basis(
+    t: Any,
+    knots: Any,
+    *,
+    degree: int = 3,
+    periodic: bool = False,
+) -> Any:
+    """Evaluate the Rust B-spline basis as a NumPy array."""
+    import numpy as np
+
+    try:
+        return np.asarray(
+            rust_module().bspline_basis(
+                _numeric_vector(t, "t"),
+                _numeric_vector(knots, "knots"),
+                int(degree),
+                bool(periodic),
+            ),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def bspline_basis_derivative(
+    t: Any,
+    knots: Any,
+    *,
+    degree: int = 3,
+    order: int = 1,
+    periodic: bool = False,
+) -> Any:
+    """Evaluate derivatives of the Rust B-spline basis as a NumPy array."""
+    import numpy as np
+
+    try:
+        return np.asarray(
+            rust_module().bspline_basis_derivative(
+                _numeric_vector(t, "t"),
+                _numeric_vector(knots, "knots"),
+                int(degree),
+                int(order),
+                bool(periodic),
+            ),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def duchon_basis_1d(
+    t: Any,
+    centers: Any,
+    *,
+    m: int = 2,
+    periodic: bool = False,
+) -> Any:
+    """Evaluate the Rust one-dimensional Duchon basis as a NumPy array."""
+    import numpy as np
+
+    try:
+        return np.asarray(
+            rust_module().duchon_basis_1d(
+                _numeric_vector(t, "t"),
+                _numeric_vector(centers, "centers"),
+                int(m),
+                bool(periodic),
+            ),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def duchon_basis_1d_derivative(
+    t: Any,
+    centers: Any,
+    *,
+    m: int = 2,
+    order: int = 1,
+    periodic: bool = False,
+) -> Any:
+    """Evaluate derivatives of the Rust one-dimensional Duchon basis."""
+    import numpy as np
+
+    try:
+        return np.asarray(
+            rust_module().duchon_basis_1d_derivative(
+                _numeric_vector(t, "t"),
+                _numeric_vector(centers, "centers"),
+                int(m),
+                int(order),
+                bool(periodic),
+            ),
+            dtype=float,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+
+
+def smoothness_penalty(
+    knots: Any,
+    *,
+    degree: int = 3,
+    order: int = 2,
+) -> tuple[Any, Any]:
+    """Return ``(S, null_basis)`` for the Rust B-spline difference penalty."""
+    import numpy as np
+
+    try:
+        penalty, null_basis = rust_module().smoothness_penalty(
+            _numeric_vector(knots, "knots"),
+            int(degree),
+            int(order),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(penalty, dtype=float), np.asarray(null_basis, dtype=float)
+
+
+def _numeric_vector(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 1:
+        raise ValueError(f"{label} must be a 1D numeric array")
+    if arr.size == 0:
+        raise ValueError(f"{label} cannot be empty")
+    return np.ascontiguousarray(arr)
+
+
+def _numeric_matrix(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.ndim != 2:
+        raise ValueError(f"{label} must be a 1D or 2D numeric array")
+    if arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError(f"{label} cannot be empty")
+    return np.ascontiguousarray(arr)
