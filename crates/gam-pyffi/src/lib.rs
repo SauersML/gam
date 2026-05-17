@@ -34,16 +34,14 @@ use gam::smooth::{
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, Dense,
-    DuchonBasisSpec, DuchonNullspaceOrder, SpatialIdentifiability, build_bspline_basis_1d,
-    build_duchon_basis, create_basis, create_cyclic_difference_penalty_matrix,
-    create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense,
+    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    SpatialIdentifiability, build_duchon_basis, create_basis, create_difference_penalty_matrix,
+    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
-use gam::{faer_ndarray::FaerEigh, matrix::SymmetricMatrix};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
+use gam::{faer_ndarray::FaerEigh, matrix::SymmetricMatrix};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
@@ -848,6 +846,415 @@ fn fit_dataset_impl(
     serde_json::to_vec_pretty(&model).map_err(|err| format!("failed to serialize model: {err}"))
 }
 
+struct MultiOutputFitPayload {
+    model_bytes: Vec<u8>,
+    coefficients_flat: Vec<f64>,
+    n_coefficients: usize,
+    n_outputs: usize,
+    lambdas: Vec<f64>,
+    reml_score: f64,
+}
+
+struct PooledGaussianEval {
+    cost: f64,
+    gradient: Array1<f64>,
+    beta: Array2<f64>,
+    lambdas: Array1<f64>,
+}
+
+struct PooledGaussianState {
+    xtwx: Array2<f64>,
+    xtwy: Array2<f64>,
+    ywy: Array1<f64>,
+    penalties: Vec<BlockwisePenalty>,
+    n_observations: usize,
+    n_outputs: usize,
+    last: Option<(Vec<u64>, PooledGaussianEval)>,
+}
+
+fn fit_gaussian_multi_output_table_impl(
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    formula: String,
+    target_columns: Vec<String>,
+    config_json: Option<&str>,
+) -> Result<MultiOutputFitPayload, String> {
+    if target_columns.is_empty() {
+        return Err("multi-output Gaussian fit requires at least one target column".to_string());
+    }
+    let dataset = dataset_with_inferred_schema(headers, rows)?;
+    let mut fit_config = parse_fit_config(config_json)?;
+    fit_config.family = Some("gaussian".to_string());
+    fit_config.link = Some("identity".to_string());
+    fit_config.transformation_normal = false;
+    fit_config.noise_formula = None;
+    fit_config.logslope_formula = None;
+    fit_config.z_column = None;
+    fit_config.frailty = None;
+    fit_config.firth = false;
+    if fit_config.flexible_link {
+        return Err(
+            "multi-output Gaussian shared smoothing does not support flexible_link".to_string(),
+        );
+    }
+    if fit_config.scale_dimensions {
+        return Err(
+            "multi-output Gaussian shared smoothing does not support scale_dimensions".to_string(),
+        );
+    }
+    if fit_config.adaptive_regularization.unwrap_or(false) {
+        return Err(
+            "multi-output Gaussian shared smoothing does not support adaptive_regularization"
+                .to_string(),
+        );
+    }
+
+    let materialized = materialize(&formula, &dataset, &fit_config)?;
+    let standard_request = match materialized.request {
+        FitRequest::Standard(request) => request,
+        _ => {
+            return Err(
+                "multi-output Gaussian shared smoothing requires a standard Gaussian formula"
+                    .to_string(),
+            );
+        }
+    };
+    if !matches!(standard_request.family, LikelihoodFamily::GaussianIdentity) {
+        return Err(
+            "multi-output shared smoothing currently supports only Gaussian identity regression"
+                .to_string(),
+        );
+    }
+    if standard_request.wiggle.is_some() {
+        return Err(
+            "multi-output Gaussian shared smoothing does not support link wiggles".to_string(),
+        );
+    }
+    if standard_request.options.firth_bias_reduction {
+        return Err(
+            "multi-output Gaussian shared smoothing does not support Firth correction".to_string(),
+        );
+    }
+
+    let col_map = dataset.column_map();
+    let n = dataset.values.nrows();
+    let d = target_columns.len();
+    let mut y = Array2::<f64>::zeros((n, d));
+    for (j, name) in target_columns.iter().enumerate() {
+        let idx = *col_map
+            .get(name)
+            .ok_or_else(|| format!("multi-output target column '{name}' is missing"))?;
+        y.column_mut(j).assign(&dataset.values.column(idx));
+    }
+    if y.iter().any(|value| !value.is_finite()) {
+        return Err("multi-output target matrix contains non-finite values".to_string());
+    }
+
+    let design = build_term_collection_design(dataset.values.view(), &standard_request.spec)
+        .map_err(|err| format!("failed to build multi-output design: {err}"))?;
+    let p = design.design.ncols();
+    let weights = standard_request.weights.clone();
+    let offset = standard_request.offset.clone();
+    let xtwx = design
+        .design
+        .compute_xtwx(&weights)
+        .map_err(|err| format!("failed to build X'WX for multi-output Gaussian fit: {err}"))?;
+    let x_dense = design
+        .design
+        .try_to_dense_arc("multi-output Gaussian shared smoothing requires dense design access")
+        .map_err(|err| format!("failed to materialize multi-output design: {err}"))?;
+    let mut centered = y;
+    for mut col in centered.columns_mut() {
+        col -= &offset;
+    }
+    let mut weighted_centered = centered.clone();
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        for j in 0..d {
+            weighted_centered[[i, j]] *= wi;
+        }
+    }
+    let xtwy = x_dense.t().dot(&weighted_centered);
+    let mut ywy = Array1::<f64>::zeros(d);
+    for j in 0..d {
+        let mut acc = 0.0;
+        for i in 0..n {
+            let value = centered[[i, j]];
+            acc += weights[i].max(0.0) * value * value;
+        }
+        ywy[j] = acc;
+    }
+
+    let mut state = PooledGaussianState {
+        xtwx,
+        xtwy,
+        ywy,
+        penalties: design.penalties.clone(),
+        n_observations: n,
+        n_outputs: d,
+        last: None,
+    };
+    let k = state.penalties.len();
+    let seed_config = gam::seeding::SeedConfig {
+        bounds: (-12.0, 12.0),
+        max_seeds: if k <= 4 {
+            2
+        } else if k <= 12 {
+            4
+        } else {
+            6
+        },
+        seed_budget: if k <= 6 { 1 } else { 2 },
+        risk_profile: gam::seeding::SeedRiskProfile::Gaussian,
+        ..gam::seeding::SeedConfig::default()
+    };
+    let problem = gam::solver::outer_strategy::OuterProblem::new(k)
+        .with_gradient(gam::solver::outer_strategy::Derivative::Analytic)
+        .with_hessian(gam::solver::outer_strategy::DeclaredHessianForm::Unavailable)
+        .with_tolerance(standard_request.options.tol)
+        .with_max_iter(standard_request.options.max_iter)
+        .with_seed_config(seed_config)
+        .with_objective_scale(Some((n * d) as f64))
+        .with_rho_bound(gam::estimate::RHO_BOUND);
+    let mut obj = problem.build_objective(
+        &mut state,
+        |state: &mut &mut PooledGaussianState, rho: &Array1<f64>| {
+            state.evaluate(rho).map(|eval| eval.cost)
+        },
+        |state: &mut &mut PooledGaussianState, rho: &Array1<f64>| {
+            let eval = state.evaluate(rho)?;
+            Ok(gam::solver::outer_strategy::OuterEval {
+                cost: eval.cost,
+                gradient: eval.gradient.clone(),
+                hessian: gam::solver::outer_strategy::HessianResult::Unavailable,
+            })
+        },
+        None::<fn(&mut &mut PooledGaussianState)>,
+        None::<
+            fn(
+                &mut &mut PooledGaussianState,
+                &Array1<f64>,
+            )
+                -> Result<gam::solver::outer_strategy::EfsEval, gam::estimate::EstimationError>,
+        >,
+    );
+    let outer = problem
+        .run(&mut obj, "multi-output Gaussian shared-smoothing REML")
+        .map_err(|err| format!("multi-output Gaussian REML optimization failed: {err}"))?;
+    let final_eval = state
+        .evaluate(&outer.rho)
+        .map_err(|err| format!("failed to evaluate final multi-output Gaussian fit: {err}"))?;
+    if final_eval.beta.nrows() != p || final_eval.beta.ncols() != d {
+        return Err(format!(
+            "multi-output coefficient shape mismatch: got {}x{}, expected {}x{}",
+            final_eval.beta.nrows(),
+            final_eval.beta.ncols(),
+            p,
+            d
+        ));
+    }
+
+    let first_target = target_columns
+        .first()
+        .ok_or_else(|| "missing first target column".to_string())?;
+    let template_formula = formula_for_target(&formula, first_target)?;
+    let template_bytes = fit_table_impl(
+        dataset.headers.clone(),
+        rows_from_dataset(&dataset),
+        template_formula,
+        config_json,
+    )?;
+    Ok(MultiOutputFitPayload {
+        model_bytes: template_bytes,
+        coefficients_flat: final_eval.beta.iter().copied().collect(),
+        n_coefficients: p,
+        n_outputs: d,
+        lambdas: final_eval.lambdas.to_vec(),
+        reml_score: final_eval.cost,
+    })
+}
+
+impl PooledGaussianState {
+    fn evaluate(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<&PooledGaussianEval, gam::estimate::EstimationError> {
+        let key = rho.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        if let Some((cached_key, _)) = self.last.as_ref()
+            && cached_key == &key
+        {
+            return Ok(&self.last.as_ref().expect("cache present").1);
+        }
+
+        let lambdas = rho.mapv(f64::exp);
+        let mut s_lambda = Array2::<f64>::zeros(self.xtwx.dim());
+        for (idx, penalty) in self.penalties.iter().enumerate() {
+            let lambda = lambdas[idx];
+            let range = penalty.col_range.clone();
+            for local_i in 0..penalty.local.nrows() {
+                let global_i = range.start + local_i;
+                for local_j in 0..penalty.local.ncols() {
+                    let global_j = range.start + local_j;
+                    s_lambda[[global_i, global_j]] += lambda * penalty.local[[local_i, local_j]];
+                }
+            }
+        }
+        let mut h = self.xtwx.clone();
+        h += &s_lambda;
+        let factor = SymmetricMatrix::Dense(h).factorize().map_err(|err| {
+            gam::estimate::EstimationError::ModelIsIllConditioned {
+                condition_number: if err.is_empty() {
+                    f64::INFINITY
+                } else {
+                    f64::NAN
+                },
+            }
+        })?;
+        let beta = factor.solvemulti(&self.xtwy).map_err(|_| {
+            gam::estimate::EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            }
+        })?;
+        let log_det_h = factor.logdet();
+        let (log_det_s, trace_s) = pseudo_logdet_and_traces(&s_lambda, &self.penalties, &lambdas)
+            .map_err(|err| {
+            gam::estimate::EstimationError::InvalidInput(format!(
+                "failed to evaluate penalty pseudo-logdet: {err}"
+            ))
+        })?;
+        let rank_s = penalty_rank(&s_lambda).map_err(|err| {
+            gam::estimate::EstimationError::InvalidInput(format!(
+                "failed to evaluate penalty rank: {err}"
+            ))
+        })?;
+        let null_dim = self.xtwx.ncols().saturating_sub(rank_s);
+        let nu = (self.n_observations as f64 - null_dim as f64).max(1.0);
+
+        let mut dp = self.ywy.clone();
+        for j in 0..self.n_outputs {
+            dp[j] -= beta.column(j).dot(&self.xtwy.column(j));
+            if !(dp[j].is_finite() && dp[j] > 0.0) {
+                dp[j] = dp[j].max(1e-300);
+            }
+        }
+        let mut cost = 0.5 * (self.n_outputs as f64) * (log_det_h - log_det_s);
+        for &dp_j in &dp {
+            cost += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp_j / nu).ln());
+        }
+
+        let mut gradient = Array1::<f64>::zeros(self.penalties.len());
+        for (idx, penalty) in self.penalties.iter().enumerate() {
+            let lambda = lambdas[idx];
+            let range = penalty.col_range.clone();
+            let block_dim = range.len();
+            let mut rhs = Array2::<f64>::zeros((self.xtwx.ncols(), block_dim));
+            for col in 0..block_dim {
+                for row in 0..block_dim {
+                    rhs[[range.start + row, col]] = lambda * penalty.local[[row, col]];
+                }
+            }
+            let sol = factor.solvemulti(&rhs).map_err(|_| {
+                gam::estimate::EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                }
+            })?;
+            let mut trace_h = 0.0;
+            for col in 0..block_dim {
+                for row in 0..block_dim {
+                    trace_h += sol[[range.start + row, col]] * rhs[[range.start + row, col]];
+                }
+            }
+
+            let beta_block = beta.slice(ndarray::s![range.clone(), ..]);
+            let local_beta = penalty.local.dot(&beta_block);
+            let mut profiled_term = 0.0;
+            for j in 0..self.n_outputs {
+                let b_col = beta_block.column(j);
+                let lb_col = local_beta.column(j);
+                let b_ab = lambda * b_col.dot(&lb_col);
+                profiled_term += 0.5 * nu * b_ab / dp[j];
+            }
+            gradient[idx] =
+                profiled_term + 0.5 * (self.n_outputs as f64) * (trace_h - trace_s[idx]);
+        }
+
+        self.last = Some((
+            key,
+            PooledGaussianEval {
+                cost,
+                gradient,
+                beta,
+                lambdas,
+            },
+        ));
+        Ok(&self.last.as_ref().expect("cache populated").1)
+    }
+}
+
+fn pseudo_logdet_and_traces(
+    s_lambda: &Array2<f64>,
+    penalties: &[BlockwisePenalty],
+    lambdas: &Array1<f64>,
+) -> Result<(f64, Array1<f64>), String> {
+    let (evals, evecs) = s_lambda
+        .eigh(faer::Side::Lower)
+        .map_err(|err| format!("{err:?}"))?;
+    let scale = evals
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1.0);
+    let tol = scale * 1e-10;
+    let active = evals
+        .iter()
+        .enumerate()
+        .filter(|&(_, &value)| value > tol)
+        .map(|(idx, &value)| (idx, value))
+        .collect::<Vec<_>>();
+    let logdet = active.iter().map(|&(_, value)| value.ln()).sum::<f64>();
+    let mut traces = Array1::<f64>::zeros(penalties.len());
+    for (k, penalty) in penalties.iter().enumerate() {
+        let lambda = lambdas[k];
+        let range = penalty.col_range.clone();
+        let mut trace = 0.0;
+        for &(eig_idx, eig_value) in &active {
+            let vec_block = evecs.slice(ndarray::s![range.clone(), eig_idx]);
+            let local = penalty.local.dot(&vec_block);
+            trace += lambda * vec_block.dot(&local) / eig_value;
+        }
+        traces[k] = trace;
+    }
+    Ok((logdet, traces))
+}
+
+fn penalty_rank(s_lambda: &Array2<f64>) -> Result<usize, String> {
+    let (evals, _) = s_lambda
+        .eigh(faer::Side::Lower)
+        .map_err(|err| format!("{err:?}"))?;
+    let scale = evals
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+        .max(1.0);
+    let tol = scale * 1e-10;
+    Ok(evals.iter().filter(|&&value| value > tol).count())
+}
+
+fn formula_for_target(formula: &str, target: &str) -> Result<String, String> {
+    let (_, rhs) = formula
+        .split_once('~')
+        .ok_or_else(|| "multi-output formula must contain '~'".to_string())?;
+    Ok(format!("{target} ~ {}", rhs.trim()))
+}
+
+fn rows_from_dataset(dataset: &EncodedDataset) -> Vec<Vec<String>> {
+    (0..dataset.values.nrows())
+        .map(|i| {
+            (0..dataset.values.ncols())
+                .map(|j| dataset.values[[i, j]].to_string())
+                .collect()
+        })
+        .collect()
+}
+
 fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
     let model: FittedModel = serde_json::from_slice(model_bytes)
         .map_err(|err| format!("failed to parse model json: {err}"))?;
@@ -1018,7 +1425,10 @@ fn design_matrix_array_impl(model_bytes: &[u8], x: Array2<f64>) -> Result<String
     design_matrix_dataset_impl(&model, dataset)
 }
 
-fn design_matrix_dataset_impl(model: &FittedModel, dataset: EncodedDataset) -> Result<String, String> {
+fn design_matrix_dataset_impl(
+    model: &FittedModel,
+    dataset: EncodedDataset,
+) -> Result<String, String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "design_matrix currently supports only standard GAM models; got '{}'. \
@@ -1623,12 +2033,8 @@ fn dataset_from_xy_arrays(
     ensure_unique_headers(&headers)?;
 
     let mut values = Array2::<f64>::zeros((x.nrows(), headers.len()));
-    values
-        .slice_mut(ndarray::s![.., 0..y.ncols()])
-        .assign(&y);
-    values
-        .slice_mut(ndarray::s![.., y.ncols()..])
-        .assign(&x);
+    values.slice_mut(ndarray::s![.., 0..y.ncols()]).assign(&y);
+    values.slice_mut(ndarray::s![.., y.ncols()..]).assign(&x);
     dataset_from_numeric_array(headers, values)
 }
 
@@ -1692,9 +2098,9 @@ fn dataset_from_numeric_array_with_schema(
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
     let mut column_kinds = Vec::<ColumnKindTag>::with_capacity(headers.len());
     for (j, name) in headers.iter().enumerate() {
-        let column = schema_byname
-            .get(name.as_str())
-            .ok_or_else(|| format!("array column '{name}' was not present in the training schema"))?;
+        let column = schema_byname.get(name.as_str()).ok_or_else(|| {
+            format!("array column '{name}' was not present in the training schema")
+        })?;
         match column.kind {
             ColumnKindTag::Categorical => {
                 return Err(format!(
@@ -1982,6 +2388,209 @@ fn string_records_from_rows(
             Ok(StringRecord::from(row))
         })
         .collect()
+}
+
+fn bspline_basis_impl(
+    t: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    validate_vector("t", t)?;
+    validate_vector("knots", knots)?;
+    if periodic {
+        let (left, right, num_basis) = periodic_knot_domain(knots)?;
+        create_periodic_bspline_basis_dense(t, (left, right), degree, num_basis)
+            .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
+    } else {
+        let (basis, _) = create_basis::<Dense>(
+            t,
+            gam::basis::KnotSource::Provided(knots),
+            degree,
+            BasisOptions::value(),
+        )
+        .map_err(|err| format!("failed to evaluate B-spline basis: {err}"))?;
+        Ok((*basis).clone())
+    }
+}
+
+fn bspline_basis_derivative_impl(
+    t: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    order: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    validate_vector("t", t)?;
+    validate_vector("knots", knots)?;
+    if periodic {
+        if order != 1 {
+            return Err(format!(
+                "periodic B-spline derivative supports order=1; got order={order}"
+            ));
+        }
+        let (left, right, num_basis) = periodic_knot_domain(knots)?;
+        create_periodic_bspline_derivative_dense(t, (left, right), degree, num_basis)
+            .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))
+    } else {
+        let options = match order {
+            0 => BasisOptions::value(),
+            1 => BasisOptions::first_derivative(),
+            2 => BasisOptions::second_derivative(),
+            _ => {
+                return Err(format!(
+                    "B-spline derivative supports orders 0, 1, and 2; got order={order}"
+                ));
+            }
+        };
+        let (basis, _) =
+            create_basis::<Dense>(t, gam::basis::KnotSource::Provided(knots), degree, options)
+                .map_err(|err| format!("failed to evaluate B-spline derivative: {err}"))?;
+        Ok((*basis).clone())
+    }
+}
+
+fn duchon_basis_1d_impl(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    m: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    validate_vector("t", t)?;
+    validate_vector("centers", centers)?;
+    if m == 0 {
+        return Err("Duchon m must be at least 1".to_string());
+    }
+    let data = column_array(t);
+    let center_matrix = column_array(centers);
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(center_matrix),
+        length_scale: None,
+        power: 0,
+        nullspace_order: duchon_nullspace_from_m(m),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic,
+    };
+    let built = build_duchon_basis(data.view(), &spec)
+        .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
+    Ok(built.design.to_dense())
+}
+
+fn duchon_basis_1d_derivative_impl(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    m: usize,
+    order: usize,
+    periodic: bool,
+) -> Result<Array2<f64>, String> {
+    match order {
+        0 => return duchon_basis_1d_impl(t, centers, m, periodic),
+        1 | 2 => {}
+        _ => {
+            return Err(format!(
+                "Duchon basis derivative supports orders 0, 1, and 2; got order={order}"
+            ));
+        }
+    }
+    let scale = centers
+        .iter()
+        .copied()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), value| {
+            (lo.min(value), hi.max(value))
+        });
+    let width = (scale.1 - scale.0).abs().max(1.0);
+    let h = 1.0e-5 * width;
+    let plus_t = t.mapv(|value| value + h);
+    let minus_t = t.mapv(|value| value - h);
+    let plus = duchon_basis_1d_impl(plus_t.view(), centers, m, periodic)?;
+    let minus = duchon_basis_1d_impl(minus_t.view(), centers, m, periodic)?;
+    if order == 1 {
+        Ok((&plus - &minus) / (2.0 * h))
+    } else {
+        let center = duchon_basis_1d_impl(t, centers, m, periodic)?;
+        Ok((&plus - &(center * 2.0) + &minus) / (h * h))
+    }
+}
+
+fn smoothness_penalty_impl(
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    order: usize,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    validate_vector("knots", knots)?;
+    if knots.len() <= degree + 1 {
+        return Err(format!(
+            "knot vector is too short for degree={degree}: got {} knots",
+            knots.len()
+        ));
+    }
+    let num_basis = knots.len() - degree - 1;
+    let greville = greville_abscissae(knots, degree, num_basis)?;
+    let penalty = create_difference_penalty_matrix(num_basis, order, Some(greville.view()))
+        .map_err(|err| format!("failed to build smoothness penalty: {err}"))?;
+    let (null_basis, _) = gam::faer_ndarray::rrqr_nullspace_basis(
+        &penalty,
+        gam::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map_err(|err| format!("failed to build penalty null basis: {err}"))?;
+    Ok((penalty, null_basis))
+}
+
+fn validate_vector(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String> {
+    if values.is_empty() {
+        return Err(format!("{name} cannot be empty"));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(format!("{name} must contain only finite values"));
+    }
+    Ok(())
+}
+
+fn periodic_knot_domain(knots: ArrayView1<'_, f64>) -> Result<(f64, f64, usize), String> {
+    if knots.len() < 2 {
+        return Err("periodic knots must contain at least start and end".to_string());
+    }
+    let left = knots[0];
+    let right = knots[knots.len() - 1];
+    if left >= right {
+        return Err(format!(
+            "periodic knot domain must be increasing; got [{left}, {right}]"
+        ));
+    }
+    Ok((left, right, knots.len() - 1))
+}
+
+fn duchon_nullspace_from_m(m: usize) -> DuchonNullspaceOrder {
+    match m {
+        1 => DuchonNullspaceOrder::Zero,
+        2 => DuchonNullspaceOrder::Linear,
+        other => DuchonNullspaceOrder::Degree(other - 1),
+    }
+}
+
+fn column_array(values: ArrayView1<'_, f64>) -> Array2<f64> {
+    values.to_owned().insert_axis(Axis(1))
+}
+
+fn greville_abscissae(
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array1<f64>, String> {
+    if degree == 0 {
+        return Err("smoothness_penalty requires degree >= 1".to_string());
+    }
+    let mut out = Array1::<f64>::zeros(num_basis);
+    for i in 0..num_basis {
+        let mut acc = 0.0;
+        for j in 1..=degree {
+            acc += knots[i + j];
+        }
+        out[i] = acc / degree as f64;
+    }
+    Ok(out)
 }
 
 fn build_standard_payload(

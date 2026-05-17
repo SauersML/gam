@@ -6583,6 +6583,22 @@ impl<'a> RemlState<'a> {
             );
             return Ok(eval.gradient);
         }
+        if let Some(result) =
+            self.try_gaussian_closed_form_reml_eval(p, super::unified::EvalMode::ValueAndGradient)?
+        {
+            let grad = result.gradient.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Gaussian closed-form REML returned no gradient".to_string(),
+                )
+            })?;
+            let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
+            log::debug!(
+                "[REML] grad-only gaussian closed-form done | |g| {:.3e} | total {:.1}ms",
+                gnorm,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+            return Ok(grad);
+        }
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
@@ -6667,6 +6683,38 @@ impl<'a> RemlState<'a> {
                 );
                 return Ok(eval);
             }
+        }
+
+        let direct_mode = if allow_second_order {
+            super::unified::EvalMode::ValueGradientHessian
+        } else {
+            super::unified::EvalMode::ValueAndGradient
+        };
+        if let Some(result) = self.try_gaussian_closed_form_reml_eval(p, direct_mode)? {
+            let gradient = result.gradient.ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "Gaussian closed-form REML returned no gradient".to_string(),
+                )
+            })?;
+            let hessian = if allow_second_order {
+                result.hessian
+            } else {
+                HessianResult::Unavailable
+            };
+            let eval = OuterEval {
+                cost: result.cost,
+                gradient,
+                hessian,
+            };
+            let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+            log::debug!(
+                "[REML] outer-eval gaussian closed-form done | cost {:.6e} | |g| {:.3e} | total {:.1}ms",
+                eval.cost,
+                gnorm,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+            self.cache_manager.store_outer_eval(&rho_key, &eval);
+            return Ok(eval);
         }
 
         let t_pirls = std::time::Instant::now();
