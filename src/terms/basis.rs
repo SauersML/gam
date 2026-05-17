@@ -14128,11 +14128,23 @@ fn fill_real_spherical_harmonics_row(
 }
 
 /// Default L for the harmonic basis when the user does not set `max_degree`.
-/// Targets ~k = 50 columns (mgcv `sos` default), capped at L=12 (168 cols).
+/// Targets ~k = 50 columns (mgcv `sos` default) for sample sizes large enough
+/// to support that many parameters, scaling down toward L=2 for small n
+/// (target ≈ n/4 columns), and capped at L=12 (168 cols) at the upper end.
+///
+/// Why these choices:
+/// - mgcv's `bs="sos"` defaults to k=50 columns → L=6 (L(L+2)=48 ≈ 50).
+/// - On tiny datasets (n=20) a 50-column basis would overfit; rule-of-thumb
+///   keeps ≥ ~4 obs per basis column.
+/// - The L=12 cap (168 cols) matches the historical wisdom that beyond
+///   degree 12 the spherical-harmonic Gram conditioning starts to suffer
+///   under realistic data densities.
 pub fn default_spherical_harmonic_degree(n_rows: usize) -> usize {
-    let target = (n_rows as f64).sqrt().clamp(3.0, 12.0).ceil() as usize;
+    // Convert a target column count into the smallest L with L(L+2) >= target.
+    // L=2 → 8 cols; L=3 → 15; L=4 → 24; L=5 → 35; L=6 → 48; L=7 → 63; L=12 → 168.
+    let target_cols = ((n_rows as f64) * 0.25).min(50.0).max(3.0);
     let mut l = 1usize;
-    while l * (l + 2) < target && l < 12 {
+    while (l as f64) * (l as f64 + 2.0) < target_cols && l < 12 {
         l += 1;
     }
     l.max(2)
