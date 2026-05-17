@@ -5777,14 +5777,22 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
 
     let out = args.out.unwrap_or_else(|| PathBuf::from("synthetic.csv"));
     progress.set_stage("generate", "writing synthetic draws");
-    write_matrix_csv(&out, &draws, "draw")?;
+    // `sampleobservation_replicates` returns shape (n_draws, nobs): each
+    // row is one synthetic observation vector. The natural CSV layout for
+    // users is: one row per input row, one column per draw — so column
+    // headers `draw_0..draw_{n_draws-1}` actually correspond to draws.
+    // Without this transpose the headers were misleading: the file had
+    // n_draws rows and nobs columns labeled "draw_*" even though each
+    // column was really an observation index.
+    let draws_per_row = draws.t().to_owned();
+    write_matrix_csv(&out, &draws_per_row, "draw")?;
     progress.advance_workflow(5);
     progress.finish_progress("generation complete");
     println!(
-        "wrote synthetic draws: {} (draws={}, rows_per_draw={})",
+        "wrote synthetic draws: {} (input_rows={}, draws={})",
         out.display(),
-        draws.nrows(),
-        draws.ncols()
+        draws_per_row.nrows(),
+        draws_per_row.ncols()
     );
     Ok(())
 }
