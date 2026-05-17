@@ -5483,6 +5483,13 @@ mod tests {
         })
     }
 
+    fn by_gate_fd_weights() -> Array1<f64> {
+        Array1::from_shape_fn(20, |row| {
+            let t = (row as f64 - 9.5) / 8.0;
+            0.9 + 0.15 * (1.3 * t).cos() + 0.04 * t
+        })
+    }
+
     fn by_gate_fd_penalty() -> Array2<f64> {
         Array2::from_diag(&array![0.0, 0.4, 1.1, 1.9, 3.0])
     }
@@ -5491,6 +5498,7 @@ mod tests {
         x: ArrayView2<'_, f64>,
         y: ArrayView2<'_, f64>,
         by: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
         penalty: ArrayView2<'_, f64>,
         target: RemlForwardScalar,
     ) -> f64 {
@@ -5499,7 +5507,7 @@ mod tests {
             gated_x.view(),
             y,
             penalty,
-            None,
+            Some(weights),
             Some(0.85),
             None,
         )
@@ -5516,9 +5524,10 @@ mod tests {
         x: ArrayView2<'_, f64>,
         y: ArrayView2<'_, f64>,
         by: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
         penalty: ArrayView2<'_, f64>,
         target: RemlForwardScalar,
-    ) -> (Array2<f64>, Array2<f64>, Array1<f64>) {
+    ) -> (Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>) {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
         let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
@@ -5538,7 +5547,7 @@ mod tests {
             gated_x.view(),
             y,
             penalty,
-            None,
+            Some(weights),
             Some(0.85),
             grad_lambda,
             coefficient_upstream,
@@ -5548,7 +5557,7 @@ mod tests {
         .expect("by-gated analytic backward");
         let (grad_x, grad_by) =
             apply_by_gate_backward(x, by, 1, backward.grad_x.view()).expect("by-gate backward");
-        (grad_x, backward.grad_y, grad_by)
+        (grad_x, backward.grad_y, grad_by, backward.grad_weights)
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
@@ -5566,6 +5575,7 @@ mod tests {
         Array1<f64>,
         Array2<f64>,
         Array1<f64>,
+        Array1<f64>,
     ) {
         let t = Array1::linspace(0.07, 0.93, 18);
         let y = Array2::from_shape_fn((18, 2), |(row, col)| {
@@ -5576,13 +5586,15 @@ mod tests {
         let knots = Array1::linspace(0.0, 1.0, 7);
         let penalty = Array2::from_diag(&array![0.0, 0.8, 1.1, 1.5, 2.0, 2.8]);
         let by = Array1::from_shape_fn(18, |row| 0.9 + 0.1 * (2.0 * t[row]).cos());
-        (t, y, knots, penalty, by)
+        let weights = Array1::from_shape_fn(18, |row| 0.88 + 0.14 * (1.4 * t[row]).sin());
+        (t, y, knots, penalty, by, weights)
     }
 
     fn position_objective(
         t: ArrayView1<'_, f64>,
         y: ArrayView2<'_, f64>,
         by: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
         knots: ArrayView1<'_, f64>,
         penalty: ArrayView2<'_, f64>,
         grad_lambda: f64,
@@ -5597,7 +5609,7 @@ mod tests {
             gated_x.view(),
             y,
             penalty,
-            None,
+            Some(weights),
             Some(0.7),
             None,
         )
@@ -5610,7 +5622,7 @@ mod tests {
 
     #[test]
     fn position_batched_forward_matches_prebuilt_by_gated_design() {
-        let (t, y, knots, penalty, by) = position_fd_inputs();
+        let (t, y, knots, penalty, by, _weights) = position_fd_inputs();
         let offsets = array![0_usize, 9_usize, 18_usize];
         let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
             .expect("position basis");
@@ -5656,8 +5668,8 @@ mod tests {
     }
 
     #[test]
-    fn position_backward_grad_t_y_and_by_match_finite_difference() {
-        let (t, y, knots, penalty, by) = position_fd_inputs();
+    fn position_backward_grad_t_y_by_and_weight_match_finite_difference() {
+        let (t, y, knots, penalty, by, weights) = position_fd_inputs();
         let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
             .expect("position basis");
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
@@ -5676,7 +5688,7 @@ mod tests {
             true,
             Some(1.0),
             penalty.view(),
-            None,
+            Some(weights.view()),
             Some(0.7),
             grad_lambda,
             Some(grad_coefficients.view()),
@@ -5698,6 +5710,7 @@ mod tests {
                 plus.view(),
                 y.view(),
                 by.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5708,6 +5721,7 @@ mod tests {
                 minus.view(),
                 y.view(),
                 by.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5727,6 +5741,7 @@ mod tests {
                 t.view(),
                 plus.view(),
                 by.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5737,6 +5752,7 @@ mod tests {
                 t.view(),
                 minus.view(),
                 by.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5760,6 +5776,7 @@ mod tests {
                 t.view(),
                 y.view(),
                 plus.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5770,6 +5787,7 @@ mod tests {
                 t.view(),
                 y.view(),
                 minus.view(),
+                weights.view(),
                 knots.view(),
                 penalty.view(),
                 grad_lambda,
@@ -5779,13 +5797,49 @@ mod tests {
             )) / (2.0 * eps);
             assert_fd_close(&format!("position by[{row}]"), grad_by[row], fd);
         }
+
+        for row in [1_usize, 7, 13] {
+            let mut plus = weights.clone();
+            let mut minus = weights.clone();
+            plus[row] += eps;
+            minus[row] -= eps;
+            let fd = (position_objective(
+                t.view(),
+                y.view(),
+                by.view(),
+                plus.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            ) - position_objective(
+                t.view(),
+                y.view(),
+                by.view(),
+                minus.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )) / (2.0 * eps);
+            assert_fd_close(
+                &format!("position weights[{row}]"),
+                backward.grad_weights[row],
+                fd,
+            );
+        }
     }
 
     #[test]
-    fn by_gate_backward_matches_forward_finite_difference_for_all_x_y_and_gate_entries() {
+    fn by_gate_backward_matches_forward_finite_difference_for_all_x_y_gate_and_weight_entries() {
         let x = by_gate_fd_design();
         let y = by_gate_fd_response();
         let by = by_gate_fd_values();
+        let weights = by_gate_fd_weights();
         let penalty = by_gate_fd_penalty();
         let targets = [
             RemlForwardScalar::Lambda,
@@ -5796,8 +5850,14 @@ mod tests {
         let eps = 1.0e-5;
 
         for target in targets {
-            let (grad_x, grad_y, grad_by) =
-                by_gate_backward(x.view(), y.view(), by.view(), penalty.view(), target);
+            let (grad_x, grad_y, grad_by, grad_weights) = by_gate_backward(
+                x.view(),
+                y.view(),
+                by.view(),
+                weights.view(),
+                penalty.view(),
+                target,
+            );
 
             for row in 0..x.nrows() {
                 for col in 0..x.ncols() {
@@ -5809,12 +5869,14 @@ mod tests {
                         plus.view(),
                         y.view(),
                         by.view(),
+                        weights.view(),
                         penalty.view(),
                         target,
                     ) - by_gate_objective(
                         minus.view(),
                         y.view(),
                         by.view(),
+                        weights.view(),
                         penalty.view(),
                         target,
                     )) / (2.0 * eps);
@@ -5836,12 +5898,14 @@ mod tests {
                         x.view(),
                         plus.view(),
                         by.view(),
+                        weights.view(),
                         penalty.view(),
                         target,
                     ) - by_gate_objective(
                         x.view(),
                         minus.view(),
                         by.view(),
+                        weights.view(),
                         penalty.view(),
                         target,
                     )) / (2.0 * eps);
@@ -5858,17 +5922,49 @@ mod tests {
                 let mut minus = by.clone();
                 plus[row] += eps;
                 minus[row] -= eps;
-                let fd =
-                    (by_gate_objective(x.view(), y.view(), plus.view(), penalty.view(), target)
-                        - by_gate_objective(
-                            x.view(),
-                            y.view(),
-                            minus.view(),
-                            penalty.view(),
-                            target,
-                        ))
-                        / (2.0 * eps);
+                let fd = (by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    plus.view(),
+                    weights.view(),
+                    penalty.view(),
+                    target,
+                ) - by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    minus.view(),
+                    weights.view(),
+                    penalty.view(),
+                    target,
+                )) / (2.0 * eps);
                 assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
+            }
+
+            for row in 0..weights.len() {
+                let mut plus = weights.clone();
+                let mut minus = weights.clone();
+                plus[row] += eps;
+                minus[row] -= eps;
+                let fd = (by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    by.view(),
+                    plus.view(),
+                    penalty.view(),
+                    target,
+                ) - by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    by.view(),
+                    minus.view(),
+                    penalty.view(),
+                    target,
+                )) / (2.0 * eps);
+                assert_fd_close(
+                    &format!("target={target:?} weights[{row}]"),
+                    grad_weights[row],
+                    fd,
+                );
             }
         }
     }
