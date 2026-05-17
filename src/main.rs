@@ -3893,9 +3893,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     .to_string(),
             );
         }
-        other => return Err(format!(
-            "unsupported survmodel(spec='{other}'); only spec=net is accepted by the one-hazard fitter"
-        )),
+        other => {
+            return Err(format!(
+                "unsupported survmodel(spec='{other}'); only spec=net is accepted by the one-hazard fitter"
+            ));
+        }
     };
     let requested_likelihood_mode =
         parse_survival_likelihood_mode(&effective_args.survival_likelihood)?;
@@ -15159,8 +15161,8 @@ mod tests {
             "expected actionable 2-arg error, got: {err}"
         );
         // 1-arg, 4-arg, etc still get the generic message
-        let err = parse_surv_response("Surv(entry_time)")
-            .expect_err("invalid Surv arity should fail");
+        let err =
+            parse_surv_response("Surv(entry_time)").expect_err("invalid Surv arity should fail");
         assert!(err.contains("expects exactly three columns"));
     }
 
