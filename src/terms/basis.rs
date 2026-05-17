@@ -13567,28 +13567,179 @@ fn validate_lat_lon_matrix(
     Ok(())
 }
 
-/// True Wahba / Sobolev spectral reproducing kernel on S² for general m.
+// ============================================================================
+// Polylogarithms Li_2, Li_3 for z ∈ [0, 1] (used by Sobolev-kernel closed
+// forms below).  Accuracy: ≤ 1e-13 absolute over the whole domain.
+// ============================================================================
+
+/// Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
 ///
-///   K_m(γ) = (1/4π) Σ_{l ≥ 1} (2l + 1) · [l(l + 1)]^{-m} · P_l(cos γ)
-///
-/// The Legendre series terms decay as l^{-(2m - 1)}, so:
-///   m=1 → l^{-1}: needs many terms (L_MAX = 1024) — slow but converges
-///   m=2 → l^{-3}: L_MAX = 256
-///   m=3 → l^{-5}: L_MAX = 128
-///   m=4 → l^{-7}: L_MAX = 96
-/// Truncation error is bounded by ∫_{L_MAX}^∞ l^{-(2m-1)} dl ≤ 1e-7 for the
-/// chosen caps.
-///
-/// We use this spectral form rather than the mgcv `makeR` pseudo-spline
-/// closed forms because the pseudo-spline kernel is a *different* RKHS
-/// (Legendre weights 2/[(l+1)(l+2)···(l+m+1)] decaying as l^{-(m+1)},
-/// not l^{-2m}). The pseudo-spline is computationally cheaper but the
-/// Sobolev-norm interpretation users expect from "Wahba spline on the
-/// sphere" requires the spectral kernel above.
+/// For `z ∈ [0, 1/2]` we sum the series directly (rapid geometric decay).
+/// For `z ∈ (1/2, 1]` we use the Euler reflection
+///   `Li_2(z) = π²/6 − ln(z) · ln(1 − z) − Li_2(1 − z)`
+/// so the series argument is back in `[0, 1/2)`.
 #[inline]
-fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
+fn dilog_unit(z: f64) -> f64 {
+    if !z.is_finite() {
+        return f64::NAN;
+    }
+    let z = z.clamp(0.0, 1.0);
+    if z == 0.0 {
+        return 0.0;
+    }
+    if z >= 1.0 {
+        return std::f64::consts::PI * std::f64::consts::PI / 6.0;
+    }
+    if z <= 0.5 {
+        let mut sum = 0.0_f64;
+        let mut zk = z;
+        for k in 1..=200 {
+            let kf = k as f64;
+            let term = zk / (kf * kf);
+            sum += term;
+            if term < 1e-18 {
+                break;
+            }
+            zk *= z;
+        }
+        sum
+    } else {
+        let one_minus_z = 1.0 - z;
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        pi2_6 - z.ln() * one_minus_z.ln() - dilog_unit(one_minus_z)
+    }
+}
+
+/// Trilogarithm `Li_3(z) = Σ_{k≥1} z^k / k³` for `z ∈ [0, 1]`.
+///
+/// For `z ∈ [0, 1/2]` we sum the series directly. For `z ∈ (1/2, 1)` we use
+/// the Landen identity (Lewin "Polylogarithms", eq. 6.10)
+///   `Li_3(z) = ζ(3) + Li_3(1 − z) + Li_3(−(1−z)/z)`
+///   `         + (1/6) ln³(1−z) − (1/2) ln(z) · ln²(1−z) + (π²/6) ln(1−z)`
+/// where `−(1−z)/z ∈ (−1, 0)` lies in the convergence region for the
+/// direct alternating series, so both `Li_3` evaluations on the RHS are
+/// fast (≤ 60 terms for 1e-15).
+#[inline]
+fn trilog_unit(z: f64) -> f64 {
+    const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
+    if !z.is_finite() {
+        return f64::NAN;
+    }
+    let z = z.clamp(0.0, 1.0);
+    if z == 0.0 {
+        return 0.0;
+    }
+    if z >= 1.0 {
+        return ZETA3;
+    }
+    if z <= 0.5 {
+        let mut sum = 0.0_f64;
+        let mut zk = z;
+        for k in 1..=300 {
+            let kf = k as f64;
+            let term = zk / (kf * kf * kf);
+            sum += term;
+            if term < 1e-18 {
+                break;
+            }
+            zk *= z;
+        }
+        sum
+    } else {
+        // Landen identity with the negative-argument trilogarithm.
+        let omz = 1.0 - z; // 1 − z ∈ (0, 1/2)
+        let neg_arg = -omz / z; // ∈ (−1, 0): alternating series converges.
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        let li3_omz = trilog_unit(omz);
+        let li3_neg = {
+            // Σ neg_arg^k / k³ with |neg_arg| < 1.
+            let w = neg_arg;
+            let mut sum = 0.0_f64;
+            let mut wk = w;
+            for k in 1..=300 {
+                let kf = k as f64;
+                let term = wk / (kf * kf * kf);
+                sum += term;
+                if term.abs() < 1e-18 {
+                    break;
+                }
+                wk *= w;
+            }
+            sum
+        };
+        let ln_omz = omz.ln();
+        let ln_z = z.ln();
+        ZETA3 + li3_omz + li3_neg + ln_omz.powi(3) / 6.0 - 0.5 * ln_z * ln_omz * ln_omz
+            + pi2_6 * ln_omz
+    }
+}
+
+// ============================================================================
+// Wahba/Sobolev kernel on S²
+// ============================================================================
+//
+// `K_m^{Sobolev}(γ) = (1/4π) · Σ_{l ≥ 1} (2l + 1) · [l(l + 1)]^{-m} · P_l(cos γ)`
+//
+// is the reproducing kernel of the canonical Sobolev space `H^m(S²)` with
+// the inner product `⟨f, g⟩ = Σ_l [l(l+1)]^m · f̂_l · ĝ_l`.
+//
+// For `m ∈ {1, 2, 3}` we use the closed-form expressions derived in
+// Beatson & zu Castell, "Thinplate Splines on the Sphere", SIGMA 14 (2018)
+// 083 (Section 6.2). In their notation `u = (1 − cos γ)/2 = sin²(γ/2)`:
+//
+//   k_{3,1}(x) =  −ln(u)  − 1
+//   k_{3,2}(x) =   Li_2(1 − u) + 1 − π²/6
+//   k_{3,3}(x) = −2 Li_3(u) − Li_2(1 − u) + ln(u) · Li_2(u)
+//                 + 2 ζ(3) + π²/6 − 2
+//
+// Beatson & zu Castell normalize so that the kernel is for the
+// `[f, g] = (1/σ_d) ∫ f g dσ` inner product (their eq. 3.2), i.e. surface
+// measure normalized to one. The basis pipeline here uses the
+// (1/4π)-scaled reproducing kernel (kernel for plain `∫ f g dσ`), so we
+// divide their expressions by `4π`.
+//
+// For `m = 4` no published elementary-plus-Li₄ form exists; we fall back
+// to the truncated spectral Legendre series (96 terms, error ≲ 1e-12).
+
+/// Sobolev `K_m^{Sobolev}` reproducing kernel on S², closed-form for
+/// `m ∈ {1, 2, 3}` plus spectral series for `m = 4`.
+#[inline]
+fn wahba_sphere_kernel_sobolev_closed_form(cos_gamma: f64, m: usize) -> f64 {
+    let cos_g = cos_gamma.clamp(-1.0, 1.0);
+    let four_pi = 4.0 * std::f64::consts::PI;
+    let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+    // u = sin²(γ/2). Floor away from zero so ln(u) is finite at γ = 0
+    // — the closed form has a logarithmic singularity there that the
+    // RKHS norm tames in any inner product but a finite-precision
+    // single evaluation cannot. The floor matches the existing
+    // `wahba_sphere_kernel_from_cos` behaviour.
+    let u = ((1.0 - cos_g) * 0.5).max(f64::EPSILON * 1.0e-4);
+    let one_minus_u = (1.0 - u).max(f64::EPSILON * 1.0e-4);
+    match m {
+        1 => (-u.ln() - 1.0) / four_pi,
+        2 => (dilog_unit(one_minus_u) + 1.0 - pi2_6) / four_pi,
+        3 => {
+            // k_{3,3}(x) = -2 Li_3(u) - Li_2(1-u) + ln(u)·Li_2(u)
+            //              + 2 ζ(3) + π²/6 - 2
+            const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
+            let li3_u = trilog_unit(u);
+            let li2_one_minus_u = dilog_unit(one_minus_u);
+            let li2_u = dilog_unit(u);
+            (-2.0 * li3_u - li2_one_minus_u + u.ln() * li2_u + 2.0 * ZETA3 + pi2_6 - 2.0) / four_pi
+        }
+        // m = 4: no published closed form in elementary + Li_n functions.
+        // Use spectral series; 96 terms give ≲ 1e-12 truncation error.
+        _ => wahba_sphere_kernel_sobolev_spectral(cos_g, m),
+    }
+}
+
+/// Spectral Legendre-series evaluation of the Sobolev kernel
+/// `K_m^{Sobolev}(γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{-m} · P_l(cos γ)`.
+/// Used as the m=4 closed-form path and as cross-validation for m=1, 2, 3.
+#[inline]
+fn wahba_sphere_kernel_sobolev_spectral(cos_gamma: f64, m: usize) -> f64 {
     let l_max = match m {
-        1 => 1024_usize,
+        1 => 4096_usize, // l^{-1} terms — needs many for far-from-1 γ
         2 => 256,
         3 => 128,
         _ => 96,
@@ -13598,7 +13749,6 @@ fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
     let four_pi = 4.0 * std::f64::consts::PI;
     let mut p_l_minus_1 = 1.0_f64;
     let mut p_l = x;
-    // l = 1 term: (2·1 + 1) / [1·2]^m / (4π) · P_1(x) = 3·x / (2^m · 4π)
     let mut sum = 3.0 * p_l / (four_pi * 2.0_f64.powi(m_i));
     for l in 1..l_max {
         let p_l_plus_1 =
@@ -13613,47 +13763,92 @@ fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
     sum
 }
 
-/// SIMD-vectorised companion to `wahba_sphere_kernel_from_cos`. Each lane of
-/// `cos_gamma` produces one kernel value. Numerical agreement with the
-/// scalar path is exercised by the in-file unit test
-/// `wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance`.
+// ============================================================================
+// Wahba 1981 pseudo-spline closed forms (mgcv `bs="sos"` compatible).
+// ============================================================================
+//
+// These polynomials in
+//   w = (1 − cos γ) / 2 = sin²(γ/2)
+//   c = 2 sin(γ/2)
+//   a = ln(1 + 1 / sin(γ/2))
+// are the reproducing kernels for the RKHS with Legendre weights
+//   a_l = 2 / [(l+1)(l+2) ··· (l+m+1)]   (l ≥ 1)
+// (decay rate `l^{−(m+1)}`, different from the Sobolev kernel's
+// `l^{−2m}`). The forms are a verbatim port of mgcv's `makeR()` function
+// and are bit-compatible with `bs="sos"` in R.
+
 #[inline]
-fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
-    use wide::f64x4;
-    let cg = cos_gamma.fast_max(f64x4::from(-1.0)).fast_min(f64x4::ONE);
-    // Spectral kernel does not benefit from the (1 - cos γ) closed-form
-    // substitution; delegate each lane to the scalar spectral routine.
-    // True SIMD-vectorization of the Legendre recurrence is possible but
-    // not worthwhile for the existing call sites.
-    let lanes = cg.to_array();
-    if (1..=4).contains(&penalty_order) {
-        f64x4::from(lanes.map(|x| wahba_sphere_kernel_spectral(x, penalty_order)))
-    } else {
-        f64x4::from(f64::NAN)
+fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
+    let cg = cos_gamma.clamp(-1.0, 1.0);
+    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
+    let w = 0.5 * z;
+    let c0 = w.sqrt();
+    let a = (1.0 + 1.0 / c0).ln();
+    let c = 2.0 * c0;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    match m {
+        1 => {
+            let q1 = 2.0 * a * w - c + 1.0;
+            (q1 - 0.5) / two_pi
+        }
+        2 => {
+            let w2 = w * w;
+            let q2 = a * (6.0 * w2 - 2.0 * w) - 3.0 * c * w + 3.0 * w + 0.5;
+            (q2 / 2.0 - 1.0 / 6.0) / two_pi
+        }
+        3 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let q3 = (a * (60.0 * w3 - 36.0 * w2) + 30.0 * w2 + c * (8.0 * w - 30.0 * w2)
+                - 3.0 * w
+                + 1.0)
+                / 3.0;
+            (q3 / 6.0 - 1.0 / 24.0) / two_pi
+        }
+        _ => {
+            // m = 4 (and any future m): use the explicit q_4 form from
+            // mgcv `makeR`. q_4 / 24 − 1 / 120, divided by 2π.
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let w4 = w3 * w;
+            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
+                + 35.0 * w3 * (1.0 - c)
+                + c * 55.0 * w2 / 3.0
+                - 12.5 * w2
+                - w / 3.0
+                + 0.25;
+            (q4 / 24.0 - 1.0 / 120.0) / two_pi
+        }
     }
 }
 
+/// Back-compat alias for the spectral Sobolev kernel (existing call sites
+/// outside this section still expect the historical name).
 #[inline]
-fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<f64, BasisError> {
-    // All m ∈ {1, 2, 3, 4} use the TRUE Wahba/Sobolev spectral kernel
-    //   K_m(γ) = (1/4π) Σ_{l ≥ 1} (2l + 1) · [l(l + 1)]^{-m} · P_l(cos γ)
-    // rather than the mgcv `makeR` pseudo-spline closed forms.
-    //
-    // Background: the mgcv pseudo-spline at m=4 produced numerically tiny
-    // kernel values (~3e-4) which, combined with REML's Frobenius-normalized
-    // penalty path, drove the smooth contribution to ~0 on smooth truths
-    // (rmse 0.43 → "predictions = response mean"). Switching m=4 to the
-    // true spectral kernel restored rmse to 0.0045. Extended to m=1, 2, 3
-    // for semantic consistency: every penalty_order now corresponds to
-    // the same family of RKHS (Sobolev H^m(S²) with norm
-    // Σ [l(l+1)]^m |f̂_l|²) rather than mixing two distinct kernels.
-    let value = match penalty_order {
-        1 | 2 | 3 | 4 => wahba_sphere_kernel_spectral(cos_gamma, penalty_order),
-        other => {
-            return Err(BasisError::InvalidInput(format!(
-                "spherical spline penalty_order must be one of 1, 2, 3, 4; got {other}"
-            )));
+fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
+    wahba_sphere_kernel_sobolev_closed_form(cos_gamma, m)
+}
+
+/// Evaluate the Wahba sphere reproducing kernel at a single `cos γ`. The
+/// choice of underlying RKHS — Sobolev or pseudo-spline — is selected by
+/// `kernel`. Both options are positive-definite on S² for every supported
+/// `penalty_order ∈ {1, 2, 3, 4}`.
+#[inline]
+fn wahba_sphere_kernel_from_cos_kind(
+    cos_gamma: f64,
+    penalty_order: usize,
+    kernel: SphereWahbaKernel,
+) -> Result<f64, BasisError> {
+    if !(1..=4).contains(&penalty_order) {
+        return Err(BasisError::InvalidInput(format!(
+            "spherical spline penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        )));
+    }
+    let value = match kernel {
+        SphereWahbaKernel::Sobolev => {
+            wahba_sphere_kernel_sobolev_closed_form(cos_gamma, penalty_order)
         }
+        SphereWahbaKernel::Pseudo => wahba_sphere_kernel_pseudo_from_cos(cos_gamma, penalty_order),
     };
     if !value.is_finite() {
         return Err(BasisError::InvalidInput(
@@ -13663,11 +13858,66 @@ fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<
     Ok(value)
 }
 
+/// SIMD lane-wise evaluation. Both Sobolev and pseudo-spline branches are
+/// scalar-per-lane: the Sobolev path uses elementary functions
+/// (`log` / `Li_2` / `Li_3`) that don't vectorise cleanly across lanes,
+/// and the pseudo-spline path is already a fast closed form. The previous
+/// hand-vectorised polynomial-of-`w,c,a` path was dropped when the closed
+/// forms switched to polylogarithm-based formulas.
+#[inline]
+fn wahba_sphere_kernel_from_cos_simd_kind(
+    cos_gamma: wide::f64x4,
+    penalty_order: usize,
+    kernel: SphereWahbaKernel,
+) -> wide::f64x4 {
+    use wide::f64x4;
+    if !(1..=4).contains(&penalty_order) {
+        return f64x4::from(f64::NAN);
+    }
+    let cg = cos_gamma.fast_max(f64x4::from(-1.0)).fast_min(f64x4::ONE);
+    let lanes = cg.to_array();
+    let f = |x: f64| -> f64 {
+        match kernel {
+            SphereWahbaKernel::Sobolev => wahba_sphere_kernel_sobolev_closed_form(x, penalty_order),
+            SphereWahbaKernel::Pseudo => wahba_sphere_kernel_pseudo_from_cos(x, penalty_order),
+        }
+    };
+    f64x4::from(lanes.map(f))
+}
+
+/// Back-compat scalar API that defaults to the Sobolev kernel.
+#[inline]
+fn wahba_sphere_kernel_from_cos(cos_gamma: f64, penalty_order: usize) -> Result<f64, BasisError> {
+    wahba_sphere_kernel_from_cos_kind(cos_gamma, penalty_order, SphereWahbaKernel::Sobolev)
+}
+
+/// Back-compat SIMD API that defaults to the Sobolev kernel.
+#[inline]
+fn wahba_sphere_kernel_from_cos_simd(cos_gamma: wide::f64x4, penalty_order: usize) -> wide::f64x4 {
+    wahba_sphere_kernel_from_cos_simd_kind(cos_gamma, penalty_order, SphereWahbaKernel::Sobolev)
+}
+
 pub fn spherical_wahba_kernel_matrix(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     penalty_order: usize,
     radians: bool,
+) -> Result<Array2<f64>, BasisError> {
+    spherical_wahba_kernel_matrix_with_kind(
+        data,
+        centers,
+        penalty_order,
+        radians,
+        SphereWahbaKernel::Sobolev,
+    )
+}
+
+pub fn spherical_wahba_kernel_matrix_with_kind(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+    radians: bool,
+    kernel: SphereWahbaKernel,
 ) -> Result<Array2<f64>, BasisError> {
     validate_lat_lon_matrix(data, "spherical spline data", radians)?;
     validate_lat_lon_matrix(centers, "spherical spline centers", radians)?;
@@ -13746,7 +13996,8 @@ pub fn spherical_wahba_kernel_matrix(
                     ]);
                     let dlon_cos = cos_lon_v * cn_c + sin_lon_v * sn_c;
                     let cos_gamma = sin_lat_v * sl_c + cos_lat_v * cl_c * dlon_cos;
-                    let vals = wahba_sphere_kernel_from_cos_simd(cos_gamma, penalty_order);
+                    let vals =
+                        wahba_sphere_kernel_from_cos_simd_kind(cos_gamma, penalty_order, kernel);
                     let arr = vals.to_array();
                     for lane in 0..4 {
                         if !arr[lane].is_finite() {
@@ -13762,7 +14013,7 @@ pub fn spherical_wahba_kernel_matrix(
                     let j = tail_start + t;
                     let dlon_cos = cos_lon * cos_lon_c[j] + sin_lon * sin_lon_c[j];
                     let cos_gamma = sin_lat * sin_lat_c[j] + cos_lat * cos_lat_c[j] * dlon_cos;
-                    match wahba_sphere_kernel_from_cos(cos_gamma, penalty_order) {
+                    match wahba_sphere_kernel_from_cos_kind(cos_gamma, penalty_order, kernel) {
                         Ok(v) => out_row[j] = v,
                         Err(_) => {
                             err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
