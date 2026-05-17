@@ -20,6 +20,12 @@ The three arguments are column names:
 All three must be present in `data` as numeric columns. Negative entry
 times are allowed; `exit >= entry` is required per row.
 
+!!! note "Coming from mgcv / R"
+    gam only supports the 3-column form `Surv(entry, exit, event)`. The
+    R/mgcv 2-column `Surv(time, status)` form is rejected with a hint
+    explaining how to add an `entry` column of zeros if there is no
+    left truncation.
+
 ## Likelihood modes
 
 Pick one via `survival_likelihood=` on `fit()`:
