@@ -9,6 +9,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
