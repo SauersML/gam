@@ -45,6 +45,9 @@ pub struct DispatchPolicy {
     /// Minimum trailing dimension `p` to dispatch symmetric
     /// eigendecomposition through cuSOLVER (`dsyevd`).
     pub syevd_min_p: usize,
+    /// Minimum estimated FLOPs to dispatch dense triangular solves through
+    /// cuBLAS (`dtrsm`).
+    pub trsm_min_flops: u64,
 }
 
 impl DispatchPolicy {
@@ -67,6 +70,10 @@ impl DispatchPolicy {
             peak_gpu_gflops,
         );
         let gemv_min_flops = flops_threshold(
+            /*payload_bytes=*/ 64.0 * 1024.0 * 1024.0,
+            peak_gpu_gflops,
+        );
+        let trsm_min_flops = flops_threshold(
             /*payload_bytes=*/ 64.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
         );
@@ -96,6 +103,7 @@ impl DispatchPolicy {
             spmv_min_rows,
             chol_min_p,
             syevd_min_p,
+            trsm_min_flops,
         }
     }
 
@@ -108,6 +116,7 @@ impl DispatchPolicy {
             spmv_min_rows: usize::MAX,
             chol_min_p: usize::MAX,
             syevd_min_p: usize::MAX,
+            trsm_min_flops: u64::MAX,
         }
     }
 
@@ -119,6 +128,14 @@ impl DispatchPolicy {
     /// Should a symmetric eigendecomposition route to the device?
     pub fn route_syevd(&self, p: usize) -> bool {
         p >= self.syevd_min_p
+    }
+
+    /// Should a dense triangular solve route to the device?
+    pub fn route_trsm(&self, p: usize, rhs_cols: usize) -> bool {
+        let flops = (p as u64)
+            .saturating_mul(p as u64)
+            .saturating_mul(rhs_cols.max(1) as u64);
+        flops >= self.trsm_min_flops
     }
 
     /// Should a dense `Xᵀ diag(w) Y` route to the device?
@@ -225,6 +242,7 @@ mod tests {
         assert!(!p.route_csr_spmv(1_000_000, 1_000_000, 1_000_000_000));
         assert!(!p.route_chol_solve(1_000_000));
         assert!(!p.route_syevd(1_000_000));
+        assert!(!p.route_trsm(1_000_000, 1_000_000));
     }
 
     #[test]
@@ -257,5 +275,7 @@ mod tests {
         assert!(p.route_chol_solve(p.chol_min_p));
         assert!(!p.route_syevd(p.syevd_min_p.saturating_sub(1)));
         assert!(p.route_syevd(p.syevd_min_p));
+        assert!(!p.route_trsm(128, 128));
+        assert!(p.route_trsm(8_192, 8_192));
     }
 }
