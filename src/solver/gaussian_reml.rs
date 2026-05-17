@@ -2228,11 +2228,22 @@ mod tests {
     }
 
     fn finite_difference_response(outputs: usize) -> Array2<f64> {
+        // The truth must NOT lie (essentially) in span(X). The 5-column design
+        // is Legendre P_0..P_4, so a low-order polynomial + low-frequency sin
+        // would be fit to near machine precision — driving σ² → 0, dp → 0,
+        // and ∂score/∂y ≈ ν w r / dp → ∞. Central finite differences with
+        // Richardson extrapolation cannot resolve such steep, highly-nonlinear
+        // surfaces at 1e-6 relative because the truncation term scales with
+        // f^(5)(y), which explodes in that regime. The high-frequency sin
+        // below is well outside span(P_0..P_4) on t ∈ [-0.95, 0.95], leaving
+        // a genuine residual (σ² ≈ 1e-3) and an interior REML optimum
+        // (ρ ≈ -3) at which the analytic-vs-FD comparison is meaningful.
         Array2::from_shape_fn((20, outputs), |(row, output)| {
             let t = (row as f64 - 9.5) / 10.0;
             let phase = output as f64 + 1.0;
             0.2 + 0.25 * phase * t - 0.12 * t * t
                 + (0.08 + 0.03 * phase) * (1.1 * t + 0.3 * phase).sin()
+                + 0.05 * (7.0 * t + 0.5 * phase).sin()
         })
     }
 
@@ -2307,18 +2318,7 @@ mod tests {
     }
 
     fn assert_fd_close(label: &str, analytic: f64, finite_difference: f64) {
-        // The cost target (RemlScore) uses the envelope identity
-        // `∂cost/∂ρ = 0` at the optimizer's returned ρ; that identity is exact
-        // only to GRAD_TOL=1e-12 of the inner Newton step, leaving a residue
-        // ≈ GRAD_TOL · dρ/dX in the comparison against FD that scales with the
-        // gradient magnitude. Lambda/Coefficient/Fitted exercise the same
-        // analytic machinery without relying on the envelope identity, so they
-        // stay at strict 1e-6.
-        let rel_tol = if label.contains("RemlScore") {
-            3.0e-6_f64
-        } else {
-            1.0e-6_f64
-        };
+        let rel_tol = 1.0e-6_f64;
         let abs_tol = 1.0e-6_f64;
         let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
         let diff = (analytic - finite_difference).abs();
