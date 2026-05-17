@@ -94,8 +94,21 @@ fn run(formula: &str) -> (f64, f64, f64) {
     let rmse_dense = (sum_dense / 100.0).sqrt();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Find WHERE the worst prediction in the sparse region occurs
+    let mut worst_sparse_x = 0.0;
+    let mut worst_sparse_dev = 0.0_f64;
+    let mut worst_sparse_pred = 0.0;
+    for i in 0..100 {
+        let dev = (pred[i] - truth_all[i]).abs();
+        if dev > worst_sparse_dev {
+            worst_sparse_dev = dev;
+            worst_sparse_x = all[i];
+            worst_sparse_pred = pred[i];
+        }
+    }
     eprintln!(
-        "[diag] `{formula}` rmse_sparse={rmse_sparse:.4} (max_dev={max_dev_sparse:.4}) rmse_dense={rmse_dense:.4} (max_dev={max_dev_dense:.4}) pred_range=[{mn:.3}, {mx:.3}]"
+        "[diag] `{formula}` rmse_sparse={rmse_sparse:.4} (max_dev={max_dev_sparse:.4} @ x={worst_sparse_x:.4} pred={worst_sparse_pred:.3} truth={:.3}) rmse_dense={rmse_dense:.4} (max_dev={max_dev_dense:.4}) pred_range=[{mn:.3}, {mx:.3}]",
+        truth(worst_sparse_x)
     );
     all.clear(); // suppress lint
     (rmse_sparse, rmse_dense, mx - mn)
