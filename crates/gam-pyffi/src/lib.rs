@@ -4387,18 +4387,20 @@ mod batch_tests {
     #[test]
     fn position_batched_backward_grad_t_matches_direct_t_finite_difference() {
         let t = array![
-            0.08, 0.16, 0.27, 0.39, 0.51, 0.64, 0.76, 0.14, 0.24, 0.36, 0.52, 0.68, 0.84
+            0.08, 0.16, 0.27, 0.39, 0.51, 0.64, 0.76, 0.89, 0.10, 0.19, 0.31, 0.43, 0.56, 0.68,
+            0.80, 0.92
         ];
         let y = Array2::from_shape_fn((t.len(), 2), |(row, output)| {
             let u = t[row];
             let scale = output as f64 + 1.0;
             0.3 + 0.4 * scale * u + 0.15 * (2.0 * u + 0.2 * scale).sin()
         });
-        let offsets = array![0_usize, 7_usize, 13_usize];
+        let offsets = array![0_usize, 8_usize, 16_usize];
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0];
-        let penalty = Array2::from_diag(&array![0.0, 0.35, 0.8, 1.4, 2.2, 3.1, 4.0]);
+        let penalty = Array2::from_diag(&array![0.2, 0.35, 0.8, 1.4, 2.2, 3.1, 4.0]);
         let weights = array![
-            1.0, 0.9, 1.1, 1.2, 0.85, 1.05, 0.95, 1.0, 1.15, 0.88, 1.04, 0.93, 1.08
+            1.0, 0.9, 1.1, 1.2, 0.85, 1.05, 0.95, 1.07, 1.0, 1.15, 0.88, 1.04, 0.93, 1.08, 0.97,
+            1.12
         ];
         let grad_lambda = array![0.07, -0.04];
         let grad_reml_score = array![0.11, -0.06];
@@ -4466,7 +4468,7 @@ mod batch_tests {
             value
         };
 
-        let eps = 1.0e-6;
+        let eps = 1.0e-7;
         for row in 0..t.len() {
             let mut plus = t.clone();
             let mut minus = t.clone();
