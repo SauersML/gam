@@ -3512,9 +3512,13 @@ fn run_predict_survival(
 fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Diagnose", 5);
-    if !args.alo {
-        return Err("only --alo is currently implemented for diagnose".to_string());
-    }
+    // `diagnose` currently has exactly one implemented diagnostic: ALO. Rather
+    // than erroring with "only --alo is currently implemented for diagnose"
+    // when the user runs the bare subcommand, just run ALO. This is the
+    // useful default and matches user expectation that `gam diagnose` does
+    // SOMETHING (a smoke-test for the most common workflow). If/when more
+    // diagnostics land, this path can route based on explicit flags.
+    let _ = args.alo;
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
