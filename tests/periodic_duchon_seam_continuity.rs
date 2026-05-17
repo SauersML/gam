@@ -17,9 +17,7 @@
 //!   higher-D periodic geometry  → `te(...)` with `bc=['periodic', ...]`
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -53,10 +51,7 @@ fn periodic_duchon_formula_returns_actionable_redirect_error() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    for formula in &[
-        "y ~ duchon(t, periodic=true)",
-        "y ~ duchon(t, cyclic=true)",
-    ] {
+    for formula in &["y ~ duchon(t, periodic=true)", "y ~ duchon(t, cyclic=true)"] {
         let err = fit_from_formula(formula, &data, &cfg).err().expect(
             "duchon(..., periodic=true) must fail at fit-time until the periodic kappa derivative is implemented",
         );
@@ -76,7 +71,8 @@ fn periodic_duchon_formula_returns_actionable_redirect_error() {
         );
         // Must mention the recommended alternative so the user can act.
         assert!(
-            lower.contains("s(") && (lower.contains("periodic=true") || lower.contains("periodic = true")),
+            lower.contains("s(")
+                && (lower.contains("periodic=true") || lower.contains("periodic = true")),
             "expected redirect to s(..., periodic=true) for `{formula}`, got: {msg}",
         );
     }

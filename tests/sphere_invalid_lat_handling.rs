@@ -36,7 +36,10 @@ fn make_data_with_lats(lats: &[f64]) -> gam::data::EncodedDataset {
 #[test]
 fn sphere_training_rejects_lat_above_90() {
     init_parallelism();
-    let bad_lats: Vec<f64> = (0..40).map(|i| -75.0 + 4.0 * i as f64).chain([95.0]).collect();
+    let bad_lats: Vec<f64> = (0..40)
+        .map(|i| -75.0 + 4.0 * i as f64)
+        .chain([95.0])
+        .collect();
     let data = make_data_with_lats(&bad_lats);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -55,7 +58,10 @@ fn sphere_training_rejects_lat_above_90() {
 #[test]
 fn sphere_training_rejects_lat_below_neg90() {
     init_parallelism();
-    let bad_lats: Vec<f64> = (0..40).map(|i| -75.0 + 4.0 * i as f64).chain([-100.0]).collect();
+    let bad_lats: Vec<f64> = (0..40)
+        .map(|i| -75.0 + 4.0 * i as f64)
+        .chain([-100.0])
+        .collect();
     let data = make_data_with_lats(&bad_lats);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -114,7 +120,10 @@ fn sphere_predict_with_lat_above_90_rejects_cleanly() {
 #[test]
 fn sphere_lat_exactly_at_pole_accepts() {
     init_parallelism();
-    let lats: Vec<f64> = (0..20).map(|i| -75.0 + 8.0 * i as f64).chain([90.0, -90.0]).collect();
+    let lats: Vec<f64> = (0..20)
+        .map(|i| -75.0 + 8.0 * i as f64)
+        .chain([90.0, -90.0])
+        .collect();
     let data = make_data_with_lats(&lats);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),

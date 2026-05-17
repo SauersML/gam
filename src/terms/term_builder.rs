@@ -642,9 +642,9 @@ pub fn build_smooth_basis(
                     // time. The default 1.0 was a basin from which REML cannot
                     // escape for high-ν / high-frequency truths.
                     // Strict: reject unparseable values like `length_scale=abc`
-// upfront instead of silently dropping them and using the auto
-// init sentinel.
-length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
+                    // upfront instead of silently dropping them and using the auto
+                    // init sentinel.
+                    length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)?,
                     radial_reparam: None,
@@ -739,11 +739,18 @@ length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                 "matern",
                 options,
                 &[
-                    "type", "bs",
+                    "type",
+                    "bs",
                     "nu",
                     "length_scale",
-                    "centers", "k", "basis_dim", "basis-dim", "basisdim", "knots",
-                    "include_intercept", "double_penalty",
+                    "centers",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "include_intercept",
+                    "double_penalty",
                     "identifiability",
                     "scale_dims",
                 ],
@@ -791,9 +798,9 @@ length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     // time. The default 1.0 was a basin from which REML cannot
                     // escape for ν ≥ 5/2 on high-frequency truths.
                     // Strict: reject unparseable values like `length_scale=abc`
-// upfront instead of silently dropping them and using the auto
-// init sentinel.
-length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
+                    // upfront instead of silently dropping them and using the auto
+                    // init sentinel.
+                    length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
@@ -1437,7 +1444,11 @@ pub fn validate_known_options(
                 .filter(|k| {
                     let kl = k.to_ascii_lowercase();
                     kl.contains(&key_l) || key_l.contains(&kl) || {
-                        let n = kl.chars().zip(key_l.chars()).take_while(|(a, b)| a == b).count();
+                        let n = kl
+                            .chars()
+                            .zip(key_l.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count();
                         n >= 3
                     }
                 })

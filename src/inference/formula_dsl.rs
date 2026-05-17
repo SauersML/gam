@@ -709,10 +709,7 @@ pub fn option_f64(map: &BTreeMap<String, String>, key: &str) -> Option<f64> {
 /// Strict float option: `Ok(None)` if absent, `Ok(Some(n))` if parses as a
 /// finite f64, `Err` if the user passed an unparseable value (rather than
 /// silently dropping it like the lenient `option_f64`).
-pub fn option_f64_strict(
-    map: &BTreeMap<String, String>,
-    key: &str,
-) -> Result<Option<f64>, String> {
+pub fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Result<Option<f64>, String> {
     match map.get(key) {
         None => Ok(None),
         Some(raw) => match raw.parse::<f64>() {
@@ -1183,8 +1180,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     // `y ~ smooth(x) + smooth(x)` upfront — without this the duplicate
     // produces a rank-deficient design and the user has no idea why their
     // fit is over-parameterized.
-    let mut seen_term_keys: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut seen_term_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for raw in parsed_dsl.rhs_terms {
         let t = raw.trim();
         if t.is_empty() || t == "1" {

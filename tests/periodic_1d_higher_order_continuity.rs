@@ -31,7 +31,9 @@ fn make_periodic_dataset(n: usize) -> gam::data::EncodedDataset {
     let y: Vec<f64> = t
         .iter()
         .map(|theta| {
-            1.0 + 0.6 * theta.cos() + 0.3 * (2.0 * theta).sin() + 0.2 * (3.0 * theta).cos()
+            1.0 + 0.6 * theta.cos()
+                + 0.3 * (2.0 * theta).sin()
+                + 0.2 * (3.0 * theta).cos()
                 + noise.sample(&mut rng)
         })
         .collect();
@@ -60,8 +62,8 @@ fn predict(formula: &str, ts: &[f64]) -> Vec<f64> {
         m[[i, 0]] = ts[i];
         m[[i, 1]] = 0.0;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild predict design");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild predict design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -69,22 +71,16 @@ fn predict(formula: &str, ts: &[f64]) -> Vec<f64> {
 fn periodic_1d_bspline_c0_value_equal_at_wrap() {
     init_parallelism();
     // Same point on the circle reached via two different parameter values.
-    let probes = [
-        0.0, TAU,
-        0.5, TAU + 0.5,
-        2.7, TAU + 2.7,
-        -1.3, TAU - 1.3,
-    ];
-    let p = predict(
-        "y ~ s(t, periodic=true, period=6.283185307179586)",
-        &probes,
-    );
+    let probes = [0.0, TAU, 0.5, TAU + 0.5, 2.7, TAU + 2.7, -1.3, TAU - 1.3];
+    let p = predict("y ~ s(t, periodic=true, period=6.283185307179586)", &probes);
     for i in (0..probes.len()).step_by(2) {
         let gap = (p[i] - p[i + 1]).abs();
         assert!(
             gap < 1e-9,
             "C⁰ wrap failure at θ={:.3}: f={:.10} vs f+2π={:.10} gap={gap:.3e}",
-            probes[i], p[i], p[i + 1],
+            probes[i],
+            p[i],
+            p[i + 1],
         );
     }
 }
@@ -105,10 +101,7 @@ fn periodic_1d_bspline_c1_slope_equal_at_wrap() {
         ts.push(theta + TAU - delta);
         ts.push(theta + TAU + delta);
     }
-    let p = predict(
-        "y ~ s(t, periodic=true, period=6.283185307179586)",
-        &ts,
-    );
+    let p = predict("y ~ s(t, periodic=true, period=6.283185307179586)", &ts);
     for (i, &theta) in theta_probes.iter().enumerate() {
         let base = i * 4;
         let slope_l = (p[base + 1] - p[base]) / (2.0 * delta);
@@ -138,10 +131,7 @@ fn periodic_1d_bspline_c2_curvature_equal_at_wrap() {
         ts.push(theta + TAU);
         ts.push(theta + TAU + delta);
     }
-    let p = predict(
-        "y ~ s(t, periodic=true, period=6.283185307179586)",
-        &ts,
-    );
+    let p = predict("y ~ s(t, periodic=true, period=6.283185307179586)", &ts);
     for (i, &theta) in theta_probes.iter().enumerate() {
         let base = i * 6;
         let d2_l = (p[base] - 2.0 * p[base + 1] + p[base + 2]) / (delta * delta);

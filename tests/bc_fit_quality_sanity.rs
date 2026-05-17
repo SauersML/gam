@@ -28,7 +28,10 @@ fn make_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
     let noise = Normal::new(0.0, sigma).expect("normal");
     let mut x: Vec<f64> = (0..n).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let y: Vec<f64> = x.iter().map(|t| truth(*t) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|t| truth(*t) + noise.sample(&mut rng))
+        .collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = x
         .iter()
@@ -104,9 +107,7 @@ fn bc_anchored_zero_fit_tracks_interior_with_known_bias() {
     let interior_xs: Vec<f64> = (0..51).map(|i| 0.20 + 0.60 * (i as f64) / 50.0).collect();
     let rmse_free = rmse_against_truth("y ~ s(x, k=12)", &interior_xs);
     let rmse_anchored_both = rmse_against_truth("y ~ s(x, k=12, bc=anchored)", &interior_xs);
-    eprintln!(
-        "[bc-anchored-quality] free={rmse_free:.4} anchored_both={rmse_anchored_both:.4}",
-    );
+    eprintln!("[bc-anchored-quality] free={rmse_free:.4} anchored_both={rmse_anchored_both:.4}",);
     // Even with 0.2 of fixed bias at the boundary, away from the boundary
     // the spline should recover the true curve. Budget = 8× free (anchored
     // costs basis flexibility at both ends but interior should still fit).
@@ -153,8 +154,8 @@ fn bc_anchored_zero_pins_smooth_to_constant_intercept_at_basis_boundaries() {
     m[[0, 1]] = 0.0;
     m[[1, 0]] = x_max;
     m[[1, 1]] = 0.0;
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("predict design ok");
+    let design =
+        build_term_collection_design(m.view(), &fit.resolvedspec).expect("predict design ok");
     let pred = design.design.apply(&fit.fit.beta);
     eprintln!(
         "[bc-anchored-pin] f(x_min={x_min:.6})={:.6} f(x_max={x_max:.6})={:.6}",
@@ -164,6 +165,8 @@ fn bc_anchored_zero_pins_smooth_to_constant_intercept_at_basis_boundaries() {
     assert!(
         diff < 1e-6,
         "BC anchored both must yield f(x_min)==f(x_max) at basis boundaries (smooth pinned to zero plus shared intercept): {:.6} vs {:.6} diff={:.3e}",
-        pred[0], pred[1], diff,
+        pred[0],
+        pred[1],
+        diff,
     );
 }

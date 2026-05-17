@@ -15,10 +15,16 @@ const PI: f64 = std::f64::consts::PI;
 struct Lcg(u64);
 impl Lcg {
     fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        Self(
+            seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        )
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn uniform_01(&mut self) -> f64 {
@@ -42,22 +48,33 @@ fn make_dataset() -> gam::data::EncodedDataset {
     let n_dense = 2000;
     let mut rng = Lcg::new(505);
     let mut x = Vec::with_capacity(n_sparse + n_dense);
-    for _ in 0..n_sparse { x.push(0.5 * rng.uniform_01()); }
-    for _ in 0..n_dense  { x.push(0.5 + 0.5 * rng.uniform_01()); }
+    for _ in 0..n_sparse {
+        x.push(0.5 * rng.uniform_01());
+    }
+    for _ in 0..n_dense {
+        x.push(0.5 + 0.5 * rng.uniform_01());
+    }
     let f = |t: f64| (2.0 * PI * t).sin() + 0.3 * t;
     let y_noisy: Vec<f64> = x.iter().map(|&t| f(t) + sigma * rng.normal()).collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y_noisy.iter())
-        .map(|(a,b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y_noisy.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn truth(t: f64) -> f64 { (2.0 * PI * t).sin() + 0.3 * t }
+fn truth(t: f64) -> f64 {
+    (2.0 * PI * t).sin() + 0.3 * t
+}
 
 fn run(formula: &str) -> (f64, f64, f64) {
     let data = make_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = match fit_from_formula(formula, &data, &cfg) {
         Ok(r) => r,
         Err(e) => {
@@ -65,7 +82,9 @@ fn run(formula: &str) -> (f64, f64, f64) {
             return (f64::INFINITY, f64::INFINITY, 0.0);
         }
     };
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     let xg_sparse: Vec<f64> = (0..100).map(|i| 0.005 + 0.49 * i as f64 / 99.0).collect();
     let xg_dense: Vec<f64> = (0..100).map(|i| 0.505 + 0.49 * i as f64 / 99.0).collect();
     let mut all: Vec<f64> = xg_sparse.iter().chain(xg_dense.iter()).copied().collect();
@@ -78,8 +97,10 @@ fn run(formula: &str) -> (f64, f64, f64) {
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let truth_all: Vec<f64> = all.iter().map(|&t| truth(t)).collect();
-    let mut sum_sparse = 0.0; let mut sum_dense = 0.0;
-    let mut max_dev_sparse = 0.0_f64; let mut max_dev_dense = 0.0_f64;
+    let mut sum_sparse = 0.0;
+    let mut sum_dense = 0.0;
+    let mut max_dev_sparse = 0.0_f64;
+    let mut max_dev_dense = 0.0_f64;
     for i in 0..100 {
         let d = pred[i] - truth_all[i];
         sum_sparse += d * d;

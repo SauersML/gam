@@ -5,9 +5,7 @@
 //! constraint or produce a broken fit.
 
 use csv::StringRecord;
-use gam::{
-    FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
+use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -48,19 +46,21 @@ fn periodic_with_bc_clamped_rejected() {
     ] {
         let r = fit_from_formula(f, &data, &cfg);
         match r {
-            Ok(_) => panic!(
-                "expected `{f}` to be rejected (periodic + clamped is contradictory)",
-            ),
+            Ok(_) => panic!("expected `{f}` to be rejected (periodic + clamped is contradictory)",),
             Err(e) => {
                 let lower = e.to_string().to_lowercase();
                 // Must mention either "periodic"/"cyclic" or "clamped" — ideally both —
                 // and must not be a deep numerical error from inside REML.
                 assert!(
-                    !lower.contains("singular") && !lower.contains("conditioning") && !lower.contains("nan"),
+                    !lower.contains("singular")
+                        && !lower.contains("conditioning")
+                        && !lower.contains("nan"),
                     "`{f}` failed with opaque numerical error: {e}",
                 );
                 assert!(
-                    lower.contains("periodic") || lower.contains("cyclic") || lower.contains("clamped"),
+                    lower.contains("periodic")
+                        || lower.contains("cyclic")
+                        || lower.contains("clamped"),
                     "`{f}` failed without naming the conflicting options: {e}",
                 );
             }
@@ -83,17 +83,21 @@ fn periodic_with_bc_anchored_rejected() {
     ] {
         let r = fit_from_formula(f, &data, &cfg);
         match r {
-            Ok(_) => panic!(
-                "expected `{f}` to be rejected (periodic + anchored is contradictory)",
-            ),
+            Ok(_) => {
+                panic!("expected `{f}` to be rejected (periodic + anchored is contradictory)",)
+            }
             Err(e) => {
                 let lower = e.to_string().to_lowercase();
                 assert!(
-                    !lower.contains("singular") && !lower.contains("conditioning") && !lower.contains("nan"),
+                    !lower.contains("singular")
+                        && !lower.contains("conditioning")
+                        && !lower.contains("nan"),
                     "`{f}` failed with opaque numerical error: {e}",
                 );
                 assert!(
-                    lower.contains("periodic") || lower.contains("cyclic") || lower.contains("anchored"),
+                    lower.contains("periodic")
+                        || lower.contains("cyclic")
+                        || lower.contains("anchored"),
                     "`{f}` failed without naming the conflicting options: {e}",
                 );
             }
