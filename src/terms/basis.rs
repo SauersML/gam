@@ -1887,8 +1887,14 @@ pub enum BSplineEndpointBoundaryCondition {
     Free,
     /// Force the first derivative to be zero at the endpoint.
     Clamped,
-    /// Force the smooth value at the endpoint. Currently only `value == 0` is
-    /// supported by the homogeneous coefficient reparameterization.
+    /// Force both the smooth value AND the first derivative to be zero at
+    /// the endpoint (Hermite-style C¹ pin). The value-only pin was added
+    /// originally but proved numerically unstable when training data was
+    /// sparse near the endpoint: the basis was free to swing arbitrarily
+    /// between the pinned point and the nearest data point since only
+    /// curvature was penalized. Co-pinning the slope removes exactly that
+    /// swing direction. Currently only `value == 0` is supported by the
+    /// homogeneous coefficient reparameterization.
     Anchored { value: f64 },
 }
 
