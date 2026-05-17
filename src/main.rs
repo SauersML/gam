@@ -3554,6 +3554,18 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let model = SavedModel::load_from_path(&args.model)?;
     progress.advance_workflow(1);
     let parsed = parse_formula(&model.formula)?;
+    // Survival / location-scale / marginal-slope models don't have a single
+    // bare-column response, so the lookup below would fail with the cryptic
+    // "response column 'Surv(...)' not found in data" message. Reject up
+    // front with a clear message naming the model class.
+    if model.predict_model_class() != PredictModelClass::Standard {
+        return Err(format!(
+            "diagnose --alo is not yet supported for {model_class:?} models; \
+             only standard GAM fits are covered. \
+             (You can still inspect the model with `gam report <model>`.)",
+            model_class = model.predict_model_class()
+        ));
+    }
     let schema = model.require_data_schema()?;
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_schema(&args.data, schema)?;
