@@ -29,8 +29,8 @@ fn make_northern_only_dataset(n: usize, seed: u64) -> gam::data::EncodedDataset 
         let lon = u_lon.sample(&mut rng);
         let lat_r = lat.to_radians();
         let lon_r = lon.to_radians();
-        let y = 0.5 + 0.6 * lat_r.sin() + 0.3 * lat_r.cos() * (lon_r).cos()
-            + noise.sample(&mut rng);
+        let y =
+            0.5 + 0.6 * lat_r.sin() + 0.3 * lat_r.cos() * (lon_r).cos() + noise.sample(&mut rng);
         rows.push(StringRecord::from(vec![
             lat.to_string(),
             lon.to_string(),
@@ -74,8 +74,7 @@ fn fit_and_extrap(formula: &str) -> (Vec<f64>, f64, f64) {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -86,7 +85,10 @@ fn fit_and_extrap(formula: &str) -> (Vec<f64>, f64, f64) {
 fn sphere_wahba_single_hemisphere_extrap_bounded() {
     init_parallelism();
     let (pred, mn, mx) = fit_and_extrap("y ~ sphere(lat, lon, k=40)");
-    assert!(pred.iter().all(|v| v.is_finite()), "Wahba produced NaN in extrap");
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "Wahba produced NaN in extrap"
+    );
     // Training y range ≈ [-0.5, 1.5]. Even on the opposite hemisphere, a
     // well-penalized fit shouldn't extrapolate beyond ~[-5, 5] (a 5x
     // generous envelope) — anything wilder indicates the basis can shoot
@@ -102,7 +104,10 @@ fn sphere_wahba_single_hemisphere_extrap_bounded() {
 fn sphere_harmonic_single_hemisphere_extrap_bounded() {
     init_parallelism();
     let (pred, mn, mx) = fit_and_extrap("y ~ sphere(lat, lon, method=harmonic, max_degree=6)");
-    assert!(pred.iter().all(|v| v.is_finite()), "harmonic produced NaN in extrap");
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "harmonic produced NaN in extrap"
+    );
     eprintln!("[hemi-harm] full pred range [{mn:.3}, {mx:.3}]");
     // Harmonic basis is global so extrapolation is "for free" but penalty
     // strength determines how tame it stays. Same envelope.

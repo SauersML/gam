@@ -28,10 +28,16 @@ const PI: f64 = std::f64::consts::PI;
 struct Lcg(u64);
 impl Lcg {
     fn new(seed: u64) -> Self {
-        Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407))
+        Self(
+            seed.wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407),
+        )
     }
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn uniform_01(&mut self) -> f64 {
@@ -55,27 +61,40 @@ fn make_sparse_dense_dataset() -> gam::data::EncodedDataset {
     let n_dense = 2000;
     let mut rng = Lcg::new(505);
     let mut x = Vec::with_capacity(n_sparse + n_dense);
-    for _ in 0..n_sparse { x.push(0.5 * rng.uniform_01()); }
-    for _ in 0..n_dense  { x.push(0.5 + 0.5 * rng.uniform_01()); }
+    for _ in 0..n_sparse {
+        x.push(0.5 * rng.uniform_01());
+    }
+    for _ in 0..n_dense {
+        x.push(0.5 + 0.5 * rng.uniform_01());
+    }
     let f = |t: f64| (2.0 * PI * t).sin() + 0.3 * t;
     let y_noisy: Vec<f64> = x.iter().map(|&t| f(t) + sigma * rng.normal()).collect();
     let headers = ["x", "y"].into_iter().map(String::from).collect();
-    let rows: Vec<StringRecord> = x.iter().zip(y_noisy.iter())
-        .map(|(a,b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
+    let rows: Vec<StringRecord> = x
+        .iter()
+        .zip(y_noisy.iter())
+        .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn truth(t: f64) -> f64 { (2.0 * PI * t).sin() + 0.3 * t }
+fn truth(t: f64) -> f64 {
+    (2.0 * PI * t).sin() + 0.3 * t
+}
 
 #[test]
 fn bc_anchored_sparse_dense_does_not_blow_up_near_pin() {
     init_parallelism();
     let data = make_sparse_dense_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
     let result = fit_from_formula("y ~ s(x, bc=anchored, k=20)", &data, &cfg)
         .expect("bc=anchored fit must succeed");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     // Dense probe across the sparse region [0.005, 0.495].
     let probes: Vec<f64> = (0..100).map(|i| 0.005 + 0.49 * (i as f64) / 99.0).collect();
     let n = probes.len();
@@ -93,7 +112,9 @@ fn bc_anchored_sparse_dense_does_not_blow_up_near_pin() {
     let mut worst_dev = 0.0_f64;
     for (i, &xt) in probes.iter().enumerate() {
         let dev = (pred[i] - truth(xt)).abs();
-        if dev > worst_dev { worst_dev = dev; }
+        if dev > worst_dev {
+            worst_dev = dev;
+        }
     }
     eprintln!("[hermite] worst sparse dev = {worst_dev:.4}");
     assert!(
@@ -114,10 +135,14 @@ fn bc_anchored_sparse_dense_does_not_blow_up_near_pin() {
 fn bc_anchored_pins_slope_zero_at_basis_boundary() {
     init_parallelism();
     let data = make_sparse_dense_dataset();
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let result = fit_from_formula("y ~ s(x, bc=anchored, k=20)", &data, &cfg)
-        .expect("fit ok");
-    let FitResult::Standard(fit) = result else { panic!() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(x, bc=anchored, k=20)", &data, &cfg).expect("fit ok");
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
     // Find training data extremes (the basis knot boundaries).
     let values = data.values.column(0);
     let x_min = values.iter().cloned().fold(f64::INFINITY, f64::min);

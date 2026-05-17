@@ -59,17 +59,14 @@ fn pred_std(formula: &str) -> (f64, f64, f64) {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     let pred = design.design.apply(&fit.fit.beta);
     let mean = pred.iter().sum::<f64>() / pred.len() as f64;
     let var = pred.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / pred.len() as f64;
     let std = var.sqrt();
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!(
-        "[const-fit] `{formula}` mean={mean:.4} std={std:.5} range=[{mn:.4}, {mx:.4}]",
-    );
+    eprintln!("[const-fit] `{formula}` mean={mean:.4} std={std:.5} range=[{mn:.4}, {mx:.4}]",);
     (mean, std, mx - mn)
 }
 

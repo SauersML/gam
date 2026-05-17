@@ -66,8 +66,7 @@ fn fit_and_predict_grid(formula: &str) -> Vec<f64> {
         m[[i, 0]] = *lat;
         m[[i, 1]] = *lon;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .expect("rebuild design");
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
