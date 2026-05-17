@@ -1026,6 +1026,18 @@ pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
     if vars.len() != 3 {
+        // Help users coming from R/mgcv (`Surv(time, status)` 2-arg form):
+        // when they give two columns, name them explicitly in the error so
+        // the fix ("prepend an entry column of zeros") is obvious.
+        if vars.len() == 2 {
+            return Err(format!(
+                "Surv(...) needs three columns: Surv(entry, exit, event). \
+                 Got `Surv({}, {})` — if these are (exit, event) from an mgcv-style \
+                 left-truncation-free dataset, add a leading entry-time column of \
+                 zeros and call `Surv(0_entry, {}, {})`.",
+                vars[0], vars[1], vars[0], vars[1]
+            ));
+        }
         return Err(format!(
             "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
             vars.len()
