@@ -1,5 +1,6 @@
 pub(crate) mod active_set;
 pub mod estimate;
+pub mod gaussian_reml;
 pub mod mixture_link;
 pub mod outer_strategy;
 pub mod pirls;

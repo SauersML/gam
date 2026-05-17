@@ -113,26 +113,34 @@ fn sphere_wahba_penalty_order_sweep_low_orders() {
 }
 
 #[test]
-fn sphere_wahba_m4_documented_collapse() {
-    // Documents a known limitation: Wahba m=4 currently collapses the fit
-    // to a near-constant (smooth ≈ mean) on a non-trivial truth. The
-    // closed-form q4 polynomial in wahba_sphere_kernel_from_cos agrees
-    // with its SIMD counterpart, so the issue is likely Gram conditioning
-    // or an off-by-constant in the kernel reference that drives REML to
-    // pick a degenerate λ. Users should prefer m=2 or m=3 for Wahba
-    // spheres, or switch to method=harmonic which handles m=4 fine
-    // (eigenvalue penalty `[l(l+1)]^m` is well-conditioned by construction).
+fn sphere_wahba_m4_must_fit_smooth_truth() {
+    // BUG TICKET: Wahba m=4 collapses the fit to a near-constant on a
+    // smooth low-degree truth. The closed-form q4 polynomial in
+    // `wahba_sphere_kernel_from_cos` agrees with its SIMD sibling and
+    // the Gram is PSD, so the issue is not a SIMD/scalar mismatch — it
+    // looks like a constant-offset / normalization error in the m=4
+    // kernel form that pushes REML to a degenerate λ.
+    //
+    // Observed at HEAD: rmse=0.43, predictions collapse to [0.502, 0.502]
+    // (the response mean) — i.e. the smooth contribution is ~0 while the
+    // truth peak-to-peak is ~1.4.
+    //
+    // This test asserts the FIXED quality target. It will fail until
+    // someone derives the correct m=4 kernel constants. Don't silence
+    // it — that's the whole point of failing here.
     init_parallelism();
-    let result = run("y ~ sphere(lat, lon, k=30, m=4)");
-    match result {
-        Ok((rmse, _mn, _mx)) => {
-            // Either: it stays collapsed (rmse > 0.3, current behavior)
-            // OR: a future fix restores quality (rmse < 0.05). Both are
-            // logged; neither is a regression failure.
-            eprintln!("[wahba-m4-doc] rmse={rmse:.4}");
-        }
-        Err(e) => eprintln!("[wahba-m4-doc] error: {e}"),
-    }
+    let (rmse, mn, mx) = run("y ~ sphere(lat, lon, k=30, m=4)")
+        .expect("wahba m=4 fit must succeed");
+    // The other Wahba orders (m=1, 2, 3) all hit rmse ≤ 0.018 on the
+    // same data. Require m=4 to be in the same ballpark — generous 5×
+    // budget = 0.10.
+    assert!(
+        rmse <= 0.10,
+        "Wahba m=4 collapsed: rmse={rmse:.4} (budget 0.10), range=[{mn:.3}, {mx:.3}]. \
+         m=1,2,3 all fit at rmse ≤ 0.018 — m=4 must reach the same quality. \
+         Likely cause: constant-offset / normalization in the closed-form q4 \
+         polynomial in wahba_sphere_kernel_from_cos (basis.rs:13685).",
+    );
 }
 
 #[test]
