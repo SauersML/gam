@@ -120,5 +120,11 @@ fn diagnose_sparse_dense_imbalance() {
     let _ = run("y ~ s(x, bc_left=anchored, k=20)");
     // TPS
     let _ = run("y ~ s(x, type=tps, k=20)");
+    // Hypothesis: bc=anchored + 1st-derivative penalty (penalty_order=1)
+    // damps the slope at the pin and should prevent the oscillation.
+    let _ = run("y ~ s(x, bc=anchored, k=20, penalty_order=1)");
+    let _ = run("y ~ s(x, bc_left=anchored, k=20, penalty_order=1)");
+    // Higher-order penalty
+    let _ = run("y ~ s(x, bc=anchored, k=20, penalty_order=3)");
     assert!(true);
 }
