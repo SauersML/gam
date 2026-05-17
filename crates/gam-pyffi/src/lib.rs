@@ -5625,6 +5625,7 @@ mod tests {
         weights: ArrayView1<'_, f64>,
         penalty: ArrayView2<'_, f64>,
         target: RemlForwardScalar,
+        init_lambda: Option<f64>,
     ) -> f64 {
         let gated_x = apply_by_gate(x, by, 1).expect("by-gated design");
         let fit = gaussian_reml_multi_closed_form_with_cache(
@@ -5632,7 +5633,7 @@ mod tests {
             y,
             penalty,
             Some(weights),
-            Some(0.85),
+            init_lambda,
             None,
         )
         .expect("by-gated finite-difference forward fit");
@@ -5699,16 +5700,8 @@ mod tests {
     where
         F: FnMut(f64) -> f64,
     {
-        let scaled_step = step * center.abs().max(1.0);
-        let mut five_point = |h: f64| {
-            (-objective(center + 2.0 * h) + 8.0 * objective(center + h)
-                - 8.0 * objective(center - h)
-                + objective(center - 2.0 * h))
-                / (12.0 * h)
-        };
-        let coarse = five_point(scaled_step);
-        let fine = five_point(0.5 * scaled_step);
-        (16.0 * fine - coarse) / 15.0
+        let h = step * center.abs().max(1.0);
+        (objective(center + h) - objective(center - h)) / (2.0 * h)
     }
 
     fn position_fd_inputs() -> (
@@ -5946,6 +5939,17 @@ mod tests {
             RemlForwardScalar::Fitted(11, 1),
         ];
         let eps = 1.0e-5;
+        let gated_x = apply_by_gate(x.view(), by.view(), 1).expect("by-gated design");
+        let base_fit = gaussian_reml_multi_closed_form_with_cache(
+            gated_x.view(),
+            y.view(),
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.85),
+            None,
+        )
+        .expect("base by-gated finite-difference fit");
+        let fd_init_lambda = Some(base_fit.lambda);
 
         for target in targets {
             let (grad_x, grad_y, grad_by, grad_weights) = by_gate_backward(
@@ -5969,6 +5973,7 @@ mod tests {
                             weights.view(),
                             penalty.view(),
                             target,
+                            fd_init_lambda,
                         )
                     });
                     assert_fd_close(
@@ -5991,6 +5996,7 @@ mod tests {
                             weights.view(),
                             penalty.view(),
                             target,
+                            fd_init_lambda,
                         )
                     });
                     assert_fd_close(
@@ -6012,6 +6018,7 @@ mod tests {
                         weights.view(),
                         penalty.view(),
                         target,
+                        fd_init_lambda,
                     )
                 });
                 assert_fd_close(&format!("target={target:?} by[{row}]"), grad_by[row], fd);
@@ -6028,6 +6035,7 @@ mod tests {
                         perturbed.view(),
                         penalty.view(),
                         target,
+                        fd_init_lambda,
                     )
                 });
                 assert_fd_close(
