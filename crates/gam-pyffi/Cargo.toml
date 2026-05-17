@@ -4,6 +4,8 @@ version = "0.1.64"
 edition = "2024"
 rust-version = "1.93"
 publish = false
+description = "PyO3 bindings for the gam crate — backs gamfit's _rust extension."
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "gam_pyffi"
