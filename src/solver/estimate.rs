@@ -464,6 +464,14 @@ impl ParametricColumnConditioning {
                 .beta_covariance_corrected
                 .as_ref()
                 .map(se_from_covariance);
+            inf.beta_covariance_frequentist = inf
+                .beta_covariance_frequentist
+                .take()
+                .map(|cov| self.backtransform_covariance(&cov));
+            // The influence matrix is a mixed linear operator, not a covariance
+            // or Hessian. Drop it across column-conditioning transforms rather
+            // than applying the wrong congruence map.
+            inf.influence_matrix = None;
             inf.bias_correction_beta = inf
                 .bias_correction_beta
                 .take()
@@ -3093,6 +3101,9 @@ where
     let mut beta_standard_errors = None;
     let mut beta_covariance_corrected = None;
     let mut beta_standard_errors_corrected = None;
+    let mut beta_covariance_frequentist = None;
+    let mut influence_matrix = None;
+    let mut covariance_is_diagonal_only = false;
     let mut bias_correction_beta = None;
 
     if opts.compute_inference {
@@ -3233,6 +3244,27 @@ where
         | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
 
+    // Explicit dispersion contract for coefficient covariance matrices:
+    // Vb = H⁻¹ * φ̂.  Fixed-scale likelihoods (Poisson/Binomial) use φ = 1,
+    // Gaussian uses the profiled residual variance, and Gamma uses φ = 1/shape.
+    let dispersion_phi = match pirls_res.likelihood.family {
+        GlmLikelihoodFamily::GaussianIdentity => standard_deviation * standard_deviation,
+        GlmLikelihoodFamily::GammaLog => {
+            1.0 / pirls_res
+                .likelihood
+                .gamma_shape()
+                .unwrap_or(1.0)
+                .max(f64::MIN_POSITIVE)
+        }
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::PoissonLog => 1.0,
+    };
+
     // Compute gradient norm at final rho for reporting
     let finalgrad = reml_state
         .compute_gradient(&final_rho)
@@ -3261,11 +3293,12 @@ where
             }
             diag_inv
         };
-        beta_covariance = if p_cov > COV_MAX_P {
+        let beta_covariance_unscaled = if p_cov > COV_MAX_P {
             log::warn!(
                 "skipping full posterior covariance inversion (p={p_cov} > {COV_MAX_P}): \
                  using diagonal-only standard errors"
             );
+            covariance_is_diagonal_only = true;
             Some(diag_fallback())
         } else {
             match matrix_inversewith_regularization(&penalized_hessian, "posterior covariance") {
@@ -3275,21 +3308,58 @@ where
                         "full posterior covariance inversion failed (p={p_cov}): \
                          falling back to diagonal-only standard errors"
                     );
+                    covariance_is_diagonal_only = true;
                     Some(diag_fallback())
                 }
             }
         };
+        beta_covariance = beta_covariance_unscaled
+            .as_ref()
+            .map(|cov| cov * dispersion_phi);
+
+        if let Some(h_inv) = beta_covariance_unscaled.as_ref()
+            && !covariance_is_diagonal_only
+        {
+            let mut s_mat = Array2::<f64>::zeros((p_cov, p_cov));
+            for (kk, cp) in pirls_res
+                .reparam_result
+                .canonical_transformed
+                .iter()
+                .enumerate()
+            {
+                if kk >= lambdas.len() {
+                    continue;
+                }
+                let r = &cp.col_range;
+                let local = cp.local_ref();
+                let lam = lambdas[kk];
+                for i in 0..cp.block_dim() {
+                    for j in 0..cp.block_dim() {
+                        s_mat[[r.start + i, r.start + j]] += lam * local[[i, j]];
+                    }
+                }
+            }
+            let mut f_mat = Array2::<f64>::eye(p_cov);
+            f_mat -= &h_inv.dot(&s_mat);
+            enforce_symmetry(&mut f_mat);
+            let mut ve = f_mat.dot(h_inv);
+            ve *= dispersion_phi;
+            enforce_symmetry(&mut ve);
+            influence_matrix = Some(f_mat);
+            beta_covariance_frequentist = Some(ve);
+        }
+
         smoothing_correction = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
-            beta_covariance.as_ref(),
+            beta_covariance_unscaled.as_ref(),
             finalgrad_norm,
         );
         beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
                 let mut corrected = base_cov.clone();
-                corrected += corr;
+                corrected += &(corr * dispersion_phi);
                 enforce_symmetry(&mut corrected);
                 Some(corrected)
             }
@@ -3317,6 +3387,9 @@ where
         beta_standard_errors,
         beta_covariance_corrected,
         beta_standard_errors_corrected,
+        beta_covariance_frequentist,
+        influence_matrix,
+        covariance_is_diagonal_only,
         bias_correction_beta,
     });
 
@@ -3508,6 +3581,15 @@ pub struct FitInference {
     pub beta_covariance_corrected: Option<Array2<f64>>,
     /// Marginal SEs from `beta_covariance_corrected`.
     pub beta_standard_errors_corrected: Option<Array1<f64>>,
+    /// Frequentist covariance Ve = H⁻¹ X'WX H⁻¹ * φ̂.
+    #[serde(default)]
+    pub beta_covariance_frequentist: Option<Array2<f64>>,
+    /// Coefficient-space influence matrix F = H⁻¹ X'WX. Its trace is the total EDF.
+    #[serde(default)]
+    pub influence_matrix: Option<Array2<f64>>,
+    /// True when covariance was forced to diagonal-only because dense inversion was unavailable.
+    #[serde(default)]
+    pub covariance_is_diagonal_only: bool,
     /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
     /// original (untransformed) coefficient basis. Predictions apply
     /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
@@ -3738,9 +3820,9 @@ pub struct UnifiedFitResult {
     /// sigma here. Non-Gaussian families keep the response-scale summary used
     /// by their explicit likelihood-scale metadata.
     pub standard_deviation: f64,
-    /// Conditional covariance Var(β | λ) for the joint coefficient vector.
+    /// Vb: Bayesian/conditional covariance Var(β | λ) = H⁻¹ * φ̂ for the joint coefficient vector.
     pub covariance_conditional: Option<Array2<f64>>,
-    /// Smoothing-parameter-corrected covariance Var*(β).
+    /// Vp: Bayesian covariance with smoothing-parameter uncertainty correction.
     pub covariance_corrected: Option<Array2<f64>>,
     /// Inference quantities from the inner solver (EDF, Hessian, etc.).
     pub inference: Option<FitInference>,
@@ -3913,6 +3995,15 @@ impl FitInference {
                 "fit_result.beta_standard_errors_corrected",
                 v.iter().copied(),
             )?;
+        }
+        if let Some(v) = self.beta_covariance_frequentist.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.beta_covariance_frequentist",
+                v.iter().copied(),
+            )?;
+        }
+        if let Some(v) = self.influence_matrix.as_ref() {
+            validate_all_finite_estimation("fit_result.influence_matrix", v.iter().copied())?;
         }
         if let Some(v) = self.smoothing_correction.as_ref() {
             validate_all_finite_estimation("fit_result.smoothing_correction", v.iter().copied())?;
@@ -4287,6 +4378,28 @@ impl UnifiedFitResult {
                     p
                 )));
             }
+            if let Some(cov) = inf.beta_covariance_frequentist.as_ref()
+                && (cov.nrows() != p || cov.ncols() != p)
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult frequentist covariance shape mismatch: got {}x{}, expected {}x{}",
+                    cov.nrows(),
+                    cov.ncols(),
+                    p,
+                    p
+                )));
+            }
+            if let Some(f_mat) = inf.influence_matrix.as_ref()
+                && (f_mat.nrows() != p || f_mat.ncols() != p)
+            {
+                return Err(EstimationError::InvalidInput(format!(
+                    "UnifiedFitResult influence matrix shape mismatch: got {}x{}, expected {}x{}",
+                    f_mat.nrows(),
+                    f_mat.ncols(),
+                    p,
+                    p
+                )));
+            }
             if let Some(corr) = inf.smoothing_correction.as_ref()
                 && (corr.nrows() != p || corr.ncols() != p)
             {
@@ -4479,6 +4592,36 @@ impl UnifiedFitResult {
                 .as_ref()
                 .and_then(|inf| inf.beta_covariance_corrected.as_ref())
         })
+    }
+
+    /// Wood/mgcv name for the Bayesian/conditional covariance Vb = H⁻¹ * φ̂.
+    pub fn vb_covariance(&self) -> Option<&Array2<f64>> {
+        self.beta_covariance()
+    }
+
+    /// Wood/mgcv name for the smoothing-parameter-corrected covariance Vp.
+    pub fn vp_covariance(&self) -> Option<&Array2<f64>> {
+        self.beta_covariance_corrected()
+    }
+
+    /// Frequentist covariance Ve = H⁻¹ X'WX H⁻¹ * φ̂.
+    pub fn ve_covariance(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_covariance_frequentist.as_ref())
+    }
+
+    /// Coefficient-space influence matrix F = H⁻¹ X'WX.
+    pub fn influence_matrix(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.influence_matrix.as_ref())
+    }
+
+    pub fn covariance_is_diagonal_only(&self) -> bool {
+        self.inference
+            .as_ref()
+            .is_some_and(|inf| inf.covariance_is_diagonal_only)
     }
 
     /// Get beta standard errors (conditional) if available.
@@ -5766,6 +5909,9 @@ mod estimate_policy_tests {
                 beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
                 beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
+                beta_covariance_frequentist: None,
+                influence_matrix: None,
+                covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
