@@ -293,6 +293,78 @@ class FuzzCiGateTests(unittest.TestCase):
             # crashing — CI shouldn't bomb on a typo.
             self.assertEqual(_FUZZ._default_n_trials(), 200)
 
+    def test_per_trial_gap_ignores_degenerate_mgcv_baseline(self) -> None:
+        # A degenerate scenario where mgcv itself produced R² < 0 (below the
+        # naive mean baseline) and rust produced an even larger negative R².
+        # The +100 "gap" between two failed fits is extrapolation noise, not
+        # a Rust regression, and must not trip the per-trial-gap gate.
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
+            for i in range(100)
+        ]
+        results[7] = _trial(
+            family="gaussian", model_type="gam", basis="duchon",
+            rust_metric=-176.65, mgcv_metric=-36.45, seed=7,
+        )
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertNotIn("per_trial_gap", gate_names, gates)
+        # And the rust-NaN-inf gate is unaffected because the values are
+        # finite (just bad).
+        self.assertNotIn("rust_nan_inf", gate_names, gates)
+
+    def test_per_trial_gap_fires_when_mgcv_baseline_is_meaningful(self) -> None:
+        # Sanity check that the filter doesn't suppress real regressions:
+        # mgcv R² = 0.79 is a meaningful baseline; rust at 0.05 is a real
+        # regression and the gate must fire.
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i)
+            for i in range(100)
+        ]
+        results[7] = _trial(rust_metric=0.05, mgcv_metric=0.79, seed=7)
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertIn("per_trial_gap", gate_names, gates)
+
+    def test_binomial_per_trial_gap_ignores_random_auc_baseline(self) -> None:
+        # Binomial scenario where mgcv AUC is essentially random (0.33,
+        # below the BINOMIAL_MEANINGFUL_AUC=0.55 floor) and rust produced
+        # no metric at all (rust_metric=None ⇒ gap = mv + 1 = 1.33 via
+        # FuzzResult.compute_gap). The "rust failed" failure is reported by
+        # the rust-only-failures bookkeeping in main(); the per-trial-gap
+        # gate must not double-flag it as a comparison-against-meaningful-
+        # mgcv regression when there was no meaningful mgcv baseline.
+        results = [
+            _trial(
+                family="binomial", rust_metric=0.65, mgcv_metric=0.66, seed=i,
+            )
+            for i in range(100)
+        ]
+        results[7] = _trial(
+            family="binomial", model_type="gam", basis="ps",
+            rust_metric=None, mgcv_metric=0.33, seed=7,
+            rust={"error": "fit rc=1"},
+        )
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertNotIn("per_trial_gap", gate_names, gates)
+
+    def test_cohort_median_ignores_degenerate_baseline(self) -> None:
+        # 20 degenerate gaussian/gam/duchon trials (mgcv R² < 0) with a +0.25
+        # gap each. Without the meaningful-baseline filter this would trip
+        # the cohort_median gate; with the filter the cohort is empty after
+        # filtering and the gate stays silent.
+        results = []
+        for i in range(20):
+            results.append(_trial(
+                family="gaussian", model_type="gam", basis="duchon",
+                rust_metric=-30.0, mgcv_metric=-29.75, seed=1000 + i,
+            ))
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=20)
+        gate_names = [gf["gate"] for gf in gates["gate_failures"]]
+        self.assertNotIn("cohort_median", gate_names, gates)
+        self.assertNotIn("cohort_net_wins", gate_names, gates)
+
     def test_baseline_regression_fires(self) -> None:
         # Baseline says gaussian/gam/ps cohort had median gap +0.02; current
         # run has +0.10 — delta 0.08 > threshold 0.05 ⇒ fail.

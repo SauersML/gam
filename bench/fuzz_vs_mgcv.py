@@ -1345,6 +1345,21 @@ MIN_VALID_TRIAL_FRACTION = 0.80
 # Metrics we check for rust NaN/inf when mgcv produced a finite value.
 NAN_GATED_METRICS = ("r2", "auc", "rmse", "logloss", "mae", "brier")
 
+# Minimum mgcv primary metric to treat a trial as a meaningful baseline.
+# Trials below these thresholds describe scenarios so degenerate that mgcv
+# itself failed to beat a naive predictor — predicting the mean for
+# gaussian, coin-flip for binomial. The primary-gap on those trials measures
+# out-of-sample extrapolation noise between two failed fits, not a Rust
+# regression. The gap gates exist to flag regressions where rust falls
+# behind a *meaningful* mgcv reference; they must not fire on cohorts where
+# mgcv itself never produced a usable fit (e.g. n=25 with 24-dim Duchon
+# basis where both methods produce R² ≪ 0 and the +100 gap between them is
+# noise, not signal). The rust-NaN-inf and coverage gates remain unfiltered:
+# a NaN is always a code bug and coverage counts comparisons regardless of
+# their quality.
+GAUSSIAN_MEANINGFUL_R2 = 0.0
+BINOMIAL_MEANINGFUL_AUC = 0.55
+
 
 def _metric_is_nonfinite(value: typing.Any) -> bool:
     if value is None:
@@ -1366,6 +1381,30 @@ def _metric_is_finite(value: typing.Any) -> bool:
     return math.isfinite(f)
 
 
+def _mgcv_produced_meaningful_baseline(r: "FuzzResult") -> bool:
+    """Return True when mgcv's primary metric clears a naive-baseline floor.
+
+    Gaussian: mgcv R² ≥ 0 (predictions beat the mean).
+    Binomial: mgcv AUC ≥ 0.55 (predictions discriminate above near-random).
+
+    When this returns False the scenario is degenerate enough that mgcv
+    itself failed; the rust-vs-mgcv gap on that trial cannot be interpreted
+    as a Rust regression. A rust-only failure (where mgcv was unset) is
+    excluded upstream by `primary_gap is not None`, so this filter does not
+    suppress the rust-only-failure flag — only the "regression vs a healthy
+    mgcv baseline" semantics.
+    """
+    fam = r.scenario.get("family")
+    metric_key = "r2" if fam == "gaussian" else "auc"
+    mv = r.mgcv.get(metric_key)
+    if not _metric_is_finite(mv):
+        return False
+    threshold = (
+        GAUSSIAN_MEANINGFUL_R2 if fam == "gaussian" else BINOMIAL_MEANINGFUL_AUC
+    )
+    return float(mv) >= threshold
+
+
 def compute_ci_gates(
     results: typing.Any,
     requested_trials: int,
@@ -1384,10 +1423,16 @@ def compute_ci_gates(
     gate_failures: list[dict[str, typing.Any]] = []
 
     # Gate 1: per-trial huge-gap regressions.
+    # Restricted to trials where mgcv produced a meaningful baseline. Without
+    # this filter the gate fires on degenerate scenarios where both methods
+    # fail (e.g. R² = -150 vs R² = -36 yields a +114 "gap" that is
+    # extrapolation noise, not a Rust regression).
     big_gap_offenders = []
     for r in results:
         gap = r.primary_gap
         if gap is None:
+            continue
+        if not _mgcv_produced_meaningful_baseline(r):
             continue
         if gap > PER_TRIAL_FAIL_GAP:
             big_gap_offenders.append(r)
@@ -1402,8 +1447,14 @@ def compute_ci_gates(
         })
 
     # Gate 2: cohort median gap regressions.
+    # Cohorts aggregate only over trials where mgcv produced a meaningful
+    # baseline; a cohort dominated by degenerate scenarios cannot signal a
+    # Rust regression and is excluded from gating (small remaining cohorts
+    # are skipped by the existing COHORT_MIN_TRIALS guard).
     cohorts: dict[tuple[typing.Any, typing.Any, typing.Any], list[FuzzResult]] = {}
     for r in valid_trials:
+        if not _mgcv_produced_meaningful_baseline(r):
+            continue
         cohort = (
             r.scenario.get("family", "?"),
             r.scenario.get("model_type", "?"),
@@ -1860,10 +1911,15 @@ def main() -> None:
             flag = " !!!" if divergence_level == "fail" else (" !!" if divergence_level == "warn" else "")
             # Per-trial gate marker — if this trial alone trips the
             # per-trial CI gate, surface that distinct from the warn/fail
-            # decoration above so CI logs are searchable for "[FAIL]".
+            # decoration above so CI logs are searchable for "[FAIL]". The
+            # meaningful-baseline filter matches `compute_ci_gates`: on
+            # degenerate scenarios where mgcv itself produced a sub-baseline
+            # fit, the gap is extrapolation noise and the gate doesn't fire,
+            # so the per-trial marker must not fire either.
             if (
                 result.primary_gap is not None
                 and result.primary_gap > PER_TRIAL_FAIL_GAP
+                and _mgcv_produced_meaningful_baseline(result)
             ):
                 flag += " [FAIL]"
             # Rust NaN/inf where mgcv is finite is also gate-tripping.
