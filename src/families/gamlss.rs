@@ -24717,10 +24717,21 @@ mod tests {
             wiggle_degree: 2,
             wiggle_block,
         };
+        // The wiggle block couples every datum's q via m = D B β_w + 1, so
+        // threshold↔wiggle and log-σ↔wiggle Hessian off-diagonals stay
+        // O(B' β_w) throughout the inner solve. The 3-block joint Newton
+        // needs more outer iterations to settle ρ and more inner cycles to
+        // reach the `inner_tol = 1e-4` KKT residual at ρ⋆ than the smoke
+        // budget supplies.
+        let opts = BlockwiseFitOptions {
+            inner_max_cycles: 200,
+            outer_max_iter: 30,
+            ..spatial_fit_smoke_options()
+        };
         let fit = fit_binomial_location_scalewiggle_terms(
             data.view(),
             spec,
-            &spatial_fit_smoke_options(),
+            &opts,
             &spatial_kappa_options(),
         )
         .expect("binomial location-scale wiggle spatial fit");
