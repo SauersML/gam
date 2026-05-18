@@ -104,11 +104,6 @@ path = "bench/cargo_benches/bvn_biobank_shape.rs"
 harness = false
 
 [[bench]]
-name = "margslope_flex_biobank_hv"
-path = "bench/cargo_benches/margslope_flex_biobank_hv.rs"
-harness = false
-
-[[bench]]
 name = "non_affine_cell_hv_shape"
 path = "bench/cargo_benches/non_affine_cell_hv_shape.rs"
 harness = false
@@ -121,11 +116,6 @@ harness = false
 [[bench]]
 name = "tail_cell_memo_biobank_shape"
 path = "bench/cargo_benches/tail_cell_memo_biobank_shape.rs"
-harness = false
-
-[[bench]]
-name = "trust_region_line_search"
-path = "bench/cargo_benches/trust_region_line_search.rs"
 harness = false
 
 [[bench]]
