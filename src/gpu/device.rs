@@ -43,11 +43,11 @@ impl GpuDeviceInfo {
         let threads_per_sm = self.max_threads_per_multiprocessor.max(1) as f64;
         let clock_ghz = (self.clock_rate_khz.max(1) as f64) / 1_000_000.0;
         let muladd_flops = 2.0_f64;
-        let fp64_ratio = self
-            .single_to_double_precision_perf_ratio
-            .unwrap_or(32)
-            .max(1) as f64;
-        sm_count * threads_per_sm * clock_ghz * muladd_flops / fp64_ratio
+        let throughput = sm_count * threads_per_sm * clock_ghz * muladd_flops;
+        match self.single_to_double_precision_perf_ratio {
+            Some(ratio) => throughput / ratio.max(1) as f64,
+            None => throughput,
+        }
     }
 
     /// Heuristic score used to pick the "best" device when multiple are

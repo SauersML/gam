@@ -172,6 +172,19 @@ fn with_runtime<T>(
         return None;
     }
     let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
+    // Phase 1: non-blocking — skip any device another thread is currently
+    // driving, so concurrent callers fan out to idle GPUs instead of
+    // serializing on the rotated slot.
+    for offset in 0..runtimes.len() {
+        let idx = (start + offset) % runtimes.len();
+        if let Ok(mut runtime) = runtimes[idx].try_lock()
+            && let Some(out) = f(&mut runtime)
+        {
+            return Some((out, runtime.device.clone()));
+        }
+    }
+    // Phase 2: every device busy or every Phase-1 attempt compute-failed.
+    // Block on each in turn so we still complete the dispatch.
     for offset in 0..runtimes.len() {
         let idx = (start + offset) % runtimes.len();
         if let Ok(mut runtime) = runtimes[idx].lock()
