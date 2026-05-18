@@ -5857,6 +5857,29 @@ fn detect_logit_instability(
     let weights_collapsed = weight_collapse_fraction > 0.98;
     let dev_extremely_small = dev_per_sample < 1e-6;
 
+    // With an active penalty, log|X'WX + λS| ≥ log|λS_rank| stays finite even
+    // when W collapses to ≈0 under saturated probabilities, so the LAML is
+    // still well-defined at any converged inner minimum. If state values are
+    // all finite, treating that converged-but-saturated point as Unstable is
+    // wrong: the runtime translates Unstable into PerfectSeparationDetected
+    // → +inf cost, and the outer startup validator rejects every seed for
+    // "non-finite cost", crashing the fit. Small-n binomial fits where every
+    // candidate rho yields saturated probabilities (e.g. p ≫ n with
+    // near-perfect separation) exercise this path consistently. mgcv's gam()
+    // accepts the degenerate fit; with penalty active and a finite converged
+    // state we do the same — the saturated probabilities are the answer at
+    // this rho, not a numerical failure.
+    let state_finite = summary.beta.as_ref().iter().all(|v| v.is_finite())
+        && summary.state.eta.iter().all(|v| v.is_finite())
+        && finalmu.iter().all(|v| v.is_finite())
+        && summary.state.deviance.is_finite();
+    if !state_finite {
+        return true;
+    }
+    if matches!(summary.status, PirlsStatus::Converged) {
+        return false;
+    }
+
     order_separated || severe_saturation || weights_collapsed || dev_extremely_small
 }
 
