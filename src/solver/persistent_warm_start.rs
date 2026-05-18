@@ -1,13 +1,12 @@
+use crate::cache::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_VERSION: u32 = 1;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ENTRIES: usize = 4096;
+const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistentWarmStartRecord {
@@ -182,41 +181,11 @@ impl StableHasher {
 }
 
 pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
-    let path = cache_file_path(key)?;
-    let metadata = fs::metadata(&path).ok()?;
-    if metadata.len() > MAX_ENTRY_BYTES {
-        let _ = fs::remove_file(path);
-        return None;
-    }
-    let mut file = File::open(&path).ok()?;
-    let mut raw = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut raw).ok()?;
-    match serde_json::from_str::<PersistentWarmStartRecord>(&raw) {
-        Ok(record) => Some(record),
-        Err(_) => {
-            let _ = fs::remove_file(path);
-            None
-        }
-    }
+    load_json_record(key)
 }
 
 pub(crate) fn load_block_record(key: &str) -> Option<PersistentBlockWarmStartRecord> {
-    let path = cache_file_path(key)?;
-    let metadata = fs::metadata(&path).ok()?;
-    if metadata.len() > MAX_ENTRY_BYTES {
-        let _ = fs::remove_file(path);
-        return None;
-    }
-    let mut file = File::open(&path).ok()?;
-    let mut raw = String::with_capacity(metadata.len() as usize);
-    file.read_to_string(&mut raw).ok()?;
-    match serde_json::from_str::<PersistentBlockWarmStartRecord>(&raw) {
-        Ok(record) => Some(record),
-        Err(_) => {
-            let _ = fs::remove_file(path);
-            None
-        }
-    }
+    load_json_record(key)
 }
 
 pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
@@ -228,150 +197,57 @@ pub(crate) fn store_block_record(record: &PersistentBlockWarmStartRecord) -> Res
 }
 
 fn store_json_record<T: Serialize>(key: &str, record: &T) -> Result<(), String> {
-    let dir = cache_dir()?;
-    fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "failed to create warm-start cache dir '{}': {e}",
-            dir.display()
-        )
-    })?;
-    let path = cache_file_path_in_dir(&dir, key);
     let bytes = serde_json::to_vec(record)
         .map_err(|e| format!("failed to encode warm-start cache record: {e}"))?;
     if bytes.len() as u64 > MAX_ENTRY_BYTES {
         return Ok(());
     }
-
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        key,
-        std::process::id() as u64 ^ unix_nanos_now()
-    ));
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .map_err(|e| {
-                format!(
-                    "failed to create warm-start cache temp file '{}': {e}",
-                    tmp.display()
-                )
-            })?;
-        file.write_all(&bytes).map_err(|e| {
-            format!(
-                "failed to write warm-start cache temp file '{}': {e}",
-                tmp.display()
-            )
-        })?;
-        file.sync_all().map_err(|e| {
-            format!(
-                "failed to sync warm-start cache temp file '{}': {e}",
-                tmp.display()
-            )
-        })?;
-    }
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!(
-            "failed to install warm-start cache record '{}': {e}",
-            path.display()
+    let Some(store) = persistent_store() else {
+        return Ok(());
+    };
+    store
+        .save(
+            &fingerprint_for_key(key),
+            &bytes,
+            None,
+            None,
+            EntryKind::Checkpoint,
         )
-    })?;
-    sync_dir_best_effort(&dir);
-    prune_cache_dir(&dir);
-    Ok(())
+        .map(|_| ())
+        .map_err(|e| format!("failed to persist warm-start cache record: {e}"))
 }
 
-fn cache_file_path(key: &str) -> Option<PathBuf> {
-    cache_dir()
-        .ok()
-        .map(|dir| cache_file_path_in_dir(&dir, key))
+fn load_json_record<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
+    let store = persistent_store()?;
+    let entry = store.lookup(&fingerprint_for_key(key)).ok().flatten()?;
+    if entry.payload.len() as u64 > MAX_ENTRY_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&entry.payload).ok()
 }
 
-fn cache_file_path_in_dir(dir: &Path, key: &str) -> PathBuf {
-    dir.join(format!("{key}.json"))
+fn persistent_store() -> Option<WarmStartStore> {
+    let base = dirs::cache_dir()?;
+    let root = base.join("gam").join("warm").join("v1");
+    WarmStartStore::open(
+        root,
+        StoreOptions {
+            size_budget_bytes: MAX_TOTAL_BYTES,
+            ttl: Duration::from_secs(CACHE_TTL_SECS),
+        },
+    )
+    .ok()
 }
 
-fn cache_dir() -> Result<PathBuf, String> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("failed to resolve current directory for warm-start cache: {e}"))?;
-    Ok(cwd
-        .join(".cache")
-        .join("gamfit")
-        .join("warm-start")
-        .join("v1"))
+fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"warm-start-key", key);
+    fp.finalize()
 }
 
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn unix_nanos_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-fn sync_dir_best_effort(dir: &Path) {
-    if let Ok(file) = File::open(dir) {
-        let _ = file.sync_all();
-    }
-}
-
-fn prune_cache_dir(dir: &Path) {
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = Vec::new();
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
-                let _ = fs::remove_file(path);
-            }
-            continue;
-        }
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        entries.push((path, metadata.len(), modified));
-    }
-    let mut total: u64 = entries.iter().map(|(_, len, _)| *len).sum();
-    if total <= MAX_TOTAL_BYTES && entries.len() <= MAX_ENTRIES {
-        return;
-    }
-    entries.sort_by_key(|(_, _, modified)| *modified);
-    for (path, len, _) in entries {
-        if total <= MAX_TOTAL_BYTES && cache_entry_count(dir) <= MAX_ENTRIES {
-            break;
-        }
-        if fs::remove_file(&path).is_ok() {
-            total = total.saturating_sub(len);
-        }
-    }
-}
-
-fn cache_entry_count(dir: &Path) -> usize {
-    fs::read_dir(dir)
-        .ok()
-        .map(|it| {
-            it.flatten()
-                .filter(|entry| entry.path().extension().and_then(|s| s.to_str()) == Some("json"))
-                .count()
-        })
         .unwrap_or(0)
 }

@@ -17,7 +17,7 @@ that can sit alongside other modules in your training loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -58,7 +58,7 @@ class _FittedGamModule(nn.Module):
         x_np = to_numpy_f64(X)
         out_np = self._model.predict_array(x_np)
         out_np = np.ascontiguousarray(np.asarray(out_np, dtype=np.float64))
-        return from_numpy_like(out_np, X)
+        return cast(torch.Tensor, from_numpy_like(out_np, X))
 
 
 def from_fitted(model: "Model") -> nn.Module:
