@@ -27240,7 +27240,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_scale_free_duchon_basis_uses_native_kernel_penalty() {
+    fn test_build_scale_free_duchon_basis_emits_default_operator_penalty_triplet() {
+        // Scale-free Duchon (`length_scale=None`) with the default
+        // `DuchonOperatorPenaltySpec` (mass/tension/stiffness all `Active`)
+        // routes through `operator_penalty_candidates_closed_form_pure`, which
+        // emits one candidate per active operator. The unified penalty
+        // framework no longer has a separate `PenaltySource::Primary` "native
+        // kernel" penalty branch for Duchon — q=0 OperatorMass is the kernel
+        // Gram (`D_0^T D_0`), and tension/stiffness add the q=1/q=2 Lebesgue
+        // operator penalties on top.
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -27259,10 +27267,30 @@ mod tests {
             periodic: false,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 1);
-        assert_eq!(out.penaltyinfo.len(), 1);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+        let sources: Vec<_> = out
+            .penaltyinfo
+            .iter()
+            .map(|info| info.source.clone())
+            .collect();
+        assert!(
+            sources.iter().any(|s| matches!(s, PenaltySource::OperatorMass)),
+            "expected OperatorMass among sources, got {sources:?}",
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| matches!(s, PenaltySource::OperatorTension)),
+            "expected OperatorTension among sources, got {sources:?}",
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| matches!(s, PenaltySource::OperatorStiffness)),
+            "expected OperatorStiffness among sources, got {sources:?}",
+        );
     }
 
     #[test]
