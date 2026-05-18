@@ -115,6 +115,7 @@ nav:
     - Data input formats: data-input.md
   - Building a model:
     - Formula DSL: formulas.md
+    - Difference smooths: difference-smooths.md
     - Families and link functions: families-and-links.md
     - Manifold smooths gallery: manifold-smooths.md
     - Survival models: survival.md

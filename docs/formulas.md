@@ -408,3 +408,5 @@ See [survival.md](survival.md).
 # Random intercept per site
 "y ~ smooth(x) + group(site)"
 ```
+
+* [Difference smooths](difference-smooths.md)
