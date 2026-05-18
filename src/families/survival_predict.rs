@@ -1201,10 +1201,13 @@ fn remap_term_collectionspec_columns(
     for random_effect_term in &mut remapped.random_effect_terms {
         random_effect_term.feature_col = resolve_training_index(random_effect_term.feature_col)?;
     }
-    for smooth_term in &mut remapped.smooth_terms {
-        match &mut smooth_term.basis {
+    fn remap_basis<F>(basis: &mut SmoothBasisSpec, resolve: &F) -> Result<(), String>
+    where
+        F: Fn(usize) -> Result<usize, String>,
+    {
+        match basis {
             SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                *feature_col = resolve_training_index(*feature_col)?;
+                *feature_col = resolve(*feature_col)?;
             }
             SmoothBasisSpec::ThinPlate { feature_cols, .. }
             | SmoothBasisSpec::Sphere { feature_cols, .. }
@@ -1212,10 +1215,18 @@ fn remap_term_collectionspec_columns(
             | SmoothBasisSpec::Duchon { feature_cols, .. }
             | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
                 for feature_col in feature_cols.iter_mut() {
-                    *feature_col = resolve_training_index(*feature_col)?;
+                    *feature_col = resolve(*feature_col)?;
                 }
             }
+            SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
+                *by_col = resolve(*by_col)?;
+                remap_basis(inner, resolve)?;
+            }
         }
+        Ok(())
+    }
+    for smooth_term in &mut remapped.smooth_terms {
+        remap_basis(&mut smooth_term.basis, &resolve_training_index)?;
     }
     Ok(remapped)
 }

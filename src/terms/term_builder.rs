@@ -4,7 +4,7 @@
 //! dataset, resolves column references, infers knot counts and center strategies,
 //! and produces a `TermCollectionSpec` ready for `build_term_collection_design`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ndarray::ArrayView1;
 
@@ -24,9 +24,9 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec,
+    ByVariableSpec, LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec,
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplineSpec, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +49,29 @@ pub fn resolve_role_col(
         .get(name)
         .copied()
         .ok_or_else(|| missing_column_message(col_map, name, Some(role)))
+}
+
+fn encoded_levels_for_column(ds: &Dataset, col: usize) -> Vec<(u64, String)> {
+    let mut seen = BTreeSet::<u64>::new();
+    for value in ds.values.column(col) {
+        if value.is_finite() {
+            seen.insert(value.to_bits());
+        }
+    }
+    let schema_levels = ds
+        .schema
+        .columns
+        .get(col)
+        .map(|column| column.levels.as_slice())
+        .unwrap_or(&[]);
+    seen.into_iter()
+        .enumerate()
+        .map(|(idx, bits)| {
+            let fallback = format!("level{}", idx + 1);
+            let label = schema_levels.get(idx).cloned().unwrap_or(fallback);
+            (bits, label)
+        })
+        .collect()
 }
 
 pub fn column_map_with_alias(
@@ -179,25 +202,125 @@ pub fn build_termspec(
                 kind,
                 options,
             } => {
+                let mut smooth_options = options.clone();
+                let by_name = smooth_options.remove("by");
                 let cols = vars
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
+
+                // mgcv compatibility: s(fac, x, bs="sz") is represented as a
+                // shared-penalty set of level-gated deviation smooths.  The
+                // exact cross-level coefficient projection is applied in the
+                // design layer in mgcv; this implementation exposes the same
+                // formula idiom and prediction semantics while keeping the
+                // per-level blocks explicit for inference.
+                let bs_alias = smooth_options
+                    .get("bs")
+                    .or_else(|| smooth_options.get("type"))
+                    .map(|value| value.to_ascii_lowercase());
+                if matches!(
+                    bs_alias.as_deref(),
+                    Some("sz" | "sum-to-zero" | "sum_to_zero")
+                ) {
+                    if vars.len() != 2 {
+                        return Err(format!(
+                            "bs=sz factor smooth expects s(factor, x, bs=sz); got {} variables in {label}",
+                            vars.len()
+                        ));
+                    }
+                    let by_col = cols[0];
+                    let x_vars = vec![vars[1].clone()];
+                    let x_cols = vec![cols[1]];
+                    smooth_options.remove("bs");
+                    smooth_options.remove("type");
+                    smooth_options.insert("identifiability".to_string(), "none".to_string());
+                    let inner = build_smooth_basis(
+                        SmoothKind::S,
+                        &x_vars,
+                        &x_cols,
+                        &smooth_options,
+                        ds,
+                        inference_notes,
+                        policy,
+                        smooth_coordinate_count,
+                    )?;
+                    for (value_bits, level_label) in encoded_levels_for_column(ds, by_col) {
+                        smooth_terms.push(SmoothTermSpec {
+                            name: format!("{label}:{level_label}"),
+                            basis: SmoothBasisSpec::ByVariable {
+                                inner: Box::new(inner.clone()),
+                                by_col,
+                                by: ByVariableSpec::Level {
+                                    value_bits,
+                                    label: level_label,
+                                },
+                            },
+                            shape: ShapeConstraint::None,
+                        });
+                    }
+                    inference_notes.push(format!(
+                        "Interpreted smooth '{label}' as a factor sum-to-zero deviation smooth (bs=sz) over '{}'.",
+                        vars[0]
+                    ));
+                    continue;
+                }
+
                 let basis = build_smooth_basis(
                     *kind,
                     vars,
                     &cols,
-                    options,
+                    &smooth_options,
                     ds,
                     inference_notes,
                     policy,
                     smooth_coordinate_count,
                 )?;
-                smooth_terms.push(SmoothTermSpec {
-                    name: label.clone(),
-                    basis,
-                    shape: ShapeConstraint::None,
-                });
+
+                if let Some(by_name) = by_name {
+                    let by_col = resolve_col(col_map, &by_name)?;
+                    let by_kind = ds.column_kinds.get(by_col).copied().ok_or_else(|| {
+                        format!("internal column-kind lookup failed for by variable '{by_name}'")
+                    })?;
+                    match by_kind {
+                        ColumnKindTag::Categorical => {
+                            for (value_bits, level_label) in encoded_levels_for_column(ds, by_col) {
+                                smooth_terms.push(SmoothTermSpec {
+                                    name: format!("{label}:{level_label}"),
+                                    basis: SmoothBasisSpec::ByVariable {
+                                        inner: Box::new(basis.clone()),
+                                        by_col,
+                                        by: ByVariableSpec::Level {
+                                            value_bits,
+                                            label: level_label,
+                                        },
+                                    },
+                                    shape: ShapeConstraint::None,
+                                });
+                            }
+                            inference_notes.push(format!(
+                                "Expanded smooth '{label}' into one independent by-factor smooth per observed level of '{by_name}'. Include '{by_name}' as a main-effect term when level offsets are substantively required."
+                            ));
+                        }
+                        ColumnKindTag::Continuous | ColumnKindTag::Binary => {
+                            smooth_terms.push(SmoothTermSpec {
+                                name: format!("{label}:by={by_name}"),
+                                basis: SmoothBasisSpec::ByVariable {
+                                    inner: Box::new(basis),
+                                    by_col,
+                                    by: ByVariableSpec::Numeric,
+                                },
+                                shape: ShapeConstraint::None,
+                            });
+                        }
+                    }
+                } else {
+                    smooth_terms.push(SmoothTermSpec {
+                        name: label.clone(),
+                        basis,
+                        shape: ShapeConstraint::None,
+                    });
+                }
             }
             ParsedTerm::LinkWiggle { .. }
             | ParsedTerm::TimeWiggle { .. }
