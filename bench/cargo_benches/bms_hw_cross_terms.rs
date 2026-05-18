@@ -1,4 +1,5 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use gam::faer_ndarray::{fast_atb, fast_atv};
 use ndarray::Array2;
 

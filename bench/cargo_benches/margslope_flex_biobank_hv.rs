@@ -17,7 +17,8 @@
 #[path = "../../tests/test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use margslope_flex_equivalence::{
     DEFAULT_REPRO_N, build_biobank_shape_problem, cycle_capped_options, fit_problem,
 };

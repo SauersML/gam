@@ -10,7 +10,7 @@ path in :mod:`gamfit.torch._coerce`.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, cast
 
 import torch
 
@@ -111,7 +111,8 @@ def bspline_basis(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
-    return _BsplineBasisFn.apply(_as_tensor(t), _as_tensor(knots), int(degree), bool(periodic))
+    apply = cast(Callable[..., Any], _BsplineBasisFn.apply)
+    return apply(_as_tensor(t), _as_tensor(knots), int(degree), bool(periodic))
 
 
 def bspline_basis_derivative(
@@ -183,7 +184,8 @@ def duchon_basis_1d(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
-    return _DuchonBasis1dFn.apply(_as_tensor(t), _as_tensor(centers), int(m), bool(periodic))
+    apply = cast(Callable[..., Any], _DuchonBasis1dFn.apply)
+    return apply(_as_tensor(t), _as_tensor(centers), int(m), bool(periodic))
 
 
 def duchon_basis_1d_derivative(
