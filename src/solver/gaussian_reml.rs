@@ -1149,9 +1149,9 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     let mut batched_lowers: Option<Vec<Array2<f64>>> = if policy_routes_batched {
         let mut buffer: Vec<Array2<f64>> = xtwx_matrices.iter().cloned().collect();
         let ok = crate::gpu::try_cholesky_batched_lower_inplace(&mut buffer).is_some()
-            && buffer.iter().all(|m| {
-                m.iter().all(|v| v.is_finite()) && m.diag().iter().all(|v| *v > 0.0)
-            });
+            && buffer
+                .iter()
+                .all(|m| m.iter().all(|v| v.is_finite()) && m.diag().iter().all(|v| *v > 0.0));
         if ok { Some(buffer) } else { None }
     } else {
         None
@@ -2678,7 +2678,10 @@ mod tests {
             assert_eq!(batched_cache.penalty_rank, single.penalty_rank);
             assert_eq!(batched_cache.nullity, single.nullity);
             assert_eq!(batched_cache.xtwx_fingerprint, single.xtwx_fingerprint);
-            assert_eq!(batched_cache.penalty_fingerprint, single.penalty_fingerprint);
+            assert_eq!(
+                batched_cache.penalty_fingerprint,
+                single.penalty_fingerprint
+            );
             assert!((batched_cache.logdet_xtwx - single.logdet_xtwx).abs() <= 1.0e-12);
             assert!(
                 (batched_cache.logdet_penalty_positive - single.logdet_penalty_positive).abs()
@@ -2708,13 +2711,7 @@ mod tests {
         // must be numerically identical to the refitting `_backward` entry
         // when fed the same forward result. This guards the optimization
         // against drift when either path is touched.
-        let x = array![
-            [1.0, -0.9],
-            [1.0, -0.4],
-            [1.0, 0.1],
-            [1.0, 0.6],
-            [1.0, 1.1],
-        ];
+        let x = array![[1.0, -0.9], [1.0, -0.4], [1.0, 0.1], [1.0, 0.6], [1.0, 1.1],];
         let y = array![[0.2, -0.1], [0.4, 0.1], [0.7, 0.3], [1.0, 0.5], [1.5, 0.8]];
         let penalty = array![[0.0, 0.0], [0.0, 1.5]];
         let weights = array![1.05, 0.95, 1.01, 0.99, 1.03];
@@ -2760,11 +2757,7 @@ mod tests {
         for (a, b) in refit.grad_y.iter().zip(from_fit.grad_y.iter()) {
             assert!((a - b).abs() <= 1.0e-12);
         }
-        for (a, b) in refit
-            .grad_weights
-            .iter()
-            .zip(from_fit.grad_weights.iter())
-        {
+        for (a, b) in refit.grad_weights.iter().zip(from_fit.grad_weights.iter()) {
             assert!((a - b).abs() <= 1.0e-12);
         }
     }
