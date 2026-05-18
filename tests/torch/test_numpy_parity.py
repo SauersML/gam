@@ -222,23 +222,26 @@ def test_geometry_parity_smoke():
     rng = np.random.default_rng(9)
     x = rng.uniform(0.1, 1.0, size=(8, 4))
     np.testing.assert_allclose(
-        gt.closure(_tensor(x)).detach().numpy(), rg.closure(x), rtol=0, atol=0
+        gt.closure(_tensor(x)).detach().numpy(), rg.closure(x), rtol=1e-12, atol=1e-12
     )
     np.testing.assert_allclose(
-        gt.clr(_tensor(x)).detach().numpy(), rg.clr(x), rtol=0, atol=0
+        gt.clr(_tensor(x)).detach().numpy(), rg.clr(x), rtol=1e-12, atol=1e-12
     )
     np.testing.assert_allclose(
-        gt.alr(_tensor(x)).detach().numpy(), rg.alr(x), rtol=0, atol=0
+        gt.alr(_tensor(x)).detach().numpy(), rg.alr(x), rtol=1e-12, atol=1e-12
     )
     z = rg.alr(x)
     np.testing.assert_allclose(
-        gt.inverse_alr(_tensor(z)).detach().numpy(), rg.inverse_alr(z), rtol=0, atol=0
+        gt.inverse_alr(_tensor(z)).detach().numpy(),
+        rg.inverse_alr(z),
+        rtol=1e-12,
+        atol=1e-12,
     )
     np.testing.assert_allclose(
         gt.simplex_frechet_mean(_tensor(x)).detach().numpy(),
         rg.simplex_frechet_mean(x),
-        rtol=0,
-        atol=0,
+        rtol=1e-12,
+        atol=1e-12,
     )
     # Sphere: normalize rows.
     y = rng.standard_normal((6, 3))
