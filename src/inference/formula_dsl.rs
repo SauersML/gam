@@ -1426,9 +1426,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             // option names.
             "bc" | "boundary" | "boundary_conditioned" => {
                 if vars.is_empty() {
-                    return Err(format!(
-                        "{name}() requires at least one variable: {raw}"
-                    ));
+                    return Err(format!("{name}() requires at least one variable: {raw}"));
                 }
                 if !options.contains_key("bc")
                     && !options.contains_key("left_bc")
