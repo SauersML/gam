@@ -4,7 +4,7 @@ use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
 impl<'a> RemlState<'a> {
-    fn cached_penalty_block_structural_nullities(
+    pub(super) fn cached_penalty_block_structural_nullities(
         &self,
     ) -> Result<super::penalty_logdet::PenaltyBlockStructuralNullities, EstimationError> {
         if let Some(cached) = self

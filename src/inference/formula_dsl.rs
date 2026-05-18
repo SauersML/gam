@@ -1364,7 +1364,9 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "bounded",
                     &options,
-                    &["min", "max", "prior", "target", "strength"],
+                    &[
+                        "min", "max", "prior", "pull", "target", "strength", "beta_a", "beta_b",
+                    ],
                     raw,
                 )?;
                 let min = parse_required_f64_option(&options, "min", raw)?;
