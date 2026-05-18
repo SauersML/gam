@@ -148,6 +148,9 @@ struct SummaryPayload {
     iterations: usize,
     edf_total: Option<f64>,
     coefficients: Vec<SummaryCoefficientRow>,
+    covariance_kind: Option<String>,
+    covariance_n: Option<usize>,
+    covariance_flat: Option<Vec<f64>>,
 }
 
 #[derive(Serialize)]
@@ -3545,6 +3548,13 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let standard_errors = fit
         .beta_standard_errors_corrected()
         .or_else(|| fit.beta_standard_errors());
+    let covariance = fit
+        .beta_covariance_corrected()
+        .map(|cov| ("corrected".to_string(), cov))
+        .or_else(|| {
+            fit.beta_covariance()
+                .map(|cov| ("conditional".to_string(), cov))
+        });
     let coefficients = fit
         .beta
         .iter()
@@ -3564,6 +3574,9 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         coefficients,
+        covariance_kind: covariance.as_ref().map(|(kind, _)| kind.clone()),
+        covariance_n: covariance.as_ref().map(|(_, cov)| cov.nrows()),
+        covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),
     };
     serde_json::to_string(&payload).map_err(|err| format!("failed to serialize summary: {err}"))
 }

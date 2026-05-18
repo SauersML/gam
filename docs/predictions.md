@@ -169,3 +169,5 @@ custom_eta = posterior.samples @ X.T    # (n_draws, n_rows)
 Use this to compose your own posterior quantity that
 isn't a straightforward `predict()` call. Restricted to standard
 non-link-wiggle GAMs.
+
+See also: [Difference smooths](difference-smooths.md) for pointwise and simultaneous bands on group trajectory contrasts.

@@ -151,6 +151,23 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         spec: TensorBSplineSpec,
     },
+    /// Row-gated wrapper used for mgcv-style ``by=`` smooths.
+    ///
+    /// ``ByNumeric`` multiplies the inner smooth by a numeric column.
+    /// ``ByLevel`` keeps the inner smooth active only for rows whose encoded
+    /// categorical value has the stored bit pattern.  Unordered factor-by
+    /// smooths are represented as one independent ``ByLevel`` term per level.
+    ByVariable {
+        inner: Box<SmoothBasisSpec>,
+        by_col: usize,
+        by: ByVariableSpec,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ByVariableSpec {
+    Numeric,
+    Level { value_bits: u64, label: String },
 }
 
 /// Tensor-product B-spline smooth specification.
@@ -469,6 +486,19 @@ impl TermCollectionSpec {
                             st.name
                         ));
                     }
+                }
+                SmoothBasisSpec::ByVariable { inner, .. } => {
+                    let nested = SmoothTermSpec {
+                        name: st.name.clone(),
+                        basis: (**inner).clone(),
+                        shape: st.shape,
+                    };
+                    TermCollectionSpec {
+                        linear_terms: Vec::new(),
+                        random_effect_terms: Vec::new(),
+                        smooth_terms: vec![nested],
+                    }
+                    .validate_frozen(label)?;
                 }
                 SmoothBasisSpec::TensorBSpline { spec, .. } => {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
@@ -3660,6 +3690,47 @@ struct LocalSmoothTermBuild {
     kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
+fn apply_by_variable_to_local_build(
+    mut built: LocalSmoothTermBuild,
+    data: ArrayView2<'_, f64>,
+    by_col: usize,
+    by: &ByVariableSpec,
+    term_name: &str,
+) -> Result<LocalSmoothTermBuild, BasisError> {
+    if by_col >= data.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "by-variable smooth term '{term_name}' references column {by_col}, but data has {} columns",
+            data.ncols()
+        )));
+    }
+    let weights = match by {
+        ByVariableSpec::Numeric => data.column(by_col).to_owned(),
+        ByVariableSpec::Level { value_bits, .. } => data.column(by_col).mapv(|value| {
+            if value.to_bits() == *value_bits {
+                1.0
+            } else {
+                0.0
+            }
+        }),
+    };
+    if weights.iter().any(|value| !value.is_finite()) {
+        return Err(BasisError::InvalidInput(format!(
+            "by-variable smooth term '{term_name}' has non-finite by-column values"
+        )));
+    }
+
+    let mut dense = built
+        .design
+        .try_to_dense_by_chunks("by-variable smooth row gating")
+        .map_err(BasisError::InvalidInput)?;
+    for (mut row, &weight) in dense.rows_mut().into_iter().zip(weights.iter()) {
+        row.mapv_inplace(|value| value * weight);
+    }
+    built.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense));
+    built.kronecker_factored = None;
+    Ok(built)
+}
+
 fn build_single_local_smooth_term(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
@@ -3671,6 +3742,16 @@ fn build_single_local_smooth_term(
             term.shape, term.name
         )));
     }
+    if let SmoothBasisSpec::ByVariable { inner, by_col, by } = &term.basis {
+        let inner_term = SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**inner).clone(),
+            shape: term.shape,
+        };
+        let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+        return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
+    }
+
     let mut shape_axis_col: Option<usize> = None;
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::BSpline1D { feature_col, spec } => {
@@ -3904,6 +3985,9 @@ fn build_single_local_smooth_term(
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
             build_tensor_bspline_basis(data, feature_cols, spec)?
+        }
+        SmoothBasisSpec::ByVariable { .. } => {
+            unreachable!("ByVariable smooths return before inner basis dispatch")
         }
     };
 
@@ -4658,6 +4742,17 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            });
+            cols.push(*by_col);
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        }
     }
 }
 
@@ -4669,6 +4764,11 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Sphere { .. } => 3,
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::ByVariable { inner, .. } => smooth_basis_family_rank(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**inner).clone(),
+            shape: term.shape,
+        }),
     }
 }
 
@@ -4699,6 +4799,13 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             TensorBSplineIdentifiability::FrozenTransform { .. }
         ),
+        SmoothBasisSpec::ByVariable { inner, .. } => {
+            smooth_has_frozen_identifiability(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            })
+        }
     }
 }
 
@@ -10839,7 +10946,9 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::ByVariable { .. } => {
             return Ok(None);
         }
     };
