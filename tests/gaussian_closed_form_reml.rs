@@ -48,7 +48,7 @@ fn fixture() -> (Array2<f64>, Array1<f64>, Array2<f64>) {
         x[[i, 2]] = t * t;
         x[[i, 3]] = (3.0 * t).sin();
         x[[i, 4]] = (5.0 * t).cos();
-        let noise = 0.05
+        let noise = 0.3
             * (((i as f64) * 0.913).sin()
                 + ((i as f64) * 1.731).cos()
                 + 0.5 * (((i as f64) * 0.317).sin() * ((i as f64) * 0.589).cos()));
