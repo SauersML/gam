@@ -493,11 +493,8 @@ pub fn gaussian_reml_multi_closed_form_batch<'a>(
         .collect();
     // Phase B: one batched cuSOLVER Cholesky (when policy approves uniform p
     // and K aggregate FLOPs), per-fit Cholesky fallback otherwise.
-    let caches = build_gaussian_reml_eigen_cache_batched(
-        xtwx_per_problem,
-        penalty.view(),
-        nullspace_dim,
-    );
+    let caches =
+        build_gaussian_reml_eigen_cache_batched(xtwx_per_problem, penalty.view(), nullspace_dim);
     // Phase C: par_iter finish each fit with its prebuilt cache, falling
     // back to a fresh build when the cache build failed for that element.
     let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
