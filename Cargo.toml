@@ -153,6 +153,11 @@ name = "bms_hv_row_skip"
 path = "bench/cargo_benches/bms_hv_row_skip.rs"
 harness = false
 
+[[bench]]
+name = "bms_hw_cross_terms"
+path = "bench/cargo_benches/bms_hw_cross_terms.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
