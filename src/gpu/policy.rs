@@ -125,6 +125,22 @@ impl DispatchPolicy {
         p >= self.chol_min_p
     }
 
+    /// Should a batched K-way Cholesky factorization route to the device?
+    /// Uses the aggregate K·p³/3 FLOP count against the gemm threshold so
+    /// biobank-scale `K = 16 000` with small per-fit `p = 5..50` reaches the
+    /// device — the per-fit `route_chol_solve` would (correctly) decline
+    /// those individually because each `O(p³/3)` factor is tiny, but the
+    /// batched dispatch amortizes the host↔device round trip across `K`.
+    pub fn route_chol_batched(&self, p: usize, batch_size: usize) -> bool {
+        if p == 0 || batch_size == 0 {
+            return false;
+        }
+        let p64 = p as u64;
+        let p3 = p64.saturating_mul(p64).saturating_mul(p64);
+        let total_flops = (batch_size as u64).saturating_mul(p3 / 3);
+        total_flops >= self.gemm_min_flops
+    }
+
     /// Should a symmetric eigendecomposition route to the device?
     pub fn route_syevd(&self, p: usize) -> bool {
         p >= self.syevd_min_p

@@ -1676,6 +1676,53 @@ fn gaussian_reml_fit_batched_impl(
     let batch = row_offsets.len() - 1;
     let p = x.ncols();
     let d = y.ncols();
+
+    // Phase A: compute X'WX per fit in parallel (CPU or per-fit GPU dispatch
+    // via `fast_xt_diag_x`). Per-fit X'WX cost is `O(n_b · p²)`; this phase
+    // produces K p×p matrices that feed the batched Cholesky in Phase B.
+    let xtwx_phase: Vec<Option<Array2<f64>>> = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return None;
+            }
+            let x_slice = x.slice(s![start..end, ..]);
+            let owned_weight: Array1<f64> = match weights.as_ref() {
+                Some(w) => w.slice(s![start..end]).to_owned(),
+                None => Array1::ones(end - start),
+            };
+            Some(gam::faer_ndarray::fast_xt_diag_x(&x_slice, &owned_weight))
+        })
+        .collect();
+
+    // Phase B: assemble live X'WX matrices and run the batched cache build.
+    // The Cholesky step inside collapses to a single `cusolverDnDpotrfBatched`
+    // call when policy + uniform shape allow; otherwise falls back to
+    // per-fit Cholesky inside the helper. The remaining whitened-penalty
+    // eigh stays per-fit (cuSOLVER has no batched symmetric eigensolver).
+    let mut live_indices: Vec<usize> = Vec::with_capacity(batch);
+    let mut live_xtwx: Vec<Array2<f64>> = Vec::with_capacity(batch);
+    for (b, slot) in xtwx_phase.into_iter().enumerate() {
+        if let Some(xtwx) = slot {
+            live_indices.push(b);
+            live_xtwx.push(xtwx);
+        }
+    }
+    let batched_caches =
+        build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
+    let mut prebuilt_caches: Vec<Option<gam::gaussian_reml::GaussianRemlEigenCache>> =
+        (0..batch).map(|_| None).collect();
+    for (i, cache_result) in batched_caches.into_iter().enumerate() {
+        if let Ok(cache) = cache_result {
+            prebuilt_caches[live_indices[i]] = Some(cache);
+        }
+    }
+
+    // Phase C: per-fit completion. Each fit either uses the prebuilt cache
+    // (skipping its chol + eigh in `prepare_gaussian_reml`) or falls through
+    // to a fresh build when the batched cache build dropped that element.
     let fit_results: Vec<
         Result<(usize, Option<gam::gaussian_reml::GaussianRemlMultiResult>), String>,
     > = (0..batch)
@@ -1687,13 +1734,14 @@ fn gaussian_reml_fit_batched_impl(
                 return Ok((b, None));
             }
             let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
+            let cache_ref = prebuilt_caches[b].as_ref();
             match gaussian_reml_multi_closed_form_with_cache(
                 x.slice(s![start..end, ..]),
                 y.slice(s![start..end, ..]),
                 penalty,
                 weight_slice,
                 init_lambda,
-                None,
+                cache_ref,
             ) {
                 Ok(result) => Ok((b, Some(result))),
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
