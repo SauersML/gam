@@ -709,6 +709,15 @@ fn gaussian_reml_fit_batched<'py>(
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
+    set_batched_gaussian_reml_dict_items(py, &out, result)?;
+    Ok(out.unbind())
+}
+
+fn set_batched_gaussian_reml_dict_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    result: BatchedGaussianRemlResult,
+) -> PyResult<()> {
     out.set_item("status", result.statuses)?;
     out.set_item("lambda", result.lambdas.into_pyarray(py))?;
     out.set_item("rho", result.rhos.into_pyarray(py))?;
@@ -727,7 +736,43 @@ fn gaussian_reml_fit_batched<'py>(
     out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
     out.set_item("fitted", result.fitted.into_pyarray(py))?;
     out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
-    Ok(out.unbind())
+    out.set_item(
+        "cache_penalty_eigenvalues",
+        result.cache_penalty_eigenvalues.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_eigenvectors",
+        result.cache_eigenvectors.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_coefficient_basis",
+        result.cache_coefficient_basis.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_xtwx_fingerprints",
+        result.cache_xtwx_fingerprints.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_penalty_fingerprints",
+        result.cache_penalty_fingerprints.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_logdet_xtwx",
+        result.cache_logdet_xtwx.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_logdet_penalty_positive",
+        result.cache_logdet_penalty_positive.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_penalty_ranks",
+        result.cache_penalty_ranks.into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_nullities",
+        result.cache_nullities.into_pyarray(py),
+    )?;
+    Ok(())
 }
 
 #[pyfunction(signature = (
@@ -739,6 +784,7 @@ fn gaussian_reml_fit_batched<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
+    forward_state = None,
     weights = None,
     init_lambda = None,
     by = None,
@@ -1286,6 +1332,19 @@ struct BatchedGaussianRemlResult {
     coefficients: Array3<f64>,
     fitted: Array2<f64>,
     sigma2: Array2<f64>,
+    // Per-fit cache stacked across the batch — populated for fits whose status
+    // is "ok". Backward callers re-bind these into `GaussianRemlMultiResult`
+    // and route to `_from_fit`, skipping the redundant ρ-search + cache build
+    // that would otherwise double per-step cost at training-loop frequency.
+    cache_penalty_eigenvalues: Array2<f64>,
+    cache_eigenvectors: Array3<f64>,
+    cache_coefficient_basis: Array3<f64>,
+    cache_xtwx_fingerprints: Array1<u64>,
+    cache_penalty_fingerprints: Array1<u64>,
+    cache_logdet_xtwx: Array1<f64>,
+    cache_logdet_penalty_positive: Array1<f64>,
+    cache_penalty_ranks: Array1<i64>,
+    cache_nullities: Array1<i64>,
 }
 
 struct BatchedGaussianRemlBackwardResult {
@@ -1507,6 +1566,15 @@ fn gaussian_reml_fit_batched_impl(
     let mut fitted = Array2::<f64>::zeros((x.nrows(), d));
     let mut sigma2 = Array2::<f64>::from_elem((batch, d), f64::NAN);
     let mut statuses = vec!["degenerate".to_string(); batch];
+    let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
+    let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
+    let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
+    let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
+    let mut cache_logdet_penalty_positive = Array1::<f64>::zeros(batch);
+    let mut cache_penalty_ranks = Array1::<i64>::zeros(batch);
+    let mut cache_nullities = Array1::<i64>::zeros(batch);
 
     for result in fit_results {
         let (b, fit) = result?;
@@ -1527,6 +1595,21 @@ fn gaussian_reml_fit_batched_impl(
                 .assign(&fit.coefficients);
             fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
             sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            cache_penalty_eigenvalues
+                .slice_mut(s![b, ..])
+                .assign(&fit.cache.penalty_eigenvalues);
+            cache_eigenvectors
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.cache.eigenvectors);
+            cache_coefficient_basis
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.cache.coefficient_basis);
+            cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
+            cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
+            cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
+            cache_logdet_penalty_positive[b] = fit.cache.logdet_penalty_positive;
+            cache_penalty_ranks[b] = fit.cache.penalty_rank as i64;
+            cache_nullities[b] = fit.cache.nullity as i64;
         }
     }
 
@@ -1543,6 +1626,15 @@ fn gaussian_reml_fit_batched_impl(
         coefficients,
         fitted,
         sigma2,
+        cache_penalty_eigenvalues,
+        cache_eigenvectors,
+        cache_coefficient_basis,
+        cache_xtwx_fingerprints,
+        cache_penalty_fingerprints,
+        cache_logdet_xtwx,
+        cache_logdet_penalty_positive,
+        cache_penalty_ranks,
+        cache_nullities,
     })
 }
 
