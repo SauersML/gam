@@ -109,8 +109,8 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
             "coefficient {idx} mismatch: closed={a} existing={b}"
         );
     }
-    let reml_rel = (closed.reml_score - existing.reml_score).abs()
-        / closed.reml_score.abs().max(1.0);
+    let reml_rel =
+        (closed.reml_score - existing.reml_score).abs() / closed.reml_score.abs().max(1.0);
     assert!(
         (closed.reml_score - existing.reml_score).abs() < 0.5 || reml_rel < 1e-2,
         "REML mismatch: closed={} existing={} rel_diff={reml_rel}",
