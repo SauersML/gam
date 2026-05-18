@@ -566,6 +566,7 @@ pub fn build_smooth_basis(
                     "penalty_order",
                     "bc",
                     "periodic",
+                    "cyclic",
                     "period",
                     "periods",
                     "period_start",
