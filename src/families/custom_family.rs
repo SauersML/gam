@@ -23,10 +23,13 @@ use crate::solver::estimate::reml::unified::{
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
+use crate::solver::persistent_warm_start::{
+    PersistentBlockWarmStartRecord, StableHasher, load_block_record, store_block_record,
+};
 use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
-use std::any::Any;
+use std::any::{Any, type_name};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
