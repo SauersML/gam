@@ -7474,10 +7474,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     out
                 },
                 reparam_qs: None,
+                dispersion: crate::estimate::Dispersion::Known(1.0),
                 beta_covariance,
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
             let geometry = Some(crate::estimate::FitGeometry {
@@ -9869,10 +9873,14 @@ fn fit_bounded_term_collection_with_design(
                     working_response
                 },
                 reparam_qs: None,
+                dispersion: crate::estimate::Dispersion::Known(1.0),
                 beta_covariance,
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
             let covariance_conditional = inf.beta_covariance.clone();
