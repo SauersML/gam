@@ -153,6 +153,11 @@ name = "bms_hv_row_skip"
 path = "bench/cargo_benches/bms_hv_row_skip.rs"
 harness = false
 
+[[bench]]
+name = "bms_hw_cross_terms"
+path = "bench/cargo_benches/bms_hw_cross_terms.rs"
+harness = false
+
 # Dev / test profile — full DWARF (debug = 2) on a dep graph this heavy
 # (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet, criterion,
 # ad_trait, autodiff, num-dual, …) blows out the ubuntu-latest CI runner's
