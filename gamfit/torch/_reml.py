@@ -106,6 +106,8 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
         ctx.forward_state = _copy_forward_state(out)
+        ctx.has_weights = weights is not None
+        ctx.has_by = by is not None
         ctx.ref = x
 
         coefficients = from_numpy_like(out["coefficients"], x)
@@ -186,6 +188,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
+        _save_diff_tensors(ctx, x, y, weights, by)
         ctx.x_np = x_np
         ctx.y_np = y_np
         ctx.offsets_np = offsets_np
@@ -213,6 +216,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         grad_lam: torch.Tensor | None,
         grad_reml_score: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_vec = _batch_grad(grad_lam)
@@ -285,6 +289,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
+        _save_diff_tensors(ctx, t, y, weights, by)
         ctx.t_np = t_np
         ctx.y_np = y_np
         ctx.knots_np = knots_np
@@ -316,6 +321,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         grad_lam: torch.Tensor | None,
         grad_reml_score: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_scalar = _scalar_grad(grad_lam)
@@ -395,6 +401,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
+        _save_diff_tensors(ctx, t, y, weights, by)
         ctx.t_np = t_np
         ctx.y_np = y_np
         ctx.offsets_np = offsets_np
@@ -427,6 +434,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         grad_lam: torch.Tensor | None,
         grad_reml_score: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_vec = _batch_grad(grad_lam)
