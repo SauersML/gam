@@ -109,9 +109,7 @@ margins for tensor products, an intrinsic `sphere(...)` kernel
 (Wahba's reproducing kernel or spherical harmonics), and
 boundary-conditioned 1-D B-splines.
 
-![rotating recovery of six manifolds (trefoil knot, latent-free loop,
-wobbly cylinder, lumpy sphere, bumpy torus, Möbius strip) from noisy
-3-D point clouds](docs/images/geometric_shapes_demo.gif)
+![rotating recovery of six manifolds (trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, Möbius strip) from noisy 3-D point clouds](docs/images/geometric_shapes_demo.gif)
 
 Each pair shows a noisy 3-D point cloud (left) and the smooth
 manifold the geometric smooths recover (right). The full gallery,
