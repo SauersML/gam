@@ -50,6 +50,19 @@ def _copy_forward_state(out: dict[str, Any]) -> dict[str, Any]:
     return {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in out.items()}
 
 
+def _save_diff_tensors(ctx: Any, *tensors: Any) -> None:
+    """Save tensor inputs so PyTorch version-tracks them and raises on in-place
+    mutation between forward and backward. ``None`` values are skipped silently;
+    callers retain their own presence flags."""
+    ctx.save_for_backward(*(t for t in tensors if isinstance(t, torch.Tensor)))
+
+
+def _check_saved_versions(ctx: Any) -> None:
+    """Touch ``ctx.saved_tensors`` so PyTorch raises if any saved input was
+    modified in-place between forward and backward."""
+    _ = ctx.saved_tensors
+
+
 class _GaussianRemlFitFn(torch.autograd.Function):
     """Autograd Function for the non-batched closed-form Gaussian REML fit."""
 
@@ -80,6 +93,11 @@ class _GaussianRemlFitFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
+        # Save the differentiable input tensors so PyTorch can version-check
+        # them and raise on any in-place mutation between forward and backward.
+        # Keep the numpy aliases on ctx for performance — they are only read in
+        # backward, which is gated by the version check.
+        _save_diff_tensors(ctx, x, y, weights, by)
         ctx.x_np = x_np
         ctx.y_np = y_np
         ctx.penalty_np = penalty_np
@@ -87,12 +105,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         ctx.by_np = by_np
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
-        # Thread the full Rust forward dict back to the analytic backward so
-        # the eigendecomposition cache is reused. Copy ndarrays defensively so
-        # in-place ops on the user-facing tensors cannot corrupt the cache.
         ctx.forward_state = _copy_forward_state(out)
-        ctx.has_weights = weights is not None
-        ctx.has_by = by is not None
         ctx.ref = x
 
         coefficients = from_numpy_like(out["coefficients"], x)
@@ -109,6 +122,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         grad_lam: torch.Tensor | None,
         grad_reml_score: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_scalar = _scalar_grad(grad_lam)
