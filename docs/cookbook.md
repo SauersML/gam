@@ -376,3 +376,38 @@ print(gs.best_params_, gs.best_score_)
 model.report("report.html")     # writes to disk
 html = model.report()           # returns string for Jupyter / inline display
 ```
+
+## Per-group trajectories (factor `by=` smooth)
+
+Use a factor `by=` smooth when each group should have its own unpooled curve:
+
+```text
+y ~ s(time, by=subject) + group(subject)
+```
+
+The smooth contribution for a previously unseen subject is zero at prediction
+time; include `group(subject)` when subject-level intercepts matter.
+
+## Hierarchical / partial-pooling smooths (`bs="fs"`)
+
+Use `bs="fs"` (or `fs(...)`) when group-specific curves should borrow strength:
+
+```text
+y ~ s(time, subject, bs="fs", k=8)
+y ~ fs(time, subject, k=8)
+```
+
+This term penalizes both wiggly components and low-order null-space components,
+so sparse groups shrink more strongly than dense groups.
+
+## Treatment vs control difference smooth (`bs="sz"`)
+
+Use `bs="sz"` with a main smooth to model deviations that sum to zero across
+factor levels:
+
+```text
+y ~ s(time) + s(treatment, time, bs="sz", k=10)
+```
+
+The main `s(time)` captures the population trajectory, while the `sz` term
+captures level-specific departures.
