@@ -3,7 +3,7 @@
 //! Measures `fit_from_formula` end-to-end at N=1M for every geometric
 //! feature we ship. Goal: prove the literal 150× target on the FIT path
 //! (basis builds are already past 150× via parallel + algorithmic
-//! changes, see docs/perf-150x-roadmap.md).
+//! changes).
 //!
 //! These tests print timings via eprintln and are intentionally
 //! ungated — they always pass even if the perf is slow — so the
