@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,7 +71,7 @@ def resolve_binary(arg: str | None) -> Path:
     return path
 
 
-def run_one(binary: Path, n: int, outdir: Path, budget: float, seed: int) -> dict:
+def run_one(binary: Path, n: int, outdir: Path, budget: float, seed: int) -> dict[str, Any]:
     data = outdir / f"dch_{n}.csv"
     log = outdir / f"dch_{n}.log"
     model = outdir / f"dch_{n}.model"
@@ -111,7 +112,7 @@ def run_one(binary: Path, n: int, outdir: Path, budget: float, seed: int) -> dic
     return parse_log(n, elapsed, rc, timed_out, log)
 
 
-def parse_log(n: int, elapsed: float, rc: int, timed_out: bool, log_path: Path) -> dict:
+def parse_log(n: int, elapsed: float, rc: int, timed_out: bool, log_path: Path) -> dict[str, Any]:
     text = log_path.read_text(errors="replace")
     trace_lines = [ln for ln in text.splitlines() if "DenseSpectralOperator::trace_logdet_operator" in ln]
     ext_coord_lines = [ln for ln in text.splitlines() if "reml_laml ext_coord_trace" in ln]

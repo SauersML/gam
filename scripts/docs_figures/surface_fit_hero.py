@@ -10,10 +10,13 @@ Run from anywhere; paths are resolved relative to this file.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
+from matplotlib.colorbar import Colorbar
 
 import gamfit
 
@@ -68,7 +71,7 @@ def truth(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
     return bump_a + bump_b + slope
 
 
-def make_data(n: int = 800, seed: int = 7) -> dict:
+def make_data(n: int = 800, seed: int = 7) -> dict[str, list[float]]:
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(0.0, 1.0, n)
     x2 = rng.uniform(0.0, 1.0, n)
@@ -76,7 +79,9 @@ def make_data(n: int = 800, seed: int = 7) -> dict:
     return {"y": y.tolist(), "x1": x1.tolist(), "x2": x2.tolist()}
 
 
-def grid_predict(model: gamfit.Model, side: int = 120, *, with_se: bool = False):
+def grid_predict(
+    model: gamfit.Model, side: int = 120, *, with_se: bool = False
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     g = np.linspace(0.0, 1.0, side)
     gx, gy = np.meshgrid(g, g)
     payload = {"x1": gx.ravel().tolist(), "x2": gy.ravel().tolist()}

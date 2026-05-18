@@ -17,13 +17,13 @@ import random
 import sys
 
 
-def std_normal(rng, two_pi=2.0 * math.pi):
+def std_normal(rng: random.Random, two_pi: float = 2.0 * math.pi) -> float:
     u1 = max(rng.random(), 1e-12)
     u2 = rng.random()
     return math.sqrt(-2.0 * math.log(u1)) * math.cos(two_pi * u2)
 
 
-def erf_approx(x):
+def erf_approx(x: float) -> float:
     a1, a2, a3, a4, a5, p = (
         0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429, 0.3275911,
     )
@@ -34,7 +34,7 @@ def erf_approx(x):
     return sign * y
 
 
-def write_csv(n, path, seed=0xA110CA7E):
+def write_csv(n: int, path: str, seed: int = 0xA110CA7E) -> None:
     rng = random.Random(seed ^ n)
     two_pi = 2.0 * math.pi
     sqrt_2 = math.sqrt(2.0)
