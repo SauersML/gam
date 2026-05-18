@@ -810,6 +810,8 @@ def gaussian_reml_fit_batched(
     *,
     weights: Any | None = None,
     init_lambda: float | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Fit K closed-form Gaussian REML problems packed by row offsets."""
     import numpy as np
@@ -822,6 +824,8 @@ def gaussian_reml_fit_batched(
             _numeric_matrix(penalty, "penalty"),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -838,6 +842,7 @@ def gaussian_reml_fit_batched_backward(
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
     grad_reml_score: Any | None = None,
+    forward_state: dict[str, Any] | None = None,
     weights: Any | None = None,
     init_lambda: float | None = None,
     by: Any | None = None,
@@ -860,6 +865,7 @@ def gaussian_reml_fit_batched_backward(
             else _numeric_tensor3(grad_coefficients, "grad_coefficients"),
             None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
             _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
+            forward_state,
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -924,6 +930,7 @@ def gaussian_reml_fit_positions_backward(
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
     grad_reml_score: float = 0.0,
+    forward_state: dict[str, Any] | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -949,6 +956,7 @@ def gaussian_reml_fit_positions_backward(
             else _numeric_matrix(grad_coefficients, "grad_coefficients"),
             None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
             float(grad_reml_score),
+            forward_state,
             order,
             bool(periodic),
             None if period is None else float(period),
@@ -1019,6 +1027,7 @@ def gaussian_reml_fit_positions_batched_backward(
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
     grad_reml_score: Any | None = None,
+    forward_state: dict[str, Any] | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -1047,6 +1056,7 @@ def gaussian_reml_fit_positions_batched_backward(
             else _numeric_tensor3(grad_coefficients, "grad_coefficients"),
             None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
             _optional_batch_vector(grad_reml_score, batch, "grad_reml_score"),
+            forward_state,
             order,
             bool(periodic),
             None if period is None else float(period),
