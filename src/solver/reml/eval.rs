@@ -90,17 +90,16 @@ impl<'a> RemlState<'a> {
 
         let lambdas_slice = lambdas.as_slice().unwrap();
 
-        let cached_block_nullities = if ridge > 0.0 {
-            Some(self.cached_penalty_block_structural_nullities()?)
-        } else {
-            None
-        };
+        // Always pass the cached structural nullities so the eigenspace rank
+        // matches between this derivative path and the cost/gradient path in
+        // `dense_penalty_logdet_derivs`. See the matching note there.
+        let cached_block_nullities = self.cached_penalty_block_structural_nullities()?;
         let pld = PenaltyPseudologdet::from_penalties_with_cached_block_nullities(
             &self.canonical_penalties,
             lambdas_slice,
             ridge,
             self.p,
-            cached_block_nullities.as_ref(),
+            Some(&cached_block_nullities),
         )
         .map_err(EstimationError::LayoutError)?;
 
