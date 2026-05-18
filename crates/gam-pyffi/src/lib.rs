@@ -1091,6 +1091,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    forward_state: Option<&Bound<'py, PyDict>>,
     basis_order: usize,
     periodic: bool,
     period: Option<f64>,
@@ -1099,6 +1100,10 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let forward_fits = forward_state
+        .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
+        .transpose()
+        .map_err(py_value_error)?;
     let backward = gaussian_reml_fit_positions_batched_backward_impl(
         t.as_array(),
         y.as_array(),
@@ -1117,6 +1122,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         grad_reml_score.as_ref().map(|g| g.as_array()),
         by.as_ref().map(|b| b.as_array()),
         by_start_col,
+        forward_fits.as_deref(),
     )
     .map_err(py_value_error)?;
 
