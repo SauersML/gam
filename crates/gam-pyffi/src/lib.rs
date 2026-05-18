@@ -1710,8 +1710,7 @@ fn gaussian_reml_fit_batched_impl(
             live_xtwx.push(xtwx);
         }
     }
-    let batched_caches =
-        build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
+    let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
     let mut prebuilt_caches: Vec<Option<gam::gaussian_reml::GaussianRemlEigenCache>> =
         (0..batch).map(|_| None).collect();
     for (i, cache_result) in batched_caches.into_iter().enumerate() {
