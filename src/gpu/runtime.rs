@@ -68,6 +68,7 @@ impl fmt::Display for GpuProbeError {
 pub struct GpuRuntime {
     selected_device: Option<GpuDeviceInfo>,
     policy: DispatchPolicy,
+    cpu_reason: Option<String>,
 }
 
 impl GpuRuntime {
@@ -92,13 +93,16 @@ impl GpuRuntime {
                 Self {
                     selected_device: Some(device),
                     policy,
+                    cpu_reason: None,
                 }
             }
             Err(err) => {
-                diagnostics::log_cuda_disabled(&err.to_string());
+                let reason = err.to_string();
+                diagnostics::log_cuda_disabled(&reason);
                 Self {
                     selected_device: None,
                     policy: DispatchPolicy::for_device(None),
+                    cpu_reason: Some(reason),
                 }
             }
         }
@@ -120,6 +124,12 @@ impl GpuRuntime {
     #[inline]
     pub fn policy(&self) -> &DispatchPolicy {
         &self.policy
+    }
+
+    /// CPU-only probe reason, or `None` when a CUDA device was selected.
+    #[inline]
+    pub fn cpu_reason(&self) -> Option<&str> {
+        self.cpu_reason.as_deref()
     }
 
     /// The one shared `(libcuda + DriverApi + context)` used by every

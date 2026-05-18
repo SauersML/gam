@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use super::device::GpuDeviceInfo;
 use super::policy::DispatchPolicy;
+use super::runtime::GpuRuntime;
 
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &DispatchPolicy) {
     log::info!(
@@ -43,6 +44,14 @@ pub(crate) fn log_policy_cpu(op: &'static str, shape: String, reason: String) {
     log_route(format!(
         "[GPU] CPU route | op={op} | shape={shape} | reason={reason}"
     ));
+}
+
+pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
+    if let Some(cpu_reason) = GpuRuntime::global().cpu_reason() {
+        format!("CUDA unavailable: {cpu_reason}")
+    } else {
+        policy_reason
+    }
 }
 
 pub(crate) fn log_runtime_cpu(op: &'static str, backend: &'static str, shape: String) {
