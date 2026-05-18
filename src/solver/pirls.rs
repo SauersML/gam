@@ -2801,20 +2801,31 @@ fn solve_newton_direction_dense(
     // factorization reports a non-PD pivot.
     let mut hess_buf = hessian.clone();
     let mut rhs_mat = gradient.to_owned().insert_axis(ndarray::Axis(1));
+    let gpu_route = crate::gpu::describe_chol_solve_route(p, rhs_mat.ncols());
+    let gpu_attempt_expected = crate::gpu::will_attempt_chol_solve(p);
     if crate::gpu::try_chol_solve_inplace(&mut hess_buf, &mut rhs_mat).is_some() {
         let mut solved = rhs_mat.remove_axis(ndarray::Axis(1));
         if array1_is_finite(&solved) {
             solved.mapv_inplace(|v| -v);
             direction_out.assign(&solved);
             log::info!(
-                "[STAGE] PIRLS dense newton solve (gpu) p={} flops~{} elapsed={:.3}s",
+                "[STAGE] PIRLS dense newton solve backend=GPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
                 p,
                 (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
                 dense_solve_start.elapsed().as_secs_f64(),
+                gpu_route,
             );
             return Ok(());
         }
     }
+    let cpu_route = if gpu_attempt_expected {
+        format!(
+            "GPU route was eligible but cuSOLVER did not return a finite solution; \
+             falling back to CPU stable solver; initial_route=\"{gpu_route}\""
+        )
+    } else {
+        gpu_route
+    };
 
     let factor = StableSolver::new("pirls newton direction")
         .factorize(hessian)
@@ -2825,10 +2836,11 @@ fn solve_newton_direction_dense(
     direction_out.mapv_inplace(|v| -v);
     if array1_is_finite(direction_out) {
         log::info!(
-            "[STAGE] PIRLS dense newton solve p={} flops~{} elapsed={:.3}s",
+            "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
             p,
             (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
             dense_solve_start.elapsed().as_secs_f64(),
+            cpu_route,
         );
         return Ok(());
     }
