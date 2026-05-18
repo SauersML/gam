@@ -376,3 +376,15 @@ print(gs.best_params_, gs.best_score_)
 model.report("report.html")     # writes to disk
 html = model.report()           # returns string for Jupyter / inline display
 ```
+
+## Per-group trajectories (factor by smooth)
+
+`y ~ fac + s(time, by=fac)` fits separate time trajectories by level; include the main `fac` effect for level offsets.
+
+## Hierarchical / partial-pooling smooths (`bs="fs"`)
+
+`y ~ s(time) + s(time, subject, bs="fs")` models a population curve plus shrinkage-stabilized subject-specific departures.
+
+## Treatment vs control difference smooth (`bs="sz"`)
+
+`y ~ s(time) + s(time, treatment, bs="sz")` estimates a population time effect and sum-to-zero treatment deviations.
