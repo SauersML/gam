@@ -142,7 +142,10 @@ y ~ s(x, bc_left=anchored, bc_right=free) # starts at zero, right end free
 y ~ s(x, bc=clamped)                      # zero slope at both endpoints
 ```
 
-Default `k`: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
+Default interior knots: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
+The basis dimension is then `k = internal_knots + degree + 1`. Pass `k=` to
+set the total basis dimension directly; passing both `k` and `knots` is an
+error.
 
 ## Multivariate smooths
 
