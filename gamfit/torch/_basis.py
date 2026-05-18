@@ -15,6 +15,7 @@ from typing import Any
 import torch
 
 from .. import _api
+from . import _torch_compat as _tc
 from ._coerce import from_numpy_like, to_numpy_f64, to_numpy_uintp
 
 
@@ -22,7 +23,7 @@ def _as_tensor(value: Any) -> Any:
     """Ensure ``value`` is a torch tensor; promote NumPy/list/scalar to one."""
     if isinstance(value, torch.Tensor):
         return value
-    return torch.as_tensor(value, dtype=torch.float64)
+    return _tc.as_tensor(value, dtype=_tc.float64)
 
 
 class _BsplineBasisFn(torch.autograd.Function):
