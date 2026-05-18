@@ -23,15 +23,13 @@ class _BsplineBasisFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, t: Any, knots: Any, degree: int, periodic: bool) -> Any:
-        import torch
-
         t_np = to_numpy_f64(t)
         knots_np = to_numpy_f64(knots)
         basis_np = _api.bspline_basis(t_np, knots_np, degree=degree, periodic=periodic)
         ctx.save_for_backward(t, knots)
         ctx.degree = degree
         ctx.periodic = periodic
-        return from_numpy_like(basis_np, t).to(dtype=torch.float64)
+        return from_numpy_like(basis_np, t)
 
     @staticmethod
     def backward(ctx: Any, grad_basis: Any) -> tuple[Any, None, None, None]:
@@ -55,15 +53,13 @@ class _DuchonBasis1dFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, t: Any, centers: Any, m: int, periodic: bool) -> Any:
-        import torch
-
         t_np = to_numpy_f64(t)
         centers_np = to_numpy_f64(centers)
         basis_np = _api.duchon_basis_1d(t_np, centers_np, m=m, periodic=periodic)
         ctx.save_for_backward(t, centers)
         ctx.m = m
         ctx.periodic = periodic
-        return from_numpy_like(basis_np, t).to(dtype=torch.float64)
+        return from_numpy_like(basis_np, t)
 
     @staticmethod
     def backward(ctx: Any, grad_basis: Any) -> tuple[Any, None, None, None]:
