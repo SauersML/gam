@@ -117,13 +117,8 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         return coefficients, fitted, lam, reml_score
 
     @staticmethod
-    def backward(
-        ctx: Any,
-        grad_coefficients: torch.Tensor | None,
-        grad_fitted: torch.Tensor | None,
-        grad_lam: torch.Tensor | None,
-        grad_reml_score: torch.Tensor | None,
-    ) -> tuple[Any, ...]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
@@ -209,13 +204,8 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         return coefficients, fitted, lam, reml_score
 
     @staticmethod
-    def backward(
-        ctx: Any,
-        grad_coefficients: torch.Tensor | None,
-        grad_fitted: torch.Tensor | None,
-        grad_lam: torch.Tensor | None,
-        grad_reml_score: torch.Tensor | None,
-    ) -> tuple[Any, ...]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
@@ -314,13 +304,8 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         return coefficients, fitted, lam, reml_score
 
     @staticmethod
-    def backward(
-        ctx: Any,
-        grad_coefficients: torch.Tensor | None,
-        grad_fitted: torch.Tensor | None,
-        grad_lam: torch.Tensor | None,
-        grad_reml_score: torch.Tensor | None,
-    ) -> tuple[Any, ...]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
@@ -427,13 +412,8 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         return coefficients, fitted, lam, reml_score
 
     @staticmethod
-    def backward(
-        ctx: Any,
-        grad_coefficients: torch.Tensor | None,
-        grad_fitted: torch.Tensor | None,
-        grad_lam: torch.Tensor | None,
-        grad_reml_score: torch.Tensor | None,
-    ) -> tuple[Any, ...]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
