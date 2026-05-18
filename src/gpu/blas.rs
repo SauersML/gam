@@ -126,26 +126,29 @@ pub fn try_fast_ab_broadcast_b_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result =
-        with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "gemm_broadcast_b_strided_batched",
-            "cuBLAS",
-            format!("batch={batch} m={m} n={n} k={k}"),
-            diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
-            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
-            diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "gemm_broadcast_b_strided_batched",
-            "cuBLAS",
-            format!("batch={batch} m={m} n={n} k={k}"),
-        );
+    match with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "gemm_broadcast_b_strided_batched",
+                "cuBLAS",
+                &device,
+                format!("batch={batch} m={m} n={n} k={k}"),
+                diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
+                diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+                diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "gemm_broadcast_b_strided_batched",
+                "cuBLAS",
+                format!("batch={batch} m={m} n={n} k={k}"),
+            );
+            None
+        }
     }
-    result
 }
 
 /// Strided batched `A · B[b]ᵀ` with `A` broadcast. Mirrors
@@ -180,26 +183,29 @@ pub fn try_fast_a_broadcast_bt_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result =
-        with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "gemm_broadcast_a_strided_batched",
-            "cuBLAS",
-            format!("batch={batch} m={m} n={n} k={k}"),
-            diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
-            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
-            diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "gemm_broadcast_a_strided_batched",
-            "cuBLAS",
-            format!("batch={batch} m={m} n={n} k={k}"),
-        );
+    match with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "gemm_broadcast_a_strided_batched",
+                "cuBLAS",
+                &device,
+                format!("batch={batch} m={m} n={n} k={k}"),
+                diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
+                diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+                diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "gemm_broadcast_a_strided_batched",
+                "cuBLAS",
+                format!("batch={batch} m={m} n={n} k={k}"),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -235,30 +241,33 @@ fn try_fast_gemm_strided_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result =
-        with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "gemm_strided_batched",
-            "cuBLAS",
-            format!(
-                "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
-            ),
-            diagnostics::gemm_flops(m, n, k).saturating_mul(batch_a as u64),
-            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
-            diagnostics::bytes_for_f64(batch_a.saturating_mul(m).saturating_mul(n)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "gemm_strided_batched",
-            "cuBLAS",
-            format!(
-                "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
-            ),
-        );
+    match with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "gemm_strided_batched",
+                "cuBLAS",
+                &device,
+                format!(
+                    "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
+                ),
+                diagnostics::gemm_flops(m, n, k).saturating_mul(batch_a as u64),
+                diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+                diagnostics::bytes_for_f64(batch_a.saturating_mul(m).saturating_mul(n)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "gemm_strided_batched",
+                "cuBLAS",
+                format!(
+                    "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
+                ),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -281,25 +290,29 @@ pub fn try_fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemm(a, b, true, false));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "atb",
-            "cuBLAS",
-            format!("rows={rows} cols={cols} rhs={rhs}"),
-            diagnostics::gemm_flops(cols, rhs, rows),
-            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
-            diagnostics::bytes_for_f64(cols.saturating_mul(rhs)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "atb",
-            "cuBLAS",
-            format!("rows={rows} cols={cols} rhs={rhs}"),
-        );
+    match with_runtime(|runtime| runtime.gemm(a, b, true, false)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "atb",
+                "cuBLAS",
+                &device,
+                format!("rows={rows} cols={cols} rhs={rhs}"),
+                diagnostics::gemm_flops(cols, rhs, rows),
+                diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+                diagnostics::bytes_for_f64(cols.saturating_mul(rhs)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "atb",
+                "cuBLAS",
+                format!("rows={rows} cols={cols} rhs={rhs}"),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -321,21 +334,25 @@ pub fn try_fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemv(a, v, false));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "av",
-            "cuBLAS",
-            format!("rows={rows} cols={cols}"),
-            diagnostics::gemv_flops(rows, cols),
-            diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
-            diagnostics::bytes_for_f64(rows),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu("av", "cuBLAS", format!("rows={rows} cols={cols}"));
+    match with_runtime(|runtime| runtime.gemv(a, v, false)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "av",
+                "cuBLAS",
+                &device,
+                format!("rows={rows} cols={cols}"),
+                diagnostics::gemv_flops(rows, cols),
+                diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
+                diagnostics::bytes_for_f64(rows),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu("av", "cuBLAS", format!("rows={rows} cols={cols}"));
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -357,21 +374,25 @@ pub fn try_fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemv(a, v, true));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "atv",
-            "cuBLAS",
-            format!("rows={rows} cols={cols}"),
-            diagnostics::gemv_flops(rows, cols),
-            diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
-            diagnostics::bytes_for_f64(cols),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu("atv", "cuBLAS", format!("rows={rows} cols={cols}"));
+    match with_runtime(|runtime| runtime.gemv(a, v, true)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "atv",
+                "cuBLAS",
+                &device,
+                format!("rows={rows} cols={cols}"),
+                diagnostics::gemv_flops(rows, cols),
+                diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
+                diagnostics::bytes_for_f64(cols),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu("atv", "cuBLAS", format!("rows={rows} cols={cols}"));
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -394,21 +415,29 @@ pub fn try_fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.xt_diag_y(x, w, x));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "xt_diag_x",
-            "cuBLAS",
-            format!("rows={rows} cols={cols}"),
-            diagnostics::gemm_flops(cols, cols, rows),
-            diagnostics::bytes_for_f64(x.len().saturating_mul(2).saturating_add(w.len())),
-            diagnostics::bytes_for_f64(cols.saturating_mul(cols)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu("xt_diag_x", "cuBLAS", format!("rows={rows} cols={cols}"));
+    match with_runtime(|runtime| runtime.xt_diag_y(x, w, x)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "xt_diag_x",
+                "cuBLAS",
+                &device,
+                format!("rows={rows} cols={cols}"),
+                diagnostics::gemm_flops(cols, cols, rows),
+                diagnostics::bytes_for_f64(x.len().saturating_mul(2).saturating_add(w.len())),
+                diagnostics::bytes_for_f64(cols.saturating_mul(cols)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "xt_diag_x",
+                "cuBLAS",
+                format!("rows={rows} cols={cols}"),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -433,25 +462,31 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.xt_diag_y(x, w, y));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "xt_diag_y",
-            "cuBLAS",
-            format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
-            diagnostics::gemm_flops(x.ncols(), y.ncols(), rows),
-            diagnostics::bytes_for_f64(x.len().saturating_add(y.len()).saturating_add(w.len())),
-            diagnostics::bytes_for_f64(x.ncols().saturating_mul(y.ncols())),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "xt_diag_y",
-            "cuBLAS",
-            format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
-        );
+    match with_runtime(|runtime| runtime.xt_diag_y(x, w, y)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "xt_diag_y",
+                "cuBLAS",
+                &device,
+                format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
+                diagnostics::gemm_flops(x.ncols(), y.ncols(), rows),
+                diagnostics::bytes_for_f64(
+                    x.len().saturating_add(y.len()).saturating_add(w.len()),
+                ),
+                diagnostics::bytes_for_f64(x.ncols().saturating_mul(y.ncols())),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "xt_diag_y",
+                "cuBLAS",
+                format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -475,27 +510,31 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "trsm_lower",
-            "cuBLAS",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-            (p as u64)
-                .saturating_mul(p as u64)
-                .saturating_mul(rhs.ncols() as u64),
-            diagnostics::bytes_for_f64(lower.len().saturating_add(rhs.len())),
-            diagnostics::bytes_for_f64(rhs.len()),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "trsm_lower",
-            "cuBLAS",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-        );
+    match with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "trsm_lower",
+                "cuBLAS",
+                &device,
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+                (p as u64)
+                    .saturating_mul(p as u64)
+                    .saturating_mul(rhs.ncols() as u64),
+                diagnostics::bytes_for_f64(lower.len().saturating_add(rhs.len())),
+                diagnostics::bytes_for_f64(rhs.len()),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "trsm_lower",
+                "cuBLAS",
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -519,27 +558,31 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "trsm_upper",
-            "cuBLAS",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-            (p as u64)
-                .saturating_mul(p as u64)
-                .saturating_mul(rhs.ncols() as u64),
-            diagnostics::bytes_for_f64(upper.len().saturating_add(rhs.len())),
-            diagnostics::bytes_for_f64(rhs.len()),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "trsm_upper",
-            "cuBLAS",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-        );
+    match with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "trsm_upper",
+                "cuBLAS",
+                &device,
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+                (p as u64)
+                    .saturating_mul(p as u64)
+                    .saturating_mul(rhs.ncols() as u64),
+                diagnostics::bytes_for_f64(upper.len().saturating_add(rhs.len())),
+                diagnostics::bytes_for_f64(rhs.len()),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "trsm_upper",
+                "cuBLAS",
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -567,31 +610,56 @@ fn route_trsm(p: usize, rhs_cols: usize) -> bool {
     p > 0 && rhs_cols > 0 && GpuRuntime::global().policy().route_trsm(p, rhs_cols)
 }
 
-fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T> {
-    static RUNTIME: OnceLock<Option<Mutex<CublasRuntime>>> = OnceLock::new();
-    RUNTIME
+fn with_runtime<T>(mut f: impl FnMut(&mut CublasRuntime) -> Option<T>) -> Option<(T, GpuDeviceInfo)> {
+    static RUNTIME: OnceLock<Vec<Mutex<CublasRuntime>>> = OnceLock::new();
+    let runtimes = RUNTIME
         .get_or_init(|| {
-            let cuda = GpuRuntime::global().cuda_working_state()?;
-            match CublasRuntime::new(cuda) {
-                Ok(runtime) => {
-                    diagnostics::log_library_ready("cuBLAS");
-                    Some(Mutex::new(runtime))
-                }
-                Err(err) => {
-                    diagnostics::log_library_unavailable("cuBLAS", &err);
-                    None
-                }
-            }
-        })
-        .as_ref()?
-        .lock()
-        .ok()
-        .and_then(|mut runtime| f(&mut runtime))
+            GpuRuntime::global()
+                .devices()
+                .iter()
+                .filter_map(|device| {
+                    let cuda = match CudaWorkingState::init(device.ordinal) {
+                        Some(cuda) => cuda,
+                        None => {
+                            diagnostics::log_library_unavailable(
+                                "cuBLAS",
+                                &format!("CUDA context init failed for device {}", device.ordinal),
+                            );
+                            return None;
+                        }
+                    };
+                    match CublasRuntime::new(cuda, device.clone()) {
+                        Ok(runtime) => {
+                            diagnostics::log_library_ready("cuBLAS", &runtime.device);
+                            Some(Mutex::new(runtime))
+                        }
+                        Err(err) => {
+                            diagnostics::log_library_unavailable("cuBLAS", &err);
+                            None
+                        }
+                    }
+                })
+                .collect()
+        });
+    if runtimes.is_empty() {
+        return None;
+    }
+    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
+    for offset in 0..runtimes.len() {
+        let idx = (start + offset) % runtimes.len();
+        if let Ok(mut runtime) = runtimes[idx].lock()
+            && let Some(out) = f(&mut runtime)
+        {
+            return Some((out, runtime.device.clone()));
+        }
+    }
+    None
 }
 
 struct CublasRuntime {
     /// Borrowed driver + context owned by [`GpuRuntime`].
-    cuda: &'static CudaWorkingState,
+    cuda: CudaWorkingState,
+    device: GpuDeviceInfo,
     /// cuBLAS entry points. The dlopen'd library is `Box::leak`'d inside
     /// `load_static_library`, so these fn pointers stay valid for the
     /// process — no owning field needed.
@@ -600,7 +668,7 @@ struct CublasRuntime {
 }
 
 impl CublasRuntime {
-    fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
+    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, String> {
         let cublas_lib = load_static_library(cublas_library_candidates())?;
         let blas = CublasApi::load(cublas_lib)?;
         cuda.set_current()?;
@@ -609,7 +677,12 @@ impl CublasRuntime {
         if create_status != CUBLAS_STATUS_SUCCESS {
             return Err(format!("cublasCreate failed with status {create_status}"));
         }
-        Ok(Self { cuda, blas, handle })
+        Ok(Self {
+            cuda,
+            device,
+            blas,
+            handle,
+        })
     }
 
     fn gemm<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
