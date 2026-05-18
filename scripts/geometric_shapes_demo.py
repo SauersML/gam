@@ -597,7 +597,7 @@ def quality_report() -> None:
         db = float(np.sqrt(d2.min(axis=0).mean()))
         return 0.5 * (da + db)
 
-    rows = []
+    rows: list[tuple[str, str, float, float]] = []
 
     # Curves: trefoil + loop — both have a 1-D parameter grid.
     T = np.loadtxt(DATA / "grid_1d.csv", delimiter=",", skiprows=1)
@@ -638,7 +638,7 @@ def quality_report() -> None:
     # Sphere (matches gen_sph)
     g = np.loadtxt(DATA / "grid_sph.csv", delimiter=",", skiprows=1)
     lat, lon = g[:, 0], g[:, 1]
-    def gd(lat0, lon0):
+    def gd(lat0: float, lon0: float) -> np.ndarray:
         c = (np.sin(lat) * np.sin(lat0)
              + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
         return np.arccos(np.clip(c, -1, 1))
@@ -706,7 +706,7 @@ def quality_report() -> None:
 # ---------------------------------------------------------------------------
 # Render outputs
 # ---------------------------------------------------------------------------
-def render_still(shapes, out_path):
+def render_still(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
     W, H = 4000, 3000
     p = pv.Plotter(shape=(3, 4), off_screen=True,
                    window_size=(W, H), border=False)
@@ -719,11 +719,17 @@ def render_still(shapes, out_path):
     print(f"  still → {out_path}  ({W}×{H})")
 
 
-def render_frames(shapes, w, h, n_frames, point_size):
+def render_frames(
+    shapes: dict[str, dict[str, Any]],
+    w: int,
+    h: int,
+    n_frames: int,
+    point_size: int,
+) -> list[np.ndarray]:
     p = pv.Plotter(shape=(3, 4), off_screen=True,
                    window_size=(w, h), border=False)
     panels = build_scene(p, shapes, point_size=point_size)
-    frames = []
+    frames: list[np.ndarray] = []
     for k, az in enumerate(np.linspace(0, 360, n_frames, endpoint=False)):
         set_all_cameras(p, panels, az)
         update_depth_scalars(panels, az)
@@ -737,7 +743,7 @@ def render_frames(shapes, w, h, n_frames, point_size):
     return frames
 
 
-def render_mp4(shapes, out_path):
+def render_mp4(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
     import imageio.v2 as imageio
     W, H = 1920, 1440
     if W % 2 or H % 2:
@@ -754,7 +760,7 @@ def render_mp4(shapes, out_path):
     print(f"  mp4   → {out_path}  ({W}×{H}, {n} frames @ 30 fps)")
 
 
-def render_gif(shapes, out_path):
+def render_gif(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
     W, H = 1280, 960
     n = 60
     frames = render_frames(shapes, W, H, n, point_size=6)
@@ -775,7 +781,7 @@ def render_gif(shapes, out_path):
 
 
 # ---------------------------------------------------------------------------
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--regen", action="store_true",
                      help="delete cached fits/data and rebuild from scratch")

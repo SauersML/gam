@@ -33,7 +33,7 @@ def test_inplace_mutation_caught_for_reml() -> None:
     with torch.no_grad():
         x.add_(1.0)
     with pytest.raises(RuntimeError, match=r"modified by an inplace operation"):
-        loss.backward()
+        torch.autograd.backward(loss)
 
 
 def test_inplace_mutation_caught_for_bspline_basis() -> None:
