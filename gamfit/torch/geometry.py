@@ -1,18 +1,8 @@
-"""Forward-only torch passthroughs for the response-geometry transforms.
+"""Torch implementations of response-geometry transforms.
 
-Each public function in this module is a thin wrapper around its
-:mod:`gamfit._response_geometry` counterpart. Tensor inputs are detached and
-moved to a CPU f64 NumPy buffer via :func:`gamfit.torch._coerce.to_numpy_f64`,
-the numpy implementation runs, and — if at least one input was a torch
-tensor — the result is wrapped back into a tensor on the first input tensor's
-device and dtype via :func:`gamfit.torch._coerce.from_numpy_like`. If every
-input was already a NumPy array (or list / scalar), the result is returned as
-a NumPy array, exactly matching the numpy module's behaviour.
-
-Forward-only. Gradients do not flow through these transforms; they cross the
-NumPy boundary. For a differentiable closure, write
-``x / x.sum(-1, keepdim=True)`` in your own code. For other transforms where
-you need autograd, compose standard torch ops directly.
+Tensor inputs stay in torch so closure, log-ratio, simplex maps, and sphere
+maps remain differentiable and device-local. Non-tensor inputs are delegated
+to :mod:`gamfit._response_geometry` so NumPy callers keep the same behavior.
 """
 
 from __future__ import annotations
@@ -20,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import _response_geometry as _np_geom
-from ._coerce import from_numpy_like, to_numpy_f64
+from ._coerce import to_numpy_f64
 
 
 def _is_tensor(value: Any) -> bool:
@@ -29,59 +19,158 @@ def _is_tensor(value: Any) -> bool:
     return isinstance(value, torch.Tensor)
 
 
-def _passthrough(result: Any, ref: Any) -> Any:
-    """Wrap ``result`` as a tensor matching ``ref`` iff ``ref`` is a tensor."""
-    if _is_tensor(ref):
-        return from_numpy_like(result, ref)
-    return result
+def _as_float_tensor(value: Any, ref: Any | None = None) -> Any:
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        tensor = value
+    else:
+        kwargs = {}
+        if isinstance(ref, torch.Tensor):
+            kwargs = {"device": ref.device, "dtype": ref.dtype}
+        tensor = torch.as_tensor(value, **kwargs)
+    if torch.is_floating_point(tensor):
+        return tensor
+    dtype = ref.dtype if isinstance(ref, torch.Tensor) and torch.is_floating_point(ref) else torch.float64
+    device = ref.device if isinstance(ref, torch.Tensor) else tensor.device
+    return tensor.to(device=device, dtype=dtype)
+
+
+def _matrix(value: Any, *, label: str, ref: Any | None = None) -> Any:
+    import torch
+
+    tensor = _as_float_tensor(value, ref)
+    if tensor.dim() != 2:
+        raise ValueError(f"{label} must be a 2-D numeric array")
+    if tensor.shape[0] == 0 or tensor.shape[1] < 2:
+        raise ValueError(f"{label} must have at least one row and at least two columns")
+    if bool((~torch.isfinite(tensor)).any()):
+        raise ValueError(f"{label} must contain only finite values")
+    return tensor
+
+
+def _closure_tensor(values: Any, *, label: str = "simplex values") -> Any:
+    tensor = _matrix(values, label=label)
+    if bool((tensor < 0.0).any()):
+        raise ValueError("simplex values must be non-negative")
+    totals = tensor.sum(dim=1, keepdim=True)
+    if bool((totals <= 0.0).any()):
+        raise ValueError("simplex rows must have positive total mass")
+    return tensor / totals
+
+
+def _keep_without_reference(d: int, reference: int) -> list[int]:
+    ref = reference % d
+    return [j for j in range(d) if j != ref]
+
+
+def _normalized_weights_tensor(n: int, weights: Any | None, ref: Any) -> Any:
+    import torch
+
+    if weights is None:
+        return torch.full((n,), 1.0 / n, dtype=ref.dtype, device=ref.device)
+    w = _as_float_tensor(weights, ref).reshape(-1)
+    if w.shape[0] != n:
+        raise ValueError("weights length must match the number of rows")
+    if bool((~torch.isfinite(w)).any()) or bool((w < 0.0).any()) or bool(w.sum() <= 0.0):
+        raise ValueError("weights must be finite, non-negative, and have positive total")
+    return w / w.sum()
+
+
+def _normalize_sphere_tensor(values: Any, *, ref: Any | None = None) -> Any:
+    import torch
+
+    tensor = _matrix(values, label="spherical values", ref=ref)
+    norms = torch.linalg.norm(tensor, dim=1, keepdim=True)
+    if bool((norms <= 0.0).any()):
+        raise ValueError("spherical rows must have non-zero norm")
+    return tensor / norms
 
 
 def closure(values: Any) -> Any:
     """Normalize rows onto the probability simplex.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        return _closure_tensor(values)
     out = _np_geom.closure(to_numpy_f64(values))
-    return _passthrough(out, values)
+    return out
 
 
 def clr(values: Any) -> Any:
     """Centered log-ratio coordinates for positive compositions.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        comp = _closure_tensor(values)
+        if bool((comp <= 0.0).any()):
+            raise ValueError("CLR coordinates require strictly positive simplex values")
+        logs = comp.log()
+        return logs - logs.mean(dim=1, keepdim=True)
     out = _np_geom.clr(to_numpy_f64(values))
-    return _passthrough(out, values)
+    return out
 
 
 def alr(values: Any, *, reference: int = -1) -> Any:
     """Additive log-ratio coordinates for positive compositions.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        comp = _closure_tensor(values)
+        if bool((comp <= 0.0).any()):
+            raise ValueError("ALR coordinates require strictly positive simplex values")
+        ref = reference % comp.shape[1]
+        keep = _keep_without_reference(comp.shape[1], reference)
+        return (comp[:, keep] / comp[:, [ref]]).log()
     out = _np_geom.alr(to_numpy_f64(values), reference=reference)
-    return _passthrough(out, values)
+    return out
 
 
 def inverse_alr(coords: Any, *, reference: int = -1) -> Any:
     """Map ALR coordinates back to the simplex.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(coords):
+        import torch
+
+        z = _as_float_tensor(coords)
+        if z.dim() != 2:
+            raise ValueError("ALR coordinates must be a 2-D numeric array")
+        d = z.shape[1] + 1
+        ref = reference % d
+        keep = _keep_without_reference(d, reference)
+        log_parts = torch.zeros((z.shape[0], d), dtype=z.dtype, device=z.device)
+        log_parts[:, keep] = z
+        log_parts = log_parts - log_parts.max(dim=1, keepdim=True).values
+        parts = log_parts.exp()
+        return parts / parts.sum(dim=1, keepdim=True)
     out = _np_geom.inverse_alr(to_numpy_f64(coords), reference=reference)
-    return _passthrough(out, coords)
+    return out
 
 
 def simplex_frechet_mean(values: Any, weights: Any | None = None) -> Any:
     """Intrinsic Fréchet mean under Aitchison simplex geometry.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        comp = _closure_tensor(values)
+        if bool((comp <= 0.0).any()):
+            raise ValueError("simplex Fréchet mean requires strictly positive values")
+        w = _normalized_weights_tensor(comp.shape[0], weights, comp)
+        mean_log = (comp.log() * w[:, None]).sum(dim=0)
+        mean_log = mean_log - mean_log.max()
+        out = mean_log.exp()
+        return out / out.sum()
     out = _np_geom.simplex_frechet_mean(
         to_numpy_f64(values),
         None if weights is None else to_numpy_f64(weights),
     )
-    return _passthrough(out, values)
+    return out
 
 
 def simplex_log_map(
@@ -93,15 +182,28 @@ def simplex_log_map(
 ) -> Any:
     """Log map at an intrinsic simplex base point in CLR or ALR coordinates.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        comp = _closure_tensor(values)
+        base_arr = _closure_tensor(_as_float_tensor(base, values).reshape(1, -1))
+        if comp.shape[1] != base_arr.shape[1]:
+            raise ValueError("simplex values and base point have different dimensions")
+        if bool((comp <= 0.0).any()) or bool((base_arr <= 0.0).any()):
+            raise ValueError("simplex log map requires strictly positive values and base point")
+        coord = coordinates.lower()
+        if coord in {"simplex", "clr"}:
+            return clr(comp) - clr(base_arr)
+        if coord == "alr":
+            return alr(comp, reference=reference) - alr(base_arr, reference=reference)
+        raise ValueError("simplex coordinates must be 'clr' or 'alr'")
     out = _np_geom.simplex_log_map(
         to_numpy_f64(values),
         to_numpy_f64(base),
         coordinates=coordinates,
         reference=reference,
     )
-    return _passthrough(out, values)
+    return out
 
 
 def simplex_exp_map(
@@ -113,15 +215,34 @@ def simplex_exp_map(
 ) -> Any:
     """Exponential map from simplex tangent coordinates back to compositions.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(tangent):
+        z = _as_float_tensor(tangent)
+        if z.dim() == 1:
+            z = z.reshape(1, -1)
+        base_arr = _closure_tensor(_as_float_tensor(base, z).reshape(1, -1))
+        coord = coordinates.lower()
+        if coord in {"simplex", "clr"}:
+            if z.shape[1] != base_arr.shape[1]:
+                raise ValueError("CLR tangent dimension must equal simplex dimension")
+            log_parts = base_arr.log() + z
+            log_parts = log_parts - log_parts.max(dim=1, keepdim=True).values
+            parts = log_parts.exp()
+            return parts / parts.sum(dim=1, keepdim=True)
+        if coord == "alr":
+            if z.shape[1] != base_arr.shape[1] - 1:
+                raise ValueError("ALR tangent dimension must be simplex dimension minus one")
+            base_alr = alr(base_arr, reference=reference)
+            return inverse_alr(base_alr + z, reference=reference)
+        raise ValueError("simplex coordinates must be 'clr' or 'alr'")
     out = _np_geom.simplex_exp_map(
         to_numpy_f64(tangent),
         to_numpy_f64(base),
         coordinates=coordinates,
         reference=reference,
     )
-    return _passthrough(out, tangent)
+    return out
 
 
 def sphere_frechet_mean(
@@ -133,30 +254,75 @@ def sphere_frechet_mean(
 ) -> Any:
     """Intrinsic Fréchet/Karcher mean on the unit sphere.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        import torch
+
+        y = _normalize_sphere_tensor(values)
+        w = _normalized_weights_tensor(y.shape[0], weights, y)
+        mu = (y * w[:, None]).sum(dim=0)
+        norm = torch.linalg.norm(mu)
+        mu = torch.where(norm <= 1e-14, y[0], mu / norm.clamp_min(1e-300))
+        for _ in range(max_iter):
+            logs = sphere_log_map(y, mu)
+            step = (logs * w[:, None]).sum(dim=0)
+            step_norm = torch.linalg.norm(step)
+            if bool(step_norm < tol):
+                break
+            mu = sphere_exp_map(step.reshape(1, -1), mu)[0]
+        return mu
     out = _np_geom.sphere_frechet_mean(
         to_numpy_f64(values),
         None if weights is None else to_numpy_f64(weights),
         tol=tol,
         max_iter=max_iter,
     )
-    return _passthrough(out, values)
+    return out
 
 
 def sphere_log_map(values: Any, base: Any) -> Any:
     """Log map from the unit sphere to the ambient tangent space at ``base``.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(values):
+        import torch
+
+        y = _normalize_sphere_tensor(values)
+        b = _normalize_sphere_tensor(_as_float_tensor(base, y).reshape(1, -1), ref=y)[0]
+        dots = (y @ b).clamp(-1.0, 1.0)
+        theta = dots.acos()
+        tangent = y - dots[:, None] * b.reshape(1, -1)
+        sin_theta = theta.sin()
+        scale = torch.ones_like(theta)
+        mask = sin_theta > 1e-12
+        scale = torch.where(mask, theta / sin_theta.clamp_min(1e-300), scale)
+        out = tangent * scale[:, None]
+        return torch.where((theta < 1e-12)[:, None], torch.zeros_like(out), out)
     out = _np_geom.sphere_log_map(to_numpy_f64(values), to_numpy_f64(base))
-    return _passthrough(out, values)
+    return out
 
 
 def sphere_exp_map(tangent: Any, base: Any) -> Any:
     """Exponential map from the ambient tangent space at ``base`` to the sphere.
 
-    Forward-only torch passthrough; see module docstring.
+    Tensor inputs stay in torch and preserve autograd.
     """
+    if _is_tensor(tangent):
+        import torch
+
+        z = _as_float_tensor(tangent)
+        if z.dim() == 1:
+            z = z.reshape(1, -1)
+        b = _normalize_sphere_tensor(_as_float_tensor(base, z).reshape(1, -1), ref=z)[0]
+        z = z - (z @ b)[:, None] * b.reshape(1, -1)
+        r = torch.linalg.norm(z, dim=1)
+        small = r < 1e-12
+        scaled = (r.sin() / r.clamp_min(1e-300))[:, None] * z
+        curved = r.cos()[:, None] * b.reshape(1, -1) + scaled
+        linear = b.reshape(1, -1) + z
+        out = torch.where(small[:, None], linear, curved)
+        return out / torch.linalg.norm(out, dim=1, keepdim=True)
     out = _np_geom.sphere_exp_map(to_numpy_f64(tangent), to_numpy_f64(base))
-    return _passthrough(out, tangent)
+    return out
