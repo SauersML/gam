@@ -3583,6 +3583,121 @@ impl BernoulliBlockHessianAccumulator {
         Ok(())
     }
 
+    /// Batch the exact h/w pullback terms for one row chunk.
+    ///
+    /// The large marginal/logslope blocks are already accumulated as chunked
+    /// weighted Gram products.  h/w used to be the remaining per-row dense
+    /// path: for every sampled row and every h/w coordinate we performed two
+    /// design-row AXPYs (column plus symmetric row).  At biobank `n` that
+    /// repeated row materialization dominates even though the h/w blocks are
+    /// tiny.  This routine keeps the same exact Hessian entries, but turns the
+    /// cross terms into `X_chunk^T weights` / `G_chunk^T weights` products and
+    /// sums the tiny h/w self-blocks in registers.
+    fn add_weighted_hw_cross_terms(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        rows: std::ops::Range<usize>,
+        slices: &BlockSlices,
+        h_q: Option<&Array2<f64>>,
+        h_g: Option<&Array2<f64>>,
+        h_h: Option<&Array2<f64>>,
+        w_q: Option<&Array2<f64>>,
+        w_g: Option<&Array2<f64>>,
+        h_w: Option<&Array2<f64>>,
+        w_w: Option<&Array2<f64>>,
+    ) -> Result<(), String> {
+        let Some(dc) = self.dense_correction.as_mut() else {
+            return Ok(());
+        };
+
+        let need_marginal = h_q.is_some() || w_q.is_some();
+        let need_logslope = h_g.is_some() || w_g.is_some();
+        let x = if need_marginal {
+            Some(
+                family
+                    .marginal_design
+                    .try_row_chunk(rows.clone())
+                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let g = if need_logslope {
+            Some(
+                family
+                    .logslope_design
+                    .try_row_chunk(rows)
+                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        if let (Some(block_h), Some(hq)) = (slices.h.as_ref(), h_q) {
+            let x = x.as_ref().expect("marginal chunk for h/q cross");
+            let cross = crate::faer_ndarray::fast_atb(x, hq);
+            for (local_idx, global_idx) in block_h.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.marginal.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.marginal.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(hg)) = (slices.h.as_ref(), h_g) {
+            let g = g.as_ref().expect("logslope chunk for h/g cross");
+            let cross = crate::faer_ndarray::fast_atb(g, hg);
+            for (local_idx, global_idx) in block_h.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.logslope.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.logslope.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(hh)) = (slices.h.as_ref(), h_h) {
+            dc.slice_mut(s![block_h.clone(), block_h.clone()])
+                .scaled_add(1.0, hh);
+        }
+
+        if let (Some(block_w), Some(wq)) = (slices.w.as_ref(), w_q) {
+            let x = x.as_ref().expect("marginal chunk for w/q cross");
+            let cross = crate::faer_ndarray::fast_atb(x, wq);
+            for (local_idx, global_idx) in block_w.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.marginal.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.marginal.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_w), Some(wg)) = (slices.w.as_ref(), w_g) {
+            let g = g.as_ref().expect("logslope chunk for w/g cross");
+            let cross = crate::faer_ndarray::fast_atb(g, wg);
+            for (local_idx, global_idx) in block_w.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.logslope.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.logslope.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(block_w), Some(hw)) =
+            (slices.h.as_ref(), slices.w.as_ref(), h_w)
+        {
+            dc.slice_mut(s![block_h.clone(), block_w.clone()])
+                .scaled_add(1.0, hw);
+            dc.slice_mut(s![block_w.clone(), block_h.clone()])
+                .scaled_add(1.0, &hw.t());
+        }
+        if let (Some(block_w), Some(ww)) = (slices.w.as_ref(), w_w) {
+            dc.slice_mut(s![block_w.clone(), block_w.clone()])
+                .scaled_add(1.0, ww);
+        }
+
+        Ok(())
+    }
+
     /// Add a rank-1 update from psi_row (in the psi block) crossed with the
     /// pullback of a primary-space vector.  Adds both left outer right and right outer left.
     ///
@@ -5738,6 +5853,7 @@ impl BernoulliMarginalSlopeFamily {
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
         let beta_h = self.score_beta(block_states)?;
         let beta_w = self.link_beta(block_states)?;
+
         let mut row_contexts = Vec::with_capacity(n);
         let mut log_likelihood = 0.0_f64;
 
@@ -11774,6 +11890,36 @@ impl BernoulliMarginalSlopeFamily {
                     let mut w_mm = Array1::<f64>::zeros(chunk_len);
                     let mut w_mg = Array1::<f64>::zeros(chunk_len);
                     let mut w_gg = Array1::<f64>::zeros(chunk_len);
+                    let mut h_q = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_g = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_h = primary
+                        .h
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((range.len(), range.len())));
+                    let mut w_q = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut w_g = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((chunk_len, range.len())));
+                    let mut h_w = match (primary.h.as_ref(), primary.w.as_ref()) {
+                        (Some(h_range), Some(w_range)) => {
+                            Some(Array2::<f64>::zeros((h_range.len(), w_range.len())))
+                        }
+                        _ => None,
+                    };
+                    let mut w_w = primary
+                        .w
+                        .as_ref()
+                        .map(|range| Array2::<f64>::zeros((range.len(), range.len())));
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for (local, row) in (start..end).enumerate() {
                         let hess_view =
@@ -11799,13 +11945,60 @@ impl BernoulliMarginalSlopeFamily {
                         w_mm[local] = hess_view[[0, 0]];
                         w_mg[local] = hess_view[[0, 1]];
                         w_gg[local] = hess_view[[1, 1]];
-                        if let Some(ref mut dc) = acc.dense_correction {
-                            self.add_pullback_primary_hessian_hw_only(
-                                dc, row, slices, primary, hess_view,
-                            );
+                        if let Some(primary_h) = primary.h.as_ref() {
+                            if let Some(ref mut hq) = h_q {
+                                hq.row_mut(local)
+                                    .assign(&hess_view.slice(s![0, primary_h.clone()]));
+                            }
+                            if let Some(ref mut hg) = h_g {
+                                hg.row_mut(local)
+                                    .assign(&hess_view.slice(s![1, primary_h.clone()]));
+                            }
+                            if let Some(ref mut hh) = h_h {
+                                hh.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_h.clone(), primary_h.clone()]),
+                                );
+                            }
+                        }
+                        if let Some(primary_w) = primary.w.as_ref() {
+                            if let Some(ref mut wq) = w_q {
+                                wq.row_mut(local)
+                                    .assign(&hess_view.slice(s![0, primary_w.clone()]));
+                            }
+                            if let Some(ref mut wg) = w_g {
+                                wg.row_mut(local)
+                                    .assign(&hess_view.slice(s![1, primary_w.clone()]));
+                            }
+                            if let Some(ref mut ww) = w_w {
+                                ww.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_w.clone(), primary_w.clone()]),
+                                );
+                            }
+                            if let (Some(primary_h), Some(ref mut hw)) =
+                                (primary.h.as_ref(), h_w.as_mut())
+                            {
+                                hw.scaled_add(
+                                    1.0,
+                                    &hess_view.slice(s![primary_h.clone(), primary_w.clone()]),
+                                );
+                            }
                         }
                     }
                     acc.add_weighted_design_grams(self, start..end, &w_mm, &w_mg, &w_gg)?;
+                    acc.add_weighted_hw_cross_terms(
+                        self,
+                        start..end,
+                        slices,
+                        h_q.as_ref(),
+                        h_g.as_ref(),
+                        h_h.as_ref(),
+                        w_q.as_ref(),
+                        w_g.as_ref(),
+                        h_w.as_ref(),
+                        w_w.as_ref(),
+                    )?;
                     Ok(acc)
                 },
             )
