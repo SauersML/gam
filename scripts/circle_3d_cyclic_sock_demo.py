@@ -181,7 +181,9 @@ def main() -> Path:
                         color="#3b82f6", alpha=0.18,
                         linewidth=0, antialiased=True, shade=True)
         ax.set_title(name)
-        ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_zlabel("z")
         # Equal-ish bounds
         for setter, vals in zip(
             (ax.set_xlim, ax.set_ylim, ax.set_zlim),

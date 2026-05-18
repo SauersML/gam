@@ -333,7 +333,7 @@ def preflight_ctn_score_warp(
     lines = [
         "BIOBANK PREFLIGHT",
         f"n_train: {n_train:,}",
-        f"CTN Kronecker: factored",
+        "CTN Kronecker: factored",
         f"p_response: {p_response}",
         f"p_cov: {p_cov}",
         f"avoided dense rowwise Kronecker: {gibibytes(dense_kron_bytes):.1f} GiB",
@@ -1925,9 +1925,9 @@ def _emit_phase_summary(
         if bfgs_iters_list:
             sorted_iters = sorted(bfgs_iters_list)
             n_i = len(sorted_iters)
-            p50 = sorted_iters[n_i // 2]
-            pmax = sorted_iters[-1]
-            iter_pieces = f" bfgs_iters_p50={p50} bfgs_iters_max={pmax}"
+            bfgs_iters_p50 = sorted_iters[n_i // 2]
+            bfgs_iters_pmax = sorted_iters[-1]
+            iter_pieces = f" bfgs_iters_p50={bfgs_iters_p50} bfgs_iters_max={bfgs_iters_pmax}"
         # Per-status breakdown (sorted for stable ordering).
         status_pieces = " ".join(
             f"bfgs_{status.replace(' ', '_').replace('-', '_')}={count}"
@@ -2310,7 +2310,7 @@ def _emit_phase_summary(
         # outcomes). MaxIterationsReached or LmStepSearchExhausted in
         # large quantities indicates the inner cap is too tight or the
         # geometry is genuinely hard.
-        status_counts: dict[str, int] = {}
+        pirls_status_counts: dict[str, int] = {}
         # Per-solve iter count distribution. Different from
         # `pirls_iters` (which counts iter-end markers — i.e., total
         # iters across all solves). p50 / p95 of per-solve iters
@@ -2318,7 +2318,7 @@ def _emit_phase_summary(
         # iter budget.
         per_solve_iters: list[int] = []
         for iters_str, _elapsed, rate_str, status in pirls_solve_matches:
-            status_counts[status] = status_counts.get(status, 0) + 1
+            pirls_status_counts[status] = pirls_status_counts.get(status, 0) + 1
             try:
                 per_solve_iters.append(int(iters_str))
             except ValueError:
@@ -2338,7 +2338,7 @@ def _emit_phase_summary(
             # Stable status breakdown (sorted alphabetically).
             status_pieces = " ".join(
                 f"pirls_status_{status}={count}"
-                for status, count in sorted(status_counts.items())
+                for status, count in sorted(pirls_status_counts.items())
             )
             iter_pieces = ""
             if per_solve_iters:
@@ -2744,11 +2744,11 @@ def _emit_phase_summary(
         # genuinely outrun the linearization); the others
         # (hessian_factorize_failed, non_finite_*, qs_dim_mismatch) are
         # bug signals if non-zero.
-        reason_counts: dict[str, int] = {}
+        ift_reason_counts: dict[str, int] = {}
         for reason in ift_rejected_matches:
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            ift_reason_counts[reason] = ift_reason_counts.get(reason, 0) + 1
         reasons_str = ",".join(
-            f"{reason}={count}" for reason, count in sorted(reason_counts.items())
+            f"{reason}={count}" for reason, count in sorted(ift_reason_counts.items())
         )
         # Two complementary accept-rate metrics:
         #
@@ -3365,7 +3365,6 @@ def impute_and_upsample(rows: list[dict[str, Any]], cfg: dict[str, Any], smoke: 
     for row in rows:
         by_subpop[str(row["subpopulation"])].append(row)
     out = [dict(r) for r in rows]
-    templates = {str(r["subpopulation"]): r for r in rows[: len(by_subpop)]}
     batch = int(cfg.get("upsample_batch_size", 5000))
     next_id = max(int(r["subject_id"]) for r in out) + 1
     subpops = sorted(by_subpop.keys())

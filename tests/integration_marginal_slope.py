@@ -2,7 +2,14 @@
 """End-to-end integration test for marginal-slope and latent survival configs."""
 import typing
 
-import csv, math, os, random, shutil, subprocess, sys, tempfile
+import csv
+import math
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
 
 GAM_BIN = os.path.join(os.path.dirname(__file__), "..", "target", "release", "gam")
 
@@ -123,7 +130,7 @@ def run(args: typing.Any, label: typing.Any, timeout: typing.Any=240) -> typing.
         for line in r.stderr.strip().split("\n")[-3:]:
             print(f"  {line}")
         return False
-    print(f"  OK")
+    print("  OK")
     for line in r.stdout.strip().split("\n")[-2:]:
         print(f"  {line}")
     return True

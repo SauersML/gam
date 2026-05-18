@@ -46,10 +46,7 @@ Usage:
 from __future__ import annotations
 import typing
 
-# Force unbuffered stdout so per-trial output appears in real time
 import sys
-typing.cast(typing.Any, sys.stdout).reconfigure(line_buffering=True)
-
 import argparse
 import inspect
 import json
@@ -60,7 +57,7 @@ import subprocess
 import tempfile
 import time
 import traceback
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -80,8 +77,10 @@ from run_suite import (
     gaussian_log_loss_score,
     zscore_train_test,
     make_folds,
-    Fold,
 )
+
+# Force unbuffered stdout so per-trial output appears in real time
+typing.cast(typing.Any, sys.stdout).reconfigure(line_buffering=True)
 
 ROOT = Path(__file__).resolve().parent.parent
 RUST_BINARY = ROOT / "target" / "release" / "gam"
@@ -137,7 +136,8 @@ def _f_quadratic(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.randn() * x**2 + rng.randn() * x + rng.randn()
 
 def _f_cubic(x: typing.Any, rng: typing.Any) -> typing.Any:
-    c = rng.randn(4); return c[0]*x**3 + c[1]*x**2 + c[2]*x + c[3]
+    c = rng.randn(4)
+    return c[0]*x**3 + c[1]*x**2 + c[2]*x + c[3]
 
 def _f_sqrt_abs(x: typing.Any, rng: typing.Any) -> typing.Any:
     return rng.uniform(1, 5) * np.sign(x) * np.sqrt(np.abs(x))
@@ -165,10 +165,14 @@ def _f_abs_sin(x: typing.Any, rng: typing.Any) -> typing.Any:
 def _f_piecewise_linear(x: typing.Any, rng: typing.Any) -> typing.Any:
     breaks = np.sort(rng.uniform(x.min(), x.max(), rng.randint(2, 7)))
     slopes = rng.randn(len(breaks) + 1) * 2
-    out = np.zeros_like(x); prev = x.min(); val = 0.0
+    out = np.zeros_like(x)
+    prev = x.min()
+    val = 0.0
     for i, b in enumerate(breaks):
-        m = (x >= prev) & (x < b); out[m] = val + slopes[i]*(x[m]-prev)
-        val += slopes[i]*(b-prev); prev = b
+        m = (x >= prev) & (x < b)
+        out[m] = val + slopes[i]*(x[m]-prev)
+        val += slopes[i]*(b-prev)
+        prev = b
     out[x >= prev] = val + slopes[-1]*(x[x >= prev]-prev)
     return out
 
@@ -323,39 +327,59 @@ SMOOTH_FN_2D = {
 # NOISE GENERATORS — 15 types
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _n_gaussian(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:     return rng.randn(n) * sd
+def _n_gaussian(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
+    return rng.randn(n) * sd
 def _n_t(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    df = rng.uniform(2.5, 8); return rng.standard_t(df, n) * sd / np.sqrt(df/(df-2))
-def _n_laplace(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:      return rng.laplace(0, sd/np.sqrt(2), n)
-def _n_cauchy(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:       return rng.standard_cauchy(n) * sd * 0.3
+    df = rng.uniform(2.5, 8)
+    return rng.standard_t(df, n) * sd / np.sqrt(df/(df-2))
+def _n_laplace(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
+    return rng.laplace(0, sd/np.sqrt(2), n)
+def _n_cauchy(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
+    return rng.standard_cauchy(n) * sd * 0.3
 def _n_skew(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    a = rng.uniform(2, 8)*rng.choice([-1, 1]); z = rng.randn(n); u = rng.randn(n)
-    raw = np.where(u < a*z, z, -z); return raw * sd/(np.std(raw)+1e-8)
+    a = rng.uniform(2, 8)*rng.choice([-1, 1])
+    z = rng.randn(n)
+    u = rng.randn(n)
+    raw = np.where(u < a*z, z, -z)
+    return raw * sd/(np.std(raw)+1e-8)
 def _n_mixture(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    mix = rng.uniform(.1, .4); s2 = rng.uniform(3, 10)
-    noise = rng.randn(n)*sd; noise[rng.random(n) < mix] *= s2; return noise
-def _n_uniform(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:      return rng.uniform(-sd*np.sqrt(3), sd*np.sqrt(3), n)
+    mix = rng.uniform(.1, .4)
+    s2 = rng.uniform(3, 10)
+    noise = rng.randn(n)*sd
+    noise[rng.random(n) < mix] *= s2
+    return noise
+def _n_uniform(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
+    return rng.uniform(-sd*np.sqrt(3), sd*np.sqrt(3), n)
 def _n_hetero(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
-    if x is None: x = np.linspace(0, 1, n)
-    t = (x - x.min())/(np.ptp(x)+1e-8); return rng.randn(n)*sd*(0.2 + 2*t)
+    if x is None:
+        x = np.linspace(0, 1, n)
+    t = (x - x.min())/(np.ptp(x)+1e-8)
+    return rng.randn(n)*sd*(0.2 + 2*t)
 def _n_periodic_het(n: typing.Any, sd: typing.Any, rng: typing.Any, x: typing.Any=None, **kw: typing.Any) -> typing.Any:
-    if x is None: x = np.linspace(0, 1, n)
+    if x is None:
+        x = np.linspace(0, 1, n)
     t = (x - x.min())/(np.ptp(x)+1e-8)
     return rng.randn(n)*sd*(0.5 + np.abs(np.sin(rng.uniform(2, 6)*np.pi*t)))
 def _n_lognormal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    raw = rng.lognormal(0, 1, n); raw -= raw.mean(); return raw*sd/(np.std(raw)+1e-8)
+    raw = rng.lognormal(0, 1, n)
+    raw -= raw.mean()
+    return raw*sd/(np.std(raw)+1e-8)
 def _n_sparse_outlier(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     noise = rng.randn(n)*sd
     k = max(1, int(n*rng.uniform(.01, .05)))
     noise[rng.choice(n, k, replace=False)] = rng.randn(k)*sd*rng.uniform(10, 50)
     return noise
 def _n_quantized(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
-    lev = rng.uniform(5, 20); return np.round(rng.randn(n)*sd*lev)/lev
+    lev = rng.uniform(5, 20)
+    return np.round(rng.randn(n)*sd*lev)/lev
 def _n_ar1(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     """Autocorrelated noise."""
-    phi = rng.uniform(0.3, 0.95); e = rng.randn(n)*sd*np.sqrt(1-phi**2)
-    out = np.zeros(n); out[0] = e[0]
-    for i in range(1, n): out[i] = phi*out[i-1] + e[i]
+    phi = rng.uniform(0.3, 0.95)
+    e = rng.randn(n)*sd*np.sqrt(1-phi**2)
+    out = np.zeros(n)
+    out[0] = e[0]
+    for i in range(1, n):
+        out[i] = phi*out[i-1] + e[i]
     return out
 def _n_bimodal(n: typing.Any, sd: typing.Any, rng: typing.Any, **kw: typing.Any) -> typing.Any:
     mask = rng.random(n) < 0.5
@@ -380,22 +404,36 @@ NOISE_FN = {
 # X DISTRIBUTIONS — 12 types
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _x_uniform(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:         return rng.uniform(-1, 1, (n, k))
-def _x_normal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:          return rng.randn(n, k)
-def _x_skewed(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:          r = rng.exponential(1, (n, k)); return r - r.mean(0)
-def _x_heavy(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:           return rng.standard_t(3, (n, k))
+def _x_uniform(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
+    return rng.uniform(-1, 1, (n, k))
+def _x_normal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
+    return rng.randn(n, k)
+def _x_skewed(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
+    r = rng.exponential(1, (n, k))
+    return r - r.mean(0)
+def _x_heavy(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
+    return rng.standard_t(3, (n, k))
 def _x_clustered(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    nc = rng.randint(2, 6); c = rng.randn(nc, k)*3
+    nc = rng.randint(2, 6)
+    c = rng.randn(nc, k)*3
     return c[rng.randint(0, nc, n)] + rng.randn(n, k)*0.3
 def _x_bimodal(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    m = rng.random((n, k)) < 0.5; return np.where(m, rng.randn(n, k)-2, rng.randn(n, k)+2)
-def _x_uniform_wide(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:    return rng.uniform(-10, 10, (n, k))
+    m = rng.random((n, k)) < 0.5
+    return np.where(m, rng.randn(n, k)-2, rng.randn(n, k)+2)
+def _x_uniform_wide(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
+    return rng.uniform(-10, 10, (n, k))
 def _x_sparse(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    r = rng.randn(n, k); r[rng.random((n, k)) < 0.8] *= 0.1; return r
+    r = rng.randn(n, k)
+    r[rng.random((n, k)) < 0.8] *= 0.1
+    return r
 def _x_grid(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    lev = rng.randint(5, 15); return np.round(rng.uniform(-1, 1, (n, k))*lev)/lev
+    lev = rng.randint(5, 15)
+    return np.round(rng.uniform(-1, 1, (n, k))*lev)/lev
 def _x_correlated(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
-    z = rng.randn(n, k); L = rng.randn(k, k)*0.3; np.fill_diagonal(L, 1.0); return z @ L
+    z = rng.randn(n, k)
+    L = rng.randn(k, k)*0.3
+    np.fill_diagonal(L, 1.0)
+    return z @ L
 def _x_low_dim_manifold(n: typing.Any, k: typing.Any, rng: typing.Any) -> typing.Any:
     """Features live on a low-dimensional manifold (intrinsic dim < k)."""
     intrinsic = max(1, k // 2)
@@ -461,7 +499,8 @@ def _build_additive_signal(X: typing.Any, smooth_kinds: typing.Any, rng: typing.
     for j, kind in enumerate(smooth_kinds):
         contrib = SMOOTH_FN[kind](X[:, j % X.shape[1]], rng)
         s = np.std(contrib)
-        if s > 1e-8: contrib /= s
+        if s > 1e-8:
+            contrib /= s
         eta += contrib
     return eta
 
@@ -487,14 +526,16 @@ def _build_2d_surface(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) 
         fn2d = SMOOTH_FN_2D[rng.choice(fn2d_names)]
         contrib = fn2d(X[:, j], X[:, j + 1], rng)
         s = np.std(contrib)
-        if s > 1e-8: contrib /= s
+        if s > 1e-8:
+            contrib /= s
         eta += contrib
     # If odd number, add a 1D smooth for the last feature
     if k % 2 == 1:
         fn1d = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
         contrib = fn1d(X[:, -1], rng)
         s = np.std(contrib)
-        if s > 1e-8: contrib /= s
+        if s > 1e-8:
+            contrib /= s
         eta += contrib
     return eta
 
@@ -510,7 +551,8 @@ def _build_low_dim_manifold(X: typing.Any, smooth_kinds: typing.Any, rng: typing
         fn = SMOOTH_FN[rng.choice(list(SMOOTH_FN.keys()))]
         contrib = fn(Z[:, d], rng)
         s = np.std(contrib)
-        if s > 1e-8: contrib /= s
+        if s > 1e-8:
+            contrib /= s
         eta += contrib
     return eta
 
