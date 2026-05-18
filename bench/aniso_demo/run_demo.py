@@ -19,6 +19,7 @@ from typing import Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
 from scipy.stats import gaussian_kde
 from sklearn.cluster import KMeans
 
@@ -100,7 +101,7 @@ def run_fit_predict(tag: str, scale_dims: bool, csv_in: Path) -> np.ndarray:
 
 
 def raincloud(
-    ax,
+    ax: Axes,
     values_by_pop: list[np.ndarray],
     colors: Sequence[str | tuple[float, float, float, float]],
     labels: list[str],

@@ -7,6 +7,8 @@ inputs to within fp64 rounding, since the underlying Rust call is identical.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -25,14 +27,14 @@ def _require_ffi(name: str) -> None:
         pytest.skip(f"engine missing FFI export `{name}`")
 
 
-def _tensor(arr, **kw):
+def _tensor(arr: Any, **kw: Any) -> torch.Tensor:
     return torch.as_tensor(np.asarray(arr, dtype=np.float64), dtype=torch.float64, **kw)
 
 
 # ----------------------------- basis primitives ----------------------------- #
 
 
-def test_bspline_basis_parity():
+def test_bspline_basis_parity() -> None:
     _require_ffi("bspline_basis")
     rng = np.random.default_rng(0)
     t = rng.uniform(0.0, 1.0, size=20)
@@ -42,7 +44,7 @@ def test_bspline_basis_parity():
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
-def test_bspline_basis_derivative_parity():
+def test_bspline_basis_derivative_parity() -> None:
     _require_ffi("bspline_basis_derivative")
     rng = np.random.default_rng(1)
     t = rng.uniform(0.0, 1.0, size=20)
@@ -52,7 +54,7 @@ def test_bspline_basis_derivative_parity():
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
-def test_duchon_basis_1d_parity():
+def test_duchon_basis_1d_parity() -> None:
     _require_ffi("duchon_basis_1d")
     rng = np.random.default_rng(2)
     t = rng.uniform(0.0, 1.0, size=20)
@@ -62,7 +64,7 @@ def test_duchon_basis_1d_parity():
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
-def test_duchon_basis_1d_derivative_parity():
+def test_duchon_basis_1d_derivative_parity() -> None:
     _require_ffi("duchon_basis_1d_derivative")
     rng = np.random.default_rng(3)
     t = rng.uniform(0.0, 1.0, size=20)
@@ -74,7 +76,7 @@ def test_duchon_basis_1d_derivative_parity():
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
-def test_smoothness_penalty_parity():
+def test_smoothness_penalty_parity() -> None:
     _require_ffi("smoothness_penalty")
     knots = np.linspace(0.0, 1.0, 8)
     s_expected, n_expected = _np_api.smoothness_penalty(knots, degree=3, order=2)
@@ -86,7 +88,7 @@ def test_smoothness_penalty_parity():
 # ------------------------------ ridge solver ------------------------------- #
 
 
-def test_gaussian_weighted_ridge_parity():
+def test_gaussian_weighted_ridge_parity() -> None:
     _require_ffi("gaussian_weighted_ridge_array")
     rng = np.random.default_rng(4)
     n, m, d = 30, 5, 2
@@ -105,7 +107,9 @@ def test_gaussian_weighted_ridge_parity():
 # ------------------------------ REML primitives ----------------------------- #
 
 
-def _reml_setup(rng, n=25, m=4, d=1):
+def _reml_setup(
+    rng: np.random.Generator, n: int = 25, m: int = 4, d: int = 1
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     X = rng.standard_normal((n, m))
     beta = rng.standard_normal((m, d))
     Y = X @ beta + 0.05 * rng.standard_normal((n, d))
@@ -113,7 +117,7 @@ def _reml_setup(rng, n=25, m=4, d=1):
     return X, Y, penalty
 
 
-def test_gaussian_reml_fit_parity():
+def test_gaussian_reml_fit_parity() -> None:
     _require_ffi("gaussian_reml_fit")
     rng = np.random.default_rng(5)
     X, Y, penalty = _reml_setup(rng)
@@ -125,7 +129,7 @@ def test_gaussian_reml_fit_parity():
     np.testing.assert_allclose(np.asarray(g.reml_score.detach()), e["reml_score"], rtol=0, atol=0)
 
 
-def test_gaussian_reml_fit_batched_parity():
+def test_gaussian_reml_fit_batched_parity() -> None:
     _require_ffi("gaussian_reml_fit_batched")
     rng = np.random.default_rng(6)
     counts = [12, 18, 15]
@@ -145,7 +149,7 @@ def test_gaussian_reml_fit_batched_parity():
     np.testing.assert_allclose(g.reml_score.detach().numpy(), e["reml_score"], rtol=0, atol=0)
 
 
-def test_gaussian_reml_fit_batched_by_matches_manual_gate():
+def test_gaussian_reml_fit_batched_by_matches_manual_gate() -> None:
     _require_ffi("gaussian_reml_fit_batched")
     rng = np.random.default_rng(61)
     counts = [12, 14]
