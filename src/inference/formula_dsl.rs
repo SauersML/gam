@@ -1418,6 +1418,43 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            // Boundary-conditioned B-spline smooth: `bc(x, anchor=0)` is sugar
+            // for `s(x, bc="anchored", anchor=0)`. With no anchor option it
+            // defaults to clamped boundaries on both endpoints. Per-side
+            // overrides (`left_bc`, `right_bc`, `anchor_left`, `anchor_right`)
+            // are accepted unchanged because the smooth builder reads the same
+            // option names.
+            "bc" | "boundary" | "boundary_conditioned" => {
+                if vars.is_empty() {
+                    return Err(format!(
+                        "{name}() requires at least one variable: {raw}"
+                    ));
+                }
+                if !options.contains_key("bc")
+                    && !options.contains_key("left_bc")
+                    && !options.contains_key("right_bc")
+                    && !options.contains_key("bc_left")
+                    && !options.contains_key("bc_right")
+                    && !options.contains_key("start_bc")
+                    && !options.contains_key("end_bc")
+                {
+                    let anchored = options.contains_key("anchor")
+                        || options.contains_key("anchor_value")
+                        || options.contains_key("value")
+                        || options.contains_key("anchor_left")
+                        || options.contains_key("left_anchor")
+                        || options.contains_key("anchor_right")
+                        || options.contains_key("right_anchor");
+                    let default_bc = if anchored { "anchored" } else { "clamped" };
+                    options.insert("bc".to_string(), default_bc.to_string());
+                }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "thinplate" | "thin_plate" | "tps" => {
                 if vars.len() < 2 {
                     return Err(format!(
@@ -1540,7 +1577,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }
