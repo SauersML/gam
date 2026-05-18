@@ -475,16 +475,45 @@ pub fn gaussian_reml_multi_closed_form_batch<'a>(
     penalty: ArrayView2<'a, f64>,
     nullspace_dim: Option<usize>,
 ) -> Result<Vec<GaussianRemlMultiResult>, EstimationError> {
-    let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
+    if problems.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Phase A: par_iter compute X'WX per problem (the only per-fit step that
+    // depends on `n_b`; remaining work is `O(p)` and can amortize through
+    // `_with_cache`).
+    let xtwx_per_problem: Vec<Array2<f64>> = problems
         .par_iter()
         .map(|problem| {
-            gaussian_reml_multi_closed_form_with_nullspace_dim(
+            let weight = match problem.weights.as_ref() {
+                Some(w) => w.to_owned(),
+                None => Array1::ones(problem.x.nrows()),
+            };
+            dense_xt_diag_x(problem.x.view(), weight.view())
+        })
+        .collect();
+    // Phase B: one batched cuSOLVER Cholesky (when policy approves uniform p
+    // and K aggregate FLOPs), per-fit Cholesky fallback otherwise.
+    let caches = build_gaussian_reml_eigen_cache_batched(
+        xtwx_per_problem,
+        penalty.view(),
+        nullspace_dim,
+    );
+    // Phase C: par_iter finish each fit with its prebuilt cache, falling
+    // back to a fresh build when the cache build failed for that element.
+    let fits: Vec<Result<GaussianRemlMultiResult, EstimationError>> = problems
+        .par_iter()
+        .zip(caches.into_par_iter())
+        .map(|(problem, cache_result)| {
+            let init_lambda = problem.init_rho.map(f64::exp);
+            let cache = cache_result.ok();
+            gaussian_reml_multi_closed_form_from_parts(
                 problem.x.view(),
                 problem.y.view(),
                 penalty.view(),
                 nullspace_dim,
                 problem.weights.as_ref().map(|weights| weights.view()),
-                problem.init_rho,
+                init_lambda,
+                cache.as_ref(),
             )
         })
         .collect();
