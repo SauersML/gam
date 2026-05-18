@@ -1169,15 +1169,33 @@ fn gaussian_reml_eigen_cache_from_xtwx(
     penalty: ArrayView2<'_, f64>,
     nullspace_dim: Option<usize>,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
-    let p = xtwx.nrows();
-    if xtwx.ncols() != p {
+    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+    let lower = gaussian_reml_cholesky_lower(xtwx)?;
+    gaussian_reml_eigen_cache_from_lower(
+        lower,
+        penalty,
+        nullspace_dim,
+        xtwx_fingerprint,
+    )
+}
+
+/// Cache-build entry point for callers that have already computed `L =
+/// chol(X'WX, lower)`. Used by the batched K-way fit path so a single
+/// `cusolverDnDpotrfBatched` call factors all K matrices, then each cache
+/// finishes per-fit without re-doing the Cholesky.
+fn gaussian_reml_eigen_cache_from_lower(
+    lower: Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    xtwx_fingerprint: u64,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
+    let p = lower.nrows();
+    if lower.ncols() != p {
         return Err(EstimationError::InvalidInput(
-            "Gaussian REML X'WX must be square".to_string(),
+            "Gaussian REML Cholesky factor must be square".to_string(),
         ));
     }
-    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
     let penalty_fingerprint = matrix_fingerprint(penalty);
-    let lower = gaussian_reml_cholesky_lower(xtwx)?;
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     let l_inv = invert_lower_triangular(&lower)?;
     let penalty_in_metric = dense_ab(l_inv.view(), penalty);
