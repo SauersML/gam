@@ -31,7 +31,11 @@ def _as_float_tensor(value: Any, ref: Any | None = None) -> Any:
         tensor = torch.as_tensor(value, **kwargs)
     if torch.is_floating_point(tensor):
         return tensor
-    dtype = ref.dtype if isinstance(ref, torch.Tensor) and torch.is_floating_point(ref) else torch.float64
+    dtype = (
+        ref.dtype
+        if isinstance(ref, torch.Tensor) and torch.is_floating_point(ref)
+        else torch.float64
+    )
     device = ref.device if isinstance(ref, torch.Tensor) else tensor.device
     return tensor.to(device=device, dtype=dtype)
 
