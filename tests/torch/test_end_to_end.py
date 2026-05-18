@@ -7,8 +7,8 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import gamfit  # noqa: E402
-import gamfit.torch as gt  # noqa: E402
+import gamfit
+import gamfit.torch as gt
 
 
 def _have_ffi(*names: str) -> bool:
