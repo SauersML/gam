@@ -55,6 +55,11 @@ pub enum EntryKind {
 struct OnDiskMeta {
     schema_version: u32,
     written_unix_secs: u64,
+    /// Nanosecond component of the write timestamp. Used to break ties in
+    /// LRU eviction so entries written within the same second don't sort
+    /// arbitrarily.
+    #[serde(default)]
+    written_nanos: u32,
     objective: Option<f64>,
     iteration: Option<u64>,
     kind: EntryKind,

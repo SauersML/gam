@@ -4,7 +4,8 @@
 //! This is intentionally not run by default test commands. Run explicitly with:
 //! `cargo bench --bench row_cell_moments_biobank_shape`.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
 
 fn synthetic_row_cells(row: usize) -> [DenestedCubicCell; 5] {

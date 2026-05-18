@@ -3,7 +3,8 @@
 //!
 //! Run with: `cargo bench --bench bvn_biobank_shape`
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use gam::families::cubic_cell_kernel::bivariate_normal_cdf;
 
 fn biobank_shape_args() -> Vec<(f64, f64, f64)> {
@@ -32,7 +33,7 @@ fn bench_bivariate_normal_cdf_biobank_shape(c: &mut Criterion) {
             let mut acc = 0.0;
             for &(h, k, rho) in &args {
                 acc +=
-                    bivariate_normal_cdf(black_box(h), black_box(k), black_box(rho)).expect("bvn");
+                    bivariate_normal_cdf(black_box(h)(k)(rho)).expect("bvn");
             }
             black_box(acc)
         });
