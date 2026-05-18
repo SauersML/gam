@@ -27,9 +27,10 @@ pub mod sparse;
 
 pub use device::GpuDeviceInfo;
 pub use dispatch::{
-    try_fast_ab, try_fast_ab_strided_batched, try_fast_atb, try_fast_atb_strided_batched,
-    try_fast_atv, try_fast_av, try_fast_xt_diag_x, try_fast_xt_diag_y,
-    try_solve_lower_triangular_matrix, try_solve_upper_triangular_matrix,
+    try_fast_a_broadcast_bt_batched, try_fast_ab, try_fast_ab_broadcast_b_batched,
+    try_fast_ab_strided_batched, try_fast_abt_strided_batched, try_fast_atb,
+    try_fast_atb_strided_batched, try_fast_atv, try_fast_av, try_fast_xt_diag_x,
+    try_fast_xt_diag_y, try_solve_lower_triangular_matrix, try_solve_upper_triangular_matrix,
 };
 pub use policy::DispatchPolicy;
 pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info};
