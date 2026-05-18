@@ -273,11 +273,21 @@ impl PenaltyPseudologdet {
                 cached_block_nullities,
             )
         } else {
-            let structural_nullity = if ridge > 0.0 {
-                structural_nullity_from_penalties(penalties, p_total)?
-            } else {
-                None
-            };
+            // Always derive the structural nullity from the unscaled penalty
+            // matrices, regardless of ridge. The intersection nullity
+            // dim(∩_k null(S_k)) is a property of the penalty subspaces alone
+            // and does not depend on the λ-weighted assembly. Gating it on
+            // `ridge > 0.0` left the ridge-free path (e.g. Gaussian-identity
+            // REML, where no Marquardt damping is applied) on
+            // eigenvalue-threshold rank detection — and that threshold scales
+            // with `max|eig(S(λ))|`, which itself moves with λ, so the rank
+            // can flip across an infinitesimal ρ perturbation. The resulting
+            // discontinuity in `log|S(λ)|₊` made finite-difference
+            // approximations of ∂_ρ log|S|₊ disagree with the analytic
+            // `tr(S⁺ S_k)` derivative by tens of percent on iso-κ Duchon
+            // probes, and the joint-Newton optimizer was solving the wrong
+            // problem.
+            let structural_nullity = structural_nullity_from_penalties(penalties, p_total)?;
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
             for (k, cp) in penalties.iter().enumerate() {
@@ -388,16 +398,18 @@ impl PenaltyPseudologdet {
             blocks
                 .iter()
                 .map(|bd| {
-                    let structural_nullity = if ridge > 0.0 {
-                        bd.structural_nullity.or_else(|| {
-                            Some(super::unified::exact_intersection_nullity(
-                                &bd.component_matrices,
-                                &bd.component_nullities,
-                            ))
-                        })
-                    } else {
-                        None
-                    };
+                    // Always force the structural nullity from the intersection
+                    // of the unscaled component nullspaces — see note in
+                    // `from_penalties_with_cached_block_nullities` (non-disjoint
+                    // branch) for why gating on `ridge > 0.0` made the rank
+                    // detection unstable across ρ perturbations on the
+                    // ridge-free Gaussian-identity REML path.
+                    let structural_nullity = bd.structural_nullity.or_else(|| {
+                        Some(super::unified::exact_intersection_nullity(
+                            &bd.component_matrices,
+                            &bd.component_nullities,
+                        ))
+                    });
                     let block_pld =
                         Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
@@ -419,16 +431,14 @@ impl PenaltyPseudologdet {
             blocks
                 .par_iter()
                 .map(|bd| {
-                    let structural_nullity = if ridge > 0.0 {
-                        bd.structural_nullity.or_else(|| {
-                            Some(super::unified::exact_intersection_nullity(
-                                &bd.component_matrices,
-                                &bd.component_nullities,
-                            ))
-                        })
-                    } else {
-                        None
-                    };
+                    // Always force the structural nullity — see note in the
+                    // sequential branch above.
+                    let structural_nullity = bd.structural_nullity.or_else(|| {
+                        Some(super::unified::exact_intersection_nullity(
+                            &bd.component_matrices,
+                            &bd.component_nullities,
+                        ))
+                    });
                     let block_pld =
                         Self::from_assembled_with_nullity(bd.local.clone(), structural_nullity)?;
                     let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
