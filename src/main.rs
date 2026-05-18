@@ -6360,6 +6360,11 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 None
             }
         }
+        SmoothBasisSpec::ByVariable { inner, .. } => smooth_term_primary_column(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**inner).clone(),
+            shape: term.shape,
+        }),
     }
 }
 
@@ -7119,6 +7124,15 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
+        SmoothBasisSpec::ByVariable { inner, .. } => match inner.as_ref() {
+            SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
+                Some(("thinplate/tps", feature_cols))
+            }
+            SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
+            SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
+            SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
+            _ => None,
+        },
         SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => None,
     }
 }
@@ -7191,6 +7205,17 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            });
+            cols.push(*by_col);
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        }
     }
 }
 
@@ -7247,6 +7272,13 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Sphere { .. } => 3,
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::ByVariable { inner, .. } => {
+            smooth_basiswarning_family_rank(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**inner).clone(),
+                shape: term.shape,
+            })
+        }
     }
 }
 
