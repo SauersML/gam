@@ -56,7 +56,7 @@ def test_from_fitted_inside_torch_module() -> None:
         mean_col = preds[:, 1:2]
         out = head(mean_col).squeeze(1)
         loss = torch.nn.functional.mse_loss(out, target)
-        loss.backward()
+        torch.autograd.backward(loss)
         optim.step()
     final_loss = loss.item()
     assert final_loss < initial_loss * 0.5, (initial_loss, final_loss)
@@ -82,6 +82,6 @@ def test_reml_positions_gradients_flow_through_torch_loop() -> None:
 
     out = gt.gaussian_reml_fit_positions(t_param, y_t, "bspline", k_t, p_t)
     loss = (out.fitted - y_t).pow(2).mean() + 0.01 * out.reml_score
-    loss.backward()
+    torch.autograd.backward(loss)
     assert t_param.grad is not None
     assert torch.isfinite(t_param.grad).all()
