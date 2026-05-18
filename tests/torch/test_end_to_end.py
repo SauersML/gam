@@ -70,7 +70,7 @@ def test_reml_positions_gradients_flow_through_torch_loop() -> None:
     t_np = np.sort(rng.uniform(0.05, 0.95, size=n))
     y_np = np.sin(2 * np.pi * t_np).reshape(-1, 1) + 0.05 * rng.standard_normal((n, 1))
     knots = np.linspace(0.0, 1.0, 8)
-    M = knots.size + 3 - 1
+    M = knots.size - 3 - 1
     penalty = np.eye(M)
 
     t_param = torch.as_tensor(t_np, dtype=torch.float64, requires_grad=True)
