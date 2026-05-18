@@ -408,3 +408,5 @@ See [survival.md](survival.md).
 # Random intercept per site
 "y ~ smooth(x) + group(site)"
 ```
+
+See also: [Difference smooths](difference-smooths.md) for `by=` smooths, `bs="sz"`, and covariance-aware group contrasts.
