@@ -28,7 +28,9 @@ pub(crate) fn log_cuda_disabled(reason: &str) {
 }
 
 pub(crate) fn log_library_ready(library: &'static str) {
-    log_route(format!("[GPU] {library} ready | CUDA library handle initialized"));
+    log_route(format!(
+        "[GPU] {library} ready | CUDA library handle initialized"
+    ));
 }
 
 pub(crate) fn log_library_unavailable(library: &'static str, reason: &str) {
@@ -122,9 +124,7 @@ pub(crate) fn gemm_flops(m: usize, n: usize, k: usize) -> u64 {
 }
 
 pub(crate) fn gemv_flops(rows: usize, cols: usize) -> u64 {
-    (rows as u64)
-        .saturating_mul(cols as u64)
-        .saturating_mul(2)
+    (rows as u64).saturating_mul(cols as u64).saturating_mul(2)
 }
 
 pub(crate) fn chol_flops(p: usize) -> u64 {

@@ -17,6 +17,7 @@ use libloading::Library;
 use ndarray::{Array1, Array2};
 use std::sync::{Mutex, OnceLock};
 
+use super::diagnostics;
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major_inplace,
     load_static_library, to_col_major, to_i32,
@@ -28,10 +29,36 @@ use super::runtime::GpuRuntime;
 #[inline]
 pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
     let p = a.nrows();
-    if p != a.ncols() || !route_syevd(p) {
+    if p != a.ncols() {
         return None;
     }
-    with_runtime(|rt| rt.syevd_inplace(a))
+    if !route_syevd(p) {
+        diagnostics::log_policy_cpu(
+            "syevd",
+            format!("p={p}"),
+            format!(
+                "below cuSOLVER policy threshold syevd_p>={}",
+                GpuRuntime::global().policy().syevd_min_p
+            ),
+        );
+        return None;
+    }
+    let start = std::time::Instant::now();
+    let result = with_runtime(|rt| rt.syevd_inplace(a));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "syevd",
+            "cuSOLVER",
+            format!("p={p}"),
+            (p as u64).saturating_mul(p as u64).saturating_mul(p as u64),
+            diagnostics::bytes_for_f64(a.len()),
+            diagnostics::bytes_for_f64(a.len().saturating_add(p)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("syevd", "cuSOLVER", format!("p={p}"));
+    }
+    result
 }
 
 /// Fused Cholesky factor + triangular solve: solve `A X = B` for SPD `A`,
@@ -44,20 +71,80 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
 #[inline]
 pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Option<()> {
     let p = a.nrows();
-    if p != a.ncols() || rhs.nrows() != p || !route_chol_solve(p) {
+    if p != a.ncols() || rhs.nrows() != p {
         return None;
     }
-    with_runtime(|rt| rt.chol_solve_inplace(a, rhs))
+    if !route_chol_solve(p) {
+        diagnostics::log_policy_cpu(
+            "chol_solve",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            format!(
+                "below cuSOLVER policy threshold chol_p>={}",
+                GpuRuntime::global().policy().chol_min_p
+            ),
+        );
+        return None;
+    }
+    let start = std::time::Instant::now();
+    let result = with_runtime(|rt| rt.chol_solve_inplace(a, rhs));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "chol_solve",
+            "cuSOLVER",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            diagnostics::chol_flops(p).saturating_add(
+                (p as u64)
+                    .saturating_mul(p as u64)
+                    .saturating_mul(rhs.ncols() as u64),
+            ),
+            diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
+            diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "chol_solve",
+            "cuSOLVER",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+        );
+    }
+    result
 }
 
 /// In-place lower Cholesky factorization: `a` becomes `L` for `A = L L^T`.
 #[inline]
 pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
     let p = a.nrows();
-    if p != a.ncols() || !route_chol_solve(p) {
+    if p != a.ncols() {
         return None;
     }
-    with_runtime(|rt| rt.cholesky_lower_inplace(a))
+    if !route_chol_solve(p) {
+        diagnostics::log_policy_cpu(
+            "cholesky_lower",
+            format!("p={p}"),
+            format!(
+                "below cuSOLVER policy threshold chol_p>={}",
+                GpuRuntime::global().policy().chol_min_p
+            ),
+        );
+        return None;
+    }
+    let start = std::time::Instant::now();
+    let result = with_runtime(|rt| rt.cholesky_lower_inplace(a));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "cholesky_lower",
+            "cuSOLVER",
+            format!("p={p}"),
+            diagnostics::chol_flops(p),
+            diagnostics::bytes_for_f64(a.len()),
+            diagnostics::bytes_for_f64(a.len()),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("cholesky_lower", "cuSOLVER", format!("p={p}"));
+    }
+    result
 }
 
 /// In-place batched lower Cholesky factorization: each `matrices[b]` becomes
@@ -82,9 +169,37 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
         return None;
     }
     if !route_chol_batched(p, matrices.len()) {
+        diagnostics::log_policy_cpu(
+            "cholesky_batched_lower",
+            format!("batch={} p={p}", matrices.len()),
+            format!(
+                "below cuSOLVER batched policy threshold aggregate_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices))
+    let batch = matrices.len();
+    let start = std::time::Instant::now();
+    let result = with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "cholesky_batched_lower",
+            "cuSOLVER",
+            format!("batch={batch} p={p}"),
+            diagnostics::chol_flops(p).saturating_mul(batch as u64),
+            diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
+            diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "cholesky_batched_lower",
+            "cuSOLVER",
+            format!("batch={batch} p={p}"),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -109,7 +224,16 @@ fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<
     RUNTIME
         .get_or_init(|| {
             let cuda = GpuRuntime::global().cuda_working_state()?;
-            CusolverRuntime::new(cuda).ok().map(Mutex::new)
+            match CusolverRuntime::new(cuda) {
+                Ok(runtime) => {
+                    diagnostics::log_library_ready("cuSOLVER");
+                    Some(Mutex::new(runtime))
+                }
+                Err(err) => {
+                    diagnostics::log_library_unavailable("cuSOLVER", &err);
+                    None
+                }
+            }
         })
         .as_ref()?
         .lock()
