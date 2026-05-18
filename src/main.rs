@@ -52,6 +52,7 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
+use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam::predict::{
@@ -60,8 +61,8 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
@@ -8229,15 +8230,34 @@ fn build_model_summary(
             .map(|block| block.iter().sum::<f64>())
             .unwrap_or(0.0);
         penalty_cursor += k;
-        let chi_sq_opt = cov_forwald.and_then(|cov| {
+        let smooth_test = cov_forwald.map(|cov| {
             let beta_block = fit
                 .beta
                 .slice(s![term.coeff_range.start..term.coeff_range.end]);
-            let cov_block = covariance_block(cov, term.coeff_range.start, term.coeff_range.end)?;
-            wald_quadratic_form(beta_block, &cov_block)
+            let nullspace_dim = term.nullspace_dims.iter().copied().max().unwrap_or(0);
+            wood_smooth_test(SmoothTestInput {
+                beta: beta_block,
+                covariance: cov,
+                coefficient_influence: fit.coefficient_influence(),
+                coeff_range: term.coeff_range.start..term.coeff_range.end,
+                edf,
+                nullspace_dim,
+                dispersion: fit.dispersion().unwrap_or_default(),
+                residual_df: fit
+                    .edf_total()
+                    .map(|edf_total| (y.len() as f64 - edf_total).max(1.0)),
+                constrained: term.shape != ShapeConstraint::None,
+            })
         });
-        let ref_df = (term.coeff_range.end - term.coeff_range.start).max(1) as f64;
-        let pvalue = chi_sq_opt.and_then(|x| chi_square_survival_approx(x, ref_df));
+        let chi_sq_opt = smooth_test
+            .as_ref()
+            .filter(|t| t.valid)
+            .map(|t| t.statistic);
+        let ref_df = smooth_test
+            .as_ref()
+            .map(|t| t.ref_df)
+            .unwrap_or_else(|| (term.coeff_range.end - term.coeff_range.start).max(1) as f64);
+        let pvalue = smooth_test.and_then(|t| t.p_value.map(|p| p.clamp(0.0, 1.0)));
         let continuous_order = if k == 3
             && term_penalty_start + 2 < fit.lambdas.len()
             && term_penalty_start + 2 < design.penaltyinfo.len()
@@ -10855,10 +10875,14 @@ mod tests {
                 working_weights: working_weights.clone(),
                 working_response: working_response.clone(),
                 reparam_qs: Some(Array2::eye(2)),
+                dispersion: gam::estimate::Dispersion::Known(1.0),
                 beta_covariance: None,
                 beta_standard_errors: None,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: None,
+                covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
             fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
