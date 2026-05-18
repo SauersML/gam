@@ -39,6 +39,9 @@ type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, CuDevice) -> CuR
 // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT from cuda.h. Hard-coded
 // because we resolve symbols dynamically and can't include the header.
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: i32 = 13;
+const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: i32 = 87;
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
 #[derive(Debug)]
@@ -366,12 +369,49 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
             },
             "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)",
         )?;
+        let mut max_threads_per_multiprocessor: i32 = 0;
+        check(
+            unsafe {
+                cu_device_get_attribute(
+                    &mut max_threads_per_multiprocessor,
+                    CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                    raw_device,
+                )
+            },
+            "cuDeviceGetAttribute(MAX_THREADS_PER_MULTIPROCESSOR)",
+        )?;
+        let mut clock_rate_khz: i32 = 0;
+        check(
+            unsafe {
+                cu_device_get_attribute(
+                    &mut clock_rate_khz,
+                    CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
+                    raw_device,
+                )
+            },
+            "cuDeviceGetAttribute(CLOCK_RATE)",
+        )?;
+        let mut single_to_double_precision_perf_ratio: i32 = 0;
+        let fp64_ratio_status = unsafe {
+            cu_device_get_attribute(
+                &mut single_to_double_precision_perf_ratio,
+                CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO,
+                raw_device,
+            )
+        };
         devices.push(GpuDeviceInfo {
             ordinal: ordinal as usize,
             name: c_name_to_string(&name_bytes),
             compute_capability_major: major,
             compute_capability_minor: minor,
             sm_count,
+            max_threads_per_multiprocessor,
+            clock_rate_khz,
+            single_to_double_precision_perf_ratio: if fp64_ratio_status == 0 {
+                Some(single_to_double_precision_perf_ratio)
+            } else {
+                None
+            },
             total_memory_bytes,
         });
     }
@@ -457,18 +497,24 @@ mod tests {
         let devices = vec![
             GpuDeviceInfo {
                 ordinal: 0,
-                name: "H100".to_string(),
+                name: String::new(),
                 compute_capability_major: 9,
                 compute_capability_minor: 0,
                 sm_count: 132,
+                max_threads_per_multiprocessor: 2048,
+                clock_rate_khz: 1_500_000,
+                single_to_double_precision_perf_ratio: Some(1),
                 total_memory_bytes: 80 * 1024 * 1024 * 1024,
             },
             GpuDeviceInfo {
                 ordinal: 1,
-                name: "T4".to_string(),
+                name: String::new(),
                 compute_capability_major: 7,
                 compute_capability_minor: 5,
                 sm_count: 40,
+                max_threads_per_multiprocessor: 1024,
+                clock_rate_khz: 1_200_000,
+                single_to_double_precision_perf_ratio: Some(32),
                 total_memory_bytes: 16 * 1024 * 1024 * 1024,
             },
         ];
