@@ -1,12 +1,12 @@
 //! cuBLAS routing for large f64 dense kernels.
 
 use libloading::Library;
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Data, Ix1, Ix2, s};
 use std::sync::{Mutex, OnceLock};
 
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
-    to_col_major, to_i32,
+    to_col_major, to_i32, to_i64,
 };
 use super::runtime::GpuRuntime;
 
@@ -22,6 +22,56 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     with_runtime(|runtime| runtime.gemm(a, b, false, false))
+}
+
+/// Strided batched dense matrix multiply: `C[b] = A[b] · B[b]` (or transposed
+/// variants) for `b = 0..batch`, all in a single cuBLAS call. The strided
+/// form requires every batch element to share the same `(m, n, k)` shape; the
+/// per-batch leading dimensions are taken from the stacked Array3 layout
+/// (row-major from ndarray, repacked column-major internally for cuBLAS).
+/// Returns `None` if the policy threshold is not met, dimensions disagree,
+/// or any device call fails — callers fall back to per-batch dispatch.
+#[inline]
+pub fn try_fast_ab_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+) -> Option<Array3<f64>> {
+    try_fast_gemm_strided_batched(a, b, false, false)
+}
+
+/// Strided batched `Aᵀ · B`. Same constraints as
+/// [`try_fast_ab_strided_batched`] but transposes A on the device per batch.
+#[inline]
+pub fn try_fast_atb_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+) -> Option<Array3<f64>> {
+    try_fast_gemm_strided_batched(a, b, true, false)
+}
+
+#[inline]
+fn try_fast_gemm_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Option<Array3<f64>> {
+    let (batch_a, a_rows, a_cols) = a.dim();
+    let (batch_b, b_rows, b_cols) = b.dim();
+    if batch_a == 0 || batch_a != batch_b {
+        return None;
+    }
+    let m = if transpose_a { a_cols } else { a_rows };
+    let k = if transpose_a { a_rows } else { a_cols };
+    let b_k = if transpose_b { b_cols } else { b_rows };
+    let n = if transpose_b { b_rows } else { b_cols };
+    if k != b_k || m == 0 || n == 0 || k == 0 {
+        return None;
+    }
+    if !route_gemm(m, n, k) {
+        return None;
+    }
+    with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b))
 }
 
 #[inline]
@@ -411,6 +461,106 @@ impl CublasRuntime {
         Some(from_col_major(&rhs_host, p, rhs_cols))
     }
 
+    fn gemm_strided_batched(
+        &mut self,
+        a: ArrayView3<'_, f64>,
+        b: ArrayView3<'_, f64>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Option<Array3<f64>> {
+        let (batch, a_rows, a_cols) = a.dim();
+        let (_, b_rows, b_cols) = b.dim();
+        let m = if transpose_a { a_cols } else { a_rows };
+        let k = if transpose_a { a_rows } else { a_cols };
+        let b_k = if transpose_b { b_cols } else { b_rows };
+        let n = if transpose_b { b_rows } else { b_cols };
+        if k != b_k {
+            return None;
+        }
+        let a_stride = a_rows.checked_mul(a_cols)?;
+        let b_stride = b_rows.checked_mul(b_cols)?;
+        let c_stride = m.checked_mul(n)?;
+        let a_total = batch.checked_mul(a_stride)?;
+        let b_total = batch.checked_mul(b_stride)?;
+        let c_total = batch.checked_mul(c_stride)?;
+
+        // Pack each batch element in column-major order. cuBLAS strided
+        // batched expects all elements contiguous in memory with a fixed
+        // stride between successive batch slices.
+        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
+        for batch_idx in 0..batch {
+            let slice = a.slice(s![batch_idx, .., ..]);
+            for col in 0..a_cols {
+                for row in 0..a_rows {
+                    a_host.push(slice[[row, col]]);
+                }
+            }
+        }
+        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
+        for batch_idx in 0..batch {
+            let slice = b.slice(s![batch_idx, .., ..]);
+            for col in 0..b_cols {
+                for row in 0..b_rows {
+                    b_host.push(slice[[row, col]]);
+                }
+            }
+        }
+        let mut c_host: Vec<f64> = vec![0.0; c_total];
+        let bytes_a = bytes_len::<f64>(a_host.len())?;
+        let bytes_b = bytes_len::<f64>(b_host.len())?;
+        let bytes_c = bytes_len::<f64>(c_host.len())?;
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
+            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
+            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
+            let alpha = 1.0_f64;
+            let beta = 0.0_f64;
+            let status = (self.blas.cublas_dgemm_strided_batched)(
+                self.handle,
+                cublas_op(transpose_a),
+                cublas_op(transpose_b),
+                to_i32(m)?,
+                to_i32(n)?,
+                to_i32(k)?,
+                &alpha,
+                a_dev.ptr,
+                to_i32(a_rows)?,
+                to_i64(a_stride)?,
+                b_dev.ptr,
+                to_i32(b_rows)?,
+                to_i64(b_stride)?,
+                &beta,
+                c_dev.ptr,
+                to_i32(m)?,
+                to_i64(c_stride)?,
+                to_i32(batch)?,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
+                "cuMemcpyDtoH strided batched C",
+            )
+            .ok()?;
+        }
+
+        // Unpack column-major slabs back into row-major Array3.
+        let mut out = Array3::<f64>::zeros((batch, m, n));
+        for batch_idx in 0..batch {
+            let start = batch_idx * c_stride;
+            let mut dest = out.slice_mut(s![batch_idx, .., ..]);
+            for col in 0..n {
+                for row in 0..m {
+                    dest[[row, col]] = c_host[start + col * m + row];
+                }
+            }
+        }
+        Some(out)
+    }
+
     unsafe fn alloc_copy<'a>(
         &'a self,
         values: &[f64],
@@ -490,6 +640,26 @@ type CublasDtrsm = unsafe extern "C" fn(
     u64,
     i32,
 ) -> CublasStatus;
+type CublasDgemmStridedBatched = unsafe extern "C" fn(
+    usize,      // handle
+    i32,        // transa
+    i32,        // transb
+    i32,        // m
+    i32,        // n
+    i32,        // k
+    *const f64, // alpha
+    u64,        // A
+    i32,        // lda
+    i64,        // strideA
+    u64,        // B
+    i32,        // ldb
+    i64,        // strideB
+    *const f64, // beta
+    u64,        // C
+    i32,        // ldc
+    i64,        // strideC
+    i32,        // batchCount
+) -> CublasStatus;
 
 struct CublasApi {
     cublas_create: CublasCreate,
@@ -498,6 +668,7 @@ struct CublasApi {
     cublas_dgemv: CublasDgemv,
     cublas_ddgmm: CublasDdgmm,
     cublas_dtrsm: CublasDtrsm,
+    cublas_dgemm_strided_batched: CublasDgemmStridedBatched,
 }
 
 impl CublasApi {
@@ -519,6 +690,9 @@ impl CublasApi {
                 cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
                 cublas_dtrsm: *library
                     .get(b"cublasDtrsm_v2\0")
+                    .map_err(|e| e.to_string())?,
+                cublas_dgemm_strided_batched: *library
+                    .get(b"cublasDgemmStridedBatched\0")
                     .map_err(|e| e.to_string())?,
             })
         }
