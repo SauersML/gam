@@ -428,7 +428,7 @@ def render_marginal_slope_3d() -> None:
             return_type="dict",
         )
         m = np.asarray(pred["mean"], dtype=float).reshape(side, side)
-        return np.clip(m, 0.0, 1.0)
+        return np.asarray(np.clip(m, 0.0, 1.0))
 
     log("[marginal-slope] predicting baseline (z=0)")
     p_base = surface_at(0.0)
@@ -491,7 +491,9 @@ def render_marginal_slope_3d() -> None:
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
-def safe(label: str, fn, *args, **kwargs):
+def safe(
+    label: str, fn: Callable[..., T], *args: Any, **kwargs: Any
+) -> T | None:
     try:
         return fn(*args, **kwargs)
     except Exception:
