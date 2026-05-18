@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// failure mode this whole module exists to prevent.
 const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
+#[derive(Debug)]
 pub struct Session {
     store: WarmStartStore,
     key: Fingerprint,
@@ -21,6 +22,7 @@ pub struct Session {
     inner: Mutex<Inner>,
 }
 
+#[derive(Debug)]
 struct Inner {
     last_write: Option<Instant>,
     best_seen: Option<f64>,
