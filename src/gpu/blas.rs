@@ -4,11 +4,11 @@ use libloading::Library;
 use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Data, Ix1, Ix2, s};
 use std::sync::{Mutex, OnceLock};
 
+use super::diagnostics;
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
     to_col_major, to_i32, to_i64,
 };
-use super::diagnostics;
 use super::runtime::GpuRuntime;
 
 #[inline]
@@ -121,7 +121,8 @@ pub fn try_fast_ab_broadcast_b_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false));
+    let result =
+        with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false));
     if result.is_some() {
         diagnostics::log_gpu_success(
             "gemm_broadcast_b_strided_batched",
@@ -174,7 +175,8 @@ pub fn try_fast_a_broadcast_bt_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true));
+    let result =
+        with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true));
     if result.is_some() {
         diagnostics::log_gpu_success(
             "gemm_broadcast_a_strided_batched",
@@ -217,7 +219,9 @@ fn try_fast_gemm_strided_batched(
     if !route_gemm(m, n, k) {
         diagnostics::log_policy_cpu(
             "gemm_strided_batched",
-            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+            format!(
+                "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
+            ),
             format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
@@ -226,12 +230,15 @@ fn try_fast_gemm_strided_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b));
+    let result =
+        with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b));
     if result.is_some() {
         diagnostics::log_gpu_success(
             "gemm_strided_batched",
             "cuBLAS",
-            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+            format!(
+                "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
+            ),
             diagnostics::gemm_flops(m, n, k).saturating_mul(batch_a as u64),
             diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
             diagnostics::bytes_for_f64(batch_a.saturating_mul(m).saturating_mul(n)),
@@ -241,7 +248,9 @@ fn try_fast_gemm_strided_batched(
         diagnostics::log_runtime_cpu(
             "gemm_strided_batched",
             "cuBLAS",
-            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+            format!(
+                "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
+            ),
         );
     }
     result
@@ -279,7 +288,11 @@ pub fn try_fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
             start.elapsed().as_secs_f64(),
         );
     } else {
-        diagnostics::log_runtime_cpu("atb", "cuBLAS", format!("rows={rows} cols={cols} rhs={rhs}"));
+        diagnostics::log_runtime_cpu(
+            "atb",
+            "cuBLAS",
+            format!("rows={rows} cols={cols} rhs={rhs}"),
+        );
     }
     result
 }
@@ -442,7 +455,10 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
     rhs: &ArrayBase<S2, Ix2>,
 ) -> Option<Array2<f64>> {
     let p = lower.nrows();
-    if lower.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+    if lower.ncols() != p || rhs.nrows() != p {
+        return None;
+    }
+    if !route_trsm(p, rhs.ncols()) {
         diagnostics::log_policy_cpu(
             "trsm_lower",
             format!("p={p} rhs_cols={}", rhs.ncols()),
@@ -460,7 +476,9 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
             "trsm_lower",
             "cuBLAS",
             format!("p={p} rhs_cols={}", rhs.ncols()),
-            (p as u64).saturating_mul(p as u64).saturating_mul(rhs.ncols() as u64),
+            (p as u64)
+                .saturating_mul(p as u64)
+                .saturating_mul(rhs.ncols() as u64),
             diagnostics::bytes_for_f64(lower.len().saturating_add(rhs.len())),
             diagnostics::bytes_for_f64(rhs.len()),
             start.elapsed().as_secs_f64(),
@@ -481,7 +499,10 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
     rhs: &ArrayBase<S2, Ix2>,
 ) -> Option<Array2<f64>> {
     let p = upper.nrows();
-    if upper.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+    if upper.ncols() != p || rhs.nrows() != p {
+        return None;
+    }
+    if !route_trsm(p, rhs.ncols()) {
         diagnostics::log_policy_cpu(
             "trsm_upper",
             format!("p={p} rhs_cols={}", rhs.ncols()),
@@ -499,7 +520,9 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
             "trsm_upper",
             "cuBLAS",
             format!("p={p} rhs_cols={}", rhs.ncols()),
-            (p as u64).saturating_mul(p as u64).saturating_mul(rhs.ncols() as u64),
+            (p as u64)
+                .saturating_mul(p as u64)
+                .saturating_mul(rhs.ncols() as u64),
             diagnostics::bytes_for_f64(upper.len().saturating_add(rhs.len())),
             diagnostics::bytes_for_f64(rhs.len()),
             start.elapsed().as_secs_f64(),

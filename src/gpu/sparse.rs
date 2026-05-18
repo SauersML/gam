@@ -9,6 +9,7 @@ use libloading::Library;
 use ndarray::{Array1, ArrayBase, Data, Ix1};
 use std::sync::{Mutex, OnceLock};
 
+use super::diagnostics;
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, load_static_library, to_i64,
 };
@@ -50,6 +51,15 @@ fn try_csr_spmv_indexed<S: Data<Elem = f64>>(
     transpose: bool,
 ) -> Option<Array1<f64>> {
     if !route_csr_spmv(rows, cols, values.len()) {
+        diagnostics::log_policy_cpu(
+            if transpose { "csr_t_spmv" } else { "csr_spmv" },
+            format!("rows={rows} cols={cols} nnz={}", values.len()),
+            format!(
+                "below cuSPARSE policy threshold rows>={} and nnz>={}",
+                GpuRuntime::global().policy().spmv_min_rows,
+                GpuRuntime::global().policy().spmv_min_nnz
+            ),
+        );
         return None;
     }
     let rowptr_i32 = checked_i32_vec(rowptr)?;
@@ -77,9 +87,36 @@ fn try_csr_spmv<S: Data<Elem = f64>>(
         return None;
     }
     if !route_csr_spmv(rows, cols, nnz) {
+        diagnostics::log_policy_cpu(
+            if transpose { "csr_t_spmv" } else { "csr_spmv" },
+            format!("rows={rows} cols={cols} nnz={nnz}"),
+            format!(
+                "below cuSPARSE policy threshold rows>={} and nnz>={}",
+                GpuRuntime::global().policy().spmv_min_rows,
+                GpuRuntime::global().policy().spmv_min_nnz
+            ),
+        );
         return None;
     }
-    with_runtime(|rt| rt.csr_spmv(rowptr, colidx, values, rows, cols, x, transpose))
+    let op = if transpose { "csr_t_spmv" } else { "csr_spmv" };
+    let start = std::time::Instant::now();
+    let result = with_runtime(|rt| rt.csr_spmv(rowptr, colidx, values, rows, cols, x, transpose));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            op,
+            "cuSPARSE",
+            format!("rows={rows} cols={cols} nnz={nnz}"),
+            (nnz as u64).saturating_mul(2),
+            diagnostics::bytes_for_i32(rowptr.len().saturating_add(colidx.len())).saturating_add(
+                diagnostics::bytes_for_f64(values.len().saturating_add(x.len())),
+            ),
+            diagnostics::bytes_for_f64(if transpose { cols } else { rows }),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(op, "cuSPARSE", format!("rows={rows} cols={cols} nnz={nnz}"));
+    }
+    result
 }
 
 #[inline]
@@ -94,7 +131,16 @@ fn with_runtime<T>(f: impl FnOnce(&mut CusparseRuntime) -> Option<T>) -> Option<
     RUNTIME
         .get_or_init(|| {
             let cuda = GpuRuntime::global().cuda_working_state()?;
-            CusparseRuntime::new(cuda).ok().map(Mutex::new)
+            match CusparseRuntime::new(cuda) {
+                Ok(runtime) => {
+                    diagnostics::log_library_ready("cuSPARSE");
+                    Some(Mutex::new(runtime))
+                }
+                Err(err) => {
+                    diagnostics::log_library_unavailable("cuSPARSE", &err);
+                    None
+                }
+            }
         })
         .as_ref()?
         .lock()
