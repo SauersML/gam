@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from .. import _response_geometry as _np_geom
+from . import _torch_compat as _tc
 from ._coerce import to_numpy_f64
 
 
@@ -24,31 +25,28 @@ def _as_float_tensor(value: Any, ref: Any | None = None) -> Any:
 
     if isinstance(value, torch.Tensor):
         tensor = value
+    elif isinstance(ref, torch.Tensor):
+        tensor = _tc.as_tensor(value, device=ref.device, dtype=ref.dtype)
     else:
-        kwargs = {}
-        if isinstance(ref, torch.Tensor):
-            kwargs = {"device": ref.device, "dtype": ref.dtype}
-        tensor = torch.as_tensor(value, **kwargs)
-    if torch.is_floating_point(tensor):
+        tensor = _tc.as_tensor(value)
+    if _tc.is_floating_point(tensor):
         return tensor
     dtype = (
         ref.dtype
-        if isinstance(ref, torch.Tensor) and torch.is_floating_point(ref)
-        else torch.float64
+        if isinstance(ref, torch.Tensor) and _tc.is_floating_point(ref)
+        else _tc.float64
     )
     device = ref.device if isinstance(ref, torch.Tensor) else tensor.device
     return tensor.to(device=device, dtype=dtype)
 
 
 def _matrix(value: Any, *, label: str, ref: Any | None = None) -> Any:
-    import torch
-
     tensor = _as_float_tensor(value, ref)
     if tensor.dim() != 2:
         raise ValueError(f"{label} must be a 2-D numeric array")
     if tensor.shape[0] == 0 or tensor.shape[1] < 2:
         raise ValueError(f"{label} must have at least one row and at least two columns")
-    if bool((~torch.isfinite(tensor)).any()):
+    if bool((~_tc.isfinite(tensor)).any()):
         raise ValueError(f"{label} must contain only finite values")
     return tensor
 
@@ -69,14 +67,12 @@ def _keep_without_reference(d: int, reference: int) -> list[int]:
 
 
 def _normalized_weights_tensor(n: int, weights: Any | None, ref: Any) -> Any:
-    import torch
-
     if weights is None:
-        return torch.full((n,), 1.0 / n, dtype=ref.dtype, device=ref.device)
+        return _tc.full((n,), 1.0 / n, dtype=ref.dtype, device=ref.device)
     w = _as_float_tensor(weights, ref).reshape(-1)
     if w.shape[0] != n:
         raise ValueError("weights length must match the number of rows")
-    if bool((~torch.isfinite(w)).any()) or bool((w < 0.0).any()) or bool(w.sum() <= 0.0):
+    if bool((~_tc.isfinite(w)).any()) or bool((w < 0.0).any()) or bool(w.sum() <= 0.0):
         raise ValueError("weights must be finite, non-negative, and have positive total")
     return w / w.sum()
 

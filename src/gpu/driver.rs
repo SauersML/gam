@@ -161,7 +161,7 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
 
 pub fn load_library(candidates: &[&str]) -> Result<Library, String> {
     for candidate in candidates {
-        if let Ok(library) = unsafe { Library::new(candidate) } {
+        if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
         }
     }
