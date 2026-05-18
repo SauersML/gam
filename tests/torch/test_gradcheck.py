@@ -34,10 +34,10 @@ _GRADCHECK_KW = dict(eps=1e-6, atol=1e-5, rtol=1e-3, nondet_tol=1e-6)
 def test_bspline_basis_gradcheck():
     _require_ffi("bspline_basis")
     rng = np.random.default_rng(11)
-    t = torch.as_tensor(
+    t = torch.tensor(
         rng.uniform(0.05, 0.95, size=8), dtype=torch.float64, requires_grad=True
     )
-    knots = torch.as_tensor(np.linspace(0.0, 1.0, 7), dtype=torch.float64)
+    knots = torch.tensor(np.linspace(0.0, 1.0, 9), dtype=torch.float64)
 
     def f(t_):
         return gt.bspline_basis(t_, knots, degree=3, periodic=False)
@@ -48,10 +48,10 @@ def test_bspline_basis_gradcheck():
 def test_duchon_basis_1d_gradcheck():
     _require_ffi("duchon_basis_1d")
     rng = np.random.default_rng(12)
-    t = torch.as_tensor(
+    t = torch.tensor(
         rng.uniform(0.05, 0.95, size=8), dtype=torch.float64, requires_grad=True
     )
-    centers = torch.as_tensor(np.linspace(0.0, 1.0, 5), dtype=torch.float64)
+    centers = torch.tensor(np.linspace(0.0, 1.0, 5), dtype=torch.float64)
 
     def f(t_):
         return gt.duchon_basis_1d(t_, centers, m=2, periodic=False)
@@ -74,9 +74,9 @@ def _reml_inputs(n=12, m=3, d=1, seed=0):
 def test_gaussian_reml_fit_gradcheck():
     _require_ffi("gaussian_reml_fit")
     X, Y, penalty = _reml_inputs(seed=13)
-    x_t = torch.as_tensor(X, dtype=torch.float64, requires_grad=True)
-    y_t = torch.as_tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.as_tensor(penalty, dtype=torch.float64)
+    x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
+    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
 
     def f(x_, y_):
         out = gt.gaussian_reml_fit(x_, y_, p_t)
@@ -97,10 +97,10 @@ def test_gaussian_reml_fit_batched_gradcheck():
     X = rng.standard_normal((n_total, m))
     Y = rng.standard_normal((n_total, d))
     penalty = np.eye(m)
-    x_t = torch.as_tensor(X, dtype=torch.float64, requires_grad=True)
-    y_t = torch.as_tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.as_tensor(penalty, dtype=torch.float64)
-    off_t = torch.as_tensor(offsets)
+    x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
+    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
+    off_t = torch.tensor(offsets)
 
     def f(x_, y_):
         out = gt.gaussian_reml_fit_batched(x_, y_, off_t, p_t)
@@ -115,13 +115,13 @@ def test_gaussian_reml_fit_positions_gradcheck():
     n = 12
     t = np.sort(rng.uniform(0.05, 0.95, size=n))
     Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n, 1))
-    knots = np.linspace(0.0, 1.0, 7)
-    M = knots.size + 3 - 1
+    knots = np.linspace(0.0, 1.0, 9)
+    M = knots.size - 3 - 1
     penalty = np.eye(M)
-    t_t = torch.as_tensor(t, dtype=torch.float64, requires_grad=True)
-    y_t = torch.as_tensor(Y, dtype=torch.float64, requires_grad=True)
-    k_t = torch.as_tensor(knots, dtype=torch.float64)
-    p_t = torch.as_tensor(penalty, dtype=torch.float64)
+    t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
+    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
+    k_t = torch.tensor(knots, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
 
     def f(t_, y_):
         out = gt.gaussian_reml_fit_positions(t_, y_, "bspline", k_t, p_t)
@@ -140,14 +140,14 @@ def test_gaussian_reml_fit_positions_batched_gradcheck():
         [np.sort(rng.uniform(0.05, 0.95, size=c)) for c in counts]
     )
     Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n_total, 1))
-    knots = np.linspace(0.0, 1.0, 7)
-    M = knots.size + 3 - 1
+    knots = np.linspace(0.0, 1.0, 9)
+    M = knots.size - 3 - 1
     penalty = np.eye(M)
-    t_t = torch.as_tensor(t, dtype=torch.float64, requires_grad=True)
-    y_t = torch.as_tensor(Y, dtype=torch.float64, requires_grad=True)
-    k_t = torch.as_tensor(knots, dtype=torch.float64)
-    p_t = torch.as_tensor(penalty, dtype=torch.float64)
-    off_t = torch.as_tensor(offsets)
+    t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
+    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
+    k_t = torch.tensor(knots, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
+    off_t = torch.tensor(offsets)
 
     def f(t_, y_):
         out = gt.gaussian_reml_fit_positions_batched(t_, y_, off_t, "bspline", k_t, p_t)
