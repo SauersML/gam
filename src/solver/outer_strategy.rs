@@ -3753,6 +3753,11 @@ struct OuterConfig {
     /// jump kappa by orders of magnitude per step and oscillate. Setting
     /// this `None` disables the psi-axis cap.
     bfgs_step_cap_psi: Option<f64>,
+    /// Optional persistent-cache session. When `Some`, every finite objective
+    /// evaluation is written through to disk (rate-limited, atomic-rename)
+    /// and the best on-disk rho is prepended as a seed at the start of each
+    /// plan attempt. Defaulted off so test-only paths skip filesystem I/O.
+    cache_session: Option<Arc<CacheSession>>,
 }
 
 impl Default for OuterConfig {
@@ -3775,6 +3780,7 @@ impl Default for OuterConfig {
             objective_scale: None,
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
+            cache_session: None,
         }
     }
 }
