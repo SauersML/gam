@@ -1879,86 +1879,88 @@ fn gaussian_reml_fit_batched_backward_impl(
     // cuBLAS strided-batched gemm (one device call instead of K). Without
     // state, each fit refits internally; that path keeps the existing
     // per-fit par_iter shape.
-    let results: Vec<Result<(usize, Option<gam::gaussian_reml::GaussianRemlBackwardResult>), String>> =
-        if let Some(fits) = forward_fits {
-            let mut active: Vec<(usize, GaussianRemlMultiBackwardProblem<'_>)> =
-                Vec::with_capacity(batch);
-            for b in 0..batch {
+    let results: Vec<
+        Result<
+            (
+                usize,
+                Option<gam::gaussian_reml::GaussianRemlBackwardResult>,
+            ),
+            String,
+        >,
+    > = if let Some(fits) = forward_fits {
+        let mut active: Vec<(usize, GaussianRemlMultiBackwardProblem<'_>)> =
+            Vec::with_capacity(batch);
+        for b in 0..batch {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                continue;
+            }
+            let Some(fit) = fits[b].as_ref() else {
+                continue;
+            };
+            active.push((
+                b,
+                GaussianRemlMultiBackwardProblem {
+                    x: x.slice(s![start..end, ..]),
+                    y: y.slice(s![start..end, ..]),
+                    weights: weights.as_ref().map(|w| w.slice(s![start..end])),
+                    fit,
+                    grad_lambda: grad_lambda.as_ref().map_or(0.0, |g| g[b]),
+                    grad_coefficients: grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..])),
+                    grad_fitted: grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..])),
+                    grad_reml_score: grad_reml_score.as_ref().map_or(0.0, |g| g[b]),
+                },
+            ));
+        }
+        let (indices, problems): (Vec<usize>, Vec<GaussianRemlMultiBackwardProblem<'_>>) =
+            active.into_iter().unzip();
+        let batch_results = gaussian_reml_multi_closed_form_backward_batch(&problems, penalty);
+        batch_results
+            .into_iter()
+            .zip(indices.into_iter())
+            .map(|(result, b)| match result {
+                Ok(backward) => Ok((b, Some(backward))),
+                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
+            })
+            .collect()
+    } else {
+        (0..batch)
+            .into_par_iter()
+            .map(|b| {
                 let start = row_offsets[b];
                 let end = row_offsets[b + 1];
                 if start == end {
-                    continue;
+                    return Ok((b, None));
                 }
-                let Some(fit) = fits[b].as_ref() else {
-                    continue;
-                };
-                active.push((
-                    b,
-                    GaussianRemlMultiBackwardProblem {
-                        x: x.slice(s![start..end, ..]),
-                        y: y.slice(s![start..end, ..]),
-                        weights: weights.as_ref().map(|w| w.slice(s![start..end])),
-                        fit,
-                        grad_lambda: grad_lambda.as_ref().map_or(0.0, |g| g[b]),
-                        grad_coefficients: grad_coefficients
-                            .as_ref()
-                            .map(|g| g.slice(s![b, .., ..])),
-                        grad_fitted: grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..])),
-                        grad_reml_score: grad_reml_score.as_ref().map_or(0.0, |g| g[b]),
-                    },
-                ));
-            }
-            let (indices, problems): (Vec<usize>, Vec<GaussianRemlMultiBackwardProblem<'_>>) =
-                active.into_iter().unzip();
-            let batch_results =
-                gaussian_reml_multi_closed_form_backward_batch(&problems, penalty);
-            batch_results
-                .into_iter()
-                .zip(indices.into_iter())
-                .map(|(result, b)| match result {
+                let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
+                let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
+                let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
+                let upstream_coefficients =
+                    grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
+                let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
+                let x_slice = x.slice(s![start..end, ..]);
+                let y_slice = y.slice(s![start..end, ..]);
+                let backward_result = gaussian_reml_multi_closed_form_backward(
+                    x_slice,
+                    y_slice,
+                    penalty,
+                    weight_slice,
+                    init_lambda,
+                    upstream_lambda,
+                    upstream_coefficients,
+                    upstream_fitted,
+                    upstream_reml_score,
+                );
+                match backward_result {
                     Ok(backward) => Ok((b, Some(backward))),
                     Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
                     Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
-                })
-                .collect()
-        } else {
-            (0..batch)
-                .into_par_iter()
-                .map(|b| {
-                    let start = row_offsets[b];
-                    let end = row_offsets[b + 1];
-                    if start == end {
-                        return Ok((b, None));
-                    }
-                    let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
-                    let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
-                    let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
-                    let upstream_coefficients =
-                        grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
-                    let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
-                    let x_slice = x.slice(s![start..end, ..]);
-                    let y_slice = y.slice(s![start..end, ..]);
-                    let backward_result = gaussian_reml_multi_closed_form_backward(
-                        x_slice,
-                        y_slice,
-                        penalty,
-                        weight_slice,
-                        init_lambda,
-                        upstream_lambda,
-                        upstream_coefficients,
-                        upstream_fitted,
-                        upstream_reml_score,
-                    );
-                    match backward_result {
-                        Ok(backward) => Ok((b, Some(backward))),
-                        Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
-                        Err(err) => {
-                            Err(format!("batched Gaussian REML backward {b} failed: {err}"))
-                        }
-                    }
-                })
-                .collect()
-        };
+                }
+            })
+            .collect()
+    };
 
     let mut statuses = vec!["degenerate".to_string(); batch];
     let mut grad_x = Array2::<f64>::zeros(x.dim());
@@ -6562,9 +6564,15 @@ mod tests {
                 let start = row_offsets[b];
                 let end = row_offsets[b + 1];
                 let cache = gam::gaussian_reml::GaussianRemlEigenCache {
-                    penalty_eigenvalues: forward.cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
+                    penalty_eigenvalues: forward
+                        .cache_penalty_eigenvalues
+                        .slice(s![b, ..])
+                        .to_owned(),
                     eigenvectors: forward.cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
-                    coefficient_basis: forward.cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+                    coefficient_basis: forward
+                        .cache_coefficient_basis
+                        .slice(s![b, .., ..])
+                        .to_owned(),
                     xtwx_fingerprint: forward.cache_xtwx_fingerprints[b],
                     penalty_fingerprint: forward.cache_penalty_fingerprints[b],
                     logdet_xtwx: forward.cache_logdet_xtwx[b],
@@ -6627,11 +6635,7 @@ mod tests {
         for (a, b) in refit.grad_y.iter().zip(from_fits.grad_y.iter()) {
             assert!((a - b).abs() <= 1.0e-12);
         }
-        for (a, b) in refit
-            .grad_weights
-            .iter()
-            .zip(from_fits.grad_weights.iter())
-        {
+        for (a, b) in refit.grad_weights.iter().zip(from_fits.grad_weights.iter()) {
             assert!((a - b).abs() <= 1.0e-12);
         }
     }
