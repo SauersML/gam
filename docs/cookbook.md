@@ -376,3 +376,53 @@ print(gs.best_params_, gs.best_score_)
 model.report("report.html")     # writes to disk
 html = model.report()           # returns string for Jupyter / inline display
 ```
+
+## Per-group trajectories (factor `by=` smooth)
+
+Use a factor `by=` smooth when each group should have its own curve without
+partial pooling between groups:
+
+```python
+model = gamfit.fit(train, formula="y ~ group(subject) + s(time, by=subject)")
+```
+
+The `group(subject)` term estimates per-subject mean offsets; the `by=` smooth
+then captures per-subject nonlinear departures. Prediction rows with subject
+levels not seen during fitting contribute zero from the factor-smooth block.
+
+## Hierarchical / partial-pooling smooths (`bs="fs"`)
+
+Use `bs="fs"` (or the `fs()` alias) when every group has a trajectory but
+small groups should shrink toward zero contribution:
+
+```python
+model = gamfit.fit(train, formula="y ~ s(time) + s(time, subject, bs='fs', k=8)")
+# same factor-smooth term: fs(time, subject, k=8)
+```
+
+The term includes ridge penalties for the spline range and low-order components,
+so it can recover subject-specific intercept and slope variation while still
+regularizing sparse subjects.
+
+## Treatment vs control difference smooth (`bs="sz"`)
+
+Use `bs="sz"` for identifiable deviations around a population smooth:
+
+```python
+model = gamfit.fit(train, formula="y ~ treatment + s(time) + s(treatment, time, bs='sz')")
+```
+
+The deviation curves are constrained to sum to zero across factor levels at each
+spline coefficient, making the `s(time)` term the population curve and the `sz`
+term the level-specific differences.
+
+## Random slopes
+
+Random slopes are available as the linear factor-smooth special case:
+
+```python
+model = gamfit.fit(train, formula="y ~ group(subject) + s(subject, time, bs='re')")
+```
+
+`group(subject)` supplies random intercepts; the `bs='re'` smooth contributes
+per-subject linear slopes in `time` with a shared ridge penalty.
