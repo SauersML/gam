@@ -2085,6 +2085,94 @@ fn composite_trace_implicit_batched(
     trace
 }
 
+/// Vector form of the implicit-axis trace batching used by
+/// [`CompositeHyperOperator`].  It returns one exact `tr(Fᵀ B_i F)` value per
+/// input operator while sharing the expensive `X·F` projection and Duchon
+/// row-kernel sweeps across sibling implicit ψ/ρ axes.
+fn trace_projected_factors_batched(
+    operators: &[Arc<dyn HyperOperator>],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<f64> {
+    let mut out = vec![0.0; operators.len()];
+    let mut handled = vec![false; operators.len()];
+
+    for i in 0..operators.len() {
+        if handled[i] {
+            continue;
+        }
+        let Some(impl_i) = operators[i].as_implicit() else {
+            out[i] = operators[i].trace_projected_factor_cached(factor, cache);
+            handled[i] = true;
+            continue;
+        };
+
+        let mut group = vec![i];
+        handled[i] = true;
+        for j in (i + 1)..operators.len() {
+            if handled[j] {
+                continue;
+            }
+            if let Some(impl_j) = operators[j].as_implicit()
+                && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+                && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && impl_i.p == impl_j.p
+            {
+                group.push(j);
+                handled[j] = true;
+            }
+        }
+
+        if group.len() >= 2 {
+            let xf = impl_i.cached_xf(factor, cache);
+            let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
+                .iter()
+                .map(|&idx| {
+                    let op = operators[idx].as_implicit().unwrap();
+                    (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
+                })
+                .collect();
+            let values = impl_i.trace_projected_factor_all_axes_with_xf(factor, xf.view(), &axes);
+            for (&idx, value) in group.iter().zip(values) {
+                out[idx] = value;
+            }
+        } else {
+            out[i] = operators[i].trace_projected_factor_cached(factor, cache);
+        }
+    }
+
+    out
+}
+
+fn dense_spectral_trace_logdet_operators_batched(
+    ds: &DenseSpectralOperator,
+    operators: &[Arc<dyn HyperOperator>],
+) -> Vec<f64> {
+    if operators.is_empty() {
+        return Vec::new();
+    }
+    if log::log_enabled!(log::Level::Info) {
+        let start = std::time::Instant::now();
+        let out =
+            trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache);
+        let implicit_count = operators.iter().filter(|op| op.is_implicit()).count();
+        dense_spectral_stage_log(
+            &format!(
+                "DenseSpectralOperator::trace_logdet_operators_batched dim={} rank={} ops={} implicit_ops={}",
+                ds.n_dim,
+                ds.g_factor.ncols(),
+                operators.len(),
+                implicit_count,
+            ),
+            start.elapsed().as_secs_f64(),
+        );
+        out
+    } else {
+        trace_projected_factors_batched(operators, &ds.g_factor, &ds.projected_factor_cache)
+    }
+}
+
 impl HyperOperator for CompositeHyperOperator {
     fn dim(&self) -> usize {
         self.dim_hint
@@ -5545,6 +5633,44 @@ pub fn reml_laml_evaluate(
     // Both ρ and ext coordinates are processed through outer_gradient_entry()
     // so that the three-term formula (penalty + trace − det) is written once.
 
+    // Exact trace batching for operator-backed ρ corrections.  The hot biobank
+    // GAMLSS path has many Duchon smoothing coordinates whose correction
+    // operators share the same design and spectral factor.  Evaluating them one
+    // by one repeats the same `X·F` projection and row-kernel setup for every
+    // coordinate.  The trace is linear, so split `tr(K·(A_i + C_i))` into the
+    // cheap penalty part plus a batched exact vector of `tr(K·C_i)` values.
+    // This preserves the full first-order gradient (no iteration caps or
+    // stochastic approximation) while collapsing the per-coordinate trace pass.
+    let rho_operator_correction_traces: Option<Vec<Option<f64>>> = if incl_logdet_h
+        && stochastic_trace_values.is_none()
+        && solution.penalty_subspace_trace.is_none()
+    {
+        let pairs: Vec<(usize, Arc<dyn HyperOperator>)> = rho_corrections
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, correction)| match correction {
+                Some(DriftDerivResult::Operator(op)) => Some((idx, Arc::clone(op))),
+                _ => None,
+            })
+            .collect();
+        if pairs.len() >= 2 {
+            hop.as_exact_dense_spectral().map(|ds| {
+                let ops: Vec<Arc<dyn HyperOperator>> =
+                    pairs.iter().map(|(_, op)| Arc::clone(op)).collect();
+                let values = dense_spectral_trace_logdet_operators_batched(ds, &ops);
+                let mut traces = vec![None; k];
+                for ((idx, _), value) in pairs.into_iter().zip(values) {
+                    traces[idx] = Some(value);
+                }
+                traces
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let rho_grad_entries: Vec<(usize, f64)> = (0..k)
         .into_par_iter()
         .map(|idx| {
@@ -5578,6 +5704,18 @@ pub fn reml_laml_evaluate(
                     DriftDerivResult::Dense(matrix) => kernel.trace_projected_logdet(&matrix),
                     DriftDerivResult::Operator(op) => kernel.trace_operator(op.as_ref()),
                 }
+            } else if let Some(correction_trace) = rho_operator_correction_traces
+                .as_ref()
+                .and_then(|traces| traces[idx])
+            {
+                let penalty_trace = if coord.is_block_local() {
+                    let (block, start, end) = coord.scaled_block_local(1.0);
+                    hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
+                } else {
+                    penalty_total_drift_result(coord, curvature_lambdas[idx], None)
+                        .trace_logdet(hop)
+                };
+                penalty_trace + correction_trace
             } else if coord.is_block_local() && rho_corrections[idx].is_none() {
                 let (block, start, end) = coord.scaled_block_local(1.0);
                 hop.trace_logdet_block_local(&block, curvature_lambdas[idx], start, end)
@@ -16244,6 +16382,76 @@ mod tests {
         // G⁺ v = [0.25*2 + 0.25*0; 0.25*2 + 0.25*0] = [0.5; 0.5]
         assert!((result[0] - 0.5).abs() < 1e-10);
         assert!((result[1] - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn batched_implicit_trace_matches_per_operator_trace() {
+        use crate::terms::basis::ImplicitDesignPsiDerivative;
+        use std::sync::Arc;
+
+        let n = 5usize;
+        let p = 3usize;
+        let n_axes = 2usize;
+        let len = n * p;
+        let phi_values = Array1::from_vec((0..len).map(|i| 0.2 + 0.03 * i as f64).collect());
+        let q_values = Array1::from_vec((0..len).map(|i| -0.4 + 0.05 * i as f64).collect());
+        let t_values = Array1::zeros(len);
+        let axis_components = Array2::from_shape_vec(
+            (len, n_axes),
+            (0..len)
+                .flat_map(|i| [0.1 + 0.02 * i as f64, -0.3 + 0.015 * i as f64])
+                .collect(),
+        )
+        .unwrap();
+        let implicit = Arc::new(ImplicitDesignPsiDerivative::new(
+            phi_values,
+            q_values,
+            t_values,
+            axis_components,
+            None,
+            None,
+            n,
+            p,
+            0,
+            n_axes,
+        ));
+        let x_data = array![
+            [1.0, 0.4, -0.2],
+            [0.5, 1.1, 0.3],
+            [-0.3, 0.9, 0.6],
+            [0.8, -0.5, 1.2],
+            [0.2, 0.7, -0.4],
+        ];
+        let x_design = Arc::new(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            x_data,
+        )));
+        let w_diag = Arc::new(array![1.0, 0.7, 1.3, 0.9, 1.1]);
+        let h = Array2::<f64>::eye(p);
+        let ds = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let make_op = |axis: usize, scale: f64| -> Arc<dyn HyperOperator> {
+            Arc::new(ImplicitHyperOperator {
+                implicit_deriv: Arc::clone(&implicit),
+                axis,
+                x_design: Arc::clone(&x_design),
+                w_diag: Arc::clone(&w_diag),
+                s_psi: Array2::<f64>::eye(p) * scale,
+                p,
+                c_x_psi_beta: Some(Arc::new(Array1::from_vec(
+                    (0..n).map(|i| scale * (i as f64 + 1.0)).collect(),
+                ))),
+            })
+        };
+        let ops = vec![make_op(0, 0.05), make_op(1, 0.07)];
+        let cache = ProjectedFactorCache::default();
+        let per_operator: Vec<f64> = ops
+            .iter()
+            .map(|op| op.trace_projected_factor_cached(&ds.g_factor, &cache))
+            .collect();
+        let batched = dense_spectral_trace_logdet_operators_batched(&ds, &ops);
+        assert_eq!(batched.len(), per_operator.len());
+        for (want, got) in per_operator.iter().zip(batched.iter()) {
+            assert_relative_eq!(got, want, epsilon = 1.0e-10, max_relative = 1.0e-10);
+        }
     }
 
     /// Contract: `ImplicitHyperOperator::mul_vec(v)` reproduces the analytic
