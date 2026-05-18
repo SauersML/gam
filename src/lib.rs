@@ -79,7 +79,7 @@ pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
 pub use inference::{
-    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample,
+    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{
