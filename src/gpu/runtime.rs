@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
+use super::diagnostics;
 use super::device::GpuDeviceInfo;
 use super::driver::CudaWorkingState;
 use super::policy::DispatchPolicy;
@@ -87,14 +88,14 @@ impl GpuRuntime {
                 });
                 let device = devices.into_iter().next().expect("non-empty");
                 let policy = DispatchPolicy::for_device(Some(&device));
-                log::debug!("[gam-gpu] autodetected {device}");
+                diagnostics::log_cuda_enabled(&device, &policy);
                 Self {
                     selected_device: Some(device),
                     policy,
                 }
             }
             Err(err) => {
-                log::trace!("[gam-gpu] CPU execution selected: {err}");
+                diagnostics::log_cuda_disabled(&err.to_string());
                 Self {
                     selected_device: None,
                     policy: DispatchPolicy::for_device(None),
