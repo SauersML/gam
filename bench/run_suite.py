@@ -7509,8 +7509,6 @@ def run_external_lifelines_coxph_enet_cv(scenario: typing.Any, *, ds: dict[str, 
         train_risk = cph.predict_partial_hazard(train_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
         risk = cph.predict_partial_hazard(test_df[fit_feature_cols]).to_numpy(dtype=float).reshape(-1)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
         cv_rows.append(
             {
                 "fit_sec": fit_sec,
@@ -7693,7 +7691,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             train_df = all_df.iloc[fold.train_idx].copy()
             test_df = all_df.iloc[fold.test_idx].copy()
             event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
-            events = test_df[ds["event_col"]].to_numpy(dtype=float)
             risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
             train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
             if risk.shape[0] != event_times.shape[0]:
@@ -7794,8 +7791,6 @@ def run_external_sksurv_gb_cv(scenario: typing.Any, *, ds: dict[str, typing.Any]
             event=train_df[event_col].to_numpy(dtype=float) > 0.5,
             time=train_df[time_col].to_numpy(dtype=float),
         )
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
 
         gb_model = GradientBoostingSurvivalAnalysis(
             loss="coxph",
@@ -7924,8 +7919,6 @@ def run_external_lifelines_aft_cv(scenario: typing.Any, *, ds: dict[str, typing.
         train_df = df.iloc[fold.train_idx].copy()
         test_df = df.iloc[fold.test_idx].copy()
         train_df, test_df = zscore_train_test(train_df, test_df, feature_cols)
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
 
         weibull = WeibullAFTFitter(penalizer=1e-3, l1_ratio=0.2)
         fit_start = datetime.now(timezone.utc)

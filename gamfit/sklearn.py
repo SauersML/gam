@@ -9,6 +9,7 @@ from sklearn.metrics import accuracy_score, r2_score
 from sklearn.utils.validation import check_is_fitted
 
 from ._api import fit as fit_model
+from ._model import Model
 from ._tables import attach_target, response_column_name, table_columns
 
 __all__ = ["GAMClassifier", "GAMRegressor"]
@@ -83,10 +84,20 @@ class _BaseGAMEstimator(BaseEstimator):
 
     def report(self, path: str) -> Any:
         check_is_fitted(self, "model_")
+        if not isinstance(self.model_, Model):
+            raise TypeError(
+                "report() is only supported for scalar GAM models; "
+                "response-geometry models do not expose a report() method"
+            )
         return self.model_.report(path)
 
     def check(self, X: Any) -> Any:
         check_is_fitted(self, "model_")
+        if not isinstance(self.model_, Model):
+            raise TypeError(
+                "check() is only supported for scalar GAM models; "
+                "response-geometry models do not expose a check() method"
+            )
         return self.model_.check(X)
 
 
