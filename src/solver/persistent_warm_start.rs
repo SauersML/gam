@@ -138,8 +138,12 @@ pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
 
 pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
     let dir = cache_dir()?;
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create warm-start cache dir '{}': {e}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| {
+        format!(
+            "failed to create warm-start cache dir '{}': {e}",
+            dir.display()
+        )
+    })?;
     let path = cache_file_path_in_dir(&dir, &record.key);
     let bytes = serde_json::to_vec(record)
         .map_err(|e| format!("failed to encode warm-start cache record: {e}"))?;
@@ -189,7 +193,9 @@ pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), Str
 }
 
 fn cache_file_path(key: &str) -> Option<PathBuf> {
-    cache_dir().ok().map(|dir| cache_file_path_in_dir(&dir, key))
+    cache_dir()
+        .ok()
+        .map(|dir| cache_file_path_in_dir(&dir, key))
 }
 
 fn cache_file_path_in_dir(dir: &Path, key: &str) -> PathBuf {
@@ -199,7 +205,11 @@ fn cache_file_path_in_dir(dir: &Path, key: &str) -> PathBuf {
 fn cache_dir() -> Result<PathBuf, String> {
     let cwd = std::env::current_dir()
         .map_err(|e| format!("failed to resolve current directory for warm-start cache: {e}"))?;
-    Ok(cwd.join(".cache").join("gamfit").join("warm-start").join("v1"))
+    Ok(cwd
+        .join(".cache")
+        .join("gamfit")
+        .join("warm-start")
+        .join("v1"))
 }
 
 fn unix_secs_now() -> u64 {

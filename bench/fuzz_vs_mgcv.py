@@ -575,10 +575,12 @@ def _build_regime(X: typing.Any, smooth_kinds: typing.Any, rng: typing.Any) -> t
     for j in range(min(k, len(smooth_kinds))):
         fn_a = SMOOTH_FN[rng.choice(smooth_names)]
         fn_b = SMOOTH_FN[rng.choice(smooth_names)]
-        ca = fn_a(X[:, j], rng); cb = fn_b(X[:, j], rng)
+        ca = fn_a(X[:, j], rng)
+        cb = fn_b(X[:, j], rng)
         for arr in [ca, cb]:
             s = np.std(arr)
-            if s > 1e-8: arr /= s
+            if s > 1e-8:
+                arr /= s
         eta += np.where(mask, ca, cb)
     return eta
 
@@ -1623,7 +1625,8 @@ def print_leaderboard(results: typing.Any, top_n: typing.Any=25) -> None:
             rs = f"{rv:.4f}" if rv is not None else "  FAIL"
             ms = f"{mv:.4f}" if mv is not None else "  FAIL"
             kinds = ",".join(k[:3] for k in s["smooth_kinds"][:4])
-            if len(s["smooth_kinds"]) > 4: kinds += f"+{len(s['smooth_kinds'])-4}"
+            if len(s["smooth_kinds"]) > 4:
+                kinds += f"+{len(s['smooth_kinds'])-4}"
             print(f"{i+1:3d}  {gap_s}  {rs:>9}  {ms:>9}  {s['n_obs']:5d}  {s['n_smooths']:2d}  "
                   f"{s['knots']:3d}  {'Y' if s['double_penalty'] else 'N':>3}  "
                   f"{s['noise_sd']:6.2f}  {s['noise_kind']:>12}  {s['basis_type']:>6}  "
@@ -1756,7 +1759,8 @@ def main() -> None:
     r_check = subprocess.run(["Rscript", "-e", "library(mgcv); cat('ok')"],
                               capture_output=True, text=True, timeout=30)
     if "ok" not in (r_check.stdout or ""):
-        print("R + mgcv not available"); sys.exit(1)
+        print("R + mgcv not available")
+        sys.exit(1)
 
     # Seed-start selection: deterministic when --seed-start is passed,
     # entropy-driven when omitted. Each invocation that does not pin a value
@@ -1793,7 +1797,8 @@ def main() -> None:
         with open(RESULTS_FILE) as f:
             for line in f:
                 line = line.strip()
-                if not line: continue
+                if not line:
+                    continue
                 obj = json.loads(line)
                 fr = FuzzResult(scenario=obj["scenario"], rust=obj["rust"], mgcv=obj["mgcv"])
                 fr.compute_gap()
@@ -1803,7 +1808,8 @@ def main() -> None:
 
     target_new_trials = max(0, args.n_trials - len(results))
     if target_new_trials == 0:
-        print_leaderboard(results, top_n=args.top); return
+        print_leaderboard(results, top_n=args.top)
+        return
 
     seed_origin = "explicit" if seed_start_explicit else "auto (system entropy)"
     print(f"Running {target_new_trials} trials")
@@ -1893,7 +1899,8 @@ def main() -> None:
 
             m = result.primary_metric or "?"
             gap_s = f"{result.primary_gap:+.4f}" if result.primary_gap is not None else " N/A "
-            rv = result.rust.get(m); mv = result.mgcv.get(m)
+            rv = result.rust.get(m)
+            mv = result.mgcv.get(m)
             rs = f"{rv:.4f}" if rv is not None else " FAIL"
             ms = f"{mv:.4f}" if mv is not None else " FAIL"
             err_r = " [R:ERR]" if result.rust.get("error") else ""
@@ -1940,7 +1947,7 @@ def main() -> None:
                         print(f"    │ cmd: {out['cmd']}", flush=True)
                     if out.get("traceback"):
                         print(f"    │ traceback: {out['traceback']}", flush=True)
-                    print(f"    └──────────────────────", flush=True)
+                    print("    └──────────────────────", flush=True)
 
     print_leaderboard(results, top_n=args.top)
 

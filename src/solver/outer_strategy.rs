@@ -2067,14 +2067,16 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     eval.cost,
                     g_norm,
                 );
-                *self.stall_signal.lock().expect("stall_signal mutex poisoned") =
-                    Some(StallSignal {
-                        last_point: x.clone(),
-                        last_cost: eval.cost,
-                        last_gradient: gradient.clone(),
-                        last_gradient_norm: g_norm,
-                        iter_count: self.iter_count.saturating_add(1),
-                    });
+                *self
+                    .stall_signal
+                    .lock()
+                    .expect("stall_signal mutex poisoned") = Some(StallSignal {
+                    last_point: x.clone(),
+                    last_cost: eval.cost,
+                    last_gradient: gradient.clone(),
+                    last_gradient_norm: g_norm,
+                    iter_count: self.iter_count.saturating_add(1),
+                });
                 return Err(ObjectiveEvalError::fatal(format!(
                     "{OUTER_STALL_TERMINATE_SENTINEL} cost_delta={cost_delta:.3e} tol={tol:.3e} stalled_evals={} cost={:.6e} |g|={g_norm:.3e}",
                     self.objective_stall_evals, eval.cost,
@@ -4848,9 +4850,8 @@ fn run_outer_with_plan(
                     // immediately hitting the line-search reject path on
                     // either block.
                     let rho_dim = layout.rho_dim();
-                    let metric_diag = ndarray::Array1::<f64>::from_shape_fn(
-                        seed_eval.gradient.len(),
-                        |i| {
+                    let metric_diag =
+                        ndarray::Array1::<f64>::from_shape_fn(seed_eval.gradient.len(), |i| {
                             let cap = if i < rho_dim {
                                 config.bfgs_step_cap
                             } else {
@@ -4861,8 +4862,7 @@ fn run_outer_with_plan(
                                 Some(c) if g_abs > c => (c / g_abs).max(1.0e-12),
                                 _ => 1.0,
                             }
-                        },
-                    );
+                        });
                     if metric_diag.iter().any(|&v| v < 1.0) {
                         let min_scale = metric_diag.iter().copied().fold(f64::INFINITY, f64::min);
                         log::info!(
@@ -4968,7 +4968,11 @@ fn run_outer_with_plan(
                         let (status, converged_flag, classification) = if grad_converged {
                             (OptimizationStatus::Converged, true, "gradient at tol")
                         } else {
-                            (OptimizationStatus::MaxIterations, false, "gradient above tol")
+                            (
+                                OptimizationStatus::MaxIterations,
+                                false,
+                                "gradient above tol",
+                            )
                         };
                         log::info!(
                             "[OUTER summary] BFGS terminated on objective stall in {} iters elapsed={:.3}s final_value={:.6e} |g|_inf={:.3e} (1+|x|_inf)*tol={:.3e} classification={} ({})",
@@ -4977,7 +4981,11 @@ fn run_outer_with_plan(
                             signal.last_cost,
                             g_inf,
                             config.tolerance * (1.0 + x_inf),
-                            if grad_converged { "Converged" } else { "MaxIterations" },
+                            if grad_converged {
+                                "Converged"
+                            } else {
+                                "MaxIterations"
+                            },
                             classification,
                         );
                         let synthesized = Solution {

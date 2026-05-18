@@ -55,12 +55,12 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
         if not rows_like:
             raise ValueError("table data cannot be empty")
         if isinstance(rows_like[0], Mapping):
-            return record_table_columns(rows_like), "records"
+            return record_table_columns(cast("list[Mapping[str, Any]]", rows_like)), "records"
         if isinstance(rows_like[0], Sequence) and not isinstance(
             rows_like[0],
             (str, bytes, bytearray),
         ):
-            return sequence_table_columns(rows_like), "rows"
+            return sequence_table_columns(cast("Sequence[Sequence[Any]]", rows_like)), "rows"
     raise TypeError(
         "unsupported table input; use pandas, pyarrow, numpy, a mapping, a list of records, or a 2D row sequence"
     )
@@ -112,35 +112,19 @@ def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
 def detect_table_kind(data: Any) -> str:
     if data is None:
         return "unknown"
-    pd: Any | None
-    try:
-        import pandas as pd
-    except ImportError:
-        pd = None
+    pd = _try_import("pandas")
     if pd is not None and isinstance(data, pd.DataFrame):
         return "pandas"
 
-    pl: Any | None
-    try:
-        import polars as pl
-    except ImportError:
-        pl = None
+    pl = _try_import("polars")
     if pl is not None and isinstance(data, pl.DataFrame):
         return "polars"
 
-    pa: Any | None
-    try:
-        import pyarrow as pa
-    except ImportError:
-        pa = None
+    pa = _try_import("pyarrow")
     if pa is not None and isinstance(data, pa.Table):
         return "pyarrow"
 
-    np: Any | None
-    try:
-        import numpy as np
-    except ImportError:
-        np = None
+    np = _try_import("numpy")
     if np is not None and isinstance(data, np.ndarray):
         return "numpy"
 

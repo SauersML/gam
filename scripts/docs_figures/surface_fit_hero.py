@@ -117,7 +117,7 @@ def render_hero() -> Path:
     x2 = np.asarray(data["x2"])
     y = np.asarray(data["y"])
 
-    model = gamfit.fit(data, "y ~ matern(x1, x2)")
+    model = gamfit.fit(data, "y ~ matern(x1, x2)", response_geometry=None)
     gx, gy, mean, se = grid_predict(model, side=140, with_se=True)
 
     # shared color scale for the data scatter and the fitted mean
@@ -184,7 +184,7 @@ def render_zoo() -> Path:
     side = 110
     surfaces: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
     for name, formula in specs:
-        m = gamfit.fit(data, formula)
+        m = gamfit.fit(data, formula, response_geometry=None)
         gx, gy, mean, _ = grid_predict(m, side=side, with_se=False)
         surfaces.append((name, gx, gy, mean))
 
