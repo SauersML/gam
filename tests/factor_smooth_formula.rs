@@ -190,7 +190,10 @@ fn factor_by_dataset(n: usize) -> EncodedDataset {
     // n rows split evenly across two levels of `fac` with `y` driven by a
     // level-dependent quadratic in `x` plus mild noise. Enough rows to fit
     // a factor-by smooth + main effect through PIRLS/REML.
-    let headers: Vec<String> = ["y", "x", "fac", "z"].iter().map(|s| s.to_string()).collect();
+    let headers: Vec<String> = ["y", "x", "fac", "z"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
             let t = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
