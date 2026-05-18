@@ -40,7 +40,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         y.view(),
         weights.view(),
         offset.view(),
-        &[dense_penalty(s)],
+        &[dense_penalty(s.clone())],
         LikelihoodFamily::GaussianIdentity,
         &FitOptions {
             latent_cloglog: None,
@@ -122,6 +122,56 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
             se_i = se[i]
         );
     }
+
+    // --- Covariance contract: Vb/Vp/Ve/F are explicitly exposed and scaled. ---
+    let dispersion = fit.dispersion().expect("dispersion should be recorded");
+    assert!(
+        dispersion.is_estimated(),
+        "Gaussian scale should be estimated"
+    );
+    assert!(dispersion.phi().is_finite() && dispersion.phi() > 0.0);
+
+    let hessian = fit
+        .penalized_hessian()
+        .expect("penalized Hessian should be available");
+    let ve = fit
+        .beta_covariance_ve()
+        .expect("frequentist covariance Ve should be available");
+    let fmat = fit
+        .coefficient_influence()
+        .expect("coefficient influence matrix F should be available");
+    assert_eq!(ve.dim(), cov.dim());
+    assert_eq!(fmat.dim(), cov.dim());
+
+    let mut weighted_penalty = s.clone();
+    weighted_penalty.mapv_inplace(|v| v * fit.lambdas[0]);
+    let mut xwx = hessian.clone();
+    xwx -= &weighted_penalty;
+    let h_inv_unscaled = cov.mapv(|v| v / dispersion.phi());
+    let ve_expected = h_inv_unscaled.dot(&xwx).dot(&h_inv_unscaled) * dispersion.phi();
+    let f_expected = h_inv_unscaled.dot(&xwx);
+    for i in 0..p {
+        for j in 0..p {
+            assert!(
+                (ve[[i, j]] - ve_expected[[i, j]]).abs() < 1e-7,
+                "Ve mismatch at ({i},{j}): got {}, expected {}",
+                ve[[i, j]],
+                ve_expected[[i, j]]
+            );
+            assert!(
+                (fmat[[i, j]] - f_expected[[i, j]]).abs() < 1e-7,
+                "F mismatch at ({i},{j}): got {}, expected {}",
+                fmat[[i, j]],
+                f_expected[[i, j]]
+            );
+        }
+    }
+    let trace_f = fmat.diag().iter().copied().sum::<f64>();
+    let edf_total = fit.edf_total().expect("edf_total should be available");
+    assert!(
+        (trace_f - edf_total).abs() < 1e-7,
+        "tr(F) should equal edf_total: trace={trace_f}, edf_total={edf_total}"
+    );
 
     let coef_ci = coefficient_uncertainty(
         &fit,
