@@ -121,16 +121,20 @@ posterior of the coefficients conditional on those estimates:
 ```python
 posterior = model.sample(train, seed=42)
 print(posterior)
-# PosteriorSamples(n_draws=1024, n_coeffs=8, method='nuts',
-#                  rhat=1.0042, ess=890.5, converged=True)
+# PosteriorSamples(n_draws=..., n_coeffs=8, method='nuts',
+#                  rhat=1.004, ess=..., converged=True)
 
 bands = posterior.predict(test, level=0.95)
 ```
 
+Defaults for `samples`, `warmup`, and `chains` are derived from the
+coefficient count — see [posterior-sampling.md](posterior-sampling.md) for
+the exact rule and how to override.
+
 NUTS is used where possible. A Gaussian Laplace fallback is used for model
 classes without exact NUTS support (location-scale survival, latent
-survival, transformation-normal, Bernoulli marginal-slope, link-wiggle).
-See [posterior-sampling.md](posterior-sampling.md).
+survival, location-scale GLMs, transformation-normal, Bernoulli
+marginal-slope). See [posterior-sampling.md](posterior-sampling.md).
 
 ## Where to go next
 
