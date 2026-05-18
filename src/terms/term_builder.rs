@@ -481,20 +481,26 @@ pub fn build_smooth_basis(
                 .get(cols[1])
                 .copied()
                 .ok_or_else(|| "column-kind lookup failed".to_string())?;
+            // Binary columns are 2-level discrete variables and are valid as
+            // the grouping factor here. We require one column to be a discrete
+            // grouping variable (Categorical or Binary) and the other to be
+            // numeric (Continuous or Binary used as 0/1).
+            let is_groupy = |k: ColumnKindTag| {
+                matches!(k, ColumnKindTag::Categorical | ColumnKindTag::Binary)
+            };
             let (group_idx, cont_idx) = match (k0, k1) {
-                (ColumnKindTag::Categorical, ColumnKindTag::Continuous | ColumnKindTag::Binary) => {
-                    (0usize, 1usize)
-                }
-                (ColumnKindTag::Continuous | ColumnKindTag::Binary, ColumnKindTag::Categorical) => {
-                    (1usize, 0usize)
-                }
+                (ColumnKindTag::Categorical, _) => (0usize, 1usize),
+                (_, ColumnKindTag::Categorical) => (1usize, 0usize),
+                (ColumnKindTag::Binary, ColumnKindTag::Continuous) => (0usize, 1usize),
+                (ColumnKindTag::Continuous, ColumnKindTag::Binary) => (1usize, 0usize),
                 _ => {
                     return Err(format!(
-                        "{} smooth requires one categorical and one numeric variable",
-                        type_opt
+                        "{} smooth requires one categorical/binary grouping variable and one numeric variable, got kinds {:?} and {:?}",
+                        type_opt, k0, k1
                     ));
                 }
             };
+            let _ = is_groupy; // silence dead-code warning when only direct matches are used
             let group_col = cols[group_idx];
             let cont_col = cols[cont_idx];
             let levels = sorted_levels_for_column(ds.values.column(group_col))?;
