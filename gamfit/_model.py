@@ -1650,7 +1650,7 @@ class Model:
             if x_name not in columns:
                 raise ValueError(f"plot column '{x_name}' is missing from the supplied data")
             x_values = coerce_numeric_vector(columns[x_name], label=x_name)
-            ordering = sorted(range(len(x_values)), key=x_values.__getitem__)
+            ordering = sorted(range(len(x_values)), key=lambda index: x_values[index])
             x_sorted = [x_values[index] for index in ordering]
             mean_sorted = [diagnostics.predicted["mean"][index] for index in ordering]
             ax.plot(x_sorted, mean_sorted, color="#1d4ed8", linewidth=2, label="mean")
