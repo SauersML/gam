@@ -3,7 +3,9 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
+use ndarray::{
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+};
 use rayon::prelude::*;
 
 const RHO_LOWER: f64 = -30.0;
@@ -797,10 +799,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             let n = problem.x.nrows();
             let p = problem.x.ncols();
             let d = problem.y.ncols();
-            let weight = gaussian_reml_weights(
-                n,
-                problem.weights.as_ref().map(|w| w.view()),
-            )?;
+            let weight = gaussian_reml_weights(n, problem.weights.as_ref().map(|w| w.view()))?;
             let inverse_hessian = if let Some(ref stacks) = batched_inverses {
                 stacks[b].clone()
             } else {
@@ -1301,48 +1300,46 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     // per-fit inverse `L_b⁻¹` is computed serially with `invert_lower_triangular`
     // — it is `O(p²)` work that does not justify a batched TRSM at typical
     // biobank `p`, but the two gemms are `O(p³)` and benefit at higher p.
-    let batched_transforms: Option<Vec<Array2<f64>>> =
-        if let Some(ref lowers) = batched_lowers {
-            let mut l_inverses = Vec::with_capacity(k);
-            let mut all_ok = true;
-            for lower in lowers.iter() {
-                match invert_lower_triangular(lower) {
-                    Ok(l_inv) => l_inverses.push(l_inv),
-                    Err(_) => {
-                        all_ok = false;
-                        break;
-                    }
+    let batched_transforms: Option<Vec<Array2<f64>>> = if let Some(ref lowers) = batched_lowers {
+        let mut l_inverses = Vec::with_capacity(k);
+        let mut all_ok = true;
+        for lower in lowers.iter() {
+            match invert_lower_triangular(lower) {
+                Ok(l_inv) => l_inverses.push(l_inv),
+                Err(_) => {
+                    all_ok = false;
+                    break;
                 }
             }
-            if !all_ok {
-                None
-            } else {
-                let mut linv_stack = Array3::<f64>::zeros((k, p, p));
-                for (b, l_inv) in l_inverses.iter().enumerate() {
-                    linv_stack.slice_mut(s![b, .., ..]).assign(l_inv);
-                }
-                if let Some(m_stack) =
-                    crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)
+        }
+        if !all_ok {
+            None
+        } else {
+            let mut linv_stack = Array3::<f64>::zeros((k, p, p));
+            for (b, l_inv) in l_inverses.iter().enumerate() {
+                linv_stack.slice_mut(s![b, .., ..]).assign(l_inv);
+            }
+            if let Some(m_stack) =
+                crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)
+            {
+                if let Some(t_stack) =
+                    crate::gpu::try_fast_abt_strided_batched(m_stack.view(), linv_stack.view())
                 {
-                    if let Some(t_stack) = crate::gpu::try_fast_abt_strided_batched(
-                        m_stack.view(),
-                        linv_stack.view(),
-                    ) {
-                        let mut out = Vec::with_capacity(k);
-                        for b in 0..k {
-                            out.push(t_stack.slice(s![b, .., ..]).to_owned());
-                        }
-                        Some(out)
-                    } else {
-                        None
+                    let mut out = Vec::with_capacity(k);
+                    for b in 0..k {
+                        out.push(t_stack.slice(s![b, .., ..]).to_owned());
                     }
+                    Some(out)
                 } else {
                     None
                 }
+            } else {
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     let mut results = Vec::with_capacity(k);
     for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
