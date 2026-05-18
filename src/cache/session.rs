@@ -114,12 +114,7 @@ impl Session {
 
     /// Persist the end-of-fit result, promoting this session's slot to
     /// `EntryKind::Final`. Bypasses the rate limit.
-    pub fn finalize(
-        &self,
-        payload: &[u8],
-        objective: Option<f64>,
-        iteration: Option<u64>,
-    ) -> bool {
+    pub fn finalize(&self, payload: &[u8], objective: Option<f64>, iteration: Option<u64>) -> bool {
         self.store
             .save_overwrite(
                 &self.key,

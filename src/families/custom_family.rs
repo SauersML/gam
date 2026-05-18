@@ -2308,7 +2308,11 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
         Some(key),
         Some(ConstrainedWarmStart {
             rho: Array1::from_vec(record.rho),
-            block_beta: record.block_beta.into_iter().map(Array1::from_vec).collect(),
+            block_beta: record
+                .block_beta
+                .into_iter()
+                .map(Array1::from_vec)
+                .collect(),
             active_sets,
             cached_inner: None,
         }),
@@ -2334,12 +2338,8 @@ fn store_persistent_custom_family_warm_start(
     {
         return;
     }
-    let mut record = PersistentBlockWarmStartRecord::new(
-        key.to_string(),
-        n_rows,
-        block_names,
-        block_dims,
-    );
+    let mut record =
+        PersistentBlockWarmStartRecord::new(key.to_string(), n_rows, block_names, block_dims);
     record.updated_unix_secs = record.created_unix_secs;
     record.rho = warm_start.rho.to_vec();
     record.block_beta = warm_start
