@@ -1957,6 +1957,7 @@ fn evaluate_reml_parts(
         cost += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
         grad += 0.5 * nu * dp_grad / dp;
         hess += 0.5 * nu * (dp_hess / dp - (dp_grad * dp_grad) / (dp * dp));
+        eprintln!("[CF] rho={rho:.6} lam={lambda:.6e} dp={dp:.6e} cost={cost:.6} grad={grad:.6e}");
     }
     ObjectiveEval {
         cost,
