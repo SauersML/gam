@@ -24,8 +24,9 @@ pub struct GpuDeviceInfo {
     /// Device core clock in kHz, as reported by the CUDA driver.
     pub clock_rate_khz: i32,
     /// Ratio of single-precision to double-precision throughput reported by
-    /// `CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO`.
-    pub single_to_double_precision_perf_ratio: i32,
+    /// `CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO`, when the
+    /// installed CUDA driver exposes it.
+    pub single_to_double_precision_perf_ratio: Option<i32>,
     pub total_memory_bytes: usize,
 }
 
@@ -42,7 +43,10 @@ impl GpuDeviceInfo {
         let threads_per_sm = self.max_threads_per_multiprocessor.max(1) as f64;
         let clock_ghz = (self.clock_rate_khz.max(1) as f64) / 1_000_000.0;
         let muladd_flops = 2.0_f64;
-        let fp64_ratio = self.single_to_double_precision_perf_ratio.max(1) as f64;
+        let fp64_ratio = self
+            .single_to_double_precision_perf_ratio
+            .unwrap_or(32)
+            .max(1) as f64;
         sm_count * threads_per_sm * clock_ghz * muladd_flops / fp64_ratio
     }
 
@@ -67,7 +71,6 @@ impl GpuDeviceInfo {
             half
         }
     }
-
 }
 
 impl fmt::Display for GpuDeviceInfo {
@@ -98,7 +101,7 @@ mod tests {
             sm_count: sms,
             max_threads_per_multiprocessor: 2048,
             clock_rate_khz: 1_500_000,
-            single_to_double_precision_perf_ratio: 32,
+            single_to_double_precision_perf_ratio: Some(32),
             total_memory_bytes: mem_gib * 1024 * 1024 * 1024,
         }
     }
@@ -111,11 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn hopper_per_sm_throughput_exceeds_ampere() {
+    fn lower_fp64_ratio_increases_per_sm_throughput() {
         let mut smaller = make(8, 108, 80);
         let mut larger = make(9, 132, 80);
-        smaller.single_to_double_precision_perf_ratio = 2;
-        larger.single_to_double_precision_perf_ratio = 1;
+        smaller.single_to_double_precision_perf_ratio = Some(2);
+        larger.single_to_double_precision_perf_ratio = Some(1);
         assert!(larger.peak_fp64_gflops() / smaller.peak_fp64_gflops() > 2.0);
     }
 
@@ -129,9 +132,9 @@ mod tests {
     #[test]
     fn driver_reported_fp64_ratio_controls_throughput_estimate() {
         let mut low_ratio = make(8, 80, 16);
-        low_ratio.single_to_double_precision_perf_ratio = 2;
+        low_ratio.single_to_double_precision_perf_ratio = Some(2);
         let mut high_ratio = make(8, 80, 16);
-        high_ratio.single_to_double_precision_perf_ratio = 64;
+        high_ratio.single_to_double_precision_perf_ratio = Some(64);
         assert!(low_ratio.peak_fp64_gflops() > high_ratio.peak_fp64_gflops() * 10.0);
     }
 }
