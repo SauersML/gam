@@ -625,21 +625,30 @@ fn survival_unified_fit_result(
     .map_err(|err| err.to_string())
 }
 
-fn hash_workflow_array_view(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView1<'_, f64>) {
+fn hash_workflow_array_view(
+    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    array: ArrayView1<'_, f64>,
+) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_f64(value);
     }
 }
 
-fn hash_workflow_u8_array(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView1<'_, u8>) {
+fn hash_workflow_u8_array(
+    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    array: ArrayView1<'_, u8>,
+) {
     hasher.write_usize(array.len());
     for &value in array {
         hasher.write_usize(usize::from(value));
     }
 }
 
-fn hash_workflow_array2(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView2<'_, f64>) {
+fn hash_workflow_array2(
+    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    array: ArrayView2<'_, f64>,
+) {
     hasher.write_usize(array.nrows());
     hasher.write_usize(array.ncols());
     for row in array.rows() {
@@ -812,14 +821,16 @@ fn store_survival_transformation_persistent_warm_start(
         summary.status,
         crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
     );
-    record.last_pirls_lm_lambda =
-        (summary.final_lm_lambda.is_finite() && summary.final_lm_lambda > 0.0)
-            .then_some(summary.final_lm_lambda);
+    record.last_pirls_lm_lambda = (summary.final_lm_lambda.is_finite()
+        && summary.final_lm_lambda > 0.0)
+        .then_some(summary.final_lm_lambda);
     record.last_pirls_accept_rho = summary
         .final_accept_rho
         .filter(|value| value.is_finite() && *value >= 0.0);
     if let Err(err) = crate::solver::persistent_warm_start::store_record(&record) {
-        log::warn!("[warm-start-cache] failed to persist survival transformation warm start: {err}");
+        log::warn!(
+            "[warm-start-cache] failed to persist survival transformation warm start: {err}"
+        );
     }
 }
 
