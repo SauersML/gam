@@ -34,6 +34,13 @@ fn fixture() -> (Array2<f64>, Array1<f64>, Array2<f64>) {
     let p = 5usize;
     let mut x = Array2::<f64>::zeros((n, p));
     let mut y = Array1::<f64>::zeros(n);
+    // A deterministic but spectrally rich noise term ensures REML has an
+    // interior optimum (RSS > 0 → σ̂² > 0 → cost bounded below). Without it,
+    // the cost is monotone-decreasing in -ρ and both optimizers hit different
+    // numerical floors at the boundary: the closed-form falls back to the
+    // RHO_LOWER candidate while the unified Newton solver plateaus where
+    // smooth_floor_dp flattens the gradient, producing artificially mismatched
+    // REML scores in a regime where the analytic optimum is undefined.
     for i in 0..n {
         let t = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
         x[[i, 0]] = 1.0;
@@ -41,7 +48,11 @@ fn fixture() -> (Array2<f64>, Array1<f64>, Array2<f64>) {
         x[[i, 2]] = t * t;
         x[[i, 3]] = (3.0 * t).sin();
         x[[i, 4]] = (5.0 * t).cos();
-        y[i] = 0.4 + 0.8 * t - 0.25 * t * t + 0.35 * (3.0 * t).sin();
+        let noise = 0.05
+            * (((i as f64) * 0.913).sin()
+                + ((i as f64) * 1.731).cos()
+                + 0.5 * (((i as f64) * 0.317).sin() * ((i as f64) * 0.589).cos()));
+        y[i] = 0.4 + 0.8 * t - 0.25 * t * t + 0.35 * (3.0 * t).sin() + noise;
     }
     let mut s = Array2::<f64>::zeros((p, p));
     for j in 0..p {
