@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import typing
+from typing import TYPE_CHECKING
 import argparse
 from collections import deque
 import importlib
@@ -77,9 +78,14 @@ for _k, _v in _SERIAL_ENV_OVERRIDES.items():
 
 # numpy and pandas are loaded via importlib (not `import ... as ...`) because
 # threading env vars above must take effect before these C extensions initialise
-# their BLAS/OpenMP pools at import time.
-np = importlib.import_module("numpy")
-pd = importlib.import_module("pandas")
+# their BLAS/OpenMP pools at import time. Static analyzers still need to see the
+# regular import so type annotations like ``pd.DataFrame`` resolve.
+if TYPE_CHECKING:
+    import numpy as np
+    import pandas as pd
+else:
+    np = importlib.import_module("numpy")
+    pd = importlib.import_module("pandas")
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench"
