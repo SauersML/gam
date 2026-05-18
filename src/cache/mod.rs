@@ -3,7 +3,8 @@
 //! Persists periodic checkpoints of in-progress fits so a subsequent run
 //! (possibly after a SIGKILL or weeks later) auto-resumes from the
 //! best-known iterate. Keyed on a SHA-256 fingerprint of the data + fit
-//! spec, so re-fitting the same model on the same data magically warm-starts.
+//! spec, so re-fitting the same model on the same data reuses the matching
+//! persisted warm-start entry.
 //!
 //! Layout under `dirs::cache_dir()/gam/warm/v1/`:
 //!

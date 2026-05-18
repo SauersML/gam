@@ -135,14 +135,12 @@ def inverse_alr(coords: Any, *, reference: int = -1) -> Any:
     Tensor inputs stay in torch and preserve autograd.
     """
     if _is_tensor(coords):
-        import torch
-
         z = _as_float_tensor(coords)
         if z.dim() != 2:
             raise ValueError("ALR coordinates must be a 2-D numeric array")
         d = z.shape[1] + 1
         keep = _keep_without_reference(d, reference)
-        log_parts = torch.zeros((z.shape[0], d), dtype=z.dtype, device=z.device)
+        log_parts = _tc.zeros((z.shape[0], d), dtype=z.dtype, device=z.device)
         log_parts[:, keep] = z
         log_parts = log_parts - log_parts.max(dim=1, keepdim=True).values
         parts = log_parts.exp()
@@ -262,7 +260,7 @@ def sphere_frechet_mean(
         w = _normalized_weights_tensor(y.shape[0], weights, y)
         mu = (y * w[:, None]).sum(dim=0)
         norm = torch.linalg.norm(mu)
-        mu = torch.where(norm <= 1e-14, y[0], mu / norm.clamp_min(1e-300))
+        mu = _tc.where(norm <= 1e-14, y[0], mu / norm.clamp_min(1e-300))
         for _ in range(max_iter):
             logs = sphere_log_map(y, mu)
             step = (logs * w[:, None]).sum(dim=0)
@@ -286,19 +284,17 @@ def sphere_log_map(values: Any, base: Any) -> Any:
     Tensor inputs stay in torch and preserve autograd.
     """
     if _is_tensor(values):
-        import torch
-
         y = _normalize_sphere_tensor(values)
         b = _normalize_sphere_tensor(_as_float_tensor(base, y).reshape(1, -1), ref=y)[0]
         dots = (y @ b).clamp(-1.0, 1.0)
         theta = dots.acos()
         tangent = y - dots[:, None] * b.reshape(1, -1)
         sin_theta = theta.sin()
-        scale = torch.ones_like(theta)
+        scale = _tc.ones_like(theta)
         mask = sin_theta > 1e-12
-        scale = torch.where(mask, theta / sin_theta.clamp_min(1e-300), scale)
+        scale = _tc.where(mask, theta / sin_theta.clamp_min(1e-300), scale)
         out = tangent * scale[:, None]
-        return torch.where((theta < 1e-12)[:, None], torch.zeros_like(out), out)
+        return _tc.where((theta < 1e-12)[:, None], _tc.zeros_like(out), out)
     out = _np_geom.sphere_log_map(to_numpy_f64(values), to_numpy_f64(base))
     return out
 
@@ -321,7 +317,7 @@ def sphere_exp_map(tangent: Any, base: Any) -> Any:
         scaled = (r.sin() / r.clamp_min(1e-300))[:, None] * z
         curved = r.cos()[:, None] * b.reshape(1, -1) + scaled
         linear = b.reshape(1, -1) + z
-        out = torch.where(small[:, None], linear, curved)
+        out = _tc.where(small[:, None], linear, curved)
         return out / torch.linalg.norm(out, dim=1, keepdim=True)
     out = _np_geom.sphere_exp_map(to_numpy_f64(tangent), to_numpy_f64(base))
     return out
