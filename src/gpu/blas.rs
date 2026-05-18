@@ -49,6 +49,70 @@ pub fn try_fast_atb_strided_batched(
     try_fast_gemm_strided_batched(a, b, true, false)
 }
 
+/// Strided batched `A · Bᵀ`. Mirrors [`try_fast_ab_strided_batched`] but
+/// transposes B on the device per batch.
+#[inline]
+pub fn try_fast_abt_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+) -> Option<Array3<f64>> {
+    try_fast_gemm_strided_batched(a, b, false, true)
+}
+
+/// Strided batched `A[b] · B` with `B` broadcast (same matrix for every batch
+/// element). Uses `cublasDgemmStridedBatched` with `strideB = 0` so the
+/// device-side B buffer is uploaded once. Designed for the K-way whitened-
+/// penalty step `L_b⁻¹ · S` of the batched REML cache build, where every
+/// problem shares the same penalty matrix S. Returns `None` when the policy
+/// declines or any device call fails.
+#[inline]
+pub fn try_fast_ab_broadcast_b_batched(
+    a: ArrayView3<'_, f64>,
+    b: ndarray::ArrayView2<'_, f64>,
+) -> Option<Array3<f64>> {
+    let (batch, a_rows, a_cols) = a.dim();
+    let (b_rows, b_cols) = b.dim();
+    if batch == 0 {
+        return None;
+    }
+    let m = a_rows;
+    let k = a_cols;
+    let n = b_cols;
+    if k != b_rows || m == 0 || n == 0 || k == 0 {
+        return None;
+    }
+    if !route_gemm(m, n, k) {
+        return None;
+    }
+    with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false))
+}
+
+/// Strided batched `A · B[b]ᵀ` with `A` broadcast. Mirrors
+/// [`try_fast_ab_broadcast_b_batched`] for the symmetric `S · L_b⁻ᵀ` step
+/// that follows the first whitening multiply in `L_b⁻¹ · S · L_b⁻ᵀ`.
+#[inline]
+pub fn try_fast_a_broadcast_bt_batched(
+    a: ndarray::ArrayView2<'_, f64>,
+    b: ArrayView3<'_, f64>,
+) -> Option<Array3<f64>> {
+    let (a_rows, a_cols) = a.dim();
+    let (batch, b_rows, b_cols) = b.dim();
+    if batch == 0 {
+        return None;
+    }
+    // Compute A @ B[b]^T: result is (a_rows × b_rows).
+    let m = a_rows;
+    let k = a_cols;
+    let n = b_rows;
+    if k != b_cols || m == 0 || n == 0 || k == 0 {
+        return None;
+    }
+    if !route_gemm(m, n, k) {
+        return None;
+    }
+    with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true))
+}
+
 #[inline]
 fn try_fast_gemm_strided_batched(
     a: ArrayView3<'_, f64>,
@@ -548,6 +612,193 @@ impl CublasRuntime {
         }
 
         // Unpack column-major slabs back into row-major Array3.
+        let mut out = Array3::<f64>::zeros((batch, m, n));
+        for batch_idx in 0..batch {
+            let start = batch_idx * c_stride;
+            let mut dest = out.slice_mut(s![batch_idx, .., ..]);
+            for col in 0..n {
+                for row in 0..m {
+                    dest[[row, col]] = c_host[start + col * m + row];
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Variant of [`gemm_strided_batched`] that broadcasts `B` (a single
+    /// matrix) over all K batch elements of `A`. cuBLAS sees `strideB = 0`
+    /// so the B buffer is uploaded exactly once.
+    fn gemm_broadcast_b_strided_batched(
+        &mut self,
+        a: ArrayView3<'_, f64>,
+        b: ndarray::ArrayView2<'_, f64>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Option<Array3<f64>> {
+        let (batch, a_rows, a_cols) = a.dim();
+        let (b_rows, b_cols) = b.dim();
+        let m = if transpose_a { a_cols } else { a_rows };
+        let k = if transpose_a { a_rows } else { a_cols };
+        let b_k = if transpose_b { b_cols } else { b_rows };
+        let n = if transpose_b { b_rows } else { b_cols };
+        if k != b_k {
+            return None;
+        }
+        let a_stride = a_rows.checked_mul(a_cols)?;
+        let c_stride = m.checked_mul(n)?;
+        let a_total = batch.checked_mul(a_stride)?;
+        let b_total = b_rows.checked_mul(b_cols)?;
+        let c_total = batch.checked_mul(c_stride)?;
+
+        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
+        for batch_idx in 0..batch {
+            let slice = a.slice(s![batch_idx, .., ..]);
+            for col in 0..a_cols {
+                for row in 0..a_rows {
+                    a_host.push(slice[[row, col]]);
+                }
+            }
+        }
+        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
+        for col in 0..b_cols {
+            for row in 0..b_rows {
+                b_host.push(b[[row, col]]);
+            }
+        }
+        let mut c_host: Vec<f64> = vec![0.0; c_total];
+        let bytes_a = bytes_len::<f64>(a_host.len())?;
+        let bytes_b = bytes_len::<f64>(b_host.len())?;
+        let bytes_c = bytes_len::<f64>(c_host.len())?;
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
+            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
+            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
+            let alpha = 1.0_f64;
+            let beta = 0.0_f64;
+            let status = (self.blas.cublas_dgemm_strided_batched)(
+                self.handle,
+                cublas_op(transpose_a),
+                cublas_op(transpose_b),
+                to_i32(m)?,
+                to_i32(n)?,
+                to_i32(k)?,
+                &alpha,
+                a_dev.ptr,
+                to_i32(a_rows)?,
+                to_i64(a_stride)?,
+                b_dev.ptr,
+                to_i32(b_rows)?,
+                0_i64, // strideB = 0 => broadcast B across K batches
+                &beta,
+                c_dev.ptr,
+                to_i32(m)?,
+                to_i64(c_stride)?,
+                to_i32(batch)?,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
+                "cuMemcpyDtoH broadcast-B strided batched C",
+            )
+            .ok()?;
+        }
+        let mut out = Array3::<f64>::zeros((batch, m, n));
+        for batch_idx in 0..batch {
+            let start = batch_idx * c_stride;
+            let mut dest = out.slice_mut(s![batch_idx, .., ..]);
+            for col in 0..n {
+                for row in 0..m {
+                    dest[[row, col]] = c_host[start + col * m + row];
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Mirror of [`gemm_broadcast_b_strided_batched`] for the symmetric
+    /// step where `A` is broadcast and `B` is strided per batch.
+    fn broadcast_a_gemm_strided_batched(
+        &mut self,
+        a: ndarray::ArrayView2<'_, f64>,
+        b: ArrayView3<'_, f64>,
+        transpose_a: bool,
+        transpose_b: bool,
+    ) -> Option<Array3<f64>> {
+        let (a_rows, a_cols) = a.dim();
+        let (batch, b_rows, b_cols) = b.dim();
+        let m = if transpose_a { a_cols } else { a_rows };
+        let k = if transpose_a { a_rows } else { a_cols };
+        let b_k = if transpose_b { b_cols } else { b_rows };
+        let n = if transpose_b { b_rows } else { b_cols };
+        if k != b_k {
+            return None;
+        }
+        let b_stride = b_rows.checked_mul(b_cols)?;
+        let c_stride = m.checked_mul(n)?;
+        let a_total = a_rows.checked_mul(a_cols)?;
+        let b_total = batch.checked_mul(b_stride)?;
+        let c_total = batch.checked_mul(c_stride)?;
+
+        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
+        for col in 0..a_cols {
+            for row in 0..a_rows {
+                a_host.push(a[[row, col]]);
+            }
+        }
+        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
+        for batch_idx in 0..batch {
+            let slice = b.slice(s![batch_idx, .., ..]);
+            for col in 0..b_cols {
+                for row in 0..b_rows {
+                    b_host.push(slice[[row, col]]);
+                }
+            }
+        }
+        let mut c_host: Vec<f64> = vec![0.0; c_total];
+        let bytes_a = bytes_len::<f64>(a_host.len())?;
+        let bytes_b = bytes_len::<f64>(b_host.len())?;
+        let bytes_c = bytes_len::<f64>(c_host.len())?;
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
+            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
+            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
+            let alpha = 1.0_f64;
+            let beta = 0.0_f64;
+            let status = (self.blas.cublas_dgemm_strided_batched)(
+                self.handle,
+                cublas_op(transpose_a),
+                cublas_op(transpose_b),
+                to_i32(m)?,
+                to_i32(n)?,
+                to_i32(k)?,
+                &alpha,
+                a_dev.ptr,
+                to_i32(a_rows)?,
+                0_i64, // strideA = 0 => broadcast A across K batches
+                b_dev.ptr,
+                to_i32(b_rows)?,
+                to_i64(b_stride)?,
+                &beta,
+                c_dev.ptr,
+                to_i32(m)?,
+                to_i64(c_stride)?,
+                to_i32(batch)?,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
+                "cuMemcpyDtoH broadcast-A strided batched C",
+            )
+            .ok()?;
+        }
         let mut out = Array3::<f64>::zeros((batch, m, n));
         for batch_idx in 0..batch {
             let start = batch_idx * c_stride;
