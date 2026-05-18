@@ -625,6 +625,204 @@ fn survival_unified_fit_result(
     .map_err(|err| err.to_string())
 }
 
+fn hash_workflow_array_view(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView1<'_, f64>) {
+    hasher.write_usize(array.len());
+    for &value in array {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_workflow_u8_array(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView1<'_, u8>) {
+    hasher.write_usize(array.len());
+    for &value in array {
+        hasher.write_usize(usize::from(value));
+    }
+}
+
+fn hash_workflow_array2(hasher: &mut crate::solver::persistent_warm_start::StableHasher, array: ArrayView2<'_, f64>) {
+    hasher.write_usize(array.nrows());
+    hasher.write_usize(array.ncols());
+    for row in array.rows() {
+        for &value in row {
+            hasher.write_f64(value);
+        }
+    }
+}
+
+fn hash_workflow_design_matrix(
+    hasher: &mut crate::solver::persistent_warm_start::StableHasher,
+    matrix: &crate::matrix::DesignMatrix,
+) {
+    let dense = matrix.to_dense();
+    hash_workflow_array2(hasher, dense.view());
+}
+
+fn survival_transformation_log_lambdas(
+    penalty_blocks: &[crate::survival::PenaltyBlock],
+) -> Vec<f64> {
+    penalty_blocks
+        .iter()
+        .map(|block| block.lambda.max(1e-300).ln())
+        .collect()
+}
+
+fn persistent_survival_transformation_key(
+    spec: &SurvivalTransformationTermSpec,
+    baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
+    dense_cov_design: ArrayView2<'_, f64>,
+    prepared: &PreparedWorkflowSurvivalTimeStack,
+    penalty_blocks: &[crate::survival::PenaltyBlock],
+    opts: &crate::pirls::WorkingModelPirlsOptions,
+    n_cols: usize,
+) -> String {
+    let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
+    hasher.write_str("gamfit-persistent-survival-transformation-working-pirls");
+    hasher.write_str(env!("CARGO_PKG_VERSION"));
+    hasher.write_str(&format!("{:?}", spec.likelihood_mode));
+    hasher.write_f64(spec.time_anchor);
+    hasher.write_f64(spec.ridge_lambda);
+    hasher.write_str(&format!("{:?}", baseline_cfg.target));
+    for value in [
+        baseline_cfg.scale,
+        baseline_cfg.shape,
+        baseline_cfg.rate,
+        baseline_cfg.makeham,
+    ] {
+        hasher.write_bool(value.is_some());
+        if let Some(value) = value {
+            hasher.write_f64(value);
+        }
+    }
+    hasher.write_str(&spec.time_build.basisname);
+    hasher.write_usize(spec.time_build.x_entry_time.nrows());
+    hasher.write_usize(spec.time_build.x_entry_time.ncols());
+    hasher.write_usize(spec.time_build.x_exit_time.nrows());
+    hasher.write_usize(spec.time_build.x_exit_time.ncols());
+    hasher.write_usize(spec.time_build.x_derivative_time.nrows());
+    hasher.write_usize(spec.time_build.x_derivative_time.ncols());
+    hasher.write_bool(spec.time_build.degree.is_some());
+    if let Some(degree) = spec.time_build.degree {
+        hasher.write_usize(degree);
+    }
+    match spec.time_build.knots.as_ref() {
+        Some(knots) => {
+            hasher.write_bool(true);
+            hasher.write_usize(knots.len());
+            for &knot in knots {
+                hasher.write_f64(knot);
+            }
+        }
+        None => hasher.write_bool(false),
+    }
+    match spec.time_build.keep_cols.as_ref() {
+        Some(cols) => {
+            hasher.write_bool(true);
+            hasher.write_usize(cols.len());
+            for &col in cols {
+                hasher.write_usize(col);
+            }
+        }
+        None => hasher.write_bool(false),
+    }
+    hasher.write_bool(spec.time_build.smooth_lambda.is_some());
+    if let Some(lambda) = spec.time_build.smooth_lambda {
+        hasher.write_f64(lambda);
+    }
+    hasher.write_usize(n_cols);
+    hash_workflow_array_view(&mut hasher, spec.age_entry.view());
+    hash_workflow_array_view(&mut hasher, spec.age_exit.view());
+    hash_workflow_u8_array(&mut hasher, spec.event_target.view());
+    hash_workflow_array_view(&mut hasher, spec.weights.view());
+    hash_workflow_array_view(&mut hasher, spec.covariate_offset.view());
+    hash_workflow_array2(&mut hasher, dense_cov_design);
+    hash_workflow_array_view(&mut hasher, prepared.eta_offset_entry.view());
+    hash_workflow_array_view(&mut hasher, prepared.eta_offset_exit.view());
+    hash_workflow_array_view(&mut hasher, prepared.derivative_offset_exit.view());
+    hash_workflow_design_matrix(&mut hasher, &prepared.time_design_entry);
+    hash_workflow_design_matrix(&mut hasher, &prepared.time_design_exit);
+    hash_workflow_design_matrix(&mut hasher, &prepared.time_design_derivative);
+    hasher.write_usize(penalty_blocks.len());
+    for block in penalty_blocks {
+        hasher.write_f64(block.lambda);
+        hasher.write_usize(block.range.start);
+        hasher.write_usize(block.range.end);
+        hasher.write_usize(block.nullspace_dim);
+        hash_workflow_array2(&mut hasher, block.matrix.view());
+    }
+    hasher.write_usize(opts.max_iterations);
+    hasher.write_f64(opts.convergence_tolerance);
+    hasher.write_usize(opts.max_step_halving);
+    hasher.write_f64(opts.min_step_size);
+    hasher.write_bool(opts.firth_bias_reduction);
+    hasher.write_bool(opts.coefficient_lower_bounds.is_some());
+    if let Some(bounds) = opts.coefficient_lower_bounds.as_ref() {
+        hash_workflow_array_view(&mut hasher, bounds.view());
+    }
+    hasher.write_bool(opts.linear_constraints.is_some());
+    format!("surv-transform-{}", hasher.finish_hex())
+}
+
+fn load_survival_transformation_persistent_warm_start(
+    key: &str,
+    spec: &SurvivalTransformationTermSpec,
+    n_cols: usize,
+    rho: &[f64],
+) -> Option<(Array1<f64>, Option<f64>)> {
+    let record = crate::solver::persistent_warm_start::load_record(key)?;
+    if !record.is_compatible(key, spec.age_entry.len(), n_cols)
+        || record.rho.len() != rho.len()
+        || !record
+            .rho
+            .iter()
+            .zip(rho.iter())
+            .all(|(cached, expected)| (*cached - *expected).abs() <= 1e-10)
+    {
+        return None;
+    }
+    log::info!("[warm-start-cache] restored survival transformation warm start key={key}");
+    let lm_lambda = record
+        .last_pirls_lm_lambda
+        .filter(|value| value.is_finite() && *value > 0.0);
+    Some((Array1::from_vec(record.beta), lm_lambda))
+}
+
+fn store_survival_transformation_persistent_warm_start(
+    key: &str,
+    spec: &SurvivalTransformationTermSpec,
+    n_cols: usize,
+    rho: Vec<f64>,
+    beta: &Array1<f64>,
+    summary: &crate::pirls::WorkingModelPirlsResult,
+) {
+    if beta.len() != n_cols
+        || beta.iter().any(|value| !value.is_finite())
+        || rho.iter().any(|value| !value.is_finite())
+    {
+        return;
+    }
+    let mut record = crate::solver::persistent_warm_start::PersistentWarmStartRecord::new(
+        key.to_string(),
+        spec.age_entry.len(),
+        n_cols,
+    );
+    record.rho = rho;
+    record.beta = beta.to_vec();
+    record.last_inner_iters = summary.iterations;
+    record.last_inner_converged = matches!(
+        summary.status,
+        crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
+    );
+    record.last_pirls_lm_lambda =
+        (summary.final_lm_lambda.is_finite() && summary.final_lm_lambda > 0.0)
+            .then_some(summary.final_lm_lambda);
+    record.last_pirls_accept_rho = summary
+        .final_accept_rho
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    if let Err(err) = crate::solver::persistent_warm_start::store_record(&record) {
+        log::warn!("[warm-start-cache] failed to persist survival transformation warm start: {err}");
+    }
+}
+
 fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
 ) -> Result<SurvivalTransformationFitResult, String> {
@@ -804,9 +1002,32 @@ fn fit_survival_transformation_model(
         linear_constraints: None,
         initial_lm_lambda: None,
     };
+    let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks);
+    let persistent_warm_start_key = persistent_survival_transformation_key(
+        &spec,
+        &baseline_cfg,
+        dense_cov_design.view(),
+        &prepared,
+        &penalty_blocks,
+        &opts,
+        beta0.len(),
+    );
+    let mut opts = opts;
+    let beta_start = match load_survival_transformation_persistent_warm_start(
+        &persistent_warm_start_key,
+        &spec,
+        beta0.len(),
+        &rho_for_cache,
+    ) {
+        Some((beta, lm_lambda)) => {
+            opts.initial_lm_lambda = lm_lambda;
+            beta
+        }
+        None => beta0,
+    };
     let summary = crate::pirls::runworking_model_pirls(
         &mut model,
-        crate::types::Coefficients::new(beta0),
+        crate::types::Coefficients::new(beta_start),
         &opts,
         |_| {},
     )
@@ -822,6 +1043,14 @@ fn fit_survival_transformation_model(
         }
     }
     let beta = summary.beta.as_ref().to_owned();
+    store_survival_transformation_persistent_warm_start(
+        &persistent_warm_start_key,
+        &spec,
+        beta.len(),
+        rho_for_cache,
+        &beta,
+        &summary,
+    );
     let state = model
         .update_state(&beta)
         .map_err(|err| format!("failed to evaluate survival optimum: {err}"))?;

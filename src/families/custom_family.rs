@@ -2302,20 +2302,7 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
     if !record.is_compatible(&key, n_rows, &block_names, &block_dims, rho_len) {
         return (Some(key), None);
     }
-    let active_sets = record
-        .active_sets
-        .into_iter()
-        .zip(block_dims.iter().copied())
-        .map(|(active, dim)| {
-            active.and_then(|rows| {
-                if rows.iter().all(|&idx| idx < dim) {
-                    Some(rows)
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+    let active_sets = normalize_active_sets(record.active_sets);
     log::info!("[warm-start-cache] restored custom-family persistent warm start key={key}");
     (
         Some(key),
@@ -16323,7 +16310,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                     } =>
             {
-                outer.warm_cache = Some(eval.warm_start.clone());
+                let warm_start = eval.warm_start.clone();
+                outer.warm_cache = Some(warm_start.clone());
+                store_persistent_custom_family_warm_start(
+                    persistent_warm_start_key.as_deref(),
+                    specs,
+                    &warm_start,
+                );
                 outer.last_error = None;
                 eval
             }
@@ -16367,7 +16360,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 EvalMode::ValueOnly,
             ) {
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
-                    outer.warm_cache = Some(eval.warm_start);
+                    let warm_start = eval.warm_start;
+                    store_persistent_custom_family_warm_start(
+                        persistent_warm_start_key.as_deref(),
+                        specs,
+                        &warm_start,
+                    );
+                    outer.warm_cache = Some(warm_start);
                     outer.last_error = None;
                     Ok(eval.objective)
                 }
@@ -16416,6 +16415,11 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 warm_ref,
             ) {
                 Ok((eval, warm, true)) => {
+                    store_persistent_custom_family_warm_start(
+                        persistent_warm_start_key.as_deref(),
+                        specs,
+                        &warm,
+                    );
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
                     Ok(eval)
