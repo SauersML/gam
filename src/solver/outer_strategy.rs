@@ -13,6 +13,7 @@
 //! falls back to BFGS or an EFS variant instead of synthesizing second-order
 //! curvature numerically.
 
+use crate::cache::Session as CacheSession;
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
@@ -1631,6 +1632,121 @@ pub trait OuterObjective {
 
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
+}
+
+// ─── Persistent warm-start checkpoint plumbing ────────────────────────
+//
+// `CheckpointingObjective` wraps any `OuterObjective` to write a copy of
+// `(rho, cost, eval_id)` to disk on each finite evaluation. The on-disk
+// [`crate::cache::Session`] rate-limits writes (≥2 s gap unless this iterate
+// strictly improves on the best-so-far) so a tight inner loop never thrashes
+// the filesystem. A subsequent run that opens a `Session` against the same
+// fingerprint reads the best-so-far iterate back and seeds the optimizer
+// from there — that is the whole resume-after-crash mechanism.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IteratePayload {
+    /// Bump on incompatible payload changes; decode rejects mismatches.
+    schema: u32,
+    rho: Vec<f64>,
+    cost: f64,
+    eval_id: u64,
+}
+
+const ITERATE_PAYLOAD_SCHEMA: u32 = 1;
+
+fn encode_iterate(rho: &Array1<f64>, cost: f64, eval_id: u64) -> Option<Vec<u8>> {
+    let p = IteratePayload {
+        schema: ITERATE_PAYLOAD_SCHEMA,
+        rho: rho.to_vec(),
+        cost,
+        eval_id,
+    };
+    serde_json::to_vec(&p).ok()
+}
+
+fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayload> {
+    let p: IteratePayload = serde_json::from_slice(bytes).ok()?;
+    if p.schema != ITERATE_PAYLOAD_SCHEMA {
+        return None;
+    }
+    if p.rho.len() != expected_rho_dim {
+        return None;
+    }
+    if !p.rho.iter().all(|x| x.is_finite()) || !p.cost.is_finite() {
+        return None;
+    }
+    Some(p)
+}
+
+struct CheckpointingObjective<'a> {
+    inner: &'a mut dyn OuterObjective,
+    session: Arc<CacheSession>,
+    eval_counter: AtomicU64,
+}
+
+impl<'a> CheckpointingObjective<'a> {
+    fn new(inner: &'a mut dyn OuterObjective, session: Arc<CacheSession>) -> Self {
+        Self {
+            inner,
+            session,
+            eval_counter: AtomicU64::new(0),
+        }
+    }
+
+    fn note(&self, rho: &Array1<f64>, cost: f64) {
+        if !cost.is_finite() {
+            return;
+        }
+        let i = self.eval_counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(bytes) = encode_iterate(rho, cost, i) {
+            self.session.checkpoint(&bytes, Some(cost), Some(i));
+        }
+    }
+}
+
+impl<'a> OuterObjective for CheckpointingObjective<'a> {
+    fn capability(&self) -> OuterCapability {
+        self.inner.capability()
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        let v = self.inner.eval_cost(rho)?;
+        self.note(rho, v);
+        Ok(v)
+    }
+
+    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        // Screening proxies run at sub-converged β̂ and aren't a meaningful
+        // best-so-far signal; forward without persisting.
+        self.inner.eval_screening_proxy(rho)
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        let r = self.inner.eval(rho)?;
+        self.note(rho, r.cost);
+        Ok(r)
+    }
+
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        let r = self.inner.eval_with_order(rho, order)?;
+        self.note(rho, r.cost);
+        Ok(r)
+    }
+
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        let r = self.inner.eval_efs(rho)?;
+        self.note(rho, r.cost);
+        Ok(r)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
 }
 
 /// Closure-based adapter for [`OuterObjective`].
