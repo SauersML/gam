@@ -2188,6 +2188,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     grad_reml_score: Option<ArrayView1<'_, f64>>,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
+    forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
 ) -> Result<BatchedPositionGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -2308,6 +2309,14 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         }
     }
 
+    if let Some(fits) = forward_fits {
+        if fits.len() != batch {
+            return Err(format!(
+                "forward_state fit count mismatch: expected {batch}, got {}",
+                fits.len()
+            ));
+        }
+    }
     let results: Vec<Result<(usize, Option<(Array2<f64>, Array2<f64>, Array1<f64>)>), String>> = (0
         ..batch)
         .into_par_iter()
@@ -2322,17 +2331,37 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
-            match gaussian_reml_multi_closed_form_backward(
-                fit_x.slice(s![start..end, ..]),
-                y.slice(s![start..end, ..]),
-                penalty,
-                weight_slice,
-                init_lambda,
-                upstream_lambda,
-                upstream_coefficients,
-                upstream_fitted,
-                upstream_reml_score,
-            ) {
+            let x_slice = fit_x.slice(s![start..end, ..]);
+            let y_slice = y.slice(s![start..end, ..]);
+            let backward_result = if let Some(fits) = forward_fits {
+                match fits[b].as_ref() {
+                    Some(fit) => gaussian_reml_multi_closed_form_backward_from_fit(
+                        x_slice,
+                        y_slice,
+                        penalty,
+                        weight_slice,
+                        fit,
+                        upstream_lambda,
+                        upstream_coefficients,
+                        upstream_fitted,
+                        upstream_reml_score,
+                    ),
+                    None => return Ok((b, None)),
+                }
+            } else {
+                gaussian_reml_multi_closed_form_backward(
+                    x_slice,
+                    y_slice,
+                    penalty,
+                    weight_slice,
+                    init_lambda,
+                    upstream_lambda,
+                    upstream_coefficients,
+                    upstream_fitted,
+                    upstream_reml_score,
+                )
+            };
+            match backward_result {
                 Ok(backward) => Ok((
                     b,
                     Some((backward.grad_x, backward.grad_y, backward.grad_weights)),
@@ -4642,6 +4671,7 @@ mod batch_tests {
             Some(grad_coefficients.view()),
             Some(grad_fitted.view()),
             Some(grad_reml_score.view()),
+            None,
         )
         .unwrap();
 
@@ -4722,6 +4752,7 @@ mod batch_tests {
             Some(grad_reml_score.view()),
             None,
             0,
+            None,
         )
         .expect("position batched backward");
 
@@ -6169,6 +6200,7 @@ mod tests {
             grad_reml_score,
             Some(by.view()),
             0,
+            None,
         )
         .expect("position analytic backward");
         let grad_by = backward.grad_by.expect("by gradient");
