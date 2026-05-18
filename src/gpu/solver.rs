@@ -121,6 +121,47 @@ pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Opt
     }
 }
 
+/// Human-readable dispatch decision for the fused Cholesky solve path.
+///
+/// This is intentionally separate from `try_chol_solve_inplace`: callers that
+/// emit their own high-level stage timing can include the same route reason in
+/// the user-visible line even when lower-level GPU diagnostics are filtered.
+pub fn describe_chol_solve_route(p: usize, rhs_cols: usize) -> String {
+    let runtime = GpuRuntime::global();
+    let shape = format!("p={p} rhs_cols={rhs_cols}");
+    if let Some(reason) = runtime.cpu_reason() {
+        return format!(
+            "backend=CPU op=chol_solve shape={shape} reason=CUDA unavailable: {reason}"
+        );
+    }
+
+    let policy = runtime.policy();
+    if !policy.route_chol_solve(p) {
+        return format!(
+            "backend=CPU op=chol_solve shape={shape} reason=below cuSOLVER policy threshold chol_p>={}",
+            policy.chol_min_p
+        );
+    }
+
+    let device = runtime
+        .selected_device()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "unknown CUDA device".to_string());
+    format!(
+        "backend=cuSOLVER op=chol_solve shape={shape} reason=meets GPU policy chol_p>={} selected_device={device}",
+        policy.chol_min_p
+    )
+}
+
+/// True when `try_chol_solve_inplace` is expected to attempt cuSOLVER for a
+/// valid `p x p` input. A later runtime/library/factorization failure can
+/// still fall back to the CPU route.
+#[inline]
+pub fn will_attempt_chol_solve(p: usize) -> bool {
+    let runtime = GpuRuntime::global();
+    runtime.is_available() && runtime.policy().route_chol_solve(p)
+}
+
 /// In-place lower Cholesky factorization: `a` becomes `L` for `A = L L^T`.
 #[inline]
 pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {

@@ -5973,11 +5973,13 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
-            line_search_step_cap: Some(0.5),
+            line_search_step_cap_rho: Some(0.5),
+            line_search_step_cap_psi: None,
             last_gradient_point: None,
             objective_stall_rel_tol: None,
             last_gradient_cost: None,
             objective_stall_evals: 0,
+            stall_signal: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
@@ -6033,11 +6035,13 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
-            line_search_step_cap: Some(0.5),
+            line_search_step_cap_rho: Some(0.5),
+            line_search_step_cap_psi: None,
             last_gradient_point: Some(array![0.0]),
             objective_stall_rel_tol: Some(1.0e-6),
             last_gradient_cost: Some(1000.0),
             objective_stall_evals: 0,
+            stall_signal: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
