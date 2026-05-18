@@ -13530,6 +13530,7 @@ fn validate_lat_lon_matrix(
 /// the kernel argument to `(0, ∞)` before invocation, so we skip the
 /// inf/NaN/subnormal blends that `wide::f64x4::ln` carries (those branches
 /// are also coarse at f64 precision; see `wide-0.7.33/src/f64x4_.rs:1297`).
+#[allow(dead_code)]
 #[inline]
 fn wahba_simd_ln(x: wide::f64x4) -> wide::f64x4 {
     use wide::{CmpGt, f64x4};
@@ -13643,11 +13644,13 @@ fn wahba_sphere_kernel_spectral(cos_gamma: f64, m: usize) -> f64 {
 }
 
 /// Legacy alias retained so existing call sites continue to compile.
+#[allow(dead_code)]
 #[inline]
 fn wahba_sphere_kernel_m4_spectral(cos_gamma: f64) -> f64 {
     wahba_sphere_kernel_spectral(cos_gamma, 4)
 }
 
+#[allow(dead_code)]
 #[inline]
 fn wahba_sphere_kernel_m4_spectral_simd(cos_gamma: wide::f64x4) -> wide::f64x4 {
     wide::f64x4::from(cos_gamma.to_array().map(wahba_sphere_kernel_m4_spectral))
