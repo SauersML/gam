@@ -2757,6 +2757,12 @@ fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
+    py.detach(move || coefficient_state_json_impl(&model_bytes))
+        .map_err(py_value_error)
+}
+
+#[pyfunction]
 fn check_json(
     py: Python<'_>,
     model_bytes: Vec<u8>,
@@ -2822,6 +2828,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
+    module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
     Ok(())
@@ -3537,6 +3544,49 @@ fn serialize_sample_payload(
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize sample payload: {err}"))
+}
+
+#[derive(Serialize)]
+struct CoefficientStatePayload {
+    beta: Vec<f64>,
+    covariance_flat: Vec<f64>,
+    covariance_n: usize,
+    covariance_corrected: bool,
+    schema: Option<DataSchema>,
+    training_feature_ranges: Option<Vec<(f64, f64)>>,
+    random_column_ranges: Vec<(usize, usize)>,
+}
+
+fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let payload = model.payload();
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let covariance = fit
+        .beta_covariance_corrected()
+        .map(|c| (c, true))
+        .or_else(|| fit.beta_covariance().map(|c| (c, false)))
+        .ok_or_else(|| "model does not contain coefficient covariance; refit with covariance-saving inference enabled".to_string())?;
+    let (cov, corrected) = covariance;
+    let mut random_ranges = Vec::<(usize, usize)>::new();
+    if let Some(spec) = payload.resolved_termspec.as_ref() {
+        let mut col = 1 + spec.linear_terms.len();
+        for re in &spec.random_effect_terms {
+            let n = re.frozen_levels.as_ref().map(|v| v.len()).unwrap_or(0);
+            random_ranges.push((col, col + n));
+            col += n;
+        }
+    }
+    let out = CoefficientStatePayload {
+        beta: fit.beta.to_vec(),
+        covariance_flat: cov.iter().copied().collect(),
+        covariance_n: cov.nrows(),
+        covariance_corrected: corrected,
+        schema: payload.data_schema.clone(),
+        training_feature_ranges: payload.training_feature_ranges.clone(),
+        random_column_ranges: random_ranges,
+    };
+    serde_json::to_string(&out)
+        .map_err(|err| format!("failed to serialize coefficient state: {err}"))
 }
 
 fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
@@ -4969,7 +5019,7 @@ fn build_standard_payload(
     payload.link = Some(family_to_link(family).name().to_string());
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
-    payload.training_headers = Some(dataset.headers.clone());
+    payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
