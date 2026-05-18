@@ -3821,6 +3821,7 @@ pub struct OuterProblem {
     objective_scale: Option<f64>,
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
+    cache_session: Option<Arc<CacheSession>>,
 }
 
 impl OuterProblem {
@@ -3850,6 +3851,7 @@ impl OuterProblem {
             objective_scale: None,
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
+            cache_session: None,
         }
     }
 
@@ -4011,6 +4013,11 @@ impl OuterProblem {
     /// path at biobank scale, where rho needs |d|≈5 while psi wants |d|≤1.
     pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
         self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
+    pub fn with_cache_session(mut self, session: Arc<CacheSession>) -> Self {
+        self.cache_session = Some(session);
         self
     }
 
@@ -4178,7 +4185,32 @@ impl OuterProblem {
         obj: &mut dyn OuterObjective,
         context: &str,
     ) -> Result<OuterResult, EstimationError> {
-        run_outer(obj, &self.config(), context)
+        let mut config = self.config();
+        let Some(session) = config.cache_session.clone() else {
+            return run_outer(obj, &config, context);
+        };
+        if let Some(entry) = session.try_load()
+            && let Some(payload) = decode_iterate(&entry.payload, self.n_params)
+        {
+            let cached_rho = Array1::from_vec(payload.rho);
+            if config
+                .initial_rho
+                .as_ref()
+                .is_none_or(|rho| rho != &cached_rho)
+            {
+                config.initial_rho = Some(cached_rho);
+                config.screen_initial_rho = false;
+            }
+        }
+        let mut checkpointing = CheckpointingObjective::new(obj, Arc::clone(&session));
+        let result = run_outer(&mut checkpointing, &config, context);
+        if let Ok(result) = result.as_ref()
+            && result.final_value.is_finite()
+            && let Some(bytes) = encode_iterate(&result.rho, result.final_value, result.iterations as u64)
+        {
+            session.finalize(&bytes, Some(result.final_value), Some(result.iterations as u64));
+        }
+        result
     }
 }
 
