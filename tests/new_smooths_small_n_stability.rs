@@ -14,6 +14,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 const TAU: f64 = std::f64::consts::TAU;
+const PI: f64 = std::f64::consts::PI;
 
 fn try_fit_predict(
     formula: &str,
@@ -193,7 +194,7 @@ fn cylinder_te_small_n_stable() {
         let probes: Vec<Vec<f64>> = vec![
             vec![0.0, 0.0, 0.0],
             vec![1.5, 0.5, 0.0],
-            vec![3.14, -0.5, 0.0],
+            vec![PI, -0.5, 0.0],
         ];
         let formula = "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=4)";
         match try_fit_predict(formula, &data, 3, &probes) {
