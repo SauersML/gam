@@ -15,6 +15,7 @@
 
 use libloading::Library;
 use ndarray::{Array1, Array2};
+use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 
 use super::device::GpuDeviceInfo;
@@ -194,12 +195,15 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     }
     let batch = matrices.len();
     let start = std::time::Instant::now();
-    match with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices)) {
-        Some(((), device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_cholesky_batched_lower_inplace(matrices).or_else(|| {
+        with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices))
+            .map(|((), device)| vec![device])
+    }) {
+        Some(devices) => {
+            diagnostics::log_gpu_success_multi(
                 "cholesky_batched_lower",
                 "cuSOLVER",
-                &device,
+                &devices,
                 format!("batch={batch} p={p}"),
                 diagnostics::chol_flops(p).saturating_mul(batch as u64),
                 diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
@@ -239,35 +243,7 @@ fn route_chol_batched(p: usize, batch_size: usize) -> bool {
 fn with_runtime<T>(
     mut f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
-    static RUNTIME: OnceLock<Vec<Mutex<CusolverRuntime>>> = OnceLock::new();
-    let runtimes = RUNTIME.get_or_init(|| {
-        GpuRuntime::global()
-            .devices()
-            .iter()
-            .filter_map(|device| {
-                let cuda = match CudaWorkingState::init(device.ordinal) {
-                    Some(cuda) => cuda,
-                    None => {
-                        diagnostics::log_library_unavailable(
-                            "cuSOLVER",
-                            &format!("CUDA context init failed for device {}", device.ordinal),
-                        );
-                        return None;
-                    }
-                };
-                match CusolverRuntime::new(cuda, device.clone()) {
-                    Ok(runtime) => {
-                        diagnostics::log_library_ready("cuSOLVER", &runtime.device);
-                        Some(Mutex::new(runtime))
-                    }
-                    Err(err) => {
-                        diagnostics::log_library_unavailable("cuSOLVER", &err);
-                        None
-                    }
-                }
-            })
-            .collect()
-    });
+    let runtimes = cusolver_runtimes();
     if runtimes.is_empty() {
         return None;
     }
@@ -281,6 +257,127 @@ fn with_runtime<T>(
         }
     }
     None
+}
+
+fn cusolver_runtimes() -> &'static [Mutex<CusolverRuntime>] {
+    static RUNTIME: OnceLock<Vec<Mutex<CusolverRuntime>>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            GpuRuntime::global()
+                .devices()
+                .iter()
+                .filter_map(|device| {
+                    let cuda = match CudaWorkingState::init(device.ordinal) {
+                        Some(cuda) => cuda,
+                        None => {
+                            diagnostics::log_library_unavailable(
+                                "cuSOLVER",
+                                &format!("CUDA context init failed for device {}", device.ordinal),
+                            );
+                            return None;
+                        }
+                    };
+                    match CusolverRuntime::new(cuda, device.clone()) {
+                        Ok(runtime) => {
+                            diagnostics::log_library_ready("cuSOLVER", &runtime.device);
+                            Some(Mutex::new(runtime))
+                        }
+                        Err(err) => {
+                            diagnostics::log_library_unavailable("cuSOLVER", &err);
+                            None
+                        }
+                    }
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+fn plan_for_cusolver(
+    batch_size: usize,
+    fixed_bytes_per_device: usize,
+    bytes_per_batch_item: usize,
+) -> Option<Vec<(usize, GpuDeviceInfo, Vec<Range<usize>>)>> {
+    let runtimes = cusolver_runtimes();
+    if runtimes.len() <= 1 {
+        return None;
+    }
+    let mut devices = Vec::with_capacity(runtimes.len());
+    for runtime in runtimes {
+        devices.push(runtime.lock().ok()?.device.clone());
+    }
+    let plans = GpuRuntime::global().plan_batched_work_for_devices(
+        &devices,
+        batch_size,
+        fixed_bytes_per_device,
+        bytes_per_batch_item,
+    )?;
+    if plans.len() <= 1 {
+        return None;
+    }
+    let mut mapped = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let idx = devices
+            .iter()
+            .position(|device| device.ordinal == plan.ordinal)?;
+        mapped.push((idx, devices[idx].clone(), plan.chunks));
+    }
+    Some(mapped)
+}
+
+fn try_multi_cholesky_batched_lower_inplace(
+    matrices: &mut [Array2<f64>],
+) -> Option<Vec<GpuDeviceInfo>> {
+    let batch = matrices.len();
+    if batch == 0 {
+        return Some(Vec::new());
+    }
+    let p = matrices[0].nrows();
+    let matrix_bytes = diagnostics::bytes_for_f64(p.checked_mul(p)?);
+    let bytes_per_batch_item = matrix_bytes
+        .saturating_add(std::mem::size_of::<u64>())
+        .saturating_add(std::mem::size_of::<i32>());
+    let plan = plan_for_cusolver(batch, 0, bytes_per_batch_item)?;
+    let runtimes = cusolver_runtimes();
+    let pieces = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            let chunk_inputs = chunks
+                .into_iter()
+                .map(|range| {
+                    let local = matrices[range.clone()].to_vec();
+                    (range, local)
+                })
+                .collect::<Vec<_>>();
+            handles.push(scope.spawn(move || {
+                let mut solved_chunks = Vec::with_capacity(chunk_inputs.len());
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                for (range, mut local) in chunk_inputs {
+                    runtime.cholesky_batched_lower_inplace(&mut local)?;
+                    solved_chunks.push((range, local));
+                }
+                Some((device, solved_chunks))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok()?)
+            .collect::<Option<Vec<_>>>()
+    })?;
+
+    let mut devices = Vec::with_capacity(pieces.len());
+    for (device, chunks) in pieces {
+        devices.push(device);
+        for (range, solved) in chunks {
+            if solved.len() != range.end - range.start {
+                return None;
+            }
+            for (dst, src) in matrices[range].iter_mut().zip(solved) {
+                *dst = src;
+            }
+        }
+    }
+    Some(devices)
 }
 
 struct CusolverRuntime {
