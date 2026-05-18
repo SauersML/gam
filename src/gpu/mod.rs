@@ -36,7 +36,7 @@ pub use dispatch::{
 pub use policy::DispatchPolicy;
 pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info};
 pub use solver::{
-    try_chol_solve_inplace, try_cholesky_batched_lower_inplace, try_cholesky_lower_inplace,
-    try_syevd_inplace,
+    describe_chol_solve_route, try_chol_solve_inplace, try_cholesky_batched_lower_inplace,
+    try_cholesky_lower_inplace, try_syevd_inplace, will_attempt_chol_solve,
 };
 pub use sparse::{try_csr_spmv_usize, try_csr_t_spmv_usize};
