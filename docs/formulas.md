@@ -408,3 +408,7 @@ See [survival.md](survival.md).
 # Random intercept per site
 "y ~ smooth(x) + group(site)"
 ```
+
+## Difference smooths
+
+For group-specific trajectories and pairwise smooth contrasts, see [Difference smooths](difference-smooths.md). That guide covers `s(x, by=group)`, numeric binary by-smooths, and `s(group, x, bs=sz)`.
