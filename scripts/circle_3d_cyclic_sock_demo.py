@@ -9,12 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import gamfit
+from gamfit import Model, ResponseGeometryModel
 
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-def make_circle_3d(n: int = 260, seed: int = 0):
+def make_circle_3d(n: int = 260, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     theta = rng.uniform(0.0, 2.0 * np.pi, n)
     # Outward Gaussian spike near 2*pi/3
@@ -39,19 +40,23 @@ def make_circle_3d(n: int = 260, seed: int = 0):
 # ---------------------------------------------------------------------------
 # Fitting one closed curve via three cyclic 1D GAMs (lifted to (cos,sin))
 # ---------------------------------------------------------------------------
-def fit_closed_curve(theta: np.ndarray, P: np.ndarray, formula_body: str):
+def fit_closed_curve(
+    theta: np.ndarray, P: np.ndarray, formula_body: str
+) -> list[Model | ResponseGeometryModel]:
     """Fit one cyclic GAM per coordinate by lifting theta -> (cos, sin).
 
     formula_body is e.g. 'duchon(ct, st, centers=80)'."""
     base = {"ct": np.cos(theta).tolist(), "st": np.sin(theta).tolist()}
-    models = []
+    models: list[Model | ResponseGeometryModel] = []
     for j in range(3):
         data = {**base, "y": P[:, j].tolist()}
         models.append(gamfit.fit(data, f"y ~ {formula_body}"))
     return models
 
 
-def predict_curve(models, grid: np.ndarray) -> np.ndarray:
+def predict_curve(
+    models: list[Model | ResponseGeometryModel], grid: np.ndarray
+) -> np.ndarray:
     payload = {"ct": np.cos(grid).tolist(), "st": np.sin(grid).tolist()}
     cols = []
     for m in models:

@@ -4061,6 +4061,7 @@ impl OuterProblem {
             objective_scale: self.objective_scale,
             bfgs_step_cap: self.bfgs_step_cap,
             bfgs_step_cap_psi: self.bfgs_step_cap_psi,
+            cache_session: self.cache_session.clone(),
         }
     }
 
