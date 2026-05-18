@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import matplotlib as mpl
 import numpy as np
@@ -54,7 +55,9 @@ PAL = dict(
 # ---------------------------------------------------------------------------
 # Data generation (with markedly higher noise than the in-tree visuals)
 # ---------------------------------------------------------------------------
-def gen_trefoil(n=2200, sig=0.40):
+def gen_trefoil(
+    n: int = 2200, sig: float = 0.40
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, np.ndarray], float]:
     t = RNG.uniform(0, TAU, n)
     x = np.sin(t) + 2 * np.sin(2 * t)
     y = np.cos(t) - 2 * np.cos(2 * t)
@@ -62,18 +65,30 @@ def gen_trefoil(n=2200, sig=0.40):
     return t, (x, y, z), sig
 
 
-def gen_cyl(n=4000, sig=0.14):
+def gen_cyl(
+    n: int = 4000, sig: float = 0.14
+) -> tuple[
+    tuple[np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    float,
+]:
     th = RNG.uniform(0, TAU, n)
     h = RNG.uniform(0, 1, n)
     r = 1.0 + 0.18 * np.sin(4 * th + 3 * np.pi * h)
     return (th, h), (r * np.cos(th), r * np.sin(th), 2 * (h - 0.5)), sig
 
 
-def gen_sph(n=4500, sig=0.10):
+def gen_sph(
+    n: int = 4500, sig: float = 0.10
+) -> tuple[
+    tuple[np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    float,
+]:
     lat = np.arcsin(RNG.uniform(-1, 1, n))
     lon = RNG.uniform(0, TAU, n)
 
-    def gd(lat0, lon0):
+    def gd(lat0: float, lon0: float) -> np.ndarray:
         c = (np.sin(lat) * np.sin(lat0)
              + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
         return np.arccos(np.clip(c, -1, 1))
@@ -93,7 +108,13 @@ def gen_sph(n=4500, sig=0.10):
     ), sig
 
 
-def gen_tor(n=4500, sig=0.12):
+def gen_tor(
+    n: int = 4500, sig: float = 0.12
+) -> tuple[
+    tuple[np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    float,
+]:
     u = RNG.uniform(0, TAU, n)
     v = RNG.uniform(0, TAU, n)
     R = 2.0 + 0.18 * np.sin(3 * v + 2 * u)
@@ -105,14 +126,22 @@ def gen_tor(n=4500, sig=0.12):
     ), sig
 
 
-def gen_mob(n=4000, sig=0.10):
+def gen_mob(
+    n: int = 4000, sig: float = 0.10
+) -> tuple[
+    tuple[np.ndarray, np.ndarray],
+    tuple[np.ndarray, np.ndarray, np.ndarray],
+    float,
+]:
     u = RNG.uniform(0, 2 * TAU, n)
     v = RNG.uniform(-0.8, 0.8, n)
     rim = 1 + 0.5 * v * np.cos(u / 2)
     return (u, v), (rim * np.cos(u), rim * np.sin(u), 0.5 * v * np.sin(u / 2)), sig
 
 
-def gen_loop(n=1000, sig=0.15):
+def gen_loop(
+    n: int = 1000, sig: float = 0.15
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray, np.ndarray], float]:
     t = RNG.uniform(0, TAU, n)
     x = np.cos(t) + 0.10 * np.sin(3 * t)
     y = np.sin(t) + 0.10 * np.cos(4 * t)
@@ -120,14 +149,21 @@ def gen_loop(n=1000, sig=0.15):
     return t, (x, y, z), sig
 
 
-def add_noise(coords, sig):
-    return tuple(c + sig * RNG.standard_normal(c.shape) for c in coords)
+def add_noise(
+    coords: tuple[np.ndarray, np.ndarray, np.ndarray], sig: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    a, b, c = coords
+    return (
+        a + sig * RNG.standard_normal(a.shape),
+        b + sig * RNG.standard_normal(b.shape),
+        c + sig * RNG.standard_normal(c.shape),
+    )
 
 
 # ---------------------------------------------------------------------------
 # Step 1: write CSVs
 # ---------------------------------------------------------------------------
-def write_csvs():
+def write_csvs() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
 
     # Trefoil (param = t)
@@ -224,7 +260,7 @@ FITS = [
 ]
 
 
-def fit_all():
+def fit_all() -> None:
     if not GAM.exists():
         sys.exit(f"missing release binary: {GAM} — run `cargo build --release`")
     for name, csv, formula, _ in FITS:
@@ -243,7 +279,7 @@ def fit_all():
         print(f"  fit   {name:8s} {time.time()-t0:5.1f}s")
 
 
-def write_grids():
+def write_grids() -> None:
     # 1-D grid for the curves
     np.savetxt(DATA / "grid_1d.csv",
                np.linspace(0, TAU, 800, endpoint=False)[:, None],
@@ -294,7 +330,7 @@ PRED_MAP = {
 }
 
 
-def predict_all():
+def predict_all() -> None:
     for name, grid in PRED_MAP.items():
         out = DATA / f"{name}_pred.csv"
         if out.exists():
@@ -312,31 +348,33 @@ def predict_all():
 # ---------------------------------------------------------------------------
 # Step 3: render
 # ---------------------------------------------------------------------------
-def cmap_for(hex_color, name="c"):
+def cmap_for(hex_color: str, name: str = "c") -> LinearSegmentedColormap:
     rgb = np.array(mpl.colors.to_rgb(hex_color))
     light = np.minimum(1, rgb + 0.55)
     dark = rgb * 0.40
     return LinearSegmentedColormap.from_list(name, [light, rgb, dark], N=128)
 
 
-def load_pred(name):
+def load_pred(name: str) -> np.ndarray:
     return np.loadtxt(DATA / f"{name}_pred.csv", delimiter=",", skiprows=1)[:, 1]
 
 
-def wrap0(A):
+def wrap0(A: np.ndarray) -> np.ndarray:
     return np.concatenate([A, A[:1, :]], axis=0)
 
 
-def wrap1(A):
+def wrap1(A: np.ndarray) -> np.ndarray:
     return np.concatenate([A, A[:, :1]], axis=1)
 
 
-def wrap2(A):
+def wrap2(A: np.ndarray) -> np.ndarray:
     A = np.concatenate([A, A[:, :1]], axis=1)
     return np.concatenate([A, A[:1, :]], axis=0)
 
 
-def make_polydata(X, Y, Z, eps_factor=1e-4):
+def make_polydata(
+    X: np.ndarray, Y: np.ndarray, Z: np.ndarray, eps_factor: float = 1e-4
+) -> Any:
     """Convert a coord-array surface to a PolyData with shared seam vertices
     and smoothed per-vertex normals. Cleans coincident vertices so wrap-seams
     do not produce shading discontinuities."""
@@ -350,8 +388,8 @@ def make_polydata(X, Y, Z, eps_factor=1e-4):
     return poly
 
 
-def build_shapes():
-    out = []
+def build_shapes() -> dict[str, dict[str, Any]]:
+    out: list[dict[str, Any]] = []
 
     # Trefoil
     pts = np.loadtxt(DATA / "tref.csv", delimiter=",", skiprows=1)[:, 1:]
@@ -433,15 +471,19 @@ LAYOUT = [
 ]
 
 
-def view_dir(elev_deg, azim_deg):
+def view_dir(elev_deg: float, azim_deg: float) -> np.ndarray:
     e, a = np.radians(elev_deg), np.radians(azim_deg)
     return np.array([np.cos(e) * np.cos(a),
                      np.cos(e) * np.sin(a),
                      np.sin(e)])
 
 
-def build_scene(plotter, shapes, point_size):
-    panels = []
+def build_scene(
+    plotter: Any,
+    shapes: dict[str, dict[str, Any]],
+    point_size: int,
+) -> list[dict[str, Any]]:
+    panels: list[dict[str, Any]] = []
     for sname, role, r, c in LAYOUT:
         s = shapes[sname]
         plotter.subplot(r, c)

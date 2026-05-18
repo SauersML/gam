@@ -823,9 +823,9 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         fit_pc_min[col] = float(np.min(vals))
         fit_pc_max[col] = float(np.max(vals))
 
-    def _clamped_rows(rows: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    def _clamped_rows(rows: list[dict[str, str]]) -> tuple[list[dict[str, str]], dict[str, int]]:
         clamp_counts: dict[str, int] = {col: 0 for col in pc_cols_for_clamp}
-        out_rows: list[dict] = []
+        out_rows: list[dict[str, str]] = []
         for row in rows:
             new_row = {key: row[key] for key in ctn_columns}
             for col in pc_cols_for_clamp:
