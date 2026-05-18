@@ -91,10 +91,10 @@ def gen_sph(
     def gd(lat0: float, lon0: float) -> np.ndarray:
         c = (np.sin(lat) * np.sin(lat0)
              + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
-        return np.arccos(np.clip(c, -1, 1))
+        return np.asarray(np.arccos(np.clip(c, -1, 1)))
 
     # Several distinct bulges, one deep crater, plus a rippling overlay.
-    r = 1.0
+    r: float | np.ndarray = 1.0
     r += 0.55 * np.exp(-(gd(0.95, 0.30) / 0.45) ** 2)
     r += 0.42 * np.exp(-(gd(-0.55, 2.50) / 0.50) ** 2)
     r -= 0.40 * np.exp(-(gd(0.05, 4.20) / 0.55) ** 2)
@@ -641,8 +641,8 @@ def quality_report() -> None:
     def gd(lat0: float, lon0: float) -> np.ndarray:
         c = (np.sin(lat) * np.sin(lat0)
              + np.cos(lat) * np.cos(lat0) * np.cos(lon - lon0))
-        return np.arccos(np.clip(c, -1, 1))
-    rr = 1.0
+        return np.asarray(np.arccos(np.clip(c, -1, 1)))
+    rr: float | np.ndarray = 1.0
     rr = rr + 0.55 * np.exp(-(gd(0.95, 0.30) / 0.45) ** 2)
     rr = rr + 0.42 * np.exp(-(gd(-0.55, 2.50) / 0.50) ** 2)
     rr = rr - 0.40 * np.exp(-(gd(0.05, 4.20) / 0.55) ** 2)
