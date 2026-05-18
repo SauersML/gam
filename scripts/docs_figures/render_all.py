@@ -16,14 +16,18 @@ from __future__ import annotations
 
 import traceback
 from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
 from matplotlib.colors import LightSource, Normalize
 from matplotlib import colormaps
 
 import gamfit
+
+T = TypeVar("T")
 
 
 def log(msg: str) -> None:
@@ -75,10 +79,10 @@ def truth_2d(x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
     peak_c = 0.7 * np.exp(-((x1 - 0.80) ** 2 + (x2 - 0.78) ** 2) / 0.04)
     saddle = 0.35 * (x1 - x2)
     ripple = 0.18 * np.sin(2.0 * np.pi * (x1 + 0.5 * x2))
-    return peak_a + peak_b + peak_c + saddle + ripple
+    return np.asarray(peak_a + peak_b + peak_c + saddle + ripple)
 
 
-def make_regression(n: int = 800, seed: int = 7) -> dict:
+def make_regression(n: int = 800, seed: int = 7) -> dict[str, list[float]]:
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(0.0, 1.0, n)
     x2 = rng.uniform(0.0, 1.0, n)
@@ -86,7 +90,13 @@ def make_regression(n: int = 800, seed: int = 7) -> dict:
     return {"y": y.tolist(), "x1": x1.tolist(), "x2": x2.tolist()}
 
 
-def grid_eval(model, side=110, with_se=False, lo=0.0, hi=1.0):
+def grid_eval(
+    model: Any,
+    side: int = 110,
+    with_se: bool = False,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
     g = np.linspace(lo, hi, side)
     gx, gy = np.meshgrid(g, g)
     payload = {"x1": gx.ravel().tolist(), "x2": gy.ravel().tolist()}
@@ -102,13 +112,15 @@ def grid_eval(model, side=110, with_se=False, lo=0.0, hi=1.0):
     return gx, gy, mean, se
 
 
-def style_colorbar(cbar) -> None:
+def style_colorbar(cbar: Any) -> None:
     cbar.outline.set_linewidth(0.3)
     cbar.outline.set_edgecolor("#9ca3af")
     cbar.ax.tick_params(width=0.4, length=2.5, labelsize=7.5, color="#9ca3af")
 
 
-def style_square_axes_2d(ax, xlabel=None, ylabel=None) -> None:
+def style_square_axes_2d(
+    ax: Axes, xlabel: str | None = None, ylabel: str | None = None
+) -> None:
     ax.set_aspect("equal")
     if xlabel is not None:
         ax.set_xlabel(xlabel)
@@ -118,7 +130,9 @@ def style_square_axes_2d(ax, xlabel=None, ylabel=None) -> None:
         ax.set_yticklabels([])
 
 
-def style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="z") -> None:
+def style_3d_axes(
+    ax: Any, xlabel: str = "x1", ylabel: str = "x2", zlabel: str = "z"
+) -> None:
     ax.set_xlabel(xlabel, labelpad=4)
     ax.set_ylabel(ylabel, labelpad=4)
     ax.set_zlabel(zlabel, labelpad=4)
@@ -135,7 +149,9 @@ def style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="z") -> None:
 # ---------------------------------------------------------------------------
 # Figure 1: 2D three-panel hero
 # ---------------------------------------------------------------------------
-def render_hero(data: dict, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def render_hero(
+    data: dict[str, list[float]], model: Any
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     log("[hero] grid eval")
     x1 = np.asarray(data["x1"])
     x2 = np.asarray(data["x2"])
@@ -183,7 +199,9 @@ def render_hero(data: dict, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 # Figure 2: 2D zoo
 # ---------------------------------------------------------------------------
-def render_zoo(data: dict, matern_mean: np.ndarray):
+def render_zoo(
+    data: dict[str, list[float]], matern_mean: np.ndarray
+) -> dict[str, np.ndarray]:
     log("[zoo] fitting alternates...")
     x1 = np.asarray(data["x1"])
     x2 = np.asarray(data["x2"])
@@ -244,7 +262,7 @@ def render_zoo(data: dict, matern_mean: np.ndarray):
 # ---------------------------------------------------------------------------
 # Figure 3: 3D shaded surface
 # ---------------------------------------------------------------------------
-def render_3d_shaded(gx, gy, mean) -> None:
+def render_3d_shaded(gx: np.ndarray, gy: np.ndarray, mean: np.ndarray) -> None:
     fig = plt.figure(figsize=(8.4, 6.0))
     ax = fig.add_subplot(111, projection="3d")
 
@@ -273,7 +291,12 @@ def render_3d_shaded(gx, gy, mean) -> None:
 # ---------------------------------------------------------------------------
 # Figure 4: 3D wireframe + scatter
 # ---------------------------------------------------------------------------
-def render_3d_wireframe(data: dict, gx, gy, mean) -> None:
+def render_3d_wireframe(
+    data: dict[str, list[float]],
+    gx: np.ndarray,
+    gy: np.ndarray,
+    mean: np.ndarray,
+) -> None:
     x1 = np.asarray(data["x1"])
     x2 = np.asarray(data["x2"])
     y = np.asarray(data["y"])
@@ -301,7 +324,7 @@ def render_3d_wireframe(data: dict, gx, gy, mean) -> None:
 # ---------------------------------------------------------------------------
 # Figure 5: 3D side-by-side Matérn vs Duchon
 # ---------------------------------------------------------------------------
-def render_3d_compare(surfaces: dict) -> None:
+def render_3d_compare(surfaces: dict[str, np.ndarray]) -> None:
     if "Matérn" not in surfaces or "Duchon" not in surfaces:
         log("[compare] skipping (missing matern/duchon)")
         return

@@ -3250,7 +3250,7 @@ def _joint_pc_basis(requested_basis: typing.Any) -> str:
     """
     canonical = _canonical_smooth_basis(requested_basis)
     if canonical in {"thinplate", "tps", "duchon", "matern"}:
-        return canonical
+        return typing.cast(str, canonical)
     return "duchon"
 
 
