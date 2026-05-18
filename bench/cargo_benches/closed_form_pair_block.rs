@@ -15,7 +15,8 @@
 //!
 //! Run with: `cargo bench --bench closed_form_pair_block`
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use gam::terms::basis::closed_form_penalty::{
     aniso_invariants_scalar, aniso_invariants_simd, pair_block_radial_with_j_second_derivatives,

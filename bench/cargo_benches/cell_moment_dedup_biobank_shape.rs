@@ -1,4 +1,5 @@
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{
     DenestedCubicCell, cell_moment_cache_key, evaluate_cell_moments,
 };
