@@ -39,10 +39,10 @@ resolver = "3"
 warnings = "deny"
 
 [dependencies]
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
-rayon = "1.11.0"
-rand = "0.10.0"
+rayon = "1.12.0"
+rand = "0.10.1"
 indicatif = "0.18.4"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
@@ -58,17 +58,17 @@ crossterm = "0.29.0"
 rand_distr = "0.6.0"
 tempfile = "3.27.0"
 approx = "0.5.1"
-zip = { version = "8.2.0", default-features = false, features = ["deflate"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 statrs = "0.18.0"
 pest = "2.8.6"
 pest_derive = "2.8.6"
-arrow = { version = "54", default-features = false, features = ["ffi"] }
-parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
-wide = "0.7"
-smallvec = "1"
-libloading = "0.8"
+arrow = { version = "58", default-features = false, features = ["ffi"] }
+parquet = { version = "58", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
+wide = "1.4"
+smallvec = "1.15"
+libloading = "0.9"
 dirs = "6.0"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
@@ -78,8 +78,8 @@ default-features = false
 [dev-dependencies]
 num-dual = "0.13.6"
 autodiff = "0.7.0"
-ad_trait = "0.2.2"
-criterion = "0.5"
+ad_trait = "0.3.0"
+criterion = "0.8"
 
 [[bin]]
 name = "gam"
