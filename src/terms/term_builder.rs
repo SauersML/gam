@@ -485,9 +485,6 @@ pub fn build_smooth_basis(
             // the grouping factor here. We require one column to be a discrete
             // grouping variable (Categorical or Binary) and the other to be
             // numeric (Continuous or Binary used as 0/1).
-            let is_groupy = |k: ColumnKindTag| {
-                matches!(k, ColumnKindTag::Categorical | ColumnKindTag::Binary)
-            };
             let (group_idx, cont_idx) = match (k0, k1) {
                 (ColumnKindTag::Categorical, _) => (0usize, 1usize),
                 (_, ColumnKindTag::Categorical) => (1usize, 0usize),
@@ -500,7 +497,6 @@ pub fn build_smooth_basis(
                     ));
                 }
             };
-            let _ = is_groupy; // silence dead-code warning when only direct matches are used
             let group_col = cols[group_idx];
             let cont_col = cols[cont_idx];
             let levels = sorted_levels_for_column(ds.values.column(group_col))?;
