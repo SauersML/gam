@@ -1145,6 +1145,133 @@ class Model:
         # matrix without the caller passing the model back in.
         return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
 
+    def _design_matrix_payload(self, data: Any) -> dict[str, Any]:
+        headers, rows, _ = normalize_table(data)
+        try:
+            raw = rust_module().design_matrix_table(self._model_bytes, headers, rows)
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return json.loads(raw)
+
+    def difference_smooth(
+        self,
+        data: Any,
+        *,
+        group: str,
+        view: str,
+        pairs: Sequence[tuple[Any, Any]] | None = None,
+        n: int = 100,
+        level: float = 0.95,
+        simultaneous: bool = False,
+        n_sim: int = 10000,
+        seed: int | None = 12345,
+        group_means: bool = True,
+        marginalise_random: bool = True,
+    ) -> Any:
+        """Estimate pairwise difference smooths with covariance-aware bands.
+
+        The contrast is computed from the joint fitted-coefficient covariance as
+        ``(X_b - X_a) V (X_b - X_a)'``.  Set ``simultaneous=True`` to replace
+        the pointwise normal critical value with a posterior-simulation maximum
+        statistic over the requested grid.
+        """
+        if not (0.0 < level < 1.0):
+            raise ValueError("level must be in (0, 1)")
+        if n < 2:
+            raise ValueError("n must be at least 2")
+        if not group_means:
+            raise NotImplementedError(
+                "group_means=False requires term-level coefficient metadata that is not yet exposed; "
+                "the default group_means=True returns the full trajectory contrast."
+            )
+        # The current design-matrix FFI represents the population-level fixed
+        # predictor. Random-effect columns for supplied grouping levels are part
+        # of X only when those random terms are present in the saved model; there
+        # is not yet public column-role metadata to drop them selectively.
+        _ = marginalise_random
+
+        import math
+        import statistics
+        import numpy as np
+
+        headers, rows, table_kind = normalize_table(data)
+        if view not in headers:
+            raise ValueError(f"view column {view!r} not present in data")
+        if group not in headers:
+            raise ValueError(f"group column {group!r} not present in data")
+        view_idx = headers.index(view)
+        group_idx = headers.index(group)
+        view_values = np.asarray([float(row[view_idx]) for row in rows], dtype=float)
+        grid = np.linspace(float(np.nanmin(view_values)), float(np.nanmax(view_values)), int(n))
+        levels = []
+        for row in rows:
+            value = row[group_idx]
+            if value not in levels:
+                levels.append(value)
+        if len(levels) < 2:
+            raise ValueError("difference_smooth requires at least two group levels in data")
+        if pairs is None:
+            pairs = [(levels[i], levels[j]) for i in range(len(levels)) for j in range(i + 1, len(levels))]
+
+        template = list(rows[0])
+        out_rows: list[dict[str, Any]] = []
+        z = statistics.NormalDist().inv_cdf(0.5 + level / 2.0)
+        for a, b in pairs:
+            rows_a = []
+            rows_b = []
+            for x in grid:
+                ra = list(template)
+                rb = list(template)
+                ra[view_idx] = str(float(x))
+                rb[view_idx] = str(float(x))
+                ra[group_idx] = str(a)
+                rb[group_idx] = str(b)
+                rows_a.append(ra)
+                rows_b.append(rb)
+            payload_a = self._design_matrix_payload({h: [r[j] for r in rows_a] for j, h in enumerate(headers)})
+            payload_b = self._design_matrix_payload({h: [r[j] for r in rows_b] for j, h in enumerate(headers)})
+            xa = np.asarray(payload_a["x_flat"], dtype=float).reshape(int(payload_a["n_rows"]), int(payload_a["n_cols"]))
+            xb = np.asarray(payload_b["x_flat"], dtype=float).reshape(int(payload_b["n_rows"]), int(payload_b["n_cols"]))
+            beta = np.asarray(payload_b.get("beta"), dtype=float)
+            cov_n = int(payload_b.get("covariance_n") or 0)
+            if beta.size == 0 or cov_n == 0:
+                raise RuntimeError("fitted model did not expose coefficients/covariance for difference_smooth")
+            cov = np.asarray(payload_b["covariance_flat"], dtype=float).reshape(cov_n, cov_n)
+            xd = xb - xa
+            diff = xd @ beta
+            var = np.einsum("ij,jk,ik->i", xd, cov, xd)
+            se = np.sqrt(np.maximum(var, 0.0))
+            crit = z
+            band_type = "pointwise"
+            if simultaneous:
+                rng = np.random.default_rng(seed)
+                draws = rng.multivariate_normal(np.zeros(cov.shape[0]), cov, size=int(n_sim), method="svd")
+                centered = draws @ xd.T
+                denom = np.where(se > 0, se, np.inf)
+                maxima = np.max(np.abs(centered) / denom, axis=1)
+                crit = float(np.quantile(maxima[np.isfinite(maxima)], level))
+                band_type = "simultaneous"
+            lower = diff - crit * se
+            upper = diff + crit * se
+            for x, d, s, lo, hi in zip(grid, diff, se, lower, upper, strict=True):
+                out_rows.append({
+                    view: float(x),
+                    "level_1": a,
+                    "level_2": b,
+                    "diff": float(d),
+                    "se": float(s),
+                    "lower": float(lo),
+                    "upper": float(hi),
+                    "critical": float(crit),
+                    "band": band_type,
+                    "level": float(level),
+                })
+        try:
+            import pandas as pd
+            return pd.DataFrame(out_rows)
+        except Exception:
+            return out_rows
+
     def design_matrix(self, data: Any) -> Any:
         """Materialised design matrix for ``data`` against the saved model.
 
