@@ -6123,10 +6123,14 @@ mod tests {
             working_weights: Array1::zeros(0),
             working_response: Array1::zeros(0),
             reparam_qs: None,
+            dispersion: crate::estimate::Dispersion::Known(1.0),
             beta_covariance: Some(covariance.clone()),
             beta_standard_errors: None,
             beta_covariance_corrected: None,
             beta_standard_errors_corrected: None,
+            beta_covariance_frequentist: None,
+            coefficient_influence: None,
+            covariance_is_diagonal_only: false,
             bias_correction_beta,
         };
         UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
