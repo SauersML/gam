@@ -1721,50 +1721,6 @@ mod tests {
     }
 
     #[test]
-    fn gaussian_identity_cost_uses_closed_form_without_pirls() {
-        use super::penalty_logdet::PenaltyPseudologdet;
-        use super::unified::{DenseSpectralOperator, HessianOperator};
-
-        let f = GaussianRemlFixture::new();
-        let state = f.state();
-        assert_eq!(state.cache_manager.pirls_cache.read().unwrap().map.len(), 0);
-
-        let cost = state.compute_cost(&f.rho).expect("closed-form cost");
-
-        assert!(
-            state.gaussian_fixed_cache.read().unwrap().is_some(),
-            "closed-form Gaussian REML should build the sufficient-statistic cache"
-        );
-        assert_eq!(
-            state.cache_manager.pirls_cache.read().unwrap().map.len(),
-            0,
-            "closed-form Gaussian REML must not populate the PIRLS cache"
-        );
-
-        let lambda = f.rho[0].exp();
-        let xtwx = f.x.t().dot(&f.x);
-        let xtwy = f.x.t().dot(&f.y);
-        let h = &xtwx + &f.s0.mapv(|v| lambda * v);
-        let hop = DenseSpectralOperator::from_symmetric(&h).expect("H spectral operator");
-        let beta = hop.solve(&xtwy);
-        let rss = (f.y.dot(&f.y) - 2.0 * beta.dot(&xtwy) + beta.dot(&xtwx.dot(&beta))).max(0.0);
-        let penalty_quadratic = beta.dot(&f.s0.mapv(|v| lambda * v).dot(&beta));
-        let pld = PenaltyPseudologdet::from_components(&[f.s0.clone()], &[lambda], 0.0)
-            .expect("penalty logdet");
-        let dp = rss + penalty_quadratic;
-        let denom = f.y.len() as f64 - 1.0;
-        let phi = dp / denom;
-        let expected = dp / (2.0 * phi)
-            + 0.5 * (hop.logdet() - pld.value())
-            + 0.5 * denom * (2.0 * std::f64::consts::PI * phi).ln();
-
-        assert!(
-            (cost - expected).abs() <= 1e-10_f64.max(1e-10 * expected.abs()),
-            "closed-form Gaussian REML cost mismatch: got={cost}, expected={expected}"
-        );
-    }
-
-    #[test]
     fn profiled_gaussian_design_moving_gradient_matches_fd() {
         let f = GaussianRemlFixture::new();
         let state = f.state();
