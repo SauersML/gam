@@ -1171,12 +1171,7 @@ fn gaussian_reml_eigen_cache_from_xtwx(
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
     let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
     let lower = gaussian_reml_cholesky_lower(xtwx)?;
-    gaussian_reml_eigen_cache_from_lower(
-        lower,
-        penalty,
-        nullspace_dim,
-        xtwx_fingerprint,
-    )
+    gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint)
 }
 
 /// Cache-build entry point for callers that have already computed `L =
