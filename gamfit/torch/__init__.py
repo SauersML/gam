@@ -25,12 +25,13 @@ The subpackage is an optional extra: ``pip install gamfit[torch]``. Importing
 from __future__ import annotations
 
 try:
-    import torch as _torch  # noqa: F401
+    import torch  # noqa: F401  (imported eagerly so callers fail fast)
 except ImportError as _exc:  # pragma: no cover - import-time guard
     raise ImportError(
         "gamfit.torch requires the optional `torch` dependency. "
         "Install via `pip install gamfit[torch]` or `pip install torch`."
     ) from _exc
+del torch
 
 from ._basis import (
     bspline_basis,
