@@ -95,13 +95,13 @@ def grid_predict(
     return gx, gy, mean, se
 
 
-def style_colorbar(cbar) -> None:
+def style_colorbar(cbar: Colorbar) -> None:
     cbar.outline.set_linewidth(0.3)
     cbar.outline.set_edgecolor("#9ca3af")
     cbar.ax.tick_params(width=0.4, length=2.5, labelsize=7.5, color="#9ca3af")
 
 
-def style_square_axes(ax, *, xlabel: str | None, ylabel: str | None) -> None:
+def style_square_axes(ax: Axes, *, xlabel: str | None, ylabel: str | None) -> None:
     if xlabel is not None:
         ax.set_xlabel(xlabel)
     if ylabel is not None:

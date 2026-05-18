@@ -9,9 +9,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import gamfit
+from gamfit import Model, ResponseGeometryModel
 
 
-def make_circle_3d(n: int = 220, seed: int = 0):
+def make_circle_3d(n: int = 220, seed: int = 0) -> tuple[
+    np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, np.ndarray,
+]:
     """Tilted unit circle in R^3, parameterized by theta in [0, 2*pi)."""
     rng = np.random.default_rng(seed)
     theta = rng.uniform(0.0, 2.0 * np.pi, n)
@@ -42,7 +46,7 @@ def make_circle_3d(n: int = 220, seed: int = 0):
     return theta, noisy[0], noisy[1], noisy[2], clean[0], clean[1], clean[2]
 
 
-def fit_cyclic(theta: np.ndarray, y: np.ndarray):
+def fit_cyclic(theta: np.ndarray, y: np.ndarray) -> Model | ResponseGeometryModel:
     """Fit a cyclic-in-theta smooth by lifting theta -> (sin, cos) on the unit
     circle and using a 2D thin-plate smooth. Any smooth function of (sin, cos)
     is automatically periodic in theta."""
@@ -54,7 +58,9 @@ def fit_cyclic(theta: np.ndarray, y: np.ndarray):
     return gamfit.fit(data, "y ~ duchon(ct, st)")
 
 
-def predict_curve(models, n_grid: int = 400):
+def predict_curve(
+    models: tuple[Model | ResponseGeometryModel, ...], n_grid: int = 400
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     grid = np.linspace(0.0, 2.0 * np.pi, n_grid, endpoint=False)
     payload = {"ct": np.cos(grid).tolist(), "st": np.sin(grid).tolist()}
     out = []

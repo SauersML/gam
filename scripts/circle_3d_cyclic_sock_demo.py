@@ -62,13 +62,13 @@ def predict_curve(
     for m in models:
         pred = m.predict(payload, return_type="dict")
         cols.append(np.asarray(pred["mean"], dtype=float))
-    return np.vstack(cols).T  # (K, 3)
+    return np.asarray(np.vstack(cols).T)  # (K, 3)
 
 
 # ---------------------------------------------------------------------------
 # Sock: smooth varying-radius tube enclosing the data around the fitted curve
 # ---------------------------------------------------------------------------
-def bishop_frame(curve: np.ndarray):
+def bishop_frame(curve: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Parallel-transport (Bishop) frame around a closed curve. Returns
     unit tangent T, and two unit perpendiculars N, B at each sample."""
     K = curve.shape[0]
@@ -136,7 +136,7 @@ def sock_radius(curve: np.ndarray, P: np.ndarray, win: int = 9) -> np.ndarray:
 
 
 def build_tube(curve: np.ndarray, N: np.ndarray, B: np.ndarray,
-               r: np.ndarray, n_phi: int = 60):
+               r: np.ndarray, n_phi: int = 60) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     phi = np.linspace(0.0, 2.0 * np.pi, n_phi)
     cphi, sphi = np.cos(phi), np.sin(phi)
     # X[k, j] = curve[k] + r[k] * (cos phi[j] * N[k] + sin phi[j] * B[k])

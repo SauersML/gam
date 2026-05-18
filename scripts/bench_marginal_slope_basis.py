@@ -30,7 +30,7 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def synth(n: int, seed: int = 11) -> dict:
+def synth(n: int, seed: int = 11) -> dict[str, list[float]]:
     rng = np.random.default_rng(seed)
     x1 = rng.uniform(-1.0, 1.0, n)
     x2 = rng.uniform(-1.0, 1.0, n)
@@ -57,7 +57,9 @@ def synth(n: int, seed: int = 11) -> dict:
     }
 
 
-def stage1_calibrate(data: dict, formula: str) -> dict:
+def stage1_calibrate(
+    data: dict[str, list[float]], formula: str
+) -> dict[str, list[float]]:
     """Fit transformation-normal on PGS to produce a standardised z."""
     log(f"[stage1] fitting {formula!r}")
     calib = gamfit.fit(
@@ -71,7 +73,8 @@ def stage1_calibrate(data: dict, formula: str) -> dict:
     return out
 
 
-def time_fit(label: str, data: dict, formula: str, logslope_formula: str,
+def time_fit(label: str, data: dict[str, list[float]], formula: str,
+             logslope_formula: str,
              repeats: int = 1) -> list[float]:
     """Fit a marginal-slope model and time each fit."""
     log(f"[fit] {label}: starting {repeats} fit(s)")
