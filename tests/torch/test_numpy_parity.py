@@ -175,7 +175,7 @@ def test_gaussian_reml_fit_batched_by_matches_manual_gate() -> None:
     np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
 
 
-def test_gaussian_reml_fit_positions_parity():
+def test_gaussian_reml_fit_positions_parity() -> None:
     _require_ffi("gaussian_reml_fit_positions")
     rng = np.random.default_rng(7)
     n = 25
@@ -192,7 +192,7 @@ def test_gaussian_reml_fit_positions_parity():
     np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
 
 
-def test_gaussian_reml_fit_positions_batched_parity():
+def test_gaussian_reml_fit_positions_batched_parity() -> None:
     _require_ffi("gaussian_reml_fit_positions_batched")
     rng = np.random.default_rng(8)
     counts = [15, 18]
@@ -221,7 +221,7 @@ def test_gaussian_reml_fit_positions_batched_parity():
 # ------------------------ response-geometry transforms ----------------------- #
 
 
-def test_geometry_parity_smoke():
+def test_geometry_parity_smoke() -> None:
     from gamfit import _response_geometry as rg
 
     rng = np.random.default_rng(9)
@@ -259,7 +259,7 @@ def test_geometry_parity_smoke():
     )
 
 
-def test_geometry_torch_inputs_keep_autograd():
+def test_geometry_torch_inputs_keep_autograd() -> None:
     x = (torch.rand((6, 4), dtype=torch.float64) + 0.25).requires_grad_()
     base = torch.full((4,), 0.25, dtype=torch.float64)
     simplex = gt.simplex_exp_map(gt.simplex_log_map(x, base), base)

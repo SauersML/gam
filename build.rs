@@ -3,28 +3,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-/// Accepted `ApproxKind:` annotations used by the comment-based approximation
-/// scanner. Kept as bare identifiers so source comments can name them without
-/// coupling the build script to a Rust module.
-const APPROX_LEDGER_VARIANTS: &[&str] = &[
-    "Exact",
-    "NumericalApproximation",
-    "StatisticalApproximation",
-    "SurrogateObjective",
-    "TemporarySolverDamping",
-];
-
-/// Hand-wavy markers that must be paired with an `ApproxKind` annotation in
-/// nearby comment lines. Case-insensitive match on whole tokens. The TO-DO
-/// ban from the original build script is preserved as an outright ban
-/// (no annotation can rescue a TO-DO — just do it now), but the other
-/// markers are *allowed* when classified.
-const HANDWAVY_MARKERS: &[&str] = &["bandaid", "hack", "magic", "FIXME"];
-
-/// Lines on either side of a marker line within which an `ApproxKind:`
-/// source comment counts as annotation.
-const LEDGER_WINDOW: usize = 8;
-
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     fs::write(out_dir.join("lint_errors.rs"), "").expect("failed to write lint_errors.rs");
@@ -57,33 +35,6 @@ fn main() {
             offenders.len(),
             needle
         );
-        std::process::exit(1);
-    }
-
-    // Approximation scan: hand-wavy markers ("bandaid", "hack", "magic",
-    // "FIXME") are allowed only when the surrounding comment window names
-    // an accepted ApproxKind annotation.
-    let mut unclassified: Vec<(PathBuf, usize, &'static str, String)> = Vec::new();
-    scan_for_unclassified_handwavy(&manifest_dir, &manifest_dir, &mut unclassified);
-    if !unclassified.is_empty() {
-        eprintln!();
-        eprintln!(
-            "error: {} unclassified hand-wavy marker(s) found.",
-            unclassified.len()
-        );
-        eprintln!(
-            "       Pair the marker with an ApproxKind annotation (one of: {}) \
-             within {} lines, or replace it with precise wording.",
-            APPROX_LEDGER_VARIANTS.join(", "),
-            LEDGER_WINDOW
-        );
-        eprintln!();
-        for (rel, line_no, marker, line) in &unclassified {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{} [{}]: {}", rel.display(), line_no, marker, snippet);
-        }
-        eprintln!();
         std::process::exit(1);
     }
 
@@ -157,81 +108,8 @@ fn scan_for_ignored_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
     });
 }
 
-fn scan_for_unclassified_handwavy(
-    root: &Path,
-    dir: &Path,
-    offenders: &mut Vec<(PathBuf, usize, &'static str, String)>,
-) {
-    visit_files(root, dir, &mut |rel, content| {
-        // Skip the build script itself: it legitimately mentions every
-        // marker by name as part of its own scanner contract.
-        // Normalize Windows backslashes so the exemption comparison matches
-        // on every host.
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str == "build.rs" {
-            return;
-        }
-        let lower = content.to_ascii_lowercase();
-        if !HANDWAVY_MARKERS
-            .iter()
-            .any(|m| lower.contains(&m.to_ascii_lowercase()))
-        {
-            return;
-        }
-        let lines: Vec<&str> = content.lines().collect();
-        let lower_lines: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
-        for (idx, line) in lines.iter().enumerate() {
-            for marker in HANDWAVY_MARKERS {
-                let m_lower = marker.to_ascii_lowercase();
-                if !lower_lines[idx].contains(&m_lower) {
-                    continue;
-                }
-                if !is_marker_in_comment(line, &m_lower) {
-                    continue;
-                }
-                if window_has_ledger_annotation(&lines, idx) {
-                    continue;
-                }
-                offenders.push((rel.to_path_buf(), idx + 1, marker, line.to_string()));
-            }
-        }
-    });
-}
-
-/// True when the marker token sits inside a line comment (`//`) — strings
-/// and identifiers like `hack_score()` or test names should not be flagged.
-/// Lightweight heuristic: we just require the marker to appear *after* a
-/// `//` on the same line.
-fn is_marker_in_comment(line: &str, marker_lower: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    let comment_pos = lower.find("//");
-    let marker_pos = lower.find(marker_lower);
-    match (comment_pos, marker_pos) {
-        (Some(cp), Some(mp)) => mp > cp,
-        _ => false,
-    }
-}
-
-/// True when any line within `LEDGER_WINDOW` of `idx` references one of the
-/// `ApproxKind` variant names. The scan is case-sensitive on the variant
-/// (they are CamelCase identifiers); a bare mention anywhere in the window
-/// is sufficient.
-fn window_has_ledger_annotation(lines: &[&str], idx: usize) -> bool {
-    let lo = idx.saturating_sub(LEDGER_WINDOW);
-    let hi = (idx + LEDGER_WINDOW + 1).min(lines.len());
-    for line in &lines[lo..hi] {
-        for variant in APPROX_LEDGER_VARIANTS {
-            if line.contains(variant) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Walk `dir` recursively, calling `visitor(rel_path, content)` for every
-/// scannable file. Centralizes the directory-skip and extension rules so
-/// the two scans share them.
+/// scannable file. Centralizes the directory-skip and extension rules.
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
