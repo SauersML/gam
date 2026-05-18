@@ -92,7 +92,7 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
         family = rows[0].get("family", "gaussian")
         metrics_cfg = _metric_display_config(family)
         active_metrics = [
-            (k, l, h) for k, l, h in metrics_cfg
+            (k, label, higher) for k, label, higher in metrics_cfg
             if any(r.get(k) is not None for r in rows)
         ]
         if not active_metrics:

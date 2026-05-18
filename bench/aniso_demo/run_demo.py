@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import subprocess
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -98,7 +99,13 @@ def run_fit_predict(tag: str, scale_dims: bool, csv_in: Path) -> np.ndarray:
     raise RuntimeError(f"no z column in {pred}; keys = {list(rows[0].keys()) if rows else []}")
 
 
-def raincloud(ax, values_by_pop: list[np.ndarray], colors: list[str], labels: list[str], title: str) -> None:
+def raincloud(
+    ax,
+    values_by_pop: list[np.ndarray],
+    colors: Sequence[str | tuple[float, float, float, float]],
+    labels: list[str],
+    title: str,
+) -> None:
     """Half-violin (KDE) above, jittered strip + box below, per population."""
     rng = np.random.default_rng(0)
     n = len(values_by_pop)

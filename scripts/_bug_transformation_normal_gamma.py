@@ -34,12 +34,14 @@ Real root cause candidates (open for the next cycle):
 Once fixed, run this script and expect a successful fit + sensible
 predictions.
 """
-import subprocess, tempfile
+import subprocess
+import tempfile
 from pathlib import Path
 import numpy as np
 
 GAM = Path(__file__).resolve().parents[1] / "target" / "release" / "gam"
-rng = np.random.default_rng(7); n = 500
+rng = np.random.default_rng(7)
+n = 500
 x = rng.uniform(0, 1, n)
 mean_x = 1.0 + 0.7 * np.sin(2*np.pi*x)
 y = rng.gamma(shape=2.0, scale=mean_x / 2.0)

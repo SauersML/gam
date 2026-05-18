@@ -164,8 +164,8 @@ def main() -> None:
 
     out = Path(__file__).resolve().parent / "bench_gamlss_surv_variants_results.json"
     out.write_text(json.dumps(
-        [{"label": l, "seconds": dt, "ok": ok, "error": err}
-         for l, dt, ok, err in results],
+        [{"label": label, "seconds": dt, "ok": ok, "error": err}
+         for label, dt, ok, err in results],
         indent=2,
     ))
     print(f"\nwrote {out}", flush=True)
