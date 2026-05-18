@@ -83,7 +83,12 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         ctx.by_np = by_np
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
-        ctx.forward_state = out.get("forward_state")
+        # Thread the full Rust forward dict back to the analytic backward so
+        # the eigendecomposition cache is reused. Copy ndarrays defensively so
+        # in-place ops on the user-facing tensors cannot corrupt the cache.
+        ctx.forward_state = {
+            k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in out.items()
+        }
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
