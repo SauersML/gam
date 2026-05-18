@@ -23765,7 +23765,11 @@ mod tests {
 
     fn spatial_fit_smoke_options() -> BlockwiseFitOptions {
         BlockwiseFitOptions {
-            inner_max_cycles: 24,
+            // The location-scale-wiggle spatial smoke test can need more than
+            // 24 blockwise cycles after the final outer REML refit; keep the
+            // tolerance unchanged and allow enough iterations for the same
+            // convergence criterion to be reached deterministically.
+            inner_max_cycles: 48,
             inner_tol: 1e-4,
             outer_max_iter: 3,
             outer_tol: 1e-4,
