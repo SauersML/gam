@@ -4206,9 +4206,14 @@ impl OuterProblem {
         let result = run_outer(&mut checkpointing, &config, context);
         if let Ok(result) = result.as_ref()
             && result.final_value.is_finite()
-            && let Some(bytes) = encode_iterate(&result.rho, result.final_value, result.iterations as u64)
+            && let Some(bytes) =
+                encode_iterate(&result.rho, result.final_value, result.iterations as u64)
         {
-            session.finalize(&bytes, Some(result.final_value), Some(result.iterations as u64));
+            session.finalize(
+                &bytes,
+                Some(result.final_value),
+                Some(result.iterations as u64),
+            );
         }
         result
     }

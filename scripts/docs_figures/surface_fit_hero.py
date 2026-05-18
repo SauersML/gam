@@ -16,7 +16,6 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
-from matplotlib.colorbar import Colorbar
 
 import gamfit
 
@@ -95,7 +94,7 @@ def grid_predict(
     return gx, gy, mean, se
 
 
-def style_colorbar(cbar: Colorbar) -> None:
+def style_colorbar(cbar: Any) -> None:
     cbar.outline.set_linewidth(0.3)
     cbar.outline.set_edgecolor("#9ca3af")
     cbar.ax.tick_params(width=0.4, length=2.5, labelsize=7.5, color="#9ca3af")
