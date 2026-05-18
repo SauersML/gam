@@ -145,7 +145,6 @@ def inverse_alr(coords: Any, *, reference: int = -1) -> Any:
         if z.dim() != 2:
             raise ValueError("ALR coordinates must be a 2-D numeric array")
         d = z.shape[1] + 1
-        ref = reference % d
         keep = _keep_without_reference(d, reference)
         log_parts = torch.zeros((z.shape[0], d), dtype=z.dtype, device=z.device)
         log_parts[:, keep] = z

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import importlib
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
+
+
+def _try_import(name: str) -> Any:
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        return None
 
 
 def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:

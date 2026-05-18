@@ -714,7 +714,7 @@ def render_gif(shapes, out_path):
     frames = render_frames(shapes, W, H, n, point_size=6)
     # Pillow gives us a properly-encoded animated GIF that plays in browsers,
     # Preview, and on Twitter (imageio's default writer sometimes does not).
-    pil_frames = [Image.fromarray(f).convert("P", palette=Image.ADAPTIVE,
+    pil_frames = [Image.fromarray(f).convert("P", palette=Image.Palette.ADAPTIVE,
                                               colors=256) for f in frames]
     pil_frames[0].save(
         str(out_path),

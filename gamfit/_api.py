@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._exceptions import map_exception
@@ -89,6 +89,70 @@ def _build_fit_payload(
         for key, value in config.items():
             payload.setdefault(key, value)
     return payload
+
+
+@overload
+def fit(
+    data: Any,
+    formula: str,
+    *,
+    family: str = ...,
+    offset: str | None = ...,
+    weights: str | None = ...,
+    transformation_normal: bool | None = ...,
+    survival_likelihood: str | None = ...,
+    baseline_target: str | None = ...,
+    baseline_scale: float | None = ...,
+    baseline_shape: float | None = ...,
+    baseline_rate: float | None = ...,
+    baseline_makeham: float | None = ...,
+    z_column: str | None = ...,
+    link: str | None = ...,
+    logslope_formula: str | None = ...,
+    frailty_kind: str | None = ...,
+    frailty_sd: float | None = ...,
+    hazard_loading: str | None = ...,
+    scale_dimensions: bool | None = ...,
+    adaptive_regularization: bool | None = ...,
+    firth: bool | None = ...,
+    response_geometry: None = ...,
+    response_columns: list[str] | tuple[str, ...] | None = ...,
+    response_coordinates: str | None = ...,
+    response_reference: int | None = ...,
+    config: dict[str, Any] | None = ...,
+) -> Model: ...
+
+
+@overload
+def fit(
+    data: Any,
+    formula: str,
+    *,
+    family: str = ...,
+    offset: str | None = ...,
+    weights: str | None = ...,
+    transformation_normal: bool | None = ...,
+    survival_likelihood: str | None = ...,
+    baseline_target: str | None = ...,
+    baseline_scale: float | None = ...,
+    baseline_shape: float | None = ...,
+    baseline_rate: float | None = ...,
+    baseline_makeham: float | None = ...,
+    z_column: str | None = ...,
+    link: str | None = ...,
+    logslope_formula: str | None = ...,
+    frailty_kind: str | None = ...,
+    frailty_sd: float | None = ...,
+    hazard_loading: str | None = ...,
+    scale_dimensions: bool | None = ...,
+    adaptive_regularization: bool | None = ...,
+    firth: bool | None = ...,
+    response_geometry: str,
+    response_columns: list[str] | tuple[str, ...] | None = ...,
+    response_coordinates: str | None = ...,
+    response_reference: int | None = ...,
+    config: dict[str, Any] | None = ...,
+) -> ResponseGeometryModel: ...
 
 
 def fit(

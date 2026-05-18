@@ -75,8 +75,11 @@ if not _FORCE_SERIAL:
 for _k, _v in _SERIAL_ENV_OVERRIDES.items():
     os.environ[_k] = _v
 
-import numpy as np
-import pandas as pd
+# numpy and pandas are loaded via importlib (not `import ... as ...`) because
+# threading env vars above must take effect before these C extensions initialise
+# their BLAS/OpenMP pools at import time.
+np = importlib.import_module("numpy")
+pd = importlib.import_module("pandas")
 
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench"
@@ -5997,7 +6000,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                 train_df = all_df.iloc[fold.train_idx].copy()
                 test_df = all_df.iloc[fold.test_idx].copy()
                 event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
-                events = test_df[ds["event_col"]].to_numpy(dtype=float)
                 risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
                 train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
                 if risk.shape[0] != event_times.shape[0]:
@@ -7214,7 +7216,6 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
             train_df = all_df.iloc[fold.train_idx].copy()
             test_df = all_df.iloc[fold.test_idx].copy()
             event_times = test_df[ds["time_col"]].to_numpy(dtype=float)
-            events = test_df[ds["event_col"]].to_numpy(dtype=float)
             risk = np.asarray(fold_row.get("risk", []), dtype=float).reshape(-1)
             train_risk = np.asarray(fold_row.get("train_risk", []), dtype=float).reshape(-1)
             if risk.shape[0] != event_times.shape[0]:
@@ -7325,8 +7326,6 @@ def run_external_sksurv_rsf_cv(scenario: typing.Any, *, ds: dict[str, typing.Any
         risk = rsf.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
         cv_rows.append(
             {
                 "fit_sec": fit_sec,
@@ -7416,8 +7415,6 @@ def run_external_sksurv_coxnet_cv(scenario: typing.Any, *, ds: dict[str, typing.
         train_risk = model.predict(x_train).astype(float)
         risk = model.predict(x_test).astype(float)
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
         cv_rows.append(
             {
                 "fit_sec": fit_sec,

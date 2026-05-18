@@ -21,7 +21,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import LightSource, Normalize
-from matplotlib import cm
+from matplotlib import colormaps
 
 import gamfit
 
@@ -137,7 +137,9 @@ def style_3d_axes(ax, xlabel="x1", ylabel="x2", zlabel="z") -> None:
 # ---------------------------------------------------------------------------
 def render_hero(data: dict, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     log("[hero] grid eval")
-    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"]); y = np.asarray(data["y"])
+    x1 = np.asarray(data["x1"])
+    x2 = np.asarray(data["x2"])
+    y = np.asarray(data["y"])
     gx, gy, mean, se = grid_eval(model, side=120, with_se=True)
 
     vmin = float(min(y.min(), mean.min()))
@@ -183,7 +185,8 @@ def render_hero(data: dict, model) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 def render_zoo(data: dict, matern_mean: np.ndarray):
     log("[zoo] fitting alternates...")
-    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"])
+    x1 = np.asarray(data["x1"])
+    x2 = np.asarray(data["x2"])
     side = matern_mean.shape[0]
     g = np.linspace(0.0, 1.0, side)
     gx, gy = np.meshgrid(g, g)
@@ -246,7 +249,7 @@ def render_3d_shaded(gx, gy, mean) -> None:
     ax = fig.add_subplot(111, projection="3d")
 
     ls = LightSource(azdeg=315, altdeg=45)
-    rgb = ls.shade(mean, cmap=cm.magma,
+    rgb = ls.shade(mean, cmap=colormaps["magma"],
                    vert_exag=0.6, blend_mode="soft")
     ax.plot_surface(gx, gy, mean, facecolors=rgb,
                     rstride=1, cstride=1, linewidth=0,
@@ -271,7 +274,9 @@ def render_3d_shaded(gx, gy, mean) -> None:
 # Figure 4: 3D wireframe + scatter
 # ---------------------------------------------------------------------------
 def render_3d_wireframe(data: dict, gx, gy, mean) -> None:
-    x1 = np.asarray(data["x1"]); x2 = np.asarray(data["x2"]); y = np.asarray(data["y"])
+    x1 = np.asarray(data["x1"])
+    x2 = np.asarray(data["x2"])
+    y = np.asarray(data["y"])
 
     fig = plt.figure(figsize=(8.4, 6.0))
     ax = fig.add_subplot(111, projection="3d")
@@ -316,7 +321,7 @@ def render_3d_compare(surfaces: dict) -> None:
     for i, (title, mean) in enumerate([("Matérn", mean_m),
                                        ("Duchon", mean_d)], start=1):
         ax = fig.add_subplot(1, 2, i, projection="3d")
-        rgb = ls.shade(mean, cmap=cm.magma, norm=norm,
+        rgb = ls.shade(mean, cmap=colormaps["magma"], norm=norm,
                        vert_exag=0.6, blend_mode="soft")
         ax.plot_surface(gx, gy, mean, facecolors=rgb,
                         rstride=1, cstride=1, linewidth=0,
@@ -414,10 +419,10 @@ def render_marginal_slope_3d() -> None:
     ax = fig.add_subplot(111, projection="3d")
 
     ls = LightSource(azdeg=315, altdeg=45)
-    rgb_base = ls.shade(p_base, cmap=cm.viridis,
+    rgb_base = ls.shade(p_base, cmap=colormaps["viridis"],
                         norm=Normalize(vmin=vmin, vmax=vmax),
                         vert_exag=0.6, blend_mode="soft")
-    rgb_high = ls.shade(p_high, cmap=cm.magma,
+    rgb_high = ls.shade(p_high, cmap=colormaps["magma"],
                         norm=Normalize(vmin=vmin, vmax=vmax),
                         vert_exag=0.6, blend_mode="soft")
 
@@ -430,7 +435,8 @@ def render_marginal_slope_3d() -> None:
     ax.contour(gx, gy, p_base, zdir="z", offset=vmin - 0.02,
                levels=10, cmap="viridis", linewidths=0.5, alpha=0.7)
 
-    ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
     ax.set_zlim(vmin - 0.02, vmax + 0.04)
     # `set_zlabel` gets clipped at this camera angle.  Annotate the
     # z-quantity as a figure-coord label instead, on the same row as the
