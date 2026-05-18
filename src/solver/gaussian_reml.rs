@@ -3,7 +3,7 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 
 const RHO_LOWER: f64 = -30.0;
@@ -1153,6 +1153,56 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     } else {
         None
     };
+    // When batched Cholesky succeeded AND the policy approves the K-way
+    // whitening (`L_b⁻¹ · S · L_b⁻ᵀ`), pre-compute every transformed-penalty
+    // matrix via two batched cuBLAS dispatches (one broadcast B, one
+    // strided AB-with-transpose) instead of K pairs of per-fit gemms. The
+    // per-fit inverse `L_b⁻¹` is computed serially with `invert_lower_triangular`
+    // — it is `O(p²)` work that does not justify a batched TRSM at typical
+    // biobank `p`, but the two gemms are `O(p³)` and benefit at higher p.
+    let batched_transforms: Option<Vec<Array2<f64>>> =
+        if let Some(ref lowers) = batched_lowers {
+            let mut l_inverses = Vec::with_capacity(k);
+            let mut all_ok = true;
+            for lower in lowers.iter() {
+                match invert_lower_triangular(lower) {
+                    Ok(l_inv) => l_inverses.push(l_inv),
+                    Err(_) => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !all_ok {
+                None
+            } else {
+                let mut linv_stack = Array3::<f64>::zeros((k, p, p));
+                for (b, l_inv) in l_inverses.iter().enumerate() {
+                    linv_stack.slice_mut(s![b, .., ..]).assign(l_inv);
+                }
+                if let Some(m_stack) =
+                    crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)
+                {
+                    if let Some(t_stack) = crate::gpu::try_fast_abt_strided_batched(
+                        m_stack.view(),
+                        linv_stack.view(),
+                    ) {
+                        let mut out = Vec::with_capacity(k);
+                        for b in 0..k {
+                            out.push(t_stack.slice(s![b, .., ..]).to_owned());
+                        }
+                        Some(out)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let mut results = Vec::with_capacity(k);
     for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
         let lower = if let Some(ref mut lowers) = batched_lowers {
@@ -1166,11 +1216,15 @@ pub fn build_gaussian_reml_eigen_cache_batched(
                 }
             }
         };
-        results.push(gaussian_reml_eigen_cache_from_lower(
+        let precomputed = batched_transforms
+            .as_ref()
+            .map(|transforms| transforms[b].clone());
+        results.push(gaussian_reml_eigen_cache_from_lower_with_transform(
             lower,
             penalty,
             nullspace_dim,
             fingerprints[b],
+            precomputed,
         ));
     }
     results
@@ -1276,6 +1330,28 @@ fn gaussian_reml_eigen_cache_from_lower(
     nullspace_dim: Option<usize>,
     xtwx_fingerprint: u64,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
+    gaussian_reml_eigen_cache_from_lower_with_transform(
+        lower,
+        penalty,
+        nullspace_dim,
+        xtwx_fingerprint,
+        None,
+    )
+}
+
+/// Cache-build variant that accepts a pre-computed whitened penalty
+/// `L⁻¹·S·L⁻ᵀ`. The batched cache build supplies it via broadcast/strided
+/// batched cuBLAS gemms when the policy approves; per-fit callers pass
+/// `None` and the helper falls back to `invert_lower_triangular` + two
+/// `dense_ab` calls (which themselves route to `try_fast_*` per the
+/// host/GPU dispatch policy).
+fn gaussian_reml_eigen_cache_from_lower_with_transform(
+    lower: Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+    xtwx_fingerprint: u64,
+    precomputed_transform: Option<Array2<f64>>,
+) -> Result<GaussianRemlEigenCache, EstimationError> {
     let p = lower.nrows();
     if lower.ncols() != p {
         return Err(EstimationError::InvalidInput(
@@ -1284,9 +1360,14 @@ fn gaussian_reml_eigen_cache_from_lower(
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
-    let l_inv = invert_lower_triangular(&lower)?;
-    let penalty_in_metric = dense_ab(l_inv.view(), penalty);
-    let transformed_penalty = dense_ab(penalty_in_metric.view(), l_inv.t());
+    let transformed_penalty = match precomputed_transform {
+        Some(transformed) => transformed,
+        None => {
+            let l_inv = invert_lower_triangular(&lower)?;
+            let penalty_in_metric = dense_ab(l_inv.view(), penalty);
+            dense_ab(penalty_in_metric.view(), l_inv.t())
+        }
+    };
     let (mut penalty_eigenvalues, eigenvectors) =
         transformed_penalty.eigh(Side::Lower).map_err(|_| {
             EstimationError::ModelIsIllConditioned {
