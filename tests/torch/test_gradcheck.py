@@ -89,13 +89,14 @@ def test_gaussian_reml_fit_gradcheck():
 
 def test_gaussian_reml_fit_batched_gradcheck():
     _require_ffi("gaussian_reml_fit_batched")
-    rng = np.random.default_rng(14)
-    counts = [8, 9]
+    rng = np.random.default_rng(100)
+    counts = [10, 11]
     offsets = np.cumsum([0] + counts).astype(np.uintp)
     n_total = int(offsets[-1])
     m, d = 3, 1
     X = rng.standard_normal((n_total, m))
-    Y = rng.standard_normal((n_total, d))
+    beta = rng.standard_normal((m, d))
+    Y = X @ beta + 0.1 * rng.standard_normal((n_total, d))
     penalty = np.eye(m)
     x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
