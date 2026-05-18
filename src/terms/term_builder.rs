@@ -1181,6 +1181,7 @@ pub fn build_smooth_basis(
                     "order",
                     "identifiability",
                     "periodic",
+                    "cyclic",
                     "period",
                     "period_start",
                     "period_end",
