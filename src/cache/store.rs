@@ -11,7 +11,7 @@ use crate::cache::key::Fingerprint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -674,31 +674,36 @@ mod tests {
     }
 
     #[test]
-    fn stale_temp_files_are_swept() {
+    fn orphan_temp_files_from_dead_processes_are_swept() {
         let (_d, store) = temp_store();
         let key = key_for("tmp");
         let dir = store.key_dir(&key);
         fs::create_dir_all(&dir).unwrap();
-        let orphan = dir.join("r0-0.json.tmp.99999.0");
-        fs::write(&orphan, b"orphan").unwrap();
-        // Backdate it past the temp-sweep threshold (300s).
-        let past = SystemTime::now() - Duration::from_secs(600);
-        let _ = filetime_set(&orphan, past);
+        // Use PID 1 — never the current process, so it counts as "other".
+        let orphan_other = dir.join("r0-0.json.tmp.1.0");
+        let mine = dir.join(format!(
+            "r0-0.bin.tmp.{}.0",
+            std::process::id()
+        ));
+        fs::write(&orphan_other, b"orphan").unwrap();
+        fs::write(&mine, b"mine").unwrap();
         store.evict_overflow().unwrap();
-        assert!(!orphan.exists(), "stale temp file should be swept");
+        assert!(!orphan_other.exists(), "other-PID tmp file should be swept");
+        assert!(mine.exists(), "same-PID tmp file must be left alone");
     }
 
-    fn filetime_set(_p: &Path, _t: SystemTime) -> io::Result<()> {
-        // Best-effort; no portable stdlib way to set mtime, so this test is
-        // platform-tolerant: if we cannot backdate, the assertion still
-        // passes when the temp file is younger than the threshold (the
-        // sweep is a no-op, the file remains, the assert below would fail).
-        // To make the test deterministic everywhere, we instead rely on
-        // the fact that filesystem mtime equals the file's actual mtime
-        // and we re-open with truncate to refresh — skipping the backdate.
-        // The test serves primarily as a regression smoke for the path,
-        // not strict timing.
-        Ok(())
+    #[test]
+    fn tmp_filenames_without_pid_are_skipped() {
+        // Malformed tmp names (no parseable pid) must not crash the sweep.
+        let (_d, store) = temp_store();
+        let key = key_for("malformed");
+        let dir = store.key_dir(&key);
+        fs::create_dir_all(&dir).unwrap();
+        let weird = dir.join("garbage.tmp.notapid.suffix");
+        fs::write(&weird, b"x").unwrap();
+        // Must not panic.
+        store.evict_overflow().unwrap();
+        assert!(weird.exists());
     }
 
     #[test]

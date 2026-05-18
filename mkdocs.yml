@@ -127,6 +127,7 @@ nav:
     - Posterior sampling: posterior-sampling.md
     - Diagnostics, summaries, reports: diagnostics.md
     - scikit-learn integration: sklearn.md
+    - PyTorch integration: torch.md
     - Save and load: persistence.md
   - Reference:
     - API reference: api-reference.md
