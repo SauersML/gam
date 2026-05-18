@@ -35,10 +35,10 @@ fn bench_biobank_shape_line_search_pattern(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("biobank_shape_line_search_pattern");
     group.bench_function("before_backtracking_accepts_fifth", |b| {
-        b.iter(|| backtracking_pattern(black_box(radius)(&newton_step)))
+        b.iter(|| backtracking_pattern(black_box(radius), black_box(&newton_step)))
     });
     group.bench_function("after_trust_region_single_trial", |b| {
-        b.iter(|| trust_region_pattern(black_box(radius)(&newton_step)))
+        b.iter(|| trust_region_pattern(black_box(radius), black_box(&newton_step)))
     });
     group.finish();
 }
