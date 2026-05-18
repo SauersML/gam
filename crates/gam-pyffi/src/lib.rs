@@ -800,6 +800,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
     by: Option<PyReadonlyArray1<'py, f64>>,
@@ -816,6 +817,10 @@ fn gaussian_reml_fit_batched_backward<'py>(
     } else {
         x_view
     };
+    let forward_fits = forward_state
+        .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
+        .transpose()
+        .map_err(py_value_error)?;
     let backward = gaussian_reml_fit_batched_backward_impl(
         fit_x,
         y_view,
@@ -827,6 +832,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score.as_ref().map(|g| g.as_array()),
+        forward_fits.as_deref(),
     )
     .map_err(py_value_error)?;
 
@@ -1049,24 +1055,7 @@ fn gaussian_reml_fit_positions_batched<'py>(
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
-    out.set_item("status", result.statuses)?;
-    out.set_item("lambda", result.lambdas.into_pyarray(py))?;
-    out.set_item("rho", result.rhos.into_pyarray(py))?;
-    out.set_item("reml_score", result.reml_scores.into_pyarray(py))?;
-    out.set_item(
-        "reml_grad_lambda",
-        result.reml_grad_lambdas.into_pyarray(py),
-    )?;
-    out.set_item(
-        "reml_hess_lambda",
-        result.reml_hess_lambdas.into_pyarray(py),
-    )?;
-    out.set_item("reml_grad_rho", result.reml_grad_rhos.into_pyarray(py))?;
-    out.set_item("reml_hess_rho", result.reml_hess_rhos.into_pyarray(py))?;
-    out.set_item("edf", result.edf.into_pyarray(py))?;
-    out.set_item("coefficients", result.coefficients.into_pyarray(py))?;
-    out.set_item("fitted", result.fitted.into_pyarray(py))?;
-    out.set_item("sigma2", result.sigma2.into_pyarray(py))?;
+    set_batched_gaussian_reml_dict_items(py, &out, result)?;
     Ok(out.unbind())
 }
 
@@ -1081,6 +1070,7 @@ fn gaussian_reml_fit_positions_batched<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
+    forward_state = None,
     basis_order = 3,
     periodic = false,
     period = None,
@@ -1286,6 +1276,161 @@ fn gaussian_reml_fit_state_from_pydict(
                 .map_err(|err| err.to_string())?,
         },
     })
+}
+
+fn batched_gaussian_reml_fits_from_pydict(
+    state: &Bound<'_, PyDict>,
+    row_offsets: ArrayView1<'_, usize>,
+) -> Result<Vec<Option<gam::gaussian_reml::GaussianRemlMultiResult>>, String> {
+    fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
+        state
+            .get_item(key)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("forward_state is missing key {key:?}"))
+    }
+    if row_offsets.len() < 2 {
+        return Err("row_offsets must contain at least [0, n]".to_string());
+    }
+    let batch = row_offsets.len() - 1;
+
+    let statuses = get(state, "status")?
+        .extract::<Vec<String>>()
+        .map_err(|err| err.to_string())?;
+    if statuses.len() != batch {
+        return Err(format!(
+            "forward_state[\"status\"] length mismatch: expected {batch}, got {}",
+            statuses.len()
+        ));
+    }
+    let lambdas = get(state, "lambda")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let lambdas = lambdas.as_array();
+    let rhos = get(state, "rho")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let rhos = rhos.as_array();
+    let reml_scores = get(state, "reml_score")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_scores = reml_scores.as_array();
+    let reml_grad_lambdas = get(state, "reml_grad_lambda")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_grad_lambdas = reml_grad_lambdas.as_array();
+    let reml_hess_lambdas = get(state, "reml_hess_lambda")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_hess_lambdas = reml_hess_lambdas.as_array();
+    let reml_grad_rhos = get(state, "reml_grad_rho")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_grad_rhos = reml_grad_rhos.as_array();
+    let reml_hess_rhos = get(state, "reml_hess_rho")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let reml_hess_rhos = reml_hess_rhos.as_array();
+    let edf = get(state, "edf")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let edf = edf.as_array();
+    let coefficients = get(state, "coefficients")?
+        .extract::<PyReadonlyArray3<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let coefficients = coefficients.as_array();
+    let fitted = get(state, "fitted")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let fitted = fitted.as_array();
+    let sigma2 = get(state, "sigma2")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let sigma2 = sigma2.as_array();
+    let cache_penalty_eigenvalues = get(state, "cache_penalty_eigenvalues")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_penalty_eigenvalues = cache_penalty_eigenvalues.as_array();
+    let cache_eigenvectors = get(state, "cache_eigenvectors")?
+        .extract::<PyReadonlyArray3<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_eigenvectors = cache_eigenvectors.as_array();
+    let cache_coefficient_basis = get(state, "cache_coefficient_basis")?
+        .extract::<PyReadonlyArray3<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_coefficient_basis = cache_coefficient_basis.as_array();
+    let cache_xtwx_fingerprints = get(state, "cache_xtwx_fingerprints")?
+        .extract::<PyReadonlyArray1<'_, u64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_xtwx_fingerprints = cache_xtwx_fingerprints.as_array();
+    let cache_penalty_fingerprints = get(state, "cache_penalty_fingerprints")?
+        .extract::<PyReadonlyArray1<'_, u64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_penalty_fingerprints = cache_penalty_fingerprints.as_array();
+    let cache_logdet_xtwx = get(state, "cache_logdet_xtwx")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_logdet_xtwx = cache_logdet_xtwx.as_array();
+    let cache_logdet_penalty_positive = get(state, "cache_logdet_penalty_positive")?
+        .extract::<PyReadonlyArray1<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_logdet_penalty_positive = cache_logdet_penalty_positive.as_array();
+    let cache_penalty_ranks = get(state, "cache_penalty_ranks")?
+        .extract::<PyReadonlyArray1<'_, i64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_penalty_ranks = cache_penalty_ranks.as_array();
+    let cache_nullities = get(state, "cache_nullities")?
+        .extract::<PyReadonlyArray1<'_, i64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_nullities = cache_nullities.as_array();
+
+    let mut fits = Vec::with_capacity(batch);
+    for b in 0..batch {
+        if statuses[b] != "ok" {
+            fits.push(None);
+            continue;
+        }
+        let rank = cache_penalty_ranks[b];
+        let nullity = cache_nullities[b];
+        if rank < 0 || nullity < 0 {
+            return Err(format!(
+                "forward_state cache_penalty_ranks[{b}]={rank} or cache_nullities[{b}]={nullity} must be non-negative"
+            ));
+        }
+        let start = row_offsets[b];
+        let end = row_offsets[b + 1];
+        if start > end || end > fitted.nrows() {
+            return Err(format!(
+                "row_offsets[{b}..{}]=({start},{end}) outside fitted shape {}",
+                b + 1,
+                fitted.nrows()
+            ));
+        }
+        fits.push(Some(gam::gaussian_reml::GaussianRemlMultiResult {
+            lambda: lambdas[b],
+            rho: rhos[b],
+            coefficients: coefficients.slice(s![b, .., ..]).to_owned(),
+            fitted: fitted.slice(s![start..end, ..]).to_owned(),
+            reml_score: reml_scores[b],
+            reml_grad_lambda: reml_grad_lambdas[b],
+            reml_hess_lambda: reml_hess_lambdas[b],
+            reml_grad_rho: reml_grad_rhos[b],
+            reml_hess_rho: reml_hess_rhos[b],
+            edf: edf[b],
+            sigma2: sigma2.slice(s![b, ..]).to_owned(),
+            cache: gam::gaussian_reml::GaussianRemlEigenCache {
+                penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
+                eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
+                coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+                xtwx_fingerprint: cache_xtwx_fingerprints[b],
+                penalty_fingerprint: cache_penalty_fingerprints[b],
+                logdet_xtwx: cache_logdet_xtwx[b],
+                logdet_penalty_positive: cache_logdet_penalty_positive[b],
+                penalty_rank: rank as usize,
+                nullity: nullity as usize,
+            },
+        }));
+    }
+    Ok(fits)
 }
 
 fn set_degenerate_gaussian_reml_items<'py>(
@@ -1650,6 +1795,7 @@ fn gaussian_reml_fit_batched_backward_impl(
     grad_coefficients: Option<ArrayView3<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
+    forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
 ) -> Result<BatchedGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -1667,6 +1813,14 @@ fn gaussian_reml_fit_batched_backward_impl(
         grad_fitted,
         grad_reml_score,
     )?;
+    if let Some(fits) = forward_fits {
+        if fits.len() != batch {
+            return Err(format!(
+                "forward_state fit count mismatch: expected {batch}, got {}",
+                fits.len()
+            ));
+        }
+    }
 
     let results: Vec<
         Result<
@@ -1689,17 +1843,37 @@ fn gaussian_reml_fit_batched_backward_impl(
             let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
-            match gaussian_reml_multi_closed_form_backward(
-                x.slice(s![start..end, ..]),
-                y.slice(s![start..end, ..]),
-                penalty,
-                weight_slice,
-                init_lambda,
-                upstream_lambda,
-                upstream_coefficients,
-                upstream_fitted,
-                upstream_reml_score,
-            ) {
+            let x_slice = x.slice(s![start..end, ..]);
+            let y_slice = y.slice(s![start..end, ..]);
+            let backward_result = if let Some(fits) = forward_fits {
+                match fits[b].as_ref() {
+                    Some(fit) => gaussian_reml_multi_closed_form_backward_from_fit(
+                        x_slice,
+                        y_slice,
+                        penalty,
+                        weight_slice,
+                        fit,
+                        upstream_lambda,
+                        upstream_coefficients,
+                        upstream_fitted,
+                        upstream_reml_score,
+                    ),
+                    None => return Ok((b, None)),
+                }
+            } else {
+                gaussian_reml_multi_closed_form_backward(
+                    x_slice,
+                    y_slice,
+                    penalty,
+                    weight_slice,
+                    init_lambda,
+                    upstream_lambda,
+                    upstream_coefficients,
+                    upstream_fitted,
+                    upstream_reml_score,
+                )
+            };
+            match backward_result {
                 Ok(backward) => Ok((b, Some(backward))),
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
                 Err(err) => Err(format!("batched Gaussian REML backward {b} failed: {err}")),
