@@ -144,6 +144,32 @@ def test_gaussian_reml_fit_batched_parity():
     np.testing.assert_allclose(g.reml_score.detach().numpy(), e["reml_score"], rtol=0, atol=0)
 
 
+def test_gaussian_reml_fit_batched_by_matches_manual_gate():
+    _require_ffi("gaussian_reml_fit_batched")
+    rng = np.random.default_rng(61)
+    counts = [12, 14]
+    offsets = np.cumsum([0] + counts).astype(np.uintp)
+    n_total = int(offsets[-1])
+    m, d = 4, 1
+    X = rng.standard_normal((n_total, m))
+    Y = rng.standard_normal((n_total, d))
+    penalty = np.eye(m)
+    by = rng.uniform(0.6, 1.4, size=n_total)
+    gated = X.copy()
+    gated[:, 1:] *= by[:, None]
+    e = _np_api.gaussian_reml_fit_batched(gated, Y, offsets, penalty)
+    g = gt.gaussian_reml_fit_batched(
+        _tensor(X),
+        _tensor(Y),
+        torch.as_tensor(offsets),
+        _tensor(penalty),
+        by=_tensor(by),
+        by_start_col=1,
+    )
+    np.testing.assert_allclose(g.coefficients.detach().numpy(), e["coefficients"], rtol=0, atol=0)
+    np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
+
+
 def test_gaussian_reml_fit_positions_parity():
     _require_ffi("gaussian_reml_fit_positions")
     rng = np.random.default_rng(7)
@@ -223,3 +249,19 @@ def test_geometry_parity_smoke():
         rtol=1e-12,
         atol=1e-12,
     )
+
+
+def test_geometry_torch_inputs_keep_autograd():
+    x = (torch.rand((6, 4), dtype=torch.float64) + 0.25).requires_grad_()
+    base = torch.full((4,), 0.25, dtype=torch.float64)
+    simplex = gt.simplex_exp_map(gt.simplex_log_map(x, base), base)
+    loss = simplex.square().sum() + gt.clr(x).square().sum()
+    loss.backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+    tangent = (torch.randn((5, 3), dtype=torch.float64) * 0.05).requires_grad_()
+    sphere = gt.sphere_exp_map(tangent, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
+    sphere.sum().backward()
+    assert tangent.grad is not None
+    assert torch.isfinite(tangent.grad).all()
