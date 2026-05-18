@@ -643,7 +643,40 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     let p = x.ncols();
     let d = y.ncols();
     let weight = gaussian_reml_weights(n, weights)?;
-    let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?;
+    gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
+        x,
+        y,
+        penalty,
+        weight,
+        fit,
+        gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?,
+        upstream_lambda,
+        upstream_coefficients,
+        upstream_fitted,
+        upstream_reml_score,
+        n,
+        p,
+        d,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weight: Array1<f64>,
+    fit: &GaussianRemlMultiResult,
+    inverse_hessian: Array2<f64>,
+    upstream_lambda: f64,
+    upstream_coefficients: Option<ArrayView2<'_, f64>>,
+    upstream_fitted: Option<ArrayView2<'_, f64>>,
+    upstream_reml_score: f64,
+    n: usize,
+    p: usize,
+    d: usize,
+) -> Result<GaussianRemlBackwardResult, EstimationError> {
+    let lambda = fit.lambda;
     let beta = &fit.coefficients;
     let residual = y.to_owned() - &fit.fitted;
     let nu = n as f64 - fit.cache.nullity as f64;
@@ -726,23 +759,131 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
     problems: &[GaussianRemlMultiBackwardProblem<'a>],
     penalty: ArrayView2<'a, f64>,
 ) -> Result<Vec<GaussianRemlBackwardResult>, EstimationError> {
+    // Batched precompute of `(X'WX + λS)⁻¹` for all K problems via one
+    // strided-batched cuBLAS `A · Bᵀ`. The dispatch is gated on the same
+    // gemm policy threshold as single-fit dispatch, so it engages at
+    // biobank-scale `K = 16 000` for high-dim `p` where the K-aggregate
+    // FLOP count beats the per-fit threshold; for small `p` the policy
+    // declines and each fit falls back to its own
+    // `gaussian_reml_inverse_hessian_from_cache` call inside `_from_fit`.
+    let batched_inverses = batched_inverse_hessians_from_caches(problems);
     let results: Vec<Result<GaussianRemlBackwardResult, EstimationError>> = problems
         .par_iter()
-        .map(|problem| {
-            gaussian_reml_multi_closed_form_backward_from_fit(
+        .enumerate()
+        .map(|(b, problem)| {
+            validate_gaussian_reml_backward_upstreams(
                 problem.x.view(),
                 problem.y.view(),
                 penalty,
-                problem.weights.as_ref().map(|weights| weights.view()),
-                problem.fit,
                 problem.grad_lambda,
-                problem.grad_coefficients.as_ref().map(|grad| grad.view()),
-                problem.grad_fitted.as_ref().map(|grad| grad.view()),
+                problem.grad_coefficients.as_ref().map(|g| g.view()),
+                problem.grad_fitted.as_ref().map(|g| g.view()),
                 problem.grad_reml_score,
+            )?;
+            validate_gaussian_reml_forward_fit(
+                problem.x.view(),
+                problem.y.view(),
+                penalty,
+                problem.weights.as_ref().map(|w| w.view()),
+                problem.fit,
+            )?;
+            let lambda = problem.fit.lambda;
+            if !(problem.fit.reml_hess_rho.is_finite() && problem.fit.reml_hess_rho.abs() > 1.0e-14)
+            {
+                return Err(EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                });
+            }
+            let n = problem.x.nrows();
+            let p = problem.x.ncols();
+            let d = problem.y.ncols();
+            let weight = gaussian_reml_weights(
+                n,
+                problem.weights.as_ref().map(|w| w.view()),
+            )?;
+            let inverse_hessian = if let Some(ref stacks) = batched_inverses {
+                stacks[b].clone()
+            } else {
+                gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, lambda)?
+            };
+            gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
+                problem.x.view(),
+                problem.y.view(),
+                penalty,
+                weight,
+                problem.fit,
+                inverse_hessian,
+                problem.grad_lambda,
+                problem.grad_coefficients.as_ref().map(|g| g.view()),
+                problem.grad_fitted.as_ref().map(|g| g.view()),
+                problem.grad_reml_score,
+                n,
+                p,
+                d,
             )
         })
         .collect();
     results.into_iter().collect()
+}
+
+/// Compute K inverse Hessian matrices `(X'WX_b + λ_b S)⁻¹` for the batched
+/// backward path via one cuBLAS strided-batched `A · Bᵀ` call. Each problem
+/// shares the same eigen-cache layout (uniform `p`), so the scaled
+/// coefficient bases form a fixed-shape stack. Returns `None` when shapes
+/// disagree, the policy declines (small aggregate FLOPs), or the device
+/// path fails — caller then falls back to per-fit
+/// `gaussian_reml_inverse_hessian_from_cache` calls.
+fn batched_inverse_hessians_from_caches<'a>(
+    problems: &[GaussianRemlMultiBackwardProblem<'a>],
+) -> Option<Vec<Array2<f64>>> {
+    if problems.is_empty() {
+        return None;
+    }
+    let p = problems[0].fit.cache.penalty_eigenvalues.len();
+    if p == 0 {
+        return None;
+    }
+    if !problems
+        .iter()
+        .all(|prob| prob.fit.cache.coefficient_basis.dim() == (p, p))
+    {
+        return None;
+    }
+    if !crate::gpu::GpuRuntime::global()
+        .policy()
+        .route_gemm(p, p, p)
+    {
+        return None;
+    }
+    let k = problems.len();
+    let mut scaled_stack = Array3::<f64>::zeros((k, p, p));
+    let mut basis_stack = Array3::<f64>::zeros((k, p, p));
+    for (b, problem) in problems.iter().enumerate() {
+        let cache = &problem.fit.cache;
+        let lambda = problem.fit.lambda;
+        let mut scaled = cache.coefficient_basis.clone();
+        for eig in 0..p {
+            let denom = 1.0 + lambda * cache.penalty_eigenvalues[eig];
+            if !denom.is_finite() || denom.abs() <= 0.0 {
+                return None;
+            }
+            let scale = 1.0 / denom;
+            for row in 0..p {
+                scaled[[row, eig]] *= scale;
+            }
+        }
+        scaled_stack.slice_mut(s![b, .., ..]).assign(&scaled);
+        basis_stack
+            .slice_mut(s![b, .., ..])
+            .assign(&cache.coefficient_basis);
+    }
+    let result_stack =
+        crate::gpu::try_fast_abt_strided_batched(scaled_stack.view(), basis_stack.view())?;
+    let mut per_fit = Vec::with_capacity(k);
+    for b in 0..k {
+        per_fit.push(result_stack.slice(s![b, .., ..]).to_owned());
+    }
+    Some(per_fit)
 }
 
 fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
