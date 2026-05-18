@@ -12,7 +12,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-import gamfit.torch as gt  # noqa: E402
+import gamfit.torch as gt
 
 
 def _require_ffi(name: str) -> None:

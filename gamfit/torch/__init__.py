@@ -24,44 +24,47 @@ The subpackage is an optional extra: ``pip install gamfit[torch]``. Importing
 
 from __future__ import annotations
 
+# Re-exporting the public surface below transitively imports ``torch`` via the
+# submodules, so a missing optional ``torch`` dependency surfaces here as an
+# :class:`ImportError`. Translate that into a user-actionable message before any
+# downstream consumer sees a raw ``No module named 'torch'``.
 try:
-    import torch  # noqa: F401  (imported eagerly so callers fail fast)
+    from ._basis import (
+        bspline_basis,
+        bspline_basis_derivative,
+        duchon_basis_1d,
+        duchon_basis_1d_derivative,
+        gaussian_weighted_ridge,
+        gaussian_weighted_ridge_batch,
+        smoothness_penalty,
+    )
+    from ._reml import (
+        GaussianRemlOutput,
+        gaussian_reml_fit,
+        gaussian_reml_fit_batched,
+        gaussian_reml_fit_positions,
+        gaussian_reml_fit_positions_batched,
+    )
+    from .geometry import (
+        alr,
+        closure,
+        clr,
+        inverse_alr,
+        simplex_exp_map,
+        simplex_frechet_mean,
+        simplex_log_map,
+        sphere_exp_map,
+        sphere_frechet_mean,
+        sphere_log_map,
+    )
+    from .modules import from_fitted
 except ImportError as _exc:  # pragma: no cover - import-time guard
-    raise ImportError(
-        "gamfit.torch requires the optional `torch` dependency. "
-        "Install via `pip install gamfit[torch]` or `pip install torch`."
-    ) from _exc
-del torch
-
-from ._basis import (
-    bspline_basis,
-    bspline_basis_derivative,
-    duchon_basis_1d,
-    duchon_basis_1d_derivative,
-    gaussian_weighted_ridge,
-    gaussian_weighted_ridge_batch,
-    smoothness_penalty,
-)
-from ._reml import (
-    GaussianRemlOutput,
-    gaussian_reml_fit,
-    gaussian_reml_fit_batched,
-    gaussian_reml_fit_positions,
-    gaussian_reml_fit_positions_batched,
-)
-from .geometry import (
-    alr,
-    closure,
-    clr,
-    inverse_alr,
-    simplex_exp_map,
-    simplex_frechet_mean,
-    simplex_log_map,
-    sphere_exp_map,
-    sphere_frechet_mean,
-    sphere_log_map,
-)
-from .modules import from_fitted
+    if _exc.name == "torch":
+        raise ImportError(
+            "gamfit.torch requires the optional `torch` dependency. "
+            "Install via `pip install gamfit[torch]` or `pip install torch`."
+        ) from _exc
+    raise
 
 __all__ = [
     "GaussianRemlOutput",

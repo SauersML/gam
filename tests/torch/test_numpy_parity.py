@@ -13,8 +13,8 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("gamfit")
 
-from gamfit import _api as _np_api  # noqa: E402
-import gamfit.torch as gt  # noqa: E402
+from gamfit import _api as _np_api
+import gamfit.torch as gt
 
 
 def _require_ffi(name: str) -> None:

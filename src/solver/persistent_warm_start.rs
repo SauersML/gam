@@ -29,6 +29,70 @@ pub(crate) struct PersistentWarmStartRecord {
     pub last_pirls_accept_rho: Option<f64>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistentBlockWarmStartRecord {
+    pub version: u32,
+    pub key: String,
+    pub package_version: String,
+    pub created_unix_secs: u64,
+    pub updated_unix_secs: u64,
+    pub n_rows: usize,
+    pub block_names: Vec<String>,
+    pub block_dims: Vec<usize>,
+    pub rho: Vec<f64>,
+    pub block_beta: Vec<Vec<f64>>,
+    pub active_sets: Vec<Option<Vec<usize>>>,
+}
+
+impl PersistentBlockWarmStartRecord {
+    pub(crate) fn new(
+        key: String,
+        n_rows: usize,
+        block_names: Vec<String>,
+        block_dims: Vec<usize>,
+    ) -> Self {
+        let now = unix_secs_now();
+        Self {
+            version: CACHE_VERSION,
+            key,
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_unix_secs: now,
+            updated_unix_secs: now,
+            n_rows,
+            block_names,
+            block_dims,
+            rho: Vec::new(),
+            block_beta: Vec::new(),
+            active_sets: Vec::new(),
+        }
+    }
+
+    pub(crate) fn is_compatible(
+        &self,
+        key: &str,
+        n_rows: usize,
+        block_names: &[String],
+        block_dims: &[usize],
+        rho_len: usize,
+    ) -> bool {
+        self.version == CACHE_VERSION
+            && self.key == key
+            && self.package_version == env!("CARGO_PKG_VERSION")
+            && self.n_rows == n_rows
+            && self.block_names == block_names
+            && self.block_dims == block_dims
+            && self.rho.len() == rho_len
+            && self.rho.iter().all(|v| v.is_finite())
+            && self.block_beta.len() == block_dims.len()
+            && self
+                .block_beta
+                .iter()
+                .zip(block_dims.iter())
+                .all(|(beta, dim)| beta.len() == *dim && beta.iter().all(|v| v.is_finite()))
+            && self.active_sets.len() == block_dims.len()
+    }
+}
+
 impl PersistentWarmStartRecord {
     pub(crate) fn new(key: String, n_rows: usize, n_cols: usize) -> Self {
         let now = unix_secs_now();
@@ -136,7 +200,34 @@ pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
     }
 }
 
+pub(crate) fn load_block_record(key: &str) -> Option<PersistentBlockWarmStartRecord> {
+    let path = cache_file_path(key)?;
+    let metadata = fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_ENTRY_BYTES {
+        let _ = fs::remove_file(path);
+        return None;
+    }
+    let mut file = File::open(&path).ok()?;
+    let mut raw = String::with_capacity(metadata.len() as usize);
+    file.read_to_string(&mut raw).ok()?;
+    match serde_json::from_str::<PersistentBlockWarmStartRecord>(&raw) {
+        Ok(record) => Some(record),
+        Err(_) => {
+            let _ = fs::remove_file(path);
+            None
+        }
+    }
+}
+
 pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
+    store_json_record(&record.key, record)
+}
+
+pub(crate) fn store_block_record(record: &PersistentBlockWarmStartRecord) -> Result<(), String> {
+    store_json_record(&record.key, record)
+}
+
+fn store_json_record<T: Serialize>(key: &str, record: &T) -> Result<(), String> {
     let dir = cache_dir()?;
     fs::create_dir_all(&dir).map_err(|e| {
         format!(
@@ -144,7 +235,7 @@ pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), Str
             dir.display()
         )
     })?;
-    let path = cache_file_path_in_dir(&dir, &record.key);
+    let path = cache_file_path_in_dir(&dir, key);
     let bytes = serde_json::to_vec(record)
         .map_err(|e| format!("failed to encode warm-start cache record: {e}"))?;
     if bytes.len() as u64 > MAX_ENTRY_BYTES {
@@ -153,7 +244,7 @@ pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), Str
 
     let tmp = dir.join(format!(
         ".{}.{}.tmp",
-        record.key,
+        key,
         std::process::id() as u64 ^ unix_nanos_now()
     ));
     {
