@@ -42,7 +42,8 @@
 //!       of truth for setting `CLOSED_FORM_OPERATOR_THRESHOLD` in
 //!       production.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use ndarray::{Array1, Array2};
 
 use gam::terms::basis::{
