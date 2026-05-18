@@ -12288,6 +12288,11 @@ fn try_exact_joint_spatial_aniso_optimization(
         seed_risk_profile_for_likelihood_family(family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
+        // Rho-axis BFGS cap: log-λ's natural step is ≈ 5 per
+        // `first_order_bfgs_loglambda_step_cap`. Anything tighter throttles
+        // BFGS on flat REML valleys.
+        Some(5.0),
+        // Psi-axis BFGS cap: kappa / aniso-log-scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
         None,
     );
@@ -12584,6 +12589,9 @@ fn try_exact_joint_spatial_isotropic_optimization(
         seed_risk_profile_for_likelihood_family(family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
+        // Rho-axis cap: log-λ natural step ≈ 5.
+        Some(5.0),
+        // Psi-axis cap: kappa scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
         None,
     );
@@ -14468,6 +14476,9 @@ where
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
+        // Rho-axis cap: log-λ natural step ≈ 5.
+        Some(5.0),
+        // Psi-axis cap: kappa scale needs ~ln 2 per iter.
         Some(kappa_options.log_step.clamp(0.25, 1.0)),
         screening_cap.clone(),
     );
