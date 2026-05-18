@@ -7,6 +7,8 @@ backward is consistent with finite differences taken through the forward.
 
 from __future__ import annotations
 
+from typing import cast
+
 import numpy as np
 import pytest
 
@@ -45,7 +47,7 @@ def test_bspline_basis_gradcheck() -> None:
     knots = torch.tensor(np.linspace(0.0, 1.0, 9), dtype=torch.float64)
 
     def f(t_: torch.Tensor) -> torch.Tensor:
-        return gt.bspline_basis(t_, knots, degree=3, periodic=False)
+        return cast(torch.Tensor, gt.bspline_basis(t_, knots, degree=3, periodic=False))
 
     assert torch.autograd.gradcheck(
         f,
@@ -66,7 +68,7 @@ def test_duchon_basis_1d_gradcheck() -> None:
     centers = torch.tensor(np.linspace(0.0, 1.0, 5), dtype=torch.float64)
 
     def f(t_: torch.Tensor) -> torch.Tensor:
-        return gt.duchon_basis_1d(t_, centers, m=2, periodic=False)
+        return cast(torch.Tensor, gt.duchon_basis_1d(t_, centers, m=2, periodic=False))
 
     assert torch.autograd.gradcheck(
         f,
