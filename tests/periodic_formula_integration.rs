@@ -66,25 +66,6 @@ fn fit_from_formula_accepts_tensor_period_origin_aliases() {
 }
 
 #[test]
-fn fit_from_formula_rejects_cyclic_duchon_with_redirect() {
-    init_parallelism();
-    let data = periodic_dataset();
-    let config = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let err = match fit_from_formula("y ~ duchon(theta, periodic=true, k=8)", &data, &config) {
-        Ok(_) => panic!("periodic Duchon formula should redirect to supported periodic smooths"),
-        Err(err) => err,
-    };
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-    assert!(
-        lower.contains("duchon") && lower.contains("periodic=true"),
-        "periodic Duchon rejection should name the unsupported request: {msg}",
-    );
-    assert!(
-        lower.contains("s(") && lower.contains("te("),
-        "periodic Duchon rejection should point to supported alternatives: {msg}",
-    );
+fn fit_from_formula_accepts_cyclic_duchon() {
+    assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
 }
