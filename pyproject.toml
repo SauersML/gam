@@ -63,6 +63,7 @@ numpy = ["numpy>=1.26"]
 pandas = ["pandas>=2.0", "pyarrow>=14"]
 plot = ["matplotlib>=3.8"]
 sklearn = ["scikit-learn>=1.4", "numpy>=1.26"]
+torch = ["torch>=2.0"]
 type = [
   "mypy>=1.18",
   "numpy>=1.26",

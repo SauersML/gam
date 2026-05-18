@@ -430,11 +430,7 @@ pub fn try_fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
             Some(out)
         }
         None => {
-            diagnostics::log_runtime_cpu(
-                "xt_diag_x",
-                "cuBLAS",
-                format!("rows={rows} cols={cols}"),
-            );
+            diagnostics::log_runtime_cpu("xt_diag_x", "cuBLAS", format!("rows={rows} cols={cols}"));
             None
         }
     }
@@ -470,9 +466,7 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
                 &device,
                 format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
                 diagnostics::gemm_flops(x.ncols(), y.ncols(), rows),
-                diagnostics::bytes_for_f64(
-                    x.len().saturating_add(y.len()).saturating_add(w.len()),
-                ),
+                diagnostics::bytes_for_f64(x.len().saturating_add(y.len()).saturating_add(w.len())),
                 diagnostics::bytes_for_f64(x.ncols().saturating_mul(y.ncols())),
                 start.elapsed().as_secs_f64(),
             );
@@ -610,37 +604,38 @@ fn route_trsm(p: usize, rhs_cols: usize) -> bool {
     p > 0 && rhs_cols > 0 && GpuRuntime::global().policy().route_trsm(p, rhs_cols)
 }
 
-fn with_runtime<T>(mut f: impl FnMut(&mut CublasRuntime) -> Option<T>) -> Option<(T, GpuDeviceInfo)> {
+fn with_runtime<T>(
+    mut f: impl FnMut(&mut CublasRuntime) -> Option<T>,
+) -> Option<(T, GpuDeviceInfo)> {
     static RUNTIME: OnceLock<Vec<Mutex<CublasRuntime>>> = OnceLock::new();
-    let runtimes = RUNTIME
-        .get_or_init(|| {
-            GpuRuntime::global()
-                .devices()
-                .iter()
-                .filter_map(|device| {
-                    let cuda = match CudaWorkingState::init(device.ordinal) {
-                        Some(cuda) => cuda,
-                        None => {
-                            diagnostics::log_library_unavailable(
-                                "cuBLAS",
-                                &format!("CUDA context init failed for device {}", device.ordinal),
-                            );
-                            return None;
-                        }
-                    };
-                    match CublasRuntime::new(cuda, device.clone()) {
-                        Ok(runtime) => {
-                            diagnostics::log_library_ready("cuBLAS", &runtime.device);
-                            Some(Mutex::new(runtime))
-                        }
-                        Err(err) => {
-                            diagnostics::log_library_unavailable("cuBLAS", &err);
-                            None
-                        }
+    let runtimes = RUNTIME.get_or_init(|| {
+        GpuRuntime::global()
+            .devices()
+            .iter()
+            .filter_map(|device| {
+                let cuda = match CudaWorkingState::init(device.ordinal) {
+                    Some(cuda) => cuda,
+                    None => {
+                        diagnostics::log_library_unavailable(
+                            "cuBLAS",
+                            &format!("CUDA context init failed for device {}", device.ordinal),
+                        );
+                        return None;
                     }
-                })
-                .collect()
-        });
+                };
+                match CublasRuntime::new(cuda, device.clone()) {
+                    Ok(runtime) => {
+                        diagnostics::log_library_ready("cuBLAS", &runtime.device);
+                        Some(Mutex::new(runtime))
+                    }
+                    Err(err) => {
+                        diagnostics::log_library_unavailable("cuBLAS", &err);
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
     if runtimes.is_empty() {
         return None;
     }

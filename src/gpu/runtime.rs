@@ -5,7 +5,8 @@
 //! 1. dlopen the platform-specific driver library (`libcuda.so.1` on Linux,
 //!    `nvcuda.dll` on Windows, `libcuda.dylib` on macOS / CUDA-on-Mac).
 //! 2. Call `cuInit(0)` and `cuDeviceGetCount` to enumerate visible devices.
-//! 3. Materialize a [`GpuDeviceInfo`] per device and pick the best score.
+//! 3. Materialize a [`GpuDeviceInfo`] per device, sort by score, and keep the
+//!    full device set available for batched work partitioning.
 //!
 //! Probe failure is silent: callers see [`GpuRuntime::is_available`] return
 //! `false` and the dispatch policy stays unused. There are no environment
@@ -13,6 +14,7 @@
 
 use std::ffi::c_char;
 use std::fmt;
+use std::ops::Range;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -64,7 +66,13 @@ impl fmt::Display for GpuProbeError {
     }
 }
 
-/// Cached probe outcome — either a selected device or CPU-only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceBatchPlan {
+    pub ordinal: usize,
+    pub chunks: Vec<Range<usize>>,
+}
+
+/// Cached probe outcome — either a selected CUDA device set or CPU-only.
 #[derive(Debug)]
 pub struct GpuRuntime {
     selected_device: Option<GpuDeviceInfo>,
@@ -91,7 +99,7 @@ impl GpuRuntime {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let device = devices[0].clone();
-                let policy = DispatchPolicy::for_device(Some(&device));
+                let policy = DispatchPolicy::for_devices(&devices);
                 diagnostics::log_cuda_enabled(&device, &policy);
                 diagnostics::log_cuda_pool(&devices);
                 Self {
@@ -134,6 +142,11 @@ impl GpuRuntime {
         &self.devices
     }
 
+    #[inline]
+    pub fn device_by_ordinal(&self, ordinal: usize) -> Option<&GpuDeviceInfo> {
+        self.devices.iter().find(|device| device.ordinal == ordinal)
+    }
+
     /// Workload-size policy for the selected device.
     #[inline]
     pub fn policy(&self) -> &DispatchPolicy {
@@ -161,6 +174,92 @@ impl GpuRuntime {
             .as_ref()
     }
 
+    pub fn plan_batched_work_for_devices(
+        &self,
+        devices: &[GpuDeviceInfo],
+        batch_size: usize,
+        fixed_bytes_per_device: usize,
+        bytes_per_batch_item: usize,
+    ) -> Option<Vec<DeviceBatchPlan>> {
+        if batch_size == 0 {
+            return Some(Vec::new());
+        }
+        if devices.is_empty() || bytes_per_batch_item == 0 {
+            return None;
+        }
+
+        struct Candidate {
+            ordinal: usize,
+            score: f64,
+            capacity: usize,
+            chunks: Vec<Range<usize>>,
+        }
+
+        let mut candidates = devices
+            .iter()
+            .filter_map(|device| {
+                let budget = device.dispatch_memory_budget_bytes();
+                if budget <= fixed_bytes_per_device {
+                    return None;
+                }
+                let capacity = (budget - fixed_bytes_per_device) / bytes_per_batch_item;
+                if capacity == 0 {
+                    return None;
+                }
+                Some(Candidate {
+                    ordinal: device.ordinal,
+                    score: device.score().max(1.0),
+                    capacity,
+                    chunks: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let mut next = 0usize;
+        while next < batch_size {
+            let total_score = candidates.iter().map(|c| c.score).sum::<f64>().max(1.0);
+            let mut made_progress = false;
+            for candidate in candidates.iter_mut() {
+                if next >= batch_size {
+                    break;
+                }
+                let remaining = batch_size - next;
+                let proportional = ((remaining as f64) * candidate.score / total_score).ceil();
+                let take = (proportional as usize)
+                    .clamp(1, candidate.capacity)
+                    .min(remaining);
+                if take == 0 {
+                    continue;
+                }
+                let start = next;
+                next += take;
+                candidate.chunks.push(start..next);
+                made_progress = true;
+            }
+            if !made_progress {
+                return None;
+            }
+        }
+
+        let plans = candidates
+            .into_iter()
+            .filter(|candidate| !candidate.chunks.is_empty())
+            .map(|candidate| DeviceBatchPlan {
+                ordinal: candidate.ordinal,
+                chunks: candidate.chunks,
+            })
+            .collect::<Vec<_>>();
+        if plans.is_empty() { None } else { Some(plans) }
+    }
+
     /// Pick a start slot for a multi-device runtime pool. Callers should try
     /// slots modulo their own pool length from this offset.
     #[inline]
@@ -183,6 +282,13 @@ pub fn gpu_available() -> bool {
 #[inline]
 pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
     GpuRuntime::global().selected_device().cloned()
+}
+
+/// Convenience: every CUDA device visible to this process, sorted by dispatch
+/// preference.
+#[inline]
+pub fn gpu_device_infos() -> Vec<GpuDeviceInfo> {
+    GpuRuntime::global().devices().to_vec()
 }
 
 fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
@@ -337,5 +443,47 @@ mod tests {
         if !a {
             assert!(selected_gpu_info().is_none());
         }
+    }
+
+    #[test]
+    fn batch_planner_splits_by_capacity_and_score() {
+        let runtime = GpuRuntime {
+            selected_device: None,
+            devices: Vec::new(),
+            policy: DispatchPolicy::for_device(None),
+            cpu_reason: None,
+            dispatch_cursor: AtomicUsize::new(0),
+        };
+        let devices = vec![
+            GpuDeviceInfo {
+                ordinal: 0,
+                name: "H100".to_string(),
+                compute_capability_major: 9,
+                compute_capability_minor: 0,
+                sm_count: 132,
+                total_memory_bytes: 80 * 1024 * 1024 * 1024,
+            },
+            GpuDeviceInfo {
+                ordinal: 1,
+                name: "T4".to_string(),
+                compute_capability_major: 7,
+                compute_capability_minor: 5,
+                sm_count: 40,
+                total_memory_bytes: 16 * 1024 * 1024 * 1024,
+            },
+        ];
+        let plans = runtime
+            .plan_batched_work_for_devices(&devices, 100, 0, 1024 * 1024 * 1024)
+            .expect("large devices should accept 1GiB batch items");
+        assert_eq!(
+            plans
+                .iter()
+                .flat_map(|plan| plan.chunks.iter())
+                .map(|range| range.end - range.start)
+                .sum::<usize>(),
+            100
+        );
+        assert!(plans.iter().any(|plan| plan.ordinal == 0));
+        assert!(plans.iter().any(|plan| plan.ordinal == 1));
     }
 }
