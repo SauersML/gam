@@ -3106,7 +3106,7 @@ impl<'a> RemlState<'a> {
             .read()
             .unwrap()
             .as_ref()
-            .map(Array1::to_vec);
+            .map(|rho| rho.to_vec());
         record.prev_beta = self
             .prev_warm_start_beta
             .read()
@@ -3115,12 +3115,10 @@ impl<'a> RemlState<'a> {
             .map(|coefficients| coefficients.0.to_vec());
         record.last_inner_iters = self.last_inner_iters.load(Ordering::Relaxed);
         record.last_inner_converged = self.last_inner_converged.load(Ordering::Relaxed);
-        record.last_pirls_lm_lambda = finite_positive_from_bits(
-            self.last_pirls_lm_lambda.load(Ordering::Relaxed),
-        );
-        record.last_ift_prediction_residual = finite_nonnegative_from_bits(
-            self.last_ift_prediction_residual.load(Ordering::Relaxed),
-        );
+        record.last_pirls_lm_lambda =
+            finite_positive_from_bits(self.last_pirls_lm_lambda.load(Ordering::Relaxed));
+        record.last_ift_prediction_residual =
+            finite_nonnegative_from_bits(self.last_ift_prediction_residual.load(Ordering::Relaxed));
         record.last_pirls_accept_rho =
             finite_nonnegative_from_bits(self.last_pirls_accept_rho.load(Ordering::Relaxed));
         if let Err(err) = store_record(&record) {
@@ -4208,6 +4206,9 @@ impl<'a> RemlState<'a> {
         // two (ρ, β) pairs to extrapolate β at the new ρ; falls back to
         // the flat last-β when no history). Either path produces a
         // `Coefficients` value used as the inner Newton's seed.
+        if !in_screening {
+            self.load_persistent_warm_start_once();
+        }
         let predicted_warm_start_with_source = if self.warm_start_enabled.load(Ordering::Relaxed) {
             self.predict_warm_start_beta_with_source(rho)
         } else {
@@ -4562,6 +4563,7 @@ impl<'a> RemlState<'a> {
                         self.last_pirls_accept_rho
                             .store(rho.to_bits(), Ordering::Relaxed);
                     }
+                    self.store_persistent_warm_start();
                     // Cache only if key is valid (not NaN).
                     if use_cache && let Some(key) = key_opt {
                         self.cache_manager

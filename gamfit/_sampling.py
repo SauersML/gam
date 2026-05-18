@@ -162,7 +162,7 @@ class PosteriorPredictive:
         >>> pp.shape
         (1000, 50)
         """
-        return tuple(self.eta.shape)  # type: ignore[return-value]
+        return tuple(self.eta.shape)
 
     @property
     def n_draws(self) -> int:
