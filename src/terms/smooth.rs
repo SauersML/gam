@@ -151,6 +151,13 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         spec: TensorBSplineSpec,
     },
+    BySmooth {
+        smooth: Box<SmoothBasisSpec>,
+        by_kind: ByVarKind,
+    },
+    FactorSmooth {
+        spec: FactorSmoothSpec,
+    },
 }
 
 /// Tensor-product B-spline smooth specification.
@@ -158,6 +165,46 @@ pub enum SmoothBasisSpec {
 /// `marginalspecs[i]` is the 1D B-spline setup for `feature_cols[i]`.
 /// The final penalty set is one Kronecker penalty per margin:
 /// `S_i = I ⊗ ... ⊗ S_marginal_i ⊗ ... ⊗ I`, plus optional global ridge.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TensorMarginalSpec {
+    BSpline(BSplineBasisSpec),
+    Categorical {
+        feature_col_offset: usize,
+        drop_first_level: bool,
+        center_for_identifiability: bool,
+        frozen_levels: Option<Vec<u64>>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ByVarKind {
+    Numeric {
+        feature_col: usize,
+    },
+    Factor {
+        feature_col: usize,
+        ordered: bool,
+        frozen_levels: Option<Vec<u64>>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactorSmoothSpec {
+    pub continuous_cols: Vec<usize>,
+    pub group_col: usize,
+    pub marginal: BSplineBasisSpec,
+    pub flavour: FactorSmoothFlavour,
+    pub group_frozen_levels: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FactorSmoothFlavour {
+    Fs { m_null_penalty_orders: Vec<usize> },
+    Sz,
+    Re,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorBSplineSpec {
     pub marginalspecs: Vec<BSplineBasisSpec>,
@@ -466,6 +513,37 @@ impl TermCollectionSpec {
                     ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
+                            st.name
+                        ));
+                    }
+                }
+                SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+                    if let SmoothBasisSpec::BySmooth { .. } = smooth.as_ref() {
+                        return Err(format!("{label} term '{}' has nested by-smooths", st.name));
+                    }
+                    match by_kind {
+                        ByVarKind::Factor { frozen_levels, .. } if frozen_levels.is_none() => {
+                            return Err(format!(
+                                "{label} term '{}' is not frozen: by-factor levels missing",
+                                st.name
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                SmoothBasisSpec::FactorSmooth { spec } => {
+                    if spec.group_frozen_levels.is_none() {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: factor-smooth levels missing",
+                            st.name
+                        ));
+                    }
+                    if !matches!(
+                        spec.marginal.knotspec,
+                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                    ) {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: factor-smooth marginal knots missing",
                             st.name
                         ));
                     }
@@ -3550,6 +3628,268 @@ fn tensor_product_design_from_marginals(
     Ok(design)
 }
 
+fn sorted_levels_from_column(
+    col: ArrayView1<'_, f64>,
+    frozen: Option<&Vec<u64>>,
+) -> Result<Vec<u64>, BasisError> {
+    let mut levels: Vec<u64> = if let Some(v) = frozen {
+        v.clone()
+    } else {
+        let mut set = BTreeSet::new();
+        for &x in col {
+            if !x.is_finite() {
+                return Err(BasisError::InvalidInput(
+                    "factor smooth group column contains non-finite values".to_string(),
+                ));
+            }
+            set.insert(x.to_bits());
+        }
+        set.into_iter().collect()
+    };
+    levels.sort_unstable();
+    levels.dedup();
+    if levels.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "factor smooth has no observed levels".to_string(),
+        ));
+    }
+    Ok(levels)
+}
+
+fn block_diag_repeat(base: &Array2<f64>, repeat: usize) -> Array2<f64> {
+    let p = base.nrows();
+    let mut out = Array2::<f64>::zeros((p * repeat, p * repeat));
+    for r in 0..repeat {
+        let start = r * p;
+        out.slice_mut(s![start..start + p, start..start + p])
+            .assign(base);
+    }
+    out
+}
+
+fn build_by_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    smooth: &SmoothBasisSpec,
+    by_kind: &ByVarKind,
+) -> Result<BasisBuildResult, BasisError> {
+    let dummy = SmoothTermSpec {
+        name: "by-inner".to_string(),
+        basis: smooth.clone(),
+        shape: ShapeConstraint::None,
+    };
+    let mut workspace = crate::basis::BasisWorkspace::default();
+    let inner = build_single_local_smooth_term(data, &dummy, &mut workspace)?;
+    let x = inner.design.to_dense();
+    let n = x.nrows();
+    let p = x.ncols();
+    match by_kind {
+        ByVarKind::Numeric { feature_col } => {
+            let z = data.column(*feature_col);
+            let mut design = x.clone();
+            for i in 0..n {
+                for j in 0..p {
+                    design[[i, j]] *= z[i];
+                }
+            }
+            Ok(BasisBuildResult {
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+                penalties: inner.penalties,
+                nullspace_dims: inner.nullspaces,
+                penaltyinfo: inner.penaltyinfo,
+                ops: inner.ops,
+                metadata: BasisMetadata::BySmooth {
+                    inner: Box::new(inner.metadata),
+                    by_col: *feature_col,
+                    levels: None,
+                    ordered: false,
+                },
+                kronecker_factored: None,
+            })
+        }
+        ByVarKind::Factor {
+            feature_col,
+            ordered,
+            frozen_levels,
+        } => {
+            let mut levels =
+                sorted_levels_from_column(data.column(*feature_col), frozen_levels.as_ref())?;
+            if *ordered && levels.len() > 1 {
+                levels.remove(0);
+            }
+            let l = levels.len();
+            let mut design = Array2::<f64>::zeros((n, p * l));
+            for i in 0..n {
+                let bits = data[[i, *feature_col]].to_bits();
+                if let Ok(g) = levels.binary_search(&bits) {
+                    let start = g * p;
+                    for j in 0..p {
+                        design[[i, start + j]] = x[[i, j]];
+                    }
+                }
+            }
+            let mut candidates = Vec::new();
+            for (pi, pen) in inner.penalties.iter().enumerate() {
+                for g in 0..l {
+                    let mut m = Array2::<f64>::zeros((p * l, p * l));
+                    let start = g * p;
+                    m.slice_mut(s![start..start + p, start..start + p])
+                        .assign(pen);
+                    candidates.push(PenaltyCandidate {
+                        matrix: m,
+                        nullspace_dim_hint: 0,
+                        source: PenaltySource::Other(format!("by-factor-level-{g}-penalty-{pi}")),
+                        normalization_scale: 1.0,
+                        kronecker_factors: None,
+                        op: None,
+                    });
+                }
+            }
+            let (penalties, nullspace_dims, penaltyinfo, ops) =
+                filter_active_penalty_candidates_with_ops(candidates)?;
+            Ok(BasisBuildResult {
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+                penalties,
+                nullspace_dims,
+                penaltyinfo,
+                ops,
+                metadata: BasisMetadata::BySmooth {
+                    inner: Box::new(inner.metadata),
+                    by_col: *feature_col,
+                    levels: Some(levels),
+                    ordered: *ordered,
+                },
+                kronecker_factored: None,
+            })
+        }
+    }
+}
+
+fn build_factor_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &FactorSmoothSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    if spec.continuous_cols.len() != 1 {
+        return Err(BasisError::InvalidInput(
+            "factor smooth currently requires exactly one continuous column".to_string(),
+        ));
+    }
+    let group_col = spec.group_col;
+    let levels =
+        sorted_levels_from_column(data.column(group_col), spec.group_frozen_levels.as_ref())?;
+    let n = data.nrows();
+    let l = levels.len();
+    let (base_x, base_penalties, knots, degree): (
+        Array2<f64>,
+        Vec<Array2<f64>>,
+        Array1<f64>,
+        usize,
+    ) = match spec.flavour {
+        FactorSmoothFlavour::Re => {
+            let xcol = data.column(spec.continuous_cols[0]);
+            let mut x = Array2::<f64>::zeros((n, 1));
+            for i in 0..n {
+                x[[i, 0]] = xcol[i];
+            }
+            (x, vec![Array2::<f64>::eye(1)], Array1::zeros(0), 1)
+        }
+        _ => {
+            let mut marginal = spec.marginal.clone();
+            marginal.identifiability = BSplineIdentifiability::None;
+            let built = build_bspline_basis_1d(data.column(spec.continuous_cols[0]), &marginal)?;
+            let knots = match &built.metadata {
+                BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
+                _ => Array1::zeros(0),
+            };
+            (
+                built.design.to_dense(),
+                built.penalties,
+                knots,
+                marginal.degree,
+            )
+        }
+    };
+    let p = base_x.ncols();
+    let is_sz = matches!(spec.flavour, FactorSmoothFlavour::Sz);
+    let out_levels = if is_sz { l.saturating_sub(1) } else { l };
+    if out_levels == 0 {
+        return Err(BasisError::InvalidInput(
+            "factor smooth needs at least two levels for sz contrasts".to_string(),
+        ));
+    }
+    let mut design = Array2::<f64>::zeros((n, p * out_levels));
+    for i in 0..n {
+        let bits = data[[i, group_col]].to_bits();
+        if let Ok(g) = levels.binary_search(&bits) {
+            if is_sz {
+                for h in 0..out_levels {
+                    let c = if g == h {
+                        1.0
+                    } else if g == l - 1 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    if c != 0.0 {
+                        for j in 0..p {
+                            design[[i, h * p + j]] = c * base_x[[i, j]];
+                        }
+                    }
+                }
+            } else {
+                let start = g * p;
+                for j in 0..p {
+                    design[[i, start + j]] = base_x[[i, j]];
+                }
+            }
+        }
+    }
+    let penalties = match spec.flavour {
+        FactorSmoothFlavour::Fs { .. } | FactorSmoothFlavour::Re => {
+            vec![Array2::<f64>::eye(p * out_levels)]
+        }
+        FactorSmoothFlavour::Sz => base_penalties
+            .iter()
+            .map(|pen| block_diag_repeat(pen, out_levels))
+            .collect(),
+    };
+    let candidates = penalties
+        .into_iter()
+        .enumerate()
+        .map(|(i, matrix)| PenaltyCandidate {
+            matrix,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Other(format!("factor-smooth-penalty-{i}")),
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        })
+        .collect();
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    let flavour = match spec.flavour {
+        FactorSmoothFlavour::Fs { .. } => "fs",
+        FactorSmoothFlavour::Sz => "sz",
+        FactorSmoothFlavour::Re => "re",
+    }
+    .to_string();
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        ops,
+        metadata: BasisMetadata::FactorSmooth {
+            continuous_cols: spec.continuous_cols.clone(),
+            group_col,
+            knots,
+            degree,
+            levels,
+            flavour,
+        },
+        kronecker_factored: None,
+    })
+}
+
 fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
     spec: &RandomEffectTermSpec,
@@ -3905,6 +4245,10 @@ fn build_single_local_smooth_term(
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
             build_tensor_bspline_basis(data, feature_cols, spec)?
         }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            build_by_smooth_basis(data, smooth, by_kind)?
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => build_factor_smooth_basis(data, spec)?,
     };
 
     match &term.basis {
@@ -4658,6 +5002,24 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: String::new(),
+                basis: *smooth.clone(),
+                shape: ShapeConstraint::None,
+            });
+            match by_kind {
+                ByVarKind::Numeric { feature_col } | ByVarKind::Factor { feature_col, .. } => {
+                    cols.push(*feature_col)
+                }
+            }
+            cols
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            let mut cols = spec.continuous_cols.clone();
+            cols.push(spec.group_col);
+            cols
+        }
     }
 }
 
@@ -4669,6 +5031,8 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Sphere { .. } => 3,
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::BySmooth { .. } => 6,
+        SmoothBasisSpec::FactorSmooth { .. } => 7,
     }
 }
 
@@ -4691,6 +5055,11 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             MaternIdentifiability::FrozenTransform { .. }
         ),
+        SmoothBasisSpec::BySmooth { by_kind, .. } => match by_kind {
+            ByVarKind::Factor { frozen_levels, .. } => frozen_levels.is_some(),
+            ByVarKind::Numeric { .. } => true,
+        },
+        SmoothBasisSpec::FactorSmooth { spec } => spec.group_frozen_levels.is_some(),
         SmoothBasisSpec::Duchon { spec, .. } => matches!(
             spec.identifiability,
             SpatialIdentifiability::FrozenTransform { .. }
@@ -5460,6 +5829,32 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
+        }),
+        BasisMetadata::BySmooth {
+            inner,
+            by_col,
+            levels,
+            ordered,
+        } => Ok(BasisMetadata::BySmooth {
+            inner: Box::new(with_identifiability_transform(inner, transform)?),
+            by_col: *by_col,
+            levels: levels.clone(),
+            ordered: *ordered,
+        }),
+        BasisMetadata::FactorSmooth {
+            continuous_cols,
+            group_col,
+            knots,
+            degree,
+            levels,
+            flavour,
+        } => Ok(BasisMetadata::FactorSmooth {
+            continuous_cols: continuous_cols.clone(),
+            group_col: *group_col,
+            knots: knots.clone(),
+            degree: *degree,
+            levels: levels.clone(),
+            flavour: flavour.clone(),
         }),
     }
 }
@@ -10839,7 +11234,10 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::BySmooth { .. }
+        | SmoothBasisSpec::FactorSmooth { .. } => {
             return Ok(None);
         }
     };
@@ -12388,6 +12786,69 @@ pub fn freeze_term_collection_from_design(
                 };
                 s.aniso_log_scales = meta_aniso.clone();
                 *input_scales = meta_scales.clone();
+            }
+            (
+                SmoothBasisSpec::BySmooth { smooth, by_kind },
+                BasisMetadata::BySmooth {
+                    inner,
+                    by_col,
+                    levels,
+                    ordered,
+                },
+            ) => {
+                match by_kind {
+                    ByVarKind::Factor {
+                        feature_col,
+                        ordered: ord,
+                        frozen_levels,
+                    } => {
+                        *feature_col = *by_col;
+                        *ord = *ordered;
+                        *frozen_levels = levels.clone();
+                    }
+                    ByVarKind::Numeric { feature_col } => *feature_col = *by_col,
+                }
+                if let (
+                    SmoothBasisSpec::BSpline1D { spec: s, .. },
+                    BasisMetadata::BSpline1D {
+                        knots,
+                        identifiability_transform,
+                        periodic,
+                    },
+                ) = (smooth.as_mut(), inner.as_ref())
+                {
+                    s.knotspec = periodic
+                        .map(
+                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                                data_range: (domain_start, domain_start + period),
+                                num_basis,
+                            },
+                        )
+                        .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+                    s.identifiability = identifiability_transform
+                        .as_ref()
+                        .map(|z| BSplineIdentifiability::FrozenTransform {
+                            transform: z.clone(),
+                        })
+                        .unwrap_or(BSplineIdentifiability::None);
+                    s.boundary_conditions = Default::default();
+                }
+            }
+            (
+                SmoothBasisSpec::FactorSmooth { spec: s },
+                BasisMetadata::FactorSmooth {
+                    knots,
+                    degree,
+                    levels,
+                    ..
+                },
+            ) => {
+                s.marginal.degree = *degree;
+                if !knots.is_empty() {
+                    s.marginal.knotspec = BSplineKnotSpec::Provided(knots.clone());
+                }
+                s.marginal.identifiability = BSplineIdentifiability::None;
+                s.group_frozen_levels = Some(levels.clone());
             }
             (
                 SmoothBasisSpec::TensorBSpline {
