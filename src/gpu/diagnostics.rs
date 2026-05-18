@@ -21,6 +21,33 @@ pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &DispatchPolicy) 
     );
 }
 
+pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
+    if devices.len() <= 1 {
+        return;
+    }
+    let summary = devices
+        .iter()
+        .map(|device| {
+            format!(
+                "{}:'{}' sm_{}{} {}SM {}",
+                device.ordinal,
+                device.name,
+                device.compute_capability_major,
+                device.compute_capability_minor,
+                device.sm_count,
+                format_bytes(device.total_memory_bytes),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    log::info!(
+        "[GPU] multi-device pool enabled | devices={} | policy_device={} | {}",
+        devices.len(),
+        devices[0].ordinal,
+        summary,
+    );
+}
+
 pub(crate) fn log_cuda_disabled(reason: &str) {
     log::info!(
         "[GPU] CUDA acceleration disabled\n  backend: CPU (faer + Rayon)\n  reason: {}",
@@ -28,9 +55,10 @@ pub(crate) fn log_cuda_disabled(reason: &str) {
     );
 }
 
-pub(crate) fn log_library_ready(library: &'static str) {
+pub(crate) fn log_library_ready(library: &'static str, device: &GpuDeviceInfo) {
     log_route(format!(
-        "[GPU] {library} ready | CUDA library handle initialized"
+        "[GPU] {library} ready | device={} '{}' | CUDA library handle initialized",
+        device.ordinal, device.name,
     ));
 }
 
@@ -63,6 +91,7 @@ pub(crate) fn log_runtime_cpu(op: &'static str, backend: &'static str, shape: St
 pub(crate) fn log_gpu_success(
     op: &'static str,
     backend: &'static str,
+    device: &GpuDeviceInfo,
     shape: String,
     flops: u64,
     h2d_bytes: usize,
@@ -70,7 +99,9 @@ pub(crate) fn log_gpu_success(
     elapsed_s: f64,
 ) {
     log_route(format!(
-        "[GPU] device route | op={op} | backend={backend} | shape={shape} | work={}flop | transfer=h2d:{} d2h:{} | elapsed={:.3}s",
+        "[GPU] device route | op={op} | backend={backend} | device={} '{}' | shape={shape} | work={}flop | transfer=h2d:{} d2h:{} | elapsed={:.3}s",
+        device.ordinal,
+        device.name,
         format_count(flops),
         format_bytes(h2d_bytes),
         format_bytes(d2h_bytes),
