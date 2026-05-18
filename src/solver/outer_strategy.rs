@@ -4835,24 +4835,51 @@ fn run_outer_with_plan(
                     Err(BfgsError::ObjectiveFailed { message })
                         if message.contains(OUTER_STALL_TERMINATE_SENTINEL) =>
                     {
-                        // Bridge tripped its objective-stall detector and
+                        // The bridge tripped its objective-stall detector and
                         // raised a sentinel-tagged Fatal so opt's BFGS would
                         // unwind without burning another ~37s/grad on a
-                        // flat-cost / stuck-gradient region. Rebuild a
-                        // Solution from the stashed snapshot and treat it as
-                        // accepted-but-not-converged, mirroring the
-                        // MaxIterationsReached / LineSearchFailed arms.
+                        // flat-cost region.
+                        //
+                        // The cost being flat does NOT mean we're at a
+                        // stationary point — the gradient can still be far
+                        // from zero (e.g. the bridge gradient is incorrect at
+                        // this point, or the step cap is keeping us pinned in
+                        // a flat valley away from the actual minimum).
+                        // Classify honestly: only call this `Converged` if
+                        // the gradient actually met the BFGS gradient
+                        // tolerance; otherwise it's `MaxIterations` — the
+                        // best point we saw, but not converged. Downstream
+                        // `is_success()` reflects that truth.
                         let signal = stall_signal
                             .lock()
                             .expect("stall_signal mutex poisoned")
                             .take()
                             .expect("stall sentinel raised without stash");
+                        // Mirror opt's gradient-convergence criterion at the
+                        // stalled point: `|g|_inf <= tol * (1 + |x|_inf)`.
+                        let g_inf = signal
+                            .last_gradient
+                            .iter()
+                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                        let x_inf = signal
+                            .last_point
+                            .iter()
+                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                        let grad_converged = g_inf <= config.tolerance * (1.0 + x_inf);
+                        let (status, converged_flag, classification) = if grad_converged {
+                            (OptimizationStatus::Converged, true, "gradient at tol")
+                        } else {
+                            (OptimizationStatus::MaxIterations, false, "gradient above tol")
+                        };
                         log::info!(
-                            "[OUTER summary] BFGS terminated on objective stall in {} iters elapsed={:.3}s final_value={:.6e} |g|={:.3e}",
+                            "[OUTER summary] BFGS terminated on objective stall in {} iters elapsed={:.3}s final_value={:.6e} |g|_inf={:.3e} (1+|x|_inf)*tol={:.3e} classification={} ({})",
                             signal.iter_count,
                             bfgs_elapsed,
                             signal.last_cost,
-                            signal.last_gradient_norm,
+                            g_inf,
+                            config.tolerance * (1.0 + x_inf),
+                            if grad_converged { "Converged" } else { "MaxIterations" },
+                            classification,
                         );
                         let synthesized = Solution {
                             final_point: signal.last_point,
@@ -4866,9 +4893,13 @@ fn run_outer_with_plan(
                             func_evals: signal.iter_count,
                             grad_evals: signal.iter_count,
                             hess_evals: 0,
-                            status_hint: Some(OptimizationStatus::NumericallyConverged),
+                            status_hint: Some(status),
                         };
-                        Ok(solution_into_outer_result(synthesized, true, *the_plan))
+                        Ok(solution_into_outer_result(
+                            synthesized,
+                            converged_flag,
+                            *the_plan,
+                        ))
                     }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "BFGS solver failed: {e:?}"
