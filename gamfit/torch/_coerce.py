@@ -23,12 +23,14 @@ def to_numpy_f64(value: Any) -> Any:
     """
     import torch
 
+    from . import _torch_compat as _tc
+
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
         if tensor.device.type != "cpu":
-            tensor = tensor.to(device="cpu", dtype=torch.float64)
-        elif tensor.dtype != torch.float64:
-            tensor = tensor.to(dtype=torch.float64)
+            tensor = tensor.to(device="cpu", dtype=_tc.float64)
+        elif tensor.dtype != _tc.float64:
+            tensor = tensor.to(dtype=_tc.float64)
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         arr = tensor.numpy()
@@ -64,10 +66,12 @@ def from_numpy_like(array: Any, ref: Any) -> Any:
     """
     import torch
 
+    from . import _torch_compat as _tc
+
     if not isinstance(ref, torch.Tensor):
         raise TypeError("from_numpy_like requires a torch tensor as reference")
     array = np.asarray(array, dtype=np.float64, order="C")
-    tensor = torch.as_tensor(array, dtype=torch.float64, device="cpu")
-    if ref.device.type == "cpu" and ref.dtype == torch.float64:
+    tensor = _tc.as_tensor(array, dtype=_tc.float64, device="cpu")
+    if ref.device.type == "cpu" and ref.dtype == _tc.float64:
         return tensor
     return tensor.to(device=ref.device, dtype=ref.dtype)
