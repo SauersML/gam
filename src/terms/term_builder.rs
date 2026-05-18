@@ -24,9 +24,9 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec,
+    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
+    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,11 +183,21 @@ pub fn build_termspec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
+                let mut options_resolved = options.clone();
+                if let Some(by_name) = options.get("by") {
+                    let by_col = resolve_col(col_map, by_name)?;
+                    options_resolved.insert("__by_col".to_string(), by_col.to_string());
+                    if !terms.iter().any(|term| matches!(term, ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == by_name)) {
+                        inference_notes.push(format!(
+                            "factor/numeric by-smooth `by={by_name}` is used without an explicit `{by_name}` main-effect term; add `{by_name}` or `group({by_name})` if level means should be identifiable."
+                        ));
+                    }
+                }
                 let basis = build_smooth_basis(
                     *kind,
                     vars,
                     &cols,
-                    options,
+                    &options_resolved,
                     ds,
                     inference_notes,
                     policy,
@@ -365,6 +375,9 @@ pub fn build_smooth_basis(
     // ("smooth basis collapses onto the parametric block"); this lift makes
     // the same diagnosis explicit and uniform across smooth families.
     for (var, &col) in vars.iter().zip(cols.iter()) {
+        if matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical)) {
+            continue;
+        }
         if unique_count_column(ds.values.column(col)) <= 1 {
             return Err(format!(
                 "smooth term over '{var}' has only one unique value in the training data \
@@ -373,6 +386,47 @@ pub fn build_smooth_basis(
             ));
         }
     }
+    if let Some(by_name) = options.get("by").cloned() {
+        let by_col = options
+            .get("__by_col")
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .or_else(|| vars.iter().position(|v| v == &by_name).map(|idx| cols[idx]))
+            .ok_or_else(|| format!("unknown by= column '{by_name}'"))?;
+        let mut inner_options = options.clone();
+        inner_options.remove("by");
+        inner_options.remove("__by_col");
+        inner_options.remove("id");
+        let inner = build_smooth_basis(
+            kind,
+            vars,
+            cols,
+            &inner_options,
+            ds,
+            inference_notes,
+            policy,
+            smooth_coordinate_count,
+        )?;
+        let by_kind = match ds.column_kinds.get(by_col).copied() {
+            Some(ColumnKindTag::Categorical) => ByVarKind::Factor {
+                feature_col: by_col,
+                ordered: option_bool(options, "ordered").unwrap_or(false),
+                frozen_levels: None,
+            },
+            Some(ColumnKindTag::Continuous | ColumnKindTag::Binary) => ByVarKind::Numeric {
+                feature_col: by_col,
+            },
+            None => {
+                return Err(format!(
+                    "internal column-kind lookup failed for by='{by_name}'"
+                ));
+            }
+        };
+        return Ok(SmoothBasisSpec::BySmooth {
+            smooth: Box::new(inner),
+            by_kind,
+        });
+    }
+
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
     let has_periodic_option = options.contains_key("periodic")
         || options.contains_key("cyclic")
@@ -396,6 +450,97 @@ pub fn build_smooth_basis(
             SmoothKind::S if has_periodic_option => "tensor".to_string(),
             SmoothKind::S => "tps".to_string(),
         });
+
+    if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
+        validate_known_options(
+            type_opt.as_str(),
+            options,
+            &[
+                "type",
+                "bs",
+                "k",
+                "basis_dim",
+                "basis-dim",
+                "basisdim",
+                "knots",
+                "degree",
+                "penalty_order",
+                "m",
+                "double_penalty",
+                "ordered",
+            ],
+        )?;
+        if cols.len() != 2 {
+            return Err(format!(
+                "{} factor-smooth currently expects exactly two variables (one numeric, one categorical)",
+                type_opt
+            ));
+        }
+        let kinds = cols
+            .iter()
+            .map(|&c| ds.column_kinds.get(c).copied())
+            .collect::<Vec<_>>();
+        let (cont_idx, group_idx) = if type_opt == "re" {
+            // mgcv random-slope examples are often s(g, x, bs="re").
+            match (kinds[0], kinds[1]) {
+                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
+                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
+                _ => (1usize, 0usize),
+            }
+        } else {
+            match (kinds[0], kinds[1]) {
+                (_, Some(ColumnKindTag::Categorical)) => (0usize, 1usize),
+                (Some(ColumnKindTag::Categorical), _) => (1usize, 0usize),
+                _ => {
+                    return Err(format!(
+                        "{} factor-smooth requires one categorical factor variable",
+                        type_opt
+                    ));
+                }
+            }
+        };
+        let c = cols[cont_idx];
+        let (minv, maxv) = col_minmax(ds.values.column(c))?;
+        let degree = if type_opt == "re" {
+            1
+        } else {
+            option_usize(options, "degree").unwrap_or(3)
+        };
+        let default_internal = heuristic_knots_for_column(ds.values.column(c));
+        let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
+        let marginal = BSplineBasisSpec {
+            degree,
+            penalty_order: option_usize(options, "penalty_order").unwrap_or(if degree > 1 {
+                2
+            } else {
+                1
+            }),
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (minv, maxv),
+                num_internal_knots: n_knots,
+            },
+            double_penalty: true,
+            identifiability: BSplineIdentifiability::None,
+            boundary_conditions: Default::default(),
+        };
+        let flavour = match type_opt.as_str() {
+            "fs" => FactorSmoothFlavour::Fs {
+                m_null_penalty_orders: vec![option_usize(options, "m").unwrap_or(2)],
+            },
+            "sz" => FactorSmoothFlavour::Sz,
+            "re" => FactorSmoothFlavour::Re,
+            _ => unreachable!(),
+        };
+        return Ok(SmoothBasisSpec::FactorSmooth {
+            spec: FactorSmoothSpec {
+                continuous_cols: vec![c],
+                group_col: cols[group_idx],
+                marginal,
+                flavour,
+                group_frozen_levels: None,
+            },
+        });
+    }
 
     match type_opt.as_str() {
         "tensor" | "te" | "tensor-bspline" => {
@@ -424,6 +569,9 @@ pub fn build_smooth_basis(
                     "period-origin",
                     "domain_origin",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                     "identifiability",
                 ],
             )?;
@@ -556,6 +704,9 @@ pub fn build_smooth_basis(
                     "period-origin",
                     "domain_origin",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                 ],
             )?;
             if cols.len() != 1 {
@@ -633,6 +784,9 @@ pub fn build_smooth_basis(
                     "period_end",
                     "origin",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                     "identifiability",
                 ],
             )?;
@@ -723,6 +877,9 @@ pub fn build_smooth_basis(
                     "knots",
                     "include_intercept",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                     "identifiability",
                     "scale_dims",
                 ],
@@ -943,6 +1100,9 @@ pub fn build_smooth_basis(
                     "knots",
                     "include_intercept",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                     "identifiability",
                     "scale_dims",
                 ],
@@ -1027,6 +1187,9 @@ pub fn build_smooth_basis(
                     "period_end",
                     "scale_dims",
                     "double_penalty",
+                    "by",
+                    "id",
+                    "__by_col",
                 ],
             )?;
             if options.contains_key("double_penalty") {

@@ -1215,6 +1215,35 @@ fn remap_term_collectionspec_columns(
                     *feature_col = resolve_training_index(*feature_col)?;
                 }
             }
+            SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+                match by_kind {
+                    crate::terms::smooth::ByVarKind::Numeric { feature_col }
+                    | crate::terms::smooth::ByVarKind::Factor { feature_col, .. } => {
+                        *feature_col = resolve_training_index(*feature_col)?;
+                    }
+                }
+                match smooth.as_mut() {
+                    SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+                        *feature_col = resolve_training_index(*feature_col)?;
+                    }
+                    SmoothBasisSpec::ThinPlate { feature_cols, .. }
+                    | SmoothBasisSpec::Sphere { feature_cols, .. }
+                    | SmoothBasisSpec::Matern { feature_cols, .. }
+                    | SmoothBasisSpec::Duchon { feature_cols, .. }
+                    | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+                        for feature_col in feature_cols.iter_mut() {
+                            *feature_col = resolve_training_index(*feature_col)?;
+                        }
+                    }
+                    SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {}
+                }
+            }
+            SmoothBasisSpec::FactorSmooth { spec } => {
+                for feature_col in spec.continuous_cols.iter_mut() {
+                    *feature_col = resolve_training_index(*feature_col)?;
+                }
+                spec.group_col = resolve_training_index(spec.group_col)?;
+            }
         }
     }
     Ok(remapped)

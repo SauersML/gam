@@ -70,15 +70,36 @@ Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`.
 plus an optional Beta prior (parameterised by `target` / `strength`)
 rather than a quadratic ridge.
 
-## Random effects
+## Random effects and factor smooths
 
 ```
 y ~ x + group(site)
-y ~ x + re(site)            # alias
+y ~ x + re(site)                         # random-intercept alias
+y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
+y ~ s(time, by=dose)                     # numeric varying-coefficient smooth
+y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
+y ~ fs(time, subject)                    # alias for bs="fs"
+y ~ s(time) + s(subject, time, bs="sz") # sum-to-zero factor deviations
+y ~ sz(subject, time)                    # alias for bs="sz"
+y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 ```
 
-Adds a random intercept per level of the grouping column. The column may be
-string- or integer-valued. Random slopes are not supported.
+`group()` / `re()` adds a random intercept per level of the grouping column.
+The column may be string- or integer-valued, and saved models freeze the observed
+level set so unseen prediction levels contribute zero.
+
+`by=` smooths multiply an ordinary smooth by a numeric column or by factor-level
+indicators. Numeric `by=` terms are a single varying-coefficient smooth. Factor
+`by=` terms create one smooth block per retained level; include the factor main
+effect (for example `+ treatment` or `+ group(subject)`) when level means should
+be estimated separately.
+
+`bs="fs"` builds factor-smooth interactions for hierarchical trajectories: each
+level gets its own curve and the whole block is ridge-penalized, including the
+low-order/null-space components, so per-level intercepts and slopes shrink.
+`bs="sz"` builds sum-to-zero deviations that pair naturally with a population
+main-effect smooth. `bs="re"` on a factor/numeric pair is the random-slope
+special case.
 
 ## Univariate smooths
 
