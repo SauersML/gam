@@ -17,6 +17,7 @@ use libloading::Library;
 use ndarray::{Array1, Array2};
 use std::sync::{Mutex, OnceLock};
 
+use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major_inplace,
@@ -44,21 +45,25 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|rt| rt.syevd_inplace(a));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "syevd",
-            "cuSOLVER",
-            format!("p={p}"),
-            (p as u64).saturating_mul(p as u64).saturating_mul(p as u64),
-            diagnostics::bytes_for_f64(a.len()),
-            diagnostics::bytes_for_f64(a.len().saturating_add(p)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu("syevd", "cuSOLVER", format!("p={p}"));
+    match with_runtime(|rt| rt.syevd_inplace(a)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "syevd",
+                "cuSOLVER",
+                &device,
+                format!("p={p}"),
+                (p as u64).saturating_mul(p as u64).saturating_mul(p as u64),
+                diagnostics::bytes_for_f64(a.len()),
+                diagnostics::bytes_for_f64(a.len().saturating_add(p)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu("syevd", "cuSOLVER", format!("p={p}"));
+            None
+        }
     }
-    result
 }
 
 /// Fused Cholesky factor + triangular solve: solve `A X = B` for SPD `A`,
@@ -86,29 +91,33 @@ pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Opt
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|rt| rt.chol_solve_inplace(a, rhs));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "chol_solve",
-            "cuSOLVER",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-            diagnostics::chol_flops(p).saturating_add(
-                (p as u64)
-                    .saturating_mul(p as u64)
-                    .saturating_mul(rhs.ncols() as u64),
-            ),
-            diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
-            diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "chol_solve",
-            "cuSOLVER",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-        );
+    match with_runtime(|rt| rt.chol_solve_inplace(a, rhs)) {
+        Some(((), device)) => {
+            diagnostics::log_gpu_success(
+                "chol_solve",
+                "cuSOLVER",
+                &device,
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+                diagnostics::chol_flops(p).saturating_add(
+                    (p as u64)
+                        .saturating_mul(p as u64)
+                        .saturating_mul(rhs.ncols() as u64),
+                ),
+                diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
+                diagnostics::bytes_for_f64(a.len().saturating_add(rhs.len())),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(())
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "chol_solve",
+                "cuSOLVER",
+                format!("p={p} rhs_cols={}", rhs.ncols()),
+            );
+            None
+        }
     }
-    result
 }
 
 /// In-place lower Cholesky factorization: `a` becomes `L` for `A = L L^T`.
@@ -130,21 +139,25 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|rt| rt.cholesky_lower_inplace(a));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "cholesky_lower",
-            "cuSOLVER",
-            format!("p={p}"),
-            diagnostics::chol_flops(p),
-            diagnostics::bytes_for_f64(a.len()),
-            diagnostics::bytes_for_f64(a.len()),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu("cholesky_lower", "cuSOLVER", format!("p={p}"));
+    match with_runtime(|rt| rt.cholesky_lower_inplace(a)) {
+        Some(((), device)) => {
+            diagnostics::log_gpu_success(
+                "cholesky_lower",
+                "cuSOLVER",
+                &device,
+                format!("p={p}"),
+                diagnostics::chol_flops(p),
+                diagnostics::bytes_for_f64(a.len()),
+                diagnostics::bytes_for_f64(a.len()),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(())
+        }
+        None => {
+            diagnostics::log_runtime_cpu("cholesky_lower", "cuSOLVER", format!("p={p}"));
+            None
+        }
     }
-    result
 }
 
 /// In-place batched lower Cholesky factorization: each `matrices[b]` becomes
@@ -181,25 +194,29 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     }
     let batch = matrices.len();
     let start = std::time::Instant::now();
-    let result = with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "cholesky_batched_lower",
-            "cuSOLVER",
-            format!("batch={batch} p={p}"),
-            diagnostics::chol_flops(p).saturating_mul(batch as u64),
-            diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
-            diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "cholesky_batched_lower",
-            "cuSOLVER",
-            format!("batch={batch} p={p}"),
-        );
+    match with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices)) {
+        Some(((), device)) => {
+            diagnostics::log_gpu_success(
+                "cholesky_batched_lower",
+                "cuSOLVER",
+                &device,
+                format!("batch={batch} p={p}"),
+                diagnostics::chol_flops(p).saturating_mul(batch as u64),
+                diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
+                diagnostics::bytes_for_f64(batch.saturating_mul(p).saturating_mul(p)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(())
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "cholesky_batched_lower",
+                "cuSOLVER",
+                format!("batch={batch} p={p}"),
+            );
+            None
+        }
     }
-    result
 }
 
 #[inline]
@@ -219,30 +236,57 @@ fn route_chol_batched(p: usize, batch_size: usize) -> bool {
         .route_chol_batched(p, batch_size)
 }
 
-fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<T> {
-    static RUNTIME: OnceLock<Option<Mutex<CusolverRuntime>>> = OnceLock::new();
-    RUNTIME
+fn with_runtime<T>(
+    mut f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
+) -> Option<(T, GpuDeviceInfo)> {
+    static RUNTIME: OnceLock<Vec<Mutex<CusolverRuntime>>> = OnceLock::new();
+    let runtimes = RUNTIME
         .get_or_init(|| {
-            let cuda = GpuRuntime::global().cuda_working_state()?;
-            match CusolverRuntime::new(cuda) {
-                Ok(runtime) => {
-                    diagnostics::log_library_ready("cuSOLVER");
-                    Some(Mutex::new(runtime))
-                }
-                Err(err) => {
-                    diagnostics::log_library_unavailable("cuSOLVER", &err);
-                    None
-                }
-            }
-        })
-        .as_ref()?
-        .lock()
-        .ok()
-        .and_then(|mut rt| f(&mut rt))
+            GpuRuntime::global()
+                .devices()
+                .iter()
+                .filter_map(|device| {
+                    let cuda = match CudaWorkingState::init(device.ordinal) {
+                        Some(cuda) => cuda,
+                        None => {
+                            diagnostics::log_library_unavailable(
+                                "cuSOLVER",
+                                &format!("CUDA context init failed for device {}", device.ordinal),
+                            );
+                            return None;
+                        }
+                    };
+                    match CusolverRuntime::new(cuda, device.clone()) {
+                        Ok(runtime) => {
+                            diagnostics::log_library_ready("cuSOLVER", &runtime.device);
+                            Some(Mutex::new(runtime))
+                        }
+                        Err(err) => {
+                            diagnostics::log_library_unavailable("cuSOLVER", &err);
+                            None
+                        }
+                    }
+                })
+                .collect()
+        });
+    if runtimes.is_empty() {
+        return None;
+    }
+    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
+    for offset in 0..runtimes.len() {
+        let idx = (start + offset) % runtimes.len();
+        if let Ok(mut runtime) = runtimes[idx].lock()
+            && let Some(out) = f(&mut runtime)
+        {
+            return Some((out, runtime.device.clone()));
+        }
+    }
+    None
 }
 
 struct CusolverRuntime {
-    cuda: &'static CudaWorkingState,
+    cuda: CudaWorkingState,
+    device: GpuDeviceInfo,
     /// cuSOLVER entry points; the dlopen'd library is leaked into a
     /// `&'static` so these pointers stay valid for the process.
     solver: CusolverApi,
@@ -250,7 +294,7 @@ struct CusolverRuntime {
 }
 
 impl CusolverRuntime {
-    fn new(cuda: &'static CudaWorkingState) -> Result<Self, String> {
+    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, String> {
         let solver_lib = load_static_library(cusolver_library_candidates())?;
         let solver = CusolverApi::load(solver_lib)?;
         cuda.set_current()?;
@@ -261,6 +305,7 @@ impl CusolverRuntime {
         }
         Ok(Self {
             cuda,
+            device,
             solver,
             handle,
         })

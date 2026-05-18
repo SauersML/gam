@@ -51,6 +51,19 @@ pub struct DispatchPolicy {
 }
 
 impl DispatchPolicy {
+    /// Build a dispatch policy from every usable device, deriving every
+    /// threshold from aggregate measured throughput and PCIe transfer cost.
+    pub fn for_devices(devices: &[GpuDeviceInfo]) -> Self {
+        if devices.is_empty() {
+            return Self::cpu_only();
+        }
+        let aggregate = devices
+            .iter()
+            .map(GpuDeviceInfo::peak_fp64_gflops)
+            .sum::<f64>();
+        Self::from_peak_fp64_gflops(aggregate)
+    }
+
     /// Build a dispatch policy from the selected device, deriving every
     /// threshold from measured peak throughput and PCIe transfer cost.
     ///
@@ -62,7 +75,10 @@ impl DispatchPolicy {
         let Some(device) = device else {
             return Self::cpu_only();
         };
-        let peak_gpu_gflops = device.peak_fp64_gflops();
+        Self::from_peak_fp64_gflops(device.peak_fp64_gflops())
+    }
+
+    fn from_peak_fp64_gflops(peak_gpu_gflops: f64) -> Self {
         let speedup = (peak_gpu_gflops / CPU_FP64_GFLOPS).max(1.0);
 
         let gemm_min_flops = flops_threshold(
@@ -172,6 +188,19 @@ impl DispatchPolicy {
         flops >= self.gemm_min_flops
     }
 
+    /// Should a uniform strided-batched dense GEMM route to the device set?
+    pub fn route_gemm_batched(&self, m: usize, n: usize, k: usize, batch_size: usize) -> bool {
+        if batch_size == 0 {
+            return false;
+        }
+        let flops = (m as u64)
+            .saturating_mul(n as u64)
+            .saturating_mul(k.max(1) as u64)
+            .saturating_mul(2)
+            .saturating_mul(batch_size as u64);
+        flops >= self.gemm_min_flops
+    }
+
     /// Should a dense GEMV route to the device?
     pub fn route_gemv(&self, rows: usize, cols: usize) -> bool {
         let flops = (rows as u64).saturating_mul(cols as u64).saturating_mul(2);
@@ -232,7 +261,7 @@ mod tests {
     fn device(major: i32, sms: i32) -> GpuDeviceInfo {
         GpuDeviceInfo {
             ordinal: 0,
-            name: "test".to_string(),
+            name: if major >= 9 { "H100" } else { "A100" }.to_string(),
             compute_capability_major: major,
             compute_capability_minor: 0,
             sm_count: sms,
@@ -247,6 +276,28 @@ mod tests {
         assert!(hopper_like.gemm_min_flops < turing_like.gemm_min_flops);
         assert!(hopper_like.gemv_min_flops < turing_like.gemv_min_flops);
         assert!(hopper_like.xtwx_min_rows <= turing_like.xtwx_min_rows);
+    }
+
+    #[test]
+    fn aggregate_devices_lower_batched_thresholds() {
+        let single = DispatchPolicy::for_devices(&[device(7, 40)]);
+        let fleet = DispatchPolicy::for_devices(&[
+            device(7, 40),
+            GpuDeviceInfo {
+                ordinal: 1,
+                ..device(7, 40)
+            },
+            GpuDeviceInfo {
+                ordinal: 2,
+                ..device(7, 40)
+            },
+            GpuDeviceInfo {
+                ordinal: 3,
+                ..device(7, 40)
+            },
+        ]);
+        assert!(fleet.gemm_min_flops < single.gemm_min_flops);
+        assert!(fleet.route_gemm_batched(512, 512, 512, 16));
     }
 
     #[test]
