@@ -1895,11 +1895,19 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
-    /// Local line-search trust budget for first-order BFGS routes. When set,
-    /// cost-only probes whose infinity-norm displacement from the most recent
-    /// accepted gradient point exceeds this cap are rejected with a large
-    /// finite cost before invoking the expensive inner solve.
-    line_search_step_cap: Option<f64>,
+    /// Local line-search trust budget on the **rho axes** (the first
+    /// `layout.rho_dim()` outer parameters = log-λ). When set, cost-only
+    /// probes whose `step_inf` on the rho block exceeds this cap are
+    /// rejected with a large finite cost before invoking the expensive
+    /// inner solve. Documented natural step on log-λ is ≈ 5.
+    line_search_step_cap_rho: Option<f64>,
+    /// Local line-search trust budget on the **psi axes** (the trailing
+    /// `layout.psi_dim` outer parameters = kappa / aniso-log-scales). The
+    /// kernel scale needs much tighter control than log-λ (≈ ln 2 per iter)
+    /// to avoid oscillating through orders of magnitude. Independent of
+    /// the rho cap so the survival-marginal-slope joint solver can give
+    /// rho the full step budget it needs without letting psi explode.
+    line_search_step_cap_psi: Option<f64>,
     last_gradient_point: Option<Array1<f64>>,
     objective_stall_rel_tol: Option<f64>,
     last_gradient_cost: Option<f64>,
@@ -1916,17 +1924,43 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
-        if let (Some(cap), Some(anchor)) = (self.line_search_step_cap, &self.last_gradient_point) {
-            let step_inf = x
-                .iter()
-                .zip(anchor.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
-            if step_inf > cap {
+        if let Some(anchor) = &self.last_gradient_point {
+            // Per-axis step caps. Compute `step_inf` separately for the rho
+            // block (first `rho_dim` axes = log-λ, natural step ≈ 5) and the
+            // psi block (trailing `psi_dim` axes = kappa / aniso-log-scale,
+            // natural step ≈ ln 2). Reject the probe if EITHER block exceeds
+            // its own cap — keeps rho free to take its full quasi-Newton
+            // step while pinning psi to a sane kernel-scale move.
+            let rho_dim = self.layout.rho_dim();
+            let mut step_inf_rho = 0.0_f64;
+            let mut step_inf_psi = 0.0_f64;
+            for (i, (a, b)) in x.iter().zip(anchor.iter()).enumerate() {
+                let d = (a - b).abs();
+                if i < rho_dim {
+                    step_inf_rho = step_inf_rho.max(d);
+                } else {
+                    step_inf_psi = step_inf_psi.max(d);
+                }
+            }
+            let rho_excess = self
+                .line_search_step_cap_rho
+                .is_some_and(|cap| step_inf_rho > cap);
+            let psi_excess = self
+                .line_search_step_cap_psi
+                .is_some_and(|cap| step_inf_psi > cap);
+            if rho_excess || psi_excess {
                 log::info!(
-                    "[OUTER/BFGS] rejecting cost probe before inner solve: step_inf={:.3e} cap={:.3e}",
-                    step_inf,
-                    cap,
+                    "[OUTER/BFGS] rejecting cost probe before inner solve: step_inf_rho={:.3e} cap_rho={:?} step_inf_psi={:.3e} cap_psi={:?} excess={}",
+                    step_inf_rho,
+                    self.line_search_step_cap_rho,
+                    step_inf_psi,
+                    self.line_search_step_cap_psi,
+                    match (rho_excess, psi_excess) {
+                        (true, true) => "rho+psi",
+                        (true, false) => "rho",
+                        (false, true) => "psi",
+                        _ => "",
+                    },
                 );
                 return Ok(BFGS_LINE_SEARCH_REJECT_COST);
             }
@@ -3587,7 +3621,20 @@ struct OuterConfig {
     /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
     /// `None` falls back to the bare `tolerance` floor.
     objective_scale: Option<f64>,
+    /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
+    /// outer parameters (log-λ axes). Documented natural step for
+    /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
+    /// per accepted outer iter — matches typical quasi-Newton direction
+    /// magnitude on flat REML surfaces). Setting this `None` disables the
+    /// rho-axis cap entirely.
     bfgs_step_cap: Option<f64>,
+    /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
+    /// outer parameters (kappa / aniso-log-scale axes). Required because
+    /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
+    /// per iter is plenty) — using the rho-axis cap here lets the optimizer
+    /// jump kappa by orders of magnitude per step and oscillate. Setting
+    /// this `None` disables the psi-axis cap.
+    bfgs_step_cap_psi: Option<f64>,
 }
 
 impl Default for OuterConfig {
@@ -3609,6 +3656,7 @@ impl Default for OuterConfig {
             arc_initial_regularization: None,
             objective_scale: None,
             bfgs_step_cap: None,
+            bfgs_step_cap_psi: None,
         }
     }
 }
@@ -3648,6 +3696,7 @@ pub struct OuterProblem {
     arc_initial_regularization: Option<f64>,
     objective_scale: Option<f64>,
     bfgs_step_cap: Option<f64>,
+    bfgs_step_cap_psi: Option<f64>,
 }
 
 impl OuterProblem {
@@ -3676,6 +3725,7 @@ impl OuterProblem {
             arc_initial_regularization: None,
             objective_scale: None,
             bfgs_step_cap: None,
+            bfgs_step_cap_psi: None,
         }
     }
 
@@ -3817,11 +3867,26 @@ impl OuterProblem {
     }
 
     /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// from the most recent accepted gradient point. Also scales the initial
-    /// inverse metric so the first trial direction respects the same local
-    /// budget coordinate-wise.
+    /// on the **rho axes** (the first `n_params - psi_dim` outer parameters,
+    /// = log-λ). Also scales the initial inverse metric so the first trial
+    /// direction respects the same local budget coordinate-wise. Documented
+    /// natural step on log-λ is ≈ 5; tighter values throttle BFGS and starve
+    /// convergence on flat REML valleys.
     pub fn with_bfgs_step_cap(mut self, cap: Option<f64>) -> Self {
         self.bfgs_step_cap = cap.filter(|v| v.is_finite() && *v > 0.0);
+        self
+    }
+
+    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
+    /// on the **psi axes** (the trailing `psi_dim` outer parameters, = kappa
+    /// or anisotropic log-scales). Mirrors [`Self::with_bfgs_step_cap`] but
+    /// scoped to kernel-scale parameters whose natural step is much smaller
+    /// than log-λ (≈ ln 2 per iter keeps kappa from oscillating). Without
+    /// this split, a uniform rho-scale cap lets psi explode while a uniform
+    /// psi-scale cap throttles rho — both fail the survival-marginal-slope
+    /// path at biobank scale, where rho needs |d|≈5 while psi wants |d|≤1.
+    pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
+        self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
         self
     }
 
@@ -3871,6 +3936,7 @@ impl OuterProblem {
             arc_initial_regularization: self.arc_initial_regularization,
             objective_scale: self.objective_scale,
             bfgs_step_cap: self.bfgs_step_cap,
+            bfgs_step_cap_psi: self.bfgs_step_cap_psi,
         }
     }
 
@@ -4725,6 +4791,11 @@ fn run_outer_with_plan(
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let stall_signal: std::sync::Arc<std::sync::Mutex<Option<StallSignal>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(None));
+                // The bridge anchors / stall-detector run whenever *any* cap is
+                // set — rho or psi — since either path needs the
+                // `last_gradient_point` anchor for the per-axis check.
+                let any_step_cap_set =
+                    config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some();
                 let objective = OuterFirstOrderBridge {
                     obj,
                     layout,
@@ -4732,10 +4803,23 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
-                    line_search_step_cap: config.bfgs_step_cap,
-                    last_gradient_point: config.bfgs_step_cap.map(|_| seed.clone()),
-                    objective_stall_rel_tol: config.bfgs_step_cap.map(|_| config.tolerance),
-                    last_gradient_cost: config.bfgs_step_cap.map(|_| seed_eval.cost),
+                    line_search_step_cap_rho: config.bfgs_step_cap,
+                    line_search_step_cap_psi: config.bfgs_step_cap_psi,
+                    last_gradient_point: if any_step_cap_set {
+                        Some(seed.clone())
+                    } else {
+                        None
+                    },
+                    objective_stall_rel_tol: if any_step_cap_set {
+                        Some(config.tolerance)
+                    } else {
+                        None
+                    },
+                    last_gradient_cost: if any_step_cap_set {
+                        Some(seed_eval.cost)
+                    } else {
+                        None
+                    },
                     objective_stall_evals: 0,
                     stall_signal: stall_signal.clone(),
                 };
@@ -4756,20 +4840,35 @@ fn run_outer_with_plan(
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter)
                     .with_initial_sample(seed.clone(), initial_sample);
-                if let Some(step_cap) = config.bfgs_step_cap {
-                    let metric_diag = seed_eval.gradient.mapv(|g| {
-                        let g_abs = g.abs();
-                        if g_abs > step_cap {
-                            (step_cap / g_abs).max(1.0e-12)
-                        } else {
-                            1.0
-                        }
-                    });
+                if any_step_cap_set {
+                    // Per-axis initial inverse metric. Rho axes use the rho
+                    // cap; psi axes use the psi cap. Each diagonal entry
+                    // scales the first BFGS direction so `|H_0[i,i] * g_i| ≤
+                    // cap_i`, which is what keeps the first trial step from
+                    // immediately hitting the line-search reject path on
+                    // either block.
+                    let rho_dim = layout.rho_dim();
+                    let metric_diag = ndarray::Array1::<f64>::from_shape_fn(
+                        seed_eval.gradient.len(),
+                        |i| {
+                            let cap = if i < rho_dim {
+                                config.bfgs_step_cap
+                            } else {
+                                config.bfgs_step_cap_psi
+                            };
+                            let g_abs = seed_eval.gradient[i].abs();
+                            match cap {
+                                Some(c) if g_abs > c => (c / g_abs).max(1.0e-12),
+                                _ => 1.0,
+                            }
+                        },
+                    );
                     if metric_diag.iter().any(|&v| v < 1.0) {
                         let min_scale = metric_diag.iter().copied().fold(f64::INFINITY, f64::min);
                         log::info!(
-                            "[OUTER/BFGS] initial inverse metric capped by first-trial step budget: step_cap={:.3e} min_diag_scale={:.3e}",
-                            step_cap,
+                            "[OUTER/BFGS] initial inverse metric capped by first-trial step budget: step_cap_rho={:?} step_cap_psi={:?} min_diag_scale={:.3e}",
+                            config.bfgs_step_cap,
+                            config.bfgs_step_cap_psi,
                             min_scale,
                         );
                         optimizer =

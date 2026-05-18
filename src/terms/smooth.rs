@@ -14101,7 +14101,16 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
+    // BFGS step caps split by parameter type. `bfgs_step_cap` (rho-axis cap)
+    // bounds first-trial moves on log-λ; documented natural step is ≈ 5.
+    // `bfgs_step_cap_psi` bounds moves on the trailing `auxiliary_dim`
+    // psi-axes (kappa / aniso-log-scales), where ≈ ln 2 keeps the kernel
+    // scale from oscillating across orders of magnitude per iter. Using a
+    // single uniform cap (the old API) starved rho on the survival-marg-slope
+    // joint solver because the psi-calibrated value (`ln 2 ≈ 0.69`) was
+    // applied to log-λ, where |d|≈5 is the natural quasi-Newton magnitude.
     bfgs_step_cap: Option<f64>,
+    bfgs_step_cap_psi: Option<f64>,
     screening_cap: Option<Arc<AtomicUsize>>,
 ) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
@@ -14129,6 +14138,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
         .with_bfgs_step_cap(bfgs_step_cap)
+        .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
             seed_budget: 2,
