@@ -241,9 +241,11 @@ impl WarmStartStore {
         // 2. Compute checksum from payload.
         let checksum = checksum_hex(payload);
         // 3. Write meta JSON.
+        let (secs, subsec_nanos) = unix_now_parts();
         let meta = OnDiskMeta {
             schema_version: SCHEMA_VERSION,
-            written_unix_secs: unix_secs_now(),
+            written_unix_secs: secs,
+            written_nanos: subsec_nanos,
             objective,
             iteration,
             kind,
@@ -276,19 +278,24 @@ impl WarmStartStore {
         Ok(())
     }
 
-    /// Drop entries older than TTL, then evict by mtime ascending until
-    /// total bytes ≤ `opts.size_budget_bytes`. Idempotent; safe to call
-    /// from many concurrent processes (worst case some entries are
+    /// Drop entries older than TTL, then evict by recorded write-time
+    /// ascending until total bytes ≤ `opts.size_budget_bytes`. Idempotent;
+    /// safe under concurrent processes (worst case some entries are
     /// double-removed, which is a no-op).
+    ///
+    /// Sort key is the `(written_unix_secs, written_nanos)` recorded in
+    /// each entry's meta, not the filesystem mtime — at second-resolution
+    /// mtime, batches of writes within the same second would sort
+    /// arbitrarily and could evict the most recent entry.
     pub fn evict_overflow(&self) -> Result<(), StoreError> {
         let read_dir = match fs::read_dir(&self.root) {
             Ok(rd) => rd,
             Err(_) => return Ok(()),
         };
-        // Collect (meta_path, bin_path, total_bytes, mtime_secs).
-        let mut all: Vec<(PathBuf, PathBuf, u64, u64)> = Vec::new();
-        let now = unix_secs_now();
-        let ttl_secs = self.opts.ttl.as_secs();
+        // Collect (meta_path, bin_path, total_bytes, write_nanos_since_epoch).
+        let mut all: Vec<(PathBuf, PathBuf, u64, u128)> = Vec::new();
+        let now_nanos = nanos_now();
+        let ttl_nanos = self.opts.ttl.as_nanos();
         for key_dir_entry in read_dir {
             let key_dir = match key_dir_entry {
                 Ok(e) => e.path(),
@@ -310,13 +317,11 @@ impl WarmStartStore {
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                // Sweep stale temp files first (a prior process crashed
-                // between writing tmp and rename; nothing else will ever
-                // reclaim these).
+                // Sweep tmp files from other processes. Same-PID tmps may
+                // be in-flight writes from this very process; leave them.
                 if name.contains(".tmp.") {
-                    if let Ok(md) = fs::metadata(&p) {
-                        let mtime = mtime_secs(&md);
-                        if now.saturating_sub(mtime) > 300 {
+                    if let Some(pid) = parse_tmp_pid(&name) {
+                        if pid != std::process::id() {
                             let _ = fs::remove_file(&p);
                         }
                     }
@@ -338,14 +343,23 @@ impl WarmStartStore {
                         continue;
                     }
                 };
-                let mtime = mtime_secs(&meta_md);
-                if ttl_secs > 0 && now.saturating_sub(mtime) > ttl_secs {
+                let meta = match read_meta(&p) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let _ = fs::remove_file(&p);
+                        let _ = fs::remove_file(&bin);
+                        continue;
+                    }
+                };
+                let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
+                    + meta.written_nanos as u128;
+                if ttl_nanos > 0 && now_nanos.saturating_sub(write_nanos) >= ttl_nanos {
                     let _ = fs::remove_file(&p);
                     let _ = fs::remove_file(&bin);
                     continue;
                 }
                 let total_bytes = meta_md.len() + bin_md.len();
-                all.push((p, bin, total_bytes, mtime));
+                all.push((p, bin, total_bytes, write_nanos));
             }
             // Sweep now-empty key dirs.
             if fs::read_dir(&key_dir).map(|mut it| it.next().is_none()).unwrap_or(false) {
@@ -368,6 +382,14 @@ impl WarmStartStore {
         }
         Ok(())
     }
+}
+
+fn parse_tmp_pid(name: &str) -> Option<u32> {
+    // Names look like "<runid>.bin.tmp.<pid>.<nonce>" or
+    // "<runid>.json.tmp.<pid>.<nonce>".
+    let tail = name.split(".tmp.").nth(1)?;
+    let pid_str = tail.split('.').next()?;
+    pid_str.parse::<u32>().ok()
 }
 
 fn read_meta(path: &Path) -> Result<OnDiskMeta, StoreError> {
@@ -407,25 +429,17 @@ fn checksum_hex(payload: &[u8]) -> String {
     s
 }
 
-fn unix_secs_now() -> u64 {
+fn unix_now_parts() -> (u64, u32) {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map(|d| (d.as_secs(), d.subsec_nanos()))
+        .unwrap_or((0, 0))
 }
 
 fn nanos_now() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-fn mtime_secs(md: &fs::Metadata) -> u64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
