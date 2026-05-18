@@ -17,7 +17,7 @@ that can sit alongside other modules in your training loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -42,12 +42,6 @@ class _FittedGamModule(nn.Module):
     def __init__(self, model: "Model") -> None:
         super().__init__()
         self._model = model
-        # A dummy buffer pins the module's device / dtype so ``model.to(...)``
-        # affects the returned predictions. We do not register the model's
-        # learned coefficients as torch buffers because the Rust engine holds
-        # the canonical serialized state; mirroring them would duplicate
-        # storage without enabling autograd through the basis evaluations.
-        self.register_buffer("_anchor", torch.zeros((), dtype=torch.float64))
 
     @property
     def model(self) -> "Model":

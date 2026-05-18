@@ -109,6 +109,43 @@ pub(crate) fn log_gpu_success(
     ));
 }
 
+pub(crate) fn log_gpu_success_multi(
+    op: &'static str,
+    backend: &'static str,
+    devices: &[GpuDeviceInfo],
+    shape: String,
+    flops: u64,
+    h2d_bytes: usize,
+    d2h_bytes: usize,
+    elapsed_s: f64,
+) {
+    if devices.len() == 1 {
+        log_gpu_success(
+            op,
+            backend,
+            &devices[0],
+            shape,
+            flops,
+            h2d_bytes,
+            d2h_bytes,
+            elapsed_s,
+        );
+        return;
+    }
+    let device_summary = devices
+        .iter()
+        .map(|device| format!("{} '{}'", device.ordinal, device.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log_route(format!(
+        "[GPU] multi-device route | op={op} | backend={backend} | devices=[{device_summary}] | shape={shape} | work={}flop | transfer=h2d:{} d2h:{} | elapsed={:.3}s",
+        format_count(flops),
+        format_bytes(h2d_bytes),
+        format_bytes(d2h_bytes),
+        elapsed_s,
+    ));
+}
+
 /// Coalesce repeated adjacent GPU routing messages. Long fits often repeat the
 /// same small CPU-routed kernel thousands of times; this keeps the first line
 /// visible and then emits heartbeat summaries at powers of two.
