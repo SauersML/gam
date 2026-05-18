@@ -15613,11 +15613,6 @@ fn prepare_duchon_derivative_contextwithworkspace(
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
-    if spec.periodic {
-        return Err(BasisError::InvalidInput(
-            "periodic Duchon log-kappa derivatives are not defined because cyclic pure Duchon has no global kappa path".to_string(),
-        ));
-    }
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
@@ -15634,6 +15629,223 @@ fn prepare_duchon_derivative_contextwithworkspace(
         "Duchon",
     )?;
     Ok((centers, identifiability_transform))
+}
+
+fn periodic_duchon_domain_from_centers(
+    centers: ArrayView2<'_, f64>,
+) -> Result<(f64, f64), BasisError> {
+    if centers.ncols() != 1 {
+        return Err(BasisError::InvalidInput(
+            "periodic Duchon smooths currently require exactly one covariate".to_string(),
+        ));
+    }
+    let left = centers
+        .column(0)
+        .iter()
+        .fold(f64::INFINITY, |a, &b| a.min(b));
+    let right = centers
+        .column(0)
+        .iter()
+        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    if !left.is_finite() || !right.is_finite() || left >= right {
+        return Err(BasisError::InvalidRange(left, right));
+    }
+    Ok((left, right - left))
+}
+
+fn fill_periodic_duchon_kernel_psi_matrices(
+    rows: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    left: f64,
+    period: f64,
+    length_scale: f64,
+    p_order: usize,
+    s_order: usize,
+    coeffs: &DuchonPartialFractionCoeffs,
+) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
+    let n = rows.nrows();
+    let k = centers.nrows();
+    let mut kernel = Array2::<f64>::zeros((n, k));
+    let mut kernel_psi = Array2::<f64>::zeros((n, k));
+    let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
+    for i in 0..n {
+        let x = wrap_to_period(rows[[i, 0]], left, period);
+        for j in 0..k {
+            let r = periodic_distance_1d(x, centers[[j, 0]], period);
+            let core =
+                duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, 1, coeffs)?;
+            kernel[[i, j]] = core.phi.value;
+            kernel_psi[[i, j]] = core.phi.psi;
+            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
+        }
+    }
+    Ok((kernel, kernel_psi, kernel_psi_psi))
+}
+
+fn periodic_duchon_identifiability_transformwithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    centers: Array2<f64>,
+    workspace: &mut BasisWorkspace,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let built = build_periodic_duchon_basis_1d(data, spec, centers, workspace)?;
+    match built.metadata {
+        BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        } => Ok(identifiability_transform),
+        _ => unreachable!("periodic Duchon builder returns Duchon metadata"),
+    }
+}
+
+fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiDerivativeBundle, BasisError> {
+    if data.ncols() != 1 {
+        return Err(BasisError::InvalidInput(
+            "periodic Duchon log-kappa derivatives require exactly one covariate".to_string(),
+        ));
+    }
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "periodic Duchon log-kappa derivatives require hybrid Duchon with length_scale"
+                .to_string(),
+        )
+    })?;
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    let (left, period) = periodic_duchon_domain_from_centers(centers.view())?;
+    let effective_nullspace_order = DuchonNullspaceOrder::Zero;
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    let s_order = spec.power;
+    validate_duchon_kernel_orders(Some(length_scale), p_order, s_order, 1)?;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
+    let z_kernel = kernel_constraint_nullspace(
+        centers.view(),
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
+    let identifiability_transform = periodic_duchon_identifiability_transformwithworkspace(
+        data,
+        spec,
+        centers.clone(),
+        workspace,
+    )?;
+
+    let (_data_kernel, data_kernel_psi, data_kernel_psi_psi) =
+        fill_periodic_duchon_kernel_psi_matrices(
+            data,
+            centers.view(),
+            left,
+            period,
+            length_scale,
+            p_order,
+            s_order,
+            &coeffs,
+        )?;
+    let kernel_amp = duchon_kernel_amplification(
+        centers.view(),
+        Some(length_scale),
+        p_order,
+        s_order,
+        1,
+        None,
+        Some(&coeffs),
+        None,
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
+    let kernel_cols = z_kernel.ncols();
+    let total_cols = kernel_cols + 1;
+    let mut design_first = Array2::<f64>::zeros((data.nrows(), total_cols));
+    let mut design_second = Array2::<f64>::zeros((data.nrows(), total_cols));
+    design_first
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&(fast_ab(&data_kernel_psi, &z_kernel) * kernel_amp));
+    design_second
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&(fast_ab(&data_kernel_psi_psi, &z_kernel) * kernel_amp));
+    if let Some(transform) = identifiability_transform.as_ref() {
+        design_first = fast_ab(&design_first, transform);
+        design_second = fast_ab(&design_second, transform);
+    }
+
+    let (center_kernel, center_kernel_psi, center_kernel_psi_psi) =
+        fill_periodic_duchon_kernel_psi_matrices(
+            centers.view(),
+            centers.view(),
+            left,
+            period,
+            length_scale,
+            p_order,
+            s_order,
+            &coeffs,
+        )?;
+    let omega = fast_ab(&fast_atb(&z_kernel, &center_kernel), &z_kernel);
+    let omega_psi = fast_ab(&fast_atb(&z_kernel, &center_kernel_psi), &z_kernel);
+    let omega_psi_psi = fast_ab(&fast_atb(&z_kernel, &center_kernel_psi_psi), &z_kernel);
+    let mut penalty = Array2::<f64>::zeros((total_cols, total_cols));
+    let mut penalty_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    let mut penalty_psi_psi = Array2::<f64>::zeros((total_cols, total_cols));
+    penalty
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega);
+    penalty_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_psi);
+    penalty_psi_psi
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega_psi_psi);
+    if let Some(transform) = identifiability_transform.as_ref() {
+        penalty = fast_ab(&fast_atb(transform, &penalty), transform);
+        penalty_psi = fast_ab(&fast_atb(transform, &penalty_psi), transform);
+        penalty_psi_psi = fast_ab(&fast_atb(transform, &penalty_psi_psi), transform);
+    }
+    let (penalty_norm, penalty_norm_psi, penalty_norm_psi_psi, normalization_scale) =
+        normalize_penaltywith_psi_derivatives(
+            &symmetrize(&penalty),
+            &symmetrize(&penalty_psi),
+            &symmetrize(&penalty_psi_psi),
+        );
+    let (_, _, penaltyinfo) = filter_active_penalty_candidates(vec![PenaltyCandidate {
+        matrix: penalty_norm,
+        nullspace_dim_hint: 1,
+        source: PenaltySource::Primary,
+        normalization_scale,
+        kronecker_factors: None,
+        op: None,
+    }])?;
+    let mut penalties_derivative = Vec::new();
+    let mut penaltiessecond_derivative = Vec::new();
+    for info in penaltyinfo.iter().filter(|info| info.active) {
+        match info.source {
+            PenaltySource::Primary => {
+                penalties_derivative.push(penalty_norm_psi.clone());
+                penaltiessecond_derivative.push(penalty_norm_psi_psi.clone());
+            }
+            ref other => {
+                return Err(BasisError::InvalidInput(format!(
+                    "unexpected periodic Duchon penalty source in derivative path: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(BasisPsiDerivativeBundle {
+        first: BasisPsiDerivativeResult {
+            design_derivative: design_first,
+            penalties_derivative,
+            implicit_operator: None,
+        },
+        second: BasisPsiSecondDerivativeResult {
+            designsecond_derivative: design_second,
+            penaltiessecond_derivative,
+            implicit_operator: None,
+        },
+        implicit_operator: None,
+    })
 }
 
 fn build_matern_design_psi_derivatives(
@@ -17680,6 +17892,11 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeBundle, BasisError> {
+    if spec.periodic {
+        return build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
+            data, spec, workspace,
+        );
+    }
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, workspace)?;
     let design_derivatives = build_duchon_design_psi_derivativeswithworkspace(

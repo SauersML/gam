@@ -1,23 +1,16 @@
-//! Regression: `duchon(x, periodic=true)` exposed through the formula DSL
-//! must surface a clear actionable error, not a deep "spatial kappa
-//! optimization failed: ... periodic Duchon log-kappa derivatives are not
-//! defined" panic from the REML inner loop.
+//! Regression: `duchon(x, periodic=true)` must fit through the formula DSL.
 //!
-//! Background: the periodic Duchon basis IS implemented at the basis layer
-//! (`build_periodic_duchon_basis_1d` builds a working wrapped-distance
-//! kernel and is exercised by unit tests in `basis.rs`), but the REML
-//! hyperparameter pipeline has no working kappa-derivative path for the
-//! wrapped-distance kernel — `prepare_duchon_derivative_context` rejects
-//! `spec.periodic` outright. As long as that derivative is missing, the
-//! formula DSL must steer users to the existing alternatives instead of
-//! letting a fit attempt blow up mid-REML.
-//!
-//! Two equivalent recommended substitutes exist:
-//!   1D periodic smoothing       → `s(x, periodic=true, period=2*pi)`
-//!   higher-D periodic geometry  → `te(...)` with `bc=['periodic', ...]`
+//! The basis layer already had a wrapped-distance periodic Duchon basis. This
+//! test locks in the full fit path, including REML smoothing selection, and
+//! verifies that predictions agree across the periodic seam.
 
 use csv::StringRecord;
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
+use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -43,37 +36,49 @@ fn make_periodic_dataset(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedD
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-#[test]
-fn periodic_duchon_formula_returns_actionable_redirect_error() {
+fn fit_predict(formula: &str, probes: &[f64]) -> Vec<f64> {
     init_parallelism();
-    let data = make_periodic_dataset(200, 0.05, 11);
+    let data = make_periodic_dataset(240, 0.04, 11);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    for formula in &["y ~ duchon(t, periodic=true)", "y ~ duchon(t, cyclic=true)"] {
-        let err = fit_from_formula(formula, &data, &cfg).err().expect(
-            "duchon(..., periodic=true) must fail at fit-time until the periodic kappa derivative is implemented",
-        );
-        let msg = err.to_string();
-        let lower = msg.to_lowercase();
-        // Must NOT leak the internal REML "spatial kappa optimization failed"
-        // wrapper or the deep "periodic Duchon log-kappa derivatives are not
-        // defined" string — the user should see a focused actionable
-        // redirect at the term-builder level.
+    let result = fit_from_formula(formula, &data, &cfg).expect("periodic Duchon fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard Gaussian fit");
+    };
+    assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+    let mut m = Array2::<f64>::zeros((probes.len(), 2));
+    for (i, &t) in probes.iter().enumerate() {
+        m[[i, 0]] = t;
+    }
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("predict design");
+    design.design.apply(&fit.fit.beta).to_vec()
+}
+
+#[test]
+fn periodic_duchon_formula_fits_and_wraps_at_seam() {
+    let probes = [0.0, 1.0e-6, TAU - 1.0e-6, TAU];
+    for formula in &[
+        "y ~ duchon(t, periodic=true, k=18)",
+        "y ~ duchon(t, cyclic=true, k=18)",
+    ] {
+        let pred = fit_predict(formula, &probes);
         assert!(
-            !lower.contains("spatial kappa optimization failed"),
-            "expected term-builder redirect for `{formula}`, got REML wrapper leak: {msg}",
+            pred.iter().all(|v| v.is_finite()),
+            "non-finite prediction for {formula}"
         );
         assert!(
-            !lower.contains("global kappa path"),
-            "expected term-builder redirect for `{formula}`, got internal-derivative leak: {msg}",
+            (pred[0] - pred[3]).abs() < 1.0e-8,
+            "periodic Duchon seam mismatch for {formula}: f(0)={} f(2pi)={}",
+            pred[0],
+            pred[3]
         );
-        // Must mention the recommended alternative so the user can act.
         assert!(
-            lower.contains("s(")
-                && (lower.contains("periodic=true") || lower.contains("periodic = true")),
-            "expected redirect to s(..., periodic=true) for `{formula}`, got: {msg}",
+            (pred[1] - pred[2]).abs() < 0.05,
+            "periodic Duchon near-seam predictions diverged for {formula}: left={} right={}",
+            pred[1],
+            pred[2]
         );
     }
 }
