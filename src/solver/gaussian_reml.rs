@@ -1939,11 +1939,6 @@ fn evaluate_reml_parts(
     let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * rho;
 
     let mut cost = 0.5 * d * (logdet_h - logdet_s);
-    eprintln!(
-        "[CLOSED_FORM] rho={rho} lambda={lambda} d={d} logdet_h={logdet_h} logdet_s={logdet_s} cost_logdet={cost} nu={nu} nullity={} penalty_rank={}",
-        cache.nullity,
-        cache.penalty_rank
-    );
     let mut grad = 0.5 * d * (trace_h - cache.penalty_rank as f64);
     let mut hess = 0.5 * d * trace_h_deriv;
     for output in 0..n_outputs {
@@ -1959,16 +1954,10 @@ fn evaluate_reml_parts(
             dp_hess += c2 * t * (1.0 - t) / (denom * denom * denom);
         }
         let dp = (ywy[output] - fitted_quadratic).max(MIN_DEVIANCE);
-        let extra = 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
-        eprintln!(
-            "[CLOSED_FORM]   output={output} ywy={} fitted_q={fitted_quadratic} dp={dp} extra={extra}",
-            ywy[output]
-        );
-        cost += extra;
+        cost += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
         grad += 0.5 * nu * dp_grad / dp;
         hess += 0.5 * nu * (dp_hess / dp - (dp_grad * dp_grad) / (dp * dp));
     }
-    eprintln!("[CLOSED_FORM] final cost={cost}");
     ObjectiveEval {
         cost,
         grad,
