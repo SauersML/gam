@@ -2614,4 +2614,121 @@ mod tests {
             fd_w
         );
     }
+
+    #[test]
+    fn batched_eigen_cache_matches_per_fit_build() {
+        // Three K=3 problems sharing the same penalty matrix. The batched
+        // pipeline must produce caches that are bit-exact identical to what
+        // the per-fit `gaussian_reml_eigen_cache_from_xtwx` builder produces,
+        // regardless of whether the GPU batched Cholesky kicks in or the
+        // helper falls through to per-fit Cholesky.
+        let xtwx_a = array![[4.0, 1.0], [1.0, 3.0]];
+        let xtwx_b = array![[2.5, -0.5], [-0.5, 1.7]];
+        let xtwx_c = array![[7.2, 0.3], [0.3, 5.1]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+
+        let batched = build_gaussian_reml_eigen_cache_batched(
+            vec![xtwx_a.clone(), xtwx_b.clone(), xtwx_c.clone()],
+            penalty.view(),
+            None,
+        );
+        assert_eq!(batched.len(), 3);
+
+        for (xtwx, batched_cache) in [&xtwx_a, &xtwx_b, &xtwx_c].into_iter().zip(batched.iter()) {
+            let single = gaussian_reml_eigen_cache_from_xtwx(xtwx.clone(), penalty.view(), None)
+                .expect("per-fit cache");
+            let batched_cache = batched_cache.as_ref().expect("batched cache");
+            assert_eq!(batched_cache.penalty_rank, single.penalty_rank);
+            assert_eq!(batched_cache.nullity, single.nullity);
+            assert_eq!(batched_cache.xtwx_fingerprint, single.xtwx_fingerprint);
+            assert_eq!(batched_cache.penalty_fingerprint, single.penalty_fingerprint);
+            assert!((batched_cache.logdet_xtwx - single.logdet_xtwx).abs() <= 1.0e-12);
+            assert!(
+                (batched_cache.logdet_penalty_positive - single.logdet_penalty_positive).abs()
+                    <= 1.0e-12
+            );
+            for (a, b) in batched_cache
+                .penalty_eigenvalues
+                .iter()
+                .zip(single.penalty_eigenvalues.iter())
+            {
+                assert!((a - b).abs() <= 1.0e-12);
+            }
+            for ((a, b), _) in batched_cache
+                .coefficient_basis
+                .iter()
+                .zip(single.coefficient_basis.iter())
+                .zip(0..)
+            {
+                assert!((a - b).abs() <= 1.0e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn backward_from_fit_matches_backward_with_refit() {
+        // The Task 3 state round-trip in pyffi calls `_from_fit`; that path
+        // must be numerically identical to the refitting `_backward` entry
+        // when fed the same forward result. This guards the optimization
+        // against drift when either path is touched.
+        let x = array![
+            [1.0, -0.9],
+            [1.0, -0.4],
+            [1.0, 0.1],
+            [1.0, 0.6],
+            [1.0, 1.1],
+        ];
+        let y = array![[0.2, -0.1], [0.4, 0.1], [0.7, 0.3], [1.0, 0.5], [1.5, 0.8]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.5]];
+        let weights = array![1.05, 0.95, 1.01, 0.99, 1.03];
+
+        let refit = gaussian_reml_multi_closed_form_backward(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.85),
+            0.2,
+            None,
+            None,
+            -0.1,
+        )
+        .expect("refit backward");
+
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            Some(weights.view()),
+            Some(0.85),
+            None,
+        )
+        .expect("forward fit");
+        let from_fit = gaussian_reml_multi_closed_form_backward_from_fit(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            Some(weights.view()),
+            &fit,
+            0.2,
+            None,
+            None,
+            -0.1,
+        )
+        .expect("from_fit backward");
+
+        for (a, b) in refit.grad_x.iter().zip(from_fit.grad_x.iter()) {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+        for (a, b) in refit.grad_y.iter().zip(from_fit.grad_y.iter()) {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+        for (a, b) in refit
+            .grad_weights
+            .iter()
+            .zip(from_fit.grad_weights.iter())
+        {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+    }
 }
