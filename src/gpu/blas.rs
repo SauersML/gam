@@ -595,6 +595,17 @@ fn route_gemm(m: usize, n: usize, k: usize) -> bool {
 }
 
 #[inline]
+fn route_gemm_batched(m: usize, n: usize, k: usize, batch_size: usize) -> bool {
+    m > 0
+        && n > 0
+        && k > 0
+        && batch_size > 0
+        && GpuRuntime::global()
+            .policy()
+            .route_gemm_batched(m, n, k, batch_size)
+}
+
+#[inline]
 fn route_gemv(rows: usize, cols: usize) -> bool {
     rows > 0 && cols > 0 && GpuRuntime::global().policy().route_gemv(rows, cols)
 }
@@ -617,35 +628,7 @@ fn route_trsm(p: usize, rhs_cols: usize) -> bool {
 fn with_runtime<T>(
     mut f: impl FnMut(&mut CublasRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
-    static RUNTIME: OnceLock<Vec<Mutex<CublasRuntime>>> = OnceLock::new();
-    let runtimes = RUNTIME.get_or_init(|| {
-        GpuRuntime::global()
-            .devices()
-            .iter()
-            .filter_map(|device| {
-                let cuda = match CudaWorkingState::init(device.ordinal) {
-                    Some(cuda) => cuda,
-                    None => {
-                        diagnostics::log_library_unavailable(
-                            "cuBLAS",
-                            &format!("CUDA context init failed for device {}", device.ordinal),
-                        );
-                        return None;
-                    }
-                };
-                match CublasRuntime::new(cuda, device.clone()) {
-                    Ok(runtime) => {
-                        diagnostics::log_library_ready("cuBLAS", &runtime.device);
-                        Some(Mutex::new(runtime))
-                    }
-                    Err(err) => {
-                        diagnostics::log_library_unavailable("cuBLAS", &err);
-                        None
-                    }
-                }
-            })
-            .collect()
-    });
+    let runtimes = cublas_runtimes();
     if runtimes.is_empty() {
         return None;
     }
@@ -659,6 +642,221 @@ fn with_runtime<T>(
         }
     }
     None
+}
+
+fn cublas_runtimes() -> &'static [Mutex<CublasRuntime>] {
+    static RUNTIME: OnceLock<Vec<Mutex<CublasRuntime>>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            GpuRuntime::global()
+                .devices()
+                .iter()
+                .filter_map(|device| {
+                    let cuda = match CudaWorkingState::init(device.ordinal) {
+                        Some(cuda) => cuda,
+                        None => {
+                            diagnostics::log_library_unavailable(
+                                "cuBLAS",
+                                &format!("CUDA context init failed for device {}", device.ordinal),
+                            );
+                            return None;
+                        }
+                    };
+                    match CublasRuntime::new(cuda, device.clone()) {
+                        Ok(runtime) => {
+                            diagnostics::log_library_ready("cuBLAS", &runtime.device);
+                            Some(Mutex::new(runtime))
+                        }
+                        Err(err) => {
+                            diagnostics::log_library_unavailable("cuBLAS", &err);
+                            None
+                        }
+                    }
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+fn plan_for_cublas(
+    batch_size: usize,
+    fixed_bytes_per_device: usize,
+    bytes_per_batch_item: usize,
+) -> Option<Vec<(usize, GpuDeviceInfo, Vec<Range<usize>>)>> {
+    let runtimes = cublas_runtimes();
+    if runtimes.len() <= 1 {
+        return None;
+    }
+    let mut devices = Vec::with_capacity(runtimes.len());
+    for runtime in runtimes {
+        devices.push(runtime.lock().ok()?.device.clone());
+    }
+    let plans = GpuRuntime::global().plan_batched_work_for_devices(
+        &devices,
+        batch_size,
+        fixed_bytes_per_device,
+        bytes_per_batch_item,
+    )?;
+    if plans.len() <= 1 {
+        return None;
+    }
+    let mut mapped = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let idx = devices
+            .iter()
+            .position(|device| device.ordinal == plan.ordinal)?;
+        mapped.push((idx, devices[idx].clone(), plan.chunks));
+    }
+    Some(mapped)
+}
+
+fn try_multi_gemm_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Option<(Array3<f64>, Vec<GpuDeviceInfo>)> {
+    let (batch, a_rows, a_cols) = a.dim();
+    let (_, b_rows, b_cols) = b.dim();
+    let m = if transpose_a { a_cols } else { a_rows };
+    let n = if transpose_b { b_rows } else { b_cols };
+    let a_stride = a_rows.checked_mul(a_cols)?;
+    let b_stride = b_rows.checked_mul(b_cols)?;
+    let c_stride = m.checked_mul(n)?;
+    let bytes_per_batch_item =
+        diagnostics::bytes_for_f64(a_stride.saturating_add(b_stride).saturating_add(c_stride));
+    let plan = plan_for_cublas(batch, 0, bytes_per_batch_item)?;
+    let runtimes = cublas_runtimes();
+    let mut pieces = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(chunks.len());
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                for range in chunks {
+                    let chunk_a = a.slice(s![range.clone(), .., ..]);
+                    let chunk_b = b.slice(s![range.clone(), .., ..]);
+                    let chunk =
+                        runtime.gemm_strided_batched(chunk_a, chunk_b, transpose_a, transpose_b)?;
+                    out.push((range, chunk));
+                }
+                Some((device, out))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok()?)
+            .collect::<Option<Vec<_>>>()
+    })?;
+    assemble_batched_output(batch, m, n, &mut pieces)
+}
+
+fn try_multi_gemm_broadcast_b_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ndarray::ArrayView2<'_, f64>,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Option<(Array3<f64>, Vec<GpuDeviceInfo>)> {
+    let (batch, a_rows, a_cols) = a.dim();
+    let (b_rows, b_cols) = b.dim();
+    let m = if transpose_a { a_cols } else { a_rows };
+    let n = if transpose_b { b_rows } else { b_cols };
+    let a_stride = a_rows.checked_mul(a_cols)?;
+    let c_stride = m.checked_mul(n)?;
+    let fixed_bytes_per_device = diagnostics::bytes_for_f64(b_rows.checked_mul(b_cols)?);
+    let bytes_per_batch_item = diagnostics::bytes_for_f64(a_stride.saturating_add(c_stride));
+    let plan = plan_for_cublas(batch, fixed_bytes_per_device, bytes_per_batch_item)?;
+    let runtimes = cublas_runtimes();
+    let mut pieces = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(chunks.len());
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                for range in chunks {
+                    let chunk_a = a.slice(s![range.clone(), .., ..]);
+                    let chunk = runtime.gemm_broadcast_b_strided_batched(
+                        chunk_a,
+                        b,
+                        transpose_a,
+                        transpose_b,
+                    )?;
+                    out.push((range, chunk));
+                }
+                Some((device, out))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok()?)
+            .collect::<Option<Vec<_>>>()
+    })?;
+    assemble_batched_output(batch, m, n, &mut pieces)
+}
+
+fn try_multi_broadcast_a_gemm_strided_batched(
+    a: ndarray::ArrayView2<'_, f64>,
+    b: ArrayView3<'_, f64>,
+    transpose_a: bool,
+    transpose_b: bool,
+) -> Option<(Array3<f64>, Vec<GpuDeviceInfo>)> {
+    let (a_rows, a_cols) = a.dim();
+    let (batch, b_rows, b_cols) = b.dim();
+    let m = if transpose_a { a_cols } else { a_rows };
+    let n = if transpose_b { b_rows } else { b_cols };
+    let b_stride = b_rows.checked_mul(b_cols)?;
+    let c_stride = m.checked_mul(n)?;
+    let fixed_bytes_per_device = diagnostics::bytes_for_f64(a_rows.checked_mul(a_cols)?);
+    let bytes_per_batch_item = diagnostics::bytes_for_f64(b_stride.saturating_add(c_stride));
+    let plan = plan_for_cublas(batch, fixed_bytes_per_device, bytes_per_batch_item)?;
+    let runtimes = cublas_runtimes();
+    let mut pieces = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            handles.push(scope.spawn(move || {
+                let mut out = Vec::with_capacity(chunks.len());
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                for range in chunks {
+                    let chunk_b = b.slice(s![range.clone(), .., ..]);
+                    let chunk = runtime.broadcast_a_gemm_strided_batched(
+                        a,
+                        chunk_b,
+                        transpose_a,
+                        transpose_b,
+                    )?;
+                    out.push((range, chunk));
+                }
+                Some((device, out))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok()?)
+            .collect::<Option<Vec<_>>>()
+    })?;
+    assemble_batched_output(batch, m, n, &mut pieces)
+}
+
+type BatchedPiece = (GpuDeviceInfo, Vec<(Range<usize>, Array3<f64>)>);
+
+fn assemble_batched_output(
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    pieces: &mut [BatchedPiece],
+) -> Option<(Array3<f64>, Vec<GpuDeviceInfo>)> {
+    let mut out = Array3::<f64>::zeros((batch, rows, cols));
+    let mut devices = Vec::with_capacity(pieces.len());
+    for (device, chunks) in pieces.iter_mut() {
+        devices.push(device.clone());
+        for (range, chunk) in chunks.drain(..) {
+            if chunk.dim() != (range.end - range.start, rows, cols) {
+                return None;
+            }
+            out.slice_mut(s![range, .., ..]).assign(&chunk);
+        }
+    }
+    Some((out, devices))
 }
 
 struct CublasRuntime {
