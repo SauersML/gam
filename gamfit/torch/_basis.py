@@ -40,7 +40,8 @@ class _BsplineBasisFn(torch.autograd.Function):
         return from_numpy_like(basis_np, t)
 
     @staticmethod
-    def backward(ctx: Any, grad_basis: Any) -> tuple[Any, None, None, None]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, None, None, None]:
+        (grad_basis,) = grad_outputs
         t, knots = ctx.saved_tensors
         t_np = to_numpy_f64(t)
         knots_np = to_numpy_f64(knots)
@@ -70,7 +71,8 @@ class _DuchonBasis1dFn(torch.autograd.Function):
         return from_numpy_like(basis_np, t)
 
     @staticmethod
-    def backward(ctx: Any, grad_basis: Any) -> tuple[Any, None, None, None]:
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, None, None, None]:
+        (grad_basis,) = grad_outputs
         t, centers = ctx.saved_tensors
         t_np = to_numpy_f64(t)
         centers_np = to_numpy_f64(centers)
