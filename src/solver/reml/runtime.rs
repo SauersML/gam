@@ -9,6 +9,9 @@ use crate::linalg::utils::{
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
+use crate::solver::persistent_warm_start::{
+    PersistentWarmStartRecord, StableHasher, load_record, store_record,
+};
 use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -61,6 +64,86 @@ fn screening_residual_penalty(cost: f64, pr: &PirlsResult) -> f64 {
     } else {
         f64::INFINITY
     }
+}
+
+fn hash_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
+    hasher.write_usize(values.len());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
+    hasher.write_usize(values.nrows());
+    hasher.write_usize(values.ncols());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    hasher.write_usize(n);
+    hasher.write_usize(p);
+    let bytes_per_row = p.saturating_mul(std::mem::size_of::<f64>()).max(1);
+    let chunk_rows = ((8 * 1024 * 1024) / bytes_per_row).clamp(1, 4096);
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("persistent warm-start design hash failed: {e}"))?;
+        hash_array2(hasher, &chunk);
+    }
+    Ok(())
+}
+
+fn hash_canonical_penalties(
+    hasher: &mut StableHasher,
+    penalties: &[crate::construction::CanonicalPenalty],
+) {
+    hasher.write_usize(penalties.len());
+    for penalty in penalties {
+        hasher.write_usize(penalty.col_range.start);
+        hasher.write_usize(penalty.col_range.end);
+        hasher.write_usize(penalty.total_dim);
+        hasher.write_usize(penalty.nullity);
+        hash_array2(hasher, &penalty.root);
+        hash_array2(hasher, &penalty.local);
+        hasher.write_usize(penalty.positive_eigenvalues.len());
+        for &value in &penalty.positive_eigenvalues {
+            hasher.write_f64(value);
+        }
+        hasher.write_bool(penalty.op.is_some());
+    }
+}
+
+fn finite_positive_from_bits(bits: u64) -> Option<f64> {
+    if bits == 0 {
+        return None;
+    }
+    let value = f64::from_bits(bits);
+    if value.is_finite() && value > 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn finite_nonnegative_from_bits(bits: u64) -> Option<f64> {
+    let value = f64::from_bits(bits);
+    if value.is_finite() && value >= 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn finite_nonnegative_bits_or_no_signal(value: Option<f64>) -> u64 {
+    value
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(f64::to_bits)
+        .unwrap_or(IFT_RESIDUAL_NO_SIGNAL_BITS)
 }
 
 struct TkCorrectionTerms {
@@ -1645,6 +1728,9 @@ impl<'a> RemlState<'a> {
         }
         self.runtime_mixture_link_state = mixture_link_state;
         self.runtime_sas_link_state = sas_link_state;
+        *self.persistent_warm_start_key.write().unwrap() = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
         self.invalidate_link_dependent_state();
     }
 
@@ -2157,6 +2243,8 @@ impl<'a> RemlState<'a> {
             kronecker_factored: None,
             penalty_block_structural_nullities: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
+            persistent_warm_start_key: RwLock::new(None),
+            persistent_warm_start_loaded: AtomicBool::new(false),
         })
     }
 
@@ -2206,6 +2294,9 @@ impl<'a> RemlState<'a> {
         // The Gaussian-fixed cache is keyed to (X, y, w, offset); replacing the
         // design invalidates it. The new surface will repopulate it on demand.
         *self.gaussian_fixed_cache.write().unwrap() = None;
+        *self.persistent_warm_start_key.write().unwrap() = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
         self.cache_manager.clear_eval_and_factor_caches();
         self.cache_manager.pirls_cache.write().unwrap().clear();
         // The new surface has a different design / penalty system /
@@ -2243,10 +2334,16 @@ impl<'a> RemlState<'a> {
     /// non-Gaussianity in the posterior. Typical value: `Some(1e-6)`.
     pub(crate) fn set_penalty_shrinkage_floor(&mut self, floor: Option<f64>) {
         self.penalty_shrinkage_floor = floor;
+        *self.persistent_warm_start_key.write().unwrap() = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn set_rho_prior(&mut self, prior: RhoPrior) {
         self.rho_prior = prior;
+        *self.persistent_warm_start_key.write().unwrap() = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
     }
 
     /// Creates a sanitized cache key from rho values.
@@ -2856,6 +2953,178 @@ impl<'a> RemlState<'a> {
         // tangent-line / flat warm-start path.
         if let Some(cache) = self.ift_warm_start_cache.write().unwrap().as_mut() {
             cache.rho = rho.to_owned();
+        }
+    }
+
+    fn persistent_warm_start_cache_key(&self) -> Option<String> {
+        if let Some(key) = self.persistent_warm_start_key.read().unwrap().clone() {
+            return Some(key);
+        }
+        let mut hasher = StableHasher::new();
+        hasher.write_str("gamfit-persistent-warm-start");
+        hasher.write_str(env!("CARGO_PKG_VERSION"));
+        hasher.write_usize(self.y.len());
+        hasher.write_usize(self.p);
+        hasher.write_str(&format!("{:?}", self.config.likelihood));
+        hasher.write_str(&format!("{:?}", self.config.link_kind));
+        hasher.write_f64(self.config.pirls_convergence_tolerance);
+        hasher.write_f64(self.config.reml_convergence_tolerance);
+        hasher.write_usize(self.config.max_iterations);
+        hasher.write_bool(self.config.firth_bias_reduction);
+        hasher.write_str(&format!("{:?}", self.runtime_mixture_link_state));
+        hasher.write_str(&format!("{:?}", self.runtime_sas_link_state));
+        match self.penalty_shrinkage_floor {
+            Some(value) => {
+                hasher.write_bool(true);
+                hasher.write_f64(value);
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_str(&format!("{:?}", self.rho_prior));
+
+        hash_array_view(&mut hasher, self.y);
+        hash_array_view(&mut hasher, self.weights);
+        hash_array_view(&mut hasher, self.offset.view());
+        if hash_design_matrix(&mut hasher, &self.x).is_err() {
+            return None;
+        }
+        hash_canonical_penalties(&mut hasher, self.canonical_penalties.as_ref());
+        hasher.write_usize(self.nullspace_dims.len());
+        for &dim in &self.nullspace_dims {
+            hasher.write_usize(dim);
+        }
+        match self.coefficient_lower_bounds.as_ref() {
+            Some(bounds) => {
+                hasher.write_bool(true);
+                hash_array_view(&mut hasher, bounds.view());
+            }
+            None => hasher.write_bool(false),
+        }
+        match self.linear_constraints.as_ref() {
+            Some(constraints) => {
+                hasher.write_bool(true);
+                hash_array2(&mut hasher, &constraints.a);
+                hash_array_view(&mut hasher, constraints.b.view());
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_bool(self.kronecker_penalty_system.is_some());
+        hasher.write_bool(self.kronecker_factored.is_some());
+        let key = hasher.finish_hex();
+        self.persistent_warm_start_key
+            .write()
+            .unwrap()
+            .replace(key.clone());
+        Some(key)
+    }
+
+    fn load_persistent_warm_start_once(&self) {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        if self
+            .persistent_warm_start_loaded
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        if self.warm_start_beta.read().unwrap().is_some() {
+            return;
+        }
+        let Some(key) = self.persistent_warm_start_cache_key() else {
+            return;
+        };
+        let Some(record) = load_record(&key) else {
+            return;
+        };
+        if !record.is_compatible(&key, self.y.len(), self.p) {
+            return;
+        }
+        let rho_len = record.rho.len();
+        if rho_len != self.canonical_penalties.len() {
+            return;
+        }
+        {
+            self.warm_start_beta
+                .write()
+                .unwrap()
+                .replace(Coefficients::new(Array1::from_vec(record.beta)));
+            self.warm_start_rho
+                .write()
+                .unwrap()
+                .replace(Array1::from_vec(record.rho));
+            *self.prev_warm_start_beta.write().unwrap() = record
+                .prev_beta
+                .map(|beta| Coefficients::new(Array1::from_vec(beta)));
+            *self.prev_warm_start_rho.write().unwrap() = record.prev_rho.map(Array1::from_vec);
+        }
+        self.last_inner_iters
+            .store(record.last_inner_iters, Ordering::Relaxed);
+        self.last_inner_converged
+            .store(record.last_inner_converged, Ordering::Relaxed);
+        self.last_pirls_lm_lambda.store(
+            record
+                .last_pirls_lm_lambda
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(f64::to_bits)
+                .unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.last_ift_prediction_residual.store(
+            finite_nonnegative_bits_or_no_signal(record.last_ift_prediction_residual),
+            Ordering::Relaxed,
+        );
+        self.last_pirls_accept_rho.store(
+            finite_nonnegative_bits_or_no_signal(record.last_pirls_accept_rho),
+            Ordering::Relaxed,
+        );
+        log::info!("[warm-start-cache] restored persistent warm start key={key}");
+    }
+
+    fn store_persistent_warm_start(&self) {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(key) = self.persistent_warm_start_cache_key() else {
+            return;
+        };
+        let Some(beta) = self.warm_start_beta.read().unwrap().as_ref().cloned() else {
+            return;
+        };
+        let Some(rho) = self.warm_start_rho.read().unwrap().clone() else {
+            return;
+        };
+        if beta.0.len() != self.p || rho.len() != self.canonical_penalties.len() {
+            return;
+        }
+        let mut record = PersistentWarmStartRecord::new(key, self.y.len(), self.p);
+        record.updated_unix_secs = record.created_unix_secs;
+        record.rho = rho.to_vec();
+        record.beta = beta.0.to_vec();
+        record.prev_rho = self
+            .prev_warm_start_rho
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Array1::to_vec);
+        record.prev_beta = self
+            .prev_warm_start_beta
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|coefficients| coefficients.0.to_vec());
+        record.last_inner_iters = self.last_inner_iters.load(Ordering::Relaxed);
+        record.last_inner_converged = self.last_inner_converged.load(Ordering::Relaxed);
+        record.last_pirls_lm_lambda = finite_positive_from_bits(
+            self.last_pirls_lm_lambda.load(Ordering::Relaxed),
+        );
+        record.last_ift_prediction_residual = finite_nonnegative_from_bits(
+            self.last_ift_prediction_residual.load(Ordering::Relaxed),
+        );
+        record.last_pirls_accept_rho =
+            finite_nonnegative_from_bits(self.last_pirls_accept_rho.load(Ordering::Relaxed));
+        if let Err(err) = store_record(&record) {
+            log::warn!("[warm-start-cache] failed to persist warm start: {err}");
         }
     }
 

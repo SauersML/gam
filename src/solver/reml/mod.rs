@@ -3955,4 +3955,10 @@ pub(crate) struct RemlState<'a> {
     ///
     /// Invalidated jointly with the design in `reset_surface`.
     pub(crate) gaussian_fixed_cache: RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
+
+    /// Stable disk-cache key for the current realized REML surface. Computed
+    /// lazily because it hashes the row-chunked design and data vectors.
+    pub(crate) persistent_warm_start_key: RwLock<Option<String>>,
+    /// Ensures the process attempts at most one disk restore per surface.
+    pub(crate) persistent_warm_start_loaded: AtomicBool,
 }

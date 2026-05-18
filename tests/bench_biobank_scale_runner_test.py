@@ -1104,7 +1104,7 @@ class MarkerPatternTests(unittest.TestCase):
         )
         sm = _RUNNER._KAPPA_PHASE_SUMMARY_PATTERN.findall(summary)
         self.assertEqual(len(sm), 1)
-        log_kappa_dim, n_cost, cost_s, n_eval, eval_s, n_efs, efs_s, optim_s = sm[0]
+        log_kappa_dim, n_cost, cost_s, _n_eval, _eval_s, _n_efs, _efs_s, optim_s = sm[0]
         self.assertEqual(log_kappa_dim, "2")
         self.assertEqual(n_cost, "12")
         self.assertAlmostEqual(float(cost_s), 5.1840)

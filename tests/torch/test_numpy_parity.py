@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
+pytest.importorskip("gamfit")
 
-import gamfit  # noqa: E402  (after importorskip)
 from gamfit import _api as _np_api  # noqa: E402
 import gamfit.torch as gt  # noqa: E402
 
