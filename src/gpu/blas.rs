@@ -8,6 +8,7 @@ use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
     to_col_major, to_i32, to_i64,
 };
+use super::diagnostics;
 use super::runtime::GpuRuntime;
 
 #[inline]
@@ -19,9 +20,36 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (k_b, n) = b.dim();
     debug_assert_eq!(k, k_b, "A and B must have compatible inner dimensions");
     if !route_gemm(m, n, k) {
+        diagnostics::log_policy_cpu(
+            "gemm",
+            format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
+            format!(
+                "below cuBLAS policy threshold gemm_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemm(a, b, false, false))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemm(a, b, false, false));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "gemm",
+            "cuBLAS",
+            format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
+            diagnostics::gemm_flops(m, n, k),
+            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+            diagnostics::bytes_for_f64(m.saturating_mul(n)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "gemm",
+            "cuBLAS",
+            format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
+        );
+    }
+    result
 }
 
 /// Strided batched dense matrix multiply: `C[b] = A[b] · B[b]` (or transposed
@@ -82,9 +110,36 @@ pub fn try_fast_ab_broadcast_b_batched(
         return None;
     }
     if !route_gemm(m, n, k) {
+        diagnostics::log_policy_cpu(
+            "gemm_broadcast_b_strided_batched",
+            format!("batch={batch} m={m} n={n} k={k}"),
+            format!(
+                "below cuBLAS policy threshold gemm_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "gemm_broadcast_b_strided_batched",
+            "cuBLAS",
+            format!("batch={batch} m={m} n={n} k={k}"),
+            diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
+            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+            diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "gemm_broadcast_b_strided_batched",
+            "cuBLAS",
+            format!("batch={batch} m={m} n={n} k={k}"),
+        );
+    }
+    result
 }
 
 /// Strided batched `A · B[b]ᵀ` with `A` broadcast. Mirrors
@@ -108,9 +163,36 @@ pub fn try_fast_a_broadcast_bt_batched(
         return None;
     }
     if !route_gemm(m, n, k) {
+        diagnostics::log_policy_cpu(
+            "gemm_broadcast_a_strided_batched",
+            format!("batch={batch} m={m} n={n} k={k}"),
+            format!(
+                "below cuBLAS policy threshold gemm_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "gemm_broadcast_a_strided_batched",
+            "cuBLAS",
+            format!("batch={batch} m={m} n={n} k={k}"),
+            diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
+            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+            diagnostics::bytes_for_f64(batch.saturating_mul(m).saturating_mul(n)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "gemm_broadcast_a_strided_batched",
+            "cuBLAS",
+            format!("batch={batch} m={m} n={n} k={k}"),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -133,9 +215,36 @@ fn try_fast_gemm_strided_batched(
         return None;
     }
     if !route_gemm(m, n, k) {
+        diagnostics::log_policy_cpu(
+            "gemm_strided_batched",
+            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+            format!(
+                "below cuBLAS policy threshold gemm_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "gemm_strided_batched",
+            "cuBLAS",
+            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+            diagnostics::gemm_flops(m, n, k).saturating_mul(batch_a as u64),
+            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+            diagnostics::bytes_for_f64(batch_a.saturating_mul(m).saturating_mul(n)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "gemm_strided_batched",
+            "cuBLAS",
+            format!("batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -147,9 +256,32 @@ pub fn try_fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (rows_b, rhs) = b.dim();
     debug_assert_eq!(rows, rows_b, "A and B must have same number of rows");
     if !route_gemm(cols, rhs, rows) {
+        diagnostics::log_policy_cpu(
+            "atb",
+            format!("rows={rows} cols={cols} rhs={rhs}"),
+            format!(
+                "below cuBLAS policy threshold gemm_flops>={}",
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemm(a, b, true, false))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemm(a, b, true, false));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "atb",
+            "cuBLAS",
+            format!("rows={rows} cols={cols} rhs={rhs}"),
+            diagnostics::gemm_flops(cols, rhs, rows),
+            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+            diagnostics::bytes_for_f64(cols.saturating_mul(rhs)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("atb", "cuBLAS", format!("rows={rows} cols={cols} rhs={rhs}"));
+    }
+    result
 }
 
 #[inline]
@@ -160,9 +292,32 @@ pub fn try_fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (rows, cols) = a.dim();
     debug_assert_eq!(cols, v.len(), "A cols must match v length");
     if !route_gemv(rows, cols) {
+        diagnostics::log_policy_cpu(
+            "av",
+            format!("rows={rows} cols={cols}"),
+            format!(
+                "below cuBLAS policy threshold gemv_flops>={}",
+                GpuRuntime::global().policy().gemv_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemv(a, v, false))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemv(a, v, false));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "av",
+            "cuBLAS",
+            format!("rows={rows} cols={cols}"),
+            diagnostics::gemv_flops(rows, cols),
+            diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
+            diagnostics::bytes_for_f64(rows),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("av", "cuBLAS", format!("rows={rows} cols={cols}"));
+    }
+    result
 }
 
 #[inline]
@@ -173,9 +328,32 @@ pub fn try_fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (rows, cols) = a.dim();
     debug_assert_eq!(rows, v.len(), "A rows must match v length");
     if !route_gemv(rows, cols) {
+        diagnostics::log_policy_cpu(
+            "atv",
+            format!("rows={rows} cols={cols}"),
+            format!(
+                "below cuBLAS policy threshold gemv_flops>={}",
+                GpuRuntime::global().policy().gemv_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.gemv(a, v, true))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.gemv(a, v, true));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "atv",
+            "cuBLAS",
+            format!("rows={rows} cols={cols}"),
+            diagnostics::gemv_flops(rows, cols),
+            diagnostics::bytes_for_f64(a.len().saturating_add(v.len())),
+            diagnostics::bytes_for_f64(cols),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("atv", "cuBLAS", format!("rows={rows} cols={cols}"));
+    }
+    result
 }
 
 #[inline]
@@ -186,9 +364,33 @@ pub fn try_fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (rows, cols) = x.dim();
     debug_assert_eq!(rows, w.len(), "X rows must match W length");
     if !route_xtwx(rows, cols, cols) {
+        diagnostics::log_policy_cpu(
+            "xt_diag_x",
+            format!("rows={rows} cols={cols}"),
+            format!(
+                "below cuBLAS policy threshold rows>={} and gemm_flops>={}",
+                GpuRuntime::global().policy().xtwx_min_rows,
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.xt_diag_y(x, w, x))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.xt_diag_y(x, w, x));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "xt_diag_x",
+            "cuBLAS",
+            format!("rows={rows} cols={cols}"),
+            diagnostics::gemm_flops(cols, cols, rows),
+            diagnostics::bytes_for_f64(x.len().saturating_mul(2).saturating_add(w.len())),
+            diagnostics::bytes_for_f64(cols.saturating_mul(cols)),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu("xt_diag_x", "cuBLAS", format!("rows={rows} cols={cols}"));
+    }
+    result
 }
 
 #[inline]
@@ -201,9 +403,37 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
     debug_assert_eq!(rows, w.len(), "X rows must match W length");
     debug_assert_eq!(rows, y.nrows(), "X rows must match Y rows");
     if !route_xtwx(rows, x.ncols(), y.ncols()) {
+        diagnostics::log_policy_cpu(
+            "xt_diag_y",
+            format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
+            format!(
+                "below cuBLAS policy threshold rows>={} and gemm_flops>={}",
+                GpuRuntime::global().policy().xtwx_min_rows,
+                GpuRuntime::global().policy().gemm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.xt_diag_y(x, w, y))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.xt_diag_y(x, w, y));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "xt_diag_y",
+            "cuBLAS",
+            format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
+            diagnostics::gemm_flops(x.ncols(), y.ncols(), rows),
+            diagnostics::bytes_for_f64(x.len().saturating_add(y.len()).saturating_add(w.len())),
+            diagnostics::bytes_for_f64(x.ncols().saturating_mul(y.ncols())),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "xt_diag_y",
+            "cuBLAS",
+            format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -213,9 +443,36 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
 ) -> Option<Array2<f64>> {
     let p = lower.nrows();
     if lower.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+        diagnostics::log_policy_cpu(
+            "trsm_lower",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            format!(
+                "below cuBLAS policy threshold trsm_flops>={}",
+                GpuRuntime::global().policy().trsm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "trsm_lower",
+            "cuBLAS",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            (p as u64).saturating_mul(p as u64).saturating_mul(rhs.ncols() as u64),
+            diagnostics::bytes_for_f64(lower.len().saturating_add(rhs.len())),
+            diagnostics::bytes_for_f64(rhs.len()),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "trsm_lower",
+            "cuBLAS",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -225,9 +482,36 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
 ) -> Option<Array2<f64>> {
     let p = upper.nrows();
     if upper.ncols() != p || rhs.nrows() != p || !route_trsm(p, rhs.ncols()) {
+        diagnostics::log_policy_cpu(
+            "trsm_upper",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            format!(
+                "below cuBLAS policy threshold trsm_flops>={}",
+                GpuRuntime::global().policy().trsm_min_flops
+            ),
+        );
         return None;
     }
-    with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER))
+    let start = std::time::Instant::now();
+    let result = with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER));
+    if result.is_some() {
+        diagnostics::log_gpu_success(
+            "trsm_upper",
+            "cuBLAS",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+            (p as u64).saturating_mul(p as u64).saturating_mul(rhs.ncols() as u64),
+            diagnostics::bytes_for_f64(upper.len().saturating_add(rhs.len())),
+            diagnostics::bytes_for_f64(rhs.len()),
+            start.elapsed().as_secs_f64(),
+        );
+    } else {
+        diagnostics::log_runtime_cpu(
+            "trsm_upper",
+            "cuBLAS",
+            format!("p={p} rhs_cols={}", rhs.ncols()),
+        );
+    }
+    result
 }
 
 #[inline]
@@ -260,7 +544,16 @@ fn with_runtime<T>(f: impl FnOnce(&mut CublasRuntime) -> Option<T>) -> Option<T>
     RUNTIME
         .get_or_init(|| {
             let cuda = GpuRuntime::global().cuda_working_state()?;
-            CublasRuntime::new(cuda).ok().map(Mutex::new)
+            match CublasRuntime::new(cuda) {
+                Ok(runtime) => {
+                    diagnostics::log_library_ready("cuBLAS");
+                    Some(Mutex::new(runtime))
+                }
+                Err(err) => {
+                    diagnostics::log_library_unavailable("cuBLAS", &err);
+                    None
+                }
+            }
         })
         .as_ref()?
         .lock()
