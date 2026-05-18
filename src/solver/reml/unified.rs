@@ -6140,6 +6140,11 @@ pub fn reml_laml_evaluate(
             "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
         ));
     }
+    eprintln!(
+        "[UN-GRAD] rho={:?} grad={:?} cost={cost}",
+        rho.iter().collect::<Vec<_>>(),
+        grad.iter().collect::<Vec<_>>()
+    );
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian {
