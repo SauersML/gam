@@ -248,7 +248,7 @@ fn factor_by_smooth_fits_end_to_end_through_reml() {
     let (ds, y) = medium_factor_dataset();
     let cmap = ds.column_map();
     let mut notes = Vec::new();
-    let parsed = parse_formula("y ~ s(x, by=fac, k=4)").unwrap();
+    let parsed = parse_formula("y ~ s(x, by=fac, k=4) + fac").unwrap();
     let spec = build_termspec(
         &parsed.terms,
         &ds,
