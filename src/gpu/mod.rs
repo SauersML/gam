@@ -17,6 +17,7 @@
 //! and behavior on hosts without a usable NVIDIA driver is unchanged.
 
 mod blas;
+mod diagnostics;
 pub mod device;
 pub mod dispatch;
 mod driver;
