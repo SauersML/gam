@@ -8105,8 +8105,6 @@ def run_external_xgboost_aft_cv(scenario: typing.Any, *, ds: dict[str, typing.An
         risk = -pred_time
         pred_sec = (datetime.now(timezone.utc) - pred_start).total_seconds()
 
-        event_times = test_df[time_col].to_numpy(dtype=float)
-        events = test_df[event_col].to_numpy(dtype=float)
         cv_rows.append(
             {
                 "fit_sec": fit_sec,
@@ -9110,7 +9108,7 @@ def generate_scenario_figures(results: list[dict[str, typing.Any]], out_dir: Pat
         ax_time.set_xlabel("Time (seconds)", fontsize=9.5, fontweight="bold")
         ax_time.set_title("Fit + Predict Time  (↓ lower is better)", fontsize=10, loc="left", pad=8)
         ax_time.grid(axis="x", color=grid_color, linewidth=0.5, zorder=0)
-        legend = ax_time.legend(
+        ax_time.legend(
             loc="lower right", fontsize=8,
             facecolor=bg_card, edgecolor=grid_color,
             labelcolor=text_color,
