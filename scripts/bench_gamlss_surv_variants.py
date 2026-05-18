@@ -19,10 +19,12 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from typing import Any
+
 import numpy as np
 
 
-def synth(n: int = 200, seed: int = 17) -> dict:
+def synth(n: int = 200, seed: int = 17) -> dict[str, list[float]]:
     rng = np.random.default_rng(seed)
     bmi   = rng.normal(27.0, 4.0, n)
     hba1c = rng.normal(5.8,  0.7, n)
@@ -55,7 +57,9 @@ def synth(n: int = 200, seed: int = 17) -> dict:
     }
 
 
-def fit_variant(args):
+def fit_variant(
+    args: tuple[str, dict[str, Any], dict[str, list[float]]],
+) -> tuple[str, float, bool, str | None]:
     """Fit one variant inside its own subprocess and return (label, time, ok, err)."""
     label, kwargs, data = args
     # Imports inside the worker keep the parent process light when the
