@@ -2,6 +2,7 @@
 
 use libloading::Library;
 use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Data, Ix1, Ix2, s};
+use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 
 use super::device::GpuDeviceInfo;
@@ -114,7 +115,7 @@ pub fn try_fast_ab_broadcast_b_batched(
     if k != b_rows || m == 0 || n == 0 || k == 0 {
         return None;
     }
-    if !route_gemm(m, n, k) {
+    if !route_gemm_batched(m, n, k, batch) {
         diagnostics::log_policy_cpu(
             "gemm_broadcast_b_strided_batched",
             format!("batch={batch} m={m} n={n} k={k}"),
@@ -126,12 +127,15 @@ pub fn try_fast_ab_broadcast_b_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_gemm_broadcast_b_strided_batched(a, b, false, false).or_else(|| {
+        with_runtime(|runtime| runtime.gemm_broadcast_b_strided_batched(a, b, false, false))
+            .map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "gemm_broadcast_b_strided_batched",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("batch={batch} m={m} n={n} k={k}"),
                 diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
                 diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
@@ -171,7 +175,7 @@ pub fn try_fast_a_broadcast_bt_batched(
     if k != b_cols || m == 0 || n == 0 || k == 0 {
         return None;
     }
-    if !route_gemm(m, n, k) {
+    if !route_gemm_batched(m, n, k, batch) {
         diagnostics::log_policy_cpu(
             "gemm_broadcast_a_strided_batched",
             format!("batch={batch} m={m} n={n} k={k}"),
@@ -183,12 +187,15 @@ pub fn try_fast_a_broadcast_bt_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_broadcast_a_gemm_strided_batched(a, b, false, true).or_else(|| {
+        with_runtime(|runtime| runtime.broadcast_a_gemm_strided_batched(a, b, false, true))
+            .map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "gemm_broadcast_a_strided_batched",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("batch={batch} m={m} n={n} k={k}"),
                 diagnostics::gemm_flops(m, n, k).saturating_mul(batch as u64),
                 diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
@@ -227,7 +234,7 @@ fn try_fast_gemm_strided_batched(
     if k != b_k || m == 0 || n == 0 || k == 0 {
         return None;
     }
-    if !route_gemm(m, n, k) {
+    if !route_gemm_batched(m, n, k, batch_a) {
         diagnostics::log_policy_cpu(
             "gemm_strided_batched",
             format!(
@@ -241,12 +248,15 @@ fn try_fast_gemm_strided_batched(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_gemm_strided_batched(a, b, transpose_a, transpose_b).or_else(|| {
+        with_runtime(|runtime| runtime.gemm_strided_batched(a, b, transpose_a, transpose_b))
+            .map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "gemm_strided_batched",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!(
                     "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
                 ),
