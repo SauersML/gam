@@ -3016,6 +3016,15 @@ pub enum BasisMetadata {
         periodic: Vec<Option<(f64, f64, usize)>>,
         identifiability_transform: Option<Array2<f64>>,
     },
+    FactorSmooth {
+        continuous_cols: Vec<usize>,
+        group_col: usize,
+        knots: Array1<f64>,
+        degree: usize,
+        periodic: Option<(f64, f64, usize)>,
+        group_levels: Vec<u64>,
+        flavour: String,
+    },
 }
 
 /// Standardized basis build result for engine-level composition.
