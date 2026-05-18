@@ -210,18 +210,25 @@ impl<'a> RemlState<'a> {
         } else if !self.canonical_penalties.is_empty()
             && self.canonical_penalties.len() == rho.len()
         {
-            let cached_block_nullities = if ridge > 0.0 {
-                Some(self.cached_penalty_block_structural_nullities()?)
-            } else {
-                None
-            };
+            // Always pass the cached structural nullities. The intersection
+            // nullity of the unscaled penalty subspaces is a property of the
+            // CanonicalPenalty layout and is invariant under ρ — by reusing
+            // the cache regardless of whether a ridge is active, we make the
+            // pseudo-logdet rank stable across the ρ perturbations a
+            // finite-difference probe walks through. Previously this was
+            // gated on `ridge > 0.0` (so the ridge-free Gaussian-identity
+            // REML path fell back to eigenvalue-threshold rank detection),
+            // which created a discontinuous `log|S(λ)|₊` whenever a
+            // near-zero eigenvalue flipped above/below the
+            // `p × ε × max|eig|`-scaled threshold.
+            let cached_block_nullities = self.cached_penalty_block_structural_nullities()?;
             let pld =
                 super::penalty_logdet::PenaltyPseudologdet::from_penalties_with_cached_block_nullities(
                     &self.canonical_penalties,
                     lambdas.as_slice().unwrap(),
                     ridge,
                     self.p,
-                    cached_block_nullities.as_ref(),
+                    Some(&cached_block_nullities),
                 )
                 .map_err(EstimationError::LayoutError)?;
             let rank = pld.rank();
@@ -3495,169 +3502,6 @@ impl<'a> RemlState<'a> {
         Some(cache)
     }
 
-    fn gaussian_closed_form_reml_eligible(&self, rho: &Array1<f64>) -> bool {
-        if rho.len() != self.canonical_penalties.len() {
-            return false;
-        }
-        let family_ok = matches!(
-            self.config.likelihood.family,
-            crate::types::GlmLikelihoodFamily::GaussianIdentity
-        );
-        let link_ok = matches!(
-            self.config.link_kind,
-            crate::types::InverseLink::Standard(LinkFunction::Identity)
-        );
-        family_ok
-            && link_ok
-            && !self.config.firth_bias_reduction
-            && self.coefficient_lower_bounds.is_none()
-            && self.linear_constraints.is_none()
-            && self.penalty_shrinkage_floor.is_none()
-            && rho.iter().all(|&r| r.is_finite())
-    }
-
-    /// Evaluate Gaussian identity-link REML directly from sufficient statistics.
-    ///
-    /// When the Gaussian fixed-cache preconditions hold, the inner mode has the
-    /// closed form
-    ///
-    /// ```text
-    /// β̂(ρ) = (XᵀWX + S(ρ))⁻¹ XᵀW(y - offset).
-    /// ```
-    ///
-    /// The REML determinant terms are exactly the pair the objective requires:
-    /// `log|XᵀWX + S(ρ)|` and `log|S(ρ)|_+`.  This path therefore bypasses
-    /// PIRLS iteration entirely, while still routing the resulting sufficient
-    /// statistics through the unified analytic REML evaluator so the gradient
-    /// and outer Hessian stay paired with the same cost.
-    fn try_gaussian_closed_form_reml_eval(
-        &self,
-        rho: &Array1<f64>,
-        mode: super::unified::EvalMode,
-    ) -> Result<Option<super::unified::RemlLamlResult>, EstimationError> {
-        if !self.gaussian_closed_form_reml_eligible(rho) {
-            return Ok(None);
-        }
-        let Some(cache) = self.gaussian_fixed_cache_if_eligible() else {
-            return Ok(None);
-        };
-        let lambdas = rho.mapv(f64::exp);
-        if lambdas
-            .iter()
-            .any(|&lambda| !lambda.is_finite() || lambda <= 0.0)
-        {
-            return Ok(None);
-        }
-
-        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
-        for (k, cp) in self.canonical_penalties.iter().enumerate() {
-            cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
-        }
-
-        let mut h = cache.xtwx_orig.clone();
-        h += &s_lambda;
-        let hessian_op = match super::unified::DenseSpectralOperator::from_symmetric(&h) {
-            Ok(op) => Arc::new(op),
-            Err(err) => {
-                log::debug!("[gaussian-closed-form-reml] declined: Hessian factor failed: {err}");
-                return Ok(None);
-            }
-        };
-        let beta = super::unified::HessianOperator::solve(hessian_op.as_ref(), &cache.xtwy_orig);
-        if beta.iter().any(|&value| !value.is_finite()) {
-            return Ok(None);
-        }
-
-        let xtwx_beta = cache.xtwx_orig.dot(&beta);
-        let rss = (cache.centered_weighted_y_sq - 2.0 * beta.dot(&cache.xtwy_orig)
-            + beta.dot(&xtwx_beta))
-        .max(0.0);
-        let penalty_quadratic = beta.dot(&s_lambda.dot(&beta));
-
-        let (penalty_logdet, penalty_rank) = if self.canonical_penalties.is_empty() {
-            (
-                super::unified::PenaltyLogdetDerivs {
-                    value: 0.0,
-                    first: Array1::zeros(0),
-                    second: Some(Array2::zeros((0, 0))),
-                },
-                0_usize,
-            )
-        } else {
-            // Build the pseudo-logdet directly from the canonical (block-local)
-            // penalty representation: `from_penalties` knows each penalty's
-            // `col_range` and `local` matrix, so it computes structural
-            // nullities in the correct local block space. The previous
-            // implementation routed through `compute_block_penalty_logdet_derivs`
-            // with the assembled `p × p` matrices and `self.nullspace_dims`
-            // (which are block-LOCAL nullities) — this confused
-            // `exact_intersection_nullity`'s "any local nullity == 0 ⇒ global
-            // intersection nullity = 0" shortcut into claiming the embedded
-            // `S(λ)` is full rank whenever any single block happened to be
-            // full rank in its own sub-block (e.g. a random-effect ridge with
-            // local nullity 0 lifting a globally rank-deficient sum). The
-            // W-factor construction inside `from_assembled_inner` would then
-            // take `1 / √ev` over every eigenvalue including the structurally
-            // null ones, producing `NaN` whenever the eigh noise floor pushed
-            // any of them just below zero — exactly the
-            // "REML/LAML gradient contains non-finite entry" failure mode
-            // surfaced by the Gaussian-identity REML startup probes.
-            //
-            // `rho_derivatives_from_penalties` operates on the same block-
-            // factored W, so it computes `tr(S⁺ S_k)` in the same coordinate
-            // system the cost's `log|S|₊` uses; the gradient stays paired
-            // with the cost identity instead of drifting against a separately
-            // assembled `p × p` Gram.
-            let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
-                &self.canonical_penalties,
-                lambdas.as_slice().unwrap(),
-                0.0,
-                self.p,
-            )
-            .map_err(EstimationError::InvalidInput)?;
-            let value = pld.value();
-            let rank = pld.rank();
-            let (first, second) = pld.rho_derivatives_from_penalties(
-                &self.canonical_penalties,
-                lambdas.as_slice().unwrap(),
-            );
-            (
-                super::unified::PenaltyLogdetDerivs {
-                    value,
-                    first,
-                    second: Some(second),
-                },
-                rank,
-            )
-        };
-        let nullspace_dim = self.p.saturating_sub(penalty_rank) as f64;
-
-        let solution = super::unified::InnerSolutionBuilder::new(
-            -0.5 * rss,
-            penalty_quadratic,
-            beta,
-            self.y.len(),
-            hessian_op,
-            self.build_penalty_coords(),
-            penalty_logdet,
-            super::unified::DispersionHandling::ProfiledGaussian,
-        )
-        .nullspace_dim_override(nullspace_dim)
-        .build();
-
-        let prior = self.build_prior(rho, mode);
-        let result =
-            super::assembly::evaluate_solution(&solution, rho.as_slice().unwrap(), mode, prior)
-                .map_err(EstimationError::InvalidInput)?;
-        log::debug!(
-            "[gaussian-closed-form-reml] evaluated k={} p={} mode={:?}",
-            rho.len(),
-            self.p,
-            mode
-        );
-        Ok(Some(result))
-    }
-
     pub(crate) fn canonical_penalties(&self) -> &[crate::construction::CanonicalPenalty] {
         &self.canonical_penalties
     }
@@ -5021,17 +4865,6 @@ impl<'a> RemlState<'a> {
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
             return Ok(eval.cost);
-        }
-        if let Some(result) =
-            self.try_gaussian_closed_form_reml_eval(p, super::unified::EvalMode::ValueOnly)?
-        {
-            log::debug!(
-                "[REML] eval#{} gaussian closed-form cost {:.6e} | total {:.1}ms",
-                cost_call_idx,
-                result.cost,
-                t_eval_start.elapsed().as_secs_f64() * 1000.0
-            );
-            return Ok(result.cost);
         }
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
@@ -6637,22 +6470,6 @@ impl<'a> RemlState<'a> {
             );
             return Ok(eval.gradient);
         }
-        if let Some(result) =
-            self.try_gaussian_closed_form_reml_eval(p, super::unified::EvalMode::ValueAndGradient)?
-        {
-            let grad = result.gradient.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Gaussian closed-form REML returned no gradient".to_string(),
-                )
-            })?;
-            let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
-                "[REML] grad-only gaussian closed-form done | |g| {:.3e} | total {:.1}ms",
-                gnorm,
-                t_eval_start.elapsed().as_secs_f64() * 1000.0
-            );
-            return Ok(grad);
-        }
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
@@ -6737,38 +6554,6 @@ impl<'a> RemlState<'a> {
                 );
                 return Ok(eval);
             }
-        }
-
-        let direct_mode = if allow_second_order {
-            super::unified::EvalMode::ValueGradientHessian
-        } else {
-            super::unified::EvalMode::ValueAndGradient
-        };
-        if let Some(result) = self.try_gaussian_closed_form_reml_eval(p, direct_mode)? {
-            let gradient = result.gradient.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "Gaussian closed-form REML returned no gradient".to_string(),
-                )
-            })?;
-            let hessian = if allow_second_order {
-                result.hessian
-            } else {
-                HessianResult::Unavailable
-            };
-            let eval = OuterEval {
-                cost: result.cost,
-                gradient,
-                hessian,
-            };
-            let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-            log::debug!(
-                "[REML] outer-eval gaussian closed-form done | cost {:.6e} | |g| {:.3e} | total {:.1}ms",
-                eval.cost,
-                gnorm,
-                t_eval_start.elapsed().as_secs_f64() * 1000.0
-            );
-            self.cache_manager.store_outer_eval(&rho_key, &eval);
-            return Ok(eval);
         }
 
         let t_pirls = std::time::Instant::now();
