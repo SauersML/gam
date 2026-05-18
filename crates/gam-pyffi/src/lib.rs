@@ -6478,4 +6478,132 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn batched_state_round_trip_matches_refit() {
+        // Document the Task 3 state round-trip contract on the BATCHED
+        // pyffi entry: backward called with `forward_state` set to the dict
+        // returned by the matching forward must produce gradients that are
+        // bit-exact identical to backward called without `forward_state`
+        // (which refits internally). Guards against drift between
+        // `_from_fit` and `_backward` for the batched path under any future
+        // change to either branch.
+        use ndarray::{array, s};
+
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.5],
+            [1.0, 0.0],
+            [1.0, 0.5],
+            [1.0, 1.0],
+            [1.0, -0.8],
+            [1.0, -0.2],
+            [1.0, 0.3],
+            [1.0, 0.7],
+            [1.0, 1.2],
+        ];
+        let y = array![
+            [0.4, -0.2],
+            [0.6, 0.1],
+            [0.9, 0.3],
+            [1.3, 0.4],
+            [1.8, 0.6],
+            [0.5, -0.1],
+            [0.7, 0.2],
+            [1.0, 0.3],
+            [1.4, 0.5],
+            [1.9, 0.7]
+        ];
+        let weights = array![1.0, 0.95, 1.05, 1.0, 0.98, 1.02, 0.99, 1.0, 1.01, 0.97];
+        let row_offsets = array![0usize, 5, 10];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+        let init_lambda = Some(0.85_f64);
+
+        let forward = gaussian_reml_fit_batched_impl(
+            x.view(),
+            y.view(),
+            row_offsets.view(),
+            penalty.view(),
+            Some(weights.view()),
+            init_lambda,
+        )
+        .expect("batched forward");
+        let prebuilt_fits = (0..(row_offsets.len() - 1))
+            .map(|b| {
+                let start = row_offsets[b];
+                let end = row_offsets[b + 1];
+                let cache = gam::gaussian_reml::GaussianRemlEigenCache {
+                    penalty_eigenvalues: forward.cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
+                    eigenvectors: forward.cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
+                    coefficient_basis: forward.cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+                    xtwx_fingerprint: forward.cache_xtwx_fingerprints[b],
+                    penalty_fingerprint: forward.cache_penalty_fingerprints[b],
+                    logdet_xtwx: forward.cache_logdet_xtwx[b],
+                    logdet_penalty_positive: forward.cache_logdet_penalty_positive[b],
+                    penalty_rank: forward.cache_penalty_ranks[b] as usize,
+                    nullity: forward.cache_nullities[b] as usize,
+                };
+                Some(gam::gaussian_reml::GaussianRemlMultiResult {
+                    lambda: forward.lambdas[b],
+                    rho: forward.rhos[b],
+                    coefficients: forward.coefficients.slice(s![b, .., ..]).to_owned(),
+                    fitted: forward.fitted.slice(s![start..end, ..]).to_owned(),
+                    reml_score: forward.reml_scores[b],
+                    reml_grad_lambda: forward.reml_grad_lambdas[b],
+                    reml_hess_lambda: forward.reml_hess_lambdas[b],
+                    reml_grad_rho: forward.reml_grad_rhos[b],
+                    reml_hess_rho: forward.reml_hess_rhos[b],
+                    edf: forward.edf[b],
+                    sigma2: forward.sigma2.slice(s![b, ..]).to_owned(),
+                    cache,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let grad_lambda = array![0.2, -0.1];
+        let grad_reml_score = array![-0.05, 0.08];
+
+        let refit = gaussian_reml_fit_batched_backward_impl(
+            x.view(),
+            y.view(),
+            row_offsets.view(),
+            penalty.view(),
+            Some(weights.view()),
+            init_lambda,
+            Some(grad_lambda.view()),
+            None,
+            None,
+            Some(grad_reml_score.view()),
+            None,
+        )
+        .expect("refit backward");
+        let from_fits = gaussian_reml_fit_batched_backward_impl(
+            x.view(),
+            y.view(),
+            row_offsets.view(),
+            penalty.view(),
+            Some(weights.view()),
+            init_lambda,
+            Some(grad_lambda.view()),
+            None,
+            None,
+            Some(grad_reml_score.view()),
+            Some(&prebuilt_fits),
+        )
+        .expect("from_fits backward");
+
+        for (a, b) in refit.grad_x.iter().zip(from_fits.grad_x.iter()) {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+        for (a, b) in refit.grad_y.iter().zip(from_fits.grad_y.iter()) {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+        for (a, b) in refit
+            .grad_weights
+            .iter()
+            .zip(from_fits.grad_weights.iter())
+        {
+            assert!((a - b).abs() <= 1.0e-12);
+        }
+    }
 }
