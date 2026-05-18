@@ -19,7 +19,7 @@ classes that don't yet have an exact NUTS path.
 **Docs:** <https://gamfit.readthedocs.io/> &middot; **PyPI:**
 <https://pypi.org/project/gamfit/>
 
-![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_shaded.png)
+![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
 ## Two ways to use it
 
