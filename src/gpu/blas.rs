@@ -23,10 +23,10 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             "gemm",
             format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -113,10 +113,10 @@ pub fn try_fast_ab_broadcast_b_batched(
         diagnostics::log_policy_cpu(
             "gemm_broadcast_b_strided_batched",
             format!("batch={batch} m={m} n={n} k={k}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -167,10 +167,10 @@ pub fn try_fast_a_broadcast_bt_batched(
         diagnostics::log_policy_cpu(
             "gemm_broadcast_a_strided_batched",
             format!("batch={batch} m={m} n={n} k={k}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -222,10 +222,10 @@ fn try_fast_gemm_strided_batched(
             format!(
                 "batch={batch_a} m={m} n={n} k={k} trans_a={transpose_a} trans_b={transpose_b}"
             ),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -268,10 +268,10 @@ pub fn try_fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             "atb",
             format!("rows={rows} cols={cols} rhs={rhs}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemm_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -308,10 +308,10 @@ pub fn try_fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             "av",
             format!("rows={rows} cols={cols}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemv_flops>={}",
                 GpuRuntime::global().policy().gemv_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -344,10 +344,10 @@ pub fn try_fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             "atv",
             format!("rows={rows} cols={cols}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold gemv_flops>={}",
                 GpuRuntime::global().policy().gemv_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -380,11 +380,11 @@ pub fn try_fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             "xt_diag_x",
             format!("rows={rows} cols={cols}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold rows>={} and gemm_flops>={}",
                 GpuRuntime::global().policy().xtwx_min_rows,
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -419,11 +419,11 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
         diagnostics::log_policy_cpu(
             "xt_diag_y",
             format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold rows>={} and gemm_flops>={}",
                 GpuRuntime::global().policy().xtwx_min_rows,
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -462,10 +462,10 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         diagnostics::log_policy_cpu(
             "trsm_lower",
             format!("p={p} rhs_cols={}", rhs.ncols()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold trsm_flops>={}",
                 GpuRuntime::global().policy().trsm_min_flops
-            ),
+            )),
         );
         return None;
     }
@@ -506,10 +506,10 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         diagnostics::log_policy_cpu(
             "trsm_upper",
             format!("p={p} rhs_cols={}", rhs.ncols()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold trsm_flops>={}",
                 GpuRuntime::global().policy().trsm_min_flops
-            ),
+            )),
         );
         return None;
     }

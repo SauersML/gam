@@ -54,11 +54,11 @@ fn try_csr_spmv_indexed<S: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             if transpose { "csr_t_spmv" } else { "csr_spmv" },
             format!("rows={rows} cols={cols} nnz={}", values.len()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSPARSE policy threshold rows>={} and nnz>={}",
                 GpuRuntime::global().policy().spmv_min_rows,
                 GpuRuntime::global().policy().spmv_min_nnz
-            ),
+            )),
         );
         return None;
     }
@@ -90,11 +90,11 @@ fn try_csr_spmv<S: Data<Elem = f64>>(
         diagnostics::log_policy_cpu(
             if transpose { "csr_t_spmv" } else { "csr_spmv" },
             format!("rows={rows} cols={cols} nnz={nnz}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSPARSE policy threshold rows>={} and nnz>={}",
                 GpuRuntime::global().policy().spmv_min_rows,
                 GpuRuntime::global().policy().spmv_min_nnz
-            ),
+            )),
         );
         return None;
     }

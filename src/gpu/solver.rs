@@ -36,10 +36,10 @@ pub fn try_syevd_inplace(a: &mut Array2<f64>) -> Option<Array1<f64>> {
         diagnostics::log_policy_cpu(
             "syevd",
             format!("p={p}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSOLVER policy threshold syevd_p>={}",
                 GpuRuntime::global().policy().syevd_min_p
-            ),
+            )),
         );
         return None;
     }
@@ -78,10 +78,10 @@ pub fn try_chol_solve_inplace(a: &mut Array2<f64>, rhs: &mut Array2<f64>) -> Opt
         diagnostics::log_policy_cpu(
             "chol_solve",
             format!("p={p} rhs_cols={}", rhs.ncols()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSOLVER policy threshold chol_p>={}",
                 GpuRuntime::global().policy().chol_min_p
-            ),
+            )),
         );
         return None;
     }
@@ -122,10 +122,10 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
         diagnostics::log_policy_cpu(
             "cholesky_lower",
             format!("p={p}"),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSOLVER policy threshold chol_p>={}",
                 GpuRuntime::global().policy().chol_min_p
-            ),
+            )),
         );
         return None;
     }
@@ -172,10 +172,10 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
         diagnostics::log_policy_cpu(
             "cholesky_batched_lower",
             format!("batch={} p={p}", matrices.len()),
-            format!(
+            diagnostics::dispatch_decline_reason(format!(
                 "below cuSOLVER batched policy threshold aggregate_flops>={}",
                 GpuRuntime::global().policy().gemm_min_flops
-            ),
+            )),
         );
         return None;
     }
