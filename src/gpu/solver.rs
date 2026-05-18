@@ -60,6 +60,33 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
     with_runtime(|rt| rt.cholesky_lower_inplace(a))
 }
 
+/// In-place batched lower Cholesky factorization: each `matrices[b]` becomes
+/// `L_b` for `A_b = L_b L_b^T`. All matrices must be the same `p × p` shape;
+/// the upper triangle of each input matrix is ignored on read and zeroed on
+/// successful return so the result is exactly the lower factor with zeros
+/// above the diagonal. Returns `None` (leaving every host matrix unchanged)
+/// when any factor is not positive definite, the policy declines the route,
+/// or any cuSOLVER/CUDA call fails — the caller then falls through to its CPU
+/// fallback per matrix, matching the single-fit `try_cholesky_lower_inplace`
+/// contract.
+#[inline]
+pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Option<()> {
+    if matrices.is_empty() {
+        return Some(());
+    }
+    let p = matrices[0].nrows();
+    if p == 0 || p != matrices[0].ncols() {
+        return None;
+    }
+    if !matrices.iter().all(|m| m.dim() == (p, p)) {
+        return None;
+    }
+    if !route_chol_solve(p) {
+        return None;
+    }
+    with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices))
+}
+
 #[inline]
 fn route_syevd(p: usize) -> bool {
     GpuRuntime::global().policy().route_syevd(p)
@@ -373,6 +400,100 @@ impl CusolverRuntime {
         Some(())
     }
 
+    /// Single host↔device round trip Cholesky over `K` uniform `p × p`
+    /// matrices via `cusolverDnDpotrfBatched`. The batched variant is
+    /// asymptotically `O(K)` cuSOLVER kernel launches vs. `K` separate calls,
+    /// removing the per-fit dispatch latency that dominates at biobank-scale
+    /// K=16k workloads. Returns `None` on any factor that is not positive
+    /// definite, leaving every host matrix unchanged so the caller can fall
+    /// through to a per-matrix host Cholesky.
+    fn cholesky_batched_lower_inplace(&mut self, matrices: &mut [Array2<f64>]) -> Option<()> {
+        let k = matrices.len();
+        if k == 0 {
+            return Some(());
+        }
+        let p = matrices[0].nrows();
+        let p_i32 = to_i32(p)?;
+        let k_i32 = to_i32(k)?;
+        let entries_per_matrix = p.checked_mul(p)?;
+        let total_doubles = k.checked_mul(entries_per_matrix)?;
+        let bytes_all = bytes_len::<f64>(total_doubles)?;
+        let bytes_ptrs = bytes_len::<u64>(k)?;
+        let bytes_info = bytes_len::<i32>(k)?;
+        let elem_bytes = std::mem::size_of::<f64>();
+
+        let mut packed: Vec<f64> = Vec::with_capacity(total_doubles);
+        for matrix in matrices.iter() {
+            packed.extend(to_col_major(matrix));
+        }
+        debug_assert_eq!(packed.len(), total_doubles);
+
+        unsafe {
+            self.cuda.set_current().ok()?;
+            let a_dev = self.alloc_copy(&packed, bytes_all)?;
+            let info_dev = DeviceAllocation::new(&self.cuda.api, bytes_info)?;
+            let ptr_dev = DeviceAllocation::new(&self.cuda.api, bytes_ptrs)?;
+            let stride_bytes = entries_per_matrix.checked_mul(elem_bytes)?;
+            let mut ptr_host: Vec<u64> = Vec::with_capacity(k);
+            for batch in 0..k {
+                let offset_bytes = batch.checked_mul(stride_bytes)?;
+                let offset_u64 = u64::try_from(offset_bytes).ok()?;
+                ptr_host.push(a_dev.ptr.checked_add(offset_u64)?);
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_htod)(
+                    ptr_dev.ptr,
+                    ptr_host.as_ptr().cast(),
+                    bytes_ptrs,
+                ),
+                "cuMemcpyHtoD batched pointer table",
+            )
+            .ok()?;
+            let status = (self.solver.dpotrf_batched)(
+                self.handle,
+                CUBLAS_FILL_LOWER,
+                p_i32,
+                ptr_dev.ptr,
+                p_i32,
+                info_dev.ptr,
+                k_i32,
+            );
+            if status != CUSOLVER_STATUS_SUCCESS {
+                return None;
+            }
+            let mut info_host = vec![0i32; k];
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(
+                    info_host.as_mut_ptr().cast(),
+                    info_dev.ptr,
+                    bytes_info,
+                ),
+                "cuMemcpyDtoH batched potrf info",
+            )
+            .ok()?;
+            if info_host.iter().any(|&code| code != 0) {
+                return None;
+            }
+            check_cuda(
+                (self.cuda.api.cu_memcpy_dtoh)(packed.as_mut_ptr().cast(), a_dev.ptr, bytes_all),
+                "cuMemcpyDtoH batched A",
+            )
+            .ok()?;
+        }
+
+        for (batch, matrix) in matrices.iter_mut().enumerate() {
+            let start = batch * entries_per_matrix;
+            let slab = &packed[start..start + entries_per_matrix];
+            from_col_major_inplace(slab, matrix);
+            for row in 0..p {
+                for col in (row + 1)..p {
+                    matrix[[row, col]] = 0.0;
+                }
+            }
+        }
+        Some(())
+    }
+
     unsafe fn alloc_copy<'a>(
         &'a self,
         values: &[f64],
@@ -451,6 +572,15 @@ type CusolverDpotrs = unsafe extern "C" fn(
     i32,   // ldb
     u64,   // devInfo
 ) -> CusolverStatus;
+type CusolverDpotrfBatched = unsafe extern "C" fn(
+    usize, // handle
+    i32,   // uplo
+    i32,   // n
+    u64,   // Aarray: double** in device memory (batchSize device pointers)
+    i32,   // lda
+    u64,   // infoArray: i32* on device, length batchSize
+    i32,   // batchSize
+) -> CusolverStatus;
 
 struct CusolverApi {
     create: CusolverCreate,
@@ -460,6 +590,7 @@ struct CusolverApi {
     dpotrf_buffersize: CusolverDpotrfBufferSize,
     dpotrf: CusolverDpotrf,
     dpotrs: CusolverDpotrs,
+    dpotrf_batched: CusolverDpotrfBatched,
 }
 
 impl CusolverApi {
@@ -486,6 +617,9 @@ impl CusolverApi {
                     .map_err(|e| e.to_string())?,
                 dpotrs: *library
                     .get(b"cusolverDnDpotrs\0")
+                    .map_err(|e| e.to_string())?,
+                dpotrf_batched: *library
+                    .get(b"cusolverDnDpotrfBatched\0")
                     .map_err(|e| e.to_string())?,
             })
         }
