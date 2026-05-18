@@ -768,10 +768,7 @@ fn set_batched_gaussian_reml_dict_items<'py>(
         "cache_penalty_ranks",
         result.cache_penalty_ranks.into_pyarray(py),
     )?;
-    out.set_item(
-        "cache_nullities",
-        result.cache_nullities.into_pyarray(py),
-    )?;
+    out.set_item("cache_nullities", result.cache_nullities.into_pyarray(py))?;
     Ok(())
 }
 
