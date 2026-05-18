@@ -1084,6 +1084,64 @@ fn fnv1a_mix(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x100000001b3)
 }
 
+/// Build eigen caches for K problems that share the same penalty matrix in
+/// a single phased pipeline. The Cholesky step is dispatched as one
+/// `cusolverDnDpotrfBatched` call when every X'WX has the same shape and is
+/// positive definite; failures (any non-PD factor, GPU dispatch returning
+/// `None`, or non-uniform shapes) fall through to per-fit Cholesky. The
+/// remaining cache build (whitened-penalty eigh + basis solve) stays
+/// per-fit because cuSOLVER has no batched symmetric eigensolver — those
+/// individual dispatches still route to `try_syevd_inplace` when the policy
+/// approves. Designed for the biobank-scale batched fit entry where K can
+/// reach 16 000+ and per-fit Cholesky launch latency dominates.
+pub fn build_gaussian_reml_eigen_cache_batched(
+    xtwx_matrices: Vec<Array2<f64>>,
+    penalty: ArrayView2<'_, f64>,
+    nullspace_dim: Option<usize>,
+) -> Vec<Result<GaussianRemlEigenCache, EstimationError>> {
+    let k = xtwx_matrices.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    let p = xtwx_matrices[0].nrows();
+    let uniform_shape = p > 0 && xtwx_matrices.iter().all(|m| m.dim() == (p, p));
+    let fingerprints: Vec<u64> = xtwx_matrices
+        .iter()
+        .map(|m| matrix_fingerprint(m.view()))
+        .collect();
+    let mut batched_lowers: Option<Vec<Array2<f64>>> = if uniform_shape {
+        let mut buffer: Vec<Array2<f64>> = xtwx_matrices.iter().cloned().collect();
+        let ok = crate::gpu::try_cholesky_batched_lower_inplace(&mut buffer).is_some()
+            && buffer.iter().all(|m| {
+                m.iter().all(|v| v.is_finite()) && m.diag().iter().all(|v| *v > 0.0)
+            });
+        if ok { Some(buffer) } else { None }
+    } else {
+        None
+    };
+    let mut results = Vec::with_capacity(k);
+    for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
+        let lower = if let Some(ref mut lowers) = batched_lowers {
+            std::mem::replace(&mut lowers[b], Array2::zeros((0, 0)))
+        } else {
+            match gaussian_reml_cholesky_lower(xtwx) {
+                Ok(l) => l,
+                Err(err) => {
+                    results.push(Err(err));
+                    continue;
+                }
+            }
+        };
+        results.push(gaussian_reml_eigen_cache_from_lower(
+            lower,
+            penalty,
+            nullspace_dim,
+            fingerprints[b],
+        ));
+    }
+    results
+}
+
 pub fn build_gaussian_reml_eigen_cache(
     x: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
