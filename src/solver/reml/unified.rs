@@ -103,9 +103,10 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Zip};
 use rayon::prelude::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::{Arc, Condvar, Mutex};
 
-use crate::faer_ndarray::FaerEigh;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::linalg::matrix::DesignMatrix;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1724,6 +1725,20 @@ pub trait HyperOperator: Send + Sync {
         None
     }
 
+    /// Downcast to `CompositeHyperOperator` when this operator is a linear
+    /// bundle. Exact dense-spectral trace batching uses this to flatten
+    /// coordinate drifts across coordinates, so one shared design projection
+    /// can feed many implicit ψ/correction operators.
+    fn as_composite(&self) -> Option<&CompositeHyperOperator> {
+        None
+    }
+
+    /// Downcast to `WeightedHyperOperator` when this operator is a weighted
+    /// linear bundle.
+    fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
+        None
+    }
+
     /// If this operator is block-local (nonzero only in [start..end, start..end]),
     /// returns the block range and local matrix. Enables O(p_block²) trace
     /// computations instead of O(p²).
@@ -1807,9 +1822,20 @@ pub struct ProjectedFactorCache {
 
 struct ProjectedFactorCacheInner {
     entries: HashMap<ProjectedFactorKey, ProjectedFactorEntry>,
+    in_progress: HashMap<ProjectedFactorKey, Arc<ProjectedFactorInProgress>>,
     next_seq: u64,
     total_bytes: usize,
     budget_bytes: usize,
+}
+
+struct ProjectedFactorInProgress {
+    state: Mutex<Option<ProjectedFactorInProgressState>>,
+    ready: Condvar,
+}
+
+enum ProjectedFactorInProgressState {
+    Ready(Arc<Array2<f64>>),
+    Failed,
 }
 
 struct ProjectedFactorEntry {
@@ -1840,6 +1866,7 @@ impl ProjectedFactorCache {
         Self {
             inner: Mutex::new(ProjectedFactorCacheInner {
                 entries: HashMap::new(),
+                in_progress: HashMap::new(),
                 next_seq: 0,
                 total_bytes: 0,
                 budget_bytes,
@@ -1852,9 +1879,13 @@ impl ProjectedFactorCache {
         key: ProjectedFactorKey,
         compute: impl FnOnce() -> Array2<f64>,
     ) -> Arc<Array2<f64>> {
-        // Fast path: probe the cache under a short critical section. If the
-        // entry is already materialized, bump its LRU timestamp and return.
-        {
+        enum CacheLookup {
+            Hit(Arc<Array2<f64>>),
+            Wait(Arc<ProjectedFactorInProgress>),
+            Compute(Arc<ProjectedFactorInProgress>),
+        }
+
+        let lookup = {
             let mut inner = self
                 .inner
                 .lock()
@@ -1863,64 +1894,119 @@ impl ProjectedFactorCache {
             let now = inner.next_seq;
             if let Some(entry) = inner.entries.get_mut(&key) {
                 entry.last_used = now;
-                return entry.value.clone();
+                CacheLookup::Hit(entry.value.clone())
+            } else if let Some(waiter) = inner.in_progress.get(&key) {
+                CacheLookup::Wait(waiter.clone())
+            } else {
+                let marker = Arc::new(ProjectedFactorInProgress {
+                    state: Mutex::new(None),
+                    ready: Condvar::new(),
+                });
+                inner.in_progress.insert(key, marker.clone());
+                CacheLookup::Compute(marker)
             }
-        }
-        // Compute *outside* the lock. The projection `J·F` runs a rayon
-        // `par_chunks_mut` inside; holding a mutex across rayon work
-        // dispatches to workers that may steal sibling jobs which also call
-        // `get_or_insert_with` on this cache, and those workers block on the
-        // mutex this thread still holds — classic nested-rayon mutex
-        // deadlock. Releasing here costs at most a duplicate compute on
-        // simultaneous misses against the same key, which we resolve on
-        // re-acquire by preferring the racer's cached value.
-        let computed = Arc::new(compute());
-        let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("projected factor cache lock poisoned");
-        inner.next_seq += 1;
-        let now = inner.next_seq;
-        if let Some(entry) = inner.entries.get_mut(&key) {
-            // Another caller computed and inserted the same key while we
-            // were busy. Keep theirs (already counted in `total_bytes`) and
-            // drop ours; mark the survivor as most-recently used.
-            entry.last_used = now;
-            return entry.value.clone();
-        }
-        // LRU eviction. Skip when the budget is disabled or when the
-        // new entry alone exceeds the budget (in which case eviction
-        // can never make it fit; we accept the over-budget insertion
-        // because the alternative — refusing to cache — guarantees a
-        // recompute on every query).
-        if inner.budget_bytes > 0 && bytes <= inner.budget_bytes {
-            while inner.total_bytes.saturating_add(bytes) > inner.budget_bytes
-                && !inner.entries.is_empty()
-            {
-                let Some(oldest_key) = inner
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.last_used)
-                    .map(|(k, _)| *k)
-                else {
-                    break;
-                };
-                if let Some(removed) = inner.entries.remove(&oldest_key) {
-                    inner.total_bytes = inner.total_bytes.saturating_sub(removed.bytes);
+        };
+
+        match lookup {
+            CacheLookup::Hit(value) => value,
+            CacheLookup::Wait(marker) => {
+                let mut guard = marker
+                    .state
+                    .lock()
+                    .expect("projected factor in-progress lock poisoned");
+                loop {
+                    match guard.as_ref() {
+                        Some(ProjectedFactorInProgressState::Ready(value)) => return value.clone(),
+                        Some(ProjectedFactorInProgressState::Failed) => {
+                            panic!("projected factor cache producer panicked")
+                        }
+                        None => {
+                            guard = marker
+                                .ready
+                                .wait(guard)
+                                .expect("projected factor in-progress wait poisoned");
+                        }
+                    }
                 }
             }
+            CacheLookup::Compute(marker) => {
+                // Compute outside the cache mutex so expensive design GEMMs do
+                // not serialize unrelated cache keys. Sibling callers for the
+                // same key wait on `marker` instead of redundantly launching the
+                // same projection, which is crucial when exact outer-gradient
+                // coordinates are evaluated in parallel.
+                let computed = match catch_unwind(AssertUnwindSafe(|| Arc::new(compute()))) {
+                    Ok(value) => value,
+                    Err(payload) => {
+                        let mut inner = self
+                            .inner
+                            .lock()
+                            .expect("projected factor cache lock poisoned");
+                        inner.in_progress.remove(&key);
+                        drop(inner);
+
+                        let mut guard = marker
+                            .state
+                            .lock()
+                            .expect("projected factor in-progress lock poisoned");
+                        *guard = Some(ProjectedFactorInProgressState::Failed);
+                        marker.ready.notify_all();
+                        resume_unwind(payload);
+                    }
+                };
+                let bytes = computed.len().saturating_mul(std::mem::size_of::<f64>());
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .expect("projected factor cache lock poisoned");
+                inner.next_seq += 1;
+                let now = inner.next_seq;
+
+                if inner.budget_bytes > 0 && bytes <= inner.budget_bytes {
+                    while inner.total_bytes.saturating_add(bytes) > inner.budget_bytes
+                        && !inner.entries.is_empty()
+                    {
+                        let Some(oldest_key) = inner
+                            .entries
+                            .iter()
+                            .min_by_key(|(_, e)| e.last_used)
+                            .map(|(k, _)| *k)
+                        else {
+                            break;
+                        };
+                        if let Some(removed) = inner.entries.remove(&oldest_key) {
+                            inner.total_bytes = inner.total_bytes.saturating_sub(removed.bytes);
+                        }
+                    }
+                }
+
+                let value = if let Some(entry) = inner.entries.get_mut(&key) {
+                    entry.last_used = now;
+                    entry.value.clone()
+                } else {
+                    inner.entries.insert(
+                        key,
+                        ProjectedFactorEntry {
+                            value: computed.clone(),
+                            bytes,
+                            last_used: now,
+                        },
+                    );
+                    inner.total_bytes = inner.total_bytes.saturating_add(bytes);
+                    computed
+                };
+                inner.in_progress.remove(&key);
+                drop(inner);
+
+                let mut guard = marker
+                    .state
+                    .lock()
+                    .expect("projected factor in-progress lock poisoned");
+                *guard = Some(ProjectedFactorInProgressState::Ready(value.clone()));
+                marker.ready.notify_all();
+                value
+            }
         }
-        inner.entries.insert(
-            key,
-            ProjectedFactorEntry {
-                value: computed.clone(),
-                bytes,
-                last_used: now,
-            },
-        );
-        inner.total_bytes = inner.total_bytes.saturating_add(bytes);
-        computed
     }
 
     /// Number of entries currently cached. Intended for diagnostics
@@ -2085,7 +2171,184 @@ fn composite_trace_implicit_batched(
     trace
 }
 
+fn dense_trace_projected_factor(matrix: &Array2<f64>, factor: &Array2<f64>) -> f64 {
+    let matrix_factor = matrix.dot(factor);
+    factor
+        .iter()
+        .zip(matrix_factor.iter())
+        .map(|(&f, &mf)| f * mf)
+        .sum()
+}
+
+fn collect_projected_trace_terms<'a>(
+    out_idx: usize,
+    weight: f64,
+    op: &'a dyn HyperOperator,
+    factor: &Array2<f64>,
+    dense_acc: &mut [f64],
+    terms: &mut Vec<(usize, f64, &'a dyn HyperOperator)>,
+) {
+    if weight == 0.0 {
+        return;
+    }
+    if let Some(composite) = op.as_composite() {
+        if let Some(dense) = composite.dense.as_ref() {
+            dense_acc[out_idx] += weight * dense_trace_projected_factor(dense, factor);
+        }
+        for inner in &composite.operators {
+            collect_projected_trace_terms(
+                out_idx,
+                weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else if let Some(weighted) = op.as_weighted() {
+        for (term_weight, inner) in &weighted.terms {
+            collect_projected_trace_terms(
+                out_idx,
+                weight * *term_weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else {
+        terms.push((out_idx, weight, op));
+    }
+}
+
+fn trace_projected_operator_terms_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n_out];
+    let mut handled = vec![false; terms.len()];
+
+    for i in 0..terms.len() {
+        if handled[i] {
+            continue;
+        }
+        let Some(impl_i) = terms[i].2.as_implicit() else {
+            continue;
+        };
+        let mut group = vec![i];
+        handled[i] = true;
+        for j in (i + 1)..terms.len() {
+            if handled[j] {
+                continue;
+            }
+            if let Some(impl_j) = terms[j].2.as_implicit() {
+                if Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+                    && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                    && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                    && impl_i.p == impl_j.p
+                {
+                    group.push(j);
+                    handled[j] = true;
+                }
+            }
+        }
+
+        let lead = terms[group[0]].2.as_implicit().unwrap();
+        let xf = lead.cached_xf(factor, cache);
+        let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
+            .iter()
+            .map(|&term_idx| {
+                let op = terms[term_idx].2.as_implicit().unwrap();
+                (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
+            })
+            .collect();
+        let values = lead.trace_projected_factor_all_axes_with_xf(factor, xf.view(), &axes);
+        for (&term_idx, value) in group.iter().zip(values.iter()) {
+            let (out_idx, weight, _) = terms[term_idx];
+            out[out_idx] += weight * *value;
+        }
+    }
+
+    for (i, (out_idx, weight, op)) in terms.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        out[*out_idx] += *weight * op.trace_projected_factor_cached(factor, cache);
+    }
+
+    out
+}
+
+fn trace_logdet_drifts_projected_factor_batched(
+    drifts: &[DriftDerivResult],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; drifts.len()];
+    let mut terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+    for (idx, drift) in drifts.iter().enumerate() {
+        match drift {
+            DriftDerivResult::Dense(matrix) => {
+                out[idx] += dense_trace_projected_factor(matrix, factor);
+            }
+            DriftDerivResult::Operator(op) => {
+                collect_projected_trace_terms(idx, 1.0, op.as_ref(), factor, &mut out, &mut terms);
+            }
+        }
+    }
+    let batched = trace_projected_operator_terms_batched(drifts.len(), &terms, factor, cache);
+    for (dst, value) in out.iter_mut().zip(batched) {
+        *dst += value;
+    }
+    out
+}
+
+fn dense_spectral_trace_logdet_drifts_batched(
+    ds: &DenseSpectralOperator,
+    drifts: &[DriftDerivResult],
+) -> Vec<f64> {
+    trace_logdet_drifts_projected_factor_batched(drifts, &ds.g_factor, &ds.projected_factor_cache)
+}
+
+fn penalty_subspace_trace_factor(kernel: &PenaltySubspaceTrace) -> Array2<f64> {
+    if let Ok(chol) = kernel.h_proj_inverse.cholesky(faer::Side::Lower) {
+        let lower = chol.lower_triangular();
+        return crate::faer_ndarray::fast_ab(&kernel.u_s, &lower);
+    }
+
+    let (evals, evecs) = kernel
+        .h_proj_inverse
+        .eigh(faer::Side::Lower)
+        .expect("PenaltySubspaceTrace kernel factor eigendecomposition failed");
+    let r = evals.len();
+    let max_eval = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let floor = f64::EPSILON.sqrt() * (r as f64).max(1.0) * max_eval.max(1.0);
+    let mut root = evecs.clone();
+    for col in 0..r {
+        let scale = evals[col].max(floor).sqrt();
+        for row in 0..r {
+            root[[row, col]] *= scale;
+        }
+    }
+    crate::faer_ndarray::fast_ab(&kernel.u_s, &root)
+}
+
+fn penalty_subspace_trace_drifts_batched(
+    kernel: &PenaltySubspaceTrace,
+    drifts: &[DriftDerivResult],
+) -> Vec<f64> {
+    let factor = penalty_subspace_trace_factor(kernel);
+    let cache = ProjectedFactorCache::default();
+    trace_logdet_drifts_projected_factor_batched(drifts, &factor, &cache)
+}
+
 impl HyperOperator for CompositeHyperOperator {
+    fn as_composite(&self) -> Option<&CompositeHyperOperator> {
+        Some(self)
+    }
+
     fn dim(&self) -> usize {
         self.dim_hint
     }
@@ -5540,6 +5803,43 @@ pub fn reml_laml_evaluate(
         None
     };
 
+    let build_trace_drifts = || {
+        let mut drifts = Vec::with_capacity(k + ext_dim);
+        for idx in 0..k {
+            drifts.push(penalty_total_drift_result(
+                &solution.penalty_coords[idx],
+                curvature_lambdas[idx],
+                rho_corrections[idx].as_ref(),
+            ));
+        }
+        for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+            drifts.push(hyper_coord_total_drift_result(
+                &coord.drift,
+                ext_corrections[ext_idx].as_ref(),
+                hop.dim(),
+            ));
+        }
+        drifts
+    };
+
+    let projected_trace_values: Option<Vec<f64>> =
+        if incl_logdet_h && stochastic_trace_values.is_none() {
+            solution
+                .penalty_subspace_trace
+                .as_ref()
+                .map(|kernel| penalty_subspace_trace_drifts_batched(kernel, &build_trace_drifts()))
+        } else {
+            None
+        };
+
+    let exact_dense_trace_values: Option<Vec<f64>> =
+        if incl_logdet_h && stochastic_trace_values.is_none() && projected_trace_values.is_none() {
+            hop.as_exact_dense_spectral()
+                .map(|ds| dense_spectral_trace_logdet_drifts_batched(ds, &build_trace_drifts()))
+        } else {
+            None
+        };
+
     // ── Gradient: one shared formula for ALL coordinate types ──
     //
     // Both ρ and ext coordinates are processed through outer_gradient_entry()
@@ -5568,6 +5868,10 @@ pub fn reml_laml_evaluate(
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
                 stoch_traces[idx]
+            } else if let Some(ref projected_traces) = projected_trace_values {
+                projected_traces[idx]
+            } else if let Some(ref exact_traces) = exact_dense_trace_values {
+                exact_traces[idx]
             } else if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
                 let drift = penalty_total_drift_result(
                     coord,
@@ -5659,6 +5963,10 @@ pub fn reml_laml_evaluate(
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
                 stoch_traces[k + ext_idx]
+            } else if let Some(ref projected_traces) = projected_trace_values {
+                projected_traces[k + ext_idx]
+            } else if let Some(ref exact_traces) = exact_dense_trace_values {
+                exact_traces[k + ext_idx]
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
@@ -7404,12 +7712,16 @@ impl HyperOperator for BorrowedStoredDriftOperator<'_> {
 /// per-term linear combination) into a single matrix-free operator that
 /// implements the same `HyperOperator` trait, so callers downstream do not
 /// need to handle a vector of (weight, op) pairs themselves.
-pub(crate) struct WeightedHyperOperator {
+pub struct WeightedHyperOperator {
     pub(crate) terms: Vec<(f64, Arc<dyn HyperOperator>)>,
     pub(crate) dim_hint: usize,
 }
 
 impl HyperOperator for WeightedHyperOperator {
+    fn as_weighted(&self) -> Option<&WeightedHyperOperator> {
+        Some(self)
+    }
+
     fn dim(&self) -> usize {
         self.dim_hint
     }
@@ -13327,6 +13639,42 @@ mod tests {
         let huge = cache.get_or_insert_with(make_factor_key(1), || Array2::from_elem((4, 4), 1.0));
         assert_eq!(huge[[0, 0]], 1.0);
         assert_eq!(cache.len(), 1);
+    }
+    #[test]
+    fn projected_factor_cache_waiters_wake_when_producer_panics() {
+        let cache = Arc::new(ProjectedFactorCache::with_budget(0));
+        let key = make_factor_key(42);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        let producer_cache = Arc::clone(&cache);
+        let producer = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                producer_cache.get_or_insert_with(key, || {
+                    started_tx.send(()).expect("send producer-start signal");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    panic!("simulated projected-factor panic");
+                });
+            }))
+            .is_err()
+        });
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("producer started computing");
+
+        let waiter_cache = Arc::clone(&cache);
+        let waiter = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                waiter_cache.get_or_insert_with(key, || Array2::from_elem((1, 1), 7.0));
+            }))
+            .is_err()
+        });
+
+        assert!(producer.join().expect("producer thread joined"));
+        assert!(waiter.join().expect("waiter thread joined"));
+
+        let recovered = cache.get_or_insert_with(key, || Array2::from_elem((1, 1), 9.0));
+        assert_eq!(recovered[[0, 0]], 9.0);
     }
 
     struct SentinelOuterHessianOperator {
