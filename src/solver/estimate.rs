@@ -468,10 +468,12 @@ impl ParametricColumnConditioning {
                 .beta_covariance_frequentist
                 .take()
                 .map(|cov| self.backtransform_covariance(&cov));
-            inf.coefficient_influence = inf
-                .coefficient_influence
-                .take()
-                .map(|f| self.backtransform_covariance(&f));
+            // The coefficient-influence matrix F = H⁻¹ X'WX is a mixed linear
+            // operator, not a covariance: it is not generally symmetric, so the
+            // covariance congruence transform Q·F·Qᵀ would map it to the wrong
+            // basis. Drop it across column conditioning rather than corrupting
+            // the per-term reference-df trace used downstream.
+            inf.coefficient_influence = None;
             inf.bias_correction_beta = inf
                 .bias_correction_beta
                 .take()
