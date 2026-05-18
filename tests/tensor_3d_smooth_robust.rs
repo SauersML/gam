@@ -50,7 +50,7 @@ fn try_fit(formula: &str, n_a: usize, n_b: usize, n_c: usize) -> Result<(f64, f6
     let probes = [
         (0.0_f64, 0.0_f64, 0.0_f64),
         (1.5, 2.5, 0.5),
-        (3.14, 1.0, -0.5),
+        (PI, 1.0, -0.5),
         (5.0, 4.0, 0.7),
     ];
     let n = probes.len();
