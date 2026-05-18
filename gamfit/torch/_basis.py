@@ -18,6 +18,13 @@ from .. import _api
 from ._coerce import from_numpy_like, to_numpy_f64, to_numpy_uintp
 
 
+def _as_tensor(value: Any) -> Any:
+    """Ensure ``value`` is a torch tensor; promote NumPy/list/scalar to one."""
+    if isinstance(value, torch.Tensor):
+        return value
+    return torch.as_tensor(value, dtype=torch.float64)
+
+
 class _BsplineBasisFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``."""
 
@@ -103,15 +110,7 @@ def bspline_basis(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
-    import torch
-
-    t_t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t, dtype=torch.float64)
-    knots_t = (
-        knots
-        if isinstance(knots, torch.Tensor)
-        else torch.as_tensor(knots, dtype=torch.float64)
-    )
-    return _BsplineBasisFn.apply(t_t, knots_t, int(degree), bool(periodic))
+    return _BsplineBasisFn.apply(_as_tensor(t), _as_tensor(knots), int(degree), bool(periodic))
 
 
 def bspline_basis_derivative(
@@ -147,12 +146,15 @@ def bspline_basis_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
-    t_np = to_numpy_f64(t)
-    knots_np = to_numpy_f64(knots)
+    t_ref = _as_tensor(t)
     deriv = _api.bspline_basis_derivative(
-        t_np, knots_np, degree=int(degree), order=int(order), periodic=bool(periodic)
+        to_numpy_f64(t_ref),
+        to_numpy_f64(_as_tensor(knots)),
+        degree=int(degree),
+        order=int(order),
+        periodic=bool(periodic),
     )
-    return from_numpy_like(deriv, t)
+    return from_numpy_like(deriv, t_ref)
 
 
 def duchon_basis_1d(
@@ -180,15 +182,7 @@ def duchon_basis_1d(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
-    import torch
-
-    t_t = t if isinstance(t, torch.Tensor) else torch.as_tensor(t, dtype=torch.float64)
-    centers_t = (
-        centers
-        if isinstance(centers, torch.Tensor)
-        else torch.as_tensor(centers, dtype=torch.float64)
-    )
-    return _DuchonBasis1dFn.apply(t_t, centers_t, int(m), bool(periodic))
+    return _DuchonBasis1dFn.apply(_as_tensor(t), _as_tensor(centers), int(m), bool(periodic))
 
 
 def duchon_basis_1d_derivative(
@@ -223,12 +217,15 @@ def duchon_basis_1d_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
-    t_np = to_numpy_f64(t)
-    centers_np = to_numpy_f64(centers)
+    t_ref = _as_tensor(t)
     deriv = _api.duchon_basis_1d_derivative(
-        t_np, centers_np, m=int(m), order=int(order), periodic=bool(periodic)
+        to_numpy_f64(t_ref),
+        to_numpy_f64(_as_tensor(centers)),
+        m=int(m),
+        order=int(order),
+        periodic=bool(periodic),
     )
-    return from_numpy_like(deriv, t)
+    return from_numpy_like(deriv, t_ref)
 
 
 def smoothness_penalty(
@@ -255,14 +252,9 @@ def smoothness_penalty(
     (torch.Tensor, torch.Tensor)
         ``S`` of shape ``(M, M)`` and ``null_basis`` of shape ``(M, p)``.
     """
-    knots_np = to_numpy_f64(knots)
-    s_np, null_np = _api.smoothness_penalty(knots_np, degree=int(degree), order=int(order))
-    import torch
-
-    ref = (
-        knots
-        if isinstance(knots, torch.Tensor)
-        else torch.as_tensor(knots, dtype=torch.float64)
+    ref = _as_tensor(knots)
+    s_np, null_np = _api.smoothness_penalty(
+        to_numpy_f64(ref), degree=int(degree), order=int(order)
     )
     return from_numpy_like(s_np, ref), from_numpy_like(null_np, ref)
 
@@ -299,14 +291,15 @@ def gaussian_weighted_ridge(
     (torch.Tensor, torch.Tensor)
         ``coefficients`` of shape ``(M, D)`` and ``fitted`` of shape ``(N, D)``.
     """
+    X_ref = _as_tensor(X)
     coef_np, fit_np = _api.gaussian_weighted_ridge(
-        to_numpy_f64(X),
-        to_numpy_f64(Y),
-        to_numpy_f64(penalty),
-        to_numpy_f64(weights),
+        to_numpy_f64(X_ref),
+        to_numpy_f64(_as_tensor(Y)),
+        to_numpy_f64(_as_tensor(penalty)),
+        to_numpy_f64(_as_tensor(weights)),
         ridge_lambda=float(ridge_lambda),
     )
-    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)
+    return from_numpy_like(coef_np, X_ref), from_numpy_like(fit_np, X_ref)
 
 
 def gaussian_weighted_ridge_batch(
@@ -331,12 +324,13 @@ def gaussian_weighted_ridge_batch(
         ``coefficients`` of shape ``(K, M, D)`` and ``fitted`` of shape
         ``(K, Nmax, D)``.
     """
+    X_ref = _as_tensor(X)
     coef_np, fit_np = _api.gaussian_weighted_ridge_batch(
-        to_numpy_f64(X),
-        to_numpy_f64(Y),
-        to_numpy_f64(penalty),
-        to_numpy_f64(weights),
+        to_numpy_f64(X_ref),
+        to_numpy_f64(_as_tensor(Y)),
+        to_numpy_f64(_as_tensor(penalty)),
+        to_numpy_f64(_as_tensor(weights)),
         ridge_lambda=float(ridge_lambda),
         row_counts=None if row_counts is None else to_numpy_uintp(row_counts),
     )
-    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)
+    return from_numpy_like(coef_np, X_ref), from_numpy_like(fit_np, X_ref)
