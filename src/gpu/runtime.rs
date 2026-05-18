@@ -434,7 +434,7 @@ fn load_cuda_driver() -> Result<&'static Library, GpuProbeError> {
         for candidate in candidates {
             // SAFETY: We never call dtors on the loaded library; the handle is
             // intentionally leaked for the process lifetime.
-            if let Ok(lib) = unsafe { Library::new(candidate) } {
+            if let Ok(lib) = unsafe { Library::new(*candidate) } {
                 return Some(Box::leak(Box::new(lib)));
             }
         }

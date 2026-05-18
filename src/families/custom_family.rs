@@ -2173,6 +2173,199 @@ struct CachedInnerMode {
     joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 }
 
+fn hash_cf_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
+    hasher.write_usize(values.len());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_cf_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
+    hasher.write_usize(values.nrows());
+    hasher.write_usize(values.ncols());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_cf_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    hasher.write_usize(n);
+    hasher.write_usize(p);
+    let bytes_per_row = p.saturating_mul(std::mem::size_of::<f64>()).max(1);
+    let chunk_rows = ((8 * 1024 * 1024) / bytes_per_row).clamp(1, 4096);
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("custom-family persistent warm-start design hash failed: {e}"))?;
+        hash_cf_array2(hasher, &chunk);
+    }
+    Ok(())
+}
+
+fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
+    match penalty {
+        PenaltyMatrix::Dense(matrix) => {
+            hasher.write_str("dense");
+            hash_cf_array2(hasher, matrix);
+        }
+        PenaltyMatrix::KroneckerFactored { left, right } => {
+            hasher.write_str("kron");
+            hash_cf_array2(hasher, left);
+            hash_cf_array2(hasher, right);
+        }
+        PenaltyMatrix::Blockwise {
+            local,
+            col_range,
+            total_dim,
+        } => {
+            hasher.write_str("blockwise");
+            hasher.write_usize(col_range.start);
+            hasher.write_usize(col_range.end);
+            hasher.write_usize(*total_dim);
+            hash_cf_array2(hasher, local);
+        }
+    }
+}
+
+fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+) -> Option<String> {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("gamfit-persistent-block-warm-start");
+    hasher.write_str(env!("CARGO_PKG_VERSION"));
+    hasher.write_str(type_name::<F>());
+    hasher.write_usize(specs.len());
+    for spec in specs {
+        hasher.write_str(&spec.name);
+        hash_cf_design_matrix(&mut hasher, &spec.design).ok()?;
+        hash_cf_array_view(&mut hasher, spec.offset.view());
+        hasher.write_usize(spec.penalties.len());
+        for penalty in &spec.penalties {
+            hash_cf_penalty(&mut hasher, penalty);
+        }
+        hasher.write_usize(spec.nullspace_dims.len());
+        for &dim in &spec.nullspace_dims {
+            hasher.write_usize(dim);
+        }
+        hash_cf_array_view(&mut hasher, spec.initial_log_lambdas.view());
+        match spec.initial_beta.as_ref() {
+            Some(beta) => {
+                hasher.write_bool(true);
+                hash_cf_array_view(&mut hasher, beta.view());
+            }
+            None => hasher.write_bool(false),
+        }
+    }
+    hasher.write_usize(options.inner_max_cycles);
+    hasher.write_f64(options.inner_tol);
+    hasher.write_usize(options.outer_max_iter);
+    hasher.write_f64(options.outer_tol);
+    hasher.write_f64(options.minweight);
+    hasher.write_f64(options.ridge_floor);
+    hasher.write_str(&format!("{:?}", options.ridge_policy));
+    hasher.write_bool(options.use_remlobjective);
+    hasher.write_bool(options.use_outer_hessian);
+    hasher.write_bool(options.compute_covariance);
+    hasher.write_bool(options.line_search_prefer_workspace);
+    hasher.write_bool(options.early_exit_threshold.is_some());
+    if let Some(value) = options.early_exit_threshold {
+        hasher.write_f64(value);
+    }
+    hasher.write_bool(options.outer_score_subsample.is_some());
+    hasher.write_bool(options.auto_outer_subsample);
+    Some(format!("cf-{}", hasher.finish_hex()))
+}
+
+fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
+    let n_rows = specs.first().map(|spec| spec.design.nrows()).unwrap_or(0);
+    let block_names = specs.iter().map(|spec| spec.name.clone()).collect();
+    let block_dims = specs.iter().map(|spec| spec.design.ncols()).collect();
+    (n_rows, block_names, block_dims)
+}
+
+fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_len: usize,
+) -> (Option<String>, Option<ConstrainedWarmStart>) {
+    let Some(key) = persistent_custom_family_key::<F>(specs, options) else {
+        return (None, None);
+    };
+    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
+    let Some(record) = load_block_record(&key) else {
+        return (Some(key), None);
+    };
+    if !record.is_compatible(&key, n_rows, &block_names, &block_dims, rho_len) {
+        return (Some(key), None);
+    }
+    let active_sets = record
+        .active_sets
+        .into_iter()
+        .zip(block_dims.iter().copied())
+        .map(|(active, dim)| {
+            active.and_then(|rows| {
+                if rows.iter().all(|&idx| idx < dim) {
+                    Some(rows)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    log::info!("[warm-start-cache] restored custom-family persistent warm start key={key}");
+    (
+        Some(key),
+        Some(ConstrainedWarmStart {
+            rho: Array1::from_vec(record.rho),
+            block_beta: record.block_beta.into_iter().map(Array1::from_vec).collect(),
+            active_sets,
+            cached_inner: None,
+        }),
+    )
+}
+
+fn store_persistent_custom_family_warm_start(
+    key: Option<&str>,
+    specs: &[ParameterBlockSpec],
+    warm_start: &ConstrainedWarmStart,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
+    if warm_start.block_beta.len() != block_dims.len()
+        || warm_start
+            .block_beta
+            .iter()
+            .zip(block_dims.iter())
+            .any(|(beta, dim)| beta.len() != *dim || beta.iter().any(|v| !v.is_finite()))
+        || warm_start.rho.iter().any(|v| !v.is_finite())
+    {
+        return;
+    }
+    let mut record = PersistentBlockWarmStartRecord::new(
+        key.to_string(),
+        n_rows,
+        block_names,
+        block_dims,
+    );
+    record.updated_unix_secs = record.created_unix_secs;
+    record.rho = warm_start.rho.to_vec();
+    record.block_beta = warm_start
+        .block_beta
+        .iter()
+        .map(|beta| beta.to_vec())
+        .collect();
+    record.active_sets = warm_start.active_sets.clone();
+    if let Err(err) = store_block_record(&record) {
+        log::warn!("[warm-start-cache] failed to persist custom-family warm start: {err}");
+    }
+}
+
 fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
     rho: &Array1<f64>,
@@ -15893,6 +16086,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     let rho0 = flatten_log_lambdas(specs);
+    let (persistent_warm_start_key, persistent_warm_start) =
+        load_persistent_custom_family_warm_start::<F>(specs, options, rho0.len());
 
     if rho0.is_empty() {
         let mut inner = inner_blockwise_fit(
@@ -15900,7 +16095,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             specs,
             &vec![Array1::zeros(0); specs.len()],
             options,
-            None,
+            persistent_warm_start.as_ref(),
         )?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)?;
         let covariance_conditional = compute_joint_covariance_required(
@@ -15925,6 +16120,12 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             "custom-family fit without smoothing parameters",
         )
         .map_err(CustomFamilyError::Optimization)?;
+        let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
+        store_persistent_custom_family_warm_start(
+            persistent_warm_start_key.as_deref(),
+            specs,
+            &warm_start,
+        );
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
                 block_states: inner.block_states,
@@ -15954,7 +16155,13 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
         );
         let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
-        let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
+        let mut inner = inner_blockwise_fit(
+            family,
+            specs,
+            &per_block,
+            options,
+            persistent_warm_start.as_ref(),
+        )?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)
             .map_err(CustomFamilyError::Optimization)?;
         let penalized_objective = checked_penalizedobjective(
@@ -15974,6 +16181,12 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         .map_err(CustomFamilyError::Optimization)?;
         let lambdas = rho0.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
+        store_persistent_custom_family_warm_start(
+            persistent_warm_start_key.as_deref(),
+            specs,
+            &warm_start,
+        );
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
                 block_states: inner.block_states,
@@ -16135,7 +16348,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let mut obj = problem.build_objective_with_eval_order(
         CustomOuterState {
-            warm_cache: None,
+            warm_cache: persistent_warm_start.clone(),
             last_error: None,
         },
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
@@ -16262,6 +16475,12 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             inner.cycles, last_error_detail
         )));
     }
+    let final_warm_start = constrained_warm_start_from_inner(&rho_star, &inner);
+    store_persistent_custom_family_warm_start(
+        persistent_warm_start_key.as_deref(),
+        specs,
+        &final_warm_start,
+    );
     refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|e| {
         format!(
             "outer smoothing optimization failed during final eta refresh: \
