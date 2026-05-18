@@ -537,7 +537,9 @@ def build_scene(
     return panels
 
 
-def set_all_cameras(plotter, panels, azim_deg):
+def set_all_cameras(
+    plotter: Any, panels: list[dict[str, Any]], azim_deg: float
+) -> None:
     # `plotter.camera_position = ...` is silently no-op in subplot mode after
     # the initial render; using set_position/set_focus/set_viewup actually
     # mutates the active renderer's camera.
@@ -551,7 +553,9 @@ def set_all_cameras(plotter, panels, azim_deg):
         plotter.reset_camera_clipping_range()
 
 
-def update_depth_scalars(panels, azim_deg):
+def update_depth_scalars(
+    panels: list[dict[str, Any]], azim_deg: float
+) -> None:
     """Only clouds get camera-relative depth coloring; surfaces and tubes
     derive their depth from solid-color smooth-shading lighting."""
     for pn in panels:
@@ -564,7 +568,7 @@ def update_depth_scalars(panels, azim_deg):
 # ---------------------------------------------------------------------------
 # Fit quality (RMSE / R² against the noise-free analytic truth)
 # ---------------------------------------------------------------------------
-def quality_report():
+def quality_report() -> None:
     """Print per-shape RMSE / R² between predicted (x, y, z) and the
     noise-free analytic truth, evaluated on the dense prediction grid.
 
@@ -574,7 +578,7 @@ def quality_report():
     errors).  The quality report is informational — it always prints,
     never gates rendering."""
 
-    def stats(pred_xyz, truth_xyz):
+    def stats(pred_xyz: np.ndarray, truth_xyz: np.ndarray) -> tuple[float, float]:
         """Pointwise RMSE / R² when latent parameters align between
         truth and prediction (true for everything except the loop)."""
         err = pred_xyz - truth_xyz
@@ -583,7 +587,7 @@ def quality_report():
         r2 = 1.0 - float(np.mean(err * err)) / var if var > 0 else float("nan")
         return rmse, r2
 
-    def chamfer(A, B):
+    def chamfer(A: np.ndarray, B: np.ndarray) -> float:
         """Symmetric mean nearest-neighbor distance between two 3-D
         point sets. Use when the latent parameterisation is unknown,
         unique only up to rotation / reflection, or otherwise not
