@@ -73,7 +73,7 @@ def test_reml_positions_gradients_flow_through_torch_loop() -> None:
     M = knots.size - 3 - 1
     penalty = np.eye(M)
 
-    t_param = torch.as_tensor(t_np, dtype=torch.float64, requires_grad=True)
+    t_param = torch.tensor(t_np, dtype=torch.float64, requires_grad=True)
     y_t = torch.as_tensor(y_np, dtype=torch.float64)
     k_t = torch.as_tensor(knots, dtype=torch.float64)
     p_t = torch.as_tensor(penalty, dtype=torch.float64)
