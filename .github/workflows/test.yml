@@ -70,6 +70,28 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Free runner disk space
+        # ubuntu-latest ships with ~14 GB free on /. `cargo test --all-features`
+        # links a binary per integration-test target against this dep graph
+        # (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet,
+        # criterion, ad_trait, autodiff, num-dual, …) and that has been
+        # exhausting the disk at link time — surfaced as `linking with cc
+        # failed: exit status: 1` followed by "No space left on device".
+        # Wiping these preinstalled toolchains (.NET, Android SDK, GHC,
+        # CodeQL, Boost) frees ~30 GB and pushes the link well clear of the
+        # ceiling. Each `rm` is `|| true`-guarded so a future runner image
+        # that drops one of these paths doesn't break the step.
+        run: |
+          set -uo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
       - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@stable
         with:
