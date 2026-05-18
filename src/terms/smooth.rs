@@ -3368,7 +3368,38 @@ fn build_by_smooth_basis(
                 levels
             };
             let ind = indicator_design_for_levels(data, *feature_col, &kept)?;
-            let design = replicate_design_by_indicator(&base, &ind);
+            let mut design = replicate_design_by_indicator(&base, &ind);
+            // Apply per-level sum-to-zero centering so each level's smooth
+            // block is orthogonal to the level indicator. Without this, the
+            // per-level constant component is collinear with a `+ fac` main
+            // effect (or with the intercept when only one level is present),
+            // producing a rank-deficient unpenalized Hessian and non-finite
+            // REML gradients. The inner basis is sum-to-zero across *all*
+            // rows, which is not the same as sum-to-zero within each level.
+            let p_inner = base.ncols();
+            let n_rows = base.nrows();
+            for lev in 0..kept.len() {
+                let count = (0..n_rows).filter(|&i| ind[[i, lev]] != 0.0).count();
+                if count <= 1 {
+                    continue;
+                }
+                let denom = count as f64;
+                for j in 0..p_inner {
+                    let col = lev * p_inner + j;
+                    let mut mean = 0.0;
+                    for i in 0..n_rows {
+                        if ind[[i, lev]] != 0.0 {
+                            mean += design[[i, col]];
+                        }
+                    }
+                    mean /= denom;
+                    for i in 0..n_rows {
+                        if ind[[i, lev]] != 0.0 {
+                            design[[i, col]] -= mean;
+                        }
+                    }
+                }
+            }
             let penalties = inner
                 .penalties
                 .iter()
