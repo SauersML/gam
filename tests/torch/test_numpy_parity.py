@@ -151,7 +151,7 @@ def test_gaussian_reml_fit_positions_parity():
     t = np.sort(rng.uniform(0.0, 1.0, size=n))
     Y = np.sin(2 * np.pi * t).reshape(-1, 1) + 0.05 * rng.standard_normal((n, 1))
     knots = np.linspace(0.0, 1.0, 8)
-    M = knots.size + 3 - 1  # degree=3 default in _position_basis_order
+    M = knots.size - 3 - 1  # degree=3 default in _position_basis_order
     penalty = np.eye(M)
     e = _np_api.gaussian_reml_fit_positions(t, Y, "bspline", knots, penalty)
     g = gt.gaussian_reml_fit_positions(
@@ -172,7 +172,7 @@ def test_gaussian_reml_fit_positions_batched_parity():
     )
     Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n_total, 1))
     knots = np.linspace(0.0, 1.0, 8)
-    M = knots.size + 3 - 1
+    M = knots.size - 3 - 1
     penalty = np.eye(M)
     e = _np_api.gaussian_reml_fit_positions_batched(t, Y, offsets, "bspline", knots, penalty)
     g = gt.gaussian_reml_fit_positions_batched(

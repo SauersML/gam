@@ -46,6 +46,10 @@ def _wrap_optional(arr: Any, ref: torch.Tensor) -> torch.Tensor | None:
     return from_numpy_like(np.asarray(arr, dtype=np.float64), ref)
 
 
+def _copy_forward_state(out: dict[str, Any]) -> dict[str, Any]:
+    return {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in out.items()}
+
+
 class _GaussianRemlFitFn(torch.autograd.Function):
     """Autograd Function for the non-batched closed-form Gaussian REML fit."""
 
@@ -86,9 +90,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         # Thread the full Rust forward dict back to the analytic backward so
         # the eigendecomposition cache is reused. Copy ndarrays defensively so
         # in-place ops on the user-facing tensors cannot corrupt the cache.
-        ctx.forward_state = {
-            k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in out.items()
-        }
+        ctx.forward_state = _copy_forward_state(out)
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
@@ -166,6 +168,8 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
             penalty_np,
             weights=weights_np,
             init_lambda=init_lambda,
+            by=by_np,
+            by_start_col=by_start_col,
         )
 
         ctx.x_np = x_np
@@ -176,6 +180,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         ctx.by_np = by_np
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
+        ctx.forward_state = _copy_forward_state(out)
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
@@ -208,6 +213,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
             grad_coefficients=grad_coef_np,
             grad_fitted=grad_fitted_np,
             grad_reml_score=grad_reml_vec,
+            forward_state=ctx.forward_state,
             weights=ctx.weights_np,
             init_lambda=ctx.init_lambda,
             by=ctx.by_np,
@@ -277,6 +283,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         ctx.period = period
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
+        ctx.forward_state = _copy_forward_state(out)
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = t
@@ -310,6 +317,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
             grad_coefficients=grad_coef_np,
             grad_fitted=grad_fitted_np,
             grad_reml_score=grad_reml_scalar,
+            forward_state=ctx.forward_state,
             basis_order=ctx.basis_order,
             periodic=ctx.periodic,
             period=ctx.period,
@@ -386,6 +394,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         ctx.period = period
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
+        ctx.forward_state = _copy_forward_state(out)
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = t
@@ -420,6 +429,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
             grad_coefficients=grad_coef_np,
             grad_fitted=grad_fitted_np,
             grad_reml_score=grad_reml_vec,
+            forward_state=ctx.forward_state,
             basis_order=ctx.basis_order,
             periodic=ctx.periodic,
             period=ctx.period,

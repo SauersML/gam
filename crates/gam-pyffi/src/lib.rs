@@ -689,7 +689,16 @@ fn gaussian_reml_fit_formula_table<'py>(
     gaussian_reml_result_to_pydict(py, result)
 }
 
-#[pyfunction(signature = (x, y, row_offsets, penalty, weights = None, init_lambda = None))]
+#[pyfunction(signature = (
+    x,
+    y,
+    row_offsets,
+    penalty,
+    weights = None,
+    init_lambda = None,
+    by = None,
+    by_start_col = 0
+))]
 fn gaussian_reml_fit_batched<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
@@ -698,10 +707,21 @@ fn gaussian_reml_fit_batched<'py>(
     penalty: PyReadonlyArray2<'py, f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let x_view = x.as_array();
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x_view
+    };
     let weight_view = weights.as_ref().map(|w| w.as_array());
     let result = gaussian_reml_fit_batched_impl(
-        x.as_array(),
+        fit_x,
         y.as_array(),
         row_offsets.as_array(),
         penalty.as_array(),
