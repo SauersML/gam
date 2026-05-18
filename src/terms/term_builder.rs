@@ -24,9 +24,9 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
-    TermCollectionSpec,
+    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
+    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -183,16 +183,54 @@ pub fn build_termspec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
-                let basis = build_smooth_basis(
+                let mut inner_options = options.clone();
+                let by_name = inner_options.remove("by");
+                let mut basis = build_smooth_basis(
                     *kind,
                     vars,
                     &cols,
-                    options,
+                    &inner_options,
                     ds,
                     inference_notes,
                     policy,
                     smooth_coordinate_count,
                 )?;
+                if let Some(by_name) = by_name {
+                    let by_col = resolve_col(col_map, &by_name)?;
+                    let by_kind_tag = ds.column_kinds.get(by_col).copied().ok_or_else(|| {
+                        format!("internal column-kind lookup failed for by variable '{by_name}'")
+                    })?;
+                    let by_kind = match by_kind_tag {
+                        ColumnKindTag::Categorical => {
+                            let levels = sorted_levels_for_column(ds.values.column(by_col))?;
+                            let ordered = inner_options
+                                .get("ordered")
+                                .map(|v| {
+                                    matches!(
+                                        v.trim().to_ascii_lowercase().as_str(),
+                                        "true" | "1" | "yes" | "ordered"
+                                    )
+                                })
+                                .unwrap_or(false)
+                                || by_name.to_ascii_lowercase().contains("ord");
+                            if !terms.iter().any(|t| matches!(t, ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == &by_name)) {
+                                inference_notes.push(format!("factor by-smooth s(..., by={by_name}) is usually identifiable with an explicit main-effect term for '{by_name}' (for example '+ {by_name}' or '+ group({by_name})')."));
+                            }
+                            ByVarKind::Factor {
+                                feature_col: by_col,
+                                ordered,
+                                frozen_levels: Some(levels),
+                            }
+                        }
+                        ColumnKindTag::Continuous | ColumnKindTag::Binary => ByVarKind::Numeric {
+                            feature_col: by_col,
+                        },
+                    };
+                    basis = SmoothBasisSpec::BySmooth {
+                        smooth: Box::new(basis),
+                        by_kind,
+                    };
+                }
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
@@ -218,6 +256,17 @@ pub fn build_termspec(
 // ---------------------------------------------------------------------------
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
+
+fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, String> {
+    let mut levels = std::collections::BTreeSet::<u64>::new();
+    for &v in col.iter() {
+        if !v.is_finite() {
+            return Err("categorical column contains non-finite values".to_string());
+        }
+        levels.insert(v.to_bits());
+    }
+    Ok(levels.into_iter().collect())
+}
 
 /// Look up a per-side boundary-condition key under any of several names that
 /// users intuitively reach for, picking the first present. Aliases:
@@ -398,6 +447,106 @@ pub fn build_smooth_basis(
         });
 
     match type_opt.as_str() {
+        "fs" | "factor-smooth" | "factor_smooth" | "sz" | "re" => {
+            validate_known_options(
+                type_opt.as_str(),
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "degree",
+                    "penalty_order",
+                    "m",
+                    "double_penalty",
+                ],
+            )?;
+            if cols.len() != 2 {
+                return Err(format!(
+                    "{} smooth currently expects exactly two variables: one continuous and one categorical/group variable",
+                    type_opt
+                ));
+            }
+            let k0 = ds
+                .column_kinds
+                .get(cols[0])
+                .copied()
+                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+            let k1 = ds
+                .column_kinds
+                .get(cols[1])
+                .copied()
+                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+            let (group_idx, cont_idx) = match (k0, k1) {
+                (ColumnKindTag::Categorical, ColumnKindTag::Continuous | ColumnKindTag::Binary) => {
+                    (0usize, 1usize)
+                }
+                (ColumnKindTag::Continuous | ColumnKindTag::Binary, ColumnKindTag::Categorical) => {
+                    (1usize, 0usize)
+                }
+                _ => {
+                    return Err(format!(
+                        "{} smooth requires one categorical and one numeric variable",
+                        type_opt
+                    ));
+                }
+            };
+            let group_col = cols[group_idx];
+            let cont_col = cols[cont_idx];
+            let levels = sorted_levels_for_column(ds.values.column(group_col))?;
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
+            let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
+            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+            let n_knots = if let Some(k) = k {
+                if k < degree + 1 {
+                    return Err(format!(
+                        "factor smooth: k={} too small for degree {}; expected k >= {}",
+                        k,
+                        degree,
+                        degree + 1
+                    ));
+                }
+                k - degree - 1
+            } else {
+                default_internal
+            };
+            let marginal = BSplineBasisSpec {
+                degree,
+                penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (minv, maxv),
+                    num_internal_knots: n_knots,
+                },
+                double_penalty: true,
+                identifiability: BSplineIdentifiability::None,
+                boundary_conditions: Default::default(),
+            };
+            let flavour = match type_opt.as_str() {
+                "fs" | "factor-smooth" | "factor_smooth" => {
+                    let m = option_usize(options, "m").unwrap_or(2);
+                    FactorSmoothFlavour::Fs {
+                        m_null_penalty_orders: vec![m],
+                    }
+                }
+                "sz" => FactorSmoothFlavour::Sz,
+                "re" => FactorSmoothFlavour::Re,
+                _ => unreachable!(),
+            };
+            Ok(SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![cont_col],
+                    group_col,
+                    marginal,
+                    flavour,
+                    group_frozen_levels: Some(levels),
+                },
+            })
+        }
         "tensor" | "te" | "tensor-bspline" => {
             validate_known_options(
                 "te",
@@ -405,6 +554,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "k",
                     "basis_dim",
                     "basis-dim",
@@ -541,6 +691,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "k",
                     "basis_dim",
                     "basis-dim",
@@ -605,6 +756,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "k",
                     "basis_dim",
                     "basis-dim",
@@ -714,6 +866,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "length_scale",
                     "centers",
                     "k",
@@ -767,6 +920,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "method",
                     "m",
                     "order",
@@ -933,6 +1087,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "nu",
                     "length_scale",
                     "centers",
@@ -1009,6 +1164,7 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "by",
                     "length_scale",
                     "centers",
                     "k",
