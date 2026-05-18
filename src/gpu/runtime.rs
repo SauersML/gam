@@ -17,8 +17,8 @@ use std::sync::OnceLock;
 
 use libloading::Library;
 
-use super::diagnostics;
 use super::device::GpuDeviceInfo;
+use super::diagnostics;
 use super::driver::CudaWorkingState;
 use super::policy::DispatchPolicy;
 
