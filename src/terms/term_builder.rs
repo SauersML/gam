@@ -2327,7 +2327,13 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed = parse_formula("y ~ duchon(x1, centers=2) + s(x2) + s(x3) + s(x4) + s(x5)")
+        // Pure 1D Duchon at default options resolves the nullspace to Linear
+        // (2s < d forces escalation), giving 2 polynomial nullspace columns;
+        // the well-posedness gate requires num_centers > polynomial_cols, so
+        // 3 is the smallest valid count. It is still well below the small-N
+        // bump target of polynomial_cols + 4 = 6, so this exercises the
+        // "explicit value is honored" path the test name advertises.
+        let parsed = parse_formula("y ~ duchon(x1, centers=3) + s(x2) + s(x3) + s(x4) + s(x5)")
             .expect("parse multi-smooth formula");
         let col_map = ds.column_map();
         let mut notes = Vec::new();
@@ -2344,7 +2350,7 @@ mod tests {
         };
         assert!(matches!(
             spec.center_strategy,
-            CenterStrategy::EqualMass { num_centers: 2 }
+            CenterStrategy::EqualMass { num_centers: 3 }
         ));
     }
 
