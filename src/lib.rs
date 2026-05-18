@@ -62,6 +62,7 @@ pub fn init_parallelism() {
     });
 }
 
+pub mod cache;
 pub mod families;
 pub mod gpu;
 pub mod inference;
