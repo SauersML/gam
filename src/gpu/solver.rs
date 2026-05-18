@@ -81,7 +81,7 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     if !matrices.iter().all(|m| m.dim() == (p, p)) {
         return None;
     }
-    if !route_chol_solve(p) {
+    if !route_chol_batched(p, matrices.len()) {
         return None;
     }
     with_runtime(|rt| rt.cholesky_batched_lower_inplace(matrices))
@@ -95,6 +95,13 @@ fn route_syevd(p: usize) -> bool {
 #[inline]
 fn route_chol_solve(p: usize) -> bool {
     GpuRuntime::global().policy().route_chol_solve(p)
+}
+
+#[inline]
+fn route_chol_batched(p: usize, batch_size: usize) -> bool {
+    GpuRuntime::global()
+        .policy()
+        .route_chol_batched(p, batch_size)
 }
 
 fn with_runtime<T>(f: impl FnOnce(&mut CusolverRuntime) -> Option<T>) -> Option<T> {
