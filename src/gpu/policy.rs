@@ -261,21 +261,24 @@ mod tests {
     fn device(major: i32, sms: i32) -> GpuDeviceInfo {
         GpuDeviceInfo {
             ordinal: 0,
-            name: if major >= 9 { "H100" } else { "A100" }.to_string(),
+            name: "test-device".to_string(),
             compute_capability_major: major,
             compute_capability_minor: 0,
             sm_count: sms,
+            max_threads_per_multiprocessor: 2048,
+            clock_rate_khz: 1_500_000,
+            single_to_double_precision_perf_ratio: Some(if major >= 9 { 1 } else { 2 }),
             total_memory_bytes: 16 * 1024 * 1024 * 1024,
         }
     }
 
     #[test]
     fn faster_device_lowers_thresholds() {
-        let turing_like = DispatchPolicy::for_device(Some(&device(7, 40)));
-        let hopper_like = DispatchPolicy::for_device(Some(&device(9, 132)));
-        assert!(hopper_like.gemm_min_flops < turing_like.gemm_min_flops);
-        assert!(hopper_like.gemv_min_flops < turing_like.gemv_min_flops);
-        assert!(hopper_like.xtwx_min_rows <= turing_like.xtwx_min_rows);
+        let slower = DispatchPolicy::for_device(Some(&device(7, 40)));
+        let faster = DispatchPolicy::for_device(Some(&device(9, 132)));
+        assert!(faster.gemm_min_flops < slower.gemm_min_flops);
+        assert!(faster.gemv_min_flops < slower.gemv_min_flops);
+        assert!(faster.xtwx_min_rows <= slower.xtwx_min_rows);
     }
 
     #[test]
