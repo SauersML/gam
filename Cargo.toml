@@ -67,6 +67,8 @@ parquet = { version = "54", default-features = false, features = ["arrow", "snap
 wide = "0.7"
 smallvec = "1"
 libloading = "0.8"
+dirs = "6.0"
+sha2 = "0.10"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
