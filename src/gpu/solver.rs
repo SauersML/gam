@@ -240,35 +240,34 @@ fn with_runtime<T>(
     mut f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
     static RUNTIME: OnceLock<Vec<Mutex<CusolverRuntime>>> = OnceLock::new();
-    let runtimes = RUNTIME
-        .get_or_init(|| {
-            GpuRuntime::global()
-                .devices()
-                .iter()
-                .filter_map(|device| {
-                    let cuda = match CudaWorkingState::init(device.ordinal) {
-                        Some(cuda) => cuda,
-                        None => {
-                            diagnostics::log_library_unavailable(
-                                "cuSOLVER",
-                                &format!("CUDA context init failed for device {}", device.ordinal),
-                            );
-                            return None;
-                        }
-                    };
-                    match CusolverRuntime::new(cuda, device.clone()) {
-                        Ok(runtime) => {
-                            diagnostics::log_library_ready("cuSOLVER", &runtime.device);
-                            Some(Mutex::new(runtime))
-                        }
-                        Err(err) => {
-                            diagnostics::log_library_unavailable("cuSOLVER", &err);
-                            None
-                        }
+    let runtimes = RUNTIME.get_or_init(|| {
+        GpuRuntime::global()
+            .devices()
+            .iter()
+            .filter_map(|device| {
+                let cuda = match CudaWorkingState::init(device.ordinal) {
+                    Some(cuda) => cuda,
+                    None => {
+                        diagnostics::log_library_unavailable(
+                            "cuSOLVER",
+                            &format!("CUDA context init failed for device {}", device.ordinal),
+                        );
+                        return None;
                     }
-                })
-                .collect()
-        });
+                };
+                match CusolverRuntime::new(cuda, device.clone()) {
+                    Ok(runtime) => {
+                        diagnostics::log_library_ready("cuSOLVER", &runtime.device);
+                        Some(Mutex::new(runtime))
+                    }
+                    Err(err) => {
+                        diagnostics::log_library_unavailable("cuSOLVER", &err);
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
     if runtimes.is_empty() {
         return None;
     }
