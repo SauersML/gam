@@ -23,6 +23,7 @@ See https://github.com/SauersML/gam for the full guide.
 """
 
 from importlib import metadata as _metadata
+from pathlib import Path
 
 from ._api import (
     bspline_basis,
@@ -71,7 +72,7 @@ try:
 except _metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
-def load_posterior(path: object) -> PosteriorSamples:
+def load_posterior(path: str | Path) -> PosteriorSamples:
     """Load a :class:`PosteriorSamples` archive from disk.
 
     Thin wrapper around :meth:`PosteriorSamples.load` provided for symmetry
@@ -94,7 +95,7 @@ def load_posterior(path: object) -> PosteriorSamples:
     >>> draws.beta.shape
     (1000, 42)
     """
-    return PosteriorSamples.load(path)  # type: ignore[arg-type]
+    return PosteriorSamples.load(path)
 
 
 __all__ = [
