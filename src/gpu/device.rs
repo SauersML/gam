@@ -17,37 +17,33 @@ pub struct GpuDeviceInfo {
     /// the architecture marketing term). Drives the peak-throughput estimate
     /// in [`super::policy::DispatchPolicy::for_device`].
     pub sm_count: i32,
+    /// Maximum resident threads per multiprocessor reported by the CUDA
+    /// driver. Used as a generic throughput proxy without product-name
+    /// categorization.
+    pub max_threads_per_multiprocessor: i32,
+    /// Device core clock in kHz, as reported by the CUDA driver.
+    pub clock_rate_khz: i32,
+    /// Ratio of single-precision to double-precision throughput reported by
+    /// `CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO`.
+    pub single_to_double_precision_perf_ratio: i32,
     pub total_memory_bytes: usize,
 }
 
 impl GpuDeviceInfo {
-    /// Effective peak FP64 throughput, GFLOPS, at a nominal 1.5 GHz boost.
+    /// Generic effective FP64 throughput proxy, GFLOPS.
     ///
-    /// FP64 cores per SM by compute-capability major and device family:
-    ///
-    /// | major | FP64 cores / SM |
-    /// |-------|-----------------|
-    /// |  6.x  |  32 (P100) or 4 (consumer Pascal) |
-    /// |  7.x  |  32 (V100) or 2 (T4 / Turing consumer) |
-    /// |  8.x  |  32 (A100) or 2 (L4 / A10 / Ampere consumer) |
-    /// |  9.x+ |  64 (H100/B100) |
-    ///
-    /// CUDA's driver API does not expose FP64 ratio directly, so device-name
-    /// matching is used for the datacenter parts with high FP64 throughput.
-    /// Everything else is treated as low-ratio FP64 hardware, which keeps
-    /// T4/L4/RTX-class devices from accepting work that only A100/H100-class
-    /// cards can amortize efficiently.
+    /// This uses only driver-reported characteristics:
+    /// `SMs × max resident threads/SM × clock × 2 FLOP/FMA ÷ SP:DP ratio`.
+    /// It is deliberately a dispatch score rather than a marketing peak
+    /// claim; the important property is that mixed fleets are weighted by
+    /// actual CUDA attributes, not product names.
     pub fn peak_fp64_gflops(&self) -> f64 {
-        let cores_per_sm = if self.compute_capability_major >= 9 {
-            64.0
-        } else if self.has_datacenter_fp64_ratio() {
-            32.0
-        } else {
-            2.0
-        };
-        let boost_ghz = 1.5_f64;
+        let sm_count = self.sm_count.max(1) as f64;
+        let threads_per_sm = self.max_threads_per_multiprocessor.max(1) as f64;
+        let clock_ghz = (self.clock_rate_khz.max(1) as f64) / 1_000_000.0;
         let muladd_flops = 2.0_f64;
-        self.sm_count.max(1) as f64 * cores_per_sm * boost_ghz * muladd_flops
+        let fp64_ratio = self.single_to_double_precision_perf_ratio.max(1) as f64;
+        sm_count * threads_per_sm * clock_ghz * muladd_flops / fp64_ratio
     }
 
     /// Heuristic score used to pick the "best" device when multiple are
@@ -64,7 +60,7 @@ impl GpuDeviceInfo {
     pub fn dispatch_memory_budget_bytes(&self) -> usize {
         let half = self.total_memory_bytes / 2;
         let seventy_percent = self.total_memory_bytes.saturating_mul(7) / 10;
-        let reserve = 512 * 1024 * 1024;
+        let reserve: usize = 512 * 1024 * 1024;
         if self.total_memory_bytes > reserve.saturating_mul(2) {
             seventy_percent.min(self.total_memory_bytes.saturating_sub(reserve))
         } else {
@@ -72,12 +68,6 @@ impl GpuDeviceInfo {
         }
     }
 
-    fn has_datacenter_fp64_ratio(&self) -> bool {
-        let name = self.name.to_ascii_uppercase();
-        ["A100", "A800", "H100", "H200", "B100", "B200", "V100", "P100"]
-            .iter()
-            .any(|needle| name.contains(needle))
-    }
 }
 
 impl fmt::Display for GpuDeviceInfo {
@@ -106,6 +96,9 @@ mod tests {
             compute_capability_major: major,
             compute_capability_minor: 0,
             sm_count: sms,
+            max_threads_per_multiprocessor: 2048,
+            clock_rate_khz: 1_500_000,
+            single_to_double_precision_perf_ratio: 32,
             total_memory_bytes: mem_gib * 1024 * 1024 * 1024,
         }
     }
@@ -119,28 +112,26 @@ mod tests {
 
     #[test]
     fn hopper_per_sm_throughput_exceeds_ampere() {
-        let a100_like = make(8, 108, 80);
-        let h100_like = make(9, 132, 80);
-        // h100 doubles FP64 cores/SM on top of more SMs; throughput should be
-        // ≥ ~2.4× even before the boost-clock advantage.
-        assert!(h100_like.peak_fp64_gflops() / a100_like.peak_fp64_gflops() > 2.0);
+        let mut smaller = make(8, 108, 80);
+        let mut larger = make(9, 132, 80);
+        smaller.single_to_double_precision_perf_ratio = 2;
+        larger.single_to_double_precision_perf_ratio = 1;
+        assert!(larger.peak_fp64_gflops() / smaller.peak_fp64_gflops() > 2.0);
     }
 
     #[test]
     fn score_prefers_higher_compute_and_memory() {
-        let mut consumer = make(7, 40, 8);
-        consumer.name = "T4".to_string();
-        let mut datacenter = make(9, 132, 80);
-        datacenter.name = "H100".to_string();
-        assert!(datacenter.score() > consumer.score());
+        let small = make(7, 40, 8);
+        let large = make(9, 132, 80);
+        assert!(large.score() > small.score());
     }
 
     #[test]
-    fn low_ratio_devices_get_conservative_fp64_estimate() {
-        let mut t4 = make(7, 40, 16);
-        t4.name = "Tesla T4".to_string();
-        let mut v100 = make(7, 80, 32);
-        v100.name = "Tesla V100".to_string();
-        assert!(v100.peak_fp64_gflops() > t4.peak_fp64_gflops() * 10.0);
+    fn driver_reported_fp64_ratio_controls_throughput_estimate() {
+        let mut low_ratio = make(8, 80, 16);
+        low_ratio.single_to_double_precision_perf_ratio = 2;
+        let mut high_ratio = make(8, 80, 16);
+        high_ratio.single_to_double_precision_perf_ratio = 64;
+        assert!(low_ratio.peak_fp64_gflops() > high_ratio.peak_fp64_gflops() * 10.0);
     }
 }
