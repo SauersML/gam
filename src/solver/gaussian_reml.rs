@@ -1109,7 +1109,15 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         .iter()
         .map(|m| matrix_fingerprint(m.view()))
         .collect();
-    let mut batched_lowers: Option<Vec<Array2<f64>>> = if uniform_shape {
+    // Only allocate the batched device-input clone when the policy is going
+    // to attempt the GPU dispatch; for large `p` (where per-fit X'WX is
+    // already O(p²) per matrix) the duplicate buffer is the dominant
+    // memory overhead, so we let `route_chol_batched` veto upfront.
+    let policy_routes_batched = uniform_shape
+        && crate::gpu::GpuRuntime::global()
+            .policy()
+            .route_chol_batched(p, k);
+    let mut batched_lowers: Option<Vec<Array2<f64>>> = if policy_routes_batched {
         let mut buffer: Vec<Array2<f64>> = xtwx_matrices.iter().cloned().collect();
         let ok = crate::gpu::try_cholesky_batched_lower_inplace(&mut buffer).is_some()
             && buffer.iter().all(|m| {
