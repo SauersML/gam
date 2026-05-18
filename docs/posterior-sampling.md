@@ -10,8 +10,8 @@ model class supports it, and a Gaussian Laplace approximation otherwise.
 ```python
 posterior = model.sample(train_df, seed=42)
 print(posterior)
-# PosteriorSamples(n_draws=1024, n_coeffs=8, method='nuts',
-#                  rhat=1.0042, ess=890.5, converged=True)
+# PosteriorSamples(n_draws=..., n_coeffs=8, method='nuts',
+#                  rhat=1.004, ess=..., converged=True)
 
 bands = posterior.predict(test_df, level=0.95)
 # Dict with eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper
