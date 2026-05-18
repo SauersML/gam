@@ -1310,28 +1310,6 @@ pub fn build_smooth_basis(
             let operator_penalties = DuchonOperatorPenaltySpec::default();
             let periodic = option_bool(options, "cyclic").unwrap_or(false)
                 || option_bool(options, "periodic").unwrap_or(false);
-            // Periodic Duchon (`duchon(x, periodic=true)`) is implemented at
-            // the basis level (`build_periodic_duchon_basis_1d`) and is used
-            // internally by tests, but the REML hyperparameter path has no
-            // working kappa-derivative for the wrapped-distance kernel:
-            // `prepare_duchon_derivative_context` explicitly rejects
-            // `spec.periodic`. Without that derivative the outer kappa
-            // optimization fails partway with an opaque
-            // "spatial kappa optimization failed" wrapper. Until the
-            // periodic kappa derivative is wired up, redirect users from
-            // the formula DSL to the alternatives that actually fit
-            // end-to-end: `s(x, periodic=true, period=...)` for 1D
-            // periodic smoothing, or `te(...)` with a periodic margin for
-            // higher-dimensional periodic geometries.
-            if periodic {
-                return Err(format!(
-                    "duchon(..., periodic=true) is not currently supported through the formula DSL because the \
-                     wrapped-distance kernel has no REML kappa-derivative path. Use `s({}, periodic=true, period=2*pi)` for \
-                     1D periodic smoothing, or `te(...)` with `bc=['periodic', ...]` for higher-dimensional \
-                     periodic geometries.",
-                    vars.join(", "),
-                ));
-            }
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
