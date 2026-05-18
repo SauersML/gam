@@ -114,7 +114,9 @@ use gam::{
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};
-use statrs::distribution::{ChiSquared, ContinuousCDF};
+#[cfg(test)]
+use statrs::distribution::ChiSquared;
+use statrs::distribution::{ContinuousCDF, StudentsT};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -7974,71 +7976,13 @@ fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
+#[cfg(test)]
 fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
     if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
         return None;
     }
     let dist = ChiSquared::new(df.max(1e-8)).ok()?;
     Some((1.0 - dist.cdf(chi_sq)).clamp(0.0, 1.0))
-}
-
-fn solve_symmetric_system(cov: &Array2<f64>, rhs: &FaerMat<f64>) -> Option<FaerMat<f64>> {
-    let covview = gam::faer_ndarray::FaerArrayView::new(cov);
-    let factor =
-        gam::faer_ndarray::factorize_symmetricwith_fallback(covview.as_ref(), Side::Lower).ok()?;
-    Some(factor.solve(rhs.as_ref()))
-}
-
-fn wald_quadratic_form(
-    beta_block: ndarray::ArrayView1<'_, f64>,
-    cov_block: &Array2<f64>,
-) -> Option<f64> {
-    let k = beta_block.len();
-    if k == 0 || cov_block.nrows() != k || cov_block.ncols() != k {
-        return None;
-    }
-    let mut rhs = FaerMat::<f64>::zeros(k, 1);
-    for i in 0..k {
-        rhs[(i, 0)] = beta_block[i];
-    }
-
-    let mut ridge = 0.0_f64;
-    for _ in 0..5 {
-        let cov_eval = if ridge > 0.0 {
-            let mut reg = cov_block.clone();
-            for i in 0..k {
-                reg[[i, i]] += ridge;
-            }
-            reg
-        } else {
-            cov_block.clone()
-        };
-        if let Some(sol) = solve_symmetric_system(&cov_eval, &rhs) {
-            let mut q = 0.0_f64;
-            for i in 0..k {
-                q += beta_block[i] * sol[(i, 0)];
-            }
-            if q.is_finite() {
-                return Some(q.max(0.0));
-            }
-        }
-        ridge = if ridge == 0.0 { 1e-10 } else { ridge * 100.0 };
-    }
-    None
-}
-
-fn covariance_block(cov: &Array2<f64>, start: usize, end: usize) -> Option<Array2<f64>> {
-    if start >= end || end > cov.nrows() || end > cov.ncols() {
-        return None;
-    }
-    let k = end - start;
-    let mut out = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in 0..k {
-            out[[i, j]] = cov[[start + i, start + j]];
-        }
-    }
-    Some(out)
 }
 
 fn build_model_summary(
@@ -8054,6 +7998,24 @@ fn build_model_summary(
         .beta_standard_errors_corrected()
         .or(fit.beta_standard_errors());
     let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
+    let scale_is_estimated = fit.dispersion().is_some_and(|d| d.is_estimated());
+    let residual_df = fit
+        .edf_total()
+        .map(|edf_total| (y.len() as f64 - edf_total).max(1.0))
+        .unwrap_or(1.0);
+    let parametric_two_sided_p = |z: f64| -> Option<f64> {
+        if !z.is_finite() {
+            return None;
+        }
+        if scale_is_estimated {
+            // Estimated scale (Gaussian / Gamma) calibrates two-sided Wald
+            // coefficient p-values against a Student-t with the residual EDF.
+            let dist = StudentsT::new(0.0, 1.0, residual_df).ok()?;
+            Some((2.0 * (1.0 - dist.cdf(z.abs()))).clamp(0.0, 1.0))
+        } else {
+            Some((2.0 * (1.0 - normal_cdf(z.abs()))).clamp(0.0, 1.0))
+        }
+    };
 
     let nullmu = match family {
         LikelihoodFamily::GaussianIdentity => {
@@ -8127,9 +8089,7 @@ fn build_model_summary(
     let intercept_beta = fit.beta.get(intercept_idx).copied().unwrap_or(0.0);
     let intercept_se = se.and_then(|s| s.get(intercept_idx).copied());
     let interceptz = intercept_se.and_then(|s| (s > 0.0).then_some(intercept_beta / s));
-    let intercept_p = interceptz
-        .map(|z| 2.0 * (1.0 - normal_cdf(z.abs())))
-        .map(|p| p.clamp(0.0, 1.0));
+    let intercept_p = interceptz.and_then(parametric_two_sided_p);
     parametric_terms.push(ParametricTermSummary {
         name: "Intercept".to_string(),
         estimate: intercept_beta,
@@ -8178,9 +8138,7 @@ fn build_model_summary(
             let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
             let se_i = se.and_then(|s| s.get(idx).copied());
             let z = se_i.and_then(|s| (s > 0.0).then_some(beta / s));
-            let p = z
-                .map(|zz| 2.0 * (1.0 - normal_cdf(zz.abs())))
-                .map(|v| v.clamp(0.0, 1.0));
+            let p = z.and_then(parametric_two_sided_p);
             let label = if range.end - range.start > 1 {
                 format!("{geometry_label}[{}]", idx - range.start)
             } else {
@@ -8198,26 +8156,22 @@ fn build_model_summary(
 
     let mut smooth_terms = Vec::<SmoothTermSummary>::new();
     let mut penalty_cursor = 0usize;
-    for (name, range) in &design.random_effect_ranges {
+    for (name, _range) in &design.random_effect_ranges {
         let edf = fit
             .edf_by_block()
             .get(penalty_cursor)
             .copied()
             .unwrap_or(0.0);
         penalty_cursor += 1;
-        let chi_sq_opt = cov_forwald.and_then(|cov| {
-            let beta_block = fit.beta.slice(s![range.start..range.end]);
-            let cov_block = covariance_block(cov, range.start, range.end)?;
-            wald_quadratic_form(beta_block, &cov_block)
-        });
-        let ref_df = (range.end - range.start).max(1) as f64;
-        let pvalue = chi_sq_opt.and_then(|x| chi_square_survival_approx(x, ref_df));
+        // Random-effect smooths are variance-component tests on the boundary;
+        // a naive coefficient Wald χ² p-value is anti-conservative, so only
+        // EDF is reported.
         smooth_terms.push(SmoothTermSummary {
             name: name.clone(),
             edf,
-            ref_df,
-            chi_sq: chi_sq_opt,
-            pvalue,
+            ref_df: edf.max(0.0),
+            chi_sq: None,
+            pvalue: None,
             continuous_order: None,
         });
     }
