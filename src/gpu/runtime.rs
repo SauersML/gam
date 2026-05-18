@@ -14,6 +14,7 @@
 use std::ffi::c_char;
 use std::fmt;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libloading::Library;
 
@@ -67,8 +68,10 @@ impl fmt::Display for GpuProbeError {
 #[derive(Debug)]
 pub struct GpuRuntime {
     selected_device: Option<GpuDeviceInfo>,
+    devices: Vec<GpuDeviceInfo>,
     policy: DispatchPolicy,
     cpu_reason: Option<String>,
+    dispatch_cursor: AtomicUsize,
 }
 
 impl GpuRuntime {
@@ -87,13 +90,16 @@ impl GpuRuntime {
                         .partial_cmp(&a.score())
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let device = devices.into_iter().next().expect("non-empty");
+                let device = devices[0].clone();
                 let policy = DispatchPolicy::for_device(Some(&device));
                 diagnostics::log_cuda_enabled(&device, &policy);
+                diagnostics::log_cuda_pool(&devices);
                 Self {
                     selected_device: Some(device),
+                    devices,
                     policy,
                     cpu_reason: None,
+                    dispatch_cursor: AtomicUsize::new(0),
                 }
             }
             Err(err) => {
@@ -101,8 +107,10 @@ impl GpuRuntime {
                 diagnostics::log_cuda_disabled(&reason);
                 Self {
                     selected_device: None,
+                    devices: Vec::new(),
                     policy: DispatchPolicy::for_device(None),
                     cpu_reason: Some(reason),
+                    dispatch_cursor: AtomicUsize::new(0),
                 }
             }
         }
@@ -118,6 +126,12 @@ impl GpuRuntime {
     #[inline]
     pub fn selected_device(&self) -> Option<&GpuDeviceInfo> {
         self.selected_device.as_ref()
+    }
+
+    /// All CUDA devices visible to the process, sorted by dispatch preference.
+    #[inline]
+    pub fn devices(&self) -> &[GpuDeviceInfo] {
+        &self.devices
     }
 
     /// Workload-size policy for the selected device.
@@ -145,6 +159,17 @@ impl GpuRuntime {
         STATE
             .get_or_init(|| CudaWorkingState::init(device.ordinal))
             .as_ref()
+    }
+
+    /// Pick a start slot for a multi-device runtime pool. Callers should try
+    /// slots modulo their own pool length from this offset.
+    #[inline]
+    pub fn next_runtime_slot(&self, len: usize) -> usize {
+        if len <= 1 {
+            0
+        } else {
+            self.dispatch_cursor.fetch_add(1, Ordering::Relaxed) % len
+        }
     }
 }
 

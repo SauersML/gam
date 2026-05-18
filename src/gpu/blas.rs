@@ -4,6 +4,7 @@ use libloading::Library;
 use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Data, Ix1, Ix2, s};
 use std::sync::{Mutex, OnceLock};
 
+use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::driver::{
     CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
@@ -31,25 +32,29 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    let result = with_runtime(|runtime| runtime.gemm(a, b, false, false));
-    if result.is_some() {
-        diagnostics::log_gpu_success(
-            "gemm",
-            "cuBLAS",
-            format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
-            diagnostics::gemm_flops(m, n, k),
-            diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
-            diagnostics::bytes_for_f64(m.saturating_mul(n)),
-            start.elapsed().as_secs_f64(),
-        );
-    } else {
-        diagnostics::log_runtime_cpu(
-            "gemm",
-            "cuBLAS",
-            format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
-        );
+    match with_runtime(|runtime| runtime.gemm(a, b, false, false)) {
+        Some((out, device)) => {
+            diagnostics::log_gpu_success(
+                "gemm",
+                "cuBLAS",
+                &device,
+                format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
+                diagnostics::gemm_flops(m, n, k),
+                diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
+                diagnostics::bytes_for_f64(m.saturating_mul(n)),
+                start.elapsed().as_secs_f64(),
+            );
+            Some(out)
+        }
+        None => {
+            diagnostics::log_runtime_cpu(
+                "gemm",
+                "cuBLAS",
+                format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
+            );
+            None
+        }
     }
-    result
 }
 
 /// Strided batched dense matrix multiply: `C[b] = A[b] · B[b]` (or transposed
