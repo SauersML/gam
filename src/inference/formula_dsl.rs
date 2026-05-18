@@ -1406,6 +1406,18 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "fs" | "sz" => {
+                if vars.len() != 2 {
+                    return Err(format!("{}() expects exactly two variables: {raw}", name));
+                }
+                options.insert("bs".to_string(), name.clone());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "thinplate" | "thin_plate" | "tps" => {
                 if vars.len() < 2 {
                     return Err(format!(

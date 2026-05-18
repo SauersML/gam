@@ -70,15 +70,42 @@ Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`.
 plus an optional Beta prior (parameterised by `target` / `strength`)
 rather than a quadratic ridge.
 
-## Random effects
+## Random effects and factor smooths
 
 ```
 y ~ x + group(site)
-y ~ x + re(site)            # alias
+y ~ x + re(site)                         # alias for random intercepts
+y ~ s(x, by=site) + site                 # separate smooth per factor level
+y ~ s(x, by=z)                           # numeric varying-coefficient smooth
+y ~ s(x, site, bs="fs")                  # partial-pooling random smooths
+y ~ fs(x, site)                          # alias for bs="fs"
+y ~ s(site, x, bs="sz") + s(x)           # sum-to-zero deviations from a main smooth
+y ~ sz(site, x)                          # alias for bs="sz"
+y ~ s(site, x, bs="re") + group(site)    # random intercepts plus random slopes
 ```
 
-Adds a random intercept per level of the grouping column. The column may be
-string- or integer-valued. Random slopes are not supported.
+`group()`/`re()` adds a random intercept per level of a string- or
+integer-valued grouping column.
+
+Factor and numeric `by=` smooths multiply an ordinary smooth basis by a
+numeric covariate or by per-level indicators. Factor `by=` smooths create a
+separate smooth for each kept level; include the factor main effect (for
+example `+ site` or `+ group(site)`) when level offsets should be identifiable.
+Ordered-factor style difference smooths can be requested with an ordered
+factor column name/convention and skip the reference level.
+
+`bs="fs"` builds random smooths: each group gets its own curve, including
+penalized null-space components such as intercept and linear trend, so small
+groups shrink toward zero contribution while larger groups can retain distinct
+curves. New/unseen groups at prediction time contribute zero for the factor
+smooth term. `m=1` reduces the number of null-space shrinkage penalties;
+`m=2` is the default.
+
+`bs="sz"` builds sum-to-zero factor-smooth deviations intended to be used with
+a population smooth such as `s(x)`. Deviations are constrained to sum to zero
+across factor levels at each spline coefficient. `bs="re"` with one grouping
+and one numeric variable builds random slopes as a factor-by-linear basis with
+an identity ridge penalty.
 
 ## Univariate smooths
 
