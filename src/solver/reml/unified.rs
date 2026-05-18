@@ -5501,6 +5501,14 @@ pub fn reml_laml_evaluate(
                 + 0.5 * (log_det_h - log_det_s)
                 + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
 
+            eprintln!(
+                "[UNIFIED_PROFILED_GAUSSIAN] dp_raw={dp_raw} dp_c={dp_c} -2ll={} pen_quad={} n_obs={} nullspace_dim={} denom={denom} phi={phi} log_det_h={log_det_h} log_det_s={log_det_s} cost={cost}",
+                -2.0 * solution.log_likelihood,
+                solution.penalty_quadratic,
+                solution.n_observations,
+                solution.nullspace_dim
+            );
+
             (cost, phi, dp_cgrad, dp_cgrad2)
         }
         DispersionHandling::Fixed {
