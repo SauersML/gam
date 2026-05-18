@@ -114,6 +114,19 @@ pub enum ShapeConstraint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SmoothBasisSpec {
+    /// Smooth multiplied by a numeric or level-indicator `by` variable.
+    By {
+        inner: Box<SmoothBasisSpec>,
+        by_col: usize,
+        by_level: Option<u64>,
+        center_active: bool,
+    },
+    /// Factor smooth with coefficients constrained to sum to zero across levels.
+    FactorSumToZero {
+        inner: Box<SmoothBasisSpec>,
+        group_col: usize,
+        levels: Vec<u64>,
+    },
     BSpline1D {
         feature_col: usize,
         spec: BSplineBasisSpec,
@@ -409,6 +422,20 @@ impl TermCollectionSpec {
         }
         for st in &self.smooth_terms {
             match &st.basis {
+                SmoothBasisSpec::By { inner, .. }
+                | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+                    let nested = SmoothTermSpec {
+                        name: st.name.clone(),
+                        basis: (*inner.clone()),
+                        shape: st.shape,
+                    };
+                    TermCollectionSpec {
+                        linear_terms: Vec::new(),
+                        random_effect_terms: Vec::new(),
+                        smooth_terms: vec![nested],
+                    }
+                    .validate_frozen(label)?;
+                }
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
                     if !matches!(
                         spec.knotspec,
@@ -3646,6 +3673,48 @@ impl SmoothDesign {
     }
 }
 
+fn by_indicator_or_numeric(by_values: ArrayView1<'_, f64>, by_level: Option<u64>) -> Array1<f64> {
+    match by_level {
+        Some(level_bits) => by_values.mapv(|v| if v.to_bits() == level_bits { 1.0 } else { 0.0 }),
+        None => by_values.to_owned(),
+    }
+}
+
+fn center_design_over_active_rows(design: &mut Array2<f64>, weights: &Array1<f64>) {
+    let active_count = weights.iter().filter(|w| **w != 0.0).count();
+    if active_count == 0 {
+        return;
+    }
+    let denom = active_count as f64;
+    for j in 0..design.ncols() {
+        let mut sum = 0.0;
+        for i in 0..design.nrows() {
+            if weights[i] != 0.0 {
+                sum += design[[i, j]];
+            }
+        }
+        let mean = sum / denom;
+        for i in 0..design.nrows() {
+            if weights[i] != 0.0 {
+                design[[i, j]] -= mean;
+            }
+        }
+    }
+}
+
+fn sum_to_zero_factor_transform(levels: usize, basis_dim: usize) -> Array2<f64> {
+    let rows = levels * basis_dim;
+    let cols = (levels - 1) * basis_dim;
+    let mut q = Array2::<f64>::zeros((rows, cols));
+    for level in 0..(levels - 1) {
+        for j in 0..basis_dim {
+            q[[level * basis_dim + j, level * basis_dim + j]] = 1.0;
+            q[[((levels - 1) * basis_dim) + j, level * basis_dim + j]] = -1.0;
+        }
+    }
+    q
+}
+
 struct LocalSmoothTermBuild {
     dim: usize,
     design: DesignMatrix,
@@ -3673,6 +3742,114 @@ fn build_single_local_smooth_term(
     }
     let mut shape_axis_col: Option<usize> = None;
     let mut built: BasisBuildResult = match &term.basis {
+        SmoothBasisSpec::By {
+            inner,
+            by_col,
+            by_level,
+            center_active,
+        } => {
+            if *by_col >= data.ncols() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "term '{}' by column {} out of bounds for {} columns",
+                    term.name,
+                    by_col,
+                    data.ncols()
+                )));
+            }
+            let inner_term = SmoothTermSpec {
+                name: format!("{}::inner", term.name),
+                basis: (*inner.clone()),
+                shape: ShapeConstraint::None,
+            };
+            let inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+            let mut dense = inner_built.design.to_dense();
+            let by_values = data.column(*by_col);
+            let weights = by_indicator_or_numeric(by_values, *by_level);
+            if *center_active {
+                center_design_over_active_rows(&mut dense, &weights);
+            }
+            for i in 0..dense.nrows() {
+                let w = weights[i];
+                for j in 0..dense.ncols() {
+                    dense[[i, j]] *= w;
+                }
+            }
+            let ops_len = inner_built.ops.len();
+            BasisBuildResult {
+                design: DesignMatrix::from(dense),
+                penalties: inner_built.penalties,
+                nullspace_dims: inner_built.nullspaces,
+                penaltyinfo: inner_built.penaltyinfo,
+                metadata: inner_built.metadata,
+                ops: std::iter::repeat_with(|| None).take(ops_len).collect(),
+                kronecker_factored: None,
+            }
+        }
+        SmoothBasisSpec::FactorSumToZero {
+            inner,
+            group_col,
+            levels,
+        } => {
+            if *group_col >= data.ncols() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "term '{}' group column {} out of bounds for {} columns",
+                    term.name,
+                    group_col,
+                    data.ncols()
+                )));
+            }
+            if levels.len() < 2 {
+                return Err(BasisError::InvalidInput(format!(
+                    "factor sum-to-zero smooth '{}' requires at least two levels",
+                    term.name
+                )));
+            }
+            let inner_term = SmoothTermSpec {
+                name: format!("{}::inner", term.name),
+                basis: (*inner.clone()),
+                shape: ShapeConstraint::None,
+            };
+            let inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+            let base = inner_built.design.to_dense();
+            let n = base.nrows();
+            let k = base.ncols();
+            let l = levels.len();
+            let mut full = Array2::<f64>::zeros((n, l * k));
+            let groups = data.column(*group_col);
+            for i in 0..n {
+                let bits = groups[i].to_bits();
+                if let Some(level_idx) = levels.iter().position(|lv| *lv == bits) {
+                    let start = level_idx * k;
+                    for j in 0..k {
+                        full[[i, start + j]] = base[[i, j]];
+                    }
+                }
+            }
+            let q = sum_to_zero_factor_transform(l, k);
+            let design = full.dot(&q);
+            let mut penalties = Vec::with_capacity(inner_built.penalties.len());
+            for s_base in &inner_built.penalties {
+                let mut s_full = Array2::<f64>::zeros((l * k, l * k));
+                for level_idx in 0..l {
+                    let start = level_idx * k;
+                    s_full
+                        .slice_mut(s![start..start + k, start..start + k])
+                        .assign(s_base);
+                }
+                penalties.push(q.t().dot(&s_full).dot(&q));
+            }
+            BasisBuildResult {
+                design: DesignMatrix::from(design),
+                penalties,
+                nullspace_dims: inner_built.nullspaces.clone(),
+                penaltyinfo: inner_built.penaltyinfo.clone(),
+                metadata: inner_built.metadata.clone(),
+                ops: std::iter::repeat_with(|| None)
+                    .take(inner_built.penalties.len())
+                    .collect(),
+                kronecker_factored: None,
+            }
+        }
         SmoothBasisSpec::BSpline1D { feature_col, spec } => {
             if *feature_col >= data.ncols() {
                 return Err(BasisError::DimensionMismatch(format!(
@@ -4652,6 +4829,28 @@ pub fn build_term_collection_designs_and_freeze_joint(
 
 fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
     match &term.basis {
+        SmoothBasisSpec::By { inner, by_col, .. } => {
+            let nested = SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (*inner.clone()),
+                shape: term.shape,
+            };
+            let mut cols = vec![*by_col];
+            cols.extend(smooth_term_feature_cols(&nested));
+            cols
+        }
+        SmoothBasisSpec::FactorSumToZero {
+            inner, group_col, ..
+        } => {
+            let nested = SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (*inner.clone()),
+                shape: term.shape,
+            };
+            let mut cols = vec![*group_col];
+            cols.extend(smooth_term_feature_cols(&nested));
+            cols
+        }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
@@ -4663,6 +4862,14 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
 
 fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
     match &term.basis {
+        SmoothBasisSpec::By { inner, .. } | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            let nested = SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (*inner.clone()),
+                shape: term.shape,
+            };
+            smooth_basis_family_rank(&nested)
+        }
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
@@ -4674,6 +4881,14 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
 
 fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
     match &term.basis {
+        SmoothBasisSpec::By { inner, .. } | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            let nested = SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (*inner.clone()),
+                shape: term.shape,
+            };
+            smooth_has_frozen_identifiability(&nested)
+        }
         SmoothBasisSpec::BSpline1D { spec, .. } => {
             matches!(
                 spec.identifiability,
@@ -10839,7 +11054,10 @@ fn try_build_spatial_term_log_kappa_derivative(
             build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::BSpline1D { .. } | SmoothBasisSpec::TensorBSpline { .. } => {
+        SmoothBasisSpec::By { .. }
+        | SmoothBasisSpec::FactorSumToZero { .. }
+        | SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. } => {
             return Ok(None);
         }
     };
