@@ -362,7 +362,10 @@ impl WarmStartStore {
                 all.push((p, bin, total_bytes, write_nanos));
             }
             // Sweep now-empty key dirs.
-            if fs::read_dir(&key_dir).map(|mut it| it.next().is_none()).unwrap_or(false) {
+            if fs::read_dir(&key_dir)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false)
+            {
                 let _ = fs::remove_dir(&key_dir);
             }
         }
@@ -479,7 +482,13 @@ mod tests {
         let (_d, store) = temp_store();
         let key = key_for("roundtrip");
         let _id = store
-            .save(&key, b"hello-warm", Some(1.5), Some(7), EntryKind::Checkpoint)
+            .save(
+                &key,
+                b"hello-warm",
+                Some(1.5),
+                Some(7),
+                EntryKind::Checkpoint,
+            )
             .unwrap();
         let got = store.lookup(&key).unwrap().unwrap();
         assert_eq!(got.payload, b"hello-warm");
@@ -526,9 +535,13 @@ mod tests {
     fn tiebreak_latest_mtime_when_no_objective() {
         let (_d, store) = temp_store();
         let key = key_for("latest");
-        store.save(&key, b"first", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"first", None, None, EntryKind::Checkpoint)
+            .unwrap();
         thread::sleep(Duration::from_millis(1100));
-        store.save(&key, b"second", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"second", None, None, EntryKind::Checkpoint)
+            .unwrap();
         let got = store.lookup(&key).unwrap().unwrap();
         assert_eq!(got.payload, b"second");
     }
@@ -559,7 +572,9 @@ mod tests {
     fn corrupt_meta_json_is_cleaned_up() {
         let (_d, store) = temp_store();
         let key = key_for("badjson");
-        store.save(&key, b"x", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"x", None, None, EntryKind::Checkpoint)
+            .unwrap();
         let dir = store.key_dir(&key);
         for entry in fs::read_dir(&dir).unwrap() {
             let p = entry.unwrap().path();
@@ -575,7 +590,9 @@ mod tests {
     fn schema_mismatch_is_ignored() {
         let (_d, store) = temp_store();
         let key = key_for("schema");
-        store.save(&key, b"x", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"x", None, None, EntryKind::Checkpoint)
+            .unwrap();
         let dir = store.key_dir(&key);
         for entry in fs::read_dir(&dir).unwrap() {
             let p = entry.unwrap().path();
@@ -593,7 +610,9 @@ mod tests {
     fn missing_bin_treated_as_missing() {
         let (_d, store) = temp_store();
         let key = key_for("nobin");
-        store.save(&key, b"x", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"x", None, None, EntryKind::Checkpoint)
+            .unwrap();
         let dir = store.key_dir(&key);
         for entry in fs::read_dir(&dir).unwrap() {
             let p = entry.unwrap().path();
@@ -644,7 +663,10 @@ mod tests {
                 }
             }
         }
-        assert!(total <= 8 * 1024, "eviction failed to bound size (got {total})");
+        assert!(
+            total <= 8 * 1024,
+            "eviction failed to bound size (got {total})"
+        );
         // Earliest keys must have been evicted; latest survive.
         assert!(store.lookup(&keys[0]).unwrap().is_none());
         assert!(store.lookup(keys.last().unwrap()).unwrap().is_some());
@@ -662,12 +684,16 @@ mod tests {
         )
         .unwrap();
         let key = key_for("ttl");
-        store.save(&key, b"x", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&key, b"x", None, None, EntryKind::Checkpoint)
+            .unwrap();
         assert!(store.lookup(&key).unwrap().is_some());
         thread::sleep(Duration::from_millis(1500));
         // Trigger eviction via a save under an unrelated key.
         let other = key_for("ttl-other");
-        store.save(&other, b"y", None, None, EntryKind::Checkpoint).unwrap();
+        store
+            .save(&other, b"y", None, None, EntryKind::Checkpoint)
+            .unwrap();
         // Original now expired.
         assert!(store.lookup(&key).unwrap().is_none());
         assert!(store.lookup(&other).unwrap().is_some());
@@ -681,10 +707,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         // Use PID 1 — never the current process, so it counts as "other".
         let orphan_other = dir.join("r0-0.json.tmp.1.0");
-        let mine = dir.join(format!(
-            "r0-0.bin.tmp.{}.0",
-            std::process::id()
-        ));
+        let mine = dir.join(format!("r0-0.bin.tmp.{}.0", std::process::id()));
         fs::write(&orphan_other, b"orphan").unwrap();
         fs::write(&mine, b"mine").unwrap();
         store.evict_overflow().unwrap();
@@ -730,8 +753,12 @@ mod tests {
         let (_d, store) = temp_store();
         let a = key_for("a");
         let b = key_for("b");
-        store.save(&a, b"AAA", Some(1.0), None, EntryKind::Final).unwrap();
-        store.save(&b, b"BBB", Some(1.0), None, EntryKind::Final).unwrap();
+        store
+            .save(&a, b"AAA", Some(1.0), None, EntryKind::Final)
+            .unwrap();
+        store
+            .save(&b, b"BBB", Some(1.0), None, EntryKind::Final)
+            .unwrap();
         assert_eq!(store.lookup(&a).unwrap().unwrap().payload, b"AAA");
         assert_eq!(store.lookup(&b).unwrap().unwrap().payload, b"BBB");
     }

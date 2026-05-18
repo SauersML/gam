@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
-import gamfit.torch as gt
+try:
+    import torch
+    import gamfit.torch as gt
+except ImportError:
+    pytest.skip("torch dependency unavailable", allow_module_level=True)
 
 
 def _require_ffi(name: str) -> None:
