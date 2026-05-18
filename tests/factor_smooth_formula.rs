@@ -1,11 +1,13 @@
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
+use gam::estimate::FitOptions;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::resource::ResourcePolicy;
 use gam::smooth::{ByVarKind, FactorSmoothFlavour, SmoothBasisSpec};
 use gam::terms::term_builder::build_termspec;
+use gam::types::LikelihoodFamily;
 
 #[test]
 fn factor_smooth_aliases_and_by_options_parse() {
@@ -182,6 +184,113 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
             }
         }
     ));
+}
+
+fn medium_factor_dataset() -> (EncodedDataset, Array1<f64>) {
+    // 60 rows with one continuous `x`, a numeric `z` covariate, and a
+    // categorical `fac`. `y` is driven by a smooth in x modulated by z, with
+    // a level-specific offset. Enough rows to fit a by-smooth through REML
+    // without rank collapse.
+    let n = 60usize;
+    let mut values = Array2::<f64>::zeros((n, 4));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
+        let fac = if i % 2 == 0 { 0.0 } else { 1.0 };
+        let z = 0.4 + 0.5 * (i as f64 / (n - 1) as f64);
+        values[[i, 0]] = 0.5 + 0.3 * t + 0.2 * t * t - 0.4 * fac * t; // y placeholder
+        values[[i, 1]] = t;
+        values[[i, 2]] = fac;
+        values[[i, 3]] = z;
+        y[i] = values[[i, 0]];
+    }
+    (
+        EncodedDataset {
+            headers: vec!["y".into(), "x".into(), "fac".into(), "z".into()],
+            values,
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "fac".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["a".into(), "b".into()],
+                    },
+                    SchemaColumn {
+                        name: "z".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+                ColumnKindTag::Continuous,
+            ],
+        },
+        y,
+    )
+}
+
+#[test]
+fn factor_by_smooth_fits_end_to_end_through_reml() {
+    let (ds, y) = medium_factor_dataset();
+    let cmap = ds.column_map();
+    let mut notes = Vec::new();
+    let parsed = parse_formula("y ~ s(x, by=fac, k=4)").unwrap();
+    let spec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &cmap,
+        &mut notes,
+        &ResourcePolicy::default_library(),
+    )
+    .expect("term spec should build for s(x, by=fac) + fac");
+
+    let weights = Array1::<f64>::ones(y.len());
+    let offset = Array1::<f64>::zeros(y.len());
+    let options = FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 60,
+        tol: 1e-6,
+        nullspace_dims: vec![],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let fitted = gam::smooth::fit_term_collection_forspec(
+        ds.values.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec,
+        LikelihoodFamily::GaussianIdentity,
+        &options,
+    )
+    .expect("factor-by smooth fit should succeed via the engine");
+    assert!(fitted.fit.beta.iter().all(|v: &f64| v.is_finite()));
+    assert!(fitted.fit.beta.len() >= 2);
+    assert!(fitted.fit.deviance.is_finite());
 }
 
 #[test]
