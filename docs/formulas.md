@@ -78,7 +78,7 @@ y ~ x + re(site)            # alias
 ```
 
 Adds a random intercept per level of the grouping column. The column may be
-string- or integer-valued. Random slopes are not supported.
+string- or integer-valued. Random slopes are supported with `s(x, group, bs="re")`, usually paired with `group(group)` for random intercepts.
 
 ## Univariate smooths
 
@@ -408,3 +408,16 @@ See [survival.md](survival.md).
 # Random intercept per site
 "y ~ smooth(x) + group(site)"
 ```
+
+
+## Factor smooths and by-smooths
+
+GAM formulas support mgcv-style factor-conditioned smooths:
+
+- `s(x, by=z)` scales one smooth of `x` by numeric covariate `z`.
+- `s(x, by=fac)` creates one smooth block per observed factor level. Unseen prediction levels contribute zero for that by-smooth.
+- `s(x, fac, bs="fs")` (or `fs(x, fac)`) creates ridge-penalized factor smooth interactions for partial-pooling style per-group curves; unseen groups contribute zero from the factor-smooth term.
+- `s(x, fac, bs="sz")` (or `sz(x, fac)`) uses sum-to-zero contrasts across factor levels for deviation smooths that can be paired with a population `s(x)`.
+- `s(x, group, bs="re")` builds a random-slope block; use `group(group)` as a companion term when random intercepts are needed.
+
+These terms preserve frozen factor levels in saved model specifications so prediction does not drift when new data omits a training level or contains an unseen level.

@@ -1420,7 +1420,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" => {
+            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" | "fs" | "sz" => {
                 if vars.is_empty() {
                     return Err(format!(
                         "smooth()/s() requires at least one variable: {raw}"
@@ -1428,6 +1428,9 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
                     options.insert("type".to_string(), "cyclic".to_string());
+                }
+                if matches!(name.as_str(), "fs" | "sz") {
+                    options.insert("bs".to_string(), name.clone());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
