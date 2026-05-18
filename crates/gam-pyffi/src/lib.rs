@@ -19,8 +19,8 @@ use gam::families::survival_predict::{
 };
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::gaussian_reml::{
-    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_from_fit,
-    gaussian_reml_multi_closed_form_with_cache,
+    build_gaussian_reml_eigen_cache_batched, gaussian_reml_multi_closed_form_backward,
+    gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
