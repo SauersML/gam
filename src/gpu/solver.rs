@@ -441,11 +441,7 @@ impl CusolverRuntime {
                 ptr_host.push(a_dev.ptr.checked_add(offset_u64)?);
             }
             check_cuda(
-                (self.cuda.api.cu_memcpy_htod)(
-                    ptr_dev.ptr,
-                    ptr_host.as_ptr().cast(),
-                    bytes_ptrs,
-                ),
+                (self.cuda.api.cu_memcpy_htod)(ptr_dev.ptr, ptr_host.as_ptr().cast(), bytes_ptrs),
                 "cuMemcpyHtoD batched pointer table",
             )
             .ok()?;
