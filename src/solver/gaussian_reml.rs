@@ -758,7 +758,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
 pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
     problems: &[GaussianRemlMultiBackwardProblem<'a>],
     penalty: ArrayView2<'a, f64>,
-) -> Result<Vec<GaussianRemlBackwardResult>, EstimationError> {
+) -> Vec<Result<GaussianRemlBackwardResult, EstimationError>> {
     // Batched precompute of `(X'WX + λS)⁻¹` for all K problems via one
     // strided-batched cuBLAS `A · Bᵀ`. The dispatch is gated on the same
     // gemm policy threshold as single-fit dispatch, so it engages at
@@ -823,7 +823,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             )
         })
         .collect();
-    results.into_iter().collect()
+    results
 }
 
 /// Compute K inverse Hessian matrices `(X'WX_b + λ_b S)⁻¹` for the batched
