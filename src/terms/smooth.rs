@@ -1529,6 +1529,17 @@ fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool
 }
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    // Periodic Duchon uses a wrapped-distance kernel with no analytic
+    // log-κ derivative in `prepare_duchon_derivative_context`. Treat such
+    // terms as having a locked kernel scale so the outer optimizer leaves
+    // κ alone and only λ-REML runs.
+    if let Some(term) = spec.smooth_terms.get(term_idx) {
+        if let SmoothBasisSpec::Duchon { spec: dspec, .. } = &term.basis {
+            if dspec.periodic {
+                return false;
+            }
+        }
+    }
     get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
 }
 

@@ -29487,6 +29487,58 @@ mod tests {
     }
 
     #[test]
+    fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
+        let data = array![[0.05], [0.4], [1.2], [2.1], [3.4], [4.8], [5.5], [6.2]];
+        let centers = array![[0.0], [0.9], [2.0], [3.3], [4.7], [6.3]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: Some(0.8),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: true,
+        };
+        let derivative = build_duchon_basis_log_kappa_derivative(data.view(), &spec)
+            .expect("periodic Duchon analytic derivative should build");
+
+        let eps: f64 = 1e-6;
+        let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
+        let ls_plus = 1.0 / (kappa * eps.exp());
+        let ls_minus = 1.0 / (kappa * (-eps).exp());
+        let mut spec_plus = spec.clone();
+        let mut spec_minus = spec.clone();
+        spec_plus.length_scale = Some(ls_plus);
+        spec_minus.length_scale = Some(ls_minus);
+        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
+        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+
+        let fd_design = (&plus.design.to_dense() - &minus.design.to_dense()) / (2.0 * eps);
+        let design_err = (&derivative.design_derivative - &fd_design)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            design_err < 1e-4,
+            "periodic Duchon design derivative mismatch too large: {design_err}"
+        );
+
+        assert_eq!(derivative.penalties_derivative.len(), plus.penalties.len());
+        let fd_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
+        let penalty_err = (&derivative.penalties_derivative[0] - &fd_penalty)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            penalty_err < 1e-4,
+            "periodic Duchon penalty derivative mismatch too large: {penalty_err}"
+        );
+    }
+
+    #[test]
     fn test_duchon_log_kappasecond_derivative_matchesfd() {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
