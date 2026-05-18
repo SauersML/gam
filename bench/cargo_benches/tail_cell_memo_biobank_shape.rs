@@ -50,7 +50,7 @@ fn bench_tail_cell_memo_biobank_shape(c: &mut Criterion) {
             set_tail_cell_moment_cache_enabled(false);
             let mut acc = 0.0;
             for &cell in &cells {
-                let state = evaluate_cell_moments_uncached(black_box(cell)(max_degree))
+                let state = evaluate_cell_moments_uncached(black_box(cell), black_box(max_degree))
                     .expect("uncached tail moments");
                 acc += state.value + state.moments[0];
             }
@@ -64,7 +64,7 @@ fn bench_tail_cell_memo_biobank_shape(c: &mut Criterion) {
             reset_tail_cell_moment_cache();
             let mut acc = 0.0;
             for &cell in &cells {
-                let state = evaluate_cell_moments(black_box(cell)(max_degree))
+                let state = evaluate_cell_moments(black_box(cell), black_box(max_degree))
                     .expect("cached tail moments");
                 acc += state.value + state.moments[0];
             }
