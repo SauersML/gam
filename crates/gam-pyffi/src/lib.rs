@@ -889,6 +889,7 @@ fn gaussian_reml_fit_positions<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
+    forward_state = None,
     basis_order = 3,
     periodic = false,
     period = None,
@@ -908,6 +909,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
+    forward_state: Option<&Bound<'py, PyDict>>,
     basis_order: usize,
     periodic: bool,
     period: Option<f64>,
@@ -916,6 +918,10 @@ fn gaussian_reml_fit_positions_backward<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
+    let forward_fit = forward_state
+        .map(gaussian_reml_fit_state_from_pydict)
+        .transpose()
+        .map_err(py_value_error)?;
     let backward = gaussian_reml_fit_positions_backward_impl(
         t.as_array(),
         y.as_array(),
@@ -933,6 +939,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
         grad_reml_score,
         by.as_ref().map(|b| b.as_array()),
         by_start_col,
+        forward_fit.as_ref(),
     )
     .map_err(py_value_error)?;
 
@@ -1773,6 +1780,7 @@ fn validate_batched_reml_upstreams(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_positions_backward_impl(
     t: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -1790,6 +1798,7 @@ fn gaussian_reml_fit_positions_backward_impl(
     grad_reml_score: f64,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
+    forward_fit: Option<&gam::gaussian_reml::GaussianRemlMultiResult>,
 ) -> Result<PositionGaussianRemlBackwardResult, String> {
     let x = position_basis_design(
         t,
@@ -1814,17 +1823,31 @@ fn gaussian_reml_fit_positions_backward_impl(
     } else {
         x.view()
     };
-    let backward = gaussian_reml_multi_closed_form_backward(
-        fit_x,
-        y,
-        penalty,
-        weights,
-        init_lambda,
-        grad_lambda,
-        grad_coefficients,
-        grad_fitted,
-        grad_reml_score,
-    )
+    let backward = if let Some(fit) = forward_fit {
+        gaussian_reml_multi_closed_form_backward_from_fit(
+            fit_x,
+            y,
+            penalty,
+            weights,
+            fit,
+            grad_lambda,
+            grad_coefficients,
+            grad_fitted,
+            grad_reml_score,
+        )
+    } else {
+        gaussian_reml_multi_closed_form_backward(
+            fit_x,
+            y,
+            penalty,
+            weights,
+            init_lambda,
+            grad_lambda,
+            grad_coefficients,
+            grad_fitted,
+            grad_reml_score,
+        )
+    }
     .map_err(|err| err.to_string())?;
     let (grad_x, grad_by) = if let Some(by_values) = by {
         let (grad_x, grad_by) =
