@@ -6864,6 +6864,8 @@ impl TransformationNormalFamily {
         cov: ArrayView2<'_, f64>,
         cov_psi: ArrayView2<'_, f64>,
         factor: ArrayView2<'_, f64>,
+        projected_cov_f: Option<ArrayView2<'_, f64>>,
+        projected_psi_f: Option<ArrayView2<'_, f64>>,
     ) -> Result<f64, String> {
         let total_n = self.response_val_basis.nrows();
         let n = cov.nrows();
@@ -6979,6 +6981,72 @@ impl TransformationNormalFamily {
             }
         }
 
+        // Project the low-rank REML factor through each response-slice of the
+        // covariate design with BLAS instead of recomputing
+        // `sum_c F[(k,c), r] * x_ic` inside every row. This is an exact
+        // algebraic refactor of the old row loop: for each response basis `k`,
+        // `projected_cov_f[:, k, :] = cov · factor_k` and
+        // `projected_psi_f[:, k, :] = cov_psi · factor_k`. Callers that sweep
+        // multiple ψ-Hessian directional traces may supply cached projections;
+        // otherwise we build the chunk-local projections here.
+        let projected_len = p_resp * rank;
+        let mut projected_cov_storage;
+        let mut projected_psi_storage;
+        let projected_cov_f = match projected_cov_f {
+            Some(view) => {
+                if view.nrows() != n || view.ncols() != projected_len {
+                    return Err(format!(
+                        "SCOP psi Hessian directional projected cov-factor shape {}x{} != expected {}x{}",
+                        view.nrows(),
+                        view.ncols(),
+                        n,
+                        projected_len
+                    ));
+                }
+                view
+            }
+            None => {
+                projected_cov_storage = Array2::<f64>::zeros((n, projected_len));
+                if rank > 0 && n > 0 {
+                    for k in 0..p_resp {
+                        let factor_block = factor.slice(s![k * p_cov..(k + 1) * p_cov, ..]);
+                        let cov_projection = fast_ab(&cov, &factor_block);
+                        projected_cov_storage
+                            .slice_mut(s![.., k * rank..(k + 1) * rank])
+                            .assign(&cov_projection);
+                    }
+                }
+                projected_cov_storage.view()
+            }
+        };
+        let projected_psi_f = match projected_psi_f {
+            Some(view) => {
+                if view.nrows() != n || view.ncols() != projected_len {
+                    return Err(format!(
+                        "SCOP psi Hessian directional projected psi-factor shape {}x{} != expected {}x{}",
+                        view.nrows(),
+                        view.ncols(),
+                        n,
+                        projected_len
+                    ));
+                }
+                view
+            }
+            None => {
+                projected_psi_storage = Array2::<f64>::zeros((n, projected_len));
+                if rank > 0 && n > 0 {
+                    for k in 0..p_resp {
+                        let factor_block = factor.slice(s![k * p_cov..(k + 1) * p_cov, ..]);
+                        let psi_projection = fast_ab(&cov_psi, &factor_block);
+                        projected_psi_storage
+                            .slice_mut(s![.., k * rank..(k + 1) * rank])
+                            .assign(&psi_projection);
+                    }
+                }
+                projected_psi_storage.view()
+            }
+        };
+
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
@@ -7007,23 +7075,18 @@ impl TransformationNormalFamily {
                         acc.gamma_psi_dir[k] = dir_mat.row(k).dot(&psi_row);
                     }
 
-                    acc.gamma_f.fill(0.0);
-                    acc.gamma_psi_f.fill(0.0);
-                    for k in 0..p_resp {
-                        let factor_row_base = k * p_cov;
-                        let projected_base = k * rank;
-                        for cidx in 0..p_cov {
-                            let factor_row = factor_row_base + cidx;
-                            let cov_v = cov_row[cidx];
-                            let psi_v = psi_row[cidx];
-                            for col in 0..rank {
-                                let coeff = factor[[factor_row, col]];
-                                let idx = projected_base + col;
-                                acc.gamma_f[idx] += coeff * cov_v;
-                                acc.gamma_psi_f[idx] += coeff * psi_v;
-                            }
-                        }
-                    }
+                    let projected_cov_row = projected_cov_f.row(local_i);
+                    let projected_psi_row = projected_psi_f.row(local_i);
+                    acc.gamma_f.copy_from_slice(
+                        projected_cov_row
+                            .as_slice()
+                            .expect("projected CTN covariate-factor row should be contiguous"),
+                    );
+                    acc.gamma_psi_f.copy_from_slice(
+                        projected_psi_row
+                            .as_slice()
+                            .expect("projected CTN psi-factor row should be contiguous"),
+                    );
 
                     let mut hp_psi = rd[0] * acc.gamma_psi[0];
                     let mut h_dir = rv[0] * acc.gamma_dir[0];
@@ -8753,31 +8816,157 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
                 .expect("validated CTN psi dH dense materialization inputs should not fail")
         })
     }
-}
 
-impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
-    fn dim(&self) -> usize {
-        self.p_total()
+    fn trace_projected_factor_dense(&self, factor: &Array2<f64>) -> f64 {
+        let dense_factor = crate::faer_ndarray::fast_ab(self.dense_matrix(), factor);
+        factor
+            .iter()
+            .zip(dense_factor.iter())
+            .map(|(&f, &bf)| f * bf)
+            .sum()
     }
 
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
-        self.dense_matrix().dot(v)
+    fn projected_factor_cache_id(&self) -> usize {
+        let family_ptr = Arc::as_ptr(&self.family) as usize;
+        family_ptr
+            ^ self.axis.wrapping_add(0x9e37_79b9).rotate_left(17)
+            ^ self.family.response_val_basis.nrows().rotate_left(7)
+            ^ self.family.covariate_design.ncols().rotate_left(29)
     }
 
-    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
-        self.dense_matrix().dot(factor)
+    fn projected_factor_table_bytes(&self, factor: &Array2<f64>) -> usize {
+        let n = self.family.response_val_basis.nrows();
+        let p_resp = self.family.response_val_basis.ncols();
+        let rank = factor.ncols();
+        n.saturating_mul(p_resp)
+            .saturating_mul(rank)
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<f64>())
     }
 
-    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+    fn projected_factor_table_fits_budget(&self, factor: &Array2<f64>) -> bool {
+        let bytes = self.projected_factor_table_bytes(factor);
+        let policy = ResourcePolicy::default_library();
+        bytes <= policy.max_single_materialization_bytes && bytes <= policy.max_operator_cache_bytes
+    }
+
+    fn projected_factor_table(&self, factor: &Array2<f64>) -> Array2<f64> {
         debug_assert_eq!(factor.nrows(), self.p_total());
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
-        let rows_per_chunk = self
-            .family
-            .scop_psi_pair_rows_per_chunk(p_cov)
-            .min(n.max(1));
+        let p_resp = self.family.response_val_basis.ncols();
+        let rank = factor.ncols();
+        let projected_len = p_resp * rank;
+        let mut table = Array2::<f64>::zeros((n, 2 * projected_len));
+        if n == 0 || rank == 0 {
+            return table;
+        }
+        let op = self.tensor_op();
+        let policy = ResourcePolicy::default_library();
+        let live_cols = p_cov
+            .saturating_mul(2)
+            .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
+            .max(1);
+        let rows_per_chunk =
+            crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
+                .max(1)
+                .min(n.max(1));
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let cov = self
+                .family
+                .covariate_design
+                .try_row_chunk(rows.clone())
+                .expect("validated CTN psi dH projected-table covariate chunk should not fail");
+            let cov_psi = op
+                .cov_first_axis_row_chunk_streaming(self.axis, rows.clone())
+                .expect("validated CTN psi dH projected-table covariate derivative chunk should not fail");
+            for k in 0..p_resp {
+                let factor_block = factor.slice(s![k * p_cov..(k + 1) * p_cov, ..]);
+                let cov_projection = fast_ab(&cov, &factor_block);
+                let psi_projection = fast_ab(&cov_psi, &factor_block);
+                table
+                    .slice_mut(s![start..end, k * rank..(k + 1) * rank])
+                    .assign(&cov_projection);
+                table
+                    .slice_mut(s![
+                        start..end,
+                        projected_len + k * rank..projected_len + (k + 1) * rank
+                    ])
+                    .assign(&psi_projection);
+            }
+        }
+        table
+    }
+
+    fn trace_projected_factor_with_projected_table(
+        &self,
+        factor: &Array2<f64>,
+        table: ArrayView2<'_, f64>,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let p_resp = self.family.response_val_basis.ncols();
+        let rank = factor.ncols();
+        let projected_len = p_resp * rank;
+        debug_assert_eq!(table.dim(), (n, 2 * projected_len));
+        let op = self.tensor_op();
+        let policy = ResourcePolicy::default_library();
+        let live_cols = p_cov.saturating_mul(2).max(1);
+        let rows_per_chunk =
+            crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
+                .max(1)
+                .min(n.max(1));
+        let mut total = 0.0;
+        for start in (0..n).step_by(rows_per_chunk) {
+            let end = (start + rows_per_chunk).min(n);
+            let rows = start..end;
+            let cov = self
+                .family
+                .covariate_design
+                .try_row_chunk(rows.clone())
+                .expect(
+                    "validated CTN psi dH cached projected trace covariate chunk should not fail",
+                );
+            let cov_psi = op
+                .cov_first_axis_row_chunk_streaming(self.axis, rows.clone())
+                .expect("validated CTN psi dH cached projected trace covariate derivative chunk should not fail");
+            let projected_cov = table.slice(s![start..end, ..projected_len]);
+            let projected_psi = table.slice(s![start..end, projected_len..]);
+            total += self
+                .family
+                .scop_psi_hessian_directional_trace_factor_chunk_from_cov(
+                    &self.beta,
+                    &self.direction,
+                    &self.row_quantities,
+                    start,
+                    cov.view(),
+                    cov_psi.view(),
+                    factor.view(),
+                    Some(projected_cov),
+                    Some(projected_psi),
+                )
+                .expect("validated CTN psi dH cached projected trace inputs should not fail");
+        }
+        total
+    }
+
+    fn trace_projected_factor_streaming(&self, factor: &Array2<f64>) -> f64 {
+        let n = self.family.response_val_basis.nrows();
+        let p_cov = self.family.covariate_design.ncols();
+        let rank = factor.ncols();
+        let p_resp = self.family.response_val_basis.ncols();
+        let policy = ResourcePolicy::default_library();
+        let live_cols = p_cov
+            .saturating_mul(2)
+            .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
+            .max(1);
+        let rows_per_chunk =
+            crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, live_cols)
+                .max(1)
+                .min(n.max(1));
         let op = self.tensor_op();
         let mut total = 0.0;
         for start in (0..n).step_by(rows_per_chunk) {
@@ -8801,10 +8990,62 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
                     cov.view(),
                     cov_psi.view(),
                     factor.view(),
+                    None,
+                    None,
                 )
                 .expect("validated CTN psi dH projected trace inputs should not fail");
         }
         total
+    }
+}
+
+impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
+    fn dim(&self) -> usize {
+        self.p_total()
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        debug_assert_eq!(v.len(), self.p_total());
+        self.dense_matrix().dot(v)
+    }
+
+    fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        self.dense_matrix().dot(factor)
+    }
+
+    fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+
+        // At the CTN biobank benchmark shape (`p≈264`, `n≈20k`), the
+        // coefficient-space directional Hessian is tiny (< 1 MiB) while the
+        // streaming projected trace repeats a full row-kernel pass for every
+        // outer-gradient coordinate and every BFGS line-search evaluation.
+        // Materializing the exact p×p directional derivative once and doing a
+        // dense BLAS3 projection is mathematically identical to the streaming
+        // contraction and is several times faster at these moderate p values.
+        // Keep the old streaming path for larger coefficient systems where a
+        // dense p×p cache can dominate memory or construction cost.
+        if self.p_total() <= 512 {
+            return self.trace_projected_factor_dense(factor);
+        }
+
+        self.trace_projected_factor_streaming(factor)
+    }
+
+    fn trace_projected_factor_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
+    ) -> f64 {
+        debug_assert_eq!(factor.nrows(), self.p_total());
+        if self.p_total() <= 512 || !self.projected_factor_table_fits_budget(factor) {
+            return self.trace_projected_factor(factor);
+        }
+        let key =
+            ProjectedFactorKey::from_factor_view(self.projected_factor_cache_id(), factor.view());
+        let table = cache.get_or_insert_with(key, || self.projected_factor_table(factor));
+        self.trace_projected_factor_with_projected_table(factor, table.view())
     }
 
     fn to_dense(&self) -> Array2<f64> {
@@ -14445,6 +14686,7 @@ pub fn fit_transformation_normal(
     // rather than the generic `coefficient_*_cost × K` default.
     let outer_derivative_policy =
         probe_family.outer_derivative_policy(&probe_blocks, joint_setup.log_kappa_dim(), &options);
+
     let solved = optimize_spatial_length_scale_exact_joint(
         covariate_data,
         &block_specs_slice,
