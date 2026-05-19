@@ -203,4 +203,5 @@ class BSplineSmoother(_SmootherBase):
         weights: torch.Tensor | None = None,
     ) -> PeriodicFitOutput:
         """Alias for ``self(t, y, weights=weights)``."""
-        return self(t, y, weights=weights)
+        result: PeriodicFitOutput = self(t, y, weights=weights)
+        return result
