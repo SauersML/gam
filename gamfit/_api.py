@@ -1475,10 +1475,11 @@ def _position_basis_dim(
     kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
     n = int(knots_or_centers.shape[0])
     if kind in {"duchon", "duchonspline"}:
-        # build_duchon_basis appends the polynomial nullspace columns
-        # to the radial-basis block; for 1-D Duchon the nullspace
-        # dimension equals ``m`` (the basis order).
-        return n + max(int(basis_order), 0)
+        # The REML position path uses only the radial-basis block; the
+        # polynomial nullspace is carried as an unpenalised side channel
+        # and is not part of the penalty matrix. So the penalty must be
+        # sized to the number of centers.
+        return n
     # Clamped B-spline: ncols = len(knots) - degree - 1. The Rust impl
     # uses the same convention for the periodic variant; rely on the
     # engine to reject mismatches if a periodic caller supplies a custom
