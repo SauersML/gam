@@ -77,7 +77,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         by: torch.Tensor | None,
         init_lambda: float | None,
         by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x_np = to_numpy_f64(x)
         y_np = to_numpy_f64(y)
         penalty_np = to_numpy_f64(penalty)
@@ -170,7 +170,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         by: torch.Tensor | None,
         init_lambda: float | None,
         by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x_np = to_numpy_f64(x)
         y_np = to_numpy_f64(y)
         offsets_np = to_numpy_uintp(row_offsets)
@@ -267,7 +267,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         period: float | None,
         init_lambda: float | None,
         by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         t_np = to_numpy_f64(t)
         y_np = to_numpy_f64(y)
         knots_np = to_numpy_f64(knots_or_centers)
@@ -377,7 +377,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         period: float | None,
         init_lambda: float | None,
         by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         t_np = to_numpy_f64(t)
         y_np = to_numpy_f64(y)
         offsets_np = to_numpy_uintp(row_offsets)
@@ -426,16 +426,18 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         fitted = from_numpy_like(out["fitted"], t)
         lam = from_numpy_like(out["lambda"], t)
         reml_score = from_numpy_like(out["reml_score"], t)
-        return coefficients, fitted, lam, reml_score
+        edf = from_numpy_like(out["edf"], t)
+        return coefficients, fitted, lam, reml_score, edf
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_vec = _batch_grad(grad_lam)
         grad_reml_vec = _batch_grad(grad_reml_score)
+        grad_edf_vec = _batch_grad(grad_edf)
 
         result = _np_api.gaussian_reml_fit_positions_batched_backward(
             ctx.t_np,
@@ -448,6 +450,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
             grad_coefficients=grad_coef_np,
             grad_fitted=grad_fitted_np,
             grad_reml_score=grad_reml_vec,
+            grad_edf=grad_edf_vec,
             forward_state=ctx.forward_state,
             basis_order=ctx.basis_order,
             periodic=ctx.periodic,
@@ -520,11 +523,11 @@ def gaussian_reml_fit(
         Tuple of ``(coefficients, fitted, lam, reml_score)`` as torch tensors
         sharing ``x``'s device and dtype.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitFn.apply)
-    coefficients, fitted, lam, reml_score = apply(
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitFn.apply)
+    coefficients, fitted, lam, reml_score, edf = apply(
         x, y, penalty, weights, by, init_lambda, by_start_col
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score)
+    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
 def gaussian_reml_fit_batched(
@@ -562,11 +565,11 @@ def gaussian_reml_fit_batched(
         ``lam`` and ``reml_score`` are length-``K`` tensors; ``coefficients``
         and ``fitted`` follow the engine's packed layout.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitBatchedFn.apply)
-    coefficients, fitted, lam, reml_score = apply(
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitBatchedFn.apply)
+    coefficients, fitted, lam, reml_score, edf = apply(
         x, y, row_offsets, penalty, weights, by, init_lambda, by_start_col
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score)
+    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
 def gaussian_reml_fit_positions(
@@ -605,8 +608,8 @@ def gaussian_reml_fit_positions(
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
-    coefficients, fitted, lam, reml_score = apply(
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
+    coefficients, fitted, lam, reml_score, edf = apply(
         t,
         y,
         knots_or_centers,
@@ -620,7 +623,7 @@ def gaussian_reml_fit_positions(
         init_lambda,
         by_start_col,
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score)
+    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
 def gaussian_reml_fit_positions_batched(
@@ -655,8 +658,8 @@ def gaussian_reml_fit_positions_batched(
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsBatchedFn.apply)
-    coefficients, fitted, lam, reml_score = apply(
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsBatchedFn.apply)
+    coefficients, fitted, lam, reml_score, edf = apply(
         t,
         y,
         row_offsets,
@@ -671,4 +674,4 @@ def gaussian_reml_fit_positions_batched(
         init_lambda,
         by_start_col,
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score)
+    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
