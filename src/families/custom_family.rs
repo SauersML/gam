@@ -10900,6 +10900,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+            let objective_flat_step_tol = objective_tol.sqrt().max(step_tol);
+            if objective_change <= objective_tol && accepted_step_inf <= objective_flat_step_tol {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat step certificate: step_inf={:.3e} <= sqrt(obj_tol)={:.3e}, obj_change={:.3e} <= tol={:.3e}, residual={:.3e}",
+                    cycle,
+                    accepted_step_inf,
+                    objective_flat_step_tol,
+                    objective_change,
+                    objective_tol,
+                    residual,
+                );
+                converged = true;
+                break;
+            }
             // Carry the objective-stagnation signal into the next
             // cycle so the line-search-failure path above can pair it
             // with trust-region collapse to certify a KKT optimum on a
@@ -14998,13 +15012,12 @@ fn derivative_quality_options_and_warm_start(
     const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
-    // The alignment exists so the implicit-function-theorem differentiation
-    // through the inner solve is resolved at the outer optimizer's requested
-    // gradient scale. With zero ψ-derivative blocks there is no IFT pullback to
-    // make accurate -- the joint-hyper objective collapses to the rho-only
-    // outer objective, and changing tolerance here breaks that equivalence by
-    // fitting β to a different inner residual than the rho-only path uses. Keep
-    // the caller's inner_tol in that case.
+    // The alignment exists so exact joint-hyper evaluations resolve the inner
+    // solve at the outer optimizer's requested gradient scale. With zero
+    // ψ-derivative blocks there is no IFT pullback to make accurate, so we do
+    // not tighten a looser caller tolerance; we still loosen a stricter
+    // default inner tolerance to the outer scale because seed validation does
+    // not gain useful hyperparameter information from a finer β residual.
     //
     // Do not hard-force f64-precision KKT solves for every ψ-bearing model:
     // biobank-scale survival marginal-slope fits have row-summed objectives
@@ -15017,15 +15030,17 @@ fn derivative_quality_options_and_warm_start(
     let direct_joint_hyper_inner_tol = eval_options
         .outer_tol
         .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR);
-    let align = has_psi_derivatives
-        && eval_options.inner_max_cycles > 1
-        && eval_options.inner_tol != direct_joint_hyper_inner_tol;
+    let tolerance_differs = eval_options.inner_tol != direct_joint_hyper_inner_tol;
+    let tightening = eval_options.inner_tol > direct_joint_hyper_inner_tol;
+    let loosening = eval_options.inner_tol < direct_joint_hyper_inner_tol;
+    let align = eval_options.inner_max_cycles > 1
+        && tolerance_differs
+        && (has_psi_derivatives || loosening);
     if !align {
         return (eval_options, None);
     }
-    let tighten = eval_options.inner_tol > direct_joint_hyper_inner_tol;
     eval_options.inner_tol = direct_joint_hyper_inner_tol;
-    let strict_warm_start = if tighten {
+    let strict_warm_start = if tightening {
         eval_options.inner_max_cycles = eval_options
             .inner_max_cycles
             .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
@@ -17097,6 +17112,11 @@ mod tests {
         assert!(
             posted_residual <= 2.0 * eval_tol && posted_objective_change <= eval_tol,
             "the exact outer startup validation should accept numerically flat inner solves at outer scale"
+        );
+        let (rho_default, _) = derivative_quality_options_and_warm_start(&options, None, false);
+        assert_eq!(
+            rho_default.inner_tol, options.outer_tol,
+            "rho-only exact joint-hyper eval should loosen a stricter default inner tolerance to the outer scale"
         );
 
         let tighter_options = BlockwiseFitOptions {
