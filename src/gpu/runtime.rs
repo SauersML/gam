@@ -48,9 +48,7 @@ impl fmt::Display for GpuProbeError {
             Self::DriverLibraryMissing(s) => write!(f, "CUDA driver library not found: {s}"),
             Self::DriverError(s) => write!(f, "CUDA driver call failed: {s}"),
             Self::NoDevices => f.write_str("no CUDA devices reported by the driver"),
-            Self::CalibrationFailed => {
-                f.write_str("all CUDA devices failed runtime calibration")
-            }
+            Self::CalibrationFailed => f.write_str("all CUDA devices failed runtime calibration"),
         }
     }
 }
@@ -298,11 +296,7 @@ fn contexts() -> &'static [Arc<CudaContext>] {
             match CudaContext::new(ordinal) {
                 Ok(ctx) => out.push(ctx),
                 Err(err) => {
-                    log::warn!(
-                        "[GPU] CudaContext::new({}) failed: {}",
-                        ordinal,
-                        err
-                    );
+                    log::warn!("[GPU] CudaContext::new({}) failed: {}", ordinal, err);
                 }
             }
         }

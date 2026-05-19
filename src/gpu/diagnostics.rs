@@ -262,7 +262,7 @@ pub fn flush_gpu_activity_summary() {
 }
 
 mod activity {
-    use super::{BTreeMap, Mutex, format_count, format_bytes};
+    use super::{BTreeMap, Mutex, format_bytes, format_count};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -382,11 +382,7 @@ mod activity {
         };
         if !snapshot.is_empty() {
             let mut sorted = snapshot;
-            sorted.sort_by(|a, b| {
-                b.1.success
-                    .cmp(&a.1.success)
-                    .then_with(|| a.0.cmp(b.0))
-            });
+            sorted.sort_by(|a, b| b.1.success.cmp(&a.1.success).then_with(|| a.0.cmp(b.0)));
             for (op, stats) in sorted {
                 let gpu_seconds = (stats.gpu_micros as f64) / 1_000_000.0;
                 lines.push(format!(
