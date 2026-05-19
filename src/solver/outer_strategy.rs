@@ -4149,22 +4149,20 @@ impl OuterProblem {
         if let Some(entry) = session.try_load() {
             if let Some(payload) = decode_iterate(&entry.payload, self.n_params) {
                 let cached_rho = Array1::from_vec(payload.rho);
-                // Validation-on-load: confirm the prior objective recorded
-                // in the entry is finite. The full re-evaluation contract
-                // (re-eval at cached θ on the *current* problem) requires
-                // calling into the objective, which OuterStrategy holds as
-                // a separate borrow — that's a Phase-3 fold-in. The basic
-                // finiteness check here already rejects corrupt or NaN-
-                // tagged payloads that decode_iterate accepts shape-wise.
-                let prior_obj = entry.objective.unwrap_or(f64::NAN);
-                let prior_finite = prior_obj.is_finite();
+                // Validation-on-load: reject payloads whose recorded
+                // objective is non-finite OR whose ρ vector contains
+                // non-finite entries. `entry.objective == None` is
+                // permissible (early checkpoint that didn't record the
+                // objective) — only `Some(non-finite)` triggers rejection.
+                let prior_obj_bad = matches!(entry.objective, Some(v) if !v.is_finite());
                 let rho_finite = cached_rho.iter().all(|v| v.is_finite());
-                if !prior_finite || !rho_finite {
+                let prior_obj_display = entry.objective.unwrap_or(f64::NAN);
+                if prior_obj_bad || !rho_finite {
                     log::info!(
                         "[CACHE] skip key={}.. context={} reason=non-finite-payload prior_obj={:.6e} all_rho_finite={}",
                         short_key,
                         context,
-                        prior_obj,
+                        prior_obj_display,
                         rho_finite,
                     );
                 } else if config
@@ -4177,7 +4175,7 @@ impl OuterProblem {
                         short_key,
                         context,
                         cached_rho.len(),
-                        prior_obj,
+                        prior_obj_display,
                         entry.iteration.unwrap_or(0),
                     );
                     config.initial_rho = Some(cached_rho);
@@ -4189,7 +4187,7 @@ impl OuterProblem {
                         short_key,
                         context,
                         cached_rho.len(),
-                        prior_obj,
+                        prior_obj_display,
                     );
                     had_hit = true;
                 }
