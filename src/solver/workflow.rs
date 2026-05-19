@@ -428,18 +428,13 @@ impl<'a> FitRequest<'a> {
             FitRequest::BinomialLocationScale(req) => {
                 req.options.cache_mirror_sessions.push(mirror);
             }
-            FitRequest::SurvivalLocationScale(_) => {
-                // SurvivalLocationScale doesn't carry a top-level mirror
-                // slot; it constructs BlockwiseFitOptions internally and
-                // currently doesn't propagate this. Mirroring for that
-                // variant happens via its own family-specific cache
-                // mechanism (persistent_survival_transformation_key in
-                // the standard-REML lane). The exact-key cache still
-                // fires; only the cross-variant seed broadcast is
-                // unavailable for this variant.
+            FitRequest::SurvivalLocationScale(req) => {
+                req.spec.cache_mirror_sessions.push(mirror);
             }
             FitRequest::SurvivalTransformation(_) => {
-                // Same as SurvivalLocationScale above.
+                // SurvivalTransformation uses an internal WorkingModelPirlsOptions
+                // path with its own warm-start key. Mirror finalize is a no-op
+                // here — the path's own cache fires on exact match.
             }
             FitRequest::BernoulliMarginalSlope(req) => {
                 req.options.cache_mirror_sessions.push(mirror);
@@ -481,9 +476,24 @@ impl<'a> FitRequest<'a> {
                 req.options.cache_session.get_or_insert(session);
             }
             FitRequest::SurvivalLocationScale(req) => {
-                req.cache_session.get_or_insert(session);
+                // The request-level slot is mirrored into the spec slot
+                // so the family fit fn sees the session when it
+                // constructs its internal BlockwiseFitOptions.
+                if req.cache_session.is_none() {
+                    req.cache_session = Some(session.clone());
+                }
+                if req.spec.cache_session.is_none() {
+                    req.spec.cache_session = Some(session);
+                }
             }
             FitRequest::SurvivalTransformation(req) => {
+                // SurvivalTransformation uses WorkingModelPirlsOptions
+                // (different mechanism) for its inner solve; the cache
+                // session here is parked at the request level so future
+                // wiring through `persistent_survival_transformation_key`
+                // can be unified. For now, the path's own
+                // `persistent_survival_transformation_key` mechanism
+                // handles exact-match warm-start.
                 req.cache_session.get_or_insert(session);
             }
             FitRequest::BernoulliMarginalSlope(req) => {
@@ -1745,9 +1755,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     let mut request = request;
     let exact_key = request.cache_key();
     let seed_key = request.cache_seed_key();
-    if let Some(session) =
-        crate::solver::persistent_warm_start::open_outer_session(&exact_key)
-    {
+    if let Some(session) = crate::solver::persistent_warm_start::open_outer_session(&exact_key) {
         let exact_present = session.try_load().is_some();
         if !exact_present
             && let Some(seed) =
@@ -1768,8 +1776,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     // related-but-not-identical structure can pick this run's ρ up via
     // the prefix lookup above. The mirror runs lazily on result —
     // checkpoints during the run only write to the exact key.
-    let mirror_session =
-        crate::solver::persistent_warm_start::open_outer_session(&seed_key);
+    let mirror_session = crate::solver::persistent_warm_start::open_outer_session(&seed_key);
     if let Some(mirror) = mirror_session.as_ref() {
         request.attach_cache_mirror(Arc::clone(mirror));
     }
@@ -3066,6 +3073,8 @@ fn materialize_survival<'a>(
                 linkwiggle_block: None,
                 initial_threshold_log_lambdas,
                 initial_log_sigma_log_lambdas,
+                cache_session: None,
+                cache_mirror_sessions: Vec::new(),
             };
             // During baseline-θ BFGS probes we hold the inverse-link state
             // fixed: otherwise every probe would trigger a nested

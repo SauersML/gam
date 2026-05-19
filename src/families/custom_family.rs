@@ -10450,8 +10450,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         predicted_reduction,
                         objective_tol,
                     );
-                let roundoff_slack =
-                    joint_objective_roundoff_slack(old_objective, trialobjective);
+                let roundoff_slack = joint_objective_roundoff_slack(old_objective, trialobjective);
                 let secondary_ok = !floor_reached
                     && trialobjective.is_finite()
                     && trust_update.accepted
@@ -10465,8 +10464,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     "reject"
                 };
-                let radius_held = (joint_trust_radius - old_radius).abs()
-                    <= 1e-12 * old_radius.abs().max(1.0);
+                let radius_held =
+                    (joint_trust_radius - old_radius).abs() <= 1e-12 * old_radius.abs().max(1.0);
                 let radius_field = if radius_held {
                     format!("r={:.3e} (held)", old_radius)
                 } else {
@@ -10491,7 +10490,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         if tr_log_first == tr_log_last {
                             log::info!(
                                 "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
-                                cycle, tr_log_first, prev,
+                                cycle,
+                                tr_log_first,
+                                prev,
                             );
                         } else {
                             log::info!(
@@ -10541,14 +10542,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // on rejections and rare events, redundant on routine first-attempt
             // accepts. Emit on verbose cycles or whenever the search ran more
             // than one attempt (multi-attempt cycles are inherently interesting).
-            let tr_log_interesting =
-                verbose_cycle || line_search_attempts > 1 || !accepted;
+            let tr_log_interesting = verbose_cycle || line_search_attempts > 1 || !accepted;
             if tr_log_interesting {
                 if let Some(prev) = tr_log_sig.as_deref() {
                     if tr_log_first == tr_log_last {
                         log::info!(
                             "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
-                            cycle, tr_log_first, prev,
+                            cycle,
+                            tr_log_first,
+                            prev,
                         );
                     } else {
                         log::info!(
@@ -10870,6 +10872,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // unable to certify convergence on a problem that was
             // solved exactly in one Newton step.
             if residual <= residual_tol {
+                converged = true;
+                break;
+            }
+            // Large survival marginal-slope fits can enter a statistically
+            // flat basin where each accepted exact-Newton step changes the
+            // objective by less than the requested inner accuracy, but the
+            // projected residual lands just above the absolute KKT threshold
+            // because the remaining gradient mass is at the row-summed
+            // arithmetic noise floor. Requiring thousands of additional
+            // identical descent cycles gives the outer optimizer no more
+            // useful hyperparameter information; it only rejects every seed as
+            // "inner did not converge". Accept this narrow plateau only when
+            // the objective has already converged and stationarity is within a
+            // small factor of the same scale-aware tolerance.
+            if objective_change <= objective_tol && residual <= 2.0 * residual_tol {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat KKT certificate: residual={:.3e} <= 2*tol={:.3e}, obj_change={:.3e} <= tol={:.3e}",
+                    cycle,
+                    residual,
+                    2.0 * residual_tol,
+                    objective_change,
+                    objective_tol,
+                );
                 converged = true;
                 break;
             }
@@ -14967,24 +14992,36 @@ fn derivative_quality_options_and_warm_start(
     warm_start: Option<&CustomFamilyWarmStart>,
     has_psi_derivatives: bool,
 ) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
-    const DIRECT_JOINT_HYPER_INNER_TOL: f64 = 1e-10;
+    const DIRECT_JOINT_HYPER_INNER_TOL_FLOOR: f64 = 1e-10;
     const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
     // The tightening exists so the implicit-function-theorem differentiation
-    // through the inner solve has β at f64 precision; without that ψ-axis
-    // gradients pick up O(inner_tol) noise. With zero ψ-derivative blocks
-    // there is no IFT pullback to make accurate — the joint-hyper objective
-    // collapses to the rho-only outer objective, and tightening here breaks
-    // that equivalence by fitting β to a tighter inner residual than the
-    // rho-only path uses. Keep the caller's inner_tol in that case.
+    // through the inner solve is at least as accurate as the outer optimizer's
+    // requested gradient scale. With zero ψ-derivative blocks there is no IFT
+    // pullback to make accurate — the joint-hyper objective collapses to the
+    // rho-only outer objective, and tightening here breaks that equivalence by
+    // fitting β to a tighter inner residual than the rho-only path uses. Keep
+    // the caller's inner_tol in that case.
+    //
+    // Do not hard-force f64-precision KKT solves for every ψ-bearing model:
+    // biobank-scale survival marginal-slope fits have row-summed objectives
+    // around 1e5-1e6, so `1e-10 * objective` asks the inner loop to resolve
+    // gradient components far below the outer optimizer's own `outer_tol`.
+    // Matching the inner target to the outer target keeps the IFT gradient
+    // noise below the requested optimization accuracy without rejecting all
+    // startup seeds after hundreds of accepted but numerically flat Newton
+    // steps.
+    let direct_joint_hyper_inner_tol = eval_options
+        .outer_tol
+        .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR);
     let tighten = has_psi_derivatives
         && eval_options.inner_max_cycles > 1
-        && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL;
+        && eval_options.inner_tol > direct_joint_hyper_inner_tol;
     if !tighten {
         return (eval_options, None);
     }
-    eval_options.inner_tol = DIRECT_JOINT_HYPER_INNER_TOL;
+    eval_options.inner_tol = direct_joint_hyper_inner_tol;
     eval_options.inner_max_cycles = eval_options
         .inner_max_cycles
         .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
@@ -16560,7 +16597,10 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         log::info!(
             "[CACHE] attach key={}.. family-tag={} backend=outer-strategy mirrors={}",
             &key_hex[..8.min(key_hex.len())],
-            std::any::type_name::<F>().rsplit("::").next().unwrap_or("?"),
+            std::any::type_name::<F>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("?"),
             options.cache_mirror_sessions.len(),
         );
         let mut p = problem.with_cache_session(session);
@@ -17022,6 +17062,44 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
+        let options = BlockwiseFitOptions {
+            inner_tol: 1e-6,
+            outer_tol: 1e-5,
+            inner_max_cycles: 100,
+            ..BlockwiseFitOptions::default()
+        };
+        let (eval_options, strict_warm_start) =
+            derivative_quality_options_and_warm_start(&options, None, true);
+
+        assert_eq!(
+            eval_options.inner_tol, options.inner_tol,
+            "default exact joint-hyper eval should not tighten below the outer optimizer scale"
+        );
+        assert_eq!(eval_options.inner_max_cycles, options.inner_max_cycles);
+        assert!(
+            strict_warm_start.is_none(),
+            "unchanged tolerance should not discard cached inner state"
+        );
+
+        let tighter_options = BlockwiseFitOptions {
+            inner_tol: 1e-3,
+            outer_tol: 1e-5,
+            inner_max_cycles: 100,
+            ..BlockwiseFitOptions::default()
+        };
+        let (tightened, _) =
+            derivative_quality_options_and_warm_start(&tighter_options, None, true);
+        assert_eq!(tightened.inner_tol, tighter_options.outer_tol);
+        assert_eq!(tightened.inner_max_cycles, 200);
+
+        let (rho_only, _) =
+            derivative_quality_options_and_warm_start(&tighter_options, None, false);
+        assert_eq!(rho_only.inner_tol, tighter_options.inner_tol);
+        assert_eq!(rho_only.inner_max_cycles, tighter_options.inner_max_cycles);
+    }
 
     fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
         family: &F,
@@ -18810,6 +18888,7 @@ mod tests {
             outer_score_subsample: None,
             auto_outer_subsample: false,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -18854,6 +18933,7 @@ mod tests {
             outer_score_subsample: None,
             auto_outer_subsample: false,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -18901,6 +18981,7 @@ mod tests {
             outer_score_subsample: None,
             auto_outer_subsample: false,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
