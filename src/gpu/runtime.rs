@@ -18,12 +18,16 @@ use std::any::Any;
 use std::fmt;
 use std::ops::Range;
 use std::panic;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys::CUdevice_attribute_enum;
+#[cfg(target_os = "linux")]
+use libloading::Library;
 
 use super::calibration::{DeviceCalibration, measure_device};
 use super::device::GpuDeviceInfo;
@@ -59,7 +63,132 @@ fn libcuda_loadable() -> bool {
 /// names cudarc will actually try.
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| unsafe { cudarc::cublas::sys::is_culib_present() })
+    *AVAILABLE.get_or_init(|| {
+        preload_packaged_cuda_libraries();
+        unsafe { cudarc::cublas::sys::is_culib_present() }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn preload_packaged_cuda_libraries() {
+    static HANDLES: OnceLock<Vec<Library>> = OnceLock::new();
+    let _ = HANDLES.get_or_init(load_packaged_cuda_libraries);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preload_packaged_cuda_libraries() {}
+
+#[cfg(target_os = "linux")]
+fn load_packaged_cuda_libraries() -> Vec<Library> {
+    cuda_library_candidate_paths()
+        .into_iter()
+        .filter_map(|path| unsafe { Library::new(path).ok() })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_library_candidate_paths() -> Vec<PathBuf> {
+    let wheel_components: &[(&str, &[&str])] = &[
+        ("cuda_runtime", &["libcudart.so.12", "libcudart.so"]),
+        ("nvjitlink", &["libnvJitLink.so.12", "libnvJitLink.so"]),
+        (
+            "cublas",
+            &[
+                "libcublasLt.so.12",
+                "libcublasLt.so",
+                "libcublas.so.12",
+                "libcublas.so",
+            ],
+        ),
+        ("cusparse", &["libcusparse.so.12", "libcusparse.so"]),
+        (
+            "cusolver",
+            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+        ),
+    ];
+    let system_dirs = [
+        Path::new("/usr/local/cuda/lib64"),
+        Path::new("/usr/local/cuda/lib"),
+    ];
+
+    let mut out = Vec::new();
+    let mut push_if_exists = |path: PathBuf| {
+        if path.exists() && !out.iter().any(|seen| seen == &path) {
+            out.push(path);
+        }
+    };
+
+    if let Some(image_dir) = current_image_dir() {
+        for root in packaged_nvidia_roots(&image_dir) {
+            for (component, names) in wheel_components {
+                for name in *names {
+                    push_if_exists(root.join(component).join("lib").join(name));
+                }
+            }
+        }
+    }
+
+    for lib_dir in system_dirs {
+        for (_, names) in wheel_components {
+            for name in *names {
+                push_if_exists(lib_dir.join(name));
+            }
+        }
+    }
+
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn packaged_nvidia_roots(image_dir: &Path) -> Vec<PathBuf> {
+    let candidates = [
+        image_dir.join("../nvidia"),
+        image_dir.join("nvidia"),
+        image_dir.join("../../nvidia"),
+    ];
+    candidates
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .filter(|path| path.is_dir())
+        .fold(Vec::new(), |mut roots, path| {
+            if !roots.iter().any(|seen| seen == &path) {
+                roots.push(path);
+            }
+            roots
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn current_image_dir() -> Option<PathBuf> {
+    use std::ffi::{CStr, c_char, c_void};
+
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const c_char,
+        dli_fbase: *mut c_void,
+        dli_sname: *const c_char,
+        dli_saddr: *mut c_void,
+    }
+
+    unsafe extern "C" {
+        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+    }
+
+    let mut info = DlInfo {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    let rc = unsafe { dladdr(current_image_dir as *const () as *const c_void, &mut info) };
+    if rc == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let image_path = unsafe { CStr::from_ptr(info.dli_fname) }.to_str().ok()?;
+    Path::new(image_path)
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
 }
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
