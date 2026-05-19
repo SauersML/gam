@@ -68,14 +68,15 @@ impl DeviceCalibration {
 /// device under test (typically the runtime probe via
 /// `runtime::cuda_context_for`). Calibration uses the context's default
 /// stream and creates its own `CudaBlas` handle scoped to that stream.
-pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
+pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String> {
     // Bind the calling thread to this context so allocations and copies
     // land on the right device when the runtime drives multiple GPUs from
     // a single probe thread.
-    ctx.bind_to_thread().ok()?;
+    ctx.bind_to_thread()
+        .map_err(|e| format!("bind_to_thread: {e}"))?;
 
     let stream = ctx.default_stream();
-    let blas = CudaBlas::new(stream.clone()).ok()?;
+    let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas_init: {e}"))?;
 
     // -- Shape constants ----------------------------------------------------
     // 1024^3 dgemm: 2.147 GFLOP, ~32 MiB working set. Big enough that the
@@ -93,60 +94,78 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
     let b_host: Vec<f64> = (0..K * N).map(|i| (i as f64).cos()).collect();
 
     // -- Device allocations -------------------------------------------------
-    let mut a_dev = stream.alloc_zeros::<f64>(M * K).ok()?;
-    let mut b_dev = stream.alloc_zeros::<f64>(K * N).ok()?;
-    let mut c_dev = stream.alloc_zeros::<f64>(M * N).ok()?;
+    let mut a_dev = stream
+        .alloc_zeros::<f64>(M * K)
+        .map_err(|e| format!("alloc A {}x{}: {e}", M, K))?;
+    let mut b_dev = stream
+        .alloc_zeros::<f64>(K * N)
+        .map_err(|e| format!("alloc B {}x{}: {e}", K, N))?;
+    let mut c_dev = stream
+        .alloc_zeros::<f64>(M * N)
+        .map_err(|e| format!("alloc C {}x{}: {e}", M, N))?;
 
     // -- H2D bandwidth ------------------------------------------------------
     // Use an f64-typed buffer so a single element count = one chunk
     // exactly TRANSFER_BYTES wide. Contents are irrelevant; what matters
     // is that real pageable host pages flow over PCIe.
     let transfer_host: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
-    let mut transfer_dev = stream.alloc_zeros::<f64>(TRANSFER_F64).ok()?;
+    let mut transfer_dev = stream
+        .alloc_zeros::<f64>(TRANSFER_F64)
+        .map_err(|e| format!("alloc transfer buffer {} bytes: {e}", TRANSFER_BYTES))?;
 
     // Warm the path once so first-call driver overhead doesn't skew the GB/s.
     stream
         .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
-        .ok()?;
-    stream.synchronize().ok()?;
+        .map_err(|e| format!("h2d warmup: {e}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| format!("h2d warmup sync: {e}"))?;
 
     let h2d_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
         stream
             .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
-            .ok()?;
+            .map_err(|e| format!("h2d copy: {e}"))?;
         // Synchronize so timing reflects real kernel completion, not just
         // the host-side queue insertion.
-        stream.synchronize().ok()?;
-        Some(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
+        stream.synchronize().map_err(|e| format!("h2d sync: {e}"))?;
+        Ok(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
     // -- D2H bandwidth ------------------------------------------------------
     let mut transfer_back: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
     stream
         .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
-        .ok()?;
-    stream.synchronize().ok()?;
+        .map_err(|e| format!("d2h warmup: {e}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| format!("d2h warmup sync: {e}"))?;
 
     let d2h_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
         stream
             .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
-            .ok()?;
-        stream.synchronize().ok()?;
-        Some(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
+            .map_err(|e| format!("d2h copy: {e}"))?;
+        stream.synchronize().map_err(|e| format!("d2h sync: {e}"))?;
+        Ok(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
     // -- FP64 dgemm throughput ---------------------------------------------
     // Copy A, B once; reuse across iterations. C is the only thing that
     // changes between runs, and dgemm always overwrites it.
-    stream.memcpy_htod(a_host.as_slice(), &mut a_dev).ok()?;
-    stream.memcpy_htod(b_host.as_slice(), &mut b_dev).ok()?;
-    stream.synchronize().ok()?;
+    stream
+        .memcpy_htod(a_host.as_slice(), &mut a_dev)
+        .map_err(|e| format!("h2d A: {e}"))?;
+    stream
+        .memcpy_htod(b_host.as_slice(), &mut b_dev)
+        .map_err(|e| format!("h2d B: {e}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| format!("h2d AB sync: {e}"))?;
 
-    let m_i = i32::try_from(M).ok()?;
-    let n_i = i32::try_from(N).ok()?;
-    let k_i = i32::try_from(K).ok()?;
+    let m_i = i32::try_from(M).map_err(|e| format!("M overflow i32: {e}"))?;
+    let n_i = i32::try_from(N).map_err(|e| format!("N overflow i32: {e}"))?;
+    let k_i = i32::try_from(K).map_err(|e| format!("K overflow i32: {e}"))?;
 
     let cfg = GemmConfig::<f64> {
         transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -162,15 +181,18 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
     };
 
     // Two warmup runs so kernel JIT + boost clock settle.
-    for _ in 0..2 {
+    for i in 0..2 {
         // SAFETY: cfg is filled with shape/leading-dimension values
         // consistent with the just-allocated a_dev/b_dev/c_dev slices
         // (M*K, K*N, M*N elements, column-major leading dims m, k, m).
         // gemm is unsafe in cudarc 0.19 because invalid shapes would
         // map to invalid device memory accesses; the shapes here are
         // statically known and match the allocations.
-        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
-        stream.synchronize().ok()?;
+        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
+            .map_err(|e| format!("dgemm warmup {i}: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| format!("dgemm warmup {i} sync: {e}"))?;
     }
 
     let flops = 2.0_f64 * (M as f64) * (N as f64) * (K as f64);
@@ -178,19 +200,26 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
         let start = Instant::now();
         // SAFETY: same as the warmup block above — cfg matches the
         // allocations and they remain in scope.
-        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
-        stream.synchronize().ok()?;
+        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
+            .map_err(|e| format!("dgemm timed: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| format!("dgemm timed sync: {e}"))?;
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed <= 0.0 {
-            return None;
+            return Err(format!("dgemm timing nonpositive elapsed: {elapsed}"));
         }
-        Some(flops / elapsed / 1e9)
+        Ok(flops / elapsed / 1e9)
     })?;
 
     // D2H result so the device-side pages are exercised end-to-end (also
     // serves as a sanity check that dgemm actually wrote something).
-    let _c_host = stream.clone_dtoh(&c_dev).ok()?;
-    stream.synchronize().ok()?;
+    let _c_host = stream
+        .clone_dtoh(&c_dev)
+        .map_err(|e| format!("d2h C result: {e}"))?;
+    stream
+        .synchronize()
+        .map_err(|e| format!("d2h C result sync: {e}"))?;
 
     let calibration = DeviceCalibration {
         fp64_gflops,
@@ -198,9 +227,12 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
         d2h_gb_s,
     };
     if calibration.is_usable() {
-        Some(calibration)
+        Ok(calibration)
     } else {
-        None
+        Err(format!(
+            "calibration result not usable: fp64_gflops={} h2d_gb_s={} d2h_gb_s={}",
+            calibration.fp64_gflops, calibration.h2d_gb_s, calibration.d2h_gb_s
+        ))
     }
 }
 
