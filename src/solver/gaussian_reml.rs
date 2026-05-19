@@ -392,6 +392,11 @@ pub fn gaussian_reml_multi_closed_form_with_cache_no_alloc(
     mut fitted: ArrayViewMut2<'_, f64>,
     mut sigma2: ArrayViewMut1<'_, f64>,
 ) -> Result<GaussianRemlNoAllocFit, EstimationError> {
+    // Match the symmetric-S contract used by the cache builder: the
+    // fingerprint check below compares against a fingerprint computed on the
+    // canonicalized penalty, so the input must be canonicalized first.
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
