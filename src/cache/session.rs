@@ -20,6 +20,14 @@ pub struct Session {
     key: Fingerprint,
     run_id: String,
     inner: Mutex<Inner>,
+    /// Pre-loaded seed payload from a hierarchical near-match key.
+    ///
+    /// Populated by callers who looked up a related (but not exact-match)
+    /// entry from a different key in the same store. The first call to
+    /// [`Self::try_load`] returns and clears this slot — so the session
+    /// can be used as a unified "load best seed, save under exact key"
+    /// abstraction regardless of where the seed came from.
+    preloaded: Mutex<Option<CachedEntry>>,
 }
 
 #[derive(Debug)]
@@ -44,7 +52,24 @@ impl Session {
                 last_write: None,
                 best_seen: None,
             }),
+            preloaded: Mutex::new(None),
         }
+    }
+
+    /// Stash a near-match payload that the next [`Self::try_load`] call
+    /// should return in preference to looking up this session's key.
+    ///
+    /// Used by the workflow dispatcher to seed a fresh fit's outer loop
+    /// from a related but not-exact-fingerprint prior fit (e.g.,
+    /// cross-validation folds of the same model). The exact-key keyspace
+    /// remains untouched by this — checkpoint and finalize writes still
+    /// go to the session's own key.
+    pub fn preload(&self, entry: CachedEntry) {
+        let mut slot = match self.preloaded.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *slot = Some(entry);
     }
 
     pub fn key(&self) -> &Fingerprint {
@@ -60,9 +85,20 @@ impl Session {
     }
 
     /// Read the best entry currently on disk for this session's key.
-    /// Lookup is read-only and may return entries from other runs (the
-    /// whole point of cross-run resume).
+    /// Lookup is read-only against the store and may return entries from
+    /// other runs (the whole point of cross-run resume).
+    ///
+    /// If a near-match seed has been preloaded via [`Self::preload`],
+    /// the seed is returned in preference to the store lookup AND
+    /// consumed (so subsequent calls fall back to the store). This
+    /// makes the session a unified abstraction over "exact-key hit"
+    /// and "hierarchical-prefix seed."
     pub fn try_load(&self) -> Option<CachedEntry> {
+        if let Ok(mut slot) = self.preloaded.lock()
+            && let Some(entry) = slot.take()
+        {
+            return Some(entry);
+        }
         self.store.lookup(&self.key).ok().flatten()
     }
 
