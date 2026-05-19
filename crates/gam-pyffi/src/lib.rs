@@ -1154,7 +1154,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score.as_ref().map(|g| g.as_array()),
         grad_edf.as_ref().map(|g| g.as_array()),
-        by.as_ref().map(|b| b.as_array()),
+        by.as_ref().map(|b_arr| b_arr.as_array()),
         by_start_col,
         forward_fits.as_deref(),
     )
@@ -2423,6 +2423,17 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             return Err("grad_reml_score must contain only finite values".to_string());
         }
     }
+    if let Some(grad_edf) = grad_edf {
+        if grad_edf.len() != batch {
+            return Err(format!(
+                "grad_edf length mismatch: expected {batch}, got {}",
+                grad_edf.len()
+            ));
+        }
+        if grad_edf.iter().any(|value| !value.is_finite()) {
+            return Err("grad_edf must contain only finite values".to_string());
+        }
+    }
     if let Some(grad_coefficients) = grad_coefficients {
         if grad_coefficients.dim() != (batch, p, d) {
             let (got_b, got_p, got_d) = grad_coefficients.dim();
@@ -2469,6 +2480,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
             let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
             let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
+            let upstream_edf = grad_edf.as_ref().map_or(0.0, |g| g[b]);
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
             let x_slice = fit_x.slice(s![start..end, ..]);
@@ -2485,6 +2497,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                         upstream_coefficients,
                         upstream_fitted,
                         upstream_reml_score,
+                        upstream_edf,
                     ),
                     None => return Ok((b, None)),
                 }
@@ -2499,6 +2512,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                     upstream_coefficients,
                     upstream_fitted,
                     upstream_reml_score,
+                    upstream_edf,
                 )
             };
             match backward_result {
@@ -4871,6 +4885,7 @@ mod batch_tests {
             Some(grad_fitted.view()),
             Some(grad_reml_score.view()),
             None,
+            None,
         )
         .unwrap();
 
@@ -4887,6 +4902,7 @@ mod batch_tests {
                 Some(grad_coefficients.slice(s![b, .., ..])),
                 Some(grad_fitted.slice(s![start..end, ..])),
                 grad_reml_score[b],
+                0.0,
             )
             .unwrap();
             assert_eq!(batched.statuses[b], "ok");
@@ -4949,6 +4965,7 @@ mod batch_tests {
             Some(grad_coefficients.view()),
             Some(grad_fitted.view()),
             Some(grad_reml_score.view()),
+            None,
             None,
             0,
             None,
