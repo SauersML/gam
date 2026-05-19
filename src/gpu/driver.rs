@@ -15,15 +15,15 @@ use libloading::Library;
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 
 pub type CuResult = i32;
-pub type CuInit = unsafe extern "C" fn(u32) -> CuResult;
-pub type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
-pub type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
-pub type CuCtxSetCurrent = unsafe extern "C" fn(usize) -> CuResult;
-pub type CuCtxDestroy = unsafe extern "C" fn(usize) -> CuResult;
-pub type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
-pub type CuMemFree = unsafe extern "C" fn(u64) -> CuResult;
-pub type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
-pub type CuMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
+type CuInit = unsafe extern "C" fn(u32) -> CuResult;
+type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
+type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
+type CuCtxSetCurrent = unsafe extern "C" fn(usize) -> CuResult;
+type CuCtxDestroy = unsafe extern "C" fn(usize) -> CuResult;
+type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
+type CuMemFree = unsafe extern "C" fn(u64) -> CuResult;
+type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
+type CuMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
 
 /// Resolved CUDA driver entry points.
 pub struct DriverApi {
@@ -159,7 +159,7 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
     }
 }
 
-pub fn load_library(candidates: &[&str]) -> Result<Library, String> {
+fn load_library(candidates: &[&str]) -> Result<Library, String> {
     for candidate in candidates {
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
