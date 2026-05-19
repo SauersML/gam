@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 use super::device::GpuDeviceInfo;
@@ -146,43 +147,21 @@ pub(crate) fn log_gpu_success_multi(
     ));
 }
 
-/// Coalesce repeated adjacent GPU routing messages. Long fits often repeat the
-/// same small CPU-routed kernel thousands of times; this keeps the first line
-/// visible and then emits heartbeat summaries at powers of two.
+/// Log each unique GPU routing message exactly once per process. Long fits
+/// often repeat the same small CPU-routed kernel thousands of times and
+/// interleave a few shapes; emitting each signature only on first occurrence
+/// keeps the log readable.
 fn log_route(signature: String) {
-    struct Repeat {
-        signature: String,
-        count: u64,
-        next_heartbeat: u64,
-    }
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
-    static REPEAT: Mutex<Option<Repeat>> = Mutex::new(None);
-
-    let mut guard = match REPEAT.lock() {
+    let mut guard = match SEEN.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-
-    if let Some(state) = guard.as_mut() {
-        if state.signature == signature {
-            state.count += 1;
-            if state.count >= state.next_heartbeat {
-                log::info!("{} (x{} so far)", state.signature, state.count);
-                state.next_heartbeat = state.next_heartbeat.saturating_mul(2);
-            }
-            return;
-        }
-        if state.count > 1 {
-            log::info!("{} final x{}", state.signature, state.count);
-        }
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if seen.insert(signature.clone()) {
+        log::info!("{signature}");
     }
-
-    log::info!("{signature}");
-    *guard = Some(Repeat {
-        signature,
-        count: 1,
-        next_heartbeat: 2,
-    });
 }
 
 pub(crate) fn bytes_for_f64(len: usize) -> usize {
