@@ -96,6 +96,7 @@ pub struct GaussianRemlScoreDerivatives {
 pub struct GaussianRemlBackwardResult {
     pub grad_x: Array2<f64>,
     pub grad_y: Array2<f64>,
+    pub grad_penalty: Array2<f64>,
     pub grad_weights: Array1<f64>,
 }
 
@@ -685,6 +686,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
 
     let mut grad_x = Array2::<f64>::zeros((n, p));
     let mut grad_y = Array2::<f64>::zeros((n, d));
+    let mut grad_penalty = Array2::<f64>::zeros((p, p));
     let mut grad_weights = Array1::<f64>::zeros(n);
 
     let mut upstream_beta = Array2::<f64>::zeros((p, d));
@@ -704,11 +706,13 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             y,
             penalty,
             &weight,
+            lambda,
             &inverse_hessian,
             beta,
             upstream_beta.view(),
             &mut grad_x,
             &mut grad_y,
+            &mut grad_penalty,
             &mut grad_weights,
         );
     }
@@ -723,8 +727,11 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             &residual,
             &fit.sigma2,
             nu,
+            lambda,
+            &fit.cache,
             &mut grad_x,
             &mut grad_y,
+            &mut grad_penalty,
             &mut grad_weights,
         );
         lambda_adjoint += upstream_reml_score * fit.reml_grad_lambda;
@@ -746,13 +753,16 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             nu,
             &mut grad_x,
             &mut grad_y,
+            &mut grad_penalty,
             &mut grad_weights,
         );
     }
 
+    let grad_penalty = symmetric_lower_storage_gradient(grad_penalty.view());
     Ok(GaussianRemlBackwardResult {
         grad_x,
         grad_y,
+        grad_penalty,
         grad_weights,
     })
 }
@@ -1022,11 +1032,13 @@ fn add_ridge_profile_vjp(
     y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
     weights: &Array1<f64>,
+    lambda: f64,
     inverse_hessian: &Array2<f64>,
     beta: &Array2<f64>,
     upstream_beta: ArrayView2<'_, f64>,
     grad_x: &mut Array2<f64>,
     grad_y: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
 ) -> f64 {
     let m = dense_ab(inverse_hessian.view(), upstream_beta);
@@ -1063,6 +1075,15 @@ fn add_ridge_profile_vjp(
     }
 
     let penalty_beta = dense_ab(penalty, beta.view());
+    for row in 0..penalty.nrows() {
+        for col in 0..penalty.ncols() {
+            let mut value = 0.0;
+            for output in 0..beta.ncols() {
+                value += m[[row, output]] * beta[[col, output]];
+            }
+            grad_penalty[[row, col]] -= scale * lambda * value;
+        }
+    }
     -scale
         * m.iter()
             .zip(penalty_beta.iter())
@@ -1079,12 +1100,22 @@ fn add_reml_score_vjp(
     residual: &Array2<f64>,
     sigma2: &Array1<f64>,
     nu: f64,
+    lambda: f64,
+    cache: &GaussianRemlEigenCache,
     grad_x: &mut Array2<f64>,
     grad_y: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
 ) {
     let d = beta.ncols() as f64;
     let xp = dense_ab(x, inverse_hessian.view());
+    let penalty_pinv = gaussian_reml_penalty_pseudoinverse_from_cache(cache);
+    for row in 0..grad_penalty.nrows() {
+        for col in 0..grad_penalty.ncols() {
+            grad_penalty[[row, col]] +=
+                scale * 0.5 * d * (lambda * inverse_hessian[[col, row]] - penalty_pinv[[col, row]]);
+        }
+    }
     for i in 0..x.nrows() {
         let wi = weights[i] * scale * d;
         for k in 0..x.ncols() {
@@ -1111,6 +1142,7 @@ fn add_reml_score_vjp(
             grad_y,
             grad_weights,
         );
+        add_rank_one_penalty_vjp(coef * lambda, beta.column(j), grad_penalty);
     }
 }
 
@@ -1128,12 +1160,19 @@ fn add_reml_rho_gradient_vjp(
     nu: f64,
     grad_x: &mut Array2<f64>,
     grad_y: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
 ) {
     let d = beta.ncols() as f64;
     let k_matrix = penalty.to_owned() * lambda;
     let inverse_k = dense_ab(inverse_hessian.view(), k_matrix.view());
     let trace_kernel = dense_ab(inverse_k.view(), inverse_hessian.view());
+    for row in 0..grad_penalty.nrows() {
+        for col in 0..grad_penalty.ncols() {
+            grad_penalty[[row, col]] +=
+                scale * 0.5 * d * lambda * (inverse_hessian[[col, row]] - trace_kernel[[col, row]]);
+        }
+    }
     let xt = dense_ab(x, trace_kernel.view());
     for i in 0..x.nrows() {
         let wi = -scale * d * weights[i];
@@ -1157,6 +1196,7 @@ fn add_reml_rho_gradient_vjp(
             upstream_beta[[row, j]] = q_coef * k_beta[[row, j]];
         }
         let dp_coef = -scale * 0.5 * nu * q / (dp * dp);
+        add_rank_one_penalty_vjp((0.5 * q_coef + dp_coef) * lambda, beta.column(j), grad_penalty);
         add_deviance_profile_vjp(
             dp_coef,
             j,
@@ -1175,13 +1215,53 @@ fn add_reml_rho_gradient_vjp(
         y,
         penalty,
         weights,
+        lambda,
         inverse_hessian,
         beta,
         upstream_beta.view(),
         grad_x,
         grad_y,
+        grad_penalty,
         grad_weights,
     );
+}
+
+fn add_rank_one_penalty_vjp(
+    scale: f64,
+    beta_col: ArrayView1<'_, f64>,
+    grad_penalty: &mut Array2<f64>,
+) {
+    for row in 0..beta_col.len() {
+        for col in 0..beta_col.len() {
+            grad_penalty[[row, col]] += scale * beta_col[row] * beta_col[col];
+        }
+    }
+}
+
+fn gaussian_reml_penalty_pseudoinverse_from_cache(cache: &GaussianRemlEigenCache) -> Array2<f64> {
+    let p = cache.penalty_eigenvalues.len();
+    let mut scaled_basis = Array2::<f64>::zeros((p, p));
+    for eig in 0..p {
+        let delta = cache.penalty_eigenvalues[eig];
+        if delta > 0.0 {
+            for row in 0..p {
+                scaled_basis[[row, eig]] = cache.coefficient_basis[[row, eig]] / delta;
+            }
+        }
+    }
+    dense_ab(scaled_basis.view(), cache.coefficient_basis.t())
+}
+
+fn symmetric_lower_storage_gradient(full_gradient: ArrayView2<'_, f64>) -> Array2<f64> {
+    let p = full_gradient.nrows();
+    let mut storage_gradient = Array2::<f64>::zeros((p, p));
+    for row in 0..p {
+        storage_gradient[[row, row]] = full_gradient[[row, row]];
+        for col in 0..row {
+            storage_gradient[[row, col]] = full_gradient[[row, col]] + full_gradient[[col, row]];
+        }
+    }
+    storage_gradient
 }
 
 fn add_deviance_profile_vjp(
