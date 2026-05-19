@@ -2693,6 +2693,15 @@ where
         } else {
             problem
         };
+        // Attach the outer-loop cache session. The session shares its
+        // realized-fit-context key with the inner beta record (different
+        // payload namespace), so a SIGKILL mid-outer-iter leaves both the
+        // last accepted β (inner record) and the best rho seen so far
+        // (outer iterate) on disk for the next run.
+        let problem = match reml_state.outer_cache_session() {
+            Some(session) => problem.with_cache_session(session),
+            None => problem,
+        };
 
         let mut obj = problem.build_objective_with_screening_proxy(
             &mut reml_state,
@@ -2831,6 +2840,10 @@ where
             problem.with_heuristic_lambdas(h.to_vec())
         } else {
             problem
+        };
+        let problem = match reml_state.outer_cache_session() {
+            Some(session) => problem.with_cache_session(session),
+            None => problem,
         };
         // Shared helper: parse theta into rho + link params, update link state.
         let apply_link_theta = |state: &mut &mut self::reml::RemlState<'_>,
