@@ -1188,7 +1188,12 @@ fn set_ok_gaussian_reml_items<'py>(
     out: &Bound<'py, PyDict>,
     fit: gam::gaussian_reml::GaussianRemlMultiResult,
 ) -> PyResult<()> {
-    out.set_item("status", "ok")?;
+    let status = if fit.lambda.is_finite() && fit.reml_score.is_finite() {
+        "ok"
+    } else {
+        "diverged"
+    };
+    out.set_item("status", status)?;
     out.set_item("lambda", fit.lambda)?;
     out.set_item("rho", fit.rho)?;
     out.set_item("reml_score", fit.reml_score)?;
@@ -1817,7 +1822,11 @@ fn gaussian_reml_fit_batched_impl(
         if let Some(fit) = fit {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
-            statuses[b] = "ok".to_string();
+            statuses[b] = if fit.lambda.is_finite() && fit.reml_score.is_finite() {
+                "ok".to_string()
+            } else {
+                "diverged".to_string()
+            };
             lambdas[b] = fit.lambda;
             rhos[b] = fit.rho;
             reml_scores[b] = fit.reml_score;
