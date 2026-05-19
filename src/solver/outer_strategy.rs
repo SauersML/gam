@@ -2162,6 +2162,11 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             g_norm,
             self.iter_count,
         );
+        // Push the (cost, ‖g‖) sample so the live progress chart shows the
+        // BFGS outer descent. Recorded as a trial; `OuterAcceptObserver`
+        // promotes the latest trial into the accepted series when BFGS's
+        // Wolfe line-search accepts the step. Cheap: throttled internally.
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2768,6 +2773,11 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        // Live-chart trial sample (ARC bridge first-order entry). Mirrors
+        // the eval_hessian site below; both run once per outer iter, so the
+        // chart's x-coord progresses on every accepted-or-rejected eval and
+        // the accepted line moves only on rho-acceptance.
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -2858,6 +2868,11 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        // Live-chart trial sample (ARC bridge second-order entry). ARC
+        // typically calls eval_grad then eval_hessian in the same outer
+        // iter; both push so the chart's outer_eval_counter advances per
+        // physical bridge call, which matches the [OUTER] eval# log cadence.
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
             eval.hessian,
@@ -2920,6 +2935,12 @@ struct OuterAcceptObserver {
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
+        // Promote the bridge-side trial sample into the visualizer's accepted
+        // series. Paired with `record_outer_eval` calls inside the bridges so
+        // the live chart shows trial scatter + accepted line. Pushed BEFORE
+        // logging so a Ctrl-C between accept and log still reflects the
+        // accepted iterate on the visible chart.
+        crate::solver::visualizer::record_outer_accept();
         log::info!(
             "[OUTER step] iter={} accepted step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
             info.iter,
@@ -2929,6 +2950,10 @@ impl OptimizerObserver for OuterAcceptObserver {
         );
     }
     fn on_step_rejected(&mut self, info: &StepInfo) {
+        // Rejected trials remain in the visualizer's trial-scatter series
+        // (recorded by the bridges' `record_outer_eval` call). Nothing to
+        // promote here; just log so the [OUTER step] line in the log stream
+        // distinguishes accept from reject.
         log::info!(
             "[OUTER step] iter={} REJECTED step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
             info.iter,
