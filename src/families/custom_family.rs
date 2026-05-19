@@ -9009,6 +9009,13 @@ fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f
     (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
 }
 
+// True iff both the realized and the model-predicted objective change are at
+// floating-point noise relative to |f|. At the floor the *sign* of either
+// quantity is round-off — a +1e-12 improvement against a +1e-15 prediction
+// sits at the same noise level as a -1e-10 step against a +1e-15 prediction.
+// The canonical Newton-decrement convergence criterion (Boyd & Vandenberghe
+// §9.5), `|½ gᵀ H⁻¹ g| ≤ ε · |f|`, is what this is — evaluated against the
+// realized line-search reduction rather than the analytic Newton decrement.
 fn joint_objective_floor_reached(
     old_objective: f64,
     trial_objective: f64,
@@ -9016,15 +9023,32 @@ fn joint_objective_floor_reached(
     predicted_reduction: f64,
     objective_tol: f64,
 ) -> bool {
+    let slack = joint_objective_roundoff_slack(old_objective, trial_objective);
     trial_objective.is_finite()
-        && actual_reduction <= 0.0
-        && actual_reduction.abs() <= joint_objective_roundoff_slack(old_objective, trial_objective)
+        && actual_reduction.is_finite()
+        && actual_reduction.abs() <= slack
         && predicted_reduction.is_finite()
-        && predicted_reduction
-            <= objective_tol.max(joint_objective_roundoff_slack(
-                old_objective,
-                trial_objective,
-            ))
+        && predicted_reduction.abs() <= objective_tol.max(slack)
+}
+
+// Pre-line-search Newton-decrement convergence test.
+//
+// For the unconstrained Newton step δ = H⁻¹ g, the model-predicted reduction
+// `g·δ − ½ δᵀHδ` reduces to `½ gᵀ H⁻¹ g = ½ λ²(β)`, the squared Newton
+// decrement (Boyd & Vandenberghe §9.5). When this falls below floating-point
+// noise relative to |f|, the local quadratic model itself certifies that no
+// step can improve f beyond round-off — *independent* of the step-size
+// proxy `‖δ‖_∞ ≤ step_tol`, which fails for ill-conditioned H along the
+// residual direction (a non-trivial ‖δ‖ corresponding to a near-null
+// curvature eigenvector). The constant 128·EPS provides headroom over the
+// natural round-off in `g·δ − ½ δᵀHδ`, two terms each of magnitude `‖g‖·‖δ‖`
+// whose difference is accurate to ~|f|·EPS.
+fn joint_newton_decrement_floor_reached(
+    old_objective: f64,
+    predicted_reduction: f64,
+) -> bool {
+    let noise_floor = old_objective.abs().max(1.0) * 128.0 * f64::EPSILON;
+    predicted_reduction.is_finite() && predicted_reduction.abs() <= noise_floor
 }
 
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
@@ -10136,6 +10160,70 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cycles_done = cycle;
                 converged = true;
                 break;
+            }
+
+            // Newton-decrement certificate (Boyd & Vandenberghe §9.5).
+            //
+            // The pre-loop KKT test above pairs ‖∇L − Sβ‖_∞ ≤ residual_tol
+            // with the *step-size proxy* ‖δ‖_∞ ≤ step_tol. The proxy is
+            // sharp for well-conditioned H but fails when H has a near-null
+            // eigendirection: the Newton step in that direction has a
+            // non-trivial 2-norm (and inf-norm) yet ½ δᵀHδ is at machine
+            // precision relative to |f|, so the line search cannot resolve
+            // ascent from descent. Spinning the trust-region loop in that
+            // state burns 24 redundant likelihood evaluations per cycle for
+            // no information gain (observed: cycles 51+ each spending ~2 s
+            // on round-off-level rho tests).
+            //
+            // The principled stop signal here is the model's *own* predicted
+            // reduction on the full (pre-truncation) Newton step. Computing
+            // it as `g·δ − ½ δᵀ H_pen δ` accounts for the QP-projected δ
+            // in the constrained case automatically, since `g` is `rhs`
+            // (the penalty-gradient-corrected residual) and `H_pen` is the
+            // operator both the inner solver and the search direction agree
+            // on. One Hv per cycle, dwarfed by the inner Hessian build.
+            //
+            // The certificate is the conjunction with the first-order
+            // condition `‖rhs‖ ≤ residual_tol`: model floor *and* gradient
+            // stationarity together pin down a true penalized optimum,
+            // never a saddle. We do NOT apply δ — β stays where it is, so
+            // round-off cannot perturb the fit.
+            if current_stationarity_residual <= residual_tol {
+                let mut hpen_full_delta = Array1::<f64>::zeros(total_p);
+                if apply_joint_penalized_hessian_into(
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    joint_solver_diagonal_ridge,
+                    &delta,
+                    &mut hpen_full_delta,
+                )
+                .is_ok()
+                {
+                    let full_predicted_reduction = joint_quadratic_predicted_reduction(
+                        &rhs,
+                        &hpen_full_delta,
+                        &delta,
+                    );
+                    if joint_newton_decrement_floor_reached(
+                        old_objective,
+                        full_predicted_reduction,
+                    ) {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement floor reached: lambda_sq_over_2={:.3e} | proposal_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
+                            cycle,
+                            full_predicted_reduction,
+                            step_inf,
+                            step_tol,
+                            current_stationarity_residual,
+                            residual_tol,
+                        );
+                        cached_joint_workspace = hessian_workspace_for_cycle;
+                        cycles_done = cycle;
+                        converged = true;
+                        break;
+                    }
+                }
             }
 
             // Trust-region retries preserve the objective-decrease guarantee
