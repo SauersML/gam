@@ -9053,20 +9053,6 @@ fn joint_objective_floor_reached(
             ))
 }
 
-fn joint_objective_flat_step_tol(objective_tol: f64, step_tol: f64) -> f64 {
-    objective_tol.sqrt().max(step_tol)
-}
-
-fn joint_objective_flat_step_reached(
-    objective_change: f64,
-    accepted_step_inf: f64,
-    objective_tol: f64,
-    step_tol: f64,
-) -> bool {
-    objective_change <= objective_tol
-        && accepted_step_inf <= joint_objective_flat_step_tol(objective_tol, step_tol)
-}
-
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -9079,6 +9065,128 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     } else {
         norm
     }
+}
+
+/// Solve the trust-region subproblem
+///
+///     min  m(δ) = -rhs·δ + ½ δ' (H + S + ε·I) δ
+///     s.t. ‖δ‖₂ ≤ Δ
+///
+/// via Moré–Sorensen / Hebden (1973) iteration on the dual variable λ_TR.
+///
+/// Why this exists. Linearly rescaling the unconstrained Newton step
+/// `δ_N = -(H+S+ε·I)⁻¹ rhs` by `Δ/‖δ_N‖` preserves the step's direction, but
+/// for ill-conditioned `H` that direction is dominated by `H`'s near-null
+/// eigenvectors (amplified by `1/λ_min`). Rescaling keeps those bad
+/// components; the iterate drifts along null directions where the cost barely
+/// changes but the gradient does not improve — the textbook signature behind
+/// biobank-scale non-convergence (`|β|∞≈10³` while `|g|∞≈10⁴` simultaneously,
+/// step shrinks but residual stays high).
+///
+/// The proper subproblem solution is `δ(λ_TR) = -(H+S+(ε+λ_TR)·I)⁻¹ rhs`
+/// with `λ_TR ≥ 0` chosen so `‖δ(λ_TR)‖ = Δ`. The `λ_TR·I` term damps the
+/// small eigenvalues of `H+S`, so `δ(λ_TR)` is bounded in null directions
+/// instead of blowing up.
+///
+/// Hebden's secant on `φ(λ) = 1/‖δ(λ)‖ − 1/Δ` (which is concave in λ for
+/// SPD `H+S+ε·I`) gives
+///
+///     λ_new = λ + (‖δ(λ)‖/‖q(λ)‖)² · (‖δ(λ)‖ − Δ)/Δ
+///
+/// where `q(λ)` solves `(H+S+(ε+λ)·I) q = δ(λ)`. Quadratic convergence in
+/// 3–5 iterations is typical for production-sized problems (p ≈ 33).
+fn dense_more_sorensen_step(
+    hessian_dense: &Array2<f64>,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    base_solver_ridge: f64,
+    rhs: &Array1<f64>,
+    radius: f64,
+    initial_unconstrained_norm: f64,
+) -> Option<(Array1<f64>, f64)> {
+    let radius = radius.max(1.0e-12);
+    let total_p = rhs.len();
+    if hessian_dense.nrows() != total_p || hessian_dense.ncols() != total_p {
+        return None;
+    }
+    // H_pen = H + S + ε·I built once. Per-iterate updates only touch the
+    // diagonal, so we keep this around instead of re-applying the penalty
+    // assembler on every Hebden iteration.
+    let mut h_pen_base = hessian_dense.clone();
+    add_joint_penalty_to_matrix(&mut h_pen_base, ranges, s_lambdas, base_solver_ridge);
+    let solver = crate::linalg::utils::StableSolver::new("joint Newton TR subproblem");
+
+    // Seed λ_TR from the oversize ratio. At λ_TR ≫ ‖H_pen‖ the step length
+    // is O(‖rhs‖/λ_TR), so a coarse initial guess proportional to how much
+    // the unconstrained step exceeded the radius gives Hebden a good
+    // starting point and avoids one or two wasted Cholesky retries.
+    let max_abs_diag = h_pen_base
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0e-12);
+    let mut lambda_tr = if initial_unconstrained_norm.is_finite()
+        && initial_unconstrained_norm > radius
+    {
+        let oversize = (initial_unconstrained_norm / radius - 1.0).max(0.0);
+        (oversize * max_abs_diag).clamp(1.0e-12, 1.0e18)
+    } else {
+        0.0
+    };
+
+    let radius_tol = (1.0e-3 * radius).max(1.0e-12);
+    let mut best: Option<(Array1<f64>, f64, f64)> = None;
+    for _hebden_iter in 0..8 {
+        let mut lhs = h_pen_base.clone();
+        if lambda_tr > 0.0 {
+            for d in 0..total_p {
+                lhs[[d, d]] += lambda_tr;
+            }
+        }
+        let delta =
+            solver.solvevectorwithridge_retries(&lhs, rhs, JOINT_TRACE_STABILITY_RIDGE)?;
+        if !delta.iter().all(|v| v.is_finite()) {
+            // Numerical breakdown — bump λ_TR and retry.
+            lambda_tr = (lambda_tr * 4.0).max(1.0e-9);
+            continue;
+        }
+        let delta_norm = joint_trust_region_step_norm(&delta);
+        let err = (delta_norm - radius).abs();
+        if best.as_ref().is_none_or(|(_, _, e)| err < *e) {
+            best = Some((delta.clone(), lambda_tr, err));
+        }
+        if err <= radius_tol {
+            return Some((delta, lambda_tr));
+        }
+        // Hebden update: solve (H_pen + λ_TR·I) q = δ, then
+        //   λ_new = λ + (‖δ‖/‖q‖)² · (‖δ‖ − Δ)/Δ
+        let q = solver.solvevectorwithridge_retries(&lhs, &delta, JOINT_TRACE_STABILITY_RIDGE)?;
+        let q_norm = joint_trust_region_step_norm(&q);
+        if !q_norm.is_finite() || q_norm <= 0.0 {
+            break;
+        }
+        let secant = (delta_norm / q_norm).powi(2) * (delta_norm - radius) / radius;
+        let mut lambda_new = lambda_tr + secant;
+        if !lambda_new.is_finite() {
+            break;
+        }
+        if lambda_new < 0.0 {
+            // Theoretical Hebden update is non-negative for SPD systems; a
+            // negative update signals model misbehavior, fall back to a
+            // bisection step toward zero instead of crossing it.
+            lambda_new = 0.5 * lambda_tr;
+        }
+        // Cap the per-iter jump so Cholesky doesn't hit ridge-retry hell on
+        // very large updates.
+        let upper_jump = (lambda_tr.max(max_abs_diag) * 10.0).max(1.0);
+        if lambda_new > lambda_tr + upper_jump {
+            lambda_new = lambda_tr + upper_jump;
+        }
+        lambda_tr = lambda_new;
+    }
+    best.map(|(delta, lambda, _)| (delta, lambda))
 }
 
 fn apply_joint_penalized_hessian_into(
@@ -10930,50 +11038,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     2.0 * residual_tol,
                     objective_change,
                     objective_tol,
-                );
-                converged = true;
-                break;
-            }
-            let objective_flat_step_tol = joint_objective_flat_step_tol(objective_tol, step_tol);
-            // `joint_objective_flat_step_reached` proves only that the iterate
-            // sits on a numerically flat ledge of the objective: both Δobj and
-            // ‖δ‖_∞ have fallen below tolerances scaled by |obj|. That is
-            // enough to exit a slow rho-only startup, but is NOT a KKT
-            // certificate — the residual ‖∇L − Sβ‖_∞ can sit many orders above
-            // residual_tol when sqrt(obj_tol) is large relative to KKT noise
-            // (biobank-scale outer screening with inner_tol ~ 1e-4 routinely
-            // produces |obj| ~ 1e5, sqrt(obj_tol) ~ 3 — large enough that
-            // step_inf ≤ 3 admits residuals at 0.1·|obj|).
-            //
-            // Accepting such an iterate breaks the analytic envelope-theorem
-            // outer gradient (∇_ρ L_REML = ∂L/∂ρ |_β̂ holds only at KKT modulo
-            // O(‖residual‖·‖∂β/∂ρ‖)). At biobank scale this surfaces as outer
-            // BFGS stalling with |g|_∞ ≈ 1e6–1e7 — the inner mode is "flat" but
-            // not stationary, so the gradient observed by the outer is noise.
-            //
-            // The ceiling `0.01·(1 + |obj|)` keeps the rho-only biobank tail
-            // (residual ≈ 67 at |obj| ≈ 7.95e4, ratio 8e-4) firing while
-            // blocking the failure regime (residual ≳ 1e3 at |obj| ≈ 1.14e5,
-            // ratios 0.01–1). Blocked cycles fall through to budget-exhausted
-            // best-effort after running more inner-Newton steps that further
-            // contract the residual.
-            let flat_step_residual_ceiling = 0.01_f64 * (1.0 + lastobjective.abs());
-            if joint_objective_flat_step_reached(
-                objective_change,
-                accepted_step_inf,
-                objective_tol,
-                step_tol,
-            ) && residual <= flat_step_residual_ceiling
-            {
-                log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat step certificate: step_inf={:.3e} <= sqrt(obj_tol)={:.3e}, obj_change={:.3e} <= tol={:.3e}, residual={:.3e} (ceiling={:.3e})",
-                    cycle,
-                    accepted_step_inf,
-                    objective_flat_step_tol,
-                    objective_change,
-                    objective_tol,
-                    residual,
-                    flat_step_residual_ceiling,
                 );
                 converged = true;
                 break;
@@ -22381,61 +22445,6 @@ mod tests {
                 objective_tol,
             ),
             "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
-        );
-    }
-
-    #[test]
-    fn joint_objective_flat_step_accepts_rho_only_biobank_tail() {
-        // Tail from the rho-only FLEX marginal-slope startup failure:
-        //
-        //   obj=7.947730e4 Δobj=-1.890e-4 accepted_|δ|∞=2.198e-1
-        //   |β|∞=4.908e2
-        //
-        // Exact outer startup validation only needs the inner mode resolved
-        // to the outer optimizer scale. The objective has already flattened
-        // and the accepted step is below sqrt(obj_tol), so the inner solve
-        // must certify instead of running to the 100-cycle cap and rejecting
-        // every seed before the outer solver starts.
-        let objective = 7.947730e4_f64;
-        let objective_change = 1.890e-4_f64;
-        let accepted_step_inf = 2.198e-1_f64;
-        let beta_inf = 4.908e2_f64;
-        let inner_tol = 1e-5_f64;
-        let objective_tol = inner_tol * (1.0 + objective.abs());
-        let step_tol = inner_tol * (1.0 + beta_inf);
-
-        assert!(
-            joint_objective_flat_step_reached(
-                objective_change,
-                accepted_step_inf,
-                objective_tol,
-                step_tol,
-            ),
-            "rho-only exact outer seed validation should accept the numerically flat inner tail"
-        );
-
-        // ── KKT residual ceiling guard ──
-        //
-        // The flat-step predicate above accepts a numerically flat ledge of
-        // the objective regardless of KKT residual. At biobank-scale outer
-        // screening (|obj| ~ 1e5, inner_tol ~ 1e-4) the residual at the same
-        // ledge can sit at 0.1–1·|obj| — large enough to break the
-        // envelope-theorem outer gradient and stall outer BFGS with |g|_∞
-        // in the millions. The inner-loop call site pairs the predicate
-        // with `residual ≤ 0.01·(1 + |obj|)`; encode that contract here so
-        // a future relaxation cannot silently re-enable the failure regime.
-        let kkt_safe_residual = 67.0_f64; // tail residual observed in the rho-only fix
-        let kkt_unsafe_residual = 1.339e5_f64; // residual that drove outer BFGS to stall
-        let bigobj = 1.141752e5_f64; // biobank-scale objective from the failing tail
-        let residual_ceiling_small_obj = 0.01_f64 * (1.0 + objective.abs());
-        let residual_ceiling_big_obj = 0.01_f64 * (1.0 + bigobj.abs());
-        assert!(
-            kkt_safe_residual <= residual_ceiling_small_obj,
-            "rho-only biobank-tail residual ({kkt_safe_residual:.3e}) must stay under the ceiling ({residual_ceiling_small_obj:.3e}) so the flat-step rescue keeps firing on the original failure"
-        );
-        assert!(
-            kkt_unsafe_residual > residual_ceiling_big_obj,
-            "biobank-scale outer-screening residual ({kkt_unsafe_residual:.3e}) must exceed the ceiling ({residual_ceiling_big_obj:.3e}) so the flat-step rescue does NOT accept a non-KKT iterate that breaks the envelope-theorem outer gradient"
         );
     }
 
