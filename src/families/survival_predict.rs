@@ -304,17 +304,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         linear_predictor: f64,
     }
 
-    impl SurvivalPredictionRow {
-        fn invalid(t_cols: usize) -> Self {
-            Self {
-                hazard: vec![f64::NAN; t_cols],
-                survival: vec![f64::NAN; t_cols],
-                cumulative_hazard: vec![f64::NAN; t_cols],
-                linear_predictor: f64::NAN,
-            }
-        }
-    }
-
     let row_results: Result<Vec<SurvivalPredictionRow>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -410,52 +399,19 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 linear_predictor: 0.0,
             };
             if per_row_eval {
-                let (eta_t, cum_t, haz_t) = match evaluate_at(age_exit[i]) {
-                    Ok(values) => values,
-                    Err(err)
-                        if should_mark_invalid_survival_prediction_row(
-                            saved_likelihood_mode,
-                            &err,
-                        ) =>
-                    {
-                        return Ok(SurvivalPredictionRow::invalid(t_cols));
-                    }
-                    Err(err) => return Err(err),
-                };
+                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
                 row.linear_predictor = eta_t;
                 row.hazard[0] = haz_t;
                 row.cumulative_hazard[0] = cum_t;
                 row.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
-                    let (_eta_t, cum_t, haz_t) = match evaluate_at(t_query) {
-                        Ok(values) => values,
-                        Err(err)
-                            if should_mark_invalid_survival_prediction_row(
-                                saved_likelihood_mode,
-                                &err,
-                            ) =>
-                        {
-                            return Ok(SurvivalPredictionRow::invalid(t_cols));
-                        }
-                        Err(err) => return Err(err),
-                    };
+                    let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
                     row.hazard[j] = haz_t;
                     row.cumulative_hazard[j] = cum_t;
                     row.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
                 }
-                let (eta_t, _, _) = match evaluate_at(age_exit[i]) {
-                    Ok(values) => values,
-                    Err(err)
-                        if should_mark_invalid_survival_prediction_row(
-                            saved_likelihood_mode,
-                            &err,
-                        ) =>
-                    {
-                        return Ok(SurvivalPredictionRow::invalid(t_cols));
-                    }
-                    Err(err) => return Err(err),
-                };
+                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
                 row.linear_predictor = eta_t;
             }
             Ok(row)
@@ -487,14 +443,6 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         survival_se: None,
         eta_se: None,
     })
-}
-
-fn should_mark_invalid_survival_prediction_row(
-    likelihood_mode: SurvivalLikelihoodMode,
-    err: &str,
-) -> bool {
-    likelihood_mode == SurvivalLikelihoodMode::MarginalSlope
-        && err.contains("saved survival marginal-slope prediction produced invalid survival")
 }
 
 // ---------------------------------------------------------------------------
@@ -2154,24 +2102,6 @@ mod tests {
         let err = probit_survival_hazard_components(1.0, -0.5)
             .expect_err("negative derivative should be invalid");
         assert!(err.contains("invalid survival index derivative"));
-    }
-
-    #[test]
-    fn marginal_slope_invalid_survival_cells_are_row_droppable() {
-        let err =
-            "saved survival marginal-slope prediction produced invalid survival index derivative";
-        assert!(should_mark_invalid_survival_prediction_row(
-            SurvivalLikelihoodMode::MarginalSlope,
-            err
-        ));
-        assert!(!should_mark_invalid_survival_prediction_row(
-            SurvivalLikelihoodMode::Transformation,
-            err
-        ));
-        assert!(!should_mark_invalid_survival_prediction_row(
-            SurvivalLikelihoodMode::MarginalSlope,
-            "saved survival marginal-slope time coefficient mismatch"
-        ));
     }
 
     #[test]
