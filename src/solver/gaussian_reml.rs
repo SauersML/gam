@@ -807,10 +807,22 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         );
     }
 
-    // grad_penalty is left in its full p×p form. The per-helper accumulators
-    // already deliver the asymmetric VJP that matches torch.autograd.gradcheck
-    // against a generic (unconstrained) penalty input; callers who require
-    // a symmetric reduction can apply it themselves.
+    // The forward consumes `S` only through the canonicalization
+    // `S_canon = 0.5 (S + Sᵀ)`. By the chain rule, the gradient w.r.t. an
+    // input `S_input` is `0.5 (G + Gᵀ)` where `G = ∂L/∂S_canon` is what the
+    // per-helper VJPs accumulate. Symmetrize the full matrix here so a
+    // single-entry perturbation `δS = ε E_{i,j}` (asymmetric, as
+    // `torch.autograd.gradcheck` produces) sees the gradient component
+    // `0.5 (G[i,j] + G[j,i])` it expects from FD — no caller-side
+    // bookkeeping required.
+    let p = grad_penalty.nrows();
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (grad_penalty[[i, j]] + grad_penalty[[j, i]]);
+            grad_penalty[[i, j]] = avg;
+            grad_penalty[[j, i]] = avg;
+        }
+    }
     Ok(GaussianRemlBackwardResult {
         grad_x,
         grad_y,
