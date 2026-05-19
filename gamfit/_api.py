@@ -1086,10 +1086,11 @@ def gaussian_reml_fit_batched_backward(
 def gaussian_reml_fit_positions(
     t: Any,
     y: Any,
-    basis_kind: str,
+    basis_kind: str | None = None,
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
+    basis: str | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -1107,6 +1108,7 @@ def gaussian_reml_fit_positions(
     """
     import numpy as np
 
+    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
     order = _position_basis_order(basis_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
@@ -1154,10 +1156,11 @@ def gaussian_reml_fit_positions(
 def gaussian_reml_fit_positions_backward(
     t: Any,
     y: Any,
-    basis_kind: str,
+    basis_kind: str | None = None,
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
+    basis: str | None = None,
     grad_lambda: float = 0.0,
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
@@ -1179,6 +1182,7 @@ def gaussian_reml_fit_positions_backward(
     """
     import numpy as np
 
+    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
     order = _position_basis_order(basis_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
@@ -1231,10 +1235,11 @@ def gaussian_reml_fit_positions_batched(
     t: Any,
     y: Any,
     row_offsets: Any,
-    basis_kind: str,
+    basis_kind: str | None = None,
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
+    basis: str | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -1251,6 +1256,7 @@ def gaussian_reml_fit_positions_batched(
     """
     import numpy as np
 
+    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
     order = _position_basis_order(basis_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
@@ -1300,10 +1306,11 @@ def gaussian_reml_fit_positions_batched_backward(
     t: Any,
     y: Any,
     row_offsets: Any,
-    basis_kind: str,
+    basis_kind: str | None = None,
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
+    basis: str | None = None,
     grad_lambda: Any | None = None,
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
@@ -1327,6 +1334,7 @@ def gaussian_reml_fit_positions_batched_backward(
 
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
+    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
     order = _position_basis_order(basis_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
