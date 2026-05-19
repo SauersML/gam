@@ -1262,23 +1262,38 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
-/// Builds the outer-gradient convergence tolerance, optionally widening the
-/// absolute floor by `objective_scale * 1e-9` when the caller has declared the
-/// natural magnitude of the objective. The relative-from-seed component is left
-/// alone so a well-scaled cold start still gets a 1e-6 reduction requirement;
-/// the scale only matters when the relative threshold has already been
-/// satisfied and the absolute floor would otherwise force the optimizer to
-/// chase sub-ULP gradient components.
+/// Builds the outer-gradient convergence tolerance.
+///
+/// The shape is a magnitude-scaled absolute rule:
+/// `‖g‖_proj ≤ max(tolerance, objective_scale · 1e-9)`. The optional
+/// `objective_scale` widening lifts the floor so a biobank-scale fit
+/// (n=1e6, tol=1e-5 → floor 1e-3) is not forced to chase sub-ULP
+/// gradient components; the per-unit-magnitude budget of `1e-9` stays
+/// ~9 decades below typical biobank-scale seed gradients
+/// (which are 1e6+), so the floor cannot drown out real descent.
+///
+/// The relative-from-seed shape (`rel_initial_grad`) is deliberately
+/// not used. On a resumed-from-cache start the optimizer's first-iter
+/// line search can accept a near-zero step where `‖g‖ / ‖g_0‖` stays
+/// at ≈ 1, and any rel-from-seed rule then fires at the seed itself
+/// — the optimizer "converges" at the very gradient it started with,
+/// no descent achieved, the iterate is not a stationary point. Using
+/// the absolute floor only means the optimizer must drive the
+/// gradient down to a magnitude-meaningful value before it can claim
+/// convergence, which is the only honest stop criterion.
 fn outer_gradient_tolerance_with_scale(
     tolerance: f64,
     objective_scale: Option<f64>,
 ) -> GradientTolerance {
-    // 1e-9 is a deliberately tight per-unit-magnitude budget: at n=1e6
-    // and tol=1e-5 the floor becomes 1e-3, which is still ~9 decades
-    // below the seed gradient norm at biobank scale (typically 1e6+).
-    // Tighter constants leave the floor binding at convergence; looser
-    // constants risk declaring convergence at materially nonzero
-    // outer gradients.
+    let abs = outer_gradient_absolute_floor(tolerance, objective_scale);
+    GradientTolerance::absolute(abs)
+}
+
+/// Effective absolute-gradient floor: the scalar tolerance, widened
+/// to `objective_scale · 1e-9` when the caller has declared the
+/// objective's natural magnitude. Used both as opt's gradient
+/// tolerance and as the shared cross-check elsewhere in the runner.
+fn outer_gradient_absolute_floor(tolerance: f64, objective_scale: Option<f64>) -> f64 {
     let mut abs = tolerance;
     if let Some(scale) = objective_scale {
         let scaled_floor = scale * 1.0e-9;
@@ -1286,12 +1301,7 @@ fn outer_gradient_tolerance_with_scale(
             abs = scaled_floor;
         }
     }
-    GradientTolerance {
-        abs,
-        rel_initial_grad: Some(tolerance),
-        rel_cost: None,
-        projected: true,
-    }
+    abs
 }
 
 fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
@@ -3621,103 +3631,6 @@ fn solution_into_outer_result(
     }
 }
 
-/// Effective absolute-gradient floor for outer-solution certification.
-///
-/// Mirrors the `abs` component of [`outer_gradient_tolerance_with_scale`]:
-/// the scalar tolerance, widened to `objective_scale · 1e-9` when the
-/// caller has declared the objective's natural magnitude. The rel-from-
-/// seed (`rel_initial_grad`) and rel-from-cost (`rel_cost`) components
-/// are NOT mirrored here — that's exactly the relative shape we refuse
-/// to trust on the certification side, because the optimizer's first-
-/// iter line search can accept a near-zero step where the ratio
-/// `‖g‖ / ‖g_0‖` stays at ≈ 1 and the relative rule fires without any
-/// real descent. The absolute floor is the one part of opt's threshold
-/// that has a magnitude meaning rather than a "fraction of the seed"
-/// meaning, so it's the safe component to certify against.
-fn outer_gradient_absolute_floor(tolerance: f64, objective_scale: Option<f64>) -> f64 {
-    let mut abs = tolerance;
-    if let Some(scale) = objective_scale {
-        let scaled_floor = scale * 1.0e-9;
-        if scaled_floor > abs {
-            abs = scaled_floor;
-        }
-    }
-    abs
-}
-
-/// Sanity-check a gradient-based optimizer's "converged" claim against
-/// the actual final gradient.
-///
-/// Opt's [`GradientTolerance`] threshold is the maximum of an absolute
-/// component, a `rel_initial_grad · ‖g_0‖` component, and a `rel_cost ·
-/// (1 + |f_0|)` component. The relative-from-seed component is the
-/// trust hazard: on a resumed-from-cache start where the first-iter
-/// line search accepts a near-zero step, `‖g‖ / ‖g_0‖` stays at ≈ 1
-/// and the rule can fire at iter 1 with a gradient still far from
-/// zero — the optimizer reports "Converged by gradient", but the
-/// iterate is not a stationary point.
-///
-/// This helper enforces only the absolute-with-magnitude-scaling rule:
-/// `‖g‖_∞ ≤ abs_floor · (1 + ‖x‖_∞)`, where `abs_floor` matches opt's
-/// own `abs` component (including the `objective_scale` widening for
-/// biobank-scale Gaussian fits — see
-/// [`outer_gradient_absolute_floor`]). When the strict rule fails,
-/// the iterate is kept as the best point reached, but the `converged`
-/// certification is downgraded so the cache-save gate (which keys off
-/// [`OuterResult::converged`]) does not persist a non-stationary point
-/// for future runs to resume from.
-fn validate_outer_gradient_convergence(solution: &Solution, abs_floor: f64) -> bool {
-    let Some(gradient) = solution.final_gradient.as_ref() else {
-        // No final gradient surfaced (e.g. derivative-free or fixed-point
-        // exit). The optimizer's own status governs in that case — this
-        // helper is specifically for gradient-based solvers.
-        return true;
-    };
-    let g_inf = gradient.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    if !g_inf.is_finite() {
-        return false;
-    }
-    let x_inf = solution
-        .final_point
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    g_inf <= abs_floor * (1.0 + x_inf)
-}
-
-/// Apply [`validate_outer_gradient_convergence`] to a "successful"
-/// optimizer outcome and log when the converged flag is being
-/// downgraded. The point itself is retained: a non-stationary iterate is
-/// still the best one found, but it must not enter the warm-start cache
-/// as a converged result.
-fn certify_outer_solution(
-    solution: Solution,
-    config: &OuterConfig,
-    plan_used: OuterPlan,
-) -> OuterResult {
-    let abs_floor = outer_gradient_absolute_floor(config.tolerance, config.objective_scale);
-    let converged = validate_outer_gradient_convergence(&solution, abs_floor);
-    if !converged {
-        let g_inf = solution
-            .final_gradient
-            .as_ref()
-            .map(|g| g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())))
-            .unwrap_or(f64::NAN);
-        let x_inf = solution
-            .final_point
-            .iter()
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        log::info!(
-            "[OUTER {plan}] optimizer reported success but gradient |g|_inf={:.3e} > abs_floor*(1+|x|_inf)={:.3e} (tolerance={:.3e}, objective_scale={:?}); downgrading converged flag (point retained for warm-start, not cache-saved)",
-            g_inf,
-            abs_floor * (1.0 + x_inf),
-            config.tolerance,
-            config.objective_scale,
-            plan = plan_used,
-        );
-    }
-    solution_into_outer_result(solution, converged, plan_used)
-}
-
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 struct OuterConfig {
@@ -4991,7 +4904,7 @@ fn run_outer_with_plan(
                             .with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(certify_outer_solution(sol, &config, *the_plan)),
+                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
@@ -5164,7 +5077,7 @@ fn run_outer_with_plan(
                     ),
                 }
                 match outcome {
-                    Ok(sol) => Ok(certify_outer_solution(sol, &config, *the_plan)),
+                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
@@ -5509,19 +5422,30 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn outer_gradient_tolerance_does_not_scale_with_raw_cost() {
+    fn outer_gradient_tolerance_is_absolute_only() {
+        // The shape is intentionally abs-only: a rel-from-seed (or
+        // rel-from-cost) component can fire at iter 1 on a resumed-
+        // from-cache start where the line search accepts a near-zero
+        // step, and the optimizer "converges" at the very gradient it
+        // started with. The runner relies on the abs floor being the
+        // sole exit gate.
         let tol = outer_gradient_tolerance_with_scale(1e-5, None);
+        assert_eq!(tol.abs, 1e-5);
+        assert_eq!(tol.rel_initial_grad, None);
         assert_eq!(tol.rel_cost, None);
-        assert_eq!(tol.rel_initial_grad, Some(1e-5));
-        assert!((tol.threshold(1.0e9, 2.0) - 2.0e-5).abs() < 1e-14);
+        // Threshold equals abs at every (seed_cost, g_0) — the relative
+        // components are off, so the seed gradient norm cannot widen
+        // the exit window.
+        assert!((tol.threshold(1.0e9, 2.0) - 1.0e-5).abs() < 1e-14);
+        assert!((tol.threshold(0.0, 0.0) - 1.0e-5).abs() < 1e-14);
     }
 
     #[test]
     fn outer_gradient_tolerance_with_scale_widens_absolute_floor_for_large_scale() {
-        // Without a scale: abs == tol (legacy behavior).
+        // Without a scale: abs == tol.
         let unscaled = outer_gradient_tolerance_with_scale(1e-7, None);
         assert_eq!(unscaled.abs, 1e-7);
-        assert_eq!(unscaled.rel_initial_grad, Some(1e-7));
+        assert_eq!(unscaled.rel_initial_grad, None);
 
         // With scale = 1e6 (biobank n): abs floor lifts to 1e-3.
         let big = outer_gradient_tolerance_with_scale(1e-7, Some(1.0e6));
@@ -5530,10 +5454,10 @@ mod tests {
             "expected abs ≈ 1e-3 for scale=1e6, got {}",
             big.abs
         );
-        // The relative-from-seed component is independent of scale: it
-        // still requires a `tol`-relative reduction from the seed
-        // gradient norm.
-        assert_eq!(big.rel_initial_grad, Some(1e-7));
+        // The widening lives entirely in `abs`; no relative component
+        // is reintroduced by the scale.
+        assert_eq!(big.rel_initial_grad, None);
+        assert_eq!(big.rel_cost, None);
 
         // Scale below 1 leaves abs at the bare `tol` (max with floor).
         let small = outer_gradient_tolerance_with_scale(1e-7, Some(10.0));
@@ -5556,6 +5480,21 @@ mod tests {
         assert_eq!(
             nan_scaled.abs, 1e-7,
             "NaN scale must not lift the abs floor"
+        );
+    }
+
+    #[test]
+    fn outer_gradient_absolute_floor_lifts_with_objective_scale() {
+        // Helper used both as opt's gradient tolerance and as a
+        // shared cross-check elsewhere; the contract is the magnitude-
+        // scaled floor without the relative components.
+        assert_eq!(outer_gradient_absolute_floor(1e-5, None), 1e-5);
+        // scale*1e-9 below tolerance leaves the floor at tolerance.
+        assert_eq!(outer_gradient_absolute_floor(1e-5, Some(100.0)), 1e-5);
+        // scale*1e-9 above tolerance lifts the floor.
+        assert!(
+            (outer_gradient_absolute_floor(1e-5, Some(1.0e6)) - 1.0e-3).abs() < 1e-14,
+            "n=1e6 should lift the abs floor to 1e-3"
         );
     }
 
