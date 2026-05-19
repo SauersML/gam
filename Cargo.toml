@@ -74,7 +74,7 @@ sha2 = "0.11"
 # crate still builds on hosts without a CUDA toolkit installed and the
 # probe in `src/gpu/runtime.rs` simply returns CPU-only when the driver
 # isn't there.
-cudarc = "0.16"
+cudarc = "0.19"
 
 [dependencies.general-mcmc]
 package = "general-mcmc"

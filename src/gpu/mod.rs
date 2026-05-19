@@ -39,7 +39,9 @@ pub use dispatch::{
     try_fast_xt_diag_y, try_solve_lower_triangular_matrix, try_solve_upper_triangular_matrix,
 };
 pub use policy::DispatchPolicy;
-pub use runtime::{GpuProbeError, GpuRuntime, gpu_available, selected_gpu_info, warm};
+pub use runtime::{
+    GpuProbeError, GpuRuntime, cuda_context_for, gpu_available, selected_gpu_info, warm,
+};
 pub use solver::{
     describe_chol_solve_route, try_chol_solve_inplace, try_cholesky_batched_lower_inplace,
     try_cholesky_lower_inplace, try_syevd_inplace, will_attempt_chol_solve,
