@@ -5,7 +5,7 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family,
+    fit_custom_family, fit_custom_family_fixed_log_lambda_warm_start,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::fast_av;
@@ -15471,31 +15471,37 @@ pub fn fit_survival_marginal_slope_terms(
         // before the real outer optimizer starts.
         pilot_options.compute_covariance = false;
         pilot_options.inner_max_cycles = pilot_options.inner_max_cycles.min(12);
-        match inner_fit(&rigid_family, &rigid_blocks, &pilot_options) {
-            Ok(rigid_fit) => {
+        match fit_custom_family_fixed_log_lambda_warm_start(
+            &rigid_family,
+            &rigid_blocks,
+            &pilot_options,
+        ) {
+            Ok((block_beta, converged, cycles)) => {
                 let mut hints_mut = hints.borrow_mut();
-                if let Some(block) = rigid_fit.block_states.get(0) {
-                    hints_mut.time_beta = Some(block.beta.clone());
+                if let Some(beta) = block_beta.first() {
+                    hints_mut.time_beta = Some(beta.clone());
                 }
-                if let Some(block) = rigid_fit.block_states.get(1) {
-                    hints_mut.marginal_beta = Some(block.beta.clone());
+                if let Some(beta) = block_beta.get(1) {
+                    hints_mut.marginal_beta = Some(beta.clone());
                 }
-                if let Some(block) = rigid_fit.block_states.get(2) {
-                    hints_mut.logslope_beta = Some(block.beta.clone());
+                if let Some(beta) = block_beta.get(2) {
+                    hints_mut.logslope_beta = Some(beta.clone());
                 }
                 if score_warp_prepared.is_some() {
-                    if let Some(block) = rigid_fit.block_states.get(3) {
-                        hints_mut.score_warp_beta = Some(block.beta.clone());
+                    if let Some(beta) = block_beta.get(3) {
+                        hints_mut.score_warp_beta = Some(beta.clone());
                     }
                 }
                 if link_dev_prepared.is_some() {
                     let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                    if let Some(block) = rigid_fit.block_states.get(link_idx) {
-                        hints_mut.link_dev_beta = Some(block.beta.clone());
+                    if let Some(beta) = block_beta.get(link_idx) {
+                        hints_mut.link_dev_beta = Some(beta.clone());
                     }
                 }
                 log::info!(
-                    "[survival-marginal-slope/pilot] end status=ok elapsed={:.3}s",
+                    "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s",
+                    if converged { "converged" } else { "partial" },
+                    cycles,
                     pilot_started.elapsed().as_secs_f64(),
                 );
             }
@@ -16519,7 +16525,9 @@ mod tests {
             "eta", "d", "h[0,0]", "h[1,1]", "h[0,0]+h[1,1]", "|h00|+|h11|", "cancel_frac"
         );
 
-        for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 100.0, 500.0, 988.0] {
+        for &eta in &[
+            0.5_f64, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 100.0, 500.0, 988.0,
+        ] {
             for &d in &[0.0_f64, 1.0] {
                 let (_nll, _grad, hess) = row_primary_closed_form(
                     eta,
