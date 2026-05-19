@@ -15701,9 +15701,15 @@ pub fn fit_survival_marginal_slope_terms(
         let mut pilot_options = options.clone();
         // The pilot is only a warm start. Avoid production covariance assembly
         // and cap inner cycles so a bad seed cannot silently consume minutes
-        // before the real outer optimizer starts.
+        // before the real outer optimizer starts. Empirically, biobank-scale
+        // survival pilots descend the joint objective by ~5 orders of
+        // magnitude in the first 10 cycles and then enter a trust-region-
+        // clipped tail; 30 cycles is a budget that catches the descent
+        // shoulder without burning into the long tail. At ~0.5s/cycle for
+        // a 350k-row LOSO fold that's ~15s — within the "no silent
+        // minutes" envelope this cap protects.
         pilot_options.compute_covariance = false;
-        pilot_options.inner_max_cycles = pilot_options.inner_max_cycles.min(12);
+        pilot_options.inner_max_cycles = pilot_options.inner_max_cycles.min(30);
         match fit_custom_family_fixed_log_lambda_warm_start(
             &rigid_family,
             &rigid_blocks,
