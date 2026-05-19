@@ -425,12 +425,14 @@ pub fn try_fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.xt_diag_y(x, w, x)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_xt_diag_y(x, w, x).or_else(|| {
+        with_runtime(|runtime| runtime.xt_diag_y(x, w, x)).map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "xt_diag_x",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("rows={rows} cols={cols}"),
                 diagnostics::gemm_flops(cols, cols, rows),
                 diagnostics::bytes_for_f64(x.len().saturating_mul(2).saturating_add(w.len())),
@@ -468,12 +470,14 @@ pub fn try_fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<E
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.xt_diag_y(x, w, y)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_xt_diag_y(x, w, y).or_else(|| {
+        with_runtime(|runtime| runtime.xt_diag_y(x, w, y)).map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "xt_diag_y",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("rows={rows} lhs_cols={} rhs_cols={}", x.ncols(), y.ncols()),
                 diagnostics::gemm_flops(x.ncols(), y.ncols(), rows),
                 diagnostics::bytes_for_f64(x.len().saturating_add(y.len()).saturating_add(w.len())),
@@ -722,6 +726,63 @@ fn plan_for_cublas(
         mapped.push((idx, devices[idx].clone(), plan.chunks));
     }
     Some(mapped)
+}
+
+fn try_multi_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
+    x: &ArrayBase<S1, Ix2>,
+    w: &ArrayBase<S2, Ix1>,
+    y: &ArrayBase<S3, Ix2>,
+) -> Option<(Array2<f64>, Vec<GpuDeviceInfo>)>
+{
+    let rows = x.nrows();
+    let x_cols = x.ncols();
+    let y_cols = y.ncols();
+    if rows == 0 || x_cols == 0 || y_cols == 0 || rows != w.len() || rows != y.nrows() {
+        return None;
+    }
+    let fixed_bytes_per_device =
+        diagnostics::bytes_for_f64(x_cols.checked_mul(y_cols)?);
+    let bytes_per_row = diagnostics::bytes_for_f64(x_cols.checked_add(y_cols)?.checked_add(1)?);
+    let plan = plan_for_cublas(rows, fixed_bytes_per_device, bytes_per_row)?;
+    if plan.len() <= 1 {
+        return None;
+    }
+    let runtimes = cublas_runtimes();
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            let owned_chunks = chunks
+                .into_iter()
+                .map(|rows_range| {
+                    (
+                        x.slice(s![rows_range.clone(), ..]).to_owned(),
+                        w.slice(s![rows_range.clone()]).to_owned(),
+                        y.slice(s![rows_range, ..]).to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            handles.push(scope.spawn(move || {
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                let mut partial = Array2::<f64>::zeros((x_cols, y_cols));
+                for (x_chunk, w_chunk, y_chunk) in owned_chunks {
+                    let chunk_out = runtime.xt_diag_y(&x_chunk, &w_chunk, &y_chunk)?;
+                    partial += &chunk_out;
+                }
+                Some((partial, device))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect::<Option<Vec<_>>>()
+    })?;
+    let mut out = Array2::<f64>::zeros((x_cols, y_cols));
+    let mut devices = Vec::with_capacity(partials.len());
+    for (partial, device) in partials {
+        out += &partial;
+        devices.push(device);
+    }
+    Some((out, devices))
 }
 
 fn try_multi_gemm_strided_batched(
