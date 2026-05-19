@@ -375,19 +375,25 @@ impl InteractiveVisualizer {
             };
             let window = (max_y - min_y).max(1.0);
 
+            // Order matters: ratatui's Chart draws datasets in declaration
+            // order, so the LAST dataset wins overlaps. We want the accepted
+            // descent line visible on top of the trial scatter — without
+            // this swap the light-blue dots cover the cyan line wherever
+            // the optimizer accepted a probe, making the descent invisible
+            // on solvers with high accept ratios (BFGS, late ARC).
             let datasets = vec![
-                Dataset::default()
-                    .name("Accepted")
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(Color::Cyan))
-                    .data(&cost_accepted),
                 Dataset::default()
                     .name("Trial")
                     .marker(symbols::Marker::Dot)
                     .graph_type(GraphType::Scatter)
                     .style(Style::default().fg(Color::LightBlue))
                     .data(&cost_trial),
+                Dataset::default()
+                    .name("Accepted")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Cyan))
+                    .data(&cost_accepted),
             ];
 
             let chart = Chart::new(datasets)
@@ -399,7 +405,15 @@ impl InteractiveVisualizer {
                 )
                 .x_axis(
                     Axis::default()
-                        .title("Outer Iteration")
+                        // The chart axis is keyed by the bridge-eval counter
+                        // (one tick per `record_outer_eval`), not by the
+                        // optimizer's iter index. Each accepted outer iter
+                        // typically produces 1-3 evals depending on the
+                        // solver (BFGS: 1, ARC: ~2, MFTR-operator: 1), so
+                        // "Outer Eval" is the honest label — calling it
+                        // "Outer Iteration" would imply a denser-than-actual
+                        // accept rate on multi-eval solvers.
+                        .title("Outer Eval")
                         .bounds([0.0, iter.max(10.0)])
                         .labels(vec![
                             Line::from("0"),

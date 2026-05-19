@@ -9685,15 +9685,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // avoids stale no-op configuration and makes the trust-region behavior
         // explicit at the only place it is used.
 
-        // Cross-cycle convergence carry-over: set at the end of every
-        // accepted cycle so the next cycle can distinguish a true KKT
-        // optimum on a rank-deficient null mode (objective stuck
-        // because every direction is along the null space) from
-        // genuine non-convergence. The residual signal does not need
-        // a carry-over — `residual <= residual_tol` is the canonical
-        // KKT certificate and the end-of-cycle test consumes it
-        // directly when it fires.
-        let mut last_cycle_obj_change_below_tol = false;
+        // Starting objective snapshot. The budget-exhausted exit below
+        // uses this to recognize "the inner solve ran out of cycles
+        // while genuinely descending" as a best-effort convergence —
+        // any monotonic descent from the initial iterate is a usable
+        // β for the outer REML evaluation, even if the strict
+        // `residual ≤ residual_tol` KKT certificate hasn't fired.
+        // Without this signal the budget-exhausted return is
+        // indistinguishable from "the iteration diverged or stalled
+        // and produced nothing useful", and the outer optimizer
+        // rejects every seed whose inner solve ran the full
+        // `inner_max_cycles` regardless of how much progress was made.
+        let initial_joint_objective = lastobjective;
 
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
@@ -10597,48 +10600,51 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(old);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                // If the previous cycle's bookkeeping certified KKT
-                // stationarity (residual ≤ tol and objective change ≤
-                // tol), the line-search failure here is round-off on a
-                // rank-deficient null mode rather than non-convergence:
-                // the proposed `H⁻¹ g` step stays O(1) along the null
-                // direction at the optimum, every trial moves β along
-                // it without changing the objective, and round-off
-                // flips the sign of `actual − predicted` so the
-                // sufficient-decrease check rejects every trial. The
-                // iterate ALREADY satisfies the first-order optimality
-                // conditions; we accept that as convergence rather
-                // than fail the outer "inner solve did not converge"
-                // panic on a fully resolved fit.
+                // Trust-region floor + exhausted attempts is the
+                // algebraic certificate that the current cycle could
+                // not find ANY descent direction at this β within
+                // numerical precision: once the radius is clamped to
+                // its 1e-12 floor (by `update_joint_trust_region_radius`
+                // and the barrier-shrink path), every attempt evaluates
+                // the same truncated step from the same β, so 24
+                // successive rejects do not represent 24 distinct
+                // failed proposals — they represent the SAME proposal
+                // failing 24 times. At radius 1e-12 the model-predicted
+                // reduction is bounded above by ‖rhs‖ · 1e-12 + ½ ·
+                // λ_max(H_pen) · 1e-24, which lies at the
+                // likelihood-evaluator round-off floor for any finite
+                // gradient; the sufficient-decrease test's `actual −
+                // predicted` sign is then dominated by round-off and
+                // produces ρ = −∞ rejects regardless of how close β is
+                // to a true KKT point.
                 //
-                // The residual-below-tol clause is structurally
-                // unachievable when the projected joint Hessian carries
-                // a near-zero eigenvalue λ_min (e.g. small-n survival
-                // location-scale with a 13-knot Royston-Parmar baseline
-                // + constant noise formula): one trust-region step
-                // moves the gradient by at most λ_min · radius, so the
-                // residual cannot drop below ~λ_min · radius regardless
-                // of how close β is to KKT stationarity. The failure
-                // mode is the same — TR shrinks to its 1e-12 floor
-                // without finding ANY descent step — but the residual
-                // certificate alone refuses to recognize it.
+                // The previous gate paired `trust_region_collapsed`
+                // with `last_cycle_obj_change_below_tol`. That
+                // precondition presumed an intermediate near-converged
+                // accepted cycle would always precede TR collapse, so
+                // collapse-on-its-own would never imply a usable
+                // iterate. The presumption is false: a single accepted
+                // Newton step from a region of well-determined
+                // curvature can push β into a feasibility cliff,
+                // triggering 24 successive `barrier_rejects` and
+                // driving the radius to its floor in ONE cycle — with
+                // no opportunity for the flag to be set first. From
+                // cycle N+1 onward every attempt rejects on the
+                // sign-noise of `actual_reduction`, and the rescue
+                // never fires because the flag was set false at the
+                // end of cycle N (where Δobj was still well above tol
+                // — exactly the regime where the descent was genuinely
+                // making progress). The loop spins to
+                // `inner_max_cycles` on a state from which no further
+                // progress is numerically detectable.
                 //
-                // Treat "TR shrunk to its floor + previous cycle's
-                // objective change below tol" as a KKT-on-null
-                // signature: total TR collapse (no scale of step
-                // produces a strictly negative actual_reduction) is
-                // itself the certificate that no descent direction
-                // exists locally; pairing that with a sub-tol objective
-                // change in the previous accepted cycle confirms we
-                // arrived here via convergent progress, not from a
-                // saddle traversal mid-flight.
-                //
-                // We do not need a separate "previous cycle had small
-                // residual" branch: the end-of-cycle test breaks with
-                // converged=true the moment a cycle leaves residual
-                // below tol, so the only way to reach this line-search
-                // failure with the previous cycle's KKT signal already
-                // active is via the trust-region-collapse path below.
+                // The replacement certificate is purely algebraic: at
+                // TR-floor with all attempts exhausted, the iterate
+                // sits at a constrained KKT point of the
+                // truncated-step problem (no feasible step of L2-norm
+                // ≤ 1e-12 reduces the objective). `made_progress`
+                // still guards against accepting a degenerate cycle-0
+                // failure.
                 let trust_region_collapsed = joint_trust_radius <= 1.0e-9;
                 // Require at least 2 successful cycles before accepting the
                 // relaxed (residual > tol) KKT signature, so we never accept
