@@ -6,6 +6,7 @@ use crate::custom_family::{
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
     fit_custom_family, fit_custom_family_fixed_log_lambda_warm_start,
+    joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::fast_av;
@@ -15652,6 +15653,7 @@ pub fn fit_survival_marginal_slope_terms(
         let psi_dim = setup.theta0().len() - setup.rho_dim();
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
+    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
     let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
@@ -15733,7 +15735,7 @@ pub fn fit_survival_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_shared(
                 &family,
                 &blocks,
-                options,
+                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
@@ -15777,7 +15779,7 @@ pub fn fit_survival_marginal_slope_terms(
             let eval = evaluate_custom_family_joint_hyper_efs_shared(
                 &family,
                 &blocks,
-                options,
+                &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
                 &rho,
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
