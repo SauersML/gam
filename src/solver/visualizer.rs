@@ -1203,18 +1203,7 @@ fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> 
             if let Some(eta) = estimate_eta(model, lane) {
                 parts.push(format!("ETA: {eta}"));
             }
-            if model.current_cost.is_finite() {
-                parts.push(format!(
-                    "objective={}",
-                    format_metric(model.current_cost, "{:.4}")
-                ));
-            }
-            if model.current_grad.is_finite() {
-                parts.push(format!(
-                    "|grad|={}",
-                    format_metric(model.current_grad, "{:.3e}")
-                ));
-            }
+            append_optimizer_metrics(&mut parts, model);
             parts.join(" | ")
         }
         _ => {
@@ -1222,20 +1211,48 @@ fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> 
                 format!("{prefix}: {}", lane.label),
                 format!("step={}", lane.current),
             ];
-            if model.current_cost.is_finite() {
-                parts.push(format!(
-                    "objective={}",
-                    format_metric(model.current_cost, "{:.4}")
-                ));
-            }
-            if model.current_grad.is_finite() {
-                parts.push(format!(
-                    "|grad|={}",
-                    format_metric(model.current_grad, "{:.3e}")
-                ));
-            }
+            append_optimizer_metrics(&mut parts, model);
             parts.join(" | ")
         }
+    }
+}
+
+/// Append the optimizer-progress fields (objective + best-so-far + signed Δ
+/// vs previous accepted + gradient norm) to a dumb-mode lane line. Centralised
+/// so both branches in `render_dumb_lane` show the same trail of fields, and
+/// new optimizer metrics (e.g. trust-region radius, accept rho) can be added
+/// in one place. The Δ field needs ≥ 2 accepted samples; until then we omit
+/// it rather than print "Δ=n/a" which competes for line width with the
+/// existing ETA / |grad| fields.
+fn append_optimizer_metrics(parts: &mut Vec<String>, model: &VisualizerModel) {
+    if model.current_cost.is_finite() {
+        let mut obj = format!("objective={}", format_metric(model.current_cost, "{:.4}"));
+        let has_best = model.best_cost.is_finite() && model.best_cost.abs() < 1e15;
+        let has_delta = model.history_cost_accepted.len() >= 2;
+        if has_best || has_delta {
+            let mut extras: Vec<String> = Vec::new();
+            if has_best {
+                extras.push(format!(
+                    "best={}",
+                    format_metric(model.best_cost, "{:.4}")
+                ));
+            }
+            if has_delta {
+                let n = model.history_cost_accepted.len();
+                let last = model.history_cost_accepted[n - 1].1;
+                let prev = model.history_cost_accepted[n - 2].1;
+                let delta = last - prev;
+                extras.push(format!("Δ={:+.3e}", delta));
+            }
+            obj.push_str(&format!(" ({})", extras.join(", ")));
+        }
+        parts.push(obj);
+    }
+    if model.current_grad.is_finite() {
+        parts.push(format!(
+            "|grad|={}",
+            format_metric(model.current_grad, "{:.3e}")
+        ));
     }
 }
 
