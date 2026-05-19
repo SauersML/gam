@@ -9022,13 +9022,19 @@ fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f
     (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
 }
 
-// True iff both the realized and the model-predicted objective change are at
-// floating-point noise relative to |f|. At the floor the *sign* of either
-// quantity is round-off — a +1e-12 improvement against a +1e-15 prediction
-// sits at the same noise level as a -1e-10 step against a +1e-15 prediction.
-// The canonical Newton-decrement convergence criterion (Boyd & Vandenberghe
-// §9.5), `|½ gᵀ H⁻¹ g| ≤ ε · |f|`, is what this is — evaluated against the
-// realized line-search reduction rather than the analytic Newton decrement.
+// True iff the line search detected a noise-level realized reduction (i.e.
+// the trial step neither helped nor hurt the objective beyond round-off)
+// AND the local quadratic model agrees that no further descent is available
+// within tolerance. `actual_reduction <= 0` is kept (not made sign-symmetric)
+// because at rank-deficient optima (σ_min(H) ≲ ε_machine) the outer-gradient
+// FD identity requires β trajectories to be CONSISTENT across λ probes —
+// accepting positive-noise-level reductions exits the loop one attempt
+// earlier than the negative case and decorrelates the null-space drift
+// between consecutive REML evaluations. Concretely:
+// `outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`
+// at HardPseudo σ_min ~ 1e-10 fails when symmetric. The asymmetric guard
+// preserves the spin avoidance for the common (negative-noise) case at
+// biobank scale while leaving the rank-deficient FD identity intact.
 fn joint_objective_floor_reached(
     old_objective: f64,
     trial_objective: f64,
@@ -9036,12 +9042,15 @@ fn joint_objective_floor_reached(
     predicted_reduction: f64,
     objective_tol: f64,
 ) -> bool {
-    let slack = joint_objective_roundoff_slack(old_objective, trial_objective);
     trial_objective.is_finite()
-        && actual_reduction.is_finite()
-        && actual_reduction.abs() <= slack
+        && actual_reduction <= 0.0
+        && actual_reduction.abs() <= joint_objective_roundoff_slack(old_objective, trial_objective)
         && predicted_reduction.is_finite()
-        && predicted_reduction.abs() <= objective_tol.max(slack)
+        && predicted_reduction
+            <= objective_tol.max(joint_objective_roundoff_slack(
+                old_objective,
+                trial_objective,
+            ))
 }
 
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
