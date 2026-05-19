@@ -14,8 +14,10 @@
 //! `false` and the dispatch policy stays unused. There are no environment
 //! variables or CLI flags involved in any of this.
 
+use std::any::Any;
 use std::fmt;
 use std::ops::Range;
+use std::panic;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,11 +81,7 @@ fn libcublas_candidates() -> &'static [&'static str] {
     } else if cfg!(target_os = "macos") {
         &["libcublas.dylib", "/usr/local/cuda/lib/libcublas.dylib"]
     } else {
-        &[
-            "libcublas.so.12",
-            "libcublas.so.11",
-            "libcublas.so",
-        ]
+        &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
     }
 }
 
@@ -136,7 +134,14 @@ impl GpuRuntime {
     }
 
     fn probe() -> Self {
-        match probe_cuda_devices() {
+        let probe_result = match panic::catch_unwind(probe_cuda_devices) {
+            Ok(result) => result,
+            Err(payload) => Err(GpuProbeError::DriverLibraryMissing(format!(
+                "CUDA loader panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ))),
+        };
+        match probe_result {
             Ok(mut devices) => {
                 debug_assert!(!devices.is_empty());
                 devices.sort_by(|a, b| {
@@ -301,6 +306,16 @@ impl GpuRuntime {
             self.dispatch_cursor.fetch_add(1, Ordering::Relaxed) % len
         }
     }
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 /// Convenience: is a GPU available in this process?
