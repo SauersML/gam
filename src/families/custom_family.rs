@@ -9687,17 +9687,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // avoids stale no-op configuration and makes the trust-region behavior
         // explicit at the only place it is used.
 
-        // Starting objective snapshot. The budget-exhausted exit below
-        // uses this to recognize "the inner solve ran out of cycles
-        // while genuinely descending" as a best-effort convergence —
-        // any monotonic descent from the initial iterate is a usable
-        // β for the outer REML evaluation, even if the strict
-        // `residual ≤ residual_tol` KKT certificate hasn't fired.
-        // Without this signal the budget-exhausted return is
-        // indistinguishable from "the iteration diverged or stalled
-        // and produced nothing useful", and the outer optimizer
-        // rejects every seed whose inner solve ran the full
-        // `inner_max_cycles` regardless of how much progress was made.
+        // Starting objective snapshot. This is diagnostic only: descent
+        // without a KKT certificate is a useful warm-start, not a converged
+        // inner mode. The outer REML/LAML gradient uses the envelope theorem,
+        // which requires the inner beta to be stationary; accepting a merely
+        // descended iterate as converged makes the outer optimizer see a
+        // mathematically invalid gradient.
         let initial_joint_objective = lastobjective;
 
         let mut joint_trust_radius = 1.0_f64;
@@ -11010,71 +11005,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if cycles_done >= inner_max_cycles {
-            // Budget-exhausted graceful exit. The strict KKT
-            // certificates (`residual ≤ residual_tol`, the relaxed
-            // narrow-plateau and step-plateau variants, and the
-            // rejected-cycle TR-floor / QP-constrained-KKT rescues)
-            // did not fire within `inner_max_cycles`, but the inner
-            // iteration may still have produced a usable iterate.
-            // Two regimes reach this point at biobank scale (n on
-            // the order of 10⁵–10⁶):
-            //
-            //   * **Plateau descent**: every accepted cycle reduces
-            //     the objective by a small relative amount that
-            //     stays above `inner_tol · (1 + |obj|)`. The
-            //     iteration is at the trust-region's effective
-            //     fixed-step rate because the Newton direction
-            //     systematically over-predicts reduction by 2–3×
-            //     (third-order curvature dominates beyond the
-            //     second-order Taylor on the per-step distance).
-            //     Each step is genuine descent; running more cycles
-            //     would continue making progress but not contract
-            //     the residual to `inner_tol · |obj|` within any
-            //     reasonable horizon.
-            //
-            //   * **Pre-TR-collapse stall**: a single accepted
-            //     Newton step pushed β into a region where the
-            //     feasibility barrier or near-kernel Hessian breaks
-            //     subsequent attempts, exhausting the cycle budget
-            //     in rejected-cycle continuations. Fix A's
-            //     TR-floor certificate catches the first canonical
-            //     instance but a slow-onset variant (radius drifts
-            //     down across many cycles rather than collapsing in
-            //     one) reaches budget exhaustion without the
-            //     algebraic floor signal firing.
-            //
-            // In both regimes the iterate at exhaustion is strictly
-            // better than the starting iterate, and the outer REML
-            // optimizer's warm-start mechanism propagates this
-            // best-effort β to neighbouring ρ-evaluations
-            // consistently — FD-gradient noise is then bounded by
-            // the relative descent rate rather than the absolute
-            // KKT residual. Treating `cycles == inner_max_cycles`
-            // as a hard failure rejects every seed whose inner
-            // solve hit either regime, blocking the outer
-            // optimization on problems where the strict KKT
-            // certificate is structurally unreachable.
-            //
-            // The descent guard `lastobjective < initial_joint_objective`
-            // protects against accepting iterates from divergent
-            // trajectories: any seed that ended with a worse
-            // objective than it started is reporting model
-            // failure, not slow progress, and must still surface
-            // `converged = false`. We require a strict decrease
-            // (no roundoff slack) because at biobank scale the
-            // initial-vs-final difference is many orders of
-            // magnitude above eval noise in any genuinely
-            // descending trajectory.
-            if !converged && lastobjective < initial_joint_objective {
-                log::info!(
-                    "[PIRLS/joint-Newton] cycle={} budget-exhausted best-effort convergence: descended from {:.6e} to {:.6e} (Δ={:.3e}) over {} cycles without satisfying strict KKT (residual stays at the iteration's trust-region-limited floor); returning best-effort iterate for the outer REML evaluation",
+            if !converged {
+                log::warn!(
+                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) over {} cycles; returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
                     cycles_done,
                     initial_joint_objective,
                     lastobjective,
                     initial_joint_objective - lastobjective,
                     cycles_done,
                 );
-                converged = true;
             }
             let penalty_value =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
