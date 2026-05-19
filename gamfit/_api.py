@@ -1503,6 +1503,33 @@ def _position_basis_dim(
     return max(n - int(basis_order) - 1, 0)
 
 
+def _attach_basis_state(
+    payload: dict[str, Any],
+    *,
+    knots_or_centers: Any,
+    penalty: Any,
+    basis_kind: str,
+    basis_order: int,
+    periodic: bool,
+    period: float | None,
+) -> dict[str, Any]:
+    """Embed the resolved basis state in a REML position-fit payload.
+
+    The keys ``knots_or_centers``, ``penalty``, ``basis_kind``,
+    ``basis_order``, ``periodic``, and ``period`` are added so a caller
+    can replay the exact same basis at predict time without recomputing
+    anything — pass them straight back into ``duchon_basis_1d`` or
+    ``bspline_basis``.
+    """
+    payload["knots_or_centers"] = knots_or_centers
+    payload["penalty"] = penalty
+    payload["basis_kind"] = str(basis_kind)
+    payload["basis_order"] = int(basis_order)
+    payload["periodic"] = bool(periodic)
+    payload["period"] = None if period is None else float(period)
+    return payload
+
+
 def _resolve_position_penalty(
     penalty: Any | None,
     knots_or_centers: Any,
