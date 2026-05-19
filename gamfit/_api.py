@@ -1108,20 +1108,22 @@ def gaussian_reml_fit_positions(
     """
     import numpy as np
 
-    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
-    order = _position_basis_order(basis_kind, basis_order)
+    display_kind = str(
+        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
+    )
+    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
         knots_or_centers,
         t_np,
-        basis_kind=basis_kind,
+        basis_kind=effective_kind,
         label="knots_or_centers",
         degree=order,
     )
     penalty_np = _resolve_position_penalty(
         penalty,
         knots_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
     )
@@ -1129,7 +1131,7 @@ def gaussian_reml_fit_positions(
         out = rust_module().gaussian_reml_fit_positions(
             t_np,
             _numeric_matrix(y, "y"),
-            str(basis_kind),
+            str(effective_kind),
             knots_np,
             penalty_np,
             order,
@@ -1146,7 +1148,7 @@ def gaussian_reml_fit_positions(
         _coerce_gaussian_reml_payload(out, np),
         knots_or_centers=knots_np,
         penalty=penalty_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
         period=period,
@@ -1182,20 +1184,22 @@ def gaussian_reml_fit_positions_backward(
     """
     import numpy as np
 
-    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
-    order = _position_basis_order(basis_kind, basis_order)
+    display_kind = str(
+        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
+    )
+    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
         knots_or_centers,
         t_np,
-        basis_kind=basis_kind,
+        basis_kind=effective_kind,
         label="knots_or_centers",
         degree=order,
     )
     penalty_np = _resolve_position_penalty(
         penalty,
         knots_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
     )
@@ -1203,7 +1207,7 @@ def gaussian_reml_fit_positions_backward(
         out = rust_module().gaussian_reml_fit_positions_backward(
             t_np,
             _numeric_matrix(y, "y"),
-            str(basis_kind),
+            str(effective_kind),
             knots_np,
             penalty_np,
             float(grad_lambda),
@@ -1256,20 +1260,22 @@ def gaussian_reml_fit_positions_batched(
     """
     import numpy as np
 
-    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
-    order = _position_basis_order(basis_kind, basis_order)
+    display_kind = str(
+        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
+    )
+    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
         knots_or_centers,
         t_np,
-        basis_kind=basis_kind,
+        basis_kind=effective_kind,
         label="knots_or_centers",
         degree=order,
     )
     penalty_np = _resolve_position_penalty(
         penalty,
         knots_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
     )
@@ -1278,7 +1284,7 @@ def gaussian_reml_fit_positions_batched(
             t_np,
             _numeric_matrix(y, "y"),
             _index_vector(row_offsets, "row_offsets"),
-            str(basis_kind),
+            str(effective_kind),
             knots_np,
             penalty_np,
             order,
@@ -1295,7 +1301,7 @@ def gaussian_reml_fit_positions_batched(
         _coerce_gaussian_reml_payload(out, np),
         knots_or_centers=knots_np,
         penalty=penalty_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
         period=period,
@@ -1334,20 +1340,22 @@ def gaussian_reml_fit_positions_batched_backward(
 
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
-    basis_kind = str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
-    order = _position_basis_order(basis_kind, basis_order)
+    display_kind = str(
+        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
+    )
+    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     knots_np = _resolve_basis_locations(
         knots_or_centers,
         t_np,
-        basis_kind=basis_kind,
+        basis_kind=effective_kind,
         label="knots_or_centers",
         degree=order,
     )
     penalty_np = _resolve_position_penalty(
         penalty,
         knots_np,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=periodic,
     )
@@ -1356,7 +1364,7 @@ def gaussian_reml_fit_positions_batched_backward(
             t_np,
             _numeric_matrix(y, "y"),
             offsets,
-            str(basis_kind),
+            str(effective_kind),
             knots_np,
             penalty_np,
             _optional_batch_vector(grad_lambda, batch, "grad_lambda"),
@@ -1647,12 +1655,28 @@ def _resolve_position_penalty(
     basis_order: int,
     periodic: bool,
 ) -> Any:
-    """Resolve the canonical penalty for position-based REML helpers."""
-    import numpy as np
+    """Resolve the canonical penalty for position-based REML helpers.
 
-    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
-    penalty_kind = None if penalty is None else str(penalty).strip().lower().replace("_", "-") if isinstance(penalty, str) else None
-    if penalty is None or penalty_kind is not None:
+    Picking a basis chooses the penalty by default — pairing a basis with
+    the wrong penalty is not a recognised statistical object. Power users
+    can override with an explicit matrix in ``penalty``; the string-form
+    ``penalty="function-norm" | "triple-operator" | "difference"`` selects
+    a non-default canonical penalty for the same basis.
+
+    Basis → default penalty:
+
+    * ``"duchon"``               → function-norm (RKHS semi-norm ``∫(f^{(m)})² dx``)
+    * ``"duchon_multipenalty"``  → triple-operator (mass + tension + stiffness)
+    * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline ≡ Duchon ``m=2`` function-norm
+    * ``"bspline"``              → P-spline 2nd-difference coefficient penalty
+    """
+    if isinstance(penalty, str):
+        penalty_kind = str(penalty).strip().lower().replace("_", "-")
+    else:
+        penalty_kind = None
+
+    if isinstance(penalty, str) or penalty is None:
+        kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
         if kind in {"duchon", "duchonspline"}:
             if penalty_kind in {None, "function-norm", "functionnorm", "rkhs"}:
                 return _duchon_function_norm_penalty(
@@ -1670,16 +1694,68 @@ def _resolve_position_penalty(
                 )
                 return mass + tension + stiffness
             raise ValueError(f"unsupported Duchon penalty {penalty!r}")
-        if kind in {"bspline", "b-spline", "spline"}:
+        if kind in {"duchonmultipenalty", "duchontripleoperator"}:
+            # The triple-operator basis carries the additive sum of mass +
+            # tension + stiffness as its default single-λ penalty. The proper
+            # multi-λ entry point is the ``smoothing="adam"`` route, which
+            # accepts a length-3 ``log_lambda`` tensor and routes gradients
+            # through each component individually.
+            if penalty_kind not in {None, "triple-operator", "tripleoperator", "operator"}:
+                raise ValueError(f"unsupported duchon_multipenalty penalty {penalty!r}")
+            mass, tension, stiffness = _duchon_operator_penalties(
+                knots_or_centers,
+                m=int(basis_order),
+                periodic=False,
+                period=None,
+            )
+            return mass + tension + stiffness
+        if kind in {"bspline", "spline"}:
             if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
             s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
             return s
         if kind in {"thinplate", "thinplatespline", "tps"}:
+            # 1D thin-plate spline = cubic smoothing spline = Duchon m=2 with
+            # bending-energy ``∫(f'')² dx``. Position-API positions are 1D,
+            # so route the bending-energy penalty through the Duchon m=2
+            # function-norm helper rather than the multi-dimensional thin-plate
+            # path (which expects 2D centers and a different kernel).
             if penalty_kind not in {None, "function-norm", "functionnorm", "bending-energy", "bendingenergy"}:
                 raise ValueError(f"unsupported thin-plate penalty {penalty!r}")
-            return _thin_plate_penalty(knots_or_centers, m=int(basis_order))
+            return _duchon_function_norm_penalty(
+                knots_or_centers,
+                m=2,
+                periodic=bool(periodic),
+                period=None,
+            )
     return _numeric_matrix(penalty, "penalty")
+
+
+def _normalize_position_basis(
+    basis_kind: str,
+    basis_order: int | None,
+) -> tuple[str, int, str]:
+    """Resolve user-facing basis names to the engine's basis kind + order.
+
+    Returns ``(effective_kind, effective_order, display_kind)``.
+
+    * ``thinplate`` (1D positions): an alias for Duchon ``m=2`` — the cubic
+      smoothing spline is the canonical 1D thin-plate spline.
+    * ``duchon_multipenalty``: same engine basis as ``duchon`` (``m=2``);
+      the difference is the penalty (triple-operator vs function-norm).
+    """
+    raw = str(basis_kind)
+    kind = raw.strip().lower().replace("_", "").replace("-", "")
+    if kind in {"thinplate", "thinplatespline", "tps"}:
+        order = 2 if basis_order is None else int(basis_order)
+        return ("duchon", order, raw)
+    if kind in {"duchonmultipenalty", "duchontripleoperator"}:
+        # Engine sees a plain Duchon basis; the penalty (triple-operator
+        # combined) is constructed by `_resolve_position_penalty` from the
+        # display_kind.
+        order = 2 if basis_order is None else int(basis_order)
+        return ("duchon", order, raw)
+    return (raw, _position_basis_order(raw, basis_order), raw)
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:
