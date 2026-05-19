@@ -22,10 +22,11 @@ use ::opt::{
     FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
     HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
     ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
-    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
+    SecondOrderObjective, SecondOrderSample, Solution, StationarityKind, StepInfo, Tolerance,
+    ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Bidirectional inner-PIRLS feedback channel.
@@ -394,6 +395,16 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
+
+/// Run-length of consecutive cost-flat gradient evals tolerated before the
+/// bridge aborts BFGS with a stall snapshot. The (N+1)th near-stall eval
+/// trips — the Nth still returns its gradient to the optimizer so a
+/// single noisy plateau in the line search doesn't force an exit. opt's
+/// own `StallPolicy` doesn't fire on this regime (the cost change is
+/// well below opt's `rel_g_ok` window without the gradient norm also
+/// falling), so without an explicit exit the outer loop burns ~37s/eval
+/// on a flat-cost / non-zero-gradient region.
+const BFGS_OBJECTIVE_STALL_EVALS: usize = 3;
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1966,6 +1977,27 @@ fn finite_efs_eval_or_error(
     Ok(eval)
 }
 
+/// Snapshot of the bridge's last gradient evaluation, captured before the
+/// bridge raises a `Fatal` stall error so the BFGS driver can rebuild a
+/// `Solution` from the converged-but-flat point instead of treating it
+/// as a hard failure.
+///
+/// The bridge writes this snapshot into a shared `Mutex` slot and then
+/// aborts the inner search. The runner inspects the slot when an
+/// `ObjectiveFailed` comes back: a `Some` entry is the signal that the
+/// abort was a controlled stall exit (synthesize a `Solution`); a `None`
+/// slot means the abort was a genuine objective failure and should
+/// propagate. Carrying the snapshot via a typed slot avoids
+/// string-substring matching on the error message.
+#[derive(Clone)]
+struct OuterStallSnapshot {
+    last_point: Array1<f64>,
+    last_cost: f64,
+    last_gradient: Array1<f64>,
+    last_gradient_norm: f64,
+    iter_count: usize,
+}
+
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -1989,6 +2021,27 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
+    /// Relative cost-change threshold that classifies a gradient eval as
+    /// "flat" for stall detection. `None` disables stall detection: that
+    /// state is reserved for fits without step caps, where a plateau
+    /// hasn't been declared a regime the caller wants the bridge to
+    /// exit on.
+    objective_stall_rel_tol: Option<f64>,
+    /// Cost from the most recent gradient eval; `None` until the first
+    /// `eval_grad` lands when stall detection is enabled, then carries
+    /// forward as the previous-cost reference for the next eval.
+    last_gradient_cost: Option<f64>,
+    /// Run-length count of consecutive flat-cost gradient evals. Reset
+    /// to zero whenever the absolute cost change exceeds the stall
+    /// tolerance.
+    objective_stall_evals: usize,
+    /// Shared slot for the stall snapshot. The bridge writes a snapshot
+    /// here just before aborting via `ObjectiveEvalError::fatal`; the
+    /// runner inspects this slot when an `ObjectiveFailed` comes back
+    /// and uses a `Some` value to synthesize a `Solution` carrying an
+    /// honest `MaxIterations`/`Converged` classification. A `None` slot
+    /// signals a genuine objective failure that should propagate.
+    stall_snapshot: Arc<Mutex<Option<OuterStallSnapshot>>>,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -2077,6 +2130,51 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        // Objective-stall detection. Activates only when the caller wired
+        // a relative tolerance into the bridge (step-cap-enabled fits —
+        // the biobank-scale signal). Compares the absolute cost change
+        // against `rel_tol * (1 + max(|prev|, |curr|))`, the same
+        // relative-with-floor form opt uses for its `rel_g_ok` window
+        // but applied to the function value. A run-length threshold
+        // separates a brief plateau (line-search noise) from a genuine
+        // flat-cost / non-zero-gradient region that the surrounding BFGS
+        // has no native exit for.
+        if let (Some(rel_tol), Some(prev_cost)) =
+            (self.objective_stall_rel_tol, self.last_gradient_cost)
+        {
+            let cost_delta = (prev_cost - eval.cost).abs();
+            let tol = rel_tol * (1.0 + prev_cost.abs().max(eval.cost.abs()));
+            if cost_delta <= tol {
+                self.objective_stall_evals = self.objective_stall_evals.saturating_add(1);
+            } else {
+                self.objective_stall_evals = 0;
+            }
+            if self.objective_stall_evals > BFGS_OBJECTIVE_STALL_EVALS {
+                log::info!(
+                    "[OUTER/BFGS] terminating on objective stall: cost_delta={:.3e} tol={:.3e} stalled_evals={} cost={:.6e} |g|={:.3e}",
+                    cost_delta,
+                    tol,
+                    self.objective_stall_evals,
+                    eval.cost,
+                    g_norm,
+                );
+                *self
+                    .stall_snapshot
+                    .lock()
+                    .expect("stall snapshot mutex poisoned") = Some(OuterStallSnapshot {
+                    last_point: x.clone(),
+                    last_cost: eval.cost,
+                    last_gradient: gradient.clone(),
+                    last_gradient_norm: g_norm,
+                    iter_count: self.iter_count.saturating_add(1),
+                });
+                return Err(ObjectiveEvalError::fatal(format!(
+                    "outer BFGS objective stall: cost_delta={cost_delta:.3e} tol={tol:.3e} stalled_evals={} cost={:.6e} |g|={g_norm:.3e}",
+                    self.objective_stall_evals, eval.cost,
+                )));
+            }
+        }
+        self.last_gradient_cost = Some(eval.cost);
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -4966,6 +5064,16 @@ fn run_outer_with_plan(
                     outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                // Stall detection activates whenever any step cap is set
+                // — that's the caller's declaration that the fit is
+                // biobank-scale and may plateau at non-zero gradient.
+                // For unsuppressed fits the bridge stays in its default
+                // pass-through mode and opt's native termination
+                // criteria govern.
+                let any_step_cap_set =
+                    config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some();
+                let stall_snapshot: Arc<Mutex<Option<OuterStallSnapshot>>> =
+                    Arc::new(Mutex::new(None));
                 let objective = OuterFirstOrderBridge {
                     obj,
                     layout,
@@ -4973,6 +5081,10 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
+                    objective_stall_rel_tol: any_step_cap_set.then_some(config.tolerance),
+                    last_gradient_cost: any_step_cap_set.then_some(seed_eval.cost),
+                    objective_stall_evals: 0,
+                    stall_snapshot: Arc::clone(&stall_snapshot),
                 };
                 // Hand the precomputed (cost, gradient) seed eval to
                 // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -5026,6 +5138,19 @@ fn run_outer_with_plan(
                 let bfgs_start = std::time::Instant::now();
                 let outcome = optimizer.run();
                 let bfgs_elapsed = bfgs_start.elapsed().as_secs_f64();
+                // The stall-snapshot slot is the canonical signal that an
+                // `ObjectiveFailed` came from the bridge's controlled
+                // stall abort rather than a genuine objective failure.
+                // Drained here so both the logging and the outcome match
+                // see the same value; downstream re-locks of the slot
+                // observe `None` regardless of which path was taken.
+                let stall_snapshot_taken = match &outcome {
+                    Err(BfgsError::ObjectiveFailed { .. }) => stall_snapshot
+                        .lock()
+                        .expect("stall snapshot mutex poisoned")
+                        .take(),
+                    _ => None,
+                };
                 match &outcome {
                     Ok(sol) => log::info!(
                         "[OUTER summary] BFGS converged in {} iters elapsed={:.3}s final_value={:.6e}",
@@ -5060,6 +5185,13 @@ fn run_outer_with_plan(
                         bfgs_elapsed,
                         last_solution.final_value
                     ),
+                    Err(BfgsError::ObjectiveFailed { .. }) if stall_snapshot_taken.is_some() => {
+                        // The summary line for a controlled stall exit
+                        // is emitted in the outcome handler below where
+                        // the snapshot's iter_count and gradient are
+                        // available; suppress the generic failure line
+                        // here so the user sees one summary per run.
+                    }
                     Err(e) => log::info!(
                         "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
                         bfgs_elapsed,
@@ -5073,6 +5205,73 @@ fn run_outer_with_plan(
                     }
                     Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                    }
+                    Err(BfgsError::ObjectiveFailed { message }) => {
+                        let Some(snapshot) = stall_snapshot_taken else {
+                            return Err(EstimationError::RemlOptimizationFailed(format!(
+                                "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
+                            )));
+                        };
+                        // Controlled stall exit. Cost is flat enough that
+                        // further evals would burn time on a plateau, but
+                        // a flat cost is NOT a stationarity certificate
+                        // — the gradient can still be far from zero
+                        // (e.g. step caps pinning descent in a flat
+                        // valley away from the actual minimum, or a
+                        // poorly-conditioned inner mode whose residual
+                        // exceeds the outer-gradient sensitivity).
+                        // Classify honestly: `Converged` only when the
+                        // gradient meets the BFGS gradient tolerance;
+                        // otherwise `MaxIterations`. The downstream
+                        // cache-save gate keys off `result.converged`,
+                        // so a non-converged exit is correctly excluded
+                        // from persistence.
+                        let g_inf = snapshot
+                            .last_gradient
+                            .iter()
+                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                        let x_inf = snapshot
+                            .last_point
+                            .iter()
+                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                        let gradient_at_tol = g_inf <= config.tolerance * (1.0 + x_inf);
+                        let (status_hint, converged_flag, classification) = if gradient_at_tol {
+                            (OptimizationStatus::Converged, true, "Converged")
+                        } else {
+                            (
+                                OptimizationStatus::MaxIterations,
+                                false,
+                                "MaxIterations (gradient above tol)",
+                            )
+                        };
+                        log::info!(
+                            "[OUTER summary] BFGS exited on objective stall in {} iters elapsed={:.3}s final_value={:.6e} |g|_inf={:.3e} (1+|x|_inf)*tol={:.3e} classification={}",
+                            snapshot.iter_count,
+                            bfgs_elapsed,
+                            snapshot.last_cost,
+                            g_inf,
+                            config.tolerance * (1.0 + x_inf),
+                            classification,
+                        );
+                        let synthesized = Solution {
+                            final_point: snapshot.last_point,
+                            final_value: snapshot.last_cost,
+                            final_gradient: Some(snapshot.last_gradient),
+                            final_hessian: None,
+                            final_gradient_norm: Some(snapshot.last_gradient_norm),
+                            final_step_norm: None,
+                            stationarity_kind: StationarityKind::ProjectedGradient,
+                            iterations: snapshot.iter_count,
+                            func_evals: snapshot.iter_count,
+                            grad_evals: snapshot.iter_count,
+                            hess_evals: 0,
+                            status_hint: Some(status_hint),
+                        };
+                        Ok(solution_into_outer_result(
+                            synthesized,
+                            converged_flag,
+                            *the_plan,
+                        ))
                     }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "BFGS solver failed: {e:?}"
