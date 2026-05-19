@@ -392,7 +392,7 @@ wheels = [
 
 [[package]]
 name = "gamfit"
-version = "0.1.77"
+version = "0.1.78"
 source = { editable = "." }
 dependencies = [
     { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
