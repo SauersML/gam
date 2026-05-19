@@ -49,6 +49,7 @@ use crate::types::{
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct LinkWiggleConfig {
@@ -331,12 +332,83 @@ impl<'a> FitRequest<'a> {
             FitRequest::TransformationNormal(req) => (req.response.len(), req.data.ncols()),
         };
         format!(
-            "v{}/family={}/dims={}x{}/shape={}",
-            env!("CARGO_PKG_VERSION"),
+            "{}/family={}/dims={}x{}/shape={}",
+            crate::solver::persistent_warm_start::cache_schema_tag(),
             self.family_tag(),
             nrows,
             ncols,
             shape_hash,
+        )
+    }
+
+    /// Data-independent cache key suitable as a *seed* lookup when the
+    /// exact-key cache misses. Two fits with the same family / link /
+    /// baseline / column shape share this key even if their row counts
+    /// differ (cross-validation folds, hyperparameter sweeps, anything
+    /// re-fitting structurally identical models on related data).
+    ///
+    /// Save always goes to [`Self::cache_key`] (exact). The dispatcher
+    /// looks up this prefix only when the exact key has no entry — so a
+    /// near-match never silently overrides a perfect match.
+    pub fn cache_seed_key(&self) -> String {
+        let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
+        match self {
+            FitRequest::Standard(req) => {
+                shape.write_str("standard-seed");
+                shape.write_str(&format!("{:?}", req.family));
+                shape.write_usize(req.data.ncols());
+            }
+            FitRequest::GaussianLocationScale(req) => {
+                shape.write_str("gauss-ls-seed");
+                shape.write_usize(req.data.ncols());
+            }
+            FitRequest::BinomialLocationScale(req) => {
+                shape.write_str("binom-ls-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.link_kind));
+            }
+            FitRequest::SurvivalLocationScale(req) => {
+                shape.write_str("surv-ls-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.inverse_link));
+            }
+            FitRequest::SurvivalTransformation(req) => {
+                shape.write_str("surv-tn-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.likelihood_mode));
+                shape.write_str(&req.spec.time_build.basisname);
+            }
+            FitRequest::BernoulliMarginalSlope(req) => {
+                shape.write_str("bern-ms-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.base_link));
+            }
+            FitRequest::SurvivalMarginalSlope(req) => {
+                shape.write_str("surv-ms-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.base_link));
+                shape.write_str(&format!("{:?}", req.spec.frailty));
+            }
+            FitRequest::LatentSurvival(req) => {
+                shape.write_str("lat-surv-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.frailty));
+            }
+            FitRequest::LatentBinary(req) => {
+                shape.write_str("lat-bin-seed");
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.frailty));
+            }
+            FitRequest::TransformationNormal(req) => {
+                shape.write_str("tn-seed");
+                shape.write_usize(req.data.ncols());
+            }
+        }
+        format!(
+            "{}/family={}/seed/{}",
+            crate::solver::persistent_warm_start::cache_schema_tag(),
+            self.family_tag(),
+            shape.finish_hex(),
         )
     }
 
@@ -1607,18 +1679,52 @@ fn fit_transformation_normal_model(
 }
 
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
-    // Single warm-start chokepoint: open a persistent cache session keyed
-    // on the FitRequest's family-shape fingerprint and attach it to the
-    // variant's BlockwiseFitOptions (or top-level slot). Family-specific
-    // fit functions then consult `options.cache_session` to seed θ from
-    // the last accepted iterate and checkpoint accepted iterates. This
-    // is what makes warm-start uniform across every model class — adding
-    // a new family does NOT require remembering to wire the cache.
+    // Single warm-start chokepoint: open a persistent cache session
+    // keyed on the FitRequest's exact family-shape fingerprint, and
+    // attach it to the variant's BlockwiseFitOptions (or top-level
+    // slot). Family-specific fit functions then consult
+    // `options.cache_session` to seed θ from the last accepted iterate
+    // and checkpoint accepted iterates. This is what makes warm-start
+    // uniform across every model class — adding a new family does NOT
+    // require remembering to wire the cache.
+    //
+    // Hierarchical near-match: if the exact key has no entry, try a
+    // data-independent seed prefix. Two fits that share the same family,
+    // link, baseline, and column structure but differ in their row sets
+    // (cross-validation folds, hyperparameter sweeps, anything refitting
+    // structurally identical models on related data) get their first
+    // fit's ρ as a seed instead of cold-starting. Save always goes to
+    // the exact key so future identical refits get exact hits.
     let mut request = request;
-    if let Some(session) = crate::solver::persistent_warm_start::open_outer_session(
-        &request.cache_key(),
-    ) {
+    let exact_key = request.cache_key();
+    let seed_key = request.cache_seed_key();
+    if let Some(session) =
+        crate::solver::persistent_warm_start::open_outer_session(&exact_key)
+    {
+        let exact_present = session.try_load().is_some();
+        if !exact_present
+            && let Some(seed) =
+                crate::solver::persistent_warm_start::lookup_outer_iterate_payload(&seed_key)
+        {
+            let prior_obj = seed.objective.unwrap_or(f64::NAN);
+            log::info!(
+                "[CACHE] seed key={}.. via prefix family={} prior_obj={:.6e}",
+                &exact_key[..8.min(exact_key.len())],
+                request.family_tag(),
+                prior_obj,
+            );
+            session.preload(seed);
+        }
         request.attach_cache_session(session);
+    }
+    // Mirror finalize to the seed-prefix keyspace so the *next* fit with
+    // related-but-not-identical structure can pick this run's ρ up via
+    // the prefix lookup above. The mirror runs lazily on result —
+    // checkpoints during the run only write to the exact key.
+    let mirror_session =
+        crate::solver::persistent_warm_start::open_outer_session(&seed_key);
+    if let Some(mirror) = mirror_session.as_ref() {
+        request.attach_cache_mirror(Arc::clone(mirror));
     }
     match request {
         FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
