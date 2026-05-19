@@ -3121,6 +3121,11 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             eval.cost,
             g_norm,
         );
+        // Live-chart trial sample (matrix-free TR operator bridge). Each
+        // accepted outer iter calls eval_value_grad_op exactly once — HVPs
+        // inside the inner CG do not flow through here — so this push
+        // matches one bridge eval per chart x-tick.
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         Ok(OperatorSample {
             value: eval.cost,
             gradient: eval.gradient,
