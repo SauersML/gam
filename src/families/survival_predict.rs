@@ -686,7 +686,7 @@ fn evaluate_marginal_slope_row(
 
 #[inline]
 fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f64, f64), String> {
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
         return Err(format!(
             "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
         ));
@@ -698,7 +698,11 @@ fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f
     // both log Phi(-eta) and the stable Mills ratio phi(eta) / Phi(-eta).
     let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
     let cumulative_hazard = -log_survival;
-    let hazard = mills_ratio * eta_derivative;
+    let hazard = if eta_derivative == 0.0 {
+        0.0
+    } else {
+        mills_ratio * eta_derivative
+    };
     // `>= 0.0` rejects NaN (a programming-bug signal) and accepts the full
     // mathematical range [0, +∞]. Saturated probit fits where the model
     // genuinely says S(t)→0 produce a +∞ cumulative hazard — that is the
@@ -2034,9 +2038,17 @@ mod tests {
     }
 
     #[test]
-    fn probit_survival_hazard_rejects_nonpositive_time_derivative() {
-        let err = probit_survival_hazard_components(1.0, 0.0)
-            .expect_err("zero derivative should be invalid");
+    fn probit_survival_hazard_accepts_zero_time_derivative_as_flat_hazard() {
+        let (cum, hazard) =
+            probit_survival_hazard_components(1.0, 0.0).expect("zero derivative is flat hazard");
+        assert!(cum > 0.0);
+        assert_eq!(hazard, 0.0);
+    }
+
+    #[test]
+    fn probit_survival_hazard_rejects_infinite_time_derivative() {
+        let err = probit_survival_hazard_components(1.0, f64::INFINITY)
+            .expect_err("infinite derivative should be invalid");
         assert!(err.contains("invalid survival index derivative"));
     }
 
