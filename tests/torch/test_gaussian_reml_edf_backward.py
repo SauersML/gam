@@ -26,11 +26,16 @@ _FD_STEP = 1e-5
 
 
 def _make_penalty(p: int, rng: np.random.Generator) -> np.ndarray:
-    """Build a positive-semidefinite ``(p, p)`` penalty with a one-dim null
-    space so the REML problem is non-trivial but well posed."""
+    """Build a positive-definite ``(p, p)`` penalty.
+
+    A small diagonal ridge keeps the smallest eigenvalue well clear of the
+    REML core's PSD tolerance so finite-difference perturbations (which break
+    exact symmetry on individual entries) do not push the matrix into the
+    ill-conditioned rejection band.
+    """
 
     a = rng.standard_normal((p, p - 1))
-    return (a @ a.T).astype(np.float64)
+    return (a @ a.T + 1e-2 * np.eye(p)).astype(np.float64)
 
 
 def _problem(seed: int = 0, n: int = 15, p: int = 4, d: int = 2):
