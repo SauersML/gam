@@ -4149,7 +4149,25 @@ impl OuterProblem {
         if let Some(entry) = session.try_load() {
             if let Some(payload) = decode_iterate(&entry.payload, self.n_params) {
                 let cached_rho = Array1::from_vec(payload.rho);
-                if config
+                // Validation-on-load: confirm the prior objective recorded
+                // in the entry is finite. The full re-evaluation contract
+                // (re-eval at cached θ on the *current* problem) requires
+                // calling into the objective, which OuterStrategy holds as
+                // a separate borrow — that's a Phase-3 fold-in. The basic
+                // finiteness check here already rejects corrupt or NaN-
+                // tagged payloads that decode_iterate accepts shape-wise.
+                let prior_obj = entry.objective.unwrap_or(f64::NAN);
+                let prior_finite = prior_obj.is_finite();
+                let rho_finite = cached_rho.iter().all(|v| v.is_finite());
+                if !prior_finite || !rho_finite {
+                    log::info!(
+                        "[CACHE] skip key={}.. context={} reason=non-finite-payload prior_obj={:.6e} all_rho_finite={}",
+                        short_key,
+                        context,
+                        prior_obj,
+                        rho_finite,
+                    );
+                } else if config
                     .initial_rho
                     .as_ref()
                     .is_none_or(|rho| rho != &cached_rho)
@@ -4159,7 +4177,7 @@ impl OuterProblem {
                         short_key,
                         context,
                         cached_rho.len(),
-                        entry.objective.unwrap_or(f64::NAN),
+                        prior_obj,
                         entry.iteration.unwrap_or(0),
                     );
                     config.initial_rho = Some(cached_rho);
@@ -4167,10 +4185,11 @@ impl OuterProblem {
                     had_hit = true;
                 } else {
                     log::info!(
-                        "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned",
+                        "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned prior_obj={:.6e}",
                         short_key,
                         context,
                         cached_rho.len(),
+                        prior_obj,
                     );
                     had_hit = true;
                 }
