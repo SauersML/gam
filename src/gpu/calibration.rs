@@ -60,9 +60,11 @@ impl DeviceCalibration {
     }
 }
 
-/// Measure throughput for a single CUDA device. Returns `None` if any step
-/// (cuBLAS init, allocation, dgemm, memcpy, synchronize) fails — the
-/// runtime then drops that device from the active set.
+/// Measure throughput for a single CUDA device. Returns `Err(reason)` if
+/// any step (bind, cuBLAS init, allocation, dgemm, memcpy, synchronize)
+/// fails — the runtime logs that reason and drops the device from the
+/// active set. The `Err` string names the failed step and the cudarc
+/// driver error so the user can see why GPU dispatch is unavailable.
 ///
 /// The caller is responsible for owning the `Arc<CudaContext>` for the
 /// device under test (typically the runtime probe via
@@ -311,21 +313,28 @@ fn bytes_per_sec(bytes: usize, seconds: f64) -> f64 {
 /// Best-of-N: run `f` `n` times, return the maximum result. The fastest
 /// run is closest to the un-throttled peak; slower runs include thermal
 /// dips, OS preemption, and host-side scheduler noise.
-fn best_of_n_transfer<F>(n: usize, mut f: F) -> Option<f64>
+fn best_of_n_transfer<F>(n: usize, mut f: F) -> Result<f64, String>
 where
-    F: FnMut() -> Option<f64>,
+    F: FnMut() -> Result<f64, String>,
 {
     let mut best = f64::NEG_INFINITY;
     let mut any = false;
+    let mut last_err: Option<String> = None;
     for _ in 0..n {
-        if let Some(value) = f() {
-            if value.is_finite() && value > best {
+        match f() {
+            Ok(value) if value.is_finite() && value > best => {
                 best = value;
                 any = true;
             }
+            Ok(_) => {}
+            Err(e) => last_err = Some(e),
         }
     }
-    if any { Some(best) } else { None }
+    if any {
+        Ok(best)
+    } else {
+        Err(last_err.unwrap_or_else(|| format!("no usable sample across {n} iterations")))
+    }
 }
 
 #[cfg(test)]
