@@ -4143,18 +4143,52 @@ impl OuterProblem {
         let Some(session) = config.cache_session.clone() else {
             return run_outer(obj, &config, context);
         };
-        if let Some(entry) = session.try_load()
-            && let Some(payload) = decode_iterate(&entry.payload, self.n_params)
-        {
-            let cached_rho = Array1::from_vec(payload.rho);
-            if config
-                .initial_rho
-                .as_ref()
-                .is_none_or(|rho| rho != &cached_rho)
-            {
-                config.initial_rho = Some(cached_rho);
-                config.screen_initial_rho = false;
+        let key_hex = session.key().to_hex();
+        let short_key = &key_hex[..8.min(key_hex.len())];
+        let mut had_hit = false;
+        if let Some(entry) = session.try_load() {
+            if let Some(payload) = decode_iterate(&entry.payload, self.n_params) {
+                let cached_rho = Array1::from_vec(payload.rho);
+                if config
+                    .initial_rho
+                    .as_ref()
+                    .is_none_or(|rho| rho != &cached_rho)
+                {
+                    log::info!(
+                        "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
+                        short_key,
+                        context,
+                        cached_rho.len(),
+                        entry.objective.unwrap_or(f64::NAN),
+                        entry.iteration.unwrap_or(0),
+                    );
+                    config.initial_rho = Some(cached_rho);
+                    config.screen_initial_rho = false;
+                    had_hit = true;
+                } else {
+                    log::info!(
+                        "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned",
+                        short_key,
+                        context,
+                        cached_rho.len(),
+                    );
+                    had_hit = true;
+                }
+            } else {
+                log::info!(
+                    "[CACHE] skip key={}.. context={} reason=payload-shape-mismatch n_params={}",
+                    short_key,
+                    context,
+                    self.n_params,
+                );
             }
+        } else {
+            log::info!(
+                "[CACHE] miss key={}.. context={} reason=fresh-fingerprint n_params={}",
+                short_key,
+                context,
+                self.n_params,
+            );
         }
         let mut checkpointing = CheckpointingObjective::new(obj, Arc::clone(&session));
         let result = run_outer(&mut checkpointing, &config, context);
@@ -4163,11 +4197,21 @@ impl OuterProblem {
             && let Some(bytes) =
                 encode_iterate(&result.rho, result.final_value, result.iterations as u64)
         {
-            session.finalize(
+            let saved = session.finalize(
                 &bytes,
                 Some(result.final_value),
                 Some(result.iterations as u64),
             );
+            if saved {
+                log::info!(
+                    "[CACHE] save key={}.. context={} final_obj={:.6e} iter={} resumed={}",
+                    short_key,
+                    context,
+                    result.final_value,
+                    result.iterations,
+                    had_hit,
+                );
+            }
         }
         result
     }

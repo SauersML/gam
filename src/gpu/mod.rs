@@ -24,10 +24,12 @@ pub mod dispatch;
 mod driver;
 pub mod policy;
 pub mod runtime;
+pub mod session;
 pub mod solver;
 pub mod sparse;
 
 pub use diagnostics::{flush_gpu_activity_summary, gpu_activity_summary};
+pub use session::{DeviceXSession, try_fast_xt_diag_x_arc};
 
 pub use device::GpuDeviceInfo;
 pub use dispatch::{

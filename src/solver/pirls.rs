@@ -1701,8 +1701,14 @@ impl<'a> GamWorkingModel<'a> {
                 // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as a single
                 // device GEMM after row-scaling. The signed weights are
                 // preserved because the device kernel forms `Xᵀ (W X)`
-                // without any sqrt clipping. CPU-only builds continue through
-                // the host streaming path.
+                // without any sqrt clipping. The resident variant keeps X
+                // on the device across PIRLS iterations — on biobank shapes
+                // (n≈3e5) that saves ~84 MiB of H2D traffic per Newton step.
+                if let Some(out) =
+                    crate::gpu::try_fast_xt_diag_x_arc(&x_dense, weights)
+                {
+                    return Ok(out);
+                }
                 if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), weights) {
                     return Ok(out);
                 }
@@ -6977,7 +6983,14 @@ fn solve_penalized_least_squares_implicit(
                 let p = x_dense.ncols();
                 let x_dense = x_dense.to_dense_arc();
                 // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as one device GEMM.
-                if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights) {
+                // Prefer the resident-X session so this XᵀWX site shares the
+                // upload with the PIRLS cache build above when the design Arc
+                // is reused.
+                if let Some(out) = crate::gpu::try_fast_xt_diag_x_arc(&x_dense, &weights) {
+                    out
+                } else if let Some(out) =
+                    crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights)
+                {
                     out
                 } else {
                     if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
