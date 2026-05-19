@@ -29,6 +29,30 @@ class GaussianRemlOutput(NamedTuple):
     edf: torch.Tensor
 
 
+class GaussianRemlPositionOutput(NamedTuple):
+    """Forward outputs for position-based REML wrappers.
+
+    Adds the resolved basis state to :class:`GaussianRemlOutput` so the
+    caller can replay the exact same basis at predict time without having
+    to thread or recompute ``knots_or_centers``. Pass these fields back
+    into :func:`gamfit.torch.duchon_basis_1d` /
+    :func:`gamfit.torch.bspline_basis` and the basis is guaranteed to
+    match the one used during the fit.
+    """
+
+    coefficients: torch.Tensor
+    fitted: torch.Tensor
+    lam: torch.Tensor
+    reml_score: torch.Tensor
+    edf: torch.Tensor
+    knots_or_centers: torch.Tensor
+    penalty: torch.Tensor
+    basis_kind: str
+    basis_order: int
+    periodic: bool
+    period: float | None
+
+
 def _scalar_grad(grad: torch.Tensor | None) -> float:
     if grad is None:
         return 0.0
@@ -647,7 +671,19 @@ def gaussian_reml_fit_positions(
         init_lambda,
         by_start_col,
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
+    return GaussianRemlPositionOutput(
+        coefficients,
+        fitted,
+        lam,
+        reml_score,
+        edf,
+        knots_t,
+        penalty_t,
+        str(basis_kind),
+        int(order),
+        bool(periodic),
+        None if period is None else float(period),
+    )
 
 
 def gaussian_reml_fit_positions_batched(
@@ -717,4 +753,16 @@ def gaussian_reml_fit_positions_batched(
         init_lambda,
         by_start_col,
     )
-    return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
+    return GaussianRemlPositionOutput(
+        coefficients,
+        fitted,
+        lam,
+        reml_score,
+        edf,
+        knots_t,
+        penalty_t,
+        str(basis_kind),
+        int(order),
+        bool(periodic),
+        None if period is None else float(period),
+    )
