@@ -3025,6 +3025,18 @@ fn fit_dataset_impl(
     formula: String,
     config_json: Option<&str>,
 ) -> Result<Vec<u8>, String> {
+    // Always-on progress for the Python bindings: every gamfit fit call
+    // installs a visualizer session so the [OUTER step] log stream is
+    // accompanied by the `Workflow: Fit | step=N | objective=… (best=…,
+    // Δ=±…) | |grad|=…` lane and the `Descent: ▇▆▄▃▂▁` sparkline. The
+    // session goes through DumbVisualizer in Python land (stdout/stderr
+    // are virtually never TTYs under the gamfit import), so output is
+    // throttled stderr writes — safe for notebooks and batch scripts.
+    // Session is owned by this function so its Drop runs (clearing the
+    // static ACTIVE_FEED) before the result is handed back to Python.
+    let mut progress = gam::visualizer::VisualizerSession::new(true);
+    progress.set_stage("fit", "optimizing penalized likelihood");
+    progress.start_workflow_open_ended("Fit");
     let fit_config = parse_fit_config(config_json)?;
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
