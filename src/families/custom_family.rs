@@ -16486,6 +16486,25 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         // cap, but tightening this bound is cheap belt-and-suspenders
         // against any path that bypasses the projected-kernel fix.
         .with_rho_bound(10.0);
+    // Attach the workflow-level warm-start session if one was threaded
+    // through. This makes the custom-family outer optimizer (BFGS / ARC
+    // depending on derivative capabilities) use the same persistent
+    // cache infrastructure as standard REML — every accepted outer step
+    // is checkpointed to disk, every fit starts by consulting the disk
+    // for a prior best iterate. Without this, every survival-marginal-
+    // slope / GAMLSS / latent fit starts cold even when a converged ρ
+    // from a near-identical prior fit is sitting in `~/.cache/gam/warm`.
+    let problem = if let Some(session) = options.cache_session.clone() {
+        let key_hex = session.key().to_hex();
+        log::info!(
+            "[CACHE] attach key={}.. family-tag={} backend=outer-strategy",
+            &key_hex[..8.min(key_hex.len())],
+            std::any::type_name::<F>().rsplit("::").next().unwrap_or("?"),
+        );
+        problem.with_cache_session(session)
+    } else {
+        problem
+    };
 
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
