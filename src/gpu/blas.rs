@@ -33,12 +33,15 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.gemm(a, b, false, false)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_ab(a, b).or_else(|| {
+        with_runtime(|runtime| runtime.gemm(a, b, false, false))
+            .map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "gemm",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("m={m} n={n} k={k} trans_a=false trans_b=false"),
                 diagnostics::gemm_flops(m, n, k),
                 diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
@@ -300,12 +303,15 @@ pub fn try_fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.gemm(a, b, true, false)) {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
+    match try_multi_atb(a, b).or_else(|| {
+        with_runtime(|runtime| runtime.gemm(a, b, true, false))
+            .map(|(out, device)| (out, vec![device]))
+    }) {
+        Some((out, devices)) => {
+            diagnostics::log_gpu_success_multi(
                 "atb",
                 "cuBLAS",
-                &device,
+                &devices,
                 format!("rows={rows} cols={cols} rhs={rhs}"),
                 diagnostics::gemm_flops(cols, rhs, rows),
                 diagnostics::bytes_for_f64(a.len().saturating_add(b.len())),
@@ -728,20 +734,121 @@ fn plan_for_cublas(
     Some(mapped)
 }
 
+fn try_multi_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+) -> Option<(Array2<f64>, Vec<GpuDeviceInfo>)> {
+    let (rows, inner) = a.dim();
+    let (b_rows, cols) = b.dim();
+    if rows == 0 || inner == 0 || cols == 0 || inner != b_rows {
+        return None;
+    }
+    let fixed_bytes_per_device = diagnostics::bytes_for_f64(inner.checked_mul(cols)?);
+    let bytes_per_row = diagnostics::bytes_for_f64(inner.checked_add(cols)?);
+    let plan = plan_for_cublas(rows, fixed_bytes_per_device, bytes_per_row)?;
+    if plan.len() <= 1 {
+        return None;
+    }
+    let runtimes = cublas_runtimes();
+    let b_owned = b.to_owned();
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            let b_device = b_owned.clone();
+            let owned_chunks = chunks
+                .into_iter()
+                .map(|rows_range| (rows_range.clone(), a.slice(s![rows_range, ..]).to_owned()))
+                .collect::<Vec<_>>();
+            handles.push(scope.spawn(move || {
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                let mut out_chunks = Vec::with_capacity(owned_chunks.len());
+                for (rows_range, a_chunk) in owned_chunks {
+                    let chunk_out = runtime.gemm(&a_chunk, &b_device, false, false)?;
+                    out_chunks.push((rows_range, chunk_out));
+                }
+                Some((out_chunks, device))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect::<Option<Vec<_>>>()
+    })?;
+    let mut out = Array2::<f64>::zeros((rows, cols));
+    let mut devices = Vec::with_capacity(partials.len());
+    for (chunks, device) in partials {
+        devices.push(device);
+        for (rows_range, chunk) in chunks {
+            out.slice_mut(s![rows_range, ..]).assign(&chunk);
+        }
+    }
+    Some((out, devices))
+}
+
+fn try_multi_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+) -> Option<(Array2<f64>, Vec<GpuDeviceInfo>)> {
+    let (rows, cols) = a.dim();
+    let (b_rows, rhs) = b.dim();
+    if rows == 0 || cols == 0 || rhs == 0 || rows != b_rows {
+        return None;
+    }
+    let fixed_bytes_per_device = diagnostics::bytes_for_f64(cols.checked_mul(rhs)?);
+    let bytes_per_row = diagnostics::bytes_for_f64(cols.checked_add(rhs)?);
+    let plan = plan_for_cublas(rows, fixed_bytes_per_device, bytes_per_row)?;
+    if plan.len() <= 1 {
+        return None;
+    }
+    let runtimes = cublas_runtimes();
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan.len());
+        for (runtime_idx, device, chunks) in plan {
+            let owned_chunks = chunks
+                .into_iter()
+                .map(|rows_range| {
+                    (
+                        a.slice(s![rows_range.clone(), ..]).to_owned(),
+                        b.slice(s![rows_range, ..]).to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            handles.push(scope.spawn(move || {
+                let mut runtime = runtimes[runtime_idx].lock().ok()?;
+                let mut partial = Array2::<f64>::zeros((cols, rhs));
+                for (a_chunk, b_chunk) in owned_chunks {
+                    let chunk_out = runtime.gemm(&a_chunk, &b_chunk, true, false)?;
+                    partial += &chunk_out;
+                }
+                Some((partial, device))
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().ok().flatten())
+            .collect::<Option<Vec<_>>>()
+    })?;
+    let mut out = Array2::<f64>::zeros((cols, rhs));
+    let mut devices = Vec::with_capacity(partials.len());
+    for (partial, device) in partials {
+        out += &partial;
+        devices.push(device);
+    }
+    Some((out, devices))
+}
+
 fn try_multi_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
-) -> Option<(Array2<f64>, Vec<GpuDeviceInfo>)>
-{
+) -> Option<(Array2<f64>, Vec<GpuDeviceInfo>)> {
     let rows = x.nrows();
     let x_cols = x.ncols();
     let y_cols = y.ncols();
     if rows == 0 || x_cols == 0 || y_cols == 0 || rows != w.len() || rows != y.nrows() {
         return None;
     }
-    let fixed_bytes_per_device =
-        diagnostics::bytes_for_f64(x_cols.checked_mul(y_cols)?);
+    let fixed_bytes_per_device = diagnostics::bytes_for_f64(x_cols.checked_mul(y_cols)?);
     let bytes_per_row = diagnostics::bytes_for_f64(x_cols.checked_add(y_cols)?.checked_add(1)?);
     let plan = plan_for_cublas(rows, fixed_bytes_per_device, bytes_per_row)?;
     if plan.len() <= 1 {
