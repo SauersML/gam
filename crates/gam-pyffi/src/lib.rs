@@ -20,6 +20,7 @@ use gam::families::survival_predict::{
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
+    gaussian_reml_free_b_score,
     gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
@@ -41,7 +42,8 @@ use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    build_duchon_basis, create_basis, create_difference_penalty_matrix,
+    build_duchon_basis, build_duchon_operator_penalty_matrices, build_thin_plate_penalty_matrix,
+    create_basis, create_difference_penalty_matrix,
     create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
@@ -282,8 +284,11 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "validate_formula",
             "design_matrix_array",
             "basis",
+            "duchon_operator_penalties",
+            "thin_plate_penalty",
             "gaussian_weighted_ridge_array",
             "gaussian_weighted_ridge_batch",
+            "gaussian_reml_score",
             "gaussian_reml_fit",
             "gaussian_reml_fit_backward",
             "gaussian_reml_fit_batched",
@@ -511,6 +516,96 @@ fn smoothness_penalty<'py>(
         penalty.into_pyarray(py).unbind(),
         null_basis.into_pyarray(py).unbind(),
     ))
+}
+
+#[pyfunction(signature = (centers, m = 2, periodic = false, period = None))]
+fn duchon_operator_penalties<'py>(
+    py: Python<'py>,
+    centers: PyReadonlyArray1<'py, f64>,
+    m: usize,
+    periodic: bool,
+    period: Option<f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if periodic {
+        return Err(py_value_error(
+            "periodic Duchon operator penalties are not defined for the triple-operator collocation constructor"
+                .to_string(),
+        ));
+    } else {
+        validate_position_period("duchon", centers.as_array(), false, period)
+            .map_err(py_value_error)?;
+    }
+    if m == 0 {
+        return Err(py_value_error("Duchon m must be at least 1".to_string()));
+    }
+    let center_matrix = column_array(centers.as_array());
+    let matrices = build_duchon_operator_penalty_matrices(
+        center_matrix.view(),
+        None,
+        None,
+        0,
+        duchon_nullspace_from_m(m),
+        None,
+        None,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok((
+        matrices.mass.into_pyarray(py).unbind(),
+        matrices.tension.into_pyarray(py).unbind(),
+        matrices.stiffness.into_pyarray(py).unbind(),
+    ))
+}
+
+#[pyfunction(signature = (centers, m = 2, length_scale = 1.0))]
+fn thin_plate_penalty<'py>(
+    py: Python<'py>,
+    centers: PyReadonlyArray2<'py, f64>,
+    _m: usize,
+    length_scale: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let matrix = build_thin_plate_penalty_matrix(centers.as_array(), length_scale)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(matrix.penalty.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (x, y, coefficients, log_lambda, penalty, weights = None, by = None, by_start_col = 0))]
+fn gaussian_reml_score<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    coefficients: PyReadonlyArray2<'py, f64>,
+    log_lambda: f64,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    by: Option<PyReadonlyArray1<'py, f64>>,
+    by_start_col: usize,
+) -> PyResult<Py<PyDict>> {
+    let x_view = x.as_array();
+    let by_view = by.as_ref().map(|b| b.as_array());
+    let gated_x;
+    let fit_x = if let Some(by_values) = by_view {
+        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
+        gated_x.view()
+    } else {
+        x_view
+    };
+    let score = gaussian_reml_free_b_score(
+        fit_x,
+        y.as_array(),
+        coefficients.as_array(),
+        log_lambda,
+        penalty.as_array(),
+        weights.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    let out = PyDict::new(py);
+    out.set_item("reml_score", score.reml_score)?;
+    out.set_item("grad_coefficients", score.grad_coefficients.into_pyarray(py))?;
+    out.set_item("grad_log_lambda", score.grad_log_lambda)?;
+    out.set_item("fitted", score.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", score.sigma2.into_pyarray(py))?;
+    out.set_item("edf", score.edf)?;
+    Ok(out.unbind())
 }
 
 #[pyfunction(signature = (x, y, penalty, weights, ridge_lambda))]
@@ -2726,16 +2821,6 @@ fn validate_position_period(
     period: Option<f64>,
 ) -> Result<(), String> {
     if periodic {
-        let Some(period) = period else {
-            return Err(format!(
-                "{label} periodic position basis requires an explicit period"
-            ));
-        };
-        if !period.is_finite() || period <= 0.0 {
-            return Err(format!(
-                "{label} period must be finite and positive; got {period}"
-            ));
-        }
         let left = knots_or_centers
             .iter()
             .fold(f64::INFINITY, |a, &b| a.min(b));
@@ -2748,9 +2833,20 @@ fn validate_position_period(
             ));
         }
         let implied = right - left;
-        if (implied - period).abs() > 1.0e-10 * period.max(1.0) {
+        if let Some(period) = period {
+            if !period.is_finite() || period <= 0.0 {
+                return Err(format!(
+                    "{label} period must be finite and positive; got {period}"
+                ));
+            }
+            if (implied - period).abs() > 1.0e-10 * period.max(1.0) {
+                return Err(format!(
+                    "{label} periodic support range ({implied}) must match explicit period ({period})"
+                ));
+            }
+        } else if label != "duchon" {
             return Err(format!(
-                "{label} periodic support range ({implied}) must match explicit period ({period})"
+                "{label} periodic position basis requires an explicit period"
             ));
         }
     } else if period.is_some() {
@@ -2934,10 +3030,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
+    module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
     module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;

@@ -626,6 +626,106 @@ pub fn gaussian_reml_score_derivatives(
     })
 }
 
+pub fn gaussian_reml_free_b_score(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    coefficients: ArrayView2<'_, f64>,
+    log_lambda: f64,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlFreeBScore, EstimationError> {
+    if !log_lambda.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML log_lambda must be finite; got {log_lambda}"
+        )));
+    }
+    let lambda = log_lambda.exp();
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
+    let n = x.nrows();
+    let p = x.ncols();
+    let d = y.ncols();
+    validate_gaussian_reml_design(x, penalty, weights)?;
+    if y.nrows() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML row mismatch: X has {n} rows but Y has {}",
+            y.nrows()
+        )));
+    }
+    if coefficients.dim() != (p, d) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML coefficient shape mismatch: expected {p}x{d}, got {}x{}",
+            coefficients.nrows(),
+            coefficients.ncols()
+        )));
+    }
+    if y.iter().chain(coefficients.iter()).any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "Gaussian REML inputs must be finite".to_string(),
+        ));
+    }
+
+    let weight = gaussian_reml_weights(n, weights)?;
+    let cache = gaussian_reml_eigen_cache(x, penalty, None, Some(weight.view()))?;
+    if n <= cache.nullity {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
+            cache.nullity
+        )));
+    }
+    let nu = n as f64 - cache.nullity as f64;
+    let fitted = dense_ab(x, coefficients);
+    let residual = y.to_owned() - &fitted;
+    let xtw_residual = dense_xt_diag_y(x, weight.view(), residual.view());
+    let s_beta = dense_ab(penalty, coefficients);
+
+    let mut logdet_h = cache.logdet_xtwx;
+    let mut trace_h = 0.0;
+    let mut edf = 0.0;
+    for &delta in &cache.penalty_eigenvalues {
+        let t = lambda * delta;
+        logdet_h += (1.0 + t).ln();
+        if delta > 0.0 {
+            trace_h += t / (1.0 + t);
+        }
+        edf += 1.0 / (1.0 + t);
+    }
+    let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * log_lambda;
+    let mut reml_score = 0.5 * (d as f64) * (logdet_h - logdet_s);
+    let mut grad_log_lambda = 0.5 * (d as f64) * (trace_h - cache.penalty_rank as f64);
+    let mut grad_coefficients = Array2::<f64>::zeros((p, d));
+    let mut sigma2 = Array1::<f64>::zeros(d);
+
+    for output in 0..d {
+        let mut weighted_rss = 0.0;
+        for row in 0..n {
+            let r = residual[[row, output]];
+            weighted_rss += weight[row] * r * r;
+        }
+        let beta_col = coefficients.column(output);
+        let s_beta_col = s_beta.column(output);
+        let penalty_quadratic = beta_col.dot(&s_beta_col);
+        let dp = (weighted_rss + lambda * penalty_quadratic).max(MIN_DEVIANCE);
+        sigma2[output] = dp / nu;
+        reml_score += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
+        grad_log_lambda += 0.5 * nu * lambda * penalty_quadratic / dp;
+        let scale = nu / dp;
+        for coeff in 0..p {
+            grad_coefficients[[coeff, output]] =
+                scale * (-xtw_residual[[coeff, output]] + lambda * s_beta[[coeff, output]]);
+        }
+    }
+
+    Ok(GaussianRemlFreeBScore {
+        reml_score,
+        grad_coefficients,
+        grad_log_lambda,
+        fitted,
+        sigma2,
+        edf,
+    })
+}
+
 pub fn gaussian_reml_multi_closed_form_backward(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
