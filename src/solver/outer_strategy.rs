@@ -7033,12 +7033,14 @@ mod tests {
         // cannot reach the optimum in three single-iter attempts.
         let mut seed_config = crate::seeding::SeedConfig::default();
         seed_config.seed_budget = 1;
+        let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
             .with_seed_config(seed_config)
             .with_initial_rho(array![5.0])
-            .with_max_iter(1);
+            .with_max_iter(1)
+            .with_cache_session(Arc::clone(&session));
         let mut obj = problem.build_objective(
             (),
             |_: &mut (), theta: &Array1<f64>| Ok(theta[0].powi(4)),
@@ -7073,6 +7075,14 @@ mod tests {
             !result.converged,
             "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
+        );
+        let cached = session
+            .try_load()
+            .expect("non-converged run should leave a best-known checkpoint");
+        assert_eq!(
+            cached.kind,
+            crate::cache::EntryKind::Checkpoint,
+            "non-converged outer results must not be promoted to final warm starts"
         );
     }
 
