@@ -203,13 +203,16 @@ pub fn to_i64(value: usize) -> Option<i64> {
 
 /// Repack a 2D `ndarray::ArrayBase` (row-major) into the column-major
 /// layout expected by every cuBLAS / cuSOLVER entry point.
+///
+/// Walks each column once via ndarray's iter (no per-element bounds checks)
+/// and extends into a pre-sized `Vec`. On biobank-shape inputs (n≈3×10⁵,
+/// p≈35) this replaces a per-element `a[[row, col]]` indexing loop that
+/// dominated the host side of every GPU dispatch.
 pub fn to_col_major<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Vec<f64> {
     let (rows, cols) = a.dim();
-    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+    let mut out: Vec<f64> = Vec::with_capacity(rows.saturating_mul(cols));
     for col in 0..cols {
-        for row in 0..rows {
-            out.push(a[[row, col]]);
-        }
+        out.extend(a.column(col).iter().copied());
     }
     out
 }
@@ -217,13 +220,15 @@ pub fn to_col_major<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Vec<f64> {
 /// Convert a column-major flat buffer back into row-major `Array2<f64>`.
 pub fn from_col_major_inplace(values: &[f64], out: &mut Array2<f64>) {
     let (rows, cols) = out.dim();
+    debug_assert_eq!(values.len(), rows.saturating_mul(cols));
     for col in 0..cols {
-        for row in 0..rows {
-            out[[row, col]] = values[col * rows + row];
-        }
+        let src = ndarray::ArrayView1::from(&values[col * rows..(col + 1) * rows]);
+        out.column_mut(col).assign(&src);
     }
 }
 
 pub fn from_col_major(values: &[f64], rows: usize, cols: usize) -> Array2<f64> {
-    Array2::from_shape_fn((rows, cols), |(row, col)| values[col * rows + row])
+    let mut out = Array2::<f64>::zeros((rows, cols));
+    from_col_major_inplace(values, &mut out);
+    out
 }
