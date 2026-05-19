@@ -34,7 +34,7 @@ For users who just want the fixed-``λ`` ridge solve under any penalty,
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
@@ -141,8 +141,11 @@ def _duchon_basis_second_derivative(
     return torch.cat([radial, zeros, zeros], dim=1)
 
 
+_BasisFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
 def _quadrature_gram(
-    basis_fn: object,
+    basis_fn: _BasisFn,
     centers: torch.Tensor,
     lo: float,
     hi: float,
@@ -159,7 +162,8 @@ def _quadrature_gram(
     quad_weights = half_width * weights_ref
     basis = basis_fn(nodes, centers)
     weighted = basis * quad_weights.unsqueeze(1)
-    return weighted.t() @ basis
+    result: torch.Tensor = weighted.t() @ basis
+    return result
 
 
 def _gauss_legendre(
