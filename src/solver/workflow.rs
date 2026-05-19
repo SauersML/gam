@@ -412,6 +412,53 @@ impl<'a> FitRequest<'a> {
         )
     }
 
+    /// Attach a mirror cache session that receives a broadcast copy of
+    /// the final-result `finalize` write. Used by the dispatcher to write
+    /// the converged ρ to the data-independent seed prefix keyspace so a
+    /// future fit with related-but-not-identical structure can warm-start
+    /// from this run. Per-checkpoint writes are NOT mirrored — only the
+    /// final result is, so the broadcast overhead is one extra write per
+    /// fit, not per outer iteration.
+    pub fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        match self {
+            FitRequest::Standard(_) => {}
+            FitRequest::GaussianLocationScale(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::BinomialLocationScale(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::SurvivalLocationScale(_) => {
+                // SurvivalLocationScale doesn't carry a top-level mirror
+                // slot; it constructs BlockwiseFitOptions internally and
+                // currently doesn't propagate this. Mirroring for that
+                // variant happens via its own family-specific cache
+                // mechanism (persistent_survival_transformation_key in
+                // the standard-REML lane). The exact-key cache still
+                // fires; only the cross-variant seed broadcast is
+                // unavailable for this variant.
+            }
+            FitRequest::SurvivalTransformation(_) => {
+                // Same as SurvivalLocationScale above.
+            }
+            FitRequest::BernoulliMarginalSlope(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::SurvivalMarginalSlope(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::LatentSurvival(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::LatentBinary(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+            FitRequest::TransformationNormal(req) => {
+                req.options.cache_mirror_sessions.push(mirror);
+            }
+        }
+    }
+
     /// Attach a warm-start cache session to this request.
     ///
     /// Threads the session into the variant's BlockwiseFitOptions

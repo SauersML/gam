@@ -2095,6 +2095,13 @@ pub struct BlockwiseFitOptions {
     /// code never has to remember to wire it. This mirrors the standard
     /// REML cache wiring in `solver/estimate.rs:2701`.
     pub cache_session: Option<Arc<crate::cache::Session>>,
+    /// Optional mirror sessions that receive a copy of the final-result
+    /// finalize() write. Used by the workflow dispatcher to broadcast a
+    /// converged ρ to additional keyspace(s) — notably the data-
+    /// independent seed prefix — so future fits with related structure
+    /// can warm-start from this run. Per-checkpoint writes only go to
+    /// the primary `cache_session`; only the final result is mirrored.
+    pub cache_mirror_sessions: Vec<Arc<crate::cache::Session>>,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -2127,6 +2134,7 @@ impl Default for BlockwiseFitOptions {
             outer_score_subsample: None,
             auto_outer_subsample: false,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         }
     }
 }
@@ -16550,11 +16558,16 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     let problem = if let Some(session) = options.cache_session.clone() {
         let key_hex = session.key().to_hex();
         log::info!(
-            "[CACHE] attach key={}.. family-tag={} backend=outer-strategy",
+            "[CACHE] attach key={}.. family-tag={} backend=outer-strategy mirrors={}",
             &key_hex[..8.min(key_hex.len())],
             std::any::type_name::<F>().rsplit("::").next().unwrap_or("?"),
+            options.cache_mirror_sessions.len(),
         );
-        problem.with_cache_session(session)
+        let mut p = problem.with_cache_session(session);
+        if !options.cache_mirror_sessions.is_empty() {
+            p = p.with_cache_mirror_sessions(options.cache_mirror_sessions.clone());
+        }
+        p
     } else {
         problem
     };
