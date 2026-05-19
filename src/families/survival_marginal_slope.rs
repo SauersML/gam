@@ -2859,8 +2859,8 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    /// Two-phase auto-subsample entry: when the caller has opted in via
-    /// `options.auto_outer_subsample` and Phase 1 still has budget, this
+    /// Two-phase auto-subsample entry: when `options.auto_outer_subsample` is
+    /// enabled and Phase 1 still has budget, this
     /// returns a cloned `BlockwiseFitOptions` carrying a freshly built
     /// stratified Horvitz-Thompson mask. Otherwise returns `None` and
     /// the caller uses the original options unchanged.

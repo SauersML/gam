@@ -9,9 +9,9 @@
 //! [`auto_outer_score_subsample`], [`maybe_install_auto_outer_subsample`],
 //! and [`build_outer_score_subsample`] — implement a stratified
 //! Horvitz–Thompson estimator that replaces the full row sum with an
-//! unbiased sample, gated by an explicit
+//! unbiased sample, gated by
 //! [`crate::custom_family::BlockwiseFitOptions::auto_outer_subsample`]
-//! opt-in.
+//! and enabled by default for large marginal-slope fits.
 //!
 //! `maybe_install_auto_outer_subsample` is the entry point family
 //! impls call: it consults the per-family phase counter and the
@@ -898,8 +898,8 @@ pub fn auto_outer_score_subsample(
 /// Two-phase auto-subsample guard shared across marginal-slope families.
 ///
 /// Returns `Some(cloned_options)` carrying a freshly stratified
-/// Horvitz-Thompson mask when the caller has opted in via
-/// `options.auto_outer_subsample`, has not already supplied a mask, and
+/// Horvitz-Thompson mask when `options.auto_outer_subsample` is enabled, the
+/// caller has not already supplied a mask, and
 /// the per-family phase counter is below `phase1_budget`. Returns `None`
 /// when the caller's options should be used unchanged (either subsample
 /// is disabled / pre-installed, the budget is exhausted, or the problem
