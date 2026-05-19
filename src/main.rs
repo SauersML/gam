@@ -4371,6 +4371,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             }),
                             kappa_options: kappa_options.clone(),
                             optimize_inverse_link,
+                            cache_session: None,
                         },
                     )) {
                         Ok(FitResult::SurvivalLocationScale(result)) => result,
@@ -4456,6 +4457,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 }),
                 kappa_options: kappa_options.clone(),
                 optimize_inverse_link,
+                cache_session: None,
             },
         )) {
             Ok(FitResult::SurvivalLocationScale(result)) => {
