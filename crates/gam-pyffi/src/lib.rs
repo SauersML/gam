@@ -640,6 +640,7 @@ fn gaussian_reml_score<'py>(
         "grad_coefficients",
         score.grad_coefficients.into_pyarray(py),
     )?;
+    out.set_item("grad_penalty", score.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_log_lambda", score.grad_log_lambda)?;
     out.set_item("fitted", score.fitted.into_pyarray(py))?;
     out.set_item("sigma2", score.sigma2.into_pyarray(py))?;
