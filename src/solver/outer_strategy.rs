@@ -8041,9 +8041,15 @@ mod tests {
         assert!(session.try_load().is_some(), "precondition: cache populated");
 
         let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        // Use the AuxiliaryGradientFree class so a no-gradient problem
+        // routes to compass search (`run_aux_compass_projects_seed_before_seed_cost`
+        // above uses the same pattern). Bounds must contain the cached rho
+        // so the projector doesn't snap it away.
         let problem = OuterProblem::new(1)
-            .with_gradient(Derivative::Unavailable)
-            .with_initial_rho(array![-99.0]) // deliberately bad
+            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_bounds(array![-5.0], array![5.0])
+            .with_initial_rho(array![-3.0]) // deliberately not 2.5
+            .with_max_iter(8)
             .with_cache_session(Arc::clone(&session));
         let mut obj = problem.build_objective(
             seen.clone(),
@@ -8063,12 +8069,12 @@ mod tests {
             >,
         );
         let _ = problem.run(&mut obj, "seed-prepend");
-        // Both seeds end up evaluated, but the cached one (2.5) must
-        // appear at or before -99.0 in the eval trace, and no -99.0
-        // eval may appear before a 2.5 eval.
+        // The cached rho (2.5) must appear in the eval trace, and it must
+        // appear no later than the configured initial_rho (−3.0). Both
+        // are inside the bounds so the projector cannot rewrite them.
         let evals = seen.lock().unwrap();
         let pos_cached = evals.iter().position(|r| (r[0] - 2.5).abs() < 1e-9);
-        let pos_initial = evals.iter().position(|r| (r[0] + 99.0).abs() < 1e-9);
+        let pos_initial = evals.iter().position(|r| (r[0] + 3.0).abs() < 1e-9);
         assert!(
             pos_cached.is_some(),
             "cached rho must be evaluated; saw {:?}",
