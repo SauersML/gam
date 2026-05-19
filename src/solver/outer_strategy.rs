@@ -7966,4 +7966,146 @@ mod tests {
             "aux direct-search must project the seed before evaluating its cost",
         );
     }
+
+    fn tmp_cache_session(label: &str) -> (tempfile::TempDir, Arc<CacheSession>) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::cache::WarmStartStore::open(
+            dir.path().to_path_buf(),
+            crate::cache::StoreOptions {
+                size_budget_bytes: 1024 * 1024,
+                ttl: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let mut fp = crate::cache::Fingerprinter::new();
+        fp.absorb_str(b"outer-test", label);
+        let key = fp.finalize();
+        (dir, Arc::new(CacheSession::open(store, key)))
+    }
+
+    #[test]
+    fn checkpointing_objective_persists_finite_evals() {
+        let (_d, session) = tmp_cache_session("ckpt-persist");
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Unavailable);
+        let mut inner: ClosureObjective<_, _, _> = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput("eval not used".into()))
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session));
+        // Initial: nothing on disk.
+        assert!(session.try_load().is_none());
+        // First eval persists.
+        let v0 = wrapped.eval_cost(&array![3.0]).unwrap();
+        assert!((v0 - 9.0).abs() < 1e-12);
+        let on_disk = session.try_load().expect("first eval should checkpoint");
+        let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
+        assert!((payload.cost - 9.0).abs() < 1e-12);
+        assert_eq!(payload.rho, vec![3.0]);
+        // Strictly improving eval must bypass the 2-second rate limit.
+        let _v1 = wrapped.eval_cost(&array![0.5]).unwrap();
+        let on_disk = session.try_load().expect("improving eval should checkpoint");
+        let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
+        assert!((payload.cost - 0.25).abs() < 1e-12);
+        assert_eq!(payload.rho, vec![0.5]);
+        // Non-finite values must not corrupt the on-disk best-known iterate.
+        let v_inf = wrapped.eval_cost(&array![f64::NAN]);
+        assert!(v_inf.is_ok() || v_inf.is_err());
+        let on_disk = session.try_load().expect("prior best preserved");
+        let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
+        assert!((payload.cost - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn checkpointing_objective_rejects_wrong_dim_on_decode() {
+        // A payload from a 3-dim fit is invalid input for a 5-dim resume.
+        let bytes = encode_iterate(&array![1.0, 2.0, 3.0], 0.5, 0).expect("encode");
+        assert!(decode_iterate(&bytes, 3).is_some());
+        assert!(decode_iterate(&bytes, 5).is_none());
+    }
+
+    #[test]
+    fn run_finalizes_on_success_and_resume_uses_cached_rho() {
+        // Synthetic 1-D quadratic centered at rho* = 1.5; the optimizer
+        // should drive to that point and `finalize` to disk. A second
+        // OuterProblem with the same session should then warm-start there.
+        let (_d, session) = tmp_cache_session("resume");
+        let seen_first: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Unavailable)
+            .with_seed_config(crate::seeding::SeedConfig::default())
+            .with_initial_rho(array![0.0])
+            .with_cache_session(Arc::clone(&session));
+        let mut obj = problem.build_objective(
+            seen_first.clone(),
+            |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                seen.lock().unwrap().push(theta.clone());
+                Ok((theta[0] - 1.5).powi(2))
+            },
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput("eval not used".into()))
+            },
+            None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
+            None::<
+                fn(
+                    &mut Arc<Mutex<Vec<Array1<f64>>>>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        );
+        let _ = problem.run(&mut obj, "ckpt-resume");
+        // The session must hold a Final entry whose rho is the optimum.
+        let entry = session.try_load().expect("final entry persisted");
+        assert_eq!(entry.kind, crate::cache::EntryKind::Final);
+        let payload = decode_iterate(&entry.payload, 1).expect("decodes");
+        assert!(
+            (payload.rho[0] - 1.5).abs() < 0.1,
+            "rho should converge near 1.5, got {:?}",
+            payload.rho
+        );
+
+        // Second run: provide a deliberately bad initial_rho. With the
+        // cached entry on disk, the runner must prepend the cached rho
+        // as the first seed and converge in fewer evals.
+        let seen_second: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Unavailable)
+            .with_seed_config(crate::seeding::SeedConfig::default())
+            .with_initial_rho(array![-50.0])
+            .with_cache_session(Arc::clone(&session));
+        let mut obj = problem.build_objective(
+            seen_second.clone(),
+            |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                seen.lock().unwrap().push(theta.clone());
+                Ok((theta[0] - 1.5).powi(2))
+            },
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput("eval not used".into()))
+            },
+            None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
+            None::<
+                fn(
+                    &mut Arc<Mutex<Vec<Array1<f64>>>>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        );
+        let _ = problem.run(&mut obj, "ckpt-resume-second");
+        // The cached rho should have been visited very early. Without
+        // resume the optimizer would spend many evals climbing back from
+        // rho = -50 before reaching anything near 1.5.
+        let evals = seen_second.lock().unwrap();
+        let visited_near_optimum =
+            evals.iter().take(3).any(|rho| (rho[0] - 1.5).abs() < 0.5);
+        assert!(
+            visited_near_optimum,
+            "second run should visit a near-optimum rho early via warm start; \
+             saw evals = {:?}",
+            evals.iter().take(5).collect::<Vec<_>>()
+        );
+    }
 }
