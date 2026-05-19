@@ -15801,6 +15801,13 @@ pub fn fit_survival_marginal_slope_terms(
         "[survival-marginal-slope/outer] solve end elapsed={:.3}s",
         fit_started.elapsed().as_secs_f64(),
     );
+    if !solved.fit.outer_converged {
+        return Err(format!(
+            "survival marginal-slope outer optimization did not converge: \
+             iterations={} final_objective={:.6e} |g|_inf={:.3e}",
+            solved.fit.outer_iterations, solved.fit.reml_score, solved.fit.outer_gradient_norm
+        ));
+    }
 
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
         let final_family =
