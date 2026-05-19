@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
+use ndarray::{Array2, ArrayBase, Data, Ix1};
 
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
@@ -55,11 +55,17 @@ pub struct DeviceXSession {
     x_dev: DeviceAllocation<'static>,
     /// Scratch for `diag(w) · X`, same shape as X. Reused across calls.
     wy_dev: DeviceAllocation<'static>,
-    /// Held to keep the column-major host copy of X alive iff we ever
-    /// need to repack — currently unused at steady state. The `Arc` keeps
-    /// the *upload source* live too, by virtue of the cache holding a
-    /// clone, but this field is reserved for future "lazy re-upload" paths.
-    _phantom: std::marker::PhantomData<()>,
+    /// Pre-allocated W scratch (n f64). Each `xtwx` call writes here via
+    /// cuMemcpyHtoD; avoids paying cuMemAlloc per iteration (~100us on a
+    /// modern driver, ~5ms across 50 PIRLS iters).
+    w_dev: DeviceAllocation<'static>,
+    /// Pre-allocated p×p output scratch. The dgemm result lands here and
+    /// gets cuMemcpyDtoH'd to a fresh host vec each call.
+    out_pp_dev: DeviceAllocation<'static>,
+    /// Pre-allocated p-length scratch for `xv` (η = X·β) results.
+    out_n_dev: DeviceAllocation<'static>,
+    /// Pre-allocated p-length input scratch for `xv` (β / v).
+    v_p_dev: DeviceAllocation<'static>,
 }
 
 impl DeviceXSession {
@@ -89,12 +95,12 @@ impl DeviceXSession {
         unsafe {
             slot.cuda.set_current().ok()?;
 
-            // Upload w (small — ~2.4 MiB at n=3e5).
+            // Upload w into the pre-allocated scratch (small — ~2.4 MiB
+            // at n=3e5). No cuMemAlloc on the hot path.
             let bytes_w = bytes_len::<f64>(n)?;
-            let w_dev = DeviceAllocation::new(&slot.cuda.api, bytes_w)?;
             check_cuda(
                 (slot.cuda.api.cu_memcpy_htod)(
-                    w_dev.ptr,
+                    self.w_dev.ptr,
                     w_ptr.cast(),
                     bytes_w,
                 ),
@@ -112,7 +118,7 @@ impl DeviceXSession {
                 p_i,
                 self.x_dev.ptr,
                 n_i,
-                w_dev.ptr,
+                self.w_dev.ptr,
                 1,
                 self.wy_dev.ptr,
                 n_i,
@@ -121,9 +127,8 @@ impl DeviceXSession {
                 return None;
             }
 
-            // result = Xᵀ · wy — dgemm.
+            // result = Xᵀ · wy — dgemm into the pre-allocated p×p scratch.
             let bytes_out = bytes_len::<f64>(p.checked_mul(p)?)?;
-            let out_dev = DeviceAllocation::new(&slot.cuda.api, bytes_out)?;
             let alpha = 1.0_f64;
             let beta = 0.0_f64;
             let status = (slot.api.cublas_dgemm)(
@@ -139,7 +144,7 @@ impl DeviceXSession {
                 self.wy_dev.ptr,
                 n_i,
                 &beta,
-                out_dev.ptr,
+                self.out_pp_dev.ptr,
                 p_i,
             );
             if status != CUBLAS_STATUS_SUCCESS {
@@ -151,13 +156,84 @@ impl DeviceXSession {
             check_cuda(
                 (slot.cuda.api.cu_memcpy_dtoh)(
                     out_host.as_mut_ptr().cast(),
-                    out_dev.ptr,
+                    self.out_pp_dev.ptr,
                     bytes_out,
                 ),
                 "cuMemcpyDtoH(out)",
             )
             .ok()?;
             Some(from_col_major(&out_host, p, p))
+        }
+    }
+
+    /// Compute `y = X · v` using the resident X. Uploads `v` (8·p bytes,
+    /// negligible), runs dgemv, downloads the n-length result.
+    pub fn xv<S: Data<Elem = f64>>(
+        &self,
+        v: &ArrayBase<S, Ix1>,
+    ) -> Option<ndarray::Array1<f64>> {
+        let n = self.rows;
+        let p = self.cols;
+        if v.len() != p {
+            return None;
+        }
+        let v_owned: Option<Vec<f64>> = match v.as_slice() {
+            Some(_) => None,
+            None => Some(v.iter().copied().collect()),
+        };
+        let v_ptr: *const f64 = match v_owned.as_ref() {
+            Some(buf) => buf.as_ptr(),
+            None => v.as_slice().unwrap().as_ptr(),
+        };
+        let slot = self.cublas.lock().ok()?;
+        unsafe {
+            slot.cuda.set_current().ok()?;
+            // Upload v into the pre-allocated p-length scratch.
+            let bytes_v = bytes_len::<f64>(p)?;
+            check_cuda(
+                (slot.cuda.api.cu_memcpy_htod)(
+                    self.v_p_dev.ptr,
+                    v_ptr.cast(),
+                    bytes_v,
+                ),
+                "cuMemcpyHtoD(v)",
+            )
+            .ok()?;
+            // y = X · v via dgemv (NO_TRANSPOSE).
+            let n_i = to_i32(n)?;
+            let p_i = to_i32(p)?;
+            let alpha = 1.0_f64;
+            let beta = 0.0_f64;
+            let status = (slot.api.cublas_dgemv)(
+                slot.handle,
+                CUBLAS_OP_N,
+                n_i,
+                p_i,
+                &alpha,
+                self.x_dev.ptr,
+                n_i,
+                self.v_p_dev.ptr,
+                1,
+                &beta,
+                self.out_n_dev.ptr,
+                1,
+            );
+            if status != CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            // Download y (n f64).
+            let bytes_y = bytes_len::<f64>(n)?;
+            let mut y_host = vec![0.0_f64; n];
+            check_cuda(
+                (slot.cuda.api.cu_memcpy_dtoh)(
+                    y_host.as_mut_ptr().cast(),
+                    self.out_n_dev.ptr,
+                    bytes_y,
+                ),
+                "cuMemcpyDtoH(y)",
+            )
+            .ok()?;
+            Some(ndarray::Array1::from_vec(y_host))
         }
     }
 
@@ -172,9 +248,9 @@ impl DeviceXSession {
 /// the caller's `Arc<Array2<f64>>`. On a cache hit only `w` and the
 /// result transit PCIe; on a miss this uploads X first and inserts the
 /// session into the LRU.
-pub fn try_fast_xt_diag_x_arc(
+pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
     x: &Arc<Array2<f64>>,
-    w: &Array1<f64>,
+    w: &ArrayBase<S, Ix1>,
 ) -> Option<Array2<f64>> {
     let (rows, cols) = x.dim();
     debug_assert_eq!(rows, w.len(), "X rows must match W length");
@@ -493,7 +569,7 @@ mod tests {
     fn session_returns_none_without_gpu() {
         // Smoke test that the lookup path doesn't panic when there's no GPU.
         let x = Arc::new(Array2::<f64>::zeros((512, 8)));
-        let w = Array1::<f64>::from_elem(512, 1.0);
+        let w = ndarray::Array1::<f64>::from_elem(512, 1.0);
         let result = try_fast_xt_diag_x_arc(&x, &w);
         if GpuRuntime::global().is_available() {
             // Either dispatched or declined — both are valid here.
