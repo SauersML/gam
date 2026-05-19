@@ -1443,10 +1443,13 @@ mod tests {
     #[test]
     fn record_outer_eval_populates_trial_series_when_session_is_active() {
         let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _session = VisualizerSession::new(true);
+        let session = VisualizerSession::new(true);
         record_outer_eval(123.4, 1e-2);
-        let feed = current_active_feed().expect("feed registered");
-        let model = lock_model(&feed.model);
+        // Read through the session's own Arc instead of the static feed:
+        // even if another test in the same process clobbers ACTIVE_FEED
+        // between push and check, the session still holds the original
+        // model Arc and the data the optimizer wrote into it is preserved.
+        let model = lock_model(&session.model);
         assert_eq!(model.history_cost_trial.len(), 1);
         assert!(model.last_trial.is_some());
         assert_eq!(model.current_eval_state, "trial");
@@ -1455,11 +1458,10 @@ mod tests {
     #[test]
     fn record_outer_accept_promotes_last_trial_into_accepted_series() {
         let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let _session = VisualizerSession::new(true);
+        let session = VisualizerSession::new(true);
         record_outer_eval(50.0, 1e-3);
         record_outer_accept();
-        let feed = current_active_feed().expect("feed registered");
-        let model = lock_model(&feed.model);
+        let model = lock_model(&session.model);
         assert_eq!(model.history_cost_accepted.len(), 1);
         assert_eq!(model.history_cost_accepted[0].1, 50.0);
         assert_eq!(model.current_eval_state, "accepted");
