@@ -19395,16 +19395,25 @@ mod tests {
     /// uses; ρ comes out to exactly 2.0 to floating-point precision.
     #[test]
     fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
-        // Synthetic 2D NLL Hessian: indefinite (lambda_min = -1, lambda_max = 1).
-        // Mirrors the saturated-probit marginal block where the
-        // entry-survival concave contribution dominates the cancellation
-        // direction.
+        // Synthetic 2D NLL Hessian: indefinite (eigenvalues -1, +1).
+        // Mirrors the saturated-probit marginal block, where the concave
+        // entry-survival term (`+w·log Φ(−η₀)`, second derivative ≈ −w)
+        // sums against the convex exit/event-density term (≈ +w) to give
+        // an INDEFINITE H_NLL: the eigenvalue is −w along the entry
+        // basis direction and +w along the exit basis direction. The
+        // sum h[0,0] + h[1,1] = 0 (proven separately) is exactly the
+        // marginal-block pullback's vanishing curvature, but the
+        // per-row 2×2 H_NLL is still indefinite.
         let h_nll = array![[-1.0, 0.0], [0.0, 1.0]];
         let source = JointHessianSource::Dense(h_nll.clone());
         let ranges = vec![(0, 2)];
-        // No smoothing penalty in this direction (mirrors the duchon-smooth
-        // polynomial null space).
-        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+        // Smoothing penalty `S` is structured to put the saturating
+        // direction in null(H_NLL + S). This mirrors the duchon-smooth
+        // polynomial null space (order=1 in 3D has a constant in the
+        // null) intersecting the marginal-block cancellation direction.
+        // Choosing S = diag(1, 0) makes H_NLL + S = diag(0, 1), so
+        // direction (1, 0) is null in H_true (= H_NLL + S + 0·I).
+        let s_lambdas = vec![array![[1.0, 0.0], [0.0, 0.0]]];
 
         // Stabilized solver ridge: should add ~1.0 to lift the
         // -1 eigenvalue to the SPD floor (~ridge_floor).
@@ -19427,15 +19436,15 @@ mod tests {
         let big_delta = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge;
 
         // True Hessian (what TRIAL OBJECTIVE sees):
-        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I = diag(-1, 1)
+        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I = diag(0, 1)
+        //   ⇒ dim 0 is a null direction of H_true.
         // Used Hessian (what SOLVE / APPLY uses):
         //   H_used = H_NLL + S + joint_solver_diagonal_ridge·I
-        //          = diag(-1 + Δ, 1 + Δ)   where Δ ≈ 1.0
-        // Newton step direction: dim 0 is the "near-null" direction of H_used
-        // (eigenvalue ~ ridge_floor); rhs targeting that direction gives a
-        // step entirely in dim 0.
+        //          = diag(Δ, 1 + Δ)   where Δ ≈ 1.0
+        //   ⇒ dim 0 has curvature Δ (purely from the stabilizing shift).
+        // rhs aimed entirely in dim 0 puts the Newton step in null(H_true).
         let rhs = array![1.0_f64, 0.0];
-        let h_used_00 = -1.0 + joint_solver_diagonal_ridge;
+        let h_used_00 = 0.0 + joint_solver_diagonal_ridge;
         let h_used_11 = 1.0 + joint_solver_diagonal_ridge;
         let delta = array![rhs[0] / h_used_00, rhs[1] / h_used_11];
 
@@ -19455,12 +19464,21 @@ mod tests {
         let predicted = joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &delta);
 
         // Actual (true) reduction: f(β=0) − f(β+δ) for the true objective
-        //   f(β) = ½·βᵀ·H_NLL·β + bᵀ·β     (with b = −rhs because rhs = −∇f)
-        // taking β_start = 0:
-        //   actual = rhs·δ − ½·δᵀ·H_NLL·δ   (no S, no joint_mode_diagonal_ridge)
-        let mut h_nll_delta = Array1::<f64>::zeros(2);
-        crate::linalg::faer_ndarray::fast_av_view_into(&h_nll, &delta, h_nll_delta.view_mut());
-        let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_nll_delta);
+        //   f(β) = ½·βᵀ·H_NLL·β + ½·βᵀ·S·β + ½·joint_mode_diagonal_ridge·‖β‖² + bᵀ·β
+        // taking β_start = 0 and using the Newton identity for the truth:
+        //   actual = rhs·δ − ½·δᵀ·H_true·δ
+        // where H_true = H_NLL + S + joint_mode_diagonal_ridge·I.
+        let mut h_true_delta = Array1::<f64>::zeros(2);
+        apply_joint_penalized_hessian_into(
+            &source,
+            &ranges,
+            &s_lambdas,
+            joint_mode_diagonal_ridge,
+            &delta,
+            &mut h_true_delta,
+        )
+        .expect("apply true (un-stabilized) hessian must succeed");
+        let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_true_delta);
 
         let rho = actual / predicted;
         eprintln!(
@@ -19502,14 +19520,18 @@ mod tests {
             .expect("apply scaled");
             let scaled_predicted =
                 joint_quadratic_predicted_reduction(&scaled_rhs, &scaled_hpen, &scaled_delta);
-            let mut scaled_h_nll_delta = Array1::<f64>::zeros(2);
-            crate::linalg::faer_ndarray::fast_av_view_into(
-                &h_nll,
+            let mut scaled_h_true_delta = Array1::<f64>::zeros(2);
+            apply_joint_penalized_hessian_into(
+                &source,
+                &ranges,
+                &s_lambdas,
+                joint_mode_diagonal_ridge,
                 &scaled_delta,
-                scaled_h_nll_delta.view_mut(),
-            );
+                &mut scaled_h_true_delta,
+            )
+            .expect("apply scaled true");
             let scaled_actual =
-                scaled_rhs.dot(&scaled_delta) - 0.5 * scaled_delta.dot(&scaled_h_nll_delta);
+                scaled_rhs.dot(&scaled_delta) - 0.5 * scaled_delta.dot(&scaled_h_true_delta);
             let scaled_rho = scaled_actual / scaled_predicted;
             assert!(
                 (scaled_rho - 2.0).abs() <= 1e-10,
