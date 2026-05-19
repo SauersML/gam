@@ -10361,11 +10361,59 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut tr_log_sig: Option<String> = None;
             let mut tr_log_first: usize = 0;
             let mut tr_log_last: usize = 0;
+            // Right-hand side for the TR subproblem, ∇L_pen = ∇ℓ − Sβ.
+            // Constant across TR retries because β only mutates on accept,
+            // and the gradient/penalty are reloaded outside the loop.
+            // For the dense unconstrained path we solve the TR subproblem
+            // properly (Moré–Sorensen / Hebden damping); the constrained QP
+            // and matrix-free PCG paths keep the rescaling fallback (their
+            // step directions are not simple Newton solves).
+            let tr_rhs_pen = {
+                let penalty_beta_for_rhs = apply_joint_block_penalty(
+                    &ranges,
+                    &s_lambdas,
+                    &beta_joint,
+                    joint_mode_diagonal_ridge,
+                );
+                &grad_joint - &penalty_beta_for_rhs
+            };
+            let tr_dense_unconstrained = joint_constraints.is_none()
+                && matches!(&joint_hessian_source, JointHessianSource::Dense(_));
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
-                let mut trial_delta = search_delta.clone();
-                truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                let search_norm = joint_trust_region_step_norm(&search_delta);
+                let mut trial_delta = if search_norm.is_finite()
+                    && search_norm <= joint_trust_radius
+                {
+                    // Unconstrained Newton step already fits in the trust
+                    // region — take it as-is.
+                    search_delta.clone()
+                } else if tr_dense_unconstrained
+                    && let JointHessianSource::Dense(h_dense) = &joint_hessian_source
+                    && let Some((tr_delta, _lambda_tr)) = dense_more_sorensen_step(
+                        h_dense,
+                        &ranges,
+                        &s_lambdas,
+                        joint_solver_diagonal_ridge,
+                        &tr_rhs_pen,
+                        joint_trust_radius,
+                        search_norm,
+                    )
+                {
+                    // Proper damped Newton step: δ = -(H+S+(ε+λ_TR)·I)⁻¹ rhs
+                    // with λ_TR ≥ 0 chosen so ‖δ‖ ≈ Δ. This regularizes the
+                    // near-null eigenvectors that the legacy rescale-based
+                    // truncation amplified.
+                    tr_delta
+                } else {
+                    // Fallback for paths Moré–Sorensen does not own
+                    // (constrained QP, matrix-free PCG, dense subproblem
+                    // failure): rescale the unconstrained direction.
+                    let mut fallback = search_delta.clone();
+                    truncate_joint_step_to_radius(&mut fallback, joint_trust_radius);
+                    fallback
+                };
                 let mut barrier_ceiling = 1.0_f64;
                 for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                     let block_delta = trial_delta.slice(s![start..end]).to_owned();
