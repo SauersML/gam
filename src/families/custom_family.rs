@@ -12510,6 +12510,16 @@ fn joint_outer_evaluate_efs(
 
 /// Evaluate the rho-only custom-family outer objective through the unified
 /// joint hyperpath with no external ψ coordinates attached.
+///
+/// Applies the same inner-precision tightening as
+/// `evaluate_custom_family_joint_hyper`. Both entry points feed
+/// `evaluate_custom_family_hyper_internal` and therefore must arrive at the
+/// same `β̂` to within the same tolerance; if one path quits the inner
+/// solve at `inner_tol = 1e-6` while the other tightens to `1e-10`, the
+/// envelope-theorem outer objectives diverge at ~`inner_tol` precision and
+/// the rho-only-vs-joint-hyper equivalence breaks (the dedicated regression
+/// `rho_only_outer_objective_matches_joint_hyper_when_psi_is_empty` pins
+/// this contract at `1e-12`).
 fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -12520,10 +12530,11 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+    let eval_options = tighten_direct_joint_hyper_options(options);
     evaluate_custom_family_hyper_internal(
         family,
         specs,
-        options,
+        &eval_options,
         penalty_counts,
         rho,
         &derivative_blocks,
@@ -14725,23 +14736,42 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
 
+/// Inner-solver precision shared by every direct hyperpath evaluation.
+///
+/// The rho-only outer evaluator (`outerobjectivegradienthessian_internal`)
+/// and the joint hyper evaluator (`evaluate_custom_family_joint_hyper`) both
+/// route through the same inner blockwise/Newton solve and the same outer
+/// REML/LAML cost identity. Reaching the same `β̂` to comparable precision
+/// is the *only* way the two paths agree on the outer objective — and the
+/// rho-only-vs-joint-hyper equivalence (`assert! < 1e-12` between the two
+/// paths at empty ψ) is a structural correctness invariant, not a tolerance
+/// knob. Both call sites must therefore see the same effective inner tol
+/// for the same `BlockwiseFitOptions` input; the helper below is the
+/// chokepoint that gives them that.
+const DIRECT_JOINT_HYPER_INNER_TOL: f64 = 1e-10;
+const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
+
+fn tighten_direct_joint_hyper_options(options: &BlockwiseFitOptions) -> BlockwiseFitOptions {
+    let mut eval_options = options.clone();
+    if eval_options.inner_max_cycles > 1 && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL {
+        eval_options.inner_tol = DIRECT_JOINT_HYPER_INNER_TOL;
+        eval_options.inner_max_cycles = eval_options
+            .inner_max_cycles
+            .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
+    }
+    eval_options
+}
+
 fn derivative_quality_options_and_warm_start(
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
 ) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
-    const DIRECT_JOINT_HYPER_INNER_TOL: f64 = 1e-10;
-    const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
-
-    let mut eval_options = options.clone();
-    let tighten =
-        eval_options.inner_max_cycles > 1 && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL;
-    if !tighten {
+    let eval_options = tighten_direct_joint_hyper_options(options);
+    let tightened = eval_options.inner_tol != options.inner_tol
+        || eval_options.inner_max_cycles != options.inner_max_cycles;
+    if !tightened {
         return (eval_options, None);
     }
-    eval_options.inner_tol = DIRECT_JOINT_HYPER_INNER_TOL;
-    eval_options.inner_max_cycles = eval_options
-        .inner_max_cycles
-        .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
     let strict_warm_start = warm_start.cloned().map(|mut warm| {
         warm.inner.cached_inner = None;
         warm
