@@ -36,53 +36,30 @@ use super::policy::DispatchPolicy;
 /// the first time any of its `culib()`-backed entry points is called on a
 /// host that has no `libcuda.*`. That's a hard abort path — there is no
 /// Result-returning variant. So before we touch *any* cudarc API in the
-/// probe, we libloading-test the same candidate names cudarc itself
-/// would search. If none load, we never call cudarc and the GPU module
-/// silently returns CPU-only.
+/// probe, we ask cudarc itself whether its loader can find the library.
 ///
-/// Without this check the probe panics on every macOS / Windows-without-
-/// GPU / Linux-without-driver host, which is a hard regression vs the
-/// previous hand-rolled libloading probe.
+/// We delegate to cudarc's own `is_culib_present()` rather than rolling
+/// our own short candidate list, because the cudarc loader walks a much
+/// broader name set (versioned variants `libcuda.so.1`, Windows-style
+/// `cuda64_X.so` mappings, etc.) than the three names we used to try.
+/// A narrower preflight produced a real regression on cloud GPU images
+/// where the library lives under a name cudarc would have found but our
+/// hard-coded list missed — surfacing as "libcublas … not loadable" even
+/// though the device set was perfectly usable.
 fn libcuda_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| try_dlopen_any(libcuda_candidates()))
+    *AVAILABLE.get_or_init(|| unsafe { cudarc::driver::sys::is_culib_present() })
 }
 
-/// Pre-flight: can libcublas be dlopen'd? cudarc's cublas lib loader is
-/// independent of the driver loader, so a host with libcuda but no
-/// libcublas would still panic the first time `CudaBlas::new` runs.
-/// Calibration and resident sessions both need cuBLAS, so a device that
-/// can't reach libcublas is unusable for GPU dispatch — we drop it
-/// rather than letting cudarc panic.
+/// Pre-flight: can libcublas be dlopen'd? Same rationale as
+/// [`libcuda_loadable`] — cudarc's cublas loader is independent of the
+/// driver loader, and a host with libcuda but no libcublas would still
+/// panic the first time `CudaBlas::new` runs. Delegating to cudarc's own
+/// presence check keeps the preflight name list in lockstep with the
+/// names cudarc will actually try.
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| try_dlopen_any(libcublas_candidates()))
-}
-
-fn try_dlopen_any(candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|name| unsafe { libloading::Library::new(*name).is_ok() })
-}
-
-fn libcuda_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["nvcuda.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["libcuda.dylib", "/usr/local/cuda/lib/libcuda.dylib"]
-    } else {
-        &["libcuda.so.1", "libcuda.so"]
-    }
-}
-
-fn libcublas_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["cublas64_12.dll", "cublas64_11.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["libcublas.dylib", "/usr/local/cuda/lib/libcublas.dylib"]
-    } else {
-        &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
-    }
+    *AVAILABLE.get_or_init(|| unsafe { cudarc::cublas::sys::is_culib_present() })
 }
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
