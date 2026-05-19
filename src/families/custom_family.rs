@@ -10702,9 +10702,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // attempt sweep failed at that radius. No descent step of
                 // L2-norm ≤ 1e-12 exists at this β within numerical precision.
                 let tr_floor_exhausted = trust_region_collapsed && trust_region_exhausted;
-                if (tr_floor_exhausted && made_progress)
-                    || (qp_constrained_kkt && made_progress)
-                {
+                if (tr_floor_exhausted && made_progress) || (qp_constrained_kkt && made_progress) {
                     if qp_constrained_kkt && !trust_region_collapsed {
                         log::info!(
                             "[PIRLS/joint-Newton] cycle={} constrained-KKT certificate: QP delta gave non-positive model reduction and the preconditioned-descent fallback exhausted {} trust-region attempts at active constraints (reject_model={}, reject_barrier={}, active_rows={})",
@@ -17251,6 +17249,39 @@ mod tests {
             derivative_quality_options_and_warm_start(&tighter_options, None, false);
         assert_eq!(rho_only.inner_tol, tighter_options.inner_tol);
         assert_eq!(rho_only.inner_max_cycles, tighter_options.inner_max_cycles);
+    }
+
+    #[test]
+    fn exact_spatial_joint_hyper_inner_tolerance_follows_spatial_outer_target() {
+        let options = BlockwiseFitOptions {
+            inner_tol: 1e-6,
+            outer_tol: 1e-10,
+            inner_max_cycles: 200,
+            ..BlockwiseFitOptions::default()
+        };
+        let spatial_outer_tol = 1e-4;
+        let eval_input = joint_hyper_options_for_outer_tolerance(&options, spatial_outer_tol);
+        let (eval_options, strict_warm_start) =
+            derivative_quality_options_and_warm_start(&eval_input, None, true);
+
+        assert_eq!(eval_options.outer_tol, spatial_outer_tol);
+        assert_eq!(
+            eval_options.inner_tol, spatial_outer_tol,
+            "exact spatial [rho, psi] evaluations should certify beta only to the tolerance of the outer optimizer consuming the derivative"
+        );
+        assert!(
+            strict_warm_start.is_none(),
+            "loosening an over-tight caller tolerance should preserve the cached inner state"
+        );
+
+        let biobank_scale_objective = 3.689e5;
+        let posted_residual_plateau = 6.788e-1;
+        let posted_objective_change = 4.209e-2;
+        let eval_tol = eval_options.inner_tol * (1.0 + biobank_scale_objective);
+        assert!(
+            posted_residual_plateau <= eval_tol && posted_objective_change <= eval_tol,
+            "the posted saturated Newton plateau is below the spatial outer derivative accuracy target"
+        );
     }
 
     fn outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(

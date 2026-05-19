@@ -16540,14 +16540,24 @@ mod tests {
         // cancellation must be ULP-exact for every η.
         for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 500.0, 988.0] {
             let (_nll, _grad, hess) = row_primary_closed_form(
-                eta, eta, qd1, g, z, w, 0.0, derivative_guard, probit_scale,
+                eta,
+                eta,
+                qd1,
+                g,
+                z,
+                w,
+                0.0,
+                derivative_guard,
+                probit_scale,
             )
             .expect("rigid censored row");
             let sum = hess[0][0] + hess[1][1];
             assert!(
                 sum.abs() <= 1e-12 * (hess[0][0].abs() + hess[1][1].abs()).max(1.0),
                 "censored cancellation broke at η={eta}: h[0,0]={:.3e} h[1,1]={:.3e} sum={:.3e}",
-                hess[0][0], hess[1][1], sum,
+                hess[0][0],
+                hess[1][1],
+                sum,
             );
         }
 
@@ -16555,7 +16565,15 @@ mod tests {
         // 1/η² by Mills asymptotic M(−η) = η + 1/η + O(1/η³).
         for &eta in &[40.0_f64, 100.0, 500.0, 988.0] {
             let (_nll, _grad, hess) = row_primary_closed_form(
-                eta, eta, qd1, g, z, w, 1.0, derivative_guard, probit_scale,
+                eta,
+                eta,
+                qd1,
+                g,
+                z,
+                w,
+                1.0,
+                derivative_guard,
+                probit_scale,
             )
             .expect("rigid event row");
             let sum = hess[0][0] + hess[1][1];
@@ -16563,7 +16581,8 @@ mod tests {
             assert!(
                 sum > 0.0 && sum <= bound,
                 "event cancellation residual at η={eta}: sum={:.3e} expected (0, {:.3e}]",
-                sum, bound,
+                sum,
+                bound,
             );
         }
 
