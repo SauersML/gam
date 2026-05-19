@@ -97,7 +97,7 @@ fn load_packaged_cuda_libraries() -> Vec<Library> {
     if loaded.is_empty() && !paths.is_empty() {
         log::warn!(
             "[GPU] found {} CUDA library file(s) but none could be dlopen'd; \
-             consider adding the CUDA toolkit lib dir to LD_LIBRARY_PATH",
+             CUDA math libraries remain unavailable",
             paths.len()
         );
     }
