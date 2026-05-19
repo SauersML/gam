@@ -2024,49 +2024,14 @@ struct OuterFirstOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        // Per-axis line-search step caps now live natively in opt::Bfgs
+        // (`with_axis_step_caps`), which shortens the BFGS direction before
+        // line search instead of poisoning the Wolfe bracket with a
+        // sentinel cost. This entry point can therefore stay honest: any
+        // call that lands here is a real line-search probe, not a too-far
+        // attempt the bridge needs to swat away.
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
-        if let Some(anchor) = &self.last_gradient_point {
-            // Per-axis step caps. Compute `step_inf` separately for the rho
-            // block (first `rho_dim` axes = log-λ, natural step ≈ 5) and the
-            // psi block (trailing `psi_dim` axes = kappa / aniso-log-scale,
-            // natural step ≈ ln 2). Reject the probe if EITHER block exceeds
-            // its own cap — keeps rho free to take its full quasi-Newton
-            // step while pinning psi to a sane kernel-scale move.
-            let rho_dim = self.layout.rho_dim();
-            let mut step_inf_rho = 0.0_f64;
-            let mut step_inf_psi = 0.0_f64;
-            for (i, (a, b)) in x.iter().zip(anchor.iter()).enumerate() {
-                let d = (a - b).abs();
-                if i < rho_dim {
-                    step_inf_rho = step_inf_rho.max(d);
-                } else {
-                    step_inf_psi = step_inf_psi.max(d);
-                }
-            }
-            let rho_excess = self
-                .line_search_step_cap_rho
-                .is_some_and(|cap| step_inf_rho > cap);
-            let psi_excess = self
-                .line_search_step_cap_psi
-                .is_some_and(|cap| step_inf_psi > cap);
-            if rho_excess || psi_excess {
-                log::info!(
-                    "[OUTER/BFGS] rejecting cost probe before inner solve: step_inf_rho={:.3e} cap_rho={:?} step_inf_psi={:.3e} cap_psi={:?} excess={}",
-                    step_inf_rho,
-                    self.line_search_step_cap_rho,
-                    step_inf_psi,
-                    self.line_search_step_cap_psi,
-                    match (rho_excess, psi_excess) {
-                        (true, true) => "rho+psi",
-                        (true, false) => "rho",
-                        (false, true) => "psi",
-                        _ => "",
-                    },
-                );
-                return Ok(BFGS_LINE_SEARCH_REJECT_COST);
-            }
-        }
         let cost = self
             .obj
             .eval_cost(x)
