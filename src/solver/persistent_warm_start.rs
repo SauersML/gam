@@ -4,9 +4,26 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_VERSION: u32 = 1;
+/// On-disk cache schema version.
+///
+/// Bumped manually only when the serialized cache layout changes in a
+/// way that makes prior entries unsafe to consume (struct fields added/
+/// removed, optimization invariants altered, payload semantics shift).
+///
+/// This is **deliberately separate** from `CARGO_PKG_VERSION` so a
+/// routine library version bump does NOT invalidate every user's
+/// warm-start cache. A user upgrading from 0.1.X to 0.1.(X+1) should
+/// see their existing checkpoints still load; only a deliberate schema
+/// change (e.g., reshaping how ρ is encoded) bumps this constant.
+pub(crate) const CACHE_SCHEMA_VERSION: u32 = 1;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
+
+/// String form of [`CACHE_SCHEMA_VERSION`] for direct use in cache keys.
+pub(crate) fn cache_schema_tag() -> String {
+    format!("schema{CACHE_SCHEMA_VERSION}")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistentWarmStartRecord {
@@ -76,7 +93,12 @@ impl PersistentBlockWarmStartRecord {
     ) -> bool {
         self.version == CACHE_VERSION
             && self.key == key
-            && self.package_version == env!("CARGO_PKG_VERSION")
+            // Note: `package_version` is no longer required to match. A
+            // library version bump that doesn't change the cache schema
+            // (the common case for patch / minor releases) should NOT
+            // invalidate users' on-disk warm-start caches. Schema-breaking
+            // changes bump `CACHE_SCHEMA_VERSION` which is encoded in
+            // the cache key itself.
             && self.n_rows == n_rows
             && self.block_names == block_names
             && self.block_dims == block_dims
@@ -118,7 +140,12 @@ impl PersistentWarmStartRecord {
     pub(crate) fn is_compatible(&self, key: &str, n_rows: usize, n_cols: usize) -> bool {
         self.version == CACHE_VERSION
             && self.key == key
-            && self.package_version == env!("CARGO_PKG_VERSION")
+            // Note: `package_version` is no longer required to match. A
+            // library version bump that doesn't change the cache schema
+            // (the common case for patch / minor releases) should NOT
+            // invalidate users' on-disk warm-start caches. Schema-breaking
+            // changes bump `CACHE_SCHEMA_VERSION` which is encoded in
+            // the cache key itself.
             && self.n_rows == n_rows
             && self.n_cols == n_cols
             && self.rho.iter().all(|v| v.is_finite())
@@ -243,6 +270,23 @@ fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"warm-start-key", key);
     fp.finalize()
+}
+
+/// Look up a single outer-iterate payload by string key without opening
+/// a long-lived session.
+///
+/// Used by the workflow dispatcher to fetch a *seed* from a near-match
+/// (data-independent) key. The session's own [`crate::cache::Session::preload`]
+/// stashes the returned entry so the next [`crate::cache::Session::try_load`]
+/// returns it ahead of the (empty) exact-key store lookup. Save writes
+/// always go to the session's own key — the prefix lookup is read-only.
+pub(crate) fn lookup_outer_iterate_payload(
+    seed_key: &str,
+) -> Option<crate::cache::CachedEntry> {
+    let store = persistent_store()?;
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"outer-iterate-key", seed_key);
+    store.lookup(&fp.finalize()).ok().flatten()
 }
 
 /// Open a [`crate::cache::Session`] for outer-iterate (rho-axis) checkpoints.

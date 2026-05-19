@@ -21,12 +21,12 @@
 //! No new public flags. Callers that don't have an `Arc` continue
 //! through the existing `try_fast_*` path with unchanged semantics.
 //!
-//! The device-side bindings are entirely [`cudarc`] 0.16: the CUDA context
+//! The device-side bindings are entirely [`cudarc`] 0.19: the CUDA context
 //! comes from `CudaContext::new` (primary context retain — same CUcontext
 //! as every other caller for the same ordinal), allocations are
 //! `CudaSlice<f64>` (RAII free on drop), and BLAS goes through
 //! `CudaBlas` + the `Gemm` / `Gemv` traits. The one exception is
-//! `cublasDdgmm`, which has no safe wrapper in 0.16; we fall through to
+//! `cublasDdgmm`, which has no safe wrapper in 0.19; we fall through to
 //! `cudarc::cublas::sys::cublasDdgmm` for that single call.
 
 use std::collections::VecDeque;
