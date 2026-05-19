@@ -14677,14 +14677,19 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+    let (eval_options, strict_warm_start) =
+        derivative_quality_options_and_warm_start(options, warm_start);
     let eval_result = evaluate_custom_family_hyper_internal(
         family,
         specs,
-        options,
+        &eval_options,
         &penalty_counts,
         rho_current,
         derivative_blocks,
-        warm_start.map(|w| &w.inner),
+        strict_warm_start
+            .as_ref()
+            .map(|w| &w.inner)
+            .or_else(|| warm_start.map(|w| &w.inner)),
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
@@ -14702,17 +14707,46 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+    let (eval_options, strict_warm_start) =
+        derivative_quality_options_and_warm_start(options, warm_start);
     let eval_result = evaluate_custom_family_hyper_internal_shared(
         family,
         specs,
-        options,
+        &eval_options,
         &penalty_counts,
         rho_current,
         derivative_blocks,
-        warm_start.map(|w| &w.inner),
+        strict_warm_start
+            .as_ref()
+            .map(|w| &w.inner)
+            .or_else(|| warm_start.map(|w| &w.inner)),
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
+}
+
+fn derivative_quality_options_and_warm_start(
+    options: &BlockwiseFitOptions,
+    warm_start: Option<&CustomFamilyWarmStart>,
+) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
+    const DIRECT_JOINT_HYPER_INNER_TOL: f64 = 1e-10;
+    const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
+
+    let mut eval_options = options.clone();
+    let tighten =
+        eval_options.inner_max_cycles > 1 && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL;
+    if !tighten {
+        return (eval_options, None);
+    }
+    eval_options.inner_tol = DIRECT_JOINT_HYPER_INNER_TOL;
+    eval_options.inner_max_cycles = eval_options
+        .inner_max_cycles
+        .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
+    let strict_warm_start = warm_start.cloned().map(|mut warm| {
+        warm.inner.cached_inner = None;
+        warm
+    });
+    (eval_options, strict_warm_start)
 }
 
 fn evaluate_custom_family_joint_hyper_efs_internal<

@@ -15,22 +15,16 @@ from typing import Any, Callable, cast
 import torch
 
 from .. import _api
-from . import _torch_compat as _tc
 from ._coerce import from_numpy_like, to_numpy_f64, to_numpy_uintp
-
-
-def _as_tensor(value: Any) -> Any:
-    """Ensure ``value`` is a torch tensor; promote NumPy/list/scalar to one."""
-    if isinstance(value, torch.Tensor):
-        return value
-    return _tc.as_tensor(value, dtype=_tc.float64)
 
 
 class _BsplineBasisFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``."""
 
     @staticmethod
-    def forward(ctx: Any, t: Any, knots: Any, degree: int, periodic: bool) -> Any:
+    def forward(
+        ctx: Any, t: torch.Tensor, knots: torch.Tensor, degree: int, periodic: bool
+    ) -> torch.Tensor:
         t_np = to_numpy_f64(t)
         knots_np = to_numpy_f64(knots)
         basis_np = _api.bspline_basis(t_np, knots_np, degree=degree, periodic=periodic)
@@ -40,14 +34,14 @@ class _BsplineBasisFn(torch.autograd.Function):
         return from_numpy_like(basis_np, t)
 
     @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, None, None, None]:
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         (grad_basis,) = grad_outputs
         t, knots = ctx.saved_tensors
-        t_np = to_numpy_f64(t)
-        knots_np = to_numpy_f64(knots)
         deriv_np = _api.bspline_basis_derivative(
-            t_np,
-            knots_np,
+            to_numpy_f64(t),
+            to_numpy_f64(knots),
             degree=ctx.degree,
             order=1,
             periodic=ctx.periodic,
@@ -61,7 +55,9 @@ class _DuchonBasis1dFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust 1-D Duchon basis with grad wrt ``t``."""
 
     @staticmethod
-    def forward(ctx: Any, t: Any, centers: Any, m: int, periodic: bool) -> Any:
+    def forward(
+        ctx: Any, t: torch.Tensor, centers: torch.Tensor, m: int, periodic: bool
+    ) -> torch.Tensor:
         t_np = to_numpy_f64(t)
         centers_np = to_numpy_f64(centers)
         basis_np = _api.duchon_basis_1d(t_np, centers_np, m=m, periodic=periodic)
@@ -71,14 +67,14 @@ class _DuchonBasis1dFn(torch.autograd.Function):
         return from_numpy_like(basis_np, t)
 
     @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, None, None, None]:
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
         (grad_basis,) = grad_outputs
         t, centers = ctx.saved_tensors
-        t_np = to_numpy_f64(t)
-        centers_np = to_numpy_f64(centers)
         deriv_np = _api.duchon_basis_1d_derivative(
-            t_np,
-            centers_np,
+            to_numpy_f64(t),
+            to_numpy_f64(centers),
             m=ctx.m,
             order=1,
             periodic=ctx.periodic,
@@ -89,12 +85,12 @@ class _DuchonBasis1dFn(torch.autograd.Function):
 
 
 def bspline_basis(
-    t: Any,
-    knots: Any,
+    t: torch.Tensor,
+    knots: torch.Tensor,
     *,
     degree: int = 3,
     periodic: bool = False,
-) -> Any:
+) -> torch.Tensor:
     """Evaluate the B-spline basis at ``t`` and route gradients back to ``t``.
 
     Parameters
@@ -114,17 +110,17 @@ def bspline_basis(
         Basis matrix of shape ``(n_t, n_basis)``.
     """
     apply = cast(Callable[..., torch.Tensor], _BsplineBasisFn.apply)
-    return apply(_as_tensor(t), _as_tensor(knots), int(degree), bool(periodic))
+    return apply(t, knots, int(degree), bool(periodic))
 
 
 def bspline_basis_derivative(
-    t: Any,
-    knots: Any,
+    t: torch.Tensor,
+    knots: torch.Tensor,
     *,
     degree: int = 3,
     order: int = 1,
     periodic: bool = False,
-) -> Any:
+) -> torch.Tensor:
     """Evaluate derivatives of the B-spline basis at ``t``.
 
     Forward-only: the returned tensor does not carry a backward through ``t``.
@@ -150,24 +146,23 @@ def bspline_basis_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
-    t_ref = _as_tensor(t)
     deriv = _api.bspline_basis_derivative(
-        to_numpy_f64(t_ref),
-        to_numpy_f64(_as_tensor(knots)),
+        to_numpy_f64(t),
+        to_numpy_f64(knots),
         degree=int(degree),
         order=int(order),
         periodic=bool(periodic),
     )
-    return from_numpy_like(deriv, t_ref)
+    return from_numpy_like(deriv, t)
 
 
 def duchon_basis_1d(
-    t: Any,
-    centers: Any,
+    t: torch.Tensor,
+    centers: torch.Tensor,
     *,
     m: int = 2,
     periodic: bool = False,
-) -> Any:
+) -> torch.Tensor:
     """Evaluate the one-dimensional Duchon basis at ``t`` with grad wrt ``t``.
 
     Parameters
@@ -187,17 +182,17 @@ def duchon_basis_1d(
         Basis matrix of shape ``(n_t, n_basis)``.
     """
     apply = cast(Callable[..., torch.Tensor], _DuchonBasis1dFn.apply)
-    return apply(_as_tensor(t), _as_tensor(centers), int(m), bool(periodic))
+    return apply(t, centers, int(m), bool(periodic))
 
 
 def duchon_basis_1d_derivative(
-    t: Any,
-    centers: Any,
+    t: torch.Tensor,
+    centers: torch.Tensor,
     *,
     m: int = 2,
     order: int = 1,
     periodic: bool = False,
-) -> Any:
+) -> torch.Tensor:
     """Evaluate derivatives of the 1-D Duchon basis at ``t``.
 
     Forward-only: the returned tensor does not carry a backward through ``t``.
@@ -222,23 +217,22 @@ def duchon_basis_1d_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
-    t_ref = _as_tensor(t)
     deriv = _api.duchon_basis_1d_derivative(
-        to_numpy_f64(t_ref),
-        to_numpy_f64(_as_tensor(centers)),
+        to_numpy_f64(t),
+        to_numpy_f64(centers),
         m=int(m),
         order=int(order),
         periodic=bool(periodic),
     )
-    return from_numpy_like(deriv, t_ref)
+    return from_numpy_like(deriv, t)
 
 
 def smoothness_penalty(
-    knots: Any,
+    knots: torch.Tensor,
     *,
     degree: int = 3,
     order: int = 2,
-) -> tuple[Any, Any]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the B-spline difference penalty and its null-space basis.
 
     Forward-only: ``knots`` is structural and the result has no autograd path.
@@ -257,21 +251,20 @@ def smoothness_penalty(
     (torch.Tensor, torch.Tensor)
         ``S`` of shape ``(M, M)`` and ``null_basis`` of shape ``(M, p)``.
     """
-    ref = _as_tensor(knots)
     s_np, null_np = _api.smoothness_penalty(
-        to_numpy_f64(ref), degree=int(degree), order=int(order)
+        to_numpy_f64(knots), degree=int(degree), order=int(order)
     )
-    return from_numpy_like(s_np, ref), from_numpy_like(null_np, ref)
+    return from_numpy_like(s_np, knots), from_numpy_like(null_np, knots)
 
 
 def gaussian_weighted_ridge(
-    X: Any,
-    Y: Any,
-    penalty: Any,
-    weights: Any,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    penalty: torch.Tensor,
+    weights: torch.Tensor,
     *,
     ridge_lambda: float,
-) -> tuple[Any, Any]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form Gaussian row-weighted ridge solve.
 
     Forward-only: :mod:`gamfit._api` exposes no analytic VJP for this primitive,
@@ -296,26 +289,25 @@ def gaussian_weighted_ridge(
     (torch.Tensor, torch.Tensor)
         ``coefficients`` of shape ``(M, D)`` and ``fitted`` of shape ``(N, D)``.
     """
-    X_ref = _as_tensor(X)
     coef_np, fit_np = _api.gaussian_weighted_ridge(
-        to_numpy_f64(X_ref),
-        to_numpy_f64(_as_tensor(Y)),
-        to_numpy_f64(_as_tensor(penalty)),
-        to_numpy_f64(_as_tensor(weights)),
+        to_numpy_f64(X),
+        to_numpy_f64(Y),
+        to_numpy_f64(penalty),
+        to_numpy_f64(weights),
         ridge_lambda=float(ridge_lambda),
     )
-    return from_numpy_like(coef_np, X_ref), from_numpy_like(fit_np, X_ref)
+    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)
 
 
 def gaussian_weighted_ridge_batch(
-    X: Any,
-    Y: Any,
-    penalty: Any,
-    weights: Any,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    penalty: torch.Tensor,
+    weights: torch.Tensor,
     *,
     ridge_lambda: float,
-    row_counts: Any | None = None,
-) -> tuple[Any, Any]:
+    row_counts: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched closed-form Gaussian row-weighted ridge solve.
 
     Forward-only: no analytic VJP is exposed in :mod:`gamfit._api`. ``X`` has
@@ -329,13 +321,12 @@ def gaussian_weighted_ridge_batch(
         ``coefficients`` of shape ``(K, M, D)`` and ``fitted`` of shape
         ``(K, Nmax, D)``.
     """
-    X_ref = _as_tensor(X)
     coef_np, fit_np = _api.gaussian_weighted_ridge_batch(
-        to_numpy_f64(X_ref),
-        to_numpy_f64(_as_tensor(Y)),
-        to_numpy_f64(_as_tensor(penalty)),
-        to_numpy_f64(_as_tensor(weights)),
+        to_numpy_f64(X),
+        to_numpy_f64(Y),
+        to_numpy_f64(penalty),
+        to_numpy_f64(weights),
         ridge_lambda=float(ridge_lambda),
         row_counts=None if row_counts is None else to_numpy_uintp(row_counts),
     )
-    return from_numpy_like(coef_np, X_ref), from_numpy_like(fit_np, X_ref)
+    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)

@@ -95,9 +95,15 @@ module-name = "gamfit._rust"
 python_version = "3.10"
 strict = true
 files = ["gamfit", "tests", "scripts", "bench"]
+mypy_path = ["bench", "tests/bench_tools"]
+explicit_package_bases = true
 exclude = [
   "^bench/\\.venv/",
 ]
+
+[[tool.mypy.overrides]]
+module = ["mgcv", "pyvista", "imageio", "imageio.v2"]
+ignore_missing_imports = true
 
 [tool.vulture]
 paths = ["gamfit", "tests", "scripts", "bench"]
