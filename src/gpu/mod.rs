@@ -19,13 +19,15 @@
 mod blas;
 pub mod calibration;
 pub mod device;
-mod diagnostics;
+pub mod diagnostics;
 pub mod dispatch;
 mod driver;
 pub mod policy;
 pub mod runtime;
 pub mod solver;
 pub mod sparse;
+
+pub use diagnostics::{flush_gpu_activity_summary, gpu_activity_summary};
 
 pub use device::GpuDeviceInfo;
 pub use dispatch::{
