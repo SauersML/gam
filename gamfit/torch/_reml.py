@@ -763,6 +763,57 @@ def _resolve_effective_basis(
     return display_kind, effective_kind, order
 
 
+def _solve_beta_at_lambda(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    penalty: torch.Tensor,
+    log_lambda: torch.Tensor,
+    weights: torch.Tensor | None,
+    by: torch.Tensor | None,
+    by_start_col: int,
+    row_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Solve ``β = (XᵀWX + λS)⁻¹ XᵀWY`` per batch at fixed ``log_lambda``.
+
+    Returned as ``(batch, n_basis, n_outputs)``. Forward-only — the chain
+    through ``β`` vanishes by envelope theorem at the inner-problem
+    optimum, so subsequent backward only needs to chase the explicit
+    dependence of the REML score on ``log_lambda``, ``X``, ``Y``, and ``S``.
+    """
+    from ._basis import gaussian_weighted_ridge
+
+    n_batch = int(row_offsets.numel()) - 1
+    if n_batch <= 0:
+        raise ValueError("row_offsets must contain at least one segment")
+    lam_value = float(log_lambda.detach().reshape(-1)[0].exp().item())
+    pen = penalty.detach()
+    if by is not None:
+        by_det = by.detach()
+    else:
+        by_det = None
+    coefs: list[torch.Tensor] = []
+    for b in range(n_batch):
+        s = int(row_offsets[b].item())
+        e = int(row_offsets[b + 1].item())
+        if e <= s:
+            coefs.append(torch.zeros(pen.shape[0], y.shape[1], dtype=x.dtype, device=x.device))
+            continue
+        x_b = x[s:e].detach()
+        y_b = y[s:e].detach()
+        w_b = (
+            torch.ones(e - s, dtype=x.dtype, device=x.device)
+            if weights is None
+            else weights[s:e].detach()
+        )
+        if by_det is not None:
+            gated = x_b.clone()
+            gated[:, by_start_col:] = gated[:, by_start_col:] * by_det[s:e].unsqueeze(1)
+            x_b = gated
+        beta, _ = gaussian_weighted_ridge(x_b, y_b, pen, w_b, ridge_lambda=lam_value)
+        coefs.append(beta)
+    return torch.stack(coefs, dim=0)
+
+
 def _canonical_penalty_tensor(
     locations: torch.Tensor,
     *,
@@ -872,7 +923,7 @@ def gaussian_reml_fit_positions(
     init_lambda: float | None = None,
     by: torch.Tensor | None = None,
     by_start_col: int = 0,
-) -> GaussianRemlOutput:
+) -> GaussianRemlPositionOutput:
     """Differentiable position-based closed-form Gaussian REML fit.
 
     Parameters
@@ -957,7 +1008,40 @@ def gaussian_reml_fit_positions(
             None if period is None else float(period),
         )
     if smoothing != "reml":
-        raise ValueError("smoothing='adam' or 'fixed' requires coefficients=... in this API")
+        # Auto-solve β at the user-supplied λ, then evaluate the free-B
+        # REML score so gradients can flow back to ``log_lambda`` (and ``X``,
+        # ``Y``, ``S``) in ``smoothing='adam'`` mode. ``smoothing='fixed'``
+        # uses a detached log_lambda so no gradient flows there.
+        if score_log_lambda is None:
+            score_log_lambda = (
+                torch.zeros((), dtype=t.dtype, device=t.device)
+                if log_lambda is None
+                else log_lambda
+            )
+        if smoothing == "fixed":
+            score_log_lambda = score_log_lambda.detach()
+        x = _position_design(
+            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
+        )
+        offsets = torch.tensor([0, int(t.numel())], dtype=torch.long, device=t.device)
+        coef_batched = _solve_beta_at_lambda(
+            x, y, penalty_t, score_log_lambda, weights, by, by_start_col, offsets
+        )
+        coefficients = coef_batched[0]
+        apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
+        reml_score = apply_score(
+            x, y, offsets, coefficients, score_log_lambda, penalty_t,
+            weights, by, by_start_col,
+        )[0]
+        fitted = x @ coefficients
+        lam = score_log_lambda.exp()
+        edf = torch.full_like(reml_score, float("nan"))
+        return GaussianRemlPositionOutput(
+            coefficients, fitted, lam, reml_score, edf,
+            knots_t, penalty_t,
+            str(display_kind), int(order), bool(periodic),
+            None if period is None else float(period),
+        )
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         t,
