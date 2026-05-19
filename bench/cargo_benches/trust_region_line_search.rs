@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use ndarray::Array1;
+use std::hint::black_box;
 
 fn backtracking_pattern(radius: f64, newton_step: &Array1<f64>) -> (usize, f64) {
     let mut attempts = 0usize;
