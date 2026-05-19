@@ -49,8 +49,7 @@ use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
-    PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;

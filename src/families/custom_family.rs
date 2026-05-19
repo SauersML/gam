@@ -9005,6 +9005,10 @@ fn update_joint_trust_region_radius(
     }
 }
 
+fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f64 {
+    (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
+}
+
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -10354,7 +10358,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 if trialobjective.is_finite()
                     && trust_update.accepted
-                    && trialobjective <= old_objective + 1e-10
+                    && trialobjective
+                        <= old_objective
+                            + joint_objective_roundoff_slack(old_objective, trialobjective)
                 {
                     current_penalty = trial_penalty;
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
@@ -21583,6 +21589,17 @@ mod tests {
             "objective increase beyond noise must reject"
         );
         assert!(update.rho.is_infinite() && update.rho < 0.0);
+    }
+
+    #[test]
+    fn joint_objective_roundoff_slack_accepts_biobank_scale_wobble() {
+        let old_objective = 1.218530e5;
+        let trial_objective = old_objective + 2.183e-10;
+        assert!(
+            trial_objective
+                <= old_objective + joint_objective_roundoff_slack(old_objective, trial_objective),
+            "sub-nanounit objective wobble at biobank scale should not burn all trust attempts"
+        );
     }
 
     #[test]
