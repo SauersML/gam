@@ -7861,8 +7861,7 @@ impl BernoulliMarginalSlopeFamily {
         const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
         const GPU_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
-        let cpu_rows =
-            (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
+        let cpu_rows = (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
         let runtime = crate::gpu::GpuRuntime::global();
         if !runtime.is_available() || n == 0 || n_dirs == 0 {
             return (cpu_rows.min(n.max(1)), false);
@@ -7889,9 +7888,7 @@ impl BernoulliMarginalSlopeFamily {
         };
         let projection_rows = rows_for_flops(
             policy.gemm_min_flops,
-            2usize
-                .saturating_mul(p_m.max(p_g))
-                .saturating_mul(n_dirs),
+            2usize.saturating_mul(p_m.max(p_g)).saturating_mul(n_dirs),
         );
         let gram_rows = rows_for_flops(
             policy.gemm_min_flops,
