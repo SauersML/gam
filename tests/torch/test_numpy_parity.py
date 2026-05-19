@@ -264,12 +264,12 @@ def test_geometry_torch_inputs_keep_autograd() -> None:
     base = torch.full((4,), 0.25, dtype=torch.float64)
     simplex = gt.simplex_exp_map(gt.simplex_log_map(x, base), base)
     loss = simplex.square().sum() + gt.clr(x).square().sum()
-    loss.backward()
+    torch.autograd.backward(loss)
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
 
     tangent = (torch.randn((5, 3), dtype=torch.float64) * 0.05).requires_grad_()
     sphere = gt.sphere_exp_map(tangent, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
-    sphere.sum().backward()
+    torch.autograd.backward(sphere.sum())
     assert tangent.grad is not None
     assert torch.isfinite(tangent.grad).all()
