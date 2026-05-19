@@ -10951,20 +10951,45 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
             let objective_flat_step_tol = joint_objective_flat_step_tol(objective_tol, step_tol);
+            // `joint_objective_flat_step_reached` proves only that the iterate
+            // sits on a numerically flat ledge of the objective: both Δobj and
+            // ‖δ‖_∞ have fallen below tolerances scaled by |obj|. That is
+            // enough to exit a slow rho-only startup, but is NOT a KKT
+            // certificate — the residual ‖∇L − Sβ‖_∞ can sit many orders above
+            // residual_tol when sqrt(obj_tol) is large relative to KKT noise
+            // (biobank-scale outer screening with inner_tol ~ 1e-4 routinely
+            // produces |obj| ~ 1e5, sqrt(obj_tol) ~ 3 — large enough that
+            // step_inf ≤ 3 admits residuals at 0.1·|obj|).
+            //
+            // Accepting such an iterate breaks the analytic envelope-theorem
+            // outer gradient (∇_ρ L_REML = ∂L/∂ρ |_β̂ holds only at KKT modulo
+            // O(‖residual‖·‖∂β/∂ρ‖)). At biobank scale this surfaces as outer
+            // BFGS stalling with |g|_∞ ≈ 1e6–1e7 — the inner mode is "flat" but
+            // not stationary, so the gradient observed by the outer is noise.
+            //
+            // The ceiling `0.01·(1 + |obj|)` keeps the rho-only biobank tail
+            // (residual ≈ 67 at |obj| ≈ 7.95e4, ratio 8e-4) firing while
+            // blocking the failure regime (residual ≳ 1e3 at |obj| ≈ 1.14e5,
+            // ratios 0.01–1). Blocked cycles fall through to budget-exhausted
+            // best-effort after running more inner-Newton steps that further
+            // contract the residual.
+            let flat_step_residual_ceiling = 0.01_f64 * (1.0 + lastobjective.abs());
             if joint_objective_flat_step_reached(
                 objective_change,
                 accepted_step_inf,
                 objective_tol,
                 step_tol,
-            ) {
+            ) && residual <= flat_step_residual_ceiling
+            {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat step certificate: step_inf={:.3e} <= sqrt(obj_tol)={:.3e}, obj_change={:.3e} <= tol={:.3e}, residual={:.3e}",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat step certificate: step_inf={:.3e} <= sqrt(obj_tol)={:.3e}, obj_change={:.3e} <= tol={:.3e}, residual={:.3e} (ceiling={:.3e})",
                     cycle,
                     accepted_step_inf,
                     objective_flat_step_tol,
                     objective_change,
                     objective_tol,
                     residual,
+                    flat_step_residual_ceiling,
                 );
                 converged = true;
                 break;
@@ -22459,6 +22484,30 @@ mod tests {
                 step_tol,
             ),
             "rho-only exact outer seed validation should accept the numerically flat inner tail"
+        );
+
+        // ── KKT residual ceiling guard ──
+        //
+        // The flat-step predicate above accepts a numerically flat ledge of
+        // the objective regardless of KKT residual. At biobank-scale outer
+        // screening (|obj| ~ 1e5, inner_tol ~ 1e-4) the residual at the same
+        // ledge can sit at 0.1–1·|obj| — large enough to break the
+        // envelope-theorem outer gradient and stall outer BFGS with |g|_∞
+        // in the millions. The inner-loop call site pairs the predicate
+        // with `residual ≤ 0.01·(1 + |obj|)`; encode that contract here so
+        // a future relaxation cannot silently re-enable the failure regime.
+        let kkt_safe_residual = 67.0_f64; // tail residual observed in the rho-only fix
+        let kkt_unsafe_residual = 1.339e5_f64; // residual that drove outer BFGS to stall
+        let bigobj = 1.141752e5_f64; // biobank-scale objective from the failing tail
+        let residual_ceiling_small_obj = 0.01_f64 * (1.0 + objective.abs());
+        let residual_ceiling_big_obj = 0.01_f64 * (1.0 + bigobj.abs());
+        assert!(
+            kkt_safe_residual <= residual_ceiling_small_obj,
+            "rho-only biobank-tail residual ({kkt_safe_residual:.3e}) must stay under the ceiling ({residual_ceiling_small_obj:.3e}) so the flat-step rescue keeps firing on the original failure"
+        );
+        assert!(
+            kkt_unsafe_residual > residual_ceiling_big_obj,
+            "biobank-scale outer-screening residual ({kkt_unsafe_residual:.3e}) must exceed the ceiling ({residual_ceiling_big_obj:.3e}) so the flat-step rescue does NOT accept a non-KKT iterate that breaks the envelope-theorem outer gradient"
         );
     }
 
