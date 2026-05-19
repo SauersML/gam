@@ -215,6 +215,177 @@ pub enum FitRequest<'a> {
     TransformationNormal(TransformationNormalFitRequest<'a>),
 }
 
+impl<'a> FitRequest<'a> {
+    /// Short stable string identifying the family variant. Used as one
+    /// segment of the warm-start cache key — every fit of this family
+    /// shape shares the same family tag, so a hierarchical lookup can
+    /// drop trailing key segments to find near-match seeds from prior
+    /// fits of the same family on related data.
+    pub fn family_tag(&self) -> &'static str {
+        match self {
+            FitRequest::Standard(_) => "standard",
+            FitRequest::GaussianLocationScale(_) => "gaussian-location-scale",
+            FitRequest::BinomialLocationScale(_) => "binomial-location-scale",
+            FitRequest::SurvivalLocationScale(_) => "survival-location-scale",
+            FitRequest::SurvivalTransformation(_) => "survival-transformation",
+            FitRequest::BernoulliMarginalSlope(_) => "bernoulli-marginal-slope",
+            FitRequest::SurvivalMarginalSlope(_) => "survival-marginal-slope",
+            FitRequest::LatentSurvival(_) => "latent-survival",
+            FitRequest::LatentBinary(_) => "latent-binary",
+            FitRequest::TransformationNormal(_) => "transformation-normal",
+        }
+    }
+
+    /// Deterministic warm-start cache key for this request.
+    ///
+    /// Layout (`/`-delimited so the suffix can be peeled for graceful
+    /// degradation in future hierarchical lookups):
+    ///   `v{lib}/family={tag}/dims=N×D/shape={family-shape-hash}`
+    ///
+    /// Inputs included: library version, family tag, dataset shape, and a
+    /// family-specific shape hash covering anything that changes the basis
+    /// dimension or coefficient layout (formula skeleton, baseline kind,
+    /// link kind, etc.). Inputs deliberately *excluded*: anything that
+    /// shifts the optimum but doesn't reshape the parameter vector
+    /// (convergence tolerances, ridge, etc.) — those go in the
+    /// finer-grained suffix so a near-match can still be a useful seed.
+    pub fn cache_key(&self) -> String {
+        // Family-shape hash: a 64-bit StableHasher-derived integer that
+        // captures dimensions / formula structure unique to this family
+        // variant. Two fits with identical family-shape hashes have
+        // compatible θ shapes and can warm-start from each other.
+        let mut shape = crate::solver::persistent_warm_start::StableHasher::new();
+        match self {
+            FitRequest::Standard(req) => {
+                shape.write_str("standard");
+                shape.write_str(&format!("{:?}", req.family));
+                shape.write_usize(req.y.len());
+                shape.write_usize(req.data.ncols());
+            }
+            FitRequest::GaussianLocationScale(req) => {
+                shape.write_str("gauss-ls");
+                shape.write_usize(req.spec.y.len());
+                shape.write_usize(req.data.ncols());
+            }
+            FitRequest::BinomialLocationScale(req) => {
+                shape.write_str("binom-ls");
+                shape.write_usize(req.spec.y.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.link_kind));
+            }
+            FitRequest::SurvivalLocationScale(req) => {
+                shape.write_str("surv-ls");
+                shape.write_usize(req.spec.age_entry.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.inverse_link));
+            }
+            FitRequest::SurvivalTransformation(req) => {
+                shape.write_str("surv-tn");
+                shape.write_usize(req.spec.age_entry.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.likelihood_mode));
+                shape.write_str(&req.spec.time_build.basisname);
+            }
+            FitRequest::BernoulliMarginalSlope(req) => {
+                shape.write_str("bern-ms");
+                shape.write_usize(req.spec.y.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.base_link));
+            }
+            FitRequest::SurvivalMarginalSlope(req) => {
+                shape.write_str("surv-ms");
+                shape.write_usize(req.spec.age_entry.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.spec.base_link));
+                shape.write_str(&format!("{:?}", req.spec.frailty));
+            }
+            FitRequest::LatentSurvival(req) => {
+                shape.write_str("lat-surv");
+                shape.write_usize(req.spec.age_entry.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.frailty));
+            }
+            FitRequest::LatentBinary(req) => {
+                shape.write_str("lat-bin");
+                shape.write_usize(req.spec.age_entry.len());
+                shape.write_usize(req.data.ncols());
+                shape.write_str(&format!("{:?}", req.frailty));
+            }
+            FitRequest::TransformationNormal(req) => {
+                shape.write_str("tn");
+                shape.write_usize(req.response.len());
+                shape.write_usize(req.data.ncols());
+            }
+        }
+        let shape_hash = shape.finish_hex();
+        let (nrows, ncols) = match self {
+            FitRequest::Standard(req) => (req.y.len(), req.data.ncols()),
+            FitRequest::GaussianLocationScale(req) => (req.spec.y.len(), req.data.ncols()),
+            FitRequest::BinomialLocationScale(req) => (req.spec.y.len(), req.data.ncols()),
+            FitRequest::SurvivalLocationScale(req) => (req.spec.age_entry.len(), req.data.ncols()),
+            FitRequest::SurvivalTransformation(req) => (req.spec.age_entry.len(), req.data.ncols()),
+            FitRequest::BernoulliMarginalSlope(req) => (req.spec.y.len(), req.data.ncols()),
+            FitRequest::SurvivalMarginalSlope(req) => (req.spec.age_entry.len(), req.data.ncols()),
+            FitRequest::LatentSurvival(req) => (req.spec.age_entry.len(), req.data.ncols()),
+            FitRequest::LatentBinary(req) => (req.spec.age_entry.len(), req.data.ncols()),
+            FitRequest::TransformationNormal(req) => (req.response.len(), req.data.ncols()),
+        };
+        format!(
+            "v{}/family={}/dims={}x{}/shape={}",
+            env!("CARGO_PKG_VERSION"),
+            self.family_tag(),
+            nrows,
+            ncols,
+            shape_hash,
+        )
+    }
+
+    /// Attach a warm-start cache session to this request.
+    ///
+    /// Threads the session into the variant's BlockwiseFitOptions
+    /// (`request.options.cache_session`) or top-level `cache_session`
+    /// field, whichever is the variant's natural slot. Idempotent —
+    /// existing sessions are not overwritten so callers can pre-attach.
+    pub fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        match self {
+            FitRequest::Standard(_) => {
+                // The standard REML path opens its own session inside the
+                // outer optimizer via `reml_state.outer_cache_session()`
+                // (see `solver/estimate.rs:2701`). The session here would
+                // be a duplicate keyed on the same fingerprint, so we
+                // skip it to avoid double-checkpointing.
+            }
+            FitRequest::GaussianLocationScale(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::BinomialLocationScale(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::SurvivalLocationScale(req) => {
+                req.cache_session.get_or_insert(session);
+            }
+            FitRequest::SurvivalTransformation(req) => {
+                req.cache_session.get_or_insert(session);
+            }
+            FitRequest::BernoulliMarginalSlope(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::SurvivalMarginalSlope(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::LatentSurvival(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::LatentBinary(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+            FitRequest::TransformationNormal(req) => {
+                req.options.cache_session.get_or_insert(session);
+            }
+        }
+    }
+}
+
 pub struct StandardFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
