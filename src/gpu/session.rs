@@ -373,6 +373,10 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
     }
     let bytes_x = bytes_len::<f64>(rows.checked_mul(cols)?)?;
     let bytes_wy = bytes_x;
+    let bytes_w = bytes_len::<f64>(rows)?;
+    let bytes_out_pp = bytes_len::<f64>(cols.checked_mul(cols)?)?;
+    let bytes_out_n = bytes_len::<f64>(rows)?;
+    let bytes_v_p = bytes_len::<f64>(cols)?;
 
     // Allocate device buffers + upload X under the runtime lock.
     let guard = slot.lock().ok()?;
@@ -390,22 +394,28 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
         )
         .ok()?;
         let wy_dev = DeviceAllocation::new(&guard.cuda.api, bytes_wy)?;
+        let w_dev = DeviceAllocation::new(&guard.cuda.api, bytes_w)?;
+        let out_pp_dev = DeviceAllocation::new(&guard.cuda.api, bytes_out_pp)?;
+        let out_n_dev = DeviceAllocation::new(&guard.cuda.api, bytes_out_n)?;
+        let v_p_dev = DeviceAllocation::new(&guard.cuda.api, bytes_v_p)?;
         // The DeviceAllocation type carries a 'a lifetime tied to the
         // borrow of DriverApi. We need 'static to live in the cache; the
         // DriverApi here came from `&'static CudaWorkingState` so this is
         // sound — extend the lifetime explicitly.
-        let x_dev_static: DeviceAllocation<'static> =
-            std::mem::transmute::<DeviceAllocation<'_>, DeviceAllocation<'static>>(x_dev);
-        let wy_dev_static: DeviceAllocation<'static> =
-            std::mem::transmute::<DeviceAllocation<'_>, DeviceAllocation<'static>>(wy_dev);
+        let into_static = |a: DeviceAllocation<'_>| -> DeviceAllocation<'static> {
+            std::mem::transmute::<DeviceAllocation<'_>, DeviceAllocation<'static>>(a)
+        };
         Some(DeviceXSession {
             rows,
             cols,
             device,
             cublas: slot,
-            x_dev: x_dev_static,
-            wy_dev: wy_dev_static,
-            _phantom: std::marker::PhantomData,
+            x_dev: into_static(x_dev),
+            wy_dev: into_static(wy_dev),
+            w_dev: into_static(w_dev),
+            out_pp_dev: into_static(out_pp_dev),
+            out_n_dev: into_static(out_n_dev),
+            v_p_dev: into_static(v_p_dev),
         })
     }
 }
@@ -519,6 +529,20 @@ type CublasDgemm = unsafe extern "C" fn(
 ) -> CublasStatus;
 type CublasDdgmm =
     unsafe extern "C" fn(usize, i32, i32, i32, u64, i32, u64, i32, u64, i32) -> CublasStatus;
+type CublasDgemv = unsafe extern "C" fn(
+    usize,
+    i32,
+    i32,
+    i32,
+    *const f64,
+    u64,
+    i32,
+    u64,
+    i32,
+    *const f64,
+    u64,
+    i32,
+) -> CublasStatus;
 
 const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
 const CUBLAS_OP_N: i32 = 0;
@@ -530,6 +554,7 @@ struct MicroCublas {
     cublas_destroy: CublasDestroy,
     cublas_dgemm: CublasDgemm,
     cublas_ddgmm: CublasDdgmm,
+    cublas_dgemv: CublasDgemv,
 }
 
 impl MicroCublas {
@@ -546,6 +571,9 @@ impl MicroCublas {
                     .get(b"cublasDgemm_v2\0")
                     .map_err(|e| e.to_string())?,
                 cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
+                cublas_dgemv: *library
+                    .get(b"cublasDgemv_v2\0")
+                    .map_err(|e| e.to_string())?,
             })
         }
     }
