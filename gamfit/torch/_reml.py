@@ -1027,11 +1027,15 @@ def gaussian_reml_fit_positions(
         # ``Y``, ``S``) in ``smoothing='adam'`` mode. ``smoothing='fixed'``
         # uses a detached log_lambda so no gradient flows there.
         if score_log_lambda is None:
-            score_log_lambda = (
-                torch.zeros((), dtype=t.dtype, device=t.device)
-                if log_lambda is None
-                else log_lambda
-            )
+            # ``_canonical_penalty_tensor`` returns ``None`` for the explicit
+            # log_lambda input when it has already folded a vector λ into the
+            # combined penalty (the triple-operator path). In that mode the
+            # score function should see ``log_lambda = 0`` so its effective
+            # multiplier is 1, and gradients flow back to the user's vector
+            # log_lambda through torch's autograd on the combined penalty
+            # tensor — not through the score function's scalar log_lambda
+            # argument.
+            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
         if smoothing == "fixed":
             score_log_lambda = score_log_lambda.detach()
         x = _position_design(
@@ -1199,11 +1203,15 @@ def gaussian_reml_fit_positions_batched(
         # free-B REML score (envelope theorem: chain through β is zero at
         # the inner-problem optimum).
         if score_log_lambda is None:
-            score_log_lambda = (
-                torch.zeros((), dtype=t.dtype, device=t.device)
-                if log_lambda is None
-                else log_lambda
-            )
+            # ``_canonical_penalty_tensor`` returns ``None`` for the explicit
+            # log_lambda input when it has already folded a vector λ into the
+            # combined penalty (the triple-operator path). In that mode the
+            # score function should see ``log_lambda = 0`` so its effective
+            # multiplier is 1, and gradients flow back to the user's vector
+            # log_lambda through torch's autograd on the combined penalty
+            # tensor — not through the score function's scalar log_lambda
+            # argument.
+            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
         if smoothing == "fixed":
             score_log_lambda = score_log_lambda.detach()
         x = _position_design(
