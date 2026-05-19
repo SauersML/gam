@@ -2083,6 +2083,18 @@ pub struct BlockwiseFitOptions {
     /// When `outer_score_subsample` is already `Some(...)` the auto
     /// path is bypassed entirely (caller-provided masks always win).
     pub auto_outer_subsample: bool,
+    /// Optional persistent warm-start cache session. When `Some`, the
+    /// outer smoothing optimizer consults the on-disk cache before
+    /// starting (to seed θ from the last accepted iterate) and writes
+    /// checkpoints + a final entry on completion. When `None`, the fit
+    /// runs cold and writes nothing — the default for unit tests and
+    /// any caller that pinned a deterministic optimum.
+    ///
+    /// The session is opened at the workflow-level `fit_model`
+    /// dispatcher so every family flows through one chokepoint; family
+    /// code never has to remember to wire it. This mirrors the standard
+    /// REML cache wiring in `solver/estimate.rs:2701`.
+    pub cache_session: Option<Arc<crate::cache::Session>>,
 }
 
 impl Default for BlockwiseFitOptions {
@@ -2114,6 +2126,7 @@ impl Default for BlockwiseFitOptions {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            cache_session: None,
         }
     }
 }
