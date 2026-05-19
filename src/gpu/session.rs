@@ -20,19 +20,26 @@
 //!
 //! No new public flags. Callers that don't have an `Arc` continue
 //! through the existing `try_fast_*` path with unchanged semantics.
+//!
+//! The device-side bindings are entirely [`cudarc`] 0.16: the CUDA context
+//! comes from `CudaContext::new` (primary context retain — same CUcontext
+//! as every other caller for the same ordinal), allocations are
+//! `CudaSlice<f64>` (RAII free on drop), and BLAS goes through
+//! `CudaBlas` + the `Gemm` / `Gemv` traits. The one exception is
+//! `cublasDdgmm`, which has no safe wrapper in 0.16; we fall through to
+//! `cudarc::cublas::sys::cublasDdgmm` for that single call.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use libloading::Library;
+use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ndarray::{Array2, ArrayBase, Data, Ix1};
 
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
-use super::driver::{
-    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
-    to_col_major, to_i32,
-};
+use super::driver::{from_col_major, to_col_major, to_i32};
 use super::runtime::GpuRuntime;
 
 /// A device-resident column-major copy of an `Array2<f64>`. Holds the
@@ -46,132 +53,141 @@ pub struct DeviceXSession {
     /// migrate between devices; biobank-scale uploads are too expensive
     /// to bounce around.
     device: GpuDeviceInfo,
-    /// Per-process cuBLAS slot for this device. Locked briefly during
-    /// each kernel; the device allocations below are not touched by any
-    /// other code path.
-    cublas: &'static Mutex<CublasSlot>,
-    /// Device-side X (rows × cols, column-major). Allocation lives as
-    /// long as this struct.
-    x_dev: DeviceAllocation<'static>,
-    /// Scratch for `diag(w) · X`, same shape as X. Reused across calls.
-    wy_dev: DeviceAllocation<'static>,
-    /// Pre-allocated W scratch (n f64). Each `xtwx` call writes here via
-    /// cuMemcpyHtoD; avoids paying cuMemAlloc per iteration (~100us on a
-    /// modern driver, ~5ms across 50 PIRLS iters).
-    w_dev: DeviceAllocation<'static>,
-    /// Pre-allocated p×p output scratch. The dgemm result lands here and
-    /// gets cuMemcpyDtoH'd to a fresh host vec each call.
-    out_pp_dev: DeviceAllocation<'static>,
-    /// Pre-allocated p-length scratch for `xv` (η = X·β) results.
-    out_n_dev: DeviceAllocation<'static>,
-    /// Pre-allocated p-length input scratch for `xv` (β / v).
-    v_p_dev: DeviceAllocation<'static>,
+    /// All device-side state, guarded by a mutex so concurrent xtwx/xv
+    /// calls on this session can't corrupt each other's scratch.
+    inner: Mutex<SessionInner>,
 }
+
+/// Device-side state for a single session. Locked as one unit because
+/// the scratch buffers (`w_dev`, `wy_dev`, etc.) are reused across calls
+/// and any concurrent xtwx/xv would race on them. The `CudaBlas` handle
+/// is also single-threaded by construction.
+struct SessionInner {
+    /// Stream this session does its work on. Owned `Arc<CudaStream>` so
+    /// it (and the underlying `CudaContext`) stay alive for the session
+    /// lifetime; the device slices below all carry their own `Arc<CudaStream>`
+    /// internally as well, so dropping `SessionInner` releases everything.
+    stream: Arc<CudaStream>,
+    /// cuBLAS handle bound to `stream`.
+    blas: CudaBlas,
+    /// Device-side X (rows × cols, column-major).
+    x_dev: CudaSlice<f64>,
+    /// Scratch for `diag(w) · X`, same shape as X. Reused across calls.
+    wy_dev: CudaSlice<f64>,
+    /// Pre-allocated W scratch (n f64).
+    w_dev: CudaSlice<f64>,
+    /// Pre-allocated p×p output scratch for `xtwx`.
+    out_pp_dev: CudaSlice<f64>,
+    /// Pre-allocated n-length scratch for `xv` (y = X·β) results.
+    out_n_dev: CudaSlice<f64>,
+    /// Pre-allocated p-length input scratch for `xv` (β / v).
+    v_p_dev: CudaSlice<f64>,
+}
+
+// CudaBlas is !Send in some configurations; the Mutex wrapping
+// SessionInner already prevents cross-thread concurrent use, and we
+// only ever access the contents through the lock. The whole
+// DeviceXSession is owned by an Arc shared via the cache, which is
+// itself protected by a Mutex.
+unsafe impl Send for SessionInner {}
 
 impl DeviceXSession {
     /// Run `Xᵀ · diag(w) · X` reusing the resident X copy. The session's
     /// internal scratch buffer holds `diag(w) · X`; only `w` (8·n bytes)
     /// and the `p × p` output cross the PCIe boundary.
-    pub fn xtwx<S: Data<Elem = f64>>(
-        &self,
-        w: &ArrayBase<S, Ix1>,
-    ) -> Option<Array2<f64>> {
+    pub fn xtwx<S: Data<Elem = f64>>(&self, w: &ArrayBase<S, Ix1>) -> Option<Array2<f64>> {
         let n = self.rows;
         let p = self.cols;
         if w.len() != n {
             return None;
         }
-        // Use a contiguous host slice for the cuMemcpy. Views over
+        // Use a contiguous host slice for memcpy. Views over
         // non-contiguous parents (e.g. strided slices) get materialized.
         let w_owned_storage: Option<Vec<f64>> = match w.as_slice() {
             Some(_) => None,
             None => Some(w.iter().copied().collect()),
         };
-        let w_ptr: *const f64 = match w_owned_storage.as_ref() {
-            Some(buf) => buf.as_ptr(),
-            None => w.as_slice().expect("contiguous slice").as_ptr(),
+        let w_slice: &[f64] = match w_owned_storage.as_ref() {
+            Some(buf) => buf.as_slice(),
+            None => w.as_slice().expect("contiguous slice"),
         };
-        let slot = self.cublas.lock().ok()?;
-        unsafe {
-            slot.cuda.set_current().ok()?;
+        let mut inner = self.inner.lock().ok()?;
+        let stream = inner.stream.clone();
 
-            // Upload w into the pre-allocated scratch (small — ~2.4 MiB
-            // at n=3e5). No cuMemAlloc on the hot path.
-            let bytes_w = bytes_len::<f64>(n)?;
-            check_cuda(
-                (slot.cuda.api.cu_memcpy_htod)(
-                    self.w_dev.ptr,
-                    w_ptr.cast(),
-                    bytes_w,
-                ),
-                "cuMemcpyHtoD(w)",
-            )
-            .ok()?;
+        // Upload w into the pre-allocated scratch.
+        stream.memcpy_htod(w_slice, &mut inner.w_dev).ok()?;
 
-            // wy = diag(w) · x — ddgmm with SIDE_LEFT scales row-by-row.
-            let n_i = to_i32(n)?;
-            let p_i = to_i32(p)?;
-            let status = (slot.api.cublas_ddgmm)(
-                slot.handle,
-                CUBLAS_SIDE_LEFT,
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+
+        // wy = diag(w) · X — ddgmm with SIDE_LEFT scales rows.
+        // No safe wrapper in cudarc 0.16, so we drop to sys directly.
+        // SAFETY: shapes/strides match the col-major X layout we
+        // uploaded above; n_i, p_i are i32-checked; pointers come from
+        // valid `CudaSlice<f64>`s living for the duration of this call.
+        let ddgmm_status = unsafe {
+            let (x_ptr, _record_x) = inner.x_dev.device_ptr(&stream);
+            let (w_ptr, _record_w) = inner.w_dev.device_ptr(&stream);
+            let (wy_ptr, _record_wy) = inner.wy_dev.device_ptr_mut(&stream);
+            cudarc::cublas::sys::cublasDdgmm(
+                *inner.blas.handle(),
+                cublasSideMode_t::CUBLAS_SIDE_LEFT,
                 n_i,
                 p_i,
-                self.x_dev.ptr,
+                x_ptr as *const f64,
                 n_i,
-                self.w_dev.ptr,
+                w_ptr as *const f64,
                 1,
-                self.wy_dev.ptr,
+                wy_ptr as *mut f64,
                 n_i,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-
-            // result = Xᵀ · wy — dgemm into the pre-allocated p×p scratch.
-            let bytes_out = bytes_len::<f64>(p.checked_mul(p)?)?;
-            let alpha = 1.0_f64;
-            let beta = 0.0_f64;
-            let status = (slot.api.cublas_dgemm)(
-                slot.handle,
-                CUBLAS_OP_T,
-                CUBLAS_OP_N,
-                p_i,
-                p_i,
-                n_i,
-                &alpha,
-                self.x_dev.ptr,
-                n_i,
-                self.wy_dev.ptr,
-                n_i,
-                &beta,
-                self.out_pp_dev.ptr,
-                p_i,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-
-            // Download result.
-            let mut out_host = vec![0.0_f64; p.checked_mul(p)?];
-            check_cuda(
-                (slot.cuda.api.cu_memcpy_dtoh)(
-                    out_host.as_mut_ptr().cast(),
-                    self.out_pp_dev.ptr,
-                    bytes_out,
-                ),
-                "cuMemcpyDtoH(out)",
             )
-            .ok()?;
-            Some(from_col_major(&out_host, p, p))
+        };
+        if ddgmm_status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return None;
         }
+
+        // result = Xᵀ · wy — dgemm into the pre-allocated p×p scratch.
+        let cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: p_i,
+            n: p_i,
+            k: n_i,
+            alpha: 1.0,
+            lda: n_i,
+            ldb: n_i,
+            beta: 0.0,
+            ldc: p_i,
+        };
+        // SAFETY: x_dev and wy_dev have rows*cols = n*p f64s, out_pp_dev
+        // has p*p f64s. Leading dims and op flags match the buffer
+        // layout. Gemm<f64>::gemm is unsafe in cudarc because shape
+        // mismatches would cause invalid memory access — we've checked
+        // all shapes against the resident X.
+        let SessionInner {
+            ref blas,
+            ref x_dev,
+            ref wy_dev,
+            ref mut out_pp_dev,
+            ..
+        } = *inner;
+        let gemm_ok = unsafe { blas.gemm(cfg, x_dev, wy_dev, out_pp_dev) }.is_ok();
+        if !gemm_ok {
+            return None;
+        }
+
+        // Download result.
+        let out_host: Vec<f64> = stream.memcpy_dtov(&inner.out_pp_dev).ok()?;
+        // The async memcpy returned above is queued on `stream`; the
+        // dtov call inserts the necessary stream sync before returning
+        // the host vec (see cudarc::driver::result::memcpy_dtoh_async +
+        // SyncOnDrop). Safe to consume.
+        Some(from_col_major(&out_host, p, p))
     }
 
     /// Compute `y = X · v` using the resident X. Uploads `v` (8·p bytes,
     /// negligible), runs dgemv, downloads the n-length result.
-    pub fn xv<S: Data<Elem = f64>>(
-        &self,
-        v: &ArrayBase<S, Ix1>,
-    ) -> Option<ndarray::Array1<f64>> {
+    pub fn xv<S: Data<Elem = f64>>(&self, v: &ArrayBase<S, Ix1>) -> Option<ndarray::Array1<f64>> {
         let n = self.rows;
         let p = self.cols;
         if v.len() != p {
@@ -181,60 +197,44 @@ impl DeviceXSession {
             Some(_) => None,
             None => Some(v.iter().copied().collect()),
         };
-        let v_ptr: *const f64 = match v_owned.as_ref() {
-            Some(buf) => buf.as_ptr(),
-            None => v.as_slice().unwrap().as_ptr(),
+        let v_slice: &[f64] = match v_owned.as_ref() {
+            Some(buf) => buf.as_slice(),
+            None => v.as_slice().expect("contiguous slice"),
         };
-        let slot = self.cublas.lock().ok()?;
-        unsafe {
-            slot.cuda.set_current().ok()?;
-            // Upload v into the pre-allocated p-length scratch.
-            let bytes_v = bytes_len::<f64>(p)?;
-            check_cuda(
-                (slot.cuda.api.cu_memcpy_htod)(
-                    self.v_p_dev.ptr,
-                    v_ptr.cast(),
-                    bytes_v,
-                ),
-                "cuMemcpyHtoD(v)",
-            )
-            .ok()?;
-            // y = X · v via dgemv (NO_TRANSPOSE).
-            let n_i = to_i32(n)?;
-            let p_i = to_i32(p)?;
-            let alpha = 1.0_f64;
-            let beta = 0.0_f64;
-            let status = (slot.api.cublas_dgemv)(
-                slot.handle,
-                CUBLAS_OP_N,
-                n_i,
-                p_i,
-                &alpha,
-                self.x_dev.ptr,
-                n_i,
-                self.v_p_dev.ptr,
-                1,
-                &beta,
-                self.out_n_dev.ptr,
-                1,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            // Download y (n f64).
-            let bytes_y = bytes_len::<f64>(n)?;
-            let mut y_host = vec![0.0_f64; n];
-            check_cuda(
-                (slot.cuda.api.cu_memcpy_dtoh)(
-                    y_host.as_mut_ptr().cast(),
-                    self.out_n_dev.ptr,
-                    bytes_y,
-                ),
-                "cuMemcpyDtoH(y)",
-            )
-            .ok()?;
-            Some(ndarray::Array1::from_vec(y_host))
+        let mut inner = self.inner.lock().ok()?;
+        let stream = inner.stream.clone();
+
+        // Upload v into the pre-allocated p-length scratch.
+        stream.memcpy_htod(v_slice, &mut inner.v_p_dev).ok()?;
+
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let cfg = GemvConfig::<f64> {
+            trans: cublasOperation_t::CUBLAS_OP_N,
+            m: n_i,
+            n: p_i,
+            alpha: 1.0,
+            lda: n_i,
+            incx: 1,
+            beta: 0.0,
+            incy: 1,
+        };
+        // SAFETY: x_dev is n*p, v_p_dev is p, out_n_dev is n. lda=n,
+        // incx=1, incy=1 match the buffer layout. NO_TRANSPOSE consumes
+        // X column-major as m×n = n×p.
+        let SessionInner {
+            ref blas,
+            ref x_dev,
+            ref v_p_dev,
+            ref mut out_n_dev,
+            ..
+        } = *inner;
+        let gemv_ok = unsafe { blas.gemv(cfg, x_dev, v_p_dev, out_n_dev) }.is_ok();
+        if !gemv_ok {
+            return None;
         }
+        let y_host: Vec<f64> = stream.memcpy_dtov(&inner.out_n_dev).ok()?;
+        Some(ndarray::Array1::from_vec(y_host))
     }
 
     /// Selected device for this session — used for diagnostic logging.
@@ -365,235 +365,44 @@ fn cache() -> &'static SessionCache {
 fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
     let runtime = GpuRuntime::global();
     let device = runtime.selected_device()?.clone();
-    let slot = cublas_for_device(device.ordinal)?;
 
     let (rows, cols) = x.dim();
     if rows == 0 || cols == 0 {
         return None;
     }
-    let bytes_x = bytes_len::<f64>(rows.checked_mul(cols)?)?;
-    let bytes_wy = bytes_x;
-    let bytes_w = bytes_len::<f64>(rows)?;
-    let bytes_out_pp = bytes_len::<f64>(cols.checked_mul(cols)?)?;
-    let bytes_out_n = bytes_len::<f64>(rows)?;
-    let bytes_v_p = bytes_len::<f64>(cols)?;
 
-    // Allocate device buffers + upload X under the runtime lock. We bind
-    // the driver API through the `&'static CudaWorkingState` so every
-    // `DeviceAllocation` returned by `::new` is already `'static` —
-    // no lifetime transmute needed for them to live in the cache.
-    let guard = slot.lock().ok()?;
-    let cuda: &'static CudaWorkingState = guard.cuda;
-    let api: &'static _ = &cuda.api;
+    // Build a fresh cudarc context+stream for this session. `CudaContext::new`
+    // uses cuDevicePrimaryCtxRetain under the hood, so every caller for the
+    // same ordinal sees the same underlying CUcontext; allocations from
+    // different sessions on the same device are mutually addressable.
+    let ctx = CudaContext::new(device.ordinal).ok()?;
+    let stream = ctx.new_stream().ok()?;
+    let blas = CudaBlas::new(stream.clone()).ok()?;
+
+    // Pack X column-major on the host then ship in one memcpy.
     let host_col_major: Vec<f64> = to_col_major(&x.view());
-    // FFI is unavoidable below: every cuda/cublas entry point is an
-    // extern "C" function pointer, and `DeviceAllocation::new` is itself
-    // `unsafe` because it requires `cuCtxSetCurrent` to have been issued
-    // beforehand (which we do as the first call inside this block).
-    unsafe {
-        cuda.set_current().ok()?;
-        let x_dev: DeviceAllocation<'static> = DeviceAllocation::new(api, bytes_x)?;
-        check_cuda(
-            (api.cu_memcpy_htod)(
-                x_dev.ptr,
-                host_col_major.as_ptr().cast(),
-                bytes_x,
-            ),
-            "cuMemcpyHtoD(X resident)",
-        )
-        .ok()?;
-        let wy_dev: DeviceAllocation<'static> =
-            DeviceAllocation::new(api, bytes_wy)?;
-        let w_dev: DeviceAllocation<'static> =
-            DeviceAllocation::new(api, bytes_w)?;
-        let out_pp_dev: DeviceAllocation<'static> =
-            DeviceAllocation::new(api, bytes_out_pp)?;
-        let out_n_dev: DeviceAllocation<'static> =
-            DeviceAllocation::new(api, bytes_out_n)?;
-        let v_p_dev: DeviceAllocation<'static> =
-            DeviceAllocation::new(api, bytes_v_p)?;
-        Some(DeviceXSession {
-            rows,
-            cols,
-            device,
-            cublas: slot,
+    let x_dev: CudaSlice<f64> = stream.memcpy_stod(&host_col_major).ok()?;
+    let wy_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows.checked_mul(cols)?).ok()?;
+    let w_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows).ok()?;
+    let out_pp_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols.checked_mul(cols)?).ok()?;
+    let out_n_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows).ok()?;
+    let v_p_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols).ok()?;
+
+    Some(DeviceXSession {
+        rows,
+        cols,
+        device,
+        inner: Mutex::new(SessionInner {
+            stream,
+            blas,
             x_dev,
             wy_dev,
             w_dev,
             out_pp_dev,
             out_n_dev,
             v_p_dev,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Slim cuBLAS slot — one per device, isolated from the dispatch path in
-// `blas.rs`. Sessions hold a `&'static Mutex<CublasSlot>` so calls don't
-// interfere with concurrent `try_fast_*` traffic.
-// ---------------------------------------------------------------------------
-
-struct CublasSlot {
-    cuda: &'static CudaWorkingState,
-    api: MicroCublas,
-    handle: usize,
-}
-
-unsafe impl Send for CublasSlot {}
-
-impl Drop for CublasSlot {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = self.cuda.set_current();
-            let _ = (self.api.cublas_destroy)(self.handle);
-        }
-    }
-}
-
-fn cublas_for_device(ordinal: usize) -> Option<&'static Mutex<CublasSlot>> {
-    static SLOTS: OnceLock<Vec<(usize, Mutex<CublasSlot>)>> = OnceLock::new();
-    let slots = SLOTS.get_or_init(|| {
-        let mut built = Vec::new();
-        for device in GpuRuntime::global().devices() {
-            if let Some(cuda) = device_working_state(device.ordinal) {
-                let cublas_lib = match load_static_library(cublas_library_candidates()) {
-                    Ok(lib) => lib,
-                    Err(_) => continue,
-                };
-                let api = match MicroCublas::load(cublas_lib) {
-                    Ok(api) => api,
-                    Err(_) => continue,
-                };
-                if cuda.set_current().is_err() {
-                    continue;
-                }
-                let mut handle = 0_usize;
-                let status = unsafe { (api.cublas_create)(&mut handle) };
-                if status != CUBLAS_STATUS_SUCCESS {
-                    continue;
-                }
-                built.push((
-                    device.ordinal,
-                    Mutex::new(CublasSlot {
-                        cuda,
-                        api,
-                        handle,
-                    }),
-                ));
-            }
-        }
-        built
-    });
-    slots
-        .iter()
-        .find(|(o, _)| *o == ordinal)
-        .map(|(_, m)| m)
-}
-
-/// One persistent `CudaWorkingState` per device ordinal, kept alive for
-/// the process lifetime so DeviceAllocations attached to it can be cast
-/// to `'static`.
-fn device_working_state(ordinal: usize) -> Option<&'static CudaWorkingState> {
-    static STATES: OnceLock<Vec<(usize, CudaWorkingState)>> = OnceLock::new();
-    let states = STATES.get_or_init(|| {
-        let mut out = Vec::new();
-        for device in GpuRuntime::global().devices() {
-            if let Some(state) = CudaWorkingState::init(device.ordinal) {
-                out.push((device.ordinal, state));
-            }
-        }
-        out
-    });
-    states
-        .iter()
-        .find(|(o, _)| *o == ordinal)
-        .map(|(_, s)| s)
-}
-
-// ---------------------------------------------------------------------------
-// Minimal cuBLAS bindings local to the session module.
-// ---------------------------------------------------------------------------
-
-type CublasStatus = i32;
-type CublasCreate = unsafe extern "C" fn(*mut usize) -> CublasStatus;
-type CublasDestroy = unsafe extern "C" fn(usize) -> CublasStatus;
-#[allow(clippy::too_many_arguments)]
-type CublasDgemm = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-    *const f64,
-    u64,
-    i32,
-) -> CublasStatus;
-type CublasDdgmm =
-    unsafe extern "C" fn(usize, i32, i32, i32, u64, i32, u64, i32, u64, i32) -> CublasStatus;
-type CublasDgemv = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-    *const f64,
-    u64,
-    i32,
-) -> CublasStatus;
-
-const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
-const CUBLAS_OP_N: i32 = 0;
-const CUBLAS_OP_T: i32 = 1;
-const CUBLAS_SIDE_LEFT: i32 = 0;
-
-struct MicroCublas {
-    cublas_create: CublasCreate,
-    cublas_destroy: CublasDestroy,
-    cublas_dgemm: CublasDgemm,
-    cublas_ddgmm: CublasDdgmm,
-    cublas_dgemv: CublasDgemv,
-}
-
-impl MicroCublas {
-    fn load(library: &Library) -> Result<Self, String> {
-        unsafe {
-            Ok(Self {
-                cublas_create: *library
-                    .get(b"cublasCreate_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_destroy: *library
-                    .get(b"cublasDestroy_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_dgemm: *library
-                    .get(b"cublasDgemm_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
-                cublas_dgemv: *library
-                    .get(b"cublasDgemv_v2\0")
-                    .map_err(|e| e.to_string())?,
-            })
-        }
-    }
-}
-
-fn cublas_library_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["cublas64_12.dll", "cublas64_11.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["/usr/local/cuda/lib/libcublas.dylib", "libcublas.dylib"]
-    } else {
-        &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
-    }
+        }),
+    })
 }
 
 #[cfg(test)]
