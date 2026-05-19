@@ -3692,7 +3692,6 @@ fn validate_outer_gradient_convergence(solution: &Solution, abs_floor: f64) -> b
 fn certify_outer_solution(
     solution: Solution,
     config: &OuterConfig,
-    context: &str,
     plan_used: OuterPlan,
 ) -> OuterResult {
     let abs_floor = outer_gradient_absolute_floor(config.tolerance, config.objective_scale);
@@ -3708,11 +3707,12 @@ fn certify_outer_solution(
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         log::info!(
-            "[OUTER] {context}: optimizer reported success but gradient |g|_inf={:.3e} > abs_floor*(1+|x|_inf)={:.3e} (tolerance={:.3e}, objective_scale={:?}); downgrading converged flag (point retained for warm-start, not cache-saved)",
+            "[OUTER {plan}] optimizer reported success but gradient |g|_inf={:.3e} > abs_floor*(1+|x|_inf)={:.3e} (tolerance={:.3e}, objective_scale={:?}); downgrading converged flag (point retained for warm-start, not cache-saved)",
             g_inf,
             abs_floor * (1.0 + x_inf),
             config.tolerance,
             config.objective_scale,
+            plan = plan_used,
         );
     }
     solution_into_outer_result(solution, converged, plan_used)
@@ -4991,7 +4991,7 @@ fn run_outer_with_plan(
                             .with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(certify_outer_solution(sol, &config, "ARC", *the_plan)),
+                        Ok(sol) => Ok(certify_outer_solution(sol, &config, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
@@ -5164,7 +5164,7 @@ fn run_outer_with_plan(
                     ),
                 }
                 match outcome {
-                    Ok(sol) => Ok(certify_outer_solution(sol, &config, "BFGS", *the_plan)),
+                    Ok(sol) => Ok(certify_outer_solution(sol, &config, *the_plan)),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
