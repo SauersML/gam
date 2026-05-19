@@ -22,8 +22,7 @@ use ::opt::{
     FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
     HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
     ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
-    SecondOrderObjective, SecondOrderSample, Solution, StationarityKind, StepInfo, Tolerance,
-    ZerothOrderObjective,
+    SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -4967,13 +4966,6 @@ fn run_outer_with_plan(
                     outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-                let stall_signal: std::sync::Arc<std::sync::Mutex<Option<StallSignal>>> =
-                    std::sync::Arc::new(std::sync::Mutex::new(None));
-                // The stall-detector activates whenever any step cap is set —
-                // rho or psi — because either path indicates the caller is
-                // running a flat-surface-tolerant biobank fit.
-                let any_step_cap_set =
-                    config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some();
                 let objective = OuterFirstOrderBridge {
                     obj,
                     layout,
@@ -4981,18 +4973,6 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
-                    objective_stall_rel_tol: if any_step_cap_set {
-                        Some(config.tolerance)
-                    } else {
-                        None
-                    },
-                    last_gradient_cost: if any_step_cap_set {
-                        Some(seed_eval.cost)
-                    } else {
-                        None
-                    },
-                    objective_stall_evals: 0,
-                    stall_signal: stall_signal.clone(),
                 };
                 // Hand the precomputed (cost, gradient) seed eval to
                 // `opt::Bfgs` so its first internal `eval_grad` call is
@@ -6039,7 +6019,7 @@ mod tests {
     // lives in opt's `with_axis_step_caps` test surface.
 
     #[test]
-    fn first_order_bridge_keeps_true_gradient_on_objective_stall() {
+    fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
         let eval_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
@@ -6073,10 +6053,6 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
-            objective_stall_rel_tol: Some(1.0e-6),
-            last_gradient_cost: Some(1000.0),
-            objective_stall_evals: 0,
-            stall_signal: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
