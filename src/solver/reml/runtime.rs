@@ -2956,6 +2956,19 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Outer-loop [`crate::cache::Session`] for this fit, derived from the
+    /// same realized-fit-context key as the inner beta record. Disjoint
+    /// keyspace, so inner and outer payloads don't collide.
+    ///
+    /// Returns `None` if no platform cache directory is discoverable.
+    pub(crate) fn outer_cache_session(&self) -> Option<std::sync::Arc<crate::cache::Session>> {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let key = self.persistent_warm_start_cache_key()?;
+        crate::solver::persistent_warm_start::open_outer_session(&key)
+    }
+
     fn persistent_warm_start_cache_key(&self) -> Option<String> {
         if let Some(key) = self.persistent_warm_start_key.read().unwrap().clone() {
             return Some(key);
