@@ -10380,6 +10380,241 @@ impl SurvivalMarginalSlopeFamily {
         }))
     }
 
+    /// Batched per-axis variant of `psi_terms_inner_with_options`. Performs a
+    /// single rayon row pass that fetches the per-row primary gradient and
+    /// Hessian once and folds them into every axis in lock-step, instead of
+    /// the K serial row passes the per-axis path would issue.
+    ///
+    /// Returns `Ok(None)` when any branch the fast path does not cover is
+    /// active (effective flex, timewiggle, or a sigma-aux index in the
+    /// request list); callers fall back to the per-axis path. The simple
+    /// spatial-only path (the biobank survival marginal-slope workload) is
+    /// the case this fast path targets.
+    pub(crate) fn psi_terms_inner_batched_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_indices: &[usize],
+        cache: Option<&EvalCache>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+        if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
+            return Ok(None);
+        }
+        for &psi_index in psi_indices {
+            if self.is_sigma_aux_index(derivative_blocks, psi_index) {
+                return Ok(None);
+            }
+        }
+
+        let k = psi_indices.len();
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let slices = block_slices(self, block_states);
+
+        // Per-axis context: psi map, primary-space loading, beta. Resolved
+        // once outside the row pass so the row hot loop sees only borrows.
+        struct AxisCtx<'a> {
+            block_idx: usize,
+            psi_map: crate::families::custom_family::PsiDesignMap,
+            loading: Array1<f64>,
+            beta_psi: &'a Array1<f64>,
+        }
+        let policy = crate::resource::ResourcePolicy::default_library();
+        let mut axes: Vec<AxisCtx<'_>> = Vec::with_capacity(k);
+        for &psi_index in psi_indices {
+            let Some((block_idx, local_idx, p_psi, psi_label)) =
+                self.psi_block_info(derivative_blocks, psi_index)?
+            else {
+                // psi_block_info returning None means caller passed an index
+                // that does not resolve to a known block; defer to per-axis
+                // so behaviour matches `first_order_terms(psi_index)`.
+                return Ok(None);
+            };
+            let deriv = &derivative_blocks[block_idx][local_idx];
+            let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+                deriv,
+                self.n,
+                p_psi,
+                0..self.n,
+                psi_label,
+                &policy,
+            )?;
+            let loading = spatial_block_primary_loading(block_idx)?;
+            let beta_psi: &Array1<f64> = match block_idx {
+                1 => &block_states[1].beta,
+                _ => &block_states[2].beta,
+            };
+            axes.push(AxisCtx {
+                block_idx,
+                psi_map,
+                loading,
+                beta_psi,
+            });
+        }
+
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockHessianAccumulator,
+        );
+        let make_accs = || -> Vec<Acc> {
+            (0..k)
+                .map(|_| {
+                    (
+                        0.0,
+                        Array1::zeros(p_t),
+                        Array1::zeros(p_m),
+                        Array1::zeros(p_g),
+                        Array1::zeros(p_h),
+                        Array1::zeros(p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    )
+                })
+                .collect()
+        };
+
+        let row_iter = outer_row_indices(options, self.n).to_vec();
+        let row_weights = outer_row_weights_by_index(options, self.n);
+
+        let folded = chunked_row_reduction(
+            row_iter.as_slice(),
+            make_accs,
+            |row, accs: &mut Vec<Acc>| -> Result<(), String> {
+                let w = row_weights[row];
+
+                // Fetch (f_pi, f_pipi) UNWEIGHTED once per row. Mutating
+                // them in place between axes would double-weight every
+                // axis after the first; instead each axis applies `w`
+                // inline below.
+                let (f_pi, f_pipi) = if let Some(c) = cache {
+                    let (g, h) = self.row_primary_gradient_hessian(row, c);
+                    (g.clone(), h.clone())
+                } else {
+                    let (_, g, h) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    (g, h)
+                };
+
+                for (axis_idx, axis) in axes.iter().enumerate() {
+                    let psi_row = axis
+                        .psi_map
+                        .row_vector(row)
+                        .map_err(|e| format!("survival rowwise psi map (batched): {e}"))?;
+                    let dir = primary_direction_from_psi_row(
+                        axis.block_idx,
+                        &psi_row,
+                        axis.beta_psi,
+                    );
+                    let mut third = self.row_primary_third_contracted_general(
+                        row,
+                        block_states,
+                        &dir,
+                    )?;
+                    if w != 1.0 {
+                        third.mapv_inplace(|v| v * w);
+                    }
+
+                    let acc = &mut accs[axis_idx];
+
+                    // objective_psi += w * (f_pi · dir)
+                    acc.0 += w * f_pi.dot(&dir);
+
+                    // score_psi += w * (f_pi · loading) * psi_row, routed to
+                    // the marginal or logslope block depending on axis.
+                    let s1 = w * f_pi.dot(&axis.loading);
+                    match axis.block_idx {
+                        1 => acc.2.scaled_add(s1, &psi_row),
+                        _ => acc.3.scaled_add(s1, &psi_row),
+                    }
+
+                    let mut pb = f_pipi.dot(&dir);
+                    if w != 1.0 {
+                        pb.mapv_inplace(|v| v * w);
+                    }
+                    self.accumulate_score_blockwise(
+                        row,
+                        &pb,
+                        &mut acc.1,
+                        &mut acc.2,
+                        &mut acc.3,
+                    )?;
+                    self.accumulate_score_identity_blocks(
+                        None,
+                        &pb,
+                        Some(&mut acc.4),
+                        Some(&mut acc.5),
+                    );
+
+                    let mut right_primary = f_pipi.dot(&axis.loading);
+                    if w != 1.0 {
+                        right_primary.mapv_inplace(|v| v * w);
+                    }
+                    acc.6.add_rank1_psi_cross(
+                        self,
+                        row,
+                        axis.block_idx,
+                        &psi_row,
+                        &right_primary,
+                    )?;
+                    acc.6.add_pullback(self, row, &third)?;
+                }
+                Ok(())
+            },
+            |total: &mut Vec<Acc>, chunk: Vec<Acc>| {
+                for (t, c) in total.iter_mut().zip(chunk.into_iter()) {
+                    t.0 += c.0;
+                    t.1 += &c.1;
+                    t.2 += &c.2;
+                    t.3 += &c.3;
+                    t.4 += &c.4;
+                    t.5 += &c.5;
+                    t.6.add(&c.6);
+                }
+            },
+        )?;
+
+        let mut out: Vec<ExactNewtonJointPsiTerms> = Vec::with_capacity(k);
+        for (obj, st, sm, sg, sh, sw, hess_acc) in folded.into_iter() {
+            let mut score_psi = Array1::zeros(slices.total);
+            score_psi
+                .slice_mut(s![slices.time.clone()])
+                .assign(&st);
+            score_psi
+                .slice_mut(s![slices.marginal.clone()])
+                .assign(&sm);
+            score_psi
+                .slice_mut(s![slices.logslope.clone()])
+                .assign(&sg);
+            if let Some(range) = slices.score_warp.as_ref() {
+                score_psi.slice_mut(s![range.clone()]).assign(&sh);
+            }
+            if let Some(range) = slices.link_dev.as_ref() {
+                score_psi.slice_mut(s![range.clone()]).assign(&sw);
+            }
+            out.push(ExactNewtonJointPsiTerms {
+                objective_psi: obj,
+                score_psi,
+                hessian_psi: Array2::zeros((0, 0)),
+                hessian_psi_operator: Some(std::sync::Arc::new(
+                    hess_acc.into_operator(slices.clone()),
+                )),
+            });
+        }
+        Ok(Some(out))
+    }
+
     fn psi_terms(
         &self,
         block_states: &[ParameterBlockState],
@@ -11721,6 +11956,21 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
             &self.block_states,
             &self.derivative_blocks,
             psi_index,
+            self.cache.as_ref(),
+            &self.options,
+        )
+    }
+
+    fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+        let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
+        if total == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let psi_indices: Vec<usize> = (0..total).collect();
+        self.family.psi_terms_inner_batched_with_options(
+            &self.block_states,
+            &self.derivative_blocks,
+            &psi_indices,
             self.cache.as_ref(),
             &self.options,
         )
