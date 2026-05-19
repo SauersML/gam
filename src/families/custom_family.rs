@@ -21668,6 +21668,46 @@ mod tests {
     }
 
     #[test]
+    fn joint_objective_floor_only_accepts_sub_tolerance_model_steps() {
+        let old_objective = 1.218942e5_f64;
+        let objective_tol = 1e-6 * (1.0 + old_objective.abs());
+        let actual_reduction = -3.783e-10;
+        let predicted_reduction = 9.481e-15;
+        let trial_objective = old_objective - actual_reduction;
+        assert!(
+            joint_objective_floor_reached(
+                old_objective,
+                trial_objective,
+                actual_reduction,
+                predicted_reduction,
+                objective_tol,
+            ),
+            "the repeated biobank-scale roundoff wobble should terminate immediately"
+        );
+
+        assert!(
+            !joint_objective_floor_reached(
+                old_objective,
+                old_objective + 2.0,
+                -2.0,
+                predicted_reduction,
+                objective_tol,
+            ),
+            "real objective increases must still be rejected"
+        );
+        assert!(
+            !joint_objective_floor_reached(
+                old_objective,
+                trial_objective,
+                actual_reduction,
+                10.0 * objective_tol,
+                objective_tol,
+            ),
+            "non-negligible predicted progress must not be hidden by the floor exit"
+        );
+    }
+
+    #[test]
     fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         // Local Rosenbrock-at-the-valley quadratic in variables (x, y):
         // f ≈ 0.5 * [dx, dy]' H [dx, dy], H = [[802, -400], [-400, 200]].
