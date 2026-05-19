@@ -2117,7 +2117,16 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             } else {
                 self.objective_stall_evals = 0;
             }
-            if self.objective_stall_evals >= BFGS_OBJECTIVE_STALL_EVALS {
+            // Strictly-greater: tolerate `BFGS_OBJECTIVE_STALL_EVALS`
+            // consecutive stalled evaluations before bailing out. BFGS
+            // needs at least a few stalled-but-valid gradient samples to
+            // update its inverse-Hessian approximation before we cut the
+            // optimizer off — the bridge's job here is to *carry* the
+            // true gradient through the flat region, not to terminate
+            // the very first time the budget is hit. Termination kicks
+            // in only on the (N+1)th stalled eval, when continuing has
+            // demonstrably failed to recover.
+            if self.objective_stall_evals > BFGS_OBJECTIVE_STALL_EVALS {
                 // Objective is flat (cost_delta << rel-tol of cost) but the
                 // gradient hasn't dropped to BFGS's `rel_g_ok` window — opt's
                 // own `StallPolicy` won't trigger, and without an explicit
