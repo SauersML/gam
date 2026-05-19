@@ -709,7 +709,7 @@ def quality_report() -> None:
 def render_still(shapes: dict[str, dict[str, Any]], out_path: Path) -> None:
     W, H = 4000, 3000
     p = pv.Plotter(shape=(3, 4), off_screen=True,
-                   window_size=(W, H), border=False)
+                   window_size=[W, H], border=False)
     panels = build_scene(p, shapes, point_size=14)
     az = 35.0
     set_all_cameras(p, panels, az)
@@ -727,7 +727,7 @@ def render_frames(
     point_size: int,
 ) -> list[np.ndarray]:
     p = pv.Plotter(shape=(3, 4), off_screen=True,
-                   window_size=(w, h), border=False)
+                   window_size=[w, h], border=False)
     panels = build_scene(p, shapes, point_size=point_size)
     frames: list[np.ndarray] = []
     for k, az in enumerate(np.linspace(0, 360, n_frames, endpoint=False)):

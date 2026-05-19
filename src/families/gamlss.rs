@@ -6971,6 +6971,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         self.exact_newton_joint_hessian_for_specs(block_states, None)
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -10554,6 +10558,10 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_joint_hessian_for_specs(block_states, None)
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -15308,6 +15316,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         self.exact_newton_joint_hessian_for_specs(block_states, None)
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
@@ -19015,6 +19027,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         };
         let pieces = self.wiggle_hessian_row_pieces(block_states)?;
         Ok(Some(pieces.assemble_dense(&x_t, &x_ls)?))
+    }
+
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
