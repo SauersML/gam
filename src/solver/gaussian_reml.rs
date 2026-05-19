@@ -2819,6 +2819,7 @@ mod tests {
             coefficient_upstream,
             fitted_upstream,
             grad_score,
+            0.0,
         )
         .expect("analytic backward VJP")
     }
@@ -2985,6 +2986,7 @@ mod tests {
             Some(upstream_coefficients.view()),
             Some(upstream_fitted.view()),
             upstream_score,
+            0.0,
         )
         .expect("backward VJP");
 
@@ -3119,6 +3121,7 @@ mod tests {
             None,
             None,
             -0.1,
+            0.0,
         )
         .expect("refit backward");
 
@@ -3141,6 +3144,7 @@ mod tests {
             None,
             None,
             -0.1,
+            0.0,
         )
         .expect("from_fit backward");
 
