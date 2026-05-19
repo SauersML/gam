@@ -2975,7 +2975,10 @@ impl<'a> RemlState<'a> {
         }
         let mut hasher = StableHasher::new();
         hasher.write_str("gamfit-persistent-warm-start");
-        hasher.write_str(env!("CARGO_PKG_VERSION"));
+        // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
+        // library version bumps don't invalidate users' on-disk
+        // warm-start caches.
+        hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
         hasher.write_usize(self.y.len());
         hasher.write_usize(self.p);
         hasher.write_str(&format!("{:?}", self.config.likelihood));

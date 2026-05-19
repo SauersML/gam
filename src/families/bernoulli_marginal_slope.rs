@@ -1731,6 +1731,21 @@ pub struct CrossBlockIdentifiabilityWarning {
 /// anchors are densified once into a contiguous `n × d` block (a few
 /// dozen columns).
 ///
+/// # `training_row_weights` (the W in the W-metric)
+///
+/// Callers **must** pass the IRLS Hessian row metric the joint Hessian
+/// will see during PIRLS, not bare sample weights. For the probit-style
+/// Bernoulli marginal slope family that is
+/// `w[i] = sample_weights[i] · φ(η_i)² / (μ_i·(1−μ_i))` at a β-independent
+/// pilot η. Passing uniform `spec.weights` instead makes A and C̃ merely
+/// Euclidean-orthogonal: `Aᵀ W_pirls C̃` is nonzero at PIRLS time, the
+/// joint Hessian carries a near-null direction along the W-metric alias,
+/// and REML can drive the flex block's λ small enough that the alias
+/// direction's joint Hessian eigenvalue collapses — manifesting as the
+/// well-known runaway (rho≈2.0, constant `step_inf`, growing `beta_inf`,
+/// inner loop hitting `inner_max_cycles` without satisfying the KKT
+/// residual). See `pilot_irls_hessian_row_metric_at_eta`.
+///
 /// # No-op fast paths
 ///
 /// * Anchor list is empty, or every anchor has zero parametric columns.
@@ -2467,6 +2482,65 @@ fn pooled_probit_baseline(
 // any non-degenerate β, so the orthogonalisation transform `T` drops only
 // the directions that are aliased *across all* β, not those that are
 // aliased only at the rigid (rank-1-in-z) pilot.
+/// IRLS Hessian row metric for the probit-style data Hessian at a fixed
+/// linear predictor `eta`: `w[i] = sample_weights[i] · φ(η_i)² / (μ_i·(1−μ_i))`.
+///
+/// This is the canonical row metric that the joint penalised Hessian sees
+/// during PIRLS for a probit GLM (and the dominant term for
+/// BernoulliMarginalSlope's data Hessian). Cross-block orthogonalisation
+/// against parametric anchors must use **this** metric — not a uniform
+/// W=spec.weights — for the joint Hessian to be block-orthogonal between
+/// parametric and flex spans. With a uniform W the orthogonalisation only
+/// kills the Euclidean alias; at PIRLS time `Aᵀ W_pirls C̃ ≠ 0` and the
+/// joint Hessian carries a near-null direction along the W-metric alias,
+/// which REML can drive to arbitrarily small eigenvalue by shrinking the
+/// flex block's smoothing parameter — β then runs away along the alias
+/// (the failure mode that manifests as `rho≈2.0`, constant `step_inf`,
+/// and `beta_inf` growing without bound during PIRLS).
+fn pilot_irls_hessian_row_metric_at_eta(
+    eta_pilot: &Array1<f64>,
+    sample_weights: &Array1<f64>,
+) -> Array1<f64> {
+    let n = eta_pilot.len();
+    let mut w = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let eta = eta_pilot[i];
+        let mu = clamp_bernoulli_link_probability(normal_cdf(eta));
+        let phi = normal_pdf(eta).max(1e-300);
+        let var = (mu * (1.0 - mu)).max(1e-300);
+        w[i] = sample_weights[i] * (phi * phi) / var;
+    }
+    w
+}
+
+/// Per-row rigid pooled-probit pilot η used to seed the IRLS Hessian
+/// metric for score-warp cross-block orthogonalisation. Score-warp's
+/// basis is evaluated at `z` (β-independent) so there is no GN-stepped
+/// pilot to share with the link-deviation path; the rigid pooled-probit
+/// pilot is a sensible β-independent reference at which to evaluate
+/// `W = p(1−p)·spec.weights` for the W-metric orthogonalisation.
+fn rigid_pooled_probit_pilot_eta(
+    base_link: &InverseLink,
+    z: &Array1<f64>,
+    marginal_offset: &Array1<f64>,
+    logslope_offset: &Array1<f64>,
+    baseline_marginal: f64,
+    baseline_logslope: f64,
+    probit_scale: f64,
+) -> Result<Array1<f64>, String> {
+    let n = z.len();
+    let mut out = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let a_pre = baseline_marginal + marginal_offset[i];
+        let b_pre = baseline_logslope + logslope_offset[i];
+        let q_marg = bernoulli_marginal_link_map(base_link, a_pre)
+            .map_err(|e| format!("rigid_pooled_probit_pilot_eta marginal link map: {e}"))?
+            .q;
+        out[i] = rigid_observed_eta(q_marg, b_pre, z[i], probit_scale);
+    }
+    Ok(out)
+}
+
 fn pilot_eta_for_link_dev_orthogonalisation(
     base_link: &InverseLink,
     y: &Array1<f64>,
@@ -17176,6 +17250,40 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // Φ_link_dev · T_lw]` has full numerical column rank, structurally
     // bounding `σ_min(joint H + S) ≥ λ_min(S) > 0` regardless of how β
     // drifts the linear predictor distribution during PIRLS.
+    // Cross-block W-metric pilot. The joint penalised Hessian during PIRLS
+    // uses the probit-style data Hessian row metric
+    //
+    //   W_pirls[i] = spec.weights[i] · φ(η_i)² / (μ_i·(1−μ_i))
+    //
+    // which is the canonical IRLS row weight. The cross-block
+    // orthogonalisation below must use this metric (not uniform
+    // spec.weights) so that `Aᵀ W C̃ = 0` holds in the same inner product
+    // the joint Hessian sees — otherwise A and C̃ are merely Euclidean-
+    // orthogonal, `Aᵀ W_pirls C̃ ≠ 0`, the joint Hessian carries a near-
+    // null direction along the W-metric alias, and REML can drive the
+    // flex block's λ small enough that the alias direction's joint
+    // Hessian eigenvalue collapses. β then runs away along the alias
+    // (manifest as `rho≈2.0`, constant `step_inf`, growing `beta_inf`
+    // during PIRLS, and the inner solve hitting `inner_max_cycles`
+    // without satisfying the KKT residual).
+    //
+    // Use the rigid pooled-probit pilot η for score-warp (its basis is
+    // β-independent in z, so the rigid pilot suffices) and the one-GN-
+    // stepped pilot η for link-deviation (its basis is evaluated at the
+    // same eta_pilot used here, so the orthogonalisation metric matches
+    // the basis evaluation point exactly). Both are β-independent so the
+    // orthogonalisation remains a one-shot construction-time step.
+    let rigid_pilot_eta = rigid_pooled_probit_pilot_eta(
+        &spec.base_link,
+        &spec.z,
+        &spec.marginal_offset,
+        &spec.logslope_offset,
+        baseline.0,
+        baseline.1,
+        probit_scale,
+    )?;
+    let cross_block_pilot_w_score_warp =
+        pilot_irls_hessian_row_metric_at_eta(&rigid_pilot_eta, &spec.weights);
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
@@ -17192,7 +17300,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 Some(ParametricAnchorBlock::Marginal),
                 Some(ParametricAnchorBlock::Logslope),
             ],
-            &spec.weights,
+            &cross_block_pilot_w_score_warp,
         )?;
         match outcome {
             CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
@@ -17311,13 +17419,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchor_tags.push(None);
         }
         let _ = link_dev_seed; // padded knot-seed retained only for knot construction
+        // W-metric for link-deviation orthogonalisation: same IRLS-style
+        // probit Hessian row weight as the score-warp path, but evaluated at
+        // `eta_pilot` (the one-GN-stepped pilot at which the link-dev basis
+        // itself is anchored) so the orthogonalisation metric matches the
+        // basis evaluation point exactly. See the
+        // `cross_block_pilot_w_score_warp` comment above for why W must be
+        // the Hessian row metric rather than `spec.weights`.
+        let cross_block_pilot_w_link_dev =
+            pilot_irls_hessian_row_metric_at_eta(&eta_pilot, &spec.weights);
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
             &eta_pilot,
             cfg,
             &anchors,
             &anchor_tags,
-            &spec.weights,
+            &cross_block_pilot_w_link_dev,
         )?;
         match outcome {
             CrossBlockIdentifiabilityOutcome::Reparameterised => Some(prepared),
