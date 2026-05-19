@@ -25,7 +25,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayBase, Data, Ix1};
 
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
@@ -66,12 +66,25 @@ impl DeviceXSession {
     /// Run `Xᵀ · diag(w) · X` reusing the resident X copy. The session's
     /// internal scratch buffer holds `diag(w) · X`; only `w` (8·n bytes)
     /// and the `p × p` output cross the PCIe boundary.
-    pub fn xtwx(&self, w: &Array1<f64>) -> Option<Array2<f64>> {
+    pub fn xtwx<S: Data<Elem = f64>>(
+        &self,
+        w: &ArrayBase<S, Ix1>,
+    ) -> Option<Array2<f64>> {
         let n = self.rows;
         let p = self.cols;
         if w.len() != n {
             return None;
         }
+        // Use a contiguous host slice for the cuMemcpy. Views over
+        // non-contiguous parents (e.g. strided slices) get materialized.
+        let w_owned_storage: Option<Vec<f64>> = match w.as_slice() {
+            Some(_) => None,
+            None => Some(w.iter().copied().collect()),
+        };
+        let w_ptr: *const f64 = match w_owned_storage.as_ref() {
+            Some(buf) => buf.as_ptr(),
+            None => w.as_slice().expect("contiguous slice").as_ptr(),
+        };
         let slot = self.cublas.lock().ok()?;
         unsafe {
             slot.cuda.set_current().ok()?;
@@ -82,7 +95,7 @@ impl DeviceXSession {
             check_cuda(
                 (slot.cuda.api.cu_memcpy_htod)(
                     w_dev.ptr,
-                    w.as_ptr().cast(),
+                    w_ptr.cast(),
                     bytes_w,
                 ),
                 "cuMemcpyHtoD(w)",
