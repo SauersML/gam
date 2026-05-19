@@ -43,7 +43,7 @@ def _batch_grad(grad: torch.Tensor | None) -> Any:
 def _wrap_optional(arr: Any, ref: torch.Tensor) -> torch.Tensor | None:
     if arr is None:
         return None
-    return cast(torch.Tensor, from_numpy_like(np.asarray(arr, dtype=np.float64), ref))
+    return from_numpy_like(np.asarray(arr, dtype=np.float64), ref)
 
 
 def _copy_forward_state(out: dict[str, Any]) -> dict[str, Any]:
