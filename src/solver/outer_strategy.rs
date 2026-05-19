@@ -395,7 +395,6 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
-const BFGS_OBJECTIVE_STALL_EVALS: usize = 3;
 
 /// Whether an analytic derivative is available for a given order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1968,25 +1967,6 @@ fn finite_efs_eval_or_error(
     Ok(eval)
 }
 
-/// Sentinel substring stuffed into the `ObjectiveEvalError::Fatal` message
-/// the bridge raises when the BFGS objective stalls. The BFGS driver pattern-
-/// matches on it after `optimizer.run()` returns `BfgsError::ObjectiveFailed`
-/// and synthesizes a `Solution` from the stashed `StallSignal` instead of
-/// treating it as a hard failure.
-const OUTER_STALL_TERMINATE_SENTINEL: &str = "[OUTER_STALL_TERMINATE]";
-
-/// Snapshot of the bridge's last gradient eval. Stashed before raising a
-/// `Fatal` stall error so the BFGS driver can rebuild a `Solution` instead of
-/// losing the converged-but-flat point.
-#[derive(Clone)]
-struct StallSignal {
-    last_point: Array1<f64>,
-    last_cost: f64,
-    last_gradient: Array1<f64>,
-    last_gradient_norm: f64,
-    iter_count: usize,
-}
-
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -2010,15 +1990,6 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
-    objective_stall_rel_tol: Option<f64>,
-    last_gradient_cost: Option<f64>,
-    objective_stall_evals: usize,
-    /// Shared with the BFGS driver. When the stall threshold trips the bridge
-    /// snapshots `(x, cost, gradient)` here and returns `Fatal`; the driver
-    /// catches `ObjectiveFailed` carrying the sentinel and uses the snapshot
-    /// to rebuild a `Solution` so the fit accepts the converged-but-flat
-    /// point instead of dying with `RemlOptimizationFailed`.
-    stall_signal: std::sync::Arc<std::sync::Mutex<Option<StallSignal>>>,
 }
 
 impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
@@ -2107,54 +2078,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
-        if let (Some(rel_tol), Some(prev_cost)) =
-            (self.objective_stall_rel_tol, self.last_gradient_cost)
-        {
-            let cost_delta = (prev_cost - eval.cost).abs();
-            let tol = rel_tol * (1.0 + prev_cost.abs().max(eval.cost.abs()));
-            if cost_delta <= tol {
-                self.objective_stall_evals = self.objective_stall_evals.saturating_add(1);
-            } else {
-                self.objective_stall_evals = 0;
-            }
-            // `BFGS_OBJECTIVE_STALL_EVALS` is the tolerated run length: the
-            // first eval whose stall count *exceeds* it raises the sentinel,
-            // matching the bridge contract that the run-length-th near-stall
-            // eval still returns its (potentially informative) gradient
-            // before the optimizer is forced to unwind.
-            if self.objective_stall_evals > BFGS_OBJECTIVE_STALL_EVALS {
-                // Objective is flat (cost_delta << rel-tol of cost) but the
-                // gradient hasn't dropped to BFGS's `rel_g_ok` window — opt's
-                // own `StallPolicy` won't trigger, and without an explicit
-                // exit the outer loop burns ~37s per stalled grad eval. Stash
-                // the current sample so the BFGS driver can rebuild a
-                // Solution from it, then raise a sentinel-tagged Fatal that
-                // the driver pattern-matches as "accept last point".
-                log::info!(
-                    "[OUTER/BFGS] terminating on objective stall: cost_delta={:.3e} tol={:.3e} stalled_evals={} cost={:.6e} |g|={:.3e}",
-                    cost_delta,
-                    tol,
-                    self.objective_stall_evals,
-                    eval.cost,
-                    g_norm,
-                );
-                *self
-                    .stall_signal
-                    .lock()
-                    .expect("stall_signal mutex poisoned") = Some(StallSignal {
-                    last_point: x.clone(),
-                    last_cost: eval.cost,
-                    last_gradient: gradient.clone(),
-                    last_gradient_norm: g_norm,
-                    iter_count: self.iter_count.saturating_add(1),
-                });
-                return Err(ObjectiveEvalError::fatal(format!(
-                    "{OUTER_STALL_TERMINATE_SENTINEL} cost_delta={cost_delta:.3e} tol={tol:.3e} stalled_evals={} cost={:.6e} |g|={g_norm:.3e}",
-                    self.objective_stall_evals, eval.cost,
-                )));
-            }
-        }
-        self.last_gradient_cost = Some(eval.cost);
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -4267,6 +4190,7 @@ impl OuterProblem {
         let result = run_outer(&mut checkpointing, &config, context);
         if let Ok(result) = result.as_ref()
             && result.final_value.is_finite()
+            && result.converged
             && let Some(bytes) =
                 encode_iterate(&result.rho, result.final_value, result.iterations as u64)
         {
@@ -5169,83 +5093,6 @@ fn run_outer_with_plan(
                     }
                     Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                    }
-                    Err(BfgsError::ObjectiveFailed { message })
-                        if message.contains(OUTER_STALL_TERMINATE_SENTINEL) =>
-                    {
-                        // The bridge tripped its objective-stall detector and
-                        // raised a sentinel-tagged Fatal so opt's BFGS would
-                        // unwind without burning another ~37s/grad on a
-                        // flat-cost region.
-                        //
-                        // The cost being flat does NOT mean we're at a
-                        // stationary point — the gradient can still be far
-                        // from zero (e.g. the bridge gradient is incorrect at
-                        // this point, or the step cap is keeping us pinned in
-                        // a flat valley away from the actual minimum).
-                        // Classify honestly: only call this `Converged` if
-                        // the gradient actually met the BFGS gradient
-                        // tolerance; otherwise it's `MaxIterations` — the
-                        // best point we saw, but not converged. Downstream
-                        // `is_success()` reflects that truth.
-                        let signal = stall_signal
-                            .lock()
-                            .expect("stall_signal mutex poisoned")
-                            .take()
-                            .expect("stall sentinel raised without stash");
-                        // Mirror opt's gradient-convergence criterion at the
-                        // stalled point: `|g|_inf <= tol * (1 + |x|_inf)`.
-                        let g_inf = signal
-                            .last_gradient
-                            .iter()
-                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                        let x_inf = signal
-                            .last_point
-                            .iter()
-                            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                        let grad_converged = g_inf <= config.tolerance * (1.0 + x_inf);
-                        let (status, converged_flag, classification) = if grad_converged {
-                            (OptimizationStatus::Converged, true, "gradient at tol")
-                        } else {
-                            (
-                                OptimizationStatus::MaxIterations,
-                                false,
-                                "gradient above tol",
-                            )
-                        };
-                        log::info!(
-                            "[OUTER summary] BFGS terminated on objective stall in {} iters elapsed={:.3}s final_value={:.6e} |g|_inf={:.3e} (1+|x|_inf)*tol={:.3e} classification={} ({})",
-                            signal.iter_count,
-                            bfgs_elapsed,
-                            signal.last_cost,
-                            g_inf,
-                            config.tolerance * (1.0 + x_inf),
-                            if grad_converged {
-                                "Converged"
-                            } else {
-                                "MaxIterations"
-                            },
-                            classification,
-                        );
-                        let synthesized = Solution {
-                            final_point: signal.last_point,
-                            final_value: signal.last_cost,
-                            final_gradient: Some(signal.last_gradient),
-                            final_hessian: None,
-                            final_gradient_norm: Some(signal.last_gradient_norm),
-                            final_step_norm: None,
-                            stationarity_kind: StationarityKind::ProjectedGradient,
-                            iterations: signal.iter_count,
-                            func_evals: signal.iter_count,
-                            grad_evals: signal.iter_count,
-                            hess_evals: 0,
-                            status_hint: Some(status),
-                        };
-                        Ok(solution_into_outer_result(
-                            synthesized,
-                            converged_flag,
-                            *the_plan,
-                        ))
                     }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
                         "BFGS solver failed: {e:?}"
