@@ -867,6 +867,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
     out.set_item("status", backward.statuses)?;
     out.set_item("grad_x", grad_x.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     if let Some(grad_by) = grad_by {
         out.set_item("grad_by", grad_by.into_pyarray(py))?;
@@ -1017,6 +1018,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
     let out = PyDict::new(py);
     out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     if let Some(grad_by) = backward.grad_by {
         out.set_item("grad_by", grad_by.into_pyarray(py))?;
@@ -1149,6 +1151,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     out.set_item("status", backward.statuses)?;
     out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     if let Some(grad_by) = backward.grad_by {
         out.set_item("grad_by", grad_by.into_pyarray(py))?;
@@ -1989,6 +1992,7 @@ fn gaussian_reml_fit_batched_backward_impl(
     let mut statuses = vec!["degenerate".to_string(); batch];
     let mut grad_x = Array2::<f64>::zeros(x.dim());
     let mut grad_y = Array2::<f64>::zeros(y.dim());
+    let mut grad_penalty = Array2::<f64>::zeros(penalty.dim());
     let mut grad_weights = Array1::<f64>::zeros(x.nrows());
     for result in results {
         let (b, backward) = result?;
@@ -2002,6 +2006,7 @@ fn gaussian_reml_fit_batched_backward_impl(
             grad_y
                 .slice_mut(s![start..end, ..])
                 .assign(&backward.grad_y);
+            grad_penalty += &backward.grad_penalty;
             grad_weights
                 .slice_mut(s![start..end])
                 .assign(&backward.grad_weights);
@@ -2012,6 +2017,7 @@ fn gaussian_reml_fit_batched_backward_impl(
         statuses,
         grad_x,
         grad_y,
+        grad_penalty,
         grad_weights,
     })
 }
@@ -2231,6 +2237,7 @@ fn gaussian_reml_fit_positions_backward_impl(
     Ok(PositionGaussianRemlBackwardResult {
         grad_t,
         grad_y: backward.grad_y,
+        grad_penalty: backward.grad_penalty,
         grad_weights: backward.grad_weights,
         grad_by,
     })
@@ -2416,8 +2423,8 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             ));
         }
     }
-    let results: Vec<Result<(usize, Option<(Array2<f64>, Array2<f64>, Array1<f64>)>), String>> = (0
-        ..batch)
+    type PositionBackwardParts = (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>);
+    let results: Vec<Result<(usize, Option<PositionBackwardParts>), String>> = (0..batch)
         .into_par_iter()
         .map(|b| {
             let start = row_offsets[b];
@@ -2463,7 +2470,12 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             match backward_result {
                 Ok(backward) => Ok((
                     b,
-                    Some((backward.grad_x, backward.grad_y, backward.grad_weights)),
+                    Some((
+                        backward.grad_x,
+                        backward.grad_y,
+                        backward.grad_penalty,
+                        backward.grad_weights,
+                    )),
                 )),
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
                 Err(err) => Err(format!(
@@ -2476,10 +2488,13 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     let mut statuses = vec!["degenerate".to_string(); batch];
     let mut grad_fit_x = Array2::<f64>::zeros(x.dim());
     let mut grad_y = Array2::<f64>::zeros(y.dim());
+    let mut grad_penalty = Array2::<f64>::zeros(penalty.dim());
     let mut grad_weights = Array1::<f64>::zeros(t.len());
     for result in results {
         let (b, backward) = result?;
-        if let Some((batch_grad_x, batch_grad_y, batch_grad_weights)) = backward {
+        if let Some((batch_grad_x, batch_grad_y, batch_grad_penalty, batch_grad_weights)) =
+            backward
+        {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
             statuses[b] = "ok".to_string();
@@ -2487,6 +2502,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                 .slice_mut(s![start..end, ..])
                 .assign(&batch_grad_x);
             grad_y.slice_mut(s![start..end, ..]).assign(&batch_grad_y);
+            grad_penalty += &batch_grad_penalty;
             grad_weights
                 .slice_mut(s![start..end])
                 .assign(&batch_grad_weights);
@@ -2505,6 +2521,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         statuses,
         grad_t,
         grad_y,
+        grad_penalty,
         grad_weights,
         grad_by,
     })

@@ -860,7 +860,7 @@ def gaussian_reml_fit_backward(
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_x", "grad_y", "grad_weights", "grad_by"):
+    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
     return result
@@ -938,7 +938,7 @@ def gaussian_reml_fit_batched_backward(
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_x", "grad_y", "grad_weights", "grad_by"):
+    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
     return result
@@ -1032,7 +1032,7 @@ def gaussian_reml_fit_positions_backward(
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_weights", "grad_by"):
+    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
     return result
@@ -1132,7 +1132,7 @@ def gaussian_reml_fit_positions_batched_backward(
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_weights", "grad_by"):
+    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
     return result
