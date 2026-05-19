@@ -1196,10 +1196,70 @@ fn dumb_render_lines(model: &VisualizerModel) -> Vec<String> {
     if !model.secondary_lane.label.is_empty() {
         lines.push(render_dumb_lane("Inner", &model.secondary_lane, model));
     }
+    // Inline ASCII sparkline of the accepted-cost descent. Only meaningful
+    // once the optimizer has accepted ≥ 3 distinct iterates; below that the
+    // line carries no shape information and would just add visual noise.
+    // Live monotonic optimizers (BFGS, ARC) produce a descending sparkline
+    // that lets a user reading piped output mentally verify "yes, the
+    // objective is still going down" without having to diff the numbers.
+    if let Some(spark) = cost_sparkline(&model.history_cost_accepted, 24) {
+        lines.push(format!("Descent: {spark}"));
+    }
     if let Some(last) = model.diagnostics_lines.last() {
         lines.push(format!("Note: {last}"));
     }
     lines
+}
+
+/// Render a Unicode block sparkline of the accepted-cost series. Returns
+/// `None` when there are fewer than 3 distinct samples — a 0-, 1-, or 2-point
+/// sparkline conveys nothing. Width `slots` is the target character count;
+/// dense series get bucketed (mean per bucket) so the sparkline always fits.
+fn cost_sparkline(series: &[(f64, f64)], slots: usize) -> Option<String> {
+    if slots == 0 || series.len() < 3 {
+        return None;
+    }
+    let costs: Vec<f64> = series.iter().map(|(_, c)| *c).filter(|c| c.is_finite()).collect();
+    if costs.len() < 3 {
+        return None;
+    }
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &c in &costs {
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    // Skip when the range is degenerate: every sample numerically identical.
+    // A flat sparkline reads as "stuck", which would mislead — better to show
+    // nothing and let the `objective=`/`Δ=` fields carry the truth.
+    if !(hi.is_finite() && lo.is_finite()) || (hi - lo) <= 0.0 {
+        return None;
+    }
+    // Bucket the series down to `slots` cells when longer. Each cell shows
+    // the mean cost in its bucket — preserves the descent envelope on long
+    // runs where naive subsampling would alias the trajectory.
+    let buckets = slots.min(costs.len());
+    let mut cells: Vec<f64> = Vec::with_capacity(buckets);
+    let n = costs.len() as f64;
+    for k in 0..buckets {
+        let start = ((k as f64 / buckets as f64) * n).floor() as usize;
+        let end = (((k + 1) as f64 / buckets as f64) * n).ceil() as usize;
+        let slice = &costs[start.min(costs.len())..end.min(costs.len())];
+        if slice.is_empty() {
+            cells.push(*costs.last().unwrap());
+        } else {
+            let m = slice.iter().sum::<f64>() / slice.len() as f64;
+            cells.push(m);
+        }
+    }
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let range = hi - lo;
+    let mut out = String::with_capacity(buckets);
+    for c in cells {
+        let t = ((c - lo) / range).clamp(0.0, 1.0);
+        let idx = (t * (BLOCKS.len() as f64 - 1.0)).round() as usize;
+        out.push(BLOCKS[idx.min(BLOCKS.len() - 1)]);
+    }
+    Some(out)
 }
 
 fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> String {
@@ -1515,6 +1575,40 @@ mod tests {
         assert_eq!(model.history_cost_accepted.len(), 1);
         assert_eq!(model.history_cost_accepted[0].1, 50.0);
         assert_eq!(model.current_eval_state, "accepted");
+    }
+
+    #[test]
+    fn sparkline_returns_none_for_too_few_or_flat_samples() {
+        // < 3 samples: descent shape is undefined, no point rendering.
+        assert!(cost_sparkline(&[], 8).is_none());
+        assert!(cost_sparkline(&[(0.0, 1.0)], 8).is_none());
+        assert!(cost_sparkline(&[(0.0, 1.0), (1.0, 1.0)], 8).is_none());
+        // Flat series (range = 0): would print a constant low-block row,
+        // which reads as "stuck" — better to suppress so the lane line's
+        // numeric Δ tells the truth.
+        let flat = vec![(0.0, 5.0), (1.0, 5.0), (2.0, 5.0)];
+        assert!(cost_sparkline(&flat, 8).is_none());
+    }
+
+    #[test]
+    fn sparkline_renders_descending_shape() {
+        // Monotone descent: every cell to the right should be ≤ the cell
+        // to its left in the block ramp (we use BLOCKS in ascending height
+        // order). Without this, the visual would mislead — the most common
+        // optimizer path is monotone descent, so the sparkline must read
+        // as a downhill ramp for that case.
+        let descending: Vec<(f64, f64)> = (0..8).map(|i| (i as f64, 8.0 - i as f64)).collect();
+        let spark = cost_sparkline(&descending, 8).expect("non-empty");
+        let chars: Vec<char> = spark.chars().collect();
+        const RANK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let rank = |c: char| RANK.iter().position(|&r| r == c).unwrap_or(0);
+        for w in chars.windows(2) {
+            assert!(
+                rank(w[0]) >= rank(w[1]),
+                "expected descending heights, got {:?}",
+                chars
+            );
+        }
     }
 
     #[test]
