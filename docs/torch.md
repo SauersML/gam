@@ -89,8 +89,8 @@ smooth from scratch, train with `gamfit.fit` and embed the result here.
 Tensor-in / tensor-out wrappers exist for the simplex, ALR/CLR, and unit-sphere
 transforms (`closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`,
 `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`,
-`sphere_frechet_mean`). Tensor inputs stay in torch and preserve autograd;
-NumPy arrays are routed through `gamfit._response_geometry` for exact parity.
+`sphere_frechet_mean`). All are pure torch implementations, so autograd flows
+through them naturally. NumPy callers use `gamfit._response_geometry` directly.
 
 ## Device and dtype
 

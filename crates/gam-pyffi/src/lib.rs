@@ -2492,8 +2492,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     let mut grad_weights = Array1::<f64>::zeros(t.len());
     for result in results {
         let (b, backward) = result?;
-        if let Some((batch_grad_x, batch_grad_y, batch_grad_penalty, batch_grad_weights)) =
-            backward
+        if let Some((batch_grad_x, batch_grad_y, batch_grad_penalty, batch_grad_weights)) = backward
         {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
