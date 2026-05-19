@@ -234,6 +234,54 @@ def test_learned_mode_mini_training_loop_converges() -> None:
     assert (delta > 1e-3).all().item()
 
 
+def test_learned_mode_end_to_end_recovers_truth_and_log_smoothing_stabilizes() -> None:
+    """End-to-end Adam loop must (a) recover the underlying periodic truth and
+    (b) leave the internal log-smoothing parameter at a sensible stationary
+    value rather than wandering. Companion to the same test on
+    :class:`DuchonSmoother` — both ride the same grad_penalty path.
+    """
+    period = 2.0 * math.pi
+    smoother = PeriodicSmoother(
+        period=period, n_centers=20, mode="learned"
+    ).double()
+    (log_smoothing,) = list(smoother.parameters())
+    init_log_smoothing = log_smoothing.detach().clone()
+
+    torch.manual_seed(23)
+    noise = 0.1
+    t, y, truth = _synthetic_periodic_data(period, 400, noise=noise)
+
+    opt = torch.optim.Adam(smoother.parameters(), lr=0.1)
+    steps = 300
+    trajectory = []
+    for _ in range(steps):
+        opt.zero_grad()
+        out = smoother(t, y)
+        (-out.smoothing_score).backward()
+        opt.step()
+        trajectory.append(log_smoothing.detach().clone())
+
+    # 1. Fitted curve tracks the truth well below the noise variance floor.
+    with torch.no_grad():
+        final = smoother(t, y)
+    mse_vs_truth = ((final.fitted - truth) ** 2).mean().item()
+    assert mse_vs_truth < 0.5 * noise ** 2, mse_vs_truth
+
+    # 2. The learned parameter moved off init …
+    final_log_smoothing = trajectory[-1]
+    delta = (final_log_smoothing - init_log_smoothing).abs()
+    assert float(delta.max()) > 1.0, delta
+
+    # 3. … and then stabilised: small per-coordinate spread over the tail.
+    tail = torch.stack(trajectory[-50:], dim=0)
+    tail_std = tail.std(dim=0)
+    assert torch.isfinite(tail_std).all()
+    assert float(tail_std.max()) < 0.2, tail_std
+
+    # 4. log_smoothing stayed in a numerically sane band (no λ blow-up).
+    assert float(final_log_smoothing.abs().max()) < 20.0, final_log_smoothing
+
+
 @pytest.mark.parametrize("mode", ["auto", "learned"])
 def test_constant_signal_absorbs_into_free_intercept(mode: str) -> None:
     period = 3.0

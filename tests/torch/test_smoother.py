@@ -157,6 +157,76 @@ def test_learned_mode_outer_adam_improves_score() -> None:
     assert score_after > score_before, (score_before, score_after)
 
 
+def test_learned_mode_end_to_end_recovers_truth_and_log_smoothing_stabilizes() -> None:
+    """End-to-end Adam loop must (a) drive the smoother to the underlying truth
+    and (b) leave the internal log-smoothing parameter at a sensible, stationary
+    value rather than wandering.
+
+    This is the real ``grad_penalty`` integration test: gradcheck only proves the
+    backward matches finite differences locally; this proves the analytic
+    derivative is well-behaved enough that a vanilla outer optimizer actually
+    finds a stable minimum.
+    """
+    torch.manual_seed(0)
+    rng = np.random.default_rng(101)
+    n = 80
+    x = torch.tensor(np.linspace(0.0, 1.0, n), dtype=torch.float64)
+    truth = torch.sin(2 * math.pi * x)
+    noise_scale = 0.1
+    y = truth + torch.tensor(
+        noise_scale * rng.standard_normal(n), dtype=torch.float64
+    )
+
+    sm = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned").double()
+    (log_smoothing,) = list(sm.parameters())
+    init_log_smoothing = log_smoothing.detach().clone()
+
+    opt = torch.optim.Adam(sm.parameters(), lr=0.1)
+    steps = 300
+    trajectory = []
+    for _ in range(steps):
+        opt.zero_grad()
+        out = sm(x, y)
+        (-out.smoothing_score).backward()
+        opt.step()
+        trajectory.append(log_smoothing.detach().clone())
+
+    # 1. The fitted curve must track the underlying truth, well below the
+    #    noise floor (variance of the additive noise is `noise_scale**2`).
+    with torch.no_grad():
+        final = sm(x, y)
+    final_mse_vs_truth = float(((final.fitted - truth) ** 2).mean())
+    assert final_mse_vs_truth < 0.5 * noise_scale ** 2, final_mse_vs_truth
+
+    # 2. The smoother must hold up out-of-sample as well — overfit smoothers
+    #    can drive in-sample MSE low while predicting badly at new points.
+    x_test = torch.linspace(0.05, 0.95, 50, dtype=torch.float64)
+    y_test_truth = torch.sin(2 * math.pi * x_test)
+    with torch.no_grad():
+        y_test_pred = sm.predict(x_test, final.coefficients)
+    test_mse = float(((y_test_pred - y_test_truth) ** 2).mean())
+    assert test_mse < 0.5 * noise_scale ** 2, test_mse
+
+    # 3. The internal log-smoothing parameter must actually have moved off its
+    #    initialisation (the training did something) but then settled — i.e.
+    #    the last segment of the trajectory has small per-coordinate spread,
+    #    instead of drifting to ±∞ or oscillating.
+    final_log_smoothing = trajectory[-1]
+    delta_from_init = (final_log_smoothing - init_log_smoothing).abs()
+    assert float(delta_from_init.max()) > 1.0, delta_from_init
+
+    tail = torch.stack(trajectory[-50:], dim=0)
+    tail_std = tail.std(dim=0)
+    assert torch.isfinite(tail_std).all()
+    # ≤0.2 nats of jitter per coordinate over the last 50 steps comfortably
+    # covers what a healthy Adam ride looks like (empirically <0.06).
+    assert float(tail_std.max()) < 0.2, tail_std
+
+    # 4. log_smoothing must stay in a numerically sane band — no λ blow-up
+    #    to ~exp(±50) that would silently break downstream solves.
+    assert float(final_log_smoothing.abs().max()) < 20.0, final_log_smoothing
+
+
 def test_predict_at_new_locations() -> None:
     sm = gt.DuchonSmoother(domain=(0.0, 1.0))
     x_train, y_train = _smooth_problem(n=80, seed=13)

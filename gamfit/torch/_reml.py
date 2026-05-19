@@ -26,6 +26,7 @@ class GaussianRemlOutput(NamedTuple):
     fitted: torch.Tensor
     lam: torch.Tensor
     reml_score: torch.Tensor
+    edf: torch.Tensor
 
 
 def _scalar_grad(grad: torch.Tensor | None) -> float:
@@ -115,16 +116,18 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         fitted = from_numpy_like(out["fitted"], x)
         lam = from_numpy_like(out["lambda"], x)
         reml_score = from_numpy_like(out["reml_score"], x)
-        return coefficients, fitted, lam, reml_score
+        edf = from_numpy_like(out["edf"], x)
+        return coefficients, fitted, lam, reml_score, edf
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score = grad_outputs
+        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
         _check_saved_versions(ctx)
         grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
         grad_lambda_scalar = _scalar_grad(grad_lam)
         grad_reml_scalar = _scalar_grad(grad_reml_score)
+        grad_edf_scalar = _scalar_grad(grad_edf)
 
         result = _np_api.gaussian_reml_fit_backward(
             ctx.x_np,
@@ -134,6 +137,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
             grad_coefficients=grad_coef_np,
             grad_fitted=grad_fitted_np,
             grad_reml_score=grad_reml_scalar,
+            grad_edf=grad_edf_scalar,
             forward_state=ctx.forward_state,
             weights=ctx.weights_np,
             init_lambda=ctx.init_lambda,
