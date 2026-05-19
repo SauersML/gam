@@ -1,26 +1,32 @@
 //! Workload-size thresholds for GPU dispatch decisions.
 //!
-//! Thresholds are derived from the selected device's measured peak FP64
-//! throughput ([`super::device::GpuDeviceInfo::peak_fp64_gflops`]) and the
-//! PCIe transfer cost — no environment variables, no CLI flags, no
-//! categorical buckets. The crossover point for routing a kernel is
-//! "when GPU compute saving exceeds the host↔device transfer cost".
+//! Every threshold is derived from three numbers that the runtime *measures*
+//! at probe time, not from constants or compute-capability tables:
+//!
+//! * **GPU FP64 throughput** — sum of measured `cublasDgemm` GFLOPS across
+//!   every successfully calibrated device.
+//! * **CPU FP64 throughput** — measured via a faer dgemm benchmark on the
+//!   host (see [`super::calibration::measured_cpu_fp64_gflops`]).
+//! * **PCIe bandwidth** — slowest one-way measurement across the visible
+//!   devices, using the same `cuMemcpy` path that real dispatches pay.
+//!
+//! The crossover point for routing a kernel is "when GPU compute saving
+//! exceeds the host↔device transfer cost", computed from those three
+//! measured numbers. Nothing here knows or cares about product names.
 
+use super::calibration::measured_cpu_fp64_gflops;
 use super::device::GpuDeviceInfo;
 
-/// CPU baseline FP64 throughput assumed for the host's faer/BLAS path.
-///
-/// Conservative estimate: modern many-core CPUs running faer's parallel
-/// dgemm sit in the 30–120 GFLOPS range depending on core count and AVX
-/// width. 50 GFLOPS keeps the GPU/CPU crossover where it belongs — large
-/// enough to amortize the PCIe round-trip without prematurely pinning
-/// small kernels to the device.
-const CPU_FP64_GFLOPS: f64 = 50.0;
+/// Floor for the CPU baseline used in crossover math. Calibration on a
+/// pathological host (single-core, hyperthreaded VM, FAILSAFE fallback)
+/// might return a near-zero value; clamping to 5 GFLOPS keeps the
+/// crossover finite without overriding measurements that are larger.
+const CPU_FP64_GFLOPS_FLOOR: f64 = 5.0;
 
-/// Effective PCIe Gen4 x16 host↔device bandwidth (GB/s, one direction).
-/// Newer Gen5 cards push ~64 GB/s but dispatch decisions are dominated
-/// by the slowest link in the chain so we model Gen4.
-const PCIE_GB_PER_S: f64 = 25.0;
+/// Floor for measured PCIe bandwidth, GB/s. If every calibrated device
+/// reports zero (e.g. all `cuMemcpy` calls returned errors after timing),
+/// fall back to a low Gen3-ish baseline rather than dividing by zero.
+const PCIE_GB_PER_S_FLOOR: f64 = 4.0;
 
 /// Per-operation minimum workload sizes the cuBLAS / cuSPARSE / cuSOLVER
 /// backends need to clear before GPU dispatch beats the in-process CPU
@@ -52,20 +58,31 @@ pub struct DispatchPolicy {
 
 impl DispatchPolicy {
     /// Build a dispatch policy from every usable device, deriving every
-    /// threshold from aggregate measured throughput and PCIe transfer cost.
+    /// threshold from the *measured* aggregate GPU FP64 throughput, the
+    /// *measured* slowest PCIe link, and the *measured* CPU FP64 baseline.
     pub fn for_devices(devices: &[GpuDeviceInfo]) -> Self {
         if devices.is_empty() {
             return Self::cpu_only();
         }
-        let aggregate = devices
+        let aggregate_gpu_gflops = devices
             .iter()
             .map(GpuDeviceInfo::peak_fp64_gflops)
             .sum::<f64>();
-        Self::from_peak_fp64_gflops(aggregate)
+        let pcie_gb_per_s = devices
+            .iter()
+            .map(GpuDeviceInfo::pcie_gb_per_s)
+            .fold(f64::INFINITY, f64::min)
+            .max(PCIE_GB_PER_S_FLOOR);
+        Self::from_measurements(
+            aggregate_gpu_gflops,
+            measured_cpu_fp64_gflops().max(CPU_FP64_GFLOPS_FLOOR),
+            pcie_gb_per_s,
+        )
     }
 
     /// Build a dispatch policy from the selected device, deriving every
-    /// threshold from measured peak throughput and PCIe transfer cost.
+    /// threshold from measured peak throughput, the device's own PCIe link,
+    /// and the measured CPU FP64 baseline.
     ///
     /// CPU-only hosts return values that suppress dispatch unconditionally;
     /// the runtime guards every entry point with
@@ -75,11 +92,19 @@ impl DispatchPolicy {
         let Some(device) = device else {
             return Self::cpu_only();
         };
-        Self::from_peak_fp64_gflops(device.peak_fp64_gflops())
+        Self::from_measurements(
+            device.peak_fp64_gflops(),
+            measured_cpu_fp64_gflops().max(CPU_FP64_GFLOPS_FLOOR),
+            device.pcie_gb_per_s().max(PCIE_GB_PER_S_FLOOR),
+        )
     }
 
-    fn from_peak_fp64_gflops(peak_gpu_gflops: f64) -> Self {
-        let speedup = (peak_gpu_gflops / CPU_FP64_GFLOPS).max(1.0);
+    fn from_measurements(
+        peak_gpu_gflops: f64,
+        cpu_gflops: f64,
+        pcie_gb_per_s: f64,
+    ) -> Self {
+        let speedup = (peak_gpu_gflops / cpu_gflops).max(1.0);
 
         // The payload constants below model the dispatch crossover as
         // "minimum FLOPs to amortize an HtoD/DtoH transfer of this many
@@ -269,15 +294,31 @@ mod tests {
     use super::*;
 
     fn device(major: i32, sms: i32) -> GpuDeviceInfo {
+        use super::super::calibration::DeviceCalibration;
+        // FP64 throughput scales with SM count and a per-arch factor that
+        // reflects how generous each architecture is with FP64 ALUs. The
+        // numbers below are stand-ins for measured calibration values —
+        // production paths receive these from `calibration::measure_device`.
+        let per_sm_fp64_gflops = if major >= 9 {
+            200.0
+        } else if major >= 8 {
+            80.0
+        } else {
+            6.0
+        };
+        let fp64 = (sms as f64) * per_sm_fp64_gflops;
         GpuDeviceInfo {
             ordinal: 0,
             name: "test-device".to_string(),
             compute_capability_major: major,
             compute_capability_minor: 0,
             sm_count: sms,
-            clock_rate_khz: 1_500_000,
-            single_to_double_precision_perf_ratio: Some(if major >= 9 { 1 } else { 2 }),
             total_memory_bytes: 16 * 1024 * 1024 * 1024,
+            calibration: DeviceCalibration {
+                fp64_gflops: fp64,
+                h2d_gb_s: 25.0,
+                d2h_gb_s: 25.0,
+            },
         }
     }
 
