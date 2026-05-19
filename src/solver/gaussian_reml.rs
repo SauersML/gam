@@ -110,6 +110,7 @@ pub struct GaussianRemlMultiBackwardProblem<'a> {
     pub grad_coefficients: Option<ArrayView2<'a, f64>>,
     pub grad_fitted: Option<ArrayView2<'a, f64>>,
     pub grad_reml_score: f64,
+    pub grad_edf: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -597,6 +598,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
     upstream_coefficients: Option<ArrayView2<'_, f64>>,
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
+    upstream_edf: f64,
 ) -> Result<GaussianRemlBackwardResult, EstimationError> {
     let fit =
         gaussian_reml_multi_closed_form_with_cache(x, y, penalty, weights, init_lambda, None)?;
@@ -610,6 +612,7 @@ pub fn gaussian_reml_multi_closed_form_backward(
         upstream_coefficients,
         upstream_fitted,
         upstream_reml_score,
+        upstream_edf,
     )
 }
 
@@ -624,6 +627,7 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     upstream_coefficients: Option<ArrayView2<'_, f64>>,
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
+    upstream_edf: f64,
 ) -> Result<GaussianRemlBackwardResult, EstimationError> {
     validate_gaussian_reml_backward_upstreams(
         x,
@@ -633,6 +637,7 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
         upstream_coefficients,
         upstream_fitted,
         upstream_reml_score,
+        upstream_edf,
     )?;
     validate_gaussian_reml_forward_fit(x, y, penalty, weights, fit)?;
     let lambda = fit.lambda;
@@ -657,6 +662,7 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
         upstream_coefficients,
         upstream_fitted,
         upstream_reml_score,
+        upstream_edf,
         n,
         p,
         d,
@@ -675,6 +681,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
     upstream_coefficients: Option<ArrayView2<'_, f64>>,
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
+    upstream_edf: f64,
     n: usize,
     p: usize,
     d: usize,
@@ -735,6 +742,20 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             &mut grad_weights,
         );
         lambda_adjoint += upstream_reml_score * fit.reml_grad_lambda;
+    }
+
+    if upstream_edf != 0.0 {
+        lambda_adjoint += add_edf_vjp(
+            upstream_edf,
+            x,
+            penalty,
+            &weight,
+            lambda,
+            &inverse_hessian,
+            &mut grad_x,
+            &mut grad_penalty,
+            &mut grad_weights,
+        );
     }
 
     if lambda_adjoint != 0.0 {
@@ -907,8 +928,12 @@ fn validate_gaussian_reml_backward_upstreams(
     upstream_coefficients: Option<ArrayView2<'_, f64>>,
     upstream_fitted: Option<ArrayView2<'_, f64>>,
     upstream_reml_score: f64,
+    upstream_edf: f64,
 ) -> Result<(), EstimationError> {
-    if !(upstream_lambda.is_finite() && upstream_reml_score.is_finite()) {
+    if !(upstream_lambda.is_finite()
+        && upstream_reml_score.is_finite()
+        && upstream_edf.is_finite())
+    {
         return Err(EstimationError::InvalidInput(
             "Gaussian REML backward upstream scalars must be finite".to_string(),
         ));
