@@ -28,6 +28,65 @@ use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::policy::DispatchPolicy;
 
+/// Pre-flight: can libcuda be dlopen'd at all?
+///
+/// `cudarc` 0.19 panics with `panic_no_lib_found` (cudarc/src/lib.rs:200)
+/// the first time any of its `culib()`-backed entry points is called on a
+/// host that has no `libcuda.*`. That's a hard abort path — there is no
+/// Result-returning variant. So before we touch *any* cudarc API in the
+/// probe, we libloading-test the same candidate names cudarc itself
+/// would search. If none load, we never call cudarc and the GPU module
+/// silently returns CPU-only.
+///
+/// Without this check the probe panics on every macOS / Windows-without-
+/// GPU / Linux-without-driver host, which is a hard regression vs the
+/// previous hand-rolled libloading probe.
+fn libcuda_loadable() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| try_dlopen_any(libcuda_candidates()))
+}
+
+/// Pre-flight: can libcublas be dlopen'd? cudarc's cublas lib loader is
+/// independent of the driver loader, so a host with libcuda but no
+/// libcublas would still panic the first time `CudaBlas::new` runs.
+/// Calibration and resident sessions both need cuBLAS, so a device that
+/// can't reach libcublas is unusable for GPU dispatch — we drop it
+/// rather than letting cudarc panic.
+pub fn libcublas_loadable() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| try_dlopen_any(libcublas_candidates()))
+}
+
+fn try_dlopen_any(candidates: &[&str]) -> bool {
+    candidates
+        .iter()
+        .any(|name| unsafe { libloading::Library::new(*name).is_ok() })
+}
+
+fn libcuda_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["nvcuda.dll"]
+    } else if cfg!(target_os = "macos") {
+        &["libcuda.dylib", "/usr/local/cuda/lib/libcuda.dylib"]
+    } else {
+        &["libcuda.so.1", "libcuda.so"]
+    }
+}
+
+fn libcublas_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["cublas64_12.dll", "cublas64_11.dll"]
+    } else if cfg!(target_os = "macos") {
+        &["libcublas.dylib", "/usr/local/cuda/lib/libcublas.dylib"]
+    } else {
+        &[
+            "libcublas.so.12",
+            "libcublas.so.11",
+            "libcublas.so",
+        ]
+    }
+}
+
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
 #[derive(Debug)]
 pub enum GpuProbeError {
@@ -287,6 +346,13 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
 fn contexts() -> &'static [Arc<CudaContext>] {
     static CONTEXTS: OnceLock<Vec<Arc<CudaContext>>> = OnceLock::new();
     CONTEXTS.get_or_init(|| {
+        // Guard against cudarc's panic-on-missing-libcuda: never call
+        // `CudaContext::device_count()` unless we've verified libcuda is
+        // dlopen'able. CPU-only hosts return an empty Vec here, and every
+        // caller (`cuda_context_for`, the probe) treats that as "no GPU".
+        if !libcuda_loadable() {
+            return Vec::new();
+        }
         let count = match CudaContext::device_count() {
             Ok(c) if c > 0 => c as usize,
             _ => return Vec::new(),
@@ -305,6 +371,14 @@ fn contexts() -> &'static [Arc<CudaContext>] {
 }
 
 fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
+    // Pre-flight libcuda check — cudarc 0.19 will panic, not error, if its
+    // own dynamic-loading attempt fails. We never let it get there on a
+    // CPU-only host.
+    if !libcuda_loadable() {
+        return Err(GpuProbeError::DriverLibraryMissing(
+            "libcuda (or platform equivalent) is not loadable on this host".to_string(),
+        ));
+    }
     let count = CudaContext::device_count().map_err(|err| {
         // No driver / unloadable libcuda surfaces as a DriverError here; we
         // map it to `DriverLibraryMissing` so the disabled-banner reads as
