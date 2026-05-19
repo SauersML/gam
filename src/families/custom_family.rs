@@ -9009,6 +9009,23 @@ fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f
     (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
 }
 
+fn joint_objective_floor_reached(
+    old_objective: f64,
+    trial_objective: f64,
+    actual_reduction: f64,
+    predicted_reduction: f64,
+    objective_tol: f64,
+) -> bool {
+    trial_objective.is_finite()
+        && actual_reduction <= 0.0
+        && actual_reduction.abs() <= joint_objective_roundoff_slack(old_objective, trial_objective)
+        && predicted_reduction.is_finite()
+        && predicted_reduction <= objective_tol.max(joint_objective_roundoff_slack(
+            old_objective,
+            trial_objective,
+        ))
+}
+
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -10356,6 +10373,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
+                if trust_update.accepted
+                    && joint_objective_floor_reached(
+                        old_objective,
+                        trialobjective,
+                        actual_reduction,
+                        predicted_reduction,
+                        objective_tol,
+                    )
+                {
+                    for (b, old) in old_beta.iter().enumerate() {
+                        states[b].beta.assign(old);
+                    }
+                    refresh_all_block_etas(family, specs, &mut states)?;
+                    log::info!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | objective floor reached: actual_reduction={:.3e} predicted_reduction={:.3e} objective_tol={:.3e}",
+                        cycle,
+                        actual_reduction,
+                        predicted_reduction,
+                        objective_tol,
+                    );
+                    accepted = true;
+                    converged = true;
+                    break;
+                }
                 if trialobjective.is_finite()
                     && trust_update.accepted
                     && trialobjective
@@ -10377,6 +10418,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 objective_rejects += 1;
             }
             let line_search_elapsed = line_search_started.elapsed();
+            if accepted && converged {
+                log::info!(
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload=0.000s total={:.3}s",
+                    cycle,
+                    hessian_and_qp_elapsed.as_secs_f64(),
+                    line_search_elapsed.as_secs_f64(),
+                    line_search_attempts,
+                    cycle_started.elapsed().as_secs_f64(),
+                );
+                cached_joint_workspace = hessian_workspace_for_cycle;
+                cycles_done = cycle + 1;
+                break;
+            }
             if !accepted {
                 // Retry the joint Newton loop from the same state after a
                 // failed trust-region search. Falling through into blockwise
