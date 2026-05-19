@@ -16968,6 +16968,34 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     .map_err(CustomFamilyError::Optimization)
 }
 
+pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+) -> Result<(Vec<Array1<f64>>, bool, usize), CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    let rho = flatten_log_lambdas(specs);
+    let per_block = split_log_lambdas(&rho, &penalty_counts)?;
+    let inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
+    let block_beta: Vec<Array1<f64>> = inner
+        .block_states
+        .iter()
+        .map(|state| state.beta.clone())
+        .collect();
+    if !block_beta
+        .iter()
+        .flat_map(|beta| beta.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err(CustomFamilyError::Optimization(
+            "fixed-log-lambda warm start produced non-finite coefficients".to_string(),
+        ));
+    }
+    Ok((block_beta, inner.converged, inner.cycles))
+}
+
 #[cfg(test)]
 mod tests {
     #[derive(Clone)]
