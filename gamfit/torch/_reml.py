@@ -593,6 +593,7 @@ class _GaussianRemlFreeBScoreBatchedFn(torch.autograd.Function):
         grad_coef = np.zeros_like(coef_np)
         grad_penalty = np.zeros((batch, penalty_np.shape[0], penalty_np.shape[1]), dtype=np.float64)
         grad_log_lambda = np.zeros(batch, dtype=np.float64)
+        grad_penalty_available = False
         for b in range(batch):
             start = int(offsets_np[b])
             end = int(offsets_np[b + 1])
@@ -612,11 +613,18 @@ class _GaussianRemlFreeBScoreBatchedFn(torch.autograd.Function):
             )
             scores[b] = float(out["reml_score"])
             grad_coef[b] = out["grad_coefficients"]
-            grad_penalty[b] = out["grad_penalty"]
+            # ``grad_penalty`` is optional in the Rust kernel — older builds
+            # of the free-B score function omit it. When absent, downstream
+            # backward returns ``None`` for the penalty input gradient (no
+            # autograd chain through ``S``).
+            grad_penalty_block = out.get("grad_penalty")
+            if grad_penalty_block is not None:
+                grad_penalty[b] = grad_penalty_block
+                grad_penalty_available = True
             grad_log_lambda[b] = float(out["grad_log_lambda"])
         _save_diff_tensors(ctx, coefficients, log_lambda, penalty)
         ctx.grad_coef = grad_coef
-        ctx.grad_penalty = grad_penalty
+        ctx.grad_penalty = grad_penalty if grad_penalty_available else None
         ctx.grad_log_lambda = grad_log_lambda
         ctx.batch = batch
         ctx.coefficients_was_2d = coefficients.ndim == 2
@@ -634,7 +642,13 @@ class _GaussianRemlFreeBScoreBatchedFn(torch.autograd.Function):
         grad_coef_np = ctx.grad_coef * upstream[:, None, None]
         if ctx.coefficients_was_2d:
             grad_coef_np = grad_coef_np.sum(axis=0)
-        grad_penalty_np = (ctx.grad_penalty * upstream[:, None, None]).sum(axis=0).astype(np.float64)
+        if ctx.grad_penalty is None:
+            grad_penalty_tensor = None
+        else:
+            grad_penalty_np = (
+                ctx.grad_penalty * upstream[:, None, None]
+            ).sum(axis=0).astype(np.float64)
+            grad_penalty_tensor = from_numpy_like(grad_penalty_np, ctx.penalty_ref)
         grad_log_np = ctx.grad_log_lambda * upstream
         if ctx.log_lambda_shape == ():
             grad_log_np = np.asarray(grad_log_np.sum(), dtype=np.float64)
@@ -648,7 +662,7 @@ class _GaussianRemlFreeBScoreBatchedFn(torch.autograd.Function):
             None,
             from_numpy_like(grad_coef_np, ctx.coefficients_ref),
             from_numpy_like(grad_log_np, ctx.log_lambda_ref),
-            from_numpy_like(grad_penalty_np, ctx.penalty_ref),
+            grad_penalty_tensor,
             None,
             None,
             None,
