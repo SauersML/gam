@@ -779,7 +779,10 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         );
     }
 
-    let grad_penalty = symmetric_lower_storage_gradient(grad_penalty.view());
+    // grad_penalty is left in its full p×p form. The per-helper accumulators
+    // already deliver the asymmetric VJP that matches torch.autograd.gradcheck
+    // against a generic (unconstrained) penalty input; callers who require
+    // a symmetric reduction can apply it themselves.
     Ok(GaussianRemlBackwardResult {
         grad_x,
         grad_y,
@@ -1349,17 +1352,6 @@ fn gaussian_reml_penalty_pseudoinverse_from_cache(cache: &GaussianRemlEigenCache
     dense_ab(scaled_basis.view(), cache.coefficient_basis.t())
 }
 
-fn symmetric_lower_storage_gradient(full_gradient: ArrayView2<'_, f64>) -> Array2<f64> {
-    let p = full_gradient.nrows();
-    let mut storage_gradient = Array2::<f64>::zeros((p, p));
-    for row in 0..p {
-        storage_gradient[[row, row]] = full_gradient[[row, row]];
-        for col in 0..row {
-            storage_gradient[[row, col]] = full_gradient[[row, col]] + full_gradient[[col, row]];
-        }
-    }
-    storage_gradient
-}
 
 fn add_deviance_profile_vjp(
     scale: f64,
