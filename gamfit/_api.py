@@ -866,7 +866,12 @@ def _gaussian_reml_score(
         raise map_exception(exc) from exc
     result = dict(out)
     for key in ("grad_coefficients", "grad_penalty", "fitted", "sigma2"):
-        result[key] = np.asarray(result[key], dtype=float)
+        # ``grad_penalty`` is only populated when the Rust kernel has built
+        # the VJP through ``S``. The closed-form path always returns the
+        # others; leaving ``grad_penalty`` absent keeps the Python surface
+        # forward-compatible with older builds.
+        if key in result:
+            result[key] = np.asarray(result[key], dtype=float)
     return result
 
 

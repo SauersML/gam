@@ -3621,6 +3621,80 @@ fn solution_into_outer_result(
     }
 }
 
+/// Sanity-check an optimizer's "converged" claim against the actual final
+/// gradient.
+///
+/// Opt's [`GradientTolerance`] supports a `rel_initial_grad` shape: the
+/// solver terminates when `‖g‖ ≤ τ · ‖g_0‖`. That rule is fine when the
+/// optimizer makes real descent, but on a resumed-from-cache start where
+/// the line search accepts a near-zero step the ratio `‖g‖ / ‖g_0‖` stays
+/// at ≈ 1 — and the relative test fires at iter 1 with a gradient still
+/// far from zero. The optimizer reports "Converged by gradient", but the
+/// iterate is not a stationary point.
+///
+/// This helper applies the strict `‖g‖_∞ ≤ tolerance · (1 + ‖x‖_∞)` rule
+/// the runner uses elsewhere (axis-step-cap stall exit, derivative-free
+/// fallback gates). When the strict rule fails, the iterate is kept as
+/// the best point reached — but the `converged` certification is
+/// downgraded so the cache-save gate (which keys off
+/// [`OuterResult::converged`]) does not persist a non-stationary point
+/// for the next run to resume from.
+///
+/// `tolerance` is the outer scalar tolerance ([`OuterConfig::tolerance`])
+/// — the same constant `outer_gradient_tolerance_with_scale` uses as
+/// `abs`, applied without the seed-grad-relative widening so this check
+/// is strictly tighter than what the optimizer accepted.
+fn validate_outer_gradient_convergence(solution: &Solution, tolerance: f64) -> bool {
+    let Some(gradient) = solution.final_gradient.as_ref() else {
+        // No final gradient surfaced (e.g. derivative-free or fixed-point
+        // exit). The optimizer's own status governs in that case — this
+        // helper is specifically for gradient-based solvers.
+        return true;
+    };
+    let g_inf = gradient
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    if !g_inf.is_finite() {
+        return false;
+    }
+    let x_inf = solution
+        .final_point
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    g_inf <= tolerance * (1.0 + x_inf)
+}
+
+/// Apply [`validate_outer_gradient_convergence`] to a "successful"
+/// optimizer outcome and log when the converged flag is being
+/// downgraded. The point itself is retained: a non-stationary iterate is
+/// still the best one found, but it must not enter the warm-start cache
+/// as a converged result.
+fn certify_outer_solution(
+    solution: Solution,
+    tolerance: f64,
+    context: &str,
+    plan_used: OuterPlan,
+) -> OuterResult {
+    let converged = validate_outer_gradient_convergence(&solution, tolerance);
+    if !converged {
+        let g_inf = solution
+            .final_gradient
+            .as_ref()
+            .map(|g| g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())))
+            .unwrap_or(f64::NAN);
+        let x_inf = solution
+            .final_point
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        log::info!(
+            "[OUTER] {context}: optimizer reported success but gradient |g|_inf={:.3e} > tol*(1+|x|_inf)={:.3e}; downgrading converged flag (point retained for warm-start, not cache-saved)",
+            g_inf,
+            tolerance * (1.0 + x_inf),
+        );
+    }
+    solution_into_outer_result(solution, converged, plan_used)
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 struct OuterConfig {
@@ -4894,7 +4968,12 @@ fn run_outer_with_plan(
                             .with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Ok(sol) => Ok(certify_outer_solution(
+                            sol,
+                            config.tolerance,
+                            "ARC",
+                            *the_plan,
+                        )),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
