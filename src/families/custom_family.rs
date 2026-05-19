@@ -10453,6 +10453,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 objective_rejects += 1;
             }
+            if let Some(prev) = tr_log_sig.as_deref() {
+                if tr_log_first == tr_log_last {
+                    log::info!(
+                        "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} {}",
+                        cycle, tr_log_first, prev,
+                    );
+                } else {
+                    log::info!(
+                        "[PIRLS/joint-Newton/trust-region] cycle={} attempts={}..{} (×{}) {}",
+                        cycle,
+                        tr_log_first,
+                        tr_log_last,
+                        tr_log_last - tr_log_first + 1,
+                        prev,
+                    );
+                }
+            }
             let line_search_elapsed = line_search_started.elapsed();
             if accepted && converged {
                 log::info!(
