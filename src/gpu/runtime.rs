@@ -1,24 +1,27 @@
-//! Env-free autodetection of an installed CUDA driver.
+//! Env-free autodetection of an installed CUDA driver via `cudarc` 0.16.
 //!
 //! The runtime probes the driver API exactly once at first access:
 //!
-//! 1. dlopen the platform-specific driver library (`libcuda.so.1` on Linux,
-//!    `nvcuda.dll` on Windows, `libcuda.dylib` on macOS / CUDA-on-Mac).
-//! 2. Call `cuInit(0)` and `cuDeviceGetCount` to enumerate visible devices.
-//! 3. Materialize a [`GpuDeviceInfo`] per device, sort by score, and keep the
-//!    full device set available for batched work partitioning.
+//! 1. Ask `cudarc::driver::CudaContext::device_count()` for the visible
+//!    device count. This implicitly initializes the driver.
+//! 2. For each ordinal, retain the primary context via
+//!    `CudaContext::new(ordinal)` and pull name / compute capability /
+//!    total memory / SM count through the safe driver API.
+//! 3. Materialize a [`GpuDeviceInfo`] per device, sort by score, and keep
+//!    the full device set available for batched work partitioning.
 //!
 //! Probe failure is silent: callers see [`GpuRuntime::is_available`] return
 //! `false` and the dispatch policy stays unused. There are no environment
 //! variables or CLI flags involved in any of this.
 
-use std::ffi::c_char;
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use libloading::Library;
+use cudarc::driver::CudaContext;
+use cudarc::driver::sys::CUdevice_attribute_enum;
 
 use super::calibration::{DeviceCalibration, measure_device};
 use super::device::GpuDeviceInfo;
@@ -26,33 +29,13 @@ use super::diagnostics;
 use super::driver::CudaWorkingState;
 use super::policy::DispatchPolicy;
 
-// Minimal CUDA driver ABI surface required for autodetection.
-type CuResult = i32;
-type CuDevice = i32;
-type CuInit = unsafe extern "C" fn(u32) -> CuResult;
-type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CuResult;
-type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
-type CuDeviceGetName = unsafe extern "C" fn(*mut c_char, i32, CuDevice) -> CuResult;
-type CuDeviceComputeCapability = unsafe extern "C" fn(*mut i32, *mut i32, CuDevice) -> CuResult;
-type CuDeviceTotalMem = unsafe extern "C" fn(*mut usize, CuDevice) -> CuResult;
-type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, CuDevice) -> CuResult;
-
-// CUDA driver `cuDeviceGetAttribute` enumerants pulled from `cuda.h`.
-// Hard-coded because we resolve symbols dynamically and can't include
-// the header. All other throughput-relevant numbers (FP64 GFLOPS, PCIe
-// bandwidth) are measured at probe time via [`super::calibration`]
-// rather than read from attributes or compute-capability tables.
-const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
-
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
 #[derive(Debug)]
 pub enum GpuProbeError {
-    /// `libcuda` could not be dlopen'd; the host has no NVIDIA driver.
+    /// The CUDA driver could not be loaded or initialized on this host.
     DriverLibraryMissing(String),
-    /// `libcuda` was found but a required entry point is missing.
-    MissingSymbol(&'static str),
-    /// A driver call returned a non-zero error code.
-    DriverCall { call: &'static str, code: CuResult },
+    /// A cudarc safe-API call returned an error.
+    DriverError(String),
     /// The driver reports zero usable devices.
     NoDevices,
     /// All enumerated devices failed runtime calibration (dgemm or memcpy).
@@ -64,10 +47,7 @@ impl fmt::Display for GpuProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DriverLibraryMissing(s) => write!(f, "CUDA driver library not found: {s}"),
-            Self::MissingSymbol(s) => write!(f, "CUDA driver missing symbol: {s}"),
-            Self::DriverCall { call, code } => {
-                write!(f, "{call} returned CUDA driver error {code}")
-            }
+            Self::DriverError(s) => write!(f, "CUDA driver call failed: {s}"),
             Self::NoDevices => f.write_str("no CUDA devices reported by the driver"),
             Self::CalibrationFailed => {
                 f.write_str("all CUDA devices failed runtime calibration")
@@ -169,19 +149,13 @@ impl GpuRuntime {
         self.cpu_reason.as_deref()
     }
 
-    /// The one shared `(libcuda + DriverApi + context)` used by every
-    /// library runtime. Lazily created on first call so probe-only
-    /// callers (`gpu_available()`, `selected_gpu_info()`) don't pay the
-    /// `cuCtxCreate` cost.
-    ///
-    /// Returns `None` when no CUDA device is selected, or when context
-    /// creation itself fails.
+    /// Legacy accessor kept for API stability while the cuBLAS / cuSOLVER /
+    /// cuSPARSE wrappers still consume the hand-rolled driver context. The
+    /// parallel cudarc migration will retire it; for now this returns
+    /// `None` so callers transparently fall through to the CPU path until
+    /// they are rewritten on top of `cuda_context_for`.
     pub fn cuda_working_state(&self) -> Option<&'static CudaWorkingState> {
-        static STATE: OnceLock<Option<CudaWorkingState>> = OnceLock::new();
-        let device = self.selected_device.as_ref()?;
-        STATE
-            .get_or_init(|| CudaWorkingState::init(device.ordinal))
-            .as_ref()
+        None
     }
 
     pub fn plan_batched_work_for_devices(
@@ -309,85 +283,88 @@ pub fn gpu_device_infos() -> Vec<GpuDeviceInfo> {
     GpuRuntime::global().devices().to_vec()
 }
 
+/// Shared `Arc<CudaContext>` for `ordinal`, or `None` if no such device.
+///
+/// The contexts are cached in a process-wide `OnceLock` so every cuBLAS /
+/// cuSOLVER / cuSPARSE / session / calibration consumer reuses the same
+/// primary context. Calling this before the probe has run will trigger
+/// enumeration as a side effect, since contexts must be discovered to be
+/// cached.
+pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
+    contexts().get(ordinal).cloned()
+}
+
+/// Lazily enumerate and retain every visible primary context. Returns an
+/// empty slice when no driver is present.
+fn contexts() -> &'static [Arc<CudaContext>] {
+    static CONTEXTS: OnceLock<Vec<Arc<CudaContext>>> = OnceLock::new();
+    CONTEXTS.get_or_init(|| {
+        let count = match CudaContext::device_count() {
+            Ok(c) if c > 0 => c as usize,
+            _ => return Vec::new(),
+        };
+        let mut out = Vec::with_capacity(count);
+        for ordinal in 0..count {
+            match CudaContext::new(ordinal) {
+                Ok(ctx) => out.push(ctx),
+                Err(err) => {
+                    log::warn!(
+                        "[GPU] CudaContext::new({}) failed: {}",
+                        ordinal,
+                        err
+                    );
+                }
+            }
+        }
+        out
+    })
+}
+
 fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
-    let library = load_cuda_driver()?;
-
-    let cu_init: libloading::Symbol<'_, CuInit> =
-        unsafe { library.get(b"cuInit\0") }.map_err(|_| GpuProbeError::MissingSymbol("cuInit"))?;
-    let cu_device_get_count: libloading::Symbol<'_, CuDeviceGetCount> =
-        unsafe { library.get(b"cuDeviceGetCount\0") }
-            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGetCount"))?;
-    let cu_device_get: libloading::Symbol<'_, CuDeviceGet> =
-        unsafe { library.get(b"cuDeviceGet\0") }
-            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGet"))?;
-    let cu_device_get_name: libloading::Symbol<'_, CuDeviceGetName> =
-        unsafe { library.get(b"cuDeviceGetName\0") }
-            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGetName"))?;
-    let cu_device_compute_capability: libloading::Symbol<'_, CuDeviceComputeCapability> =
-        unsafe { library.get(b"cuDeviceComputeCapability\0") }
-            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceComputeCapability"))?;
-    let cu_device_total_mem: libloading::Symbol<'_, CuDeviceTotalMem> = unsafe {
-        library
-            .get(b"cuDeviceTotalMem_v2\0")
-            .or_else(|_| library.get(b"cuDeviceTotalMem\0"))
-    }
-    .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceTotalMem"))?;
-    let cu_device_get_attribute: libloading::Symbol<'_, CuDeviceGetAttribute> =
-        unsafe { library.get(b"cuDeviceGetAttribute\0") }
-            .map_err(|_| GpuProbeError::MissingSymbol("cuDeviceGetAttribute"))?;
-
-    check(unsafe { cu_init(0) }, "cuInit")?;
-    let mut count: i32 = 0;
-    check(
-        unsafe { cu_device_get_count(&mut count) },
-        "cuDeviceGetCount",
-    )?;
+    let count = CudaContext::device_count().map_err(|err| {
+        // No driver / unloadable libcuda surfaces as a DriverError here; we
+        // map it to `DriverLibraryMissing` so the disabled-banner reads as
+        // "no driver" rather than a noisy call error.
+        GpuProbeError::DriverLibraryMissing(err.to_string())
+    })?;
     if count <= 0 {
         return Err(GpuProbeError::NoDevices);
     }
 
+    // Eagerly populate the shared-context cache so that every later caller
+    // (`cuda_context_for`) sees the same `Arc<CudaContext>` we used here.
+    let ctxs = contexts();
+    if ctxs.is_empty() {
+        return Err(GpuProbeError::DriverError(
+            "no CUDA contexts could be retained".to_string(),
+        ));
+    }
+
     // ---- Phase 1: enumerate device descriptors -------------------------
-    let mut descriptors = Vec::with_capacity(count as usize);
-    for ordinal in 0..count {
-        let mut raw_device: CuDevice = 0;
-        check(
-            unsafe { cu_device_get(&mut raw_device, ordinal) },
-            "cuDeviceGet",
-        )?;
-        let mut name_bytes = [0_i8; 256];
-        let name_len =
-            i32::try_from(name_bytes.len()).expect("CUDA device name buffer length must fit i32");
-        check(
-            unsafe {
-                cu_device_get_name(name_bytes.as_mut_ptr() as *mut c_char, name_len, raw_device)
-            },
-            "cuDeviceGetName",
-        )?;
-        let mut major: i32 = 0;
-        let mut minor: i32 = 0;
-        check(
-            unsafe { cu_device_compute_capability(&mut major, &mut minor, raw_device) },
-            "cuDeviceComputeCapability",
-        )?;
-        let mut total_memory_bytes: usize = 0;
-        check(
-            unsafe { cu_device_total_mem(&mut total_memory_bytes, raw_device) },
-            "cuDeviceTotalMem",
-        )?;
-        let mut sm_count: i32 = 0;
-        check(
-            unsafe {
-                cu_device_get_attribute(
-                    &mut sm_count,
-                    CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                    raw_device,
-                )
-            },
-            "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)",
-        )?;
+    let mut descriptors: Vec<GpuDeviceDescriptor> = Vec::with_capacity(ctxs.len());
+    for ctx in ctxs.iter() {
+        let ordinal = ctx.ordinal();
+        let name = ctx
+            .name()
+            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetName: {e}")))?;
+        let major = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(MAJOR): {e}")))?;
+        let minor = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(MINOR): {e}")))?;
+        let sm_count = ctx
+            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(SM): {e}")))?;
+        // `cudarc::driver::result::device::total_mem` is `unsafe` — safe to call
+        // here because we use the `CUdevice` handle that cudarc just gave us.
+        let total_memory_bytes = unsafe {
+            cudarc::driver::result::device::total_mem(ctx.cu_device())
+        }
+        .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceTotalMem: {e}")))?;
         descriptors.push(GpuDeviceDescriptor {
-            ordinal: ordinal as usize,
-            name: c_name_to_string(&name_bytes),
+            ordinal,
+            name: name.trim().to_string(),
             compute_capability_major: major,
             compute_capability_minor: minor,
             sm_count,
@@ -448,9 +425,6 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
     if devices.is_empty() {
         return Err(GpuProbeError::CalibrationFailed);
     }
-    // The `Symbol` bindings go out of scope at function exit; they don't
-    // carry destructors with side effects. `library` itself is a `&'static`
-    // handle owned by the `OnceLock` inside `load_cuda_driver`.
     Ok(devices)
 }
 
@@ -461,51 +435,6 @@ struct GpuDeviceDescriptor {
     compute_capability_minor: i32,
     sm_count: i32,
     total_memory_bytes: usize,
-}
-
-fn load_cuda_driver() -> Result<&'static Library, GpuProbeError> {
-    static LIBRARY: OnceLock<Option<&'static Library>> = OnceLock::new();
-    let slot = LIBRARY.get_or_init(|| {
-        let candidates: &[&str] = if cfg!(target_os = "windows") {
-            &["nvcuda.dll"]
-        } else if cfg!(target_os = "macos") {
-            &["/usr/local/cuda/lib/libcuda.dylib", "libcuda.dylib"]
-        } else {
-            &["libcuda.so.1", "libcuda.so"]
-        };
-        for candidate in candidates {
-            // SAFETY: We never call dtors on the loaded library; the handle is
-            // intentionally leaked for the process lifetime.
-            if let Ok(lib) = unsafe { Library::new(*candidate) } {
-                return Some(Box::leak(Box::new(lib)));
-            }
-        }
-        None
-    });
-    slot.ok_or_else(|| {
-        GpuProbeError::DriverLibraryMissing(if cfg!(target_os = "windows") {
-            "nvcuda.dll".to_string()
-        } else if cfg!(target_os = "macos") {
-            "libcuda.dylib".to_string()
-        } else {
-            "libcuda.so.1".to_string()
-        })
-    })
-}
-
-#[inline]
-fn check(code: CuResult, call: &'static str) -> Result<(), GpuProbeError> {
-    if code == 0 {
-        Ok(())
-    } else {
-        Err(GpuProbeError::DriverCall { call, code })
-    }
-}
-
-fn c_name_to_string(bytes: &[i8]) -> String {
-    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    let raw: Vec<u8> = bytes[..nul].iter().map(|&b| b as u8).collect();
-    String::from_utf8_lossy(&raw).trim().to_string()
 }
 
 #[cfg(test)]
