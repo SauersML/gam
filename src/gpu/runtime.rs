@@ -1,4 +1,4 @@
-//! Env-free autodetection of an installed CUDA driver via `cudarc` 0.16.
+//! Env-free autodetection of an installed CUDA driver via `cudarc` 0.19.
 //!
 //! The runtime probes the driver API exactly once at first access:
 //!
@@ -347,21 +347,15 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
         let name = ctx
             .name()
             .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetName: {e}")))?;
-        let major = ctx
-            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(MAJOR): {e}")))?;
-        let minor = ctx
-            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(MINOR): {e}")))?;
+        let (major, minor) = ctx
+            .compute_capability()
+            .map_err(|e| GpuProbeError::DriverError(format!("compute_capability: {e}")))?;
         let sm_count = ctx
             .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(SM): {e}")))?;
-        // `cudarc::driver::result::device::total_mem` is `unsafe` — safe to call
-        // here because we use the `CUdevice` handle that cudarc just gave us.
-        let total_memory_bytes = unsafe {
-            cudarc::driver::result::device::total_mem(ctx.cu_device())
-        }
-        .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceTotalMem: {e}")))?;
+        let total_memory_bytes = ctx
+            .total_mem()
+            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceTotalMem: {e}")))?;
         descriptors.push(GpuDeviceDescriptor {
             ordinal,
             name: name.trim().to_string(),

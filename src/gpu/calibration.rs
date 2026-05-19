@@ -6,8 +6,8 @@
 //!   and taking the fastest iteration (best-of-N captures the un-throttled
 //!   sustained rate while still hammering the FP64 ALUs hard enough to
 //!   match real biobank-shape dispatch).
-//! * **Host↔device bandwidth** — by timing pageable `cuMemcpyHtoD` and
-//!   `cuMemcpyDtoH` transfers of a 32 MiB buffer.
+//! * **Host↔device bandwidth** — by timing pageable H2D and D2H transfers
+//!   of a 32 MiB buffer.
 //!
 //! Every threshold the [`super::policy::DispatchPolicy`] derives is read
 //! from these measurements, so the cross-over math reflects what the
@@ -17,16 +17,24 @@
 //! Calibration is best-effort: a device whose calibration fails is silently
 //! dropped from the active set by [`super::runtime::GpuRuntime::probe`]
 //! and the runtime falls through to CPU dispatch.
+//!
+//! ## API contract
+//!
+//! `measure_device` takes an `Arc<CudaContext>` provided by the runtime
+//! probe via [`super::runtime::cuda_context_for`], which returns the
+//! process-wide cached primary context for the requested ordinal.
+//! Calibration borrows that context long enough to issue the timed
+//! transfers and dgemm calls. All CUDA driver and cuBLAS bindings are
+//! provided by `cudarc` 0.19 — there is no hand-rolled FFI, no
+//! `libloading` symbol lookup, and no per-call handle lifecycle in this
+//! module.
 
-use std::ffi::c_void;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use libloading::Library;
-
-use super::driver::{
-    CudaWorkingState, DeviceAllocation, check_cuda, load_static_library, to_i32,
-};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
+use cudarc::driver::CudaContext;
 
 /// Measured per-device throughput used by every dispatch threshold.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,23 +61,21 @@ impl DeviceCalibration {
 }
 
 /// Measure throughput for a single CUDA device. Returns `None` if any step
-/// (cuBLAS load, allocation, dgemm, memcpy, synchronize) fails — the runtime
-/// then drops that device from the active set.
-pub fn measure_device(working: &CudaWorkingState) -> Option<DeviceCalibration> {
-    working.set_current().ok()?;
+/// (cuBLAS init, allocation, dgemm, memcpy, synchronize) fails — the
+/// runtime then drops that device from the active set.
+///
+/// The caller is responsible for owning the `Arc<CudaContext>` for the
+/// device under test (typically the runtime probe via
+/// `runtime::cuda_context_for`). Calibration uses the context's default
+/// stream and creates its own `CudaBlas` handle scoped to that stream.
+pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
+    // Bind the calling thread to this context so allocations and copies
+    // land on the right device when the runtime drives multiple GPUs from
+    // a single probe thread.
+    ctx.bind_to_thread().ok()?;
 
-    let cublas_lib = load_static_library(cublas_library_candidates()).ok()?;
-    let api = MicroCublas::load(cublas_lib).ok()?;
-    let cu_ctx_synchronize = load_ctx_synchronize().ok()?;
-
-    let mut handle: usize = 0;
-    if unsafe { (api.cublas_create)(&mut handle) } != CUBLAS_STATUS_SUCCESS {
-        return None;
-    }
-    let _handle_guard = HandleGuard {
-        handle,
-        destroy: api.cublas_destroy,
-    };
+    let stream = ctx.default_stream();
+    let blas = CudaBlas::new(stream.clone()).ok()?;
 
     // -- Shape constants ----------------------------------------------------
     // 1024^3 dgemm: 2.147 GFLOP, ~32 MiB working set. Big enough that the
@@ -79,165 +85,101 @@ pub fn measure_device(working: &CudaWorkingState) -> Option<DeviceCalibration> {
     const N: usize = 1024;
     const K: usize = 1024;
     const TRANSFER_BYTES: usize = 32 * 1024 * 1024;
-
-    let bytes_mm: usize = M * K * std::mem::size_of::<f64>();
-    let bytes_kn: usize = K * N * std::mem::size_of::<f64>();
-    let bytes_mn: usize = M * N * std::mem::size_of::<f64>();
+    const TRANSFER_F64: usize = TRANSFER_BYTES / std::mem::size_of::<f64>();
 
     // Host buffers (deterministic content; we don't compare results, just
     // need real FP64 work and real bytes flowing).
     let a_host: Vec<f64> = (0..M * K).map(|i| (i as f64).sin()).collect();
     let b_host: Vec<f64> = (0..K * N).map(|i| (i as f64).cos()).collect();
-    let mut c_host: Vec<f64> = vec![0.0; M * N];
 
     // -- Device allocations -------------------------------------------------
-    let a_dev = unsafe { DeviceAllocation::new(&working.api, bytes_mm)? };
-    let b_dev = unsafe { DeviceAllocation::new(&working.api, bytes_kn)? };
-    let c_dev = unsafe { DeviceAllocation::new(&working.api, bytes_mn)? };
+    let mut a_dev = stream.alloc_zeros::<f64>(M * K).ok()?;
+    let mut b_dev = stream.alloc_zeros::<f64>(K * N).ok()?;
+    let mut c_dev = stream.alloc_zeros::<f64>(M * N).ok()?;
 
     // -- H2D bandwidth ------------------------------------------------------
-    let transfer_buffer: Vec<u8> = vec![0u8; TRANSFER_BYTES];
-    let h2d_dev =
-        unsafe { DeviceAllocation::new(&working.api, TRANSFER_BYTES)? };
+    // Use an f64-typed buffer so a single element count = one chunk
+    // exactly TRANSFER_BYTES wide. Contents are irrelevant; what matters
+    // is that real pageable host pages flow over PCIe.
+    let transfer_host: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
+    let mut transfer_dev = stream.alloc_zeros::<f64>(TRANSFER_F64).ok()?;
+
     // Warm the path once so first-call driver overhead doesn't skew the GB/s.
-    check_cuda(
-        unsafe {
-            (working.api.cu_memcpy_htod)(
-                h2d_dev.ptr,
-                transfer_buffer.as_ptr().cast(),
-                TRANSFER_BYTES,
-            )
-        },
-        "cuMemcpyHtoD(warmup)",
-    )
-    .ok()?;
-    check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(h2d_warmup)").ok()?;
+    stream
+        .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
+        .ok()?;
+    stream.synchronize().ok()?;
 
     let h2d_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
-        check_cuda(
-            unsafe {
-                (working.api.cu_memcpy_htod)(
-                    h2d_dev.ptr,
-                    transfer_buffer.as_ptr().cast(),
-                    TRANSFER_BYTES,
-                )
-            },
-            "cuMemcpyHtoD",
-        )
-        .ok()?;
-        check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(h2d)").ok()?;
+        stream
+            .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
+            .ok()?;
+        // Synchronize so timing reflects real kernel completion, not just
+        // the host-side queue insertion.
+        stream.synchronize().ok()?;
         Some(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
     // -- D2H bandwidth ------------------------------------------------------
-    let mut transfer_back: Vec<u8> = vec![0u8; TRANSFER_BYTES];
-    check_cuda(
-        unsafe {
-            (working.api.cu_memcpy_dtoh)(
-                transfer_back.as_mut_ptr().cast::<c_void>(),
-                h2d_dev.ptr,
-                TRANSFER_BYTES,
-            )
-        },
-        "cuMemcpyDtoH(warmup)",
-    )
-    .ok()?;
-    check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(d2h_warmup)").ok()?;
+    let mut transfer_back: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
+    stream
+        .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
+        .ok()?;
+    stream.synchronize().ok()?;
 
     let d2h_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
-        check_cuda(
-            unsafe {
-                (working.api.cu_memcpy_dtoh)(
-                    transfer_back.as_mut_ptr().cast::<c_void>(),
-                    h2d_dev.ptr,
-                    TRANSFER_BYTES,
-                )
-            },
-            "cuMemcpyDtoH",
-        )
-        .ok()?;
-        check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(d2h)").ok()?;
+        stream
+            .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
+            .ok()?;
+        stream.synchronize().ok()?;
         Some(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
     // -- FP64 dgemm throughput ---------------------------------------------
     // Copy A, B once; reuse across iterations. C is the only thing that
     // changes between runs, and dgemm always overwrites it.
-    check_cuda(
-        unsafe {
-            (working.api.cu_memcpy_htod)(a_dev.ptr, a_host.as_ptr().cast(), bytes_mm)
-        },
-        "cuMemcpyHtoD(A)",
-    )
-    .ok()?;
-    check_cuda(
-        unsafe {
-            (working.api.cu_memcpy_htod)(b_dev.ptr, b_host.as_ptr().cast(), bytes_kn)
-        },
-        "cuMemcpyHtoD(B)",
-    )
-    .ok()?;
+    stream.memcpy_htod(a_host.as_slice(), &mut a_dev).ok()?;
+    stream.memcpy_htod(b_host.as_slice(), &mut b_dev).ok()?;
+    stream.synchronize().ok()?;
 
-    let alpha = 1.0_f64;
-    let beta = 0.0_f64;
-    let m_i = to_i32(M)?;
-    let n_i = to_i32(N)?;
-    let k_i = to_i32(K)?;
+    let m_i = i32::try_from(M).ok()?;
+    let n_i = i32::try_from(N).ok()?;
+    let k_i = i32::try_from(K).ok()?;
+
+    let cfg = GemmConfig::<f64> {
+        transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+        transb: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+        m: m_i,
+        n: n_i,
+        k: k_i,
+        alpha: 1.0_f64,
+        lda: m_i,
+        ldb: k_i,
+        beta: 0.0_f64,
+        ldc: m_i,
+    };
 
     // Two warmup runs so kernel JIT + boost clock settle.
     for _ in 0..2 {
-        let status = unsafe {
-            (api.cublas_dgemm)(
-                handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                m_i,
-                n_i,
-                k_i,
-                &alpha,
-                a_dev.ptr,
-                m_i,
-                b_dev.ptr,
-                k_i,
-                &beta,
-                c_dev.ptr,
-                m_i,
-            )
-        };
-        if status != CUBLAS_STATUS_SUCCESS {
-            return None;
-        }
-        check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(dgemm_warmup)")
-            .ok()?;
+        // SAFETY: cfg is filled with shape/leading-dimension values
+        // consistent with the just-allocated a_dev/b_dev/c_dev slices
+        // (M*K, K*N, M*N elements, column-major leading dims m, k, m).
+        // gemm is unsafe in cudarc 0.16 because invalid shapes would
+        // map to invalid device memory accesses; the shapes here are
+        // statically known and match the allocations.
+        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
+        stream.synchronize().ok()?;
     }
 
     let flops = 2.0_f64 * (M as f64) * (N as f64) * (K as f64);
     let fp64_gflops = best_of_n_transfer(5, || {
         let start = Instant::now();
-        let status = unsafe {
-            (api.cublas_dgemm)(
-                handle,
-                CUBLAS_OP_N,
-                CUBLAS_OP_N,
-                m_i,
-                n_i,
-                k_i,
-                &alpha,
-                a_dev.ptr,
-                m_i,
-                b_dev.ptr,
-                k_i,
-                &beta,
-                c_dev.ptr,
-                m_i,
-            )
-        };
-        if status != CUBLAS_STATUS_SUCCESS {
-            return None;
-        }
-        check_cuda(unsafe { cu_ctx_synchronize() }, "cuCtxSynchronize(dgemm)").ok()?;
+        // SAFETY: same as the warmup block above — cfg matches the
+        // allocations and they remain in scope.
+        unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
+        stream.synchronize().ok()?;
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed <= 0.0 {
             return None;
@@ -247,17 +189,8 @@ pub fn measure_device(working: &CudaWorkingState) -> Option<DeviceCalibration> {
 
     // D2H result so the device-side pages are exercised end-to-end (also
     // serves as a sanity check that dgemm actually wrote something).
-    check_cuda(
-        unsafe {
-            (working.api.cu_memcpy_dtoh)(
-                c_host.as_mut_ptr().cast::<c_void>(),
-                c_dev.ptr,
-                bytes_mn,
-            )
-        },
-        "cuMemcpyDtoH(C)",
-    )
-    .ok()?;
+    let _c_host = stream.clone_dtoh(&c_dev).ok()?;
+    stream.synchronize().ok()?;
 
     let calibration = DeviceCalibration {
         fp64_gflops,
@@ -361,110 +294,6 @@ where
         }
     }
     if any { Some(best) } else { None }
-}
-
-// ---------------------------------------------------------------------------
-// Minimal cuBLAS binding scoped to calibration.
-//
-// The CublasApi in `blas.rs` already binds many cuBLAS entry points but it
-// also owns the persistent runtime handles and per-dispatch routing. Re-using
-// it from inside the probe would create a circular dependency between
-// `runtime::probe` and `blas::cublas_runtimes`. The three symbols below are
-// enough for calibration and stay local to this module.
-// ---------------------------------------------------------------------------
-
-type CublasStatus = i32;
-type CublasCreate = unsafe extern "C" fn(*mut usize) -> CublasStatus;
-type CublasDestroy = unsafe extern "C" fn(usize) -> CublasStatus;
-#[allow(clippy::too_many_arguments)]
-type CublasDgemm = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-    *const f64,
-    u64,
-    i32,
-) -> CublasStatus;
-
-const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
-const CUBLAS_OP_N: i32 = 0;
-
-struct MicroCublas {
-    cublas_create: CublasCreate,
-    cublas_destroy: CublasDestroy,
-    cublas_dgemm: CublasDgemm,
-}
-
-impl MicroCublas {
-    fn load(library: &Library) -> Result<Self, String> {
-        unsafe {
-            Ok(Self {
-                cublas_create: *library
-                    .get(b"cublasCreate_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_destroy: *library
-                    .get(b"cublasDestroy_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_dgemm: *library
-                    .get(b"cublasDgemm_v2\0")
-                    .map_err(|e| e.to_string())?,
-            })
-        }
-    }
-}
-
-fn cublas_library_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["cublas64_12.dll", "cublas64_11.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["/usr/local/cuda/lib/libcublas.dylib", "libcublas.dylib"]
-    } else {
-        &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
-    }
-}
-
-/// Resolve `cuCtxSynchronize` from libcuda. Cached per process.
-fn load_ctx_synchronize() -> Result<unsafe extern "C" fn() -> i32, String> {
-    static CACHED: OnceLock<usize> = OnceLock::new();
-    let slot = CACHED.get_or_init(|| {
-        let library = match load_static_library(super::driver::cuda_library_candidates())
-        {
-            Ok(lib) => lib,
-            Err(_) => return 0,
-        };
-        let sym: libloading::Symbol<'_, unsafe extern "C" fn() -> i32> =
-            match unsafe { library.get(b"cuCtxSynchronize\0") } {
-                Ok(sym) => sym,
-                Err(_) => return 0,
-            };
-        unsafe { std::mem::transmute::<unsafe extern "C" fn() -> i32, usize>(*sym) }
-    });
-    if *slot == 0 {
-        Err("cuCtxSynchronize not exported by libcuda".to_string())
-    } else {
-        Ok(unsafe { std::mem::transmute::<usize, unsafe extern "C" fn() -> i32>(*slot) })
-    }
-}
-
-struct HandleGuard {
-    handle: usize,
-    destroy: CublasDestroy,
-}
-
-impl Drop for HandleGuard {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = (self.destroy)(self.handle);
-        }
-    }
 }
 
 #[cfg(test)]
