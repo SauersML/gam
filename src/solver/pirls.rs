@@ -1704,9 +1704,7 @@ impl<'a> GamWorkingModel<'a> {
                 // without any sqrt clipping. The resident variant keeps X
                 // on the device across PIRLS iterations — on biobank shapes
                 // (n≈3e5) that saves ~84 MiB of H2D traffic per Newton step.
-                if let Some(out) =
-                    crate::gpu::try_fast_xt_diag_x_arc(&x_dense, weights)
-                {
+                if let Some(out) = crate::gpu::try_fast_xt_diag_x_arc(&x_dense, weights) {
                     return Ok(out);
                 }
                 if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), weights) {
@@ -6988,8 +6986,7 @@ fn solve_penalized_least_squares_implicit(
                 // is reused.
                 if let Some(out) = crate::gpu::try_fast_xt_diag_x_arc(&x_dense, &weights) {
                     out
-                } else if let Some(out) =
-                    crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights)
+                } else if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights)
                 {
                     out
                 } else {

@@ -3988,10 +3988,7 @@ impl OuterProblem {
     /// Attach mirror cache sessions that receive a broadcast copy of
     /// the final-result finalize write. See
     /// [`OuterConfig::cache_mirror_sessions`].
-    pub fn with_cache_mirror_sessions(
-        mut self,
-        sessions: Vec<Arc<CacheSession>>,
-    ) -> Self {
+    pub fn with_cache_mirror_sessions(mut self, sessions: Vec<Arc<CacheSession>>) -> Self {
         self.cache_mirror_sessions = sessions;
         self
     }

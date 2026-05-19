@@ -99,11 +99,7 @@ impl DispatchPolicy {
         )
     }
 
-    fn from_measurements(
-        peak_gpu_gflops: f64,
-        cpu_gflops: f64,
-        pcie_gb_per_s: f64,
-    ) -> Self {
+    fn from_measurements(peak_gpu_gflops: f64, cpu_gflops: f64, pcie_gb_per_s: f64) -> Self {
         let speedup = (peak_gpu_gflops / cpu_gflops).max(1.0);
 
         // The payload constants below model the dispatch crossover as

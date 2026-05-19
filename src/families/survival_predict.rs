@@ -699,11 +699,13 @@ fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f
     let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
     let cumulative_hazard = -log_survival;
     let hazard = mills_ratio * eta_derivative;
-    if !(cumulative_hazard.is_finite()
-        && cumulative_hazard >= 0.0
-        && hazard.is_finite()
-        && hazard >= 0.0)
-    {
+    // `>= 0.0` rejects NaN (a programming-bug signal) and accepts the full
+    // mathematical range [0, +∞]. Saturated probit fits where the model
+    // genuinely says S(t)→0 produce a +∞ cumulative hazard — that is the
+    // truthful answer, and the consumer's `survival = exp(-cum).clamp(0,1)`
+    // handles it cleanly. Rejecting +∞ would force the predictor to fail on
+    // models that the inner solver has already certified as a valid fit.
+    if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
         return Err(format!(
             "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
         ));
@@ -817,11 +819,15 @@ fn royston_parmar_survival_hazard_components(
     }
     let cumulative_hazard = eta.exp();
     let hazard = cumulative_hazard * eta_derivative;
-    if !(cumulative_hazard.is_finite()
-        && cumulative_hazard >= 0.0
-        && hazard.is_finite()
-        && hazard >= 0.0)
-    {
+    // Royston-Parmar parameterizes `eta = log Lambda(t)`, so `Lambda = exp(eta)`
+    // is unbounded above and `exp(eta)` saturates to `+∞` in f64 once
+    // `eta >~ 709.78` — exactly the regime a saturated RP fit produces in the
+    // right tail. The math is well-defined (`S(t) → 0`, `h(t) → ∞`); rejecting
+    // `+∞` here would crash predict on a fit the inner solver already accepted.
+    // `>= 0.0` rejects NaN (the only true bug signal) while allowing the full
+    // [0, +∞] range. The consumer materializes survival via
+    // `survival = exp(-cum).clamp(0, 1)`, which collapses cleanly at saturation.
+    if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
         return Err(format!(
             "saved Royston-Parmar survival prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, cumulative_hazard={cumulative_hazard}, hazard={hazard}"
         ));
@@ -2052,6 +2058,47 @@ mod tests {
         let err = royston_parmar_survival_hazard_components(0.0, 0.0)
             .expect_err("zero derivative should be invalid");
         assert!(err.contains("invalid log-cumulative-hazard derivative"));
+    }
+
+    #[test]
+    fn royston_parmar_hazard_propagates_saturation_as_infinity() {
+        // η = log Λ(t); a saturated RP fit can drive η well past the
+        // exp(709.78)≈f64::MAX boundary in the right tail. The math is
+        // S(t)→0, h(t)→∞; the helper must not reject this regime, because the
+        // inner solver has already accepted the underlying fit.
+        let eta = 1000.0_f64;
+        let eta_t = 0.5_f64;
+        assert!(eta.exp().is_infinite(), "test premise: exp(1000) overflows");
+
+        let (cum, hazard) = royston_parmar_survival_hazard_components(eta, eta_t)
+            .expect("saturated RP fit must yield a result, not an error");
+        assert!(cum.is_infinite() && cum > 0.0, "expected +∞ cum, got {cum}");
+        assert!(hazard.is_infinite() && hazard > 0.0, "expected +∞ hazard, got {hazard}");
+
+        // Consumer materializes survival via exp(-cum).clamp(0,1).
+        let survival = (-cum).exp().clamp(0.0, 1.0);
+        assert_eq!(survival, 0.0, "saturated cum_hazard must give survival 0");
+    }
+
+    #[test]
+    fn royston_parmar_hazard_rejects_nan_eta() {
+        let err = royston_parmar_survival_hazard_components(f64::NAN, 0.5)
+            .expect_err("NaN eta should be invalid");
+        assert!(err.contains("invalid log-cumulative-hazard derivative"));
+    }
+
+    #[test]
+    fn probit_survival_hazard_left_tail_collapses_to_zero() {
+        // η→-∞ mirror of the right-tail test: survival → 1, hazard → 0.
+        // Asymptote: Mills(η) = φ(η)/Φ(-η) → 0 as η → -∞ (φ underflows,
+        // Φ(-η) → 1).  No error, no NaN, no spurious negativity.
+        let eta = -40.0_f64;
+        let eta_t = 1.5_f64;
+
+        let (cum, hazard) = probit_survival_hazard_components(eta, eta_t)
+            .expect("left tail must remain valid");
+        assert!(cum >= 0.0 && cum < 1e-300, "left-tail cum should be ~0, got {cum}");
+        assert_eq!(hazard, 0.0, "left-tail hazard should underflow to 0, got {hazard}");
     }
 
     #[test]

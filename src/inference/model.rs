@@ -3296,7 +3296,10 @@ mod tests {
         };
         payload.apply_survival_time_basis(&snapshot);
 
-        assert_eq!(payload.survival_time_basis.as_deref(), Some("royston-parmar"));
+        assert_eq!(
+            payload.survival_time_basis.as_deref(),
+            Some("royston-parmar")
+        );
         assert_eq!(payload.survival_time_degree, Some(3));
         assert_eq!(payload.survival_time_knots, Some(vec![0.0, 1.0, 2.0]));
         assert_eq!(payload.survival_time_keep_cols, Some(vec![0, 2]));

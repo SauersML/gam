@@ -280,9 +280,7 @@ fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
 /// stashes the returned entry so the next [`crate::cache::Session::try_load`]
 /// returns it ahead of the (empty) exact-key store lookup. Save writes
 /// always go to the session's own key — the prefix lookup is read-only.
-pub(crate) fn lookup_outer_iterate_payload(
-    seed_key: &str,
-) -> Option<crate::cache::CachedEntry> {
+pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::cache::CachedEntry> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", seed_key);
