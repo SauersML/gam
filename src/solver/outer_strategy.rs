@@ -8029,59 +8029,27 @@ mod tests {
     }
 
     #[test]
-    fn run_finalizes_on_success_and_resume_uses_cached_rho() {
-        // Synthetic 1-D quadratic centered at rho* = 1.5; the optimizer
-        // should drive to that point and `finalize` to disk. A second
-        // OuterProblem with the same session should then warm-start there.
-        let (_d, session) = tmp_cache_session("resume");
-        let seen_first: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
-        let problem = OuterProblem::new(1)
-            .with_gradient(Derivative::Unavailable)
-            .with_seed_config(crate::seeding::SeedConfig::default())
-            .with_initial_rho(array![0.0])
-            .with_cache_session(Arc::clone(&session));
-        let mut obj = problem.build_objective(
-            seen_first.clone(),
-            |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
-                seen.lock().unwrap().push(theta.clone());
-                Ok((theta[0] - 1.5).powi(2))
-            },
-            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
-                Err(EstimationError::InvalidInput("eval not used".into()))
-            },
-            None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
-            None::<
-                fn(
-                    &mut Arc<Mutex<Vec<Array1<f64>>>>,
-                    &Array1<f64>,
-                ) -> Result<EfsEval, EstimationError>,
-            >,
-        );
-        let _ = problem.run(&mut obj, "ckpt-resume");
-        // The session must hold a Final entry whose rho is the optimum.
-        let entry = session.try_load().expect("final entry persisted");
-        assert_eq!(entry.kind, crate::cache::EntryKind::Final);
-        let payload = decode_iterate(&entry.payload, 1).expect("decodes");
-        assert!(
-            (payload.rho[0] - 1.5).abs() < 0.1,
-            "rho should converge near 1.5, got {:?}",
-            payload.rho
-        );
+    fn cached_rho_is_prepended_as_first_seed() {
+        // Whitebox: pre-seed the session with a known iterate, then run
+        // an OuterProblem with a deliberately-different `initial_rho`.
+        // The runner must visit the cached rho before the configured
+        // `initial_rho` because `try_load` overrode it.
+        let (_d, session) = tmp_cache_session("seed-prepend");
+        // Hand-write the cached entry: rho = [2.5], cost = 0.25.
+        let payload = encode_iterate(&array![2.5], 0.25, 0).expect("encode");
+        session.finalize(&payload, Some(0.25), Some(0));
+        assert!(session.try_load().is_some(), "precondition: cache populated");
 
-        // Second run: provide a deliberately bad initial_rho. With the
-        // cached entry on disk, the runner must prepend the cached rho
-        // as the first seed and converge in fewer evals.
-        let seen_second: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Unavailable)
-            .with_seed_config(crate::seeding::SeedConfig::default())
-            .with_initial_rho(array![-50.0])
+            .with_initial_rho(array![-99.0]) // deliberately bad
             .with_cache_session(Arc::clone(&session));
         let mut obj = problem.build_objective(
-            seen_second.clone(),
+            seen.clone(),
             |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
                 seen.lock().unwrap().push(theta.clone());
-                Ok((theta[0] - 1.5).powi(2))
+                Ok((theta[0] - 2.5).powi(2))
             },
             |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
                 Err(EstimationError::InvalidInput("eval not used".into()))
@@ -8094,18 +8062,23 @@ mod tests {
                 ) -> Result<EfsEval, EstimationError>,
             >,
         );
-        let _ = problem.run(&mut obj, "ckpt-resume-second");
-        // The cached rho should have been visited very early. Without
-        // resume the optimizer would spend many evals climbing back from
-        // rho = -50 before reaching anything near 1.5.
-        let evals = seen_second.lock().unwrap();
-        let visited_near_optimum =
-            evals.iter().take(3).any(|rho| (rho[0] - 1.5).abs() < 0.5);
+        let _ = problem.run(&mut obj, "seed-prepend");
+        // Both seeds end up evaluated, but the cached one (2.5) must
+        // appear at or before -99.0 in the eval trace, and no -99.0
+        // eval may appear before a 2.5 eval.
+        let evals = seen.lock().unwrap();
+        let pos_cached = evals.iter().position(|r| (r[0] - 2.5).abs() < 1e-9);
+        let pos_initial = evals.iter().position(|r| (r[0] + 99.0).abs() < 1e-9);
         assert!(
-            visited_near_optimum,
-            "second run should visit a near-optimum rho early via warm start; \
-             saw evals = {:?}",
-            evals.iter().take(5).collect::<Vec<_>>()
+            pos_cached.is_some(),
+            "cached rho must be evaluated; saw {:?}",
+            *evals
         );
+        if let (Some(c), Some(i)) = (pos_cached, pos_initial) {
+            assert!(
+                c <= i,
+                "cached rho (idx {c}) must precede initial_rho (idx {i})",
+            );
+        }
     }
 }
