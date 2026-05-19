@@ -14458,10 +14458,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        let options = BlockwiseFitOptions {
+            auto_outer_subsample: false,
+            ..BlockwiseFitOptions::default()
+        };
         SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(
             self,
             block_states,
-            &BlockwiseFitOptions::default(),
+            &options,
         )
     }
 
