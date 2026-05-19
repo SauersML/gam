@@ -80,10 +80,28 @@ fn preload_packaged_cuda_libraries() {}
 
 #[cfg(target_os = "linux")]
 fn load_packaged_cuda_libraries() -> Vec<Library> {
-    cuda_library_candidate_paths()
-        .into_iter()
-        .filter_map(|path| unsafe { Library::new(path).ok() })
-        .collect()
+    let paths = cuda_library_candidate_paths();
+    let loaded: Vec<Library> = paths
+        .iter()
+        .filter_map(|path| match unsafe { Library::new(path) } {
+            Ok(lib) => {
+                log::debug!("[GPU] preloaded CUDA library: {}", path.display());
+                Some(lib)
+            }
+            Err(err) => {
+                log::debug!("[GPU] preload failed for {}: {}", path.display(), err);
+                None
+            }
+        })
+        .collect();
+    if loaded.is_empty() && !paths.is_empty() {
+        log::warn!(
+            "[GPU] found {} CUDA library file(s) but none could be dlopen'd; \
+             consider adding the CUDA toolkit lib dir to LD_LIBRARY_PATH",
+            paths.len()
+        );
+    }
+    loaded
 }
 
 #[cfg(target_os = "linux")]
@@ -106,11 +124,6 @@ fn cuda_library_candidate_paths() -> Vec<PathBuf> {
             &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
         ),
     ];
-    let system_dirs = [
-        Path::new("/usr/local/cuda/lib64"),
-        Path::new("/usr/local/cuda/lib"),
-    ];
-
     let mut out = Vec::new();
     let mut push_if_exists = |path: PathBuf| {
         if path.exists() && !out.iter().any(|seen| seen == &path) {
@@ -128,7 +141,7 @@ fn cuda_library_candidate_paths() -> Vec<PathBuf> {
         }
     }
 
-    for lib_dir in system_dirs {
+    for lib_dir in system_library_dirs() {
         for (_, names) in wheel_components {
             for name in *names {
                 push_if_exists(lib_dir.join(name));
@@ -137,6 +150,58 @@ fn cuda_library_candidate_paths() -> Vec<PathBuf> {
     }
 
     out
+}
+
+/// CUDA toolkit shared libraries live in a handful of well-known places
+/// across cloud images, distro packages, and conda envs — but rarely all
+/// of them are on `LD_LIBRARY_PATH`, so `libloading::Library::new("libcublas.so.12")`
+/// fails on a host that nonetheless has a perfectly usable install. We
+/// walk every plausible directory and let the caller dlopen by absolute
+/// path; once the shared object is mapped, cudarc's own bare-name
+/// `dlopen("libcublas.so.12")` succeeds by SONAME match against the
+/// already-loaded mapping.
+#[cfg(target_os = "linux")]
+fn system_library_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.is_dir() && !dirs.iter().any(|seen| seen == &path) {
+            dirs.push(path);
+        }
+    };
+
+    // Canonical CUDA toolkit install (symlinked).
+    push(PathBuf::from("/usr/local/cuda/lib64"));
+    push(PathBuf::from("/usr/local/cuda/lib"));
+
+    // Versioned toolkit installs without the `/usr/local/cuda` symlink —
+    // some Google Cloud Deep Learning VM images ship `/usr/local/cuda-12.x/`
+    // with no current-version symlink, so we enumerate them.
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        let mut versioned: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("cuda-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        versioned.sort();
+        for root in versioned {
+            push(root.join("lib64"));
+            push(root.join("lib"));
+        }
+    }
+
+    // Debian / Ubuntu system packages (`nvidia-cuda-toolkit`, `libcublas12`).
+    push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
+    // RHEL / Fedora / CentOS system packages.
+    push(PathBuf::from("/usr/lib64"));
+    // WSL2 GPU passthrough.
+    push(PathBuf::from("/usr/lib/wsl/lib"));
+
+    dirs
 }
 
 #[cfg(target_os = "linux")]
