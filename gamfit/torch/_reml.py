@@ -579,8 +579,8 @@ def gaussian_reml_fit_positions(
     t: torch.Tensor,
     y: torch.Tensor,
     basis_kind: str,
-    knots_or_centers: torch.Tensor,
-    penalty: torch.Tensor,
+    knots_or_centers: Any = None,
+    penalty: Any = None,
     *,
     basis_order: int | None = None,
     periodic: bool = False,
@@ -601,9 +601,12 @@ def gaussian_reml_fit_positions(
     basis_kind:
         Internal basis identifier (e.g. ``"bspline"``, ``"duchon"``).
     knots_or_centers:
-        1D tensor of basis knots (B-spline) or centers (Duchon).
+        1D tensor of basis knots (B-spline) or centers (Duchon). May also
+        be ``None`` to auto-derive from ``t`` quantiles, or an ``int`` to
+        request a specific basis count with quantile placement.
     penalty:
-        Symmetric penalty matrix of shape ``(M, M)``. See
+        Symmetric penalty matrix of shape ``(M, M)``. ``None`` defaults to
+        an identity ridge sized to the inferred basis dimension. See
         :func:`gaussian_reml_fit` for the input contract.
     basis_order:
         Optional override for the basis order; defaults from ``basis_kind``.
@@ -612,12 +615,29 @@ def gaussian_reml_fit_positions(
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
+    from ._basis import _resolve_basis_locations_tensor
+
+    order = _np_api._position_basis_order(basis_kind, basis_order)
+    knots_t = _resolve_basis_locations_tensor(
+        t, knots_or_centers, basis_kind=basis_kind, degree=order
+    )
+    if isinstance(penalty, torch.Tensor):
+        penalty_t = penalty
+    else:
+        penalty_np = _np_api._resolve_position_penalty(
+            penalty,
+            to_numpy_f64(knots_t),
+            basis_kind=basis_kind,
+            basis_order=order,
+            periodic=bool(periodic),
+        )
+        penalty_t = from_numpy_like(penalty_np, t)
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         t,
         y,
-        knots_or_centers,
-        penalty,
+        knots_t,
+        penalty_t,
         weights,
         by,
         basis_kind,
@@ -635,8 +655,8 @@ def gaussian_reml_fit_positions_batched(
     y: torch.Tensor,
     row_offsets: torch.Tensor,
     basis_kind: str,
-    knots_or_centers: torch.Tensor,
-    penalty: torch.Tensor,
+    knots_or_centers: Any = None,
+    penalty: Any = None,
     *,
     basis_order: int | None = None,
     periodic: bool = False,
@@ -658,17 +678,36 @@ def gaussian_reml_fit_positions_batched(
         ``uintp`` 1D tensor of length ``K + 1``.
     basis_kind, knots_or_centers, penalty, basis_order, periodic, period:
         Internal basis configuration; see
-        :func:`gaussian_reml_fit_positions`.
+        :func:`gaussian_reml_fit_positions`. ``knots_or_centers`` and
+        ``penalty`` accept the same auto-derived defaults — basis
+        locations are inferred from the concatenated ``t``.
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
+    from ._basis import _resolve_basis_locations_tensor
+
+    order = _np_api._position_basis_order(basis_kind, basis_order)
+    knots_t = _resolve_basis_locations_tensor(
+        t, knots_or_centers, basis_kind=basis_kind, degree=order
+    )
+    if isinstance(penalty, torch.Tensor):
+        penalty_t = penalty
+    else:
+        penalty_np = _np_api._resolve_position_penalty(
+            penalty,
+            to_numpy_f64(knots_t),
+            basis_kind=basis_kind,
+            basis_order=order,
+            periodic=bool(periodic),
+        )
+        penalty_t = from_numpy_like(penalty_np, t)
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsBatchedFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         t,
         y,
         row_offsets,
-        knots_or_centers,
-        penalty,
+        knots_t,
+        penalty_t,
         weights,
         by,
         basis_kind,
