@@ -2117,7 +2117,12 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             } else {
                 self.objective_stall_evals = 0;
             }
-            if self.objective_stall_evals >= BFGS_OBJECTIVE_STALL_EVALS {
+            // `BFGS_OBJECTIVE_STALL_EVALS` is the tolerated run length: the
+            // first eval whose stall count *exceeds* it raises the sentinel,
+            // matching the bridge contract that the run-length-th near-stall
+            // eval still returns its (potentially informative) gradient
+            // before the optimizer is forced to unwind.
+            if self.objective_stall_evals > BFGS_OBJECTIVE_STALL_EVALS {
                 // Objective is flat (cost_delta << rel-tol of cost) but the
                 // gradient hasn't dropped to BFGS's `rel_g_ok` window — opt's
                 // own `StallPolicy` won't trigger, and without an explicit
