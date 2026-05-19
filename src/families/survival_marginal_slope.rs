@@ -10512,16 +10512,10 @@ impl SurvivalMarginalSlopeFamily {
                         .psi_map
                         .row_vector(row)
                         .map_err(|e| format!("survival rowwise psi map (batched): {e}"))?;
-                    let dir = primary_direction_from_psi_row(
-                        axis.block_idx,
-                        &psi_row,
-                        axis.beta_psi,
-                    );
-                    let mut third = self.row_primary_third_contracted_general(
-                        row,
-                        block_states,
-                        &dir,
-                    )?;
+                    let dir =
+                        primary_direction_from_psi_row(axis.block_idx, &psi_row, axis.beta_psi);
+                    let mut third =
+                        self.row_primary_third_contracted_general(row, block_states, &dir)?;
                     if w != 1.0 {
                         third.mapv_inplace(|v| v * w);
                     }
@@ -10543,13 +10537,7 @@ impl SurvivalMarginalSlopeFamily {
                     if w != 1.0 {
                         pb.mapv_inplace(|v| v * w);
                     }
-                    self.accumulate_score_blockwise(
-                        row,
-                        &pb,
-                        &mut acc.1,
-                        &mut acc.2,
-                        &mut acc.3,
-                    )?;
+                    self.accumulate_score_blockwise(row, &pb, &mut acc.1, &mut acc.2, &mut acc.3)?;
                     self.accumulate_score_identity_blocks(
                         None,
                         &pb,
@@ -10588,15 +10576,9 @@ impl SurvivalMarginalSlopeFamily {
         let mut out: Vec<ExactNewtonJointPsiTerms> = Vec::with_capacity(k);
         for (obj, st, sm, sg, sh, sw, hess_acc) in folded.into_iter() {
             let mut score_psi = Array1::zeros(slices.total);
-            score_psi
-                .slice_mut(s![slices.time.clone()])
-                .assign(&st);
-            score_psi
-                .slice_mut(s![slices.marginal.clone()])
-                .assign(&sm);
-            score_psi
-                .slice_mut(s![slices.logslope.clone()])
-                .assign(&sg);
+            score_psi.slice_mut(s![slices.time.clone()]).assign(&st);
+            score_psi.slice_mut(s![slices.marginal.clone()]).assign(&sm);
+            score_psi.slice_mut(s![slices.logslope.clone()]).assign(&sg);
             if let Some(range) = slices.score_warp.as_ref() {
                 score_psi.slice_mut(s![range.clone()]).assign(&sh);
             }
@@ -14462,11 +14444,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             auto_outer_subsample: false,
             ..BlockwiseFitOptions::default()
         };
-        SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(
-            self,
-            block_states,
-            &options,
-        )
+        SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(self, block_states, &options)
     }
 
     fn log_likelihood_only_with_options(
@@ -20044,22 +20022,15 @@ mod tests {
             .expect("some");
 
         let batched = family
-            .psi_terms_inner_batched_with_options(
-                &states,
-                &derivative_blocks,
-                &[0, 1],
-                None,
-                &opts,
-            )
+            .psi_terms_inner_batched_with_options(&states, &derivative_blocks, &[0, 1], None, &opts)
             .expect("batched")
             .expect("batched simple-spatial path returned None unexpectedly");
         assert_eq!(batched.len(), 2, "batched should yield one term per axis");
 
         let per_axis = [&per_axis_0, &per_axis_1];
         for (i, (lhs, rhs)) in per_axis.iter().zip(batched.iter()).enumerate() {
-            let obj_rel = ((rhs.objective_psi - lhs.objective_psi)
-                / lhs.objective_psi.abs().max(1.0))
-            .abs();
+            let obj_rel =
+                ((rhs.objective_psi - lhs.objective_psi) / lhs.objective_psi.abs().max(1.0)).abs();
             assert!(
                 obj_rel < 1e-12,
                 "axis {i} objective_psi rel {obj_rel} (per-axis={}, batched={})",
@@ -20101,11 +20072,8 @@ mod tests {
 
         let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
         let mut opts = BlockwiseFitOptions::default();
-        opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-            even_mask,
-            n,
-            0xC0FFEE,
-        )));
+        opts.outer_score_subsample =
+            Some(Arc::new(OuterScoreSubsample::new(even_mask, n, 0xC0FFEE)));
 
         let per_axis_0 = family
             .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts)
@@ -20117,25 +20085,24 @@ mod tests {
             .expect("some");
 
         let batched = family
-            .psi_terms_inner_batched_with_options(
-                &states,
-                &derivative_blocks,
-                &[0, 1],
-                None,
-                &opts,
-            )
+            .psi_terms_inner_batched_with_options(&states, &derivative_blocks, &[0, 1], None, &opts)
             .expect("batched")
             .expect("batched simple-spatial path returned None under subsample");
         assert_eq!(batched.len(), 2);
 
         let per_axis = [&per_axis_0, &per_axis_1];
         for (i, (lhs, rhs)) in per_axis.iter().zip(batched.iter()).enumerate() {
-            let obj_rel = ((rhs.objective_psi - lhs.objective_psi)
-                / lhs.objective_psi.abs().max(1.0))
-            .abs();
-            assert!(obj_rel < 1e-12, "axis {i} subsample objective_psi rel {obj_rel}");
+            let obj_rel =
+                ((rhs.objective_psi - lhs.objective_psi) / lhs.objective_psi.abs().max(1.0)).abs();
+            assert!(
+                obj_rel < 1e-12,
+                "axis {i} subsample objective_psi rel {obj_rel}"
+            );
             let score_rel = rel_diff_array1_survival(&rhs.score_psi, &lhs.score_psi);
-            assert!(score_rel < 1e-12, "axis {i} subsample score_psi rel {score_rel}");
+            assert!(
+                score_rel < 1e-12,
+                "axis {i} subsample score_psi rel {score_rel}"
+            );
 
             let op_a = lhs.hessian_psi_operator.as_ref().unwrap();
             let op_b = rhs.hessian_psi_operator.as_ref().unwrap();
@@ -20146,7 +20113,10 @@ mod tests {
             let a = op_a.mul_vec(&probe);
             let b = op_b.mul_vec(&probe);
             let op_rel = rel_diff_array1_survival(&a, &b);
-            assert!(op_rel < 1e-12, "axis {i} subsample Hessian-action rel {op_rel}");
+            assert!(
+                op_rel < 1e-12,
+                "axis {i} subsample Hessian-action rel {op_rel}"
+            );
         }
     }
 

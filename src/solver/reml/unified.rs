@@ -5678,11 +5678,7 @@ pub fn reml_laml_evaluate(
         debug_assert_eq!(col_idx, total_cols);
         let solved_stack = hop.solve_multi(&rhs_stack);
         let rho_v_ks = if need_family_corrections {
-            Some(
-                (0..k)
-                    .map(|i| solved_stack.column(i).to_owned())
-                    .collect(),
-            )
+            Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
         } else {
             None
         };
