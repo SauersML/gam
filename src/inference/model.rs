@@ -48,7 +48,7 @@ use std::path::Path;
 /// Do NOT bump for purely additive `Option<T>` fields that the save-time
 /// invariant (`validate_for_persistence`) does not yet require. Those are
 /// forward-compatible.
-pub const MODEL_PAYLOAD_VERSION: u32 = 5;
+pub const MODEL_PAYLOAD_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataSchema {
@@ -2703,6 +2703,13 @@ impl FittedModel {
                 "saved survival model is missing survival_likelihood metadata; refit".to_string(),
             );
         }
+        if matches!(self.family_state, FittedFamily::Survival { .. })
+            && self.survival_time_basis.is_none()
+        {
+            return Err(
+                "saved survival model is missing survival_time_basis metadata; refit".to_string(),
+            );
+        }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
             || self.beta_link_wiggle.is_some()
@@ -3129,6 +3136,21 @@ mod tests {
         payload.survival_likelihood = Some("marginal-slope".to_string());
         payload.survival_distribution = Some("probit".to_string());
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
+        payload.data_schema = Some(DataSchema {
+            columns: vec![SchemaColumn {
+                name: "z".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: vec![],
+            }],
+        });
+        payload.set_training_feature_metadata(vec!["z".to_string()], vec![(0.0, 0.0)]);
+        payload.resolved_termspec = Some(empty_termspec());
+        payload.resolved_termspec_logslope = Some(empty_termspec());
+        payload.formula_logslope = Some("1".to_string());
+        payload.z_column = Some("z".to_string());
+        payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
+        payload.logslope_baseline = Some(0.0);
+        payload.link = Some("probit".to_string());
         payload
     }
 
@@ -3200,6 +3222,36 @@ mod tests {
                 "survival marginal-slope link basis mismatch should fail runtime validation",
             );
         assert!(err.contains("link-deviation coefficient mismatch"));
+    }
+
+    #[test]
+    fn validate_for_persistence_rejects_survival_without_time_basis_metadata() {
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.3],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+
+        let err = FittedModel::from_payload(payload)
+            .validate_for_persistence()
+            .expect_err("survival model without time-basis metadata should fail validation");
+        assert!(err.contains("missing survival_time_basis"));
     }
 
     #[test]
