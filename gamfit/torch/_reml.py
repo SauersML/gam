@@ -507,7 +507,11 @@ def gaussian_reml_fit(
     y:
         Response matrix of shape ``(N, D)``.
     penalty:
-        Penalty matrix of shape ``(M, M)``.
+        Penalty matrix of shape ``(M, M)``. Symmetrized at entry via
+        ``S → 0.5 (S + Sᵀ)``; see :func:`gaussian_reml_fit` for the contract. Treated as symmetric: the
+        wrapper replaces ``S`` with ``0.5 (S + Sᵀ)`` before the engine sees
+        it. For symmetric input this is a numerical no-op; an asymmetric
+        input is silently mapped to its symmetric average.
     weights:
         Optional row weights of shape ``(N,)``.
     init_lambda:
@@ -520,14 +524,21 @@ def gaussian_reml_fit(
     Returns
     -------
     GaussianRemlOutput
-        Tuple of ``(coefficients, fitted, lam, reml_score)`` as torch tensors
-        sharing ``x``'s device and dtype.
+        Tuple of ``(coefficients, fitted, lam, reml_score, edf)`` as torch
+        tensors sharing ``x``'s device and dtype.
+
+    Notes
+    -----
+    The function defines its dependence on ``S`` through ``S_sym :=
+    0.5 (S + Sᵀ)``: ``gaussian_reml_fit(x, y, S, ...) ≡
+    gaussian_reml_fit(x, y, S_sym, ...)``. Autograd consequently routes
+    every gradient on ``S`` through that symmetrization, so the gradient
+    delivered to a generic torch parameter ``P`` is the symmetric part of
+    the analytic VJP, ``0.5 (G + Gᵀ)``. This contract makes the function
+    well-defined for any input (e.g. gradcheck's per-entry perturbations
+    that momentarily break symmetry) while preserving the mathematical
+    convention that a penalty matrix is symmetric.
     """
-    # Symmetrize the penalty before the analytic backward sees it. The closed-
-    # form REML interior assumes ``S`` is symmetric, so an explicit
-    # ``0.5 * (S + Sᵀ)`` makes the backward consistent with the forward for any
-    # input (gradcheck included). torch's autograd chains through this op
-    # automatically; for an already-symmetric input it is a no-op at runtime.
     penalty = 0.5 * (penalty + penalty.t())
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
@@ -559,7 +570,8 @@ def gaussian_reml_fit_batched(
         ``uintp`` 1D tensor of length ``K + 1`` marking the row boundaries
         of each problem in the packed batch.
     penalty:
-        Penalty matrix of shape ``(M, M)``.
+        Penalty matrix of shape ``(M, M)``. Symmetrized at entry via
+        ``S → 0.5 (S + Sᵀ)``; see :func:`gaussian_reml_fit` for the contract.
     weights, by:
         Optional 1D tensors of length ``N_total``.
     init_lambda, by_start_col:
@@ -607,7 +619,8 @@ def gaussian_reml_fit_positions(
     knots_or_centers:
         1D tensor of basis knots (B-spline) or centers (Duchon).
     penalty:
-        Penalty matrix of shape ``(M, M)``.
+        Penalty matrix of shape ``(M, M)``. Symmetrized at entry via
+        ``S → 0.5 (S + Sᵀ)``; see :func:`gaussian_reml_fit` for the contract.
     basis_order:
         Optional override for the basis order; defaults from ``basis_kind``.
     periodic, period:
