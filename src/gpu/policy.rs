@@ -81,16 +81,26 @@ impl DispatchPolicy {
     fn from_peak_fp64_gflops(peak_gpu_gflops: f64) -> Self {
         let speedup = (peak_gpu_gflops / CPU_FP64_GFLOPS).max(1.0);
 
+        // The payload constants below model the dispatch crossover as
+        // "minimum FLOPs to amortize an HtoD/DtoH transfer of this many
+        // bytes". Earlier values (256 MB gemm, 64 MB gemv/trsm) effectively
+        // disabled dispatch for any iterative solver whose design matrix
+        // is reused across cycles — biobank GLMs at n≈3×10⁵, p≈35 sit
+        // just below the old threshold despite easily winning on real
+        // hardware. The smaller values here put the crossover at workload
+        // sizes that match measured cuBLAS launch + transfer costs on
+        // modern Gen4 PCIe cards while leaving the existing dimension
+        // floors (xtwx_min_rows / gemv-via-flops) intact for tiny shapes.
         let gemm_min_flops = flops_threshold(
-            /*payload_bytes=*/ 256.0 * 1024.0 * 1024.0,
+            /*payload_bytes=*/ 32.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
         );
         let gemv_min_flops = flops_threshold(
-            /*payload_bytes=*/ 64.0 * 1024.0 * 1024.0,
+            /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
         );
         let trsm_min_flops = flops_threshold(
-            /*payload_bytes=*/ 64.0 * 1024.0 * 1024.0,
+            /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
         );
 
