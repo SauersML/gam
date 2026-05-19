@@ -14683,8 +14683,9 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     let (eval_options, strict_warm_start) =
-        derivative_quality_options_and_warm_start(options, warm_start);
+        derivative_quality_options_and_warm_start(options, warm_start, has_psi_derivatives);
     let eval_result = evaluate_custom_family_hyper_internal(
         family,
         specs,
@@ -14713,8 +14714,9 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
     eval_mode: EvalMode,
 ) -> Result<CustomFamilyJointHyperResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
+    let has_psi_derivatives = derivative_blocks.iter().any(|block| !block.is_empty());
     let (eval_options, strict_warm_start) =
-        derivative_quality_options_and_warm_start(options, warm_start);
+        derivative_quality_options_and_warm_start(options, warm_start, has_psi_derivatives);
     let eval_result = evaluate_custom_family_hyper_internal_shared(
         family,
         specs,
@@ -14734,13 +14736,22 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
 fn derivative_quality_options_and_warm_start(
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
+    has_psi_derivatives: bool,
 ) -> (BlockwiseFitOptions, Option<CustomFamilyWarmStart>) {
     const DIRECT_JOINT_HYPER_INNER_TOL: f64 = 1e-10;
     const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
-    let tighten =
-        eval_options.inner_max_cycles > 1 && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL;
+    // The tightening exists so the implicit-function-theorem differentiation
+    // through the inner solve has β at f64 precision; without that ψ-axis
+    // gradients pick up O(inner_tol) noise. With zero ψ-derivative blocks
+    // there is no IFT pullback to make accurate — the joint-hyper objective
+    // collapses to the rho-only outer objective, and tightening here breaks
+    // that equivalence by fitting β to a tighter inner residual than the
+    // rho-only path uses. Keep the caller's inner_tol in that case.
+    let tighten = has_psi_derivatives
+        && eval_options.inner_max_cycles > 1
+        && eval_options.inner_tol > DIRECT_JOINT_HYPER_INNER_TOL;
     if !tighten {
         return (eval_options, None);
     }
