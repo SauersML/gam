@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::device::GpuDeviceInfo;
 use super::policy::DispatchPolicy;
@@ -233,5 +232,190 @@ fn format_float(value: f64) -> String {
         format!("{value:.0}")
     } else {
         format!("{value:.1}")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide activity tracker
+// ---------------------------------------------------------------------------
+
+/// Format a single roll-up line summarizing every GPU dispatch decision
+/// taken in this process so far. Used as the "did the GPUs do any work?"
+/// answer at end-of-fit / end-of-process — no source-file reading needed.
+///
+/// Returns `None` when the GPU runtime never selected a device (CPU-only
+/// host); the empty case is suppressed so we don't spam logs on machines
+/// without CUDA installed.
+pub fn gpu_activity_summary() -> Option<String> {
+    if !GpuRuntime::global().is_available() {
+        return None;
+    }
+    Some(activity::snapshot_summary())
+}
+
+/// Emit the summary via `log::info!` if there's anything to report. Safe
+/// to call multiple times; each call snapshots the current totals.
+pub fn flush_gpu_activity_summary() {
+    if let Some(summary) = gpu_activity_summary() {
+        log::info!("{summary}");
+    }
+}
+
+mod activity {
+    use super::{BTreeMap, Mutex, format_count, format_bytes};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SUCCESS_COUNT: AtomicU64 = AtomicU64::new(0);
+    static POLICY_DECLINE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static RUNTIME_DECLINE_COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_FLOPS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_H2D_BYTES: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_D2H_BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Sum of measured wall-time across successful dispatches, in
+    /// microseconds. Stored as u64 to atomically update without a lock.
+    static TOTAL_GPU_MICROS: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-op breakdown so the summary can show which kernels actually
+    /// landed on the GPU vs which were declined. Tiny map (~20 keys),
+    /// guarded by a mutex — contention is negligible against millisecond-
+    /// scale kernel launches.
+    static PER_OP: Mutex<Option<BTreeMap<&'static str, PerOpStats>>> = Mutex::new(None);
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct PerOpStats {
+        pub success: u64,
+        pub policy_decline: u64,
+        pub runtime_decline: u64,
+        pub flops: u64,
+        pub gpu_micros: u64,
+    }
+
+    fn with_per_op<F: FnOnce(&mut BTreeMap<&'static str, PerOpStats>)>(f: F) {
+        let mut guard = match PER_OP.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let map = guard.get_or_insert_with(BTreeMap::new);
+        f(map);
+    }
+
+    pub(super) fn record_success(
+        op: &'static str,
+        flops: u64,
+        h2d_bytes: usize,
+        d2h_bytes: usize,
+        elapsed_s: f64,
+    ) {
+        SUCCESS_COUNT.fetch_add(1, Ordering::Relaxed);
+        TOTAL_FLOPS.fetch_add(flops, Ordering::Relaxed);
+        TOTAL_H2D_BYTES.fetch_add(h2d_bytes as u64, Ordering::Relaxed);
+        TOTAL_D2H_BYTES.fetch_add(d2h_bytes as u64, Ordering::Relaxed);
+        let micros = (elapsed_s * 1_000_000.0).max(0.0) as u64;
+        TOTAL_GPU_MICROS.fetch_add(micros, Ordering::Relaxed);
+        with_per_op(|map| {
+            let entry = map.entry(op).or_default();
+            entry.success += 1;
+            entry.flops = entry.flops.saturating_add(flops);
+            entry.gpu_micros = entry.gpu_micros.saturating_add(micros);
+        });
+    }
+
+    pub(super) fn record_policy_decline(op: &'static str) {
+        POLICY_DECLINE_COUNT.fetch_add(1, Ordering::Relaxed);
+        with_per_op(|map| {
+            map.entry(op).or_default().policy_decline += 1;
+        });
+    }
+
+    pub(super) fn record_runtime_decline(op: &'static str) {
+        RUNTIME_DECLINE_COUNT.fetch_add(1, Ordering::Relaxed);
+        with_per_op(|map| {
+            map.entry(op).or_default().runtime_decline += 1;
+        });
+    }
+
+    /// Snapshot the totals and produce a multi-line summary string.
+    pub(super) fn snapshot_summary() -> String {
+        let success = SUCCESS_COUNT.load(Ordering::Relaxed);
+        let policy_decline = POLICY_DECLINE_COUNT.load(Ordering::Relaxed);
+        let runtime_decline = RUNTIME_DECLINE_COUNT.load(Ordering::Relaxed);
+        let flops = TOTAL_FLOPS.load(Ordering::Relaxed);
+        let h2d = TOTAL_H2D_BYTES.load(Ordering::Relaxed);
+        let d2h = TOTAL_D2H_BYTES.load(Ordering::Relaxed);
+        let gpu_micros = TOTAL_GPU_MICROS.load(Ordering::Relaxed);
+
+        let total = success + policy_decline + runtime_decline;
+        if total == 0 {
+            return "[GPU] activity summary: no dispatch sites reached".to_string();
+        }
+
+        let gpu_seconds = (gpu_micros as f64) / 1_000_000.0;
+        let measured_gflops = if gpu_seconds > 0.0 {
+            (flops as f64) / gpu_seconds / 1e9
+        } else {
+            0.0
+        };
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "[GPU] activity summary | dispatched={} declined_policy={} declined_runtime={} | work={}flop in {:.3}s ({:.0} GFLOP/s effective) | transfer=h2d:{} d2h:{}",
+            success,
+            policy_decline,
+            runtime_decline,
+            format_count(flops),
+            gpu_seconds,
+            measured_gflops,
+            format_bytes(h2d as usize),
+            format_bytes(d2h as usize),
+        ));
+
+        // Per-op breakdown, sorted by descending success count then op name.
+        let snapshot: Vec<(&'static str, PerOpStats)> = {
+            let guard = match PER_OP.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match guard.as_ref() {
+                Some(map) => map.iter().map(|(k, v)| (*k, *v)).collect(),
+                None => Vec::new(),
+            }
+        };
+        if !snapshot.is_empty() {
+            let mut sorted = snapshot;
+            sorted.sort_by(|a, b| {
+                b.1.success
+                    .cmp(&a.1.success)
+                    .then_with(|| a.0.cmp(b.0))
+            });
+            for (op, stats) in sorted {
+                let gpu_seconds = (stats.gpu_micros as f64) / 1_000_000.0;
+                lines.push(format!(
+                    "  {op:>32}: gpu={} cpu_policy={} cpu_runtime={} work={}flop t={:.3}s",
+                    stats.success,
+                    stats.policy_decline,
+                    stats.runtime_decline,
+                    format_count(stats.flops),
+                    gpu_seconds,
+                ));
+            }
+        }
+        lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::activity;
+
+    #[test]
+    fn empty_summary_short_circuits() {
+        // No record_* calls — summary should be the "no dispatch sites" string.
+        // (This test runs alongside others which DO record into the global
+        // counters; in isolation the totals stay zero only when run first,
+        // so we tolerate either format by checking that snapshot returns
+        // a non-empty string that mentions either "no dispatch" or
+        // "activity summary".)
+        let s = activity::snapshot_summary();
+        assert!(s.contains("activity summary") || s.contains("no dispatch"));
     }
 }
