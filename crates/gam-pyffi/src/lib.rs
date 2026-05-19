@@ -20,8 +20,8 @@ use gam::families::survival_predict::{
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
-    gaussian_reml_free_b_score,
-    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
+    gaussian_reml_free_b_score, gaussian_reml_multi_closed_form_backward,
+    gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
 use gam::hmc::{NutsConfig, NutsResult};
@@ -43,8 +43,8 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
     build_duchon_basis, build_duchon_operator_penalty_matrices, build_thin_plate_penalty_matrix,
-    create_basis, create_difference_penalty_matrix,
-    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
+    create_basis, create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
@@ -595,9 +595,10 @@ fn duchon_function_norm_penalty<'py>(
 fn thin_plate_penalty<'py>(
     py: Python<'py>,
     centers: PyReadonlyArray2<'py, f64>,
-    _m: usize,
+    m: usize,
     length_scale: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
+    let _ = m;
     let matrix = build_thin_plate_penalty_matrix(centers.as_array(), length_scale)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(matrix.penalty.into_pyarray(py).unbind())
@@ -635,7 +636,10 @@ fn gaussian_reml_score<'py>(
     .map_err(|err| py_value_error(err.to_string()))?;
     let out = PyDict::new(py);
     out.set_item("reml_score", score.reml_score)?;
-    out.set_item("grad_coefficients", score.grad_coefficients.into_pyarray(py))?;
+    out.set_item(
+        "grad_coefficients",
+        score.grad_coefficients.into_pyarray(py),
+    )?;
     out.set_item("grad_log_lambda", score.grad_log_lambda)?;
     out.set_item("fitted", score.fitted.into_pyarray(py))?;
     out.set_item("sigma2", score.sigma2.into_pyarray(py))?;
