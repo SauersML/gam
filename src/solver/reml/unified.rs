@@ -5637,21 +5637,61 @@ pub fn reml_laml_evaluate(
         })
         .collect();
     let need_family_corrections = effective_deriv.has_corrections();
-    let rho_v_ks: Option<Vec<Array1<f64>>> = if need_family_corrections {
-        Some(
-            rho_curvature_a_k_betas
-                .par_iter()
-                .map(|a_k_beta| hop.solve(a_k_beta))
-                .collect(),
+    // Stack the K curvature-penalty RHS (when corrections are active) and the
+    // ext_dim outer-coordinate gradient RHS into a single (dim, total_cols)
+    // matrix and dispatch one `solve_multi` against the shared Hessian
+    // factorization. The dense-spectral backend turns that into one
+    // `Uᵀ·R`, one per-eigendirection scale, and one `U·projected` — a BLAS-3
+    // pass that has much better cache locality than 14 independent BLAS-2
+    // single-RHS solves and lets large-`dim` fits hit the cuSOLVER batched
+    // chol_solve route in `gpu/policy.rs` (the per-vector solves never
+    // crossed the threshold).
+    let dim = hop.dim();
+    let ext_dim_local = solution.ext_coords.len();
+    let total_cols = if need_family_corrections {
+        k + ext_dim_local
+    } else {
+        ext_dim_local
+    };
+    let (rho_v_ks, ext_v_is): (Option<Vec<Array1<f64>>>, Vec<Array1<f64>>) = if total_cols == 0 {
+        (
+            if need_family_corrections {
+                Some(Vec::new())
+            } else {
+                None
+            },
+            Vec::new(),
         )
     } else {
-        None
+        let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
+        let mut col_idx = 0;
+        if need_family_corrections {
+            for a_k_beta in rho_curvature_a_k_betas.iter() {
+                rhs_stack.column_mut(col_idx).assign(a_k_beta);
+                col_idx += 1;
+            }
+        }
+        for coord in solution.ext_coords.iter() {
+            rhs_stack.column_mut(col_idx).assign(&coord.g);
+            col_idx += 1;
+        }
+        debug_assert_eq!(col_idx, total_cols);
+        let solved_stack = hop.solve_multi(&rhs_stack);
+        let rho_v_ks = if need_family_corrections {
+            Some(
+                (0..k)
+                    .map(|i| solved_stack.column(i).to_owned())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let ext_offset = if need_family_corrections { k } else { 0 };
+        let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
+            .map(|i| solved_stack.column(ext_offset + i).to_owned())
+            .collect();
+        (rho_v_ks, ext_v_is)
     };
-    let ext_v_is: Vec<Array1<f64>> = solution
-        .ext_coords
-        .par_iter()
-        .map(|coord| hop.solve(&coord.g))
-        .collect();
     let coord_corrections: Vec<Option<DriftDerivResult>> = if need_family_corrections {
         let rho_vs = rho_v_ks
             .as_ref()
