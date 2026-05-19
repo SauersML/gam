@@ -178,19 +178,6 @@ def test_gaussian_reml_fit_penalty_gradcheck_lambda_only() -> None:
 # --------------------------- batched REML fit --------------------------- #
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Batched FFI pre-builds the eigen cache from the raw penalty before the"
-        " solver-side canonicalize step sees the matrix, so a single-entry"
-        " asymmetric gradcheck perturbation produces a different canonical"
-        " penalty in the cache build than in the per-fit prepare call and"
-        " trips the cache-fingerprint mismatch check. The single-fit and"
-        " positions variants share the canonical penalty across both phases"
-        " and pass; the batched path needs the cache build to consume the"
-        " canonical penalty directly. Tracked separately."
-    ),
-    strict=True,
-)
 def test_gaussian_reml_fit_batched_penalty_gradcheck() -> None:
     _require_ffi("gaussian_reml_fit_batched")
     rng = np.random.default_rng(200)
@@ -263,10 +250,6 @@ def test_gaussian_reml_fit_positions_penalty_gradcheck() -> None:
 # ----------------------- batched positions REML fit --------------------- #
 
 
-@pytest.mark.xfail(
-    reason="Same batched-cache-fingerprint mismatch as in the batched fit gradcheck.",
-    strict=True,
-)
 def test_gaussian_reml_fit_positions_batched_penalty_gradcheck() -> None:
     _require_ffi("gaussian_reml_fit_positions_batched")
     rng = np.random.default_rng(400)
