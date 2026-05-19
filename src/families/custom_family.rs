@@ -9020,10 +9020,11 @@ fn joint_objective_floor_reached(
         && actual_reduction <= 0.0
         && actual_reduction.abs() <= joint_objective_roundoff_slack(old_objective, trial_objective)
         && predicted_reduction.is_finite()
-        && predicted_reduction <= objective_tol.max(joint_objective_roundoff_slack(
-            old_objective,
-            trial_objective,
-        ))
+        && predicted_reduction
+            <= objective_tol.max(joint_objective_roundoff_slack(
+                old_objective,
+                trial_objective,
+            ))
 }
 
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
@@ -10182,6 +10183,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut objective_rejects = 0usize;
             let mut barrier_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
+            // Coalesce consecutive trust-region attempts whose accept/reject
+            // outcome and numeric signature round to the same values, so a long
+            // run of identical retries collapses into a single "attempts a..b
+            // (×N)" line at flush time instead of spamming one line per try.
+            let mut tr_log_sig: Option<String> = None;
+            let mut tr_log_first: usize = 0;
+            let mut tr_log_last: usize = 0;
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
@@ -10359,10 +10367,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 let old_radius = joint_trust_radius;
                 joint_trust_radius = trust_update.radius;
-                log::info!(
-                    "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e} proposal_inf={:.3e}",
-                    cycle,
-                    line_search_attempts,
+                let tr_attempt_sig = format!(
+                    "accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e} proposal_inf={:.3e}",
                     trust_update.accepted,
                     trust_update.rho,
                     actual_reduction,
@@ -10373,6 +10379,36 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
+                match tr_log_sig.as_deref() {
+                    Some(prev) if prev == tr_attempt_sig.as_str() => {
+                        tr_log_last = line_search_attempts;
+                    }
+                    Some(prev) => {
+                        if tr_log_first == tr_log_last {
+                            log::info!(
+                                "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} {}",
+                                cycle, tr_log_first, prev,
+                            );
+                        } else {
+                            log::info!(
+                                "[PIRLS/joint-Newton/trust-region] cycle={} attempts={}..{} (×{}) {}",
+                                cycle,
+                                tr_log_first,
+                                tr_log_last,
+                                tr_log_last - tr_log_first + 1,
+                                prev,
+                            );
+                        }
+                        tr_log_sig = Some(tr_attempt_sig);
+                        tr_log_first = line_search_attempts;
+                        tr_log_last = line_search_attempts;
+                    }
+                    None => {
+                        tr_log_sig = Some(tr_attempt_sig);
+                        tr_log_first = line_search_attempts;
+                        tr_log_last = line_search_attempts;
+                    }
+                }
                 if trust_update.accepted
                     && joint_objective_floor_reached(
                         old_objective,
