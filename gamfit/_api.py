@@ -769,6 +769,107 @@ def smoothness_penalty(
     return np.asarray(penalty, dtype=float), np.asarray(null_basis, dtype=float)
 
 
+def _duchon_operator_penalties(
+    centers: Any,
+    *,
+    m: int = 2,
+    periodic: bool = False,
+    period: float | None = None,
+) -> tuple[Any, Any, Any]:
+    """Internal Duchon operator penalty constructor."""
+    import numpy as np
+
+    try:
+        mass, tension, stiffness = rust_module().duchon_operator_penalties(
+            _numeric_vector(centers, "centers"),
+            int(m),
+            bool(periodic),
+            None if period is None else float(period),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return (
+        np.asarray(mass, dtype=float),
+        np.asarray(tension, dtype=float),
+        np.asarray(stiffness, dtype=float),
+    )
+
+
+def _duchon_function_norm_penalty(
+    centers: Any,
+    *,
+    m: int = 2,
+    periodic: bool = False,
+    period: float | None = None,
+) -> Any:
+    """Internal Duchon RKHS/function-norm penalty constructor."""
+    import numpy as np
+
+    try:
+        penalty = rust_module().duchon_function_norm_penalty(
+            _numeric_vector(centers, "centers"),
+            int(m),
+            bool(periodic),
+            None if period is None else float(period),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(penalty, dtype=float)
+
+
+def _thin_plate_penalty(
+    centers: Any,
+    *,
+    m: int = 2,
+    length_scale: float = 1.0,
+) -> Any:
+    """Internal thin-plate bending-energy penalty constructor."""
+    import numpy as np
+
+    try:
+        penalty = rust_module().thin_plate_penalty(
+            _numeric_matrix(centers, "centers"),
+            int(m),
+            float(length_scale),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(penalty, dtype=float)
+
+
+def _gaussian_reml_score(
+    X: Any,
+    Y: Any,
+    coefficients: Any,
+    log_lambda: float,
+    penalty: Any,
+    *,
+    weights: Any | None = None,
+    by: Any | None = None,
+    by_start_col: int = 0,
+) -> dict[str, Any]:
+    """Internal free-coefficient REML score evaluator."""
+    import numpy as np
+
+    try:
+        out = rust_module().gaussian_reml_score(
+            _numeric_matrix(X, "X"),
+            _numeric_matrix(Y, "Y"),
+            _numeric_matrix(coefficients, "coefficients"),
+            float(log_lambda),
+            _numeric_matrix(penalty, "penalty"),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if by is None else _numeric_vector(by, "by"),
+            int(by_start_col),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_coefficients", "grad_penalty", "fitted", "sigma2"):
+        result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def gaussian_weighted_ridge(
     X: Any,
     Y: Any,
@@ -1538,23 +1639,38 @@ def _resolve_position_penalty(
     basis_order: int,
     periodic: bool,
 ) -> Any:
-    """Resolve the penalty argument for ``gaussian_reml_fit_positions*``.
-
-    ``None`` → identity matrix of basis-dimension size (a neutral ridge
-    that lets REML pick ``lambda`` from data). Otherwise forwarded to
-    :func:`_numeric_matrix` unchanged.
-    """
+    """Resolve the canonical penalty for position-based REML helpers."""
     import numpy as np
 
-    if penalty is None:
-        dim = _position_basis_dim(knots_or_centers, basis_kind, basis_order, periodic)
-        if dim <= 0:
-            raise ValueError(
-                "cannot auto-derive identity penalty: inferred basis dim is non-positive "
-                f"(basis_kind={basis_kind!r}, locations.size={knots_or_centers.shape[0]}, "
-                f"basis_order={basis_order})"
-            )
-        return np.eye(dim, dtype=np.float64)
+    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
+    penalty_kind = None if penalty is None else str(penalty).strip().lower().replace("_", "-") if isinstance(penalty, str) else None
+    if penalty is None or penalty_kind is not None:
+        if kind in {"duchon", "duchonspline"}:
+            if penalty_kind in {None, "function-norm", "functionnorm", "rkhs"}:
+                return _duchon_function_norm_penalty(
+                    knots_or_centers,
+                    m=int(basis_order),
+                    periodic=bool(periodic),
+                    period=None,
+                )
+            if penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
+                mass, tension, stiffness = _duchon_operator_penalties(
+                    knots_or_centers,
+                    m=int(basis_order),
+                    periodic=False,
+                    period=None,
+                )
+                return mass + tension + stiffness
+            raise ValueError(f"unsupported Duchon penalty {penalty!r}")
+        if kind in {"bspline", "b-spline", "spline"}:
+            if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
+                raise ValueError(f"unsupported B-spline penalty {penalty!r}")
+            s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
+            return s
+        if kind in {"thinplate", "thinplatespline", "tps"}:
+            if penalty_kind not in {None, "function-norm", "functionnorm", "bending-energy", "bendingenergy"}:
+                raise ValueError(f"unsupported thin-plate penalty {penalty!r}")
+            return _thin_plate_penalty(knots_or_centers, m=int(basis_order))
     return _numeric_matrix(penalty, "penalty")
 
 
