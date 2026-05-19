@@ -33,7 +33,7 @@ use crate::inference::model::{
 use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
 use crate::linalg::matrix::DesignMatrix;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use crate::probability::normal_cdf;
+use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
@@ -533,12 +533,12 @@ fn build_marginal_slope_predict_context(
 ///
 /// Calls the saved [`BernoulliMarginalSlopePredictor`]
 /// (`predict_eta_and_q_chain`) to obtain both the linear predictor `eta` and
-/// the exact IFT-pullback factor `∂eta/∂q`. The hazard time-derivative is then
-/// `(∂eta/∂q) · qd_with_wiggle`. In rigid mode this collapses to `c · qd` (the
-/// closed-form probit-frailty composition); under score-warp / link-deviation
-/// it picks up the exact implicit-function pull-back through the per-row
-/// calibration intercept, mirroring `compute_survival_timepoint_exact` in
-/// `survival_marginal_slope.rs`.
+/// the exact IFT-pullback factor `∂eta/∂q`. The survival-index time derivative
+/// is then `(∂eta/∂q) · qd_with_wiggle`. In rigid mode this collapses to
+/// `c · qd` (the closed-form probit-frailty composition); under score-warp /
+/// link-deviation it picks up the exact implicit-function pull-back through the
+/// per-row calibration intercept, mirroring `compute_survival_timepoint_exact`
+/// in `survival_marginal_slope.rs`.
 fn evaluate_marginal_slope_row(
     row_index: usize,
     ctx: &MarginalSlopePredictContext,
@@ -667,25 +667,43 @@ fn evaluate_marginal_slope_row(
     };
 
     // Exact IFT pull-back: the predictor returns both `eta` and the analytic
-    // factor `∂eta/∂q` for this (row, t). The hazard time derivative is
-    // `(∂eta/∂q) · dq/dt` — the rigid `c·qd` is the no-flex special case.
+    // factor `∂eta/∂q` for this (row, t). This gives d eta(t) / dt; the hazard
+    // conversion below divides the event density by S(t).
     let (eta_arr, deta_dq_arr) = ctx
         .predictor
         .predict_eta_and_q_chain(&pred_input)
         .map_err(|e| format!("saved survival marginal-slope predictor eta failed: {e}"))?;
     let eta = eta_arr[0];
     let eta_derivative = deta_dq_arr[0] * qd_with_wiggle;
+    let (cum, haz) = probit_survival_hazard_components(eta, eta_derivative)?;
+    Ok((eta, cum, haz))
+}
 
-    let surv = normal_cdf(-eta).clamp(1e-300, 1.0);
-    let cum = -surv.ln();
-    let phi_eta = (-0.5f64 * eta * eta).exp() / (2.0f64 * std::f64::consts::PI).sqrt();
-    let haz = phi_eta * eta_derivative;
-    if !(eta_derivative.is_finite() && eta_derivative > 0.0 && haz.is_finite() && haz > 0.0) {
+#[inline]
+fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f64, f64), String> {
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
         return Err(format!(
-            "saved survival marginal-slope prediction produced non-positive time derivative: eta_t={eta_derivative}, hazard={haz}"
+            "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
         ));
     }
-    Ok((eta, cum, haz))
+
+    // Survival marginal-slope defines S(t) = Phi(-eta(t)). The event density
+    // is f(t) = phi(eta(t)) * eta'(t), while the hazard rate exposed by the
+    // prediction API is h(t) = f(t) / S(t). The signed-probit helper returns
+    // both log Phi(-eta) and the stable Mills ratio phi(eta) / Phi(-eta).
+    let (log_survival, mills_ratio) = signed_probit_logcdf_and_mills_ratio(-eta);
+    let cumulative_hazard = -log_survival;
+    let hazard = mills_ratio * eta_derivative;
+    if !(cumulative_hazard.is_finite()
+        && cumulative_hazard >= 0.0
+        && hazard.is_finite()
+        && hazard >= 0.0)
+    {
+        return Err(format!(
+            "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
+        ));
+    }
+    Ok((cumulative_hazard, hazard))
 }
 
 fn evaluate_rp_row(
@@ -1724,5 +1742,51 @@ pub fn gaussian_frailty_sigma_from_frailty(frailty: Option<&FrailtySpec>) -> Opt
             sigma_fixed: Some(sigma),
         }) => Some(*sigma),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probability::{normal_cdf, normal_pdf};
+
+    #[test]
+    fn probit_survival_hazard_uses_density_over_survival() {
+        let eta = 2.0;
+        let eta_t = 0.3;
+
+        let (cum, hazard) =
+            probit_survival_hazard_components(eta, eta_t).expect("valid components");
+
+        let survival = normal_cdf(-eta);
+        let expected_cum = -survival.ln();
+        let expected_hazard = normal_pdf(eta) * eta_t / survival;
+        assert!((cum - expected_cum).abs() <= 1e-14);
+        assert!((hazard - expected_hazard).abs() <= 1e-14);
+    }
+
+    #[test]
+    fn probit_survival_hazard_stays_finite_in_right_tail() {
+        let eta = 40.0;
+        let eta_t = 9.694_340_360_912_401e-5;
+
+        let event_density =
+            (-0.5_f64 * eta * eta).exp() / (2.0 * std::f64::consts::PI).sqrt() * eta_t;
+        assert_eq!(event_density, 0.0);
+
+        let (cum, hazard) =
+            probit_survival_hazard_components(eta, eta_t).expect("valid tail components");
+        assert!(cum > 800.0, "right-tail cumulative hazard was {cum}");
+        assert!(
+            (3.87e-3..3.89e-3).contains(&hazard),
+            "right-tail hazard was {hazard}"
+        );
+    }
+
+    #[test]
+    fn probit_survival_hazard_rejects_nonpositive_time_derivative() {
+        let err = probit_survival_hazard_components(1.0, 0.0)
+            .expect_err("zero derivative should be invalid");
+        assert!(err.contains("invalid survival index derivative"));
     }
 }

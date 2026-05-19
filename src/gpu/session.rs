@@ -378,14 +378,23 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
     let bytes_out_n = bytes_len::<f64>(rows)?;
     let bytes_v_p = bytes_len::<f64>(cols)?;
 
-    // Allocate device buffers + upload X under the runtime lock.
+    // Allocate device buffers + upload X under the runtime lock. We bind
+    // the driver API through the `&'static CudaWorkingState` so every
+    // `DeviceAllocation` returned by `::new` is already `'static` —
+    // no lifetime transmute needed for them to live in the cache.
     let guard = slot.lock().ok()?;
+    let cuda: &'static CudaWorkingState = guard.cuda;
+    let api: &'static _ = &cuda.api;
     let host_col_major: Vec<f64> = to_col_major(&x.view());
+    // FFI is unavoidable below: every cuda/cublas entry point is an
+    // extern "C" function pointer, and `DeviceAllocation::new` is itself
+    // `unsafe` because it requires `cuCtxSetCurrent` to have been issued
+    // beforehand (which we do as the first call inside this block).
     unsafe {
-        guard.cuda.set_current().ok()?;
-        let x_dev = DeviceAllocation::new(&guard.cuda.api, bytes_x)?;
+        cuda.set_current().ok()?;
+        let x_dev: DeviceAllocation<'static> = DeviceAllocation::new(api, bytes_x)?;
         check_cuda(
-            (guard.cuda.api.cu_memcpy_htod)(
+            (api.cu_memcpy_htod)(
                 x_dev.ptr,
                 host_col_major.as_ptr().cast(),
                 bytes_x,
@@ -393,29 +402,27 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
             "cuMemcpyHtoD(X resident)",
         )
         .ok()?;
-        let wy_dev = DeviceAllocation::new(&guard.cuda.api, bytes_wy)?;
-        let w_dev = DeviceAllocation::new(&guard.cuda.api, bytes_w)?;
-        let out_pp_dev = DeviceAllocation::new(&guard.cuda.api, bytes_out_pp)?;
-        let out_n_dev = DeviceAllocation::new(&guard.cuda.api, bytes_out_n)?;
-        let v_p_dev = DeviceAllocation::new(&guard.cuda.api, bytes_v_p)?;
-        // The DeviceAllocation type carries a 'a lifetime tied to the
-        // borrow of DriverApi. We need 'static to live in the cache; the
-        // DriverApi here came from `&'static CudaWorkingState` so this is
-        // sound — extend the lifetime explicitly.
-        let into_static = |a: DeviceAllocation<'_>| -> DeviceAllocation<'static> {
-            std::mem::transmute::<DeviceAllocation<'_>, DeviceAllocation<'static>>(a)
-        };
+        let wy_dev: DeviceAllocation<'static> =
+            DeviceAllocation::new(api, bytes_wy)?;
+        let w_dev: DeviceAllocation<'static> =
+            DeviceAllocation::new(api, bytes_w)?;
+        let out_pp_dev: DeviceAllocation<'static> =
+            DeviceAllocation::new(api, bytes_out_pp)?;
+        let out_n_dev: DeviceAllocation<'static> =
+            DeviceAllocation::new(api, bytes_out_n)?;
+        let v_p_dev: DeviceAllocation<'static> =
+            DeviceAllocation::new(api, bytes_v_p)?;
         Some(DeviceXSession {
             rows,
             cols,
             device,
             cublas: slot,
-            x_dev: into_static(x_dev),
-            wy_dev: into_static(wy_dev),
-            w_dev: into_static(w_dev),
-            out_pp_dev: into_static(out_pp_dev),
-            out_n_dev: into_static(out_n_dev),
-            v_p_dev: into_static(v_p_dev),
+            x_dev,
+            wy_dev,
+            w_dev,
+            out_pp_dev,
+            out_n_dev,
+            v_p_dev,
         })
     }
 }
