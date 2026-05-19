@@ -6230,6 +6230,7 @@ mod tests {
             coefficient_upstream,
             fitted_upstream,
             grad_score,
+            0.0,
         )
         .expect("by-gated analytic backward");
         let (grad_x, grad_by) =
@@ -6414,6 +6415,7 @@ mod tests {
             Some(grad_coefficients.view()),
             Some(grad_fitted.view()),
             grad_reml_score,
+            0.0,
             Some(by.view()),
             0,
             None,
@@ -6753,6 +6755,7 @@ mod tests {
             None,
             Some(grad_reml_score.view()),
             None,
+            None,
         )
         .expect("refit backward");
         let from_fits = gaussian_reml_fit_batched_backward_impl(
@@ -6766,6 +6769,7 @@ mod tests {
             None,
             None,
             Some(grad_reml_score.view()),
+            None,
             Some(&prebuilt_fits),
         )
         .expect("from_fits backward");
