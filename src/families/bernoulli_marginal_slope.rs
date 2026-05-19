@@ -17123,7 +17123,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &spec.latent_z_policy,
     )?;
     spec.z = z_standardized;
-    let pilot_baseline = pooled_probit_baseline(&spec.y, &spec.z, &spec.weights)?;
     let sigma_learnable = matches!(
         &spec.frailty,
         FrailtySpec::GaussianShift { sigma_fixed: None }
@@ -17139,14 +17138,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
-    let baseline = (
-        bernoulli_marginal_slope_eta_from_probability(
-            &spec.base_link,
-            normal_cdf(pilot_baseline.0),
-            "bernoulli marginal-slope baseline link inversion",
-        )?,
-        pilot_baseline.1 / probit_scale,
-    );
     let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
         data_view,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
@@ -17182,6 +17173,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
             Arc::new(cal.apply_to_training(&spec.z)?)
         }
     };
+    let z_train = z.as_ref();
+    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)?;
+    let baseline = (
+        bernoulli_marginal_slope_eta_from_probability(
+            &spec.base_link,
+            normal_cdf(pilot_baseline.0),
+            "bernoulli marginal-slope baseline link inversion",
+        )?,
+        pilot_baseline.1 / probit_scale,
+    );
 
     // Score-warp basis construction is β-independent (identifiability is
     // provided by the smoothness-null-space drop on the basis transform,
@@ -17227,7 +17228,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // orthogonalisation remains a one-shot construction-time step.
     let rigid_pilot_eta = rigid_pooled_probit_pilot_eta(
         &spec.base_link,
-        &spec.z,
+        z_train,
         &spec.marginal_offset,
         &spec.logslope_offset,
         baseline.0,
@@ -17239,10 +17240,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut cross_block_warnings: Vec<CrossBlockIdentifiabilityWarning> = Vec::new();
     let score_warp_prepared = if let Some(cfg) = spec.score_warp.as_ref() {
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
-        let mut prepared = build_score_warp_deviation_block_from_seed(&spec.z, cfg)?;
+        let mut prepared = build_score_warp_deviation_block_from_seed(z_train, cfg)?;
         let outcome = enforce_cross_block_identifiability_for_flex_block(
             &mut prepared,
-            &spec.z,
+            z_train,
             cfg,
             &[
                 CrossBlockAnchor::Parametric(&marginal_design.design),
@@ -17301,7 +17302,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         let eta_pilot = pilot_eta_for_link_dev_orthogonalisation(
             &spec.base_link,
             &spec.y,
-            &spec.z,
+            z_train,
             &spec.weights,
             &marginal_design.design,
             &spec.marginal_offset,
@@ -17355,7 +17356,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // converge on the right matrix.
         let score_warp_anchor_design = score_warp_prepared
             .as_ref()
-            .map(|sw| sw.runtime.design_at_training_with_residual(&spec.z))
+            .map(|sw| sw.runtime.design_at_training_with_residual(z_train))
             .transpose()?;
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
         let mut anchors = vec![
