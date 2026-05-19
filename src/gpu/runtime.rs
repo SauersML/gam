@@ -373,11 +373,11 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
     // threshold derives from the measured numbers.
     let mut devices: Vec<GpuDeviceInfo> = Vec::with_capacity(descriptors.len());
     for desc in descriptors {
-        let working = match CudaWorkingState::init(desc.ordinal) {
-            Some(state) => state,
+        let ctx = match cuda_context_for(desc.ordinal) {
+            Some(ctx) => ctx,
             None => {
                 log::warn!(
-                    "[GPU] device {} '{}' skipped: context init failed",
+                    "[GPU] device {} '{}' skipped: context retain failed",
                     desc.ordinal,
                     desc.name
                 );
@@ -385,7 +385,7 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
             }
         };
         let start = std::time::Instant::now();
-        let calibration: DeviceCalibration = match measure_device(&working) {
+        let calibration: DeviceCalibration = match measure_device(ctx) {
             Some(c) => c,
             None => {
                 log::warn!(
