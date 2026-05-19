@@ -3651,9 +3651,7 @@ fn validate_outer_gradient_convergence(solution: &Solution, tolerance: f64) -> b
         // helper is specifically for gradient-based solvers.
         return true;
     };
-    let g_inf = gradient
-        .iter()
-        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let g_inf = gradient.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     if !g_inf.is_finite() {
         return false;
     }
@@ -5146,7 +5144,12 @@ fn run_outer_with_plan(
                     ),
                 }
                 match outcome {
-                    Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                    Ok(sol) => Ok(certify_outer_solution(
+                        sol,
+                        config.tolerance,
+                        "BFGS",
+                        *the_plan,
+                    )),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
