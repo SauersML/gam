@@ -642,7 +642,6 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     validate_gaussian_reml_forward_fit(x, y, penalty, weights, fit)?;
     let lambda = fit.lambda;
     if !(fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14) {
-        eprintln!("[gamfit-debug] site_645_validate_fwd_fit_hess_rho");
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
@@ -828,7 +827,6 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             let lambda = problem.fit.lambda;
             if !(problem.fit.reml_hess_rho.is_finite() && problem.fit.reml_hess_rho.abs() > 1.0e-14)
             {
-                eprintln!("[gamfit-debug] site_830_hess_rho_problem");
                 return Err(EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 });
@@ -1051,7 +1049,6 @@ fn gaussian_reml_inverse_hessian_from_cache(
     }
     let inverse = dense_ab(scaled_basis.view(), cache.coefficient_basis.t());
     if inverse.iter().any(|value| !value.is_finite()) {
-        eprintln!("[gamfit-debug] site_1052_inverse_nan");
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
@@ -1680,7 +1677,6 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     };
     let (mut penalty_eigenvalues, eigenvectors) =
         transformed_penalty.eigh(Side::Lower).map_err(|_| {
-            eprintln!("[gamfit-debug] site_1680_transformed_penalty_eigh");
             EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
             }
@@ -1764,7 +1760,6 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     let p = xtwx.nrows();
     let trace: f64 = (0..p).map(|i| xtwx[[i, i]]).sum();
     if !trace.is_finite() || trace <= 0.0 {
-        eprintln!("[gamfit-debug] site_1763_trace_invalid");
         return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         });
@@ -1780,7 +1775,6 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
         }
         jitter *= 10.0;
     }
-    eprintln!("[gamfit-debug] site_1778_jitter_exhausted");
     Err(EstimationError::ModelIsIllConditioned {
         condition_number: f64::INFINITY,
     })
@@ -1794,7 +1788,6 @@ fn gaussian_penalty_positive_logdet(
         return Ok(0.0);
     }
     let (pen_eigs, _) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
-        eprintln!("[gamfit-debug] site_1791_penalty_eigh");
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
@@ -1819,7 +1812,6 @@ fn gaussian_penalty_positive_logdet(
             .collect();
         positive_eigs.sort_by(|a, b| b.total_cmp(a));
         if positive_eigs.len() < penalty_rank {
-            eprintln!("[gamfit-debug] site_1815_penalty_rank_short");
             return Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
             });
@@ -2469,7 +2461,6 @@ fn solve_lower_triangular_matrix(
             }
             let diag = lower[[i, i]];
             if !(diag.is_finite() && diag.abs() > 0.0) {
-                eprintln!("[gamfit-debug] site_2464_lower_zero_diag");
                 return Err(EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 });
@@ -2505,7 +2496,6 @@ fn solve_upper_triangular_matrix(
             }
             let diag = upper[[i, i]];
             if !(diag.is_finite() && diag.abs() > 0.0) {
-                eprintln!("[gamfit-debug] site_2499_upper_zero_diag");
                 return Err(EstimationError::ModelIsIllConditioned {
                     condition_number: f64::INFINITY,
                 });
