@@ -3069,6 +3069,13 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
+        // Live-chart trial sample (matrix-free TR operator bridge,
+        // first-order entry). Some opt subroutines call eval_grad without
+        // going through eval_value_grad_op; pushing here as well makes the
+        // chart progress monotonically for those callers too. Duplicate
+        // pushes are harmless — they just produce trial scatter at adjacent
+        // x-coords if the same outer iter is sampled by both entry points.
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
