@@ -2073,7 +2073,10 @@ mod tests {
         let (cum, hazard) = royston_parmar_survival_hazard_components(eta, eta_t)
             .expect("saturated RP fit must yield a result, not an error");
         assert!(cum.is_infinite() && cum > 0.0, "expected +∞ cum, got {cum}");
-        assert!(hazard.is_infinite() && hazard > 0.0, "expected +∞ hazard, got {hazard}");
+        assert!(
+            hazard.is_infinite() && hazard > 0.0,
+            "expected +∞ hazard, got {hazard}"
+        );
 
         // Consumer materializes survival via exp(-cum).clamp(0,1).
         let survival = (-cum).exp().clamp(0.0, 1.0);
@@ -2095,10 +2098,16 @@ mod tests {
         let eta = -40.0_f64;
         let eta_t = 1.5_f64;
 
-        let (cum, hazard) = probit_survival_hazard_components(eta, eta_t)
-            .expect("left tail must remain valid");
-        assert!(cum >= 0.0 && cum < 1e-300, "left-tail cum should be ~0, got {cum}");
-        assert_eq!(hazard, 0.0, "left-tail hazard should underflow to 0, got {hazard}");
+        let (cum, hazard) =
+            probit_survival_hazard_components(eta, eta_t).expect("left tail must remain valid");
+        assert!(
+            cum >= 0.0 && cum < 1e-300,
+            "left-tail cum should be ~0, got {cum}"
+        );
+        assert_eq!(
+            hazard, 0.0,
+            "left-tail hazard should underflow to 0, got {hazard}"
+        );
     }
 
     #[test]
