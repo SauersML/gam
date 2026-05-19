@@ -10293,11 +10293,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .map(f64::abs)
                     .fold(0.0_f64, f64::max);
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
+                // Predicted reduction must use the TRUE penalized Hessian
+                // (the one that appears in `f(β) = -ℓ + ½βᵀSβ + ½·joint_mode_diagonal_ridge·‖β‖²`),
+                // NOT the SPD-stabilized version. The stabilizing shift
+                // in `joint_solver_diagonal_ridge` is purely a solver-side
+                // tool to make the Newton system invertible when H_NLL
+                // has negative eigenvalues; it is not part of the true
+                // objective the trial-likelihood evaluator computes.
+                //
+                // If we use `joint_solver_diagonal_ridge` here, then for
+                // any Newton step lying in null(H_true) (e.g. the
+                // marginal-block cancellation direction in the saturated
+                // probit regime — see
+                // `marginal_block_hessian_cancels_in_saturated_regime`),
+                // predicted = ½·rhs·δ while actual = rhs·δ, giving ρ = 2
+                // exactly. The trust-region loop then accepts the step
+                // (ρ > 0.75 expands the radius), and the same regime
+                // repeats every cycle — exactly the biobank-saturated
+                // failure trace. Pinned by
+                // `ridge_stabilization_gap_produces_exact_rho_two_in_null_direction`.
                 if apply_joint_penalized_hessian_into(
                     &joint_hessian_source,
                     &ranges,
                     &s_lambdas,
-                    joint_solver_diagonal_ridge,
+                    joint_mode_diagonal_ridge,
                     &trial_delta,
                     &mut hpen_delta,
                 )
