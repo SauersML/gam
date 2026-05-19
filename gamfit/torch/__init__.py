@@ -62,7 +62,7 @@ try:
         sphere_log_map,
     )
     from .modules import from_fitted
-    from ._smoother import BSplineSmoother, penalized_ridge_solve
+    from ._smoother import DuchonSmoother, penalized_ridge_solve
 except ImportError as _exc:  # pragma: no cover - import-time guard
     if _exc.name == "torch":
         raise ImportError(
@@ -72,7 +72,7 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
     raise
 
 __all__ = [
-    "BSplineSmoother",
+    "DuchonSmoother",
     "GaussianRemlOutput",
     "PeriodicFitOutput",
     "PeriodicSmoother",
