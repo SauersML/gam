@@ -1001,8 +1001,8 @@ def gaussian_reml_fit_positions(
 
     ``knots_or_centers`` may be ``None``, an ``int`` (basis count), or an
     array; the basis-location vector is auto-derived from ``t`` when not
-    supplied. ``penalty`` defaults to the identity of matching size when
-    omitted — a neutral ridge that lets REML pick ``lambda`` from data.
+    supplied. ``penalty`` may be ``None`` for a neutral identity ridge of
+    matching size.
     """
     import numpy as np
 
@@ -1015,7 +1015,13 @@ def gaussian_reml_fit_positions(
         label="knots_or_centers",
         degree=order,
     )
-    penalty_np = _resolve_penalty(penalty, knots_np, basis_kind=basis_kind, order=order)
+    penalty_np = _resolve_position_penalty(
+        penalty,
+        knots_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+    )
     try:
         out = rust_module().gaussian_reml_fit_positions(
             t_np,
@@ -1040,8 +1046,8 @@ def gaussian_reml_fit_positions_backward(
     t: Any,
     y: Any,
     basis_kind: str,
-    knots_or_centers: Any,
-    penalty: Any,
+    knots_or_centers: Any = None,
+    penalty: Any | None = None,
     *,
     grad_lambda: float = 0.0,
     grad_coefficients: Any | None = None,
@@ -1057,17 +1063,36 @@ def gaussian_reml_fit_positions_backward(
     by: Any | None = None,
     by_start_col: int = 0,
 ) -> dict[str, Any]:
-    """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs."""
+    """Run the analytic VJP for ``gaussian_reml_fit_positions`` outputs.
+
+    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
+    defaults as :func:`gaussian_reml_fit_positions`.
+    """
     import numpy as np
 
     order = _position_basis_order(basis_kind, basis_order)
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_basis_locations(
+        knots_or_centers,
+        t_np,
+        basis_kind=basis_kind,
+        label="knots_or_centers",
+        degree=order,
+    )
+    penalty_np = _resolve_position_penalty(
+        penalty,
+        knots_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+    )
     try:
         out = rust_module().gaussian_reml_fit_positions_backward(
-            _numeric_vector(t, "t"),
+            t_np,
             _numeric_matrix(y, "y"),
             str(basis_kind),
-            _numeric_vector(knots_or_centers, "knots_or_centers"),
-            _numeric_matrix(penalty, "penalty"),
+            knots_np,
+            penalty_np,
             float(grad_lambda),
             None
             if grad_coefficients is None
@@ -1098,8 +1123,8 @@ def gaussian_reml_fit_positions_batched(
     y: Any,
     row_offsets: Any,
     basis_kind: str,
-    knots_or_centers: Any,
-    penalty: Any,
+    knots_or_centers: Any = None,
+    penalty: Any | None = None,
     *,
     basis_order: int | None = None,
     periodic: bool = False,
@@ -1109,18 +1134,38 @@ def gaussian_reml_fit_positions_batched(
     by: Any | None = None,
     by_start_col: int = 0,
 ) -> dict[str, Any]:
-    """Fit packed ragged closed-form Gaussian REML problems from positions."""
+    """Fit packed ragged closed-form Gaussian REML problems from positions.
+
+    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
+    defaults as :func:`gaussian_reml_fit_positions`. The basis locations
+    are inferred from the concatenated positions across all groups.
+    """
     import numpy as np
 
     order = _position_basis_order(basis_kind, basis_order)
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_basis_locations(
+        knots_or_centers,
+        t_np,
+        basis_kind=basis_kind,
+        label="knots_or_centers",
+        degree=order,
+    )
+    penalty_np = _resolve_position_penalty(
+        penalty,
+        knots_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched(
-            _numeric_vector(t, "t"),
+            t_np,
             _numeric_matrix(y, "y"),
             _index_vector(row_offsets, "row_offsets"),
             str(basis_kind),
-            _numeric_vector(knots_or_centers, "knots_or_centers"),
-            _numeric_matrix(penalty, "penalty"),
+            knots_np,
+            penalty_np,
             order,
             bool(periodic),
             None if period is None else float(period),
@@ -1139,8 +1184,8 @@ def gaussian_reml_fit_positions_batched_backward(
     y: Any,
     row_offsets: Any,
     basis_kind: str,
-    knots_or_centers: Any,
-    penalty: Any,
+    knots_or_centers: Any = None,
+    penalty: Any | None = None,
     *,
     grad_lambda: Any | None = None,
     grad_coefficients: Any | None = None,
@@ -1156,20 +1201,39 @@ def gaussian_reml_fit_positions_batched_backward(
     by: Any | None = None,
     by_start_col: int = 0,
 ) -> dict[str, Any]:
-    """Run the analytic VJP for packed position-based Gaussian REML fits."""
+    """Run the analytic VJP for packed position-based Gaussian REML fits.
+
+    ``knots_or_centers`` and ``penalty`` accept the same auto-derived
+    defaults as :func:`gaussian_reml_fit_positions_batched`.
+    """
     import numpy as np
 
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
     order = _position_basis_order(basis_kind, basis_order)
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_basis_locations(
+        knots_or_centers,
+        t_np,
+        basis_kind=basis_kind,
+        label="knots_or_centers",
+        degree=order,
+    )
+    penalty_np = _resolve_position_penalty(
+        penalty,
+        knots_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+    )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched_backward(
-            _numeric_vector(t, "t"),
+            t_np,
             _numeric_matrix(y, "y"),
             offsets,
             str(basis_kind),
-            _numeric_vector(knots_or_centers, "knots_or_centers"),
-            _numeric_matrix(penalty, "penalty"),
+            knots_np,
+            penalty_np,
             _optional_batch_vector(grad_lambda, batch, "grad_lambda"),
             None
             if grad_coefficients is None
@@ -1458,10 +1522,62 @@ def _resolve_basis_locations(
     Mirrors :func:`_resolve_centers` for ``basis_kind == "duchon"`` and
     :func:`_resolve_knots` for B-spline-like kinds.
     """
-    kind = str(basis_kind).lower()
-    if kind == "duchon":
+    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
+    if kind in {"duchon", "duchonspline"}:
         return _resolve_centers(arg, t_arr, label=label)
     return _resolve_knots(arg, t_arr, label=label, degree=degree)
+
+
+def _position_basis_dim(
+    knots_or_centers: Any,
+    basis_kind: str,
+    basis_order: int,
+    periodic: bool,
+) -> int:
+    """Return the basis dimension (= design ncols) for a position basis.
+
+    Used to size a default identity penalty when the caller omits one.
+    """
+    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
+    n = int(knots_or_centers.shape[0])
+    if kind in {"duchon", "duchonspline"}:
+        # build_duchon_basis appends the polynomial nullspace columns
+        # to the radial-basis block; for 1-D Duchon the nullspace
+        # dimension equals ``m`` (the basis order).
+        return n + max(int(basis_order), 0)
+    # Clamped B-spline: ncols = len(knots) - degree - 1. The Rust impl
+    # uses the same convention for the periodic variant; rely on the
+    # engine to reject mismatches if a periodic caller supplies a custom
+    # penalty themselves.
+    return max(n - int(basis_order) - 1, 0)
+
+
+def _resolve_position_penalty(
+    penalty: Any | None,
+    knots_or_centers: Any,
+    *,
+    basis_kind: str,
+    basis_order: int,
+    periodic: bool,
+) -> Any:
+    """Resolve the penalty argument for ``gaussian_reml_fit_positions*``.
+
+    ``None`` → identity matrix of basis-dimension size (a neutral ridge
+    that lets REML pick ``lambda`` from data). Otherwise forwarded to
+    :func:`_numeric_matrix` unchanged.
+    """
+    import numpy as np
+
+    if penalty is None:
+        dim = _position_basis_dim(knots_or_centers, basis_kind, basis_order, periodic)
+        if dim <= 0:
+            raise ValueError(
+                "cannot auto-derive identity penalty: inferred basis dim is non-positive "
+                f"(basis_kind={basis_kind!r}, locations.size={knots_or_centers.shape[0]}, "
+                f"basis_order={basis_order})"
+            )
+        return np.eye(dim, dtype=np.float64)
+    return _numeric_matrix(penalty, "penalty")
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:

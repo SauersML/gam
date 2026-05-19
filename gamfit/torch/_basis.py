@@ -18,6 +18,40 @@ from .. import _api
 from ._coerce import from_numpy_like, to_numpy_f64, to_numpy_uintp
 
 
+def _resolve_centers_tensor(t: torch.Tensor, centers: Any) -> torch.Tensor:
+    """Accept None / int / Tensor for Duchon centers; auto-derive when needed."""
+    if isinstance(centers, torch.Tensor):
+        return centers
+    resolved = _api._resolve_centers(centers, to_numpy_f64(t), label="centers")
+    return from_numpy_like(resolved, t)
+
+
+def _resolve_knots_tensor(
+    t: torch.Tensor, knots: Any, *, degree: int
+) -> torch.Tensor:
+    """Accept None / int / Tensor for B-spline knots; auto-derive when needed."""
+    if isinstance(knots, torch.Tensor):
+        return knots
+    resolved = _api._resolve_knots(knots, to_numpy_f64(t), label="knots", degree=degree)
+    return from_numpy_like(resolved, t)
+
+
+def _resolve_basis_locations_tensor(
+    t: torch.Tensor,
+    knots_or_centers: Any,
+    *,
+    basis_kind: str,
+    degree: int,
+) -> torch.Tensor:
+    """Dispatch :func:`_resolve_centers_tensor`/:func:`_resolve_knots_tensor`."""
+    if isinstance(knots_or_centers, torch.Tensor):
+        return knots_or_centers
+    kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
+    if kind in {"duchon", "duchonspline"}:
+        return _resolve_centers_tensor(t, knots_or_centers)
+    return _resolve_knots_tensor(t, knots_or_centers, degree=degree)
+
+
 class _BsplineBasisFn(torch.autograd.Function):
     """Autograd Function evaluating the Rust B-spline basis with grad wrt ``t``."""
 
@@ -86,7 +120,7 @@ class _DuchonBasis1dFn(torch.autograd.Function):
 
 def bspline_basis(
     t: torch.Tensor,
-    knots: torch.Tensor,
+    knots: Any = None,
     *,
     degree: int = 3,
     periodic: bool = False,
@@ -97,8 +131,11 @@ def bspline_basis(
     ----------
     t : torch.Tensor
         Evaluation locations, shape ``(n_t,)``. Differentiable input.
-    knots : torch.Tensor
-        Knot vector. Treated as structural; no gradient is propagated.
+    knots : torch.Tensor | int | None, optional
+        Knot vector. ``None`` (default) auto-derives a clamped knot
+        vector with quantile-spaced interior knots from ``t``; an ``int``
+        ``K`` overrides the interior-knot count. Treated as structural
+        either way — no gradient is propagated.
     degree : int, optional
         Spline degree. Default ``3``.
     periodic : bool, optional
@@ -109,13 +146,14 @@ def bspline_basis(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
+    knots_t = _resolve_knots_tensor(t, knots, degree=int(degree))
     apply = cast(Callable[..., torch.Tensor], _BsplineBasisFn.apply)
-    return apply(t, knots, int(degree), bool(periodic))
+    return apply(t, knots_t, int(degree), bool(periodic))
 
 
 def bspline_basis_derivative(
     t: torch.Tensor,
-    knots: torch.Tensor,
+    knots: Any = None,
     *,
     degree: int = 3,
     order: int = 1,
