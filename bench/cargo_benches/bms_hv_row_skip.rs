@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
+use std::hint::black_box;
 
 // Compile-time gate for the multi-second `bms_hv_row_skip` sweep. Flip to
 // `true` locally when you want to time the importance-weighted row-skip

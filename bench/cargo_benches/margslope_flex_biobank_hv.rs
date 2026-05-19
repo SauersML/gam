@@ -18,10 +18,10 @@
 mod margslope_flex_equivalence;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use margslope_flex_equivalence::{
     DEFAULT_REPRO_N, build_biobank_shape_problem, cycle_capped_options, fit_problem,
 };
+use std::hint::black_box;
 use std::time::Duration;
 
 fn env_usize(name: &str, default: usize) -> usize {

@@ -4,8 +4,8 @@
 //! Run with: `cargo bench --bench bvn_biobank_shape`
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::bivariate_normal_cdf;
+use std::hint::black_box;
 
 fn biobank_shape_args() -> Vec<(f64, f64, f64)> {
     // Cycle-0 affine cells use h = alpha/sqrt(1+beta^2), k = cell boundary,

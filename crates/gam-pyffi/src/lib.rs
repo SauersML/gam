@@ -40,7 +40,8 @@ use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
-    SpatialIdentifiability, build_duchon_basis, create_basis, create_difference_penalty_matrix,
+    SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
+    build_duchon_basis, create_basis, create_difference_penalty_matrix,
     create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
@@ -48,7 +49,8 @@ use gam::types::{InverseLink, LikelihoodFamily};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -463,6 +465,29 @@ fn duchon_basis_1d_derivative<'py>(
         duchon_basis_1d_derivative_impl(t.as_array(), centers.as_array(), m, order, periodic)
             .map_err(py_value_error)?;
     Ok(basis.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (t, num_internal_knots, degree = 3))]
+fn auto_knots_1d<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    num_internal_knots: usize,
+    degree: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let knots = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(knots.into_pyarray(py).unbind())
+}
+
+#[pyfunction(signature = (t, num_centers))]
+fn auto_centers_1d<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    num_centers: usize,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let centers = auto_centers_1d_equal_mass(t.as_array(), num_centers)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(centers.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
@@ -2900,6 +2925,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
+    module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
+    module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_array, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_weighted_ridge_batch, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit, module)?)?;
