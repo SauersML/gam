@@ -83,6 +83,10 @@ impl CustomFamily for CoupledQuarticExactFamily {
         ]))
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
