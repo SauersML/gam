@@ -469,12 +469,13 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
         };
         let start = std::time::Instant::now();
         let calibration: DeviceCalibration = match measure_device(ctx) {
-            Some(c) => c,
-            None => {
+            Ok(c) => c,
+            Err(reason) => {
                 log::warn!(
-                    "[GPU] device {} '{}' skipped: calibration failed",
+                    "[GPU] device {} '{}' skipped: calibration failed at {}",
                     desc.ordinal,
-                    desc.name
+                    desc.name,
+                    reason
                 );
                 continue;
             }
