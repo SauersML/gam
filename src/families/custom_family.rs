@@ -9714,7 +9714,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // convergence events) keep the full detail. JOINT_LOG_VERBOSE_PERIOD is
         // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
         // 1 compact line per remaining cycle (~210 lines), down from ~800.
-        const JOINT_LOG_VERBOSE_PERIOD: usize = 20;
+        const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
@@ -9722,24 +9722,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let verbose_cycle = cycle == 0
                 || cycle + 1 == inner_max_cycles
                 || (cycle + 1) % JOINT_LOG_VERBOSE_PERIOD == 0;
-            // Fires at the top of each inner joint-Newton cycle so CI logs can
-            // distinguish "inner spin" (thousands of these) from "outer-assembly
-            // spin" (zero of these). Emitted at info-level so the silent-grind
-            // failure mode (e.g. CI hitting cmd timeout while PIRLS quietly
-            // chews on the first outer-iter at biobank scale) is visible
-            // without enabling debug logs. Throttled to verbose-cadence cycles
-            // — the compact post-cycle one-liner below carries the same info
-            // on non-verbose cycles.
-            if verbose_cycle {
-                log::info!(
-                    "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
-                    cycle,
-                    inner_max_cycles,
-                    -current_log_likelihood,
-                    current_penalty,
-                    lastobjective,
-                );
-            }
+            // Pre-cycle header line removed: the post-cycle one-liner below
+            // carries cycle/objective/Δobj/step/residual/time and on verbose
+            // cadence the expanded convergence line additionally carries
+            // -loglik and penalty. Suppressing this avoids emitting a second
+            // info-level line per cycle just to repeat numbers we already
+            // log at end of cycle.
             // Per-cycle phase-timing accumulators. Surface where the inner
             // joint-Newton spends time so a 18-min silent cycle 0 (the
             // bernoulli marginal-slope FLEX biobank failure mode) becomes a
@@ -10831,21 +10819,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // the step is small but residual is still 10⁵× above tol —
             // defeating the throttle entirely.
             let near_convergence = residual <= 10.0 * residual_tol;
+            let signed_obj_change = lastobjective - old_objective;
             if verbose_cycle || near_convergence {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | proposal_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
+                    "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} -loglik={:.6e} pen={:.3e} Δobj={:+.3e} |δ|∞={:.3e} accepted_|δ|∞={:.3e} resid={:.3e} (tol={:.3e}) obj_tol={:.3e} step_tol={:.3e} |β|∞={:.3e} attempts={} t={:.3}s",
                     cycle,
+                    inner_max_cycles,
+                    lastobjective,
+                    -current_log_likelihood,
+                    current_penalty,
+                    signed_obj_change,
                     step_inf,
-                    step_tol,
                     accepted_step_inf,
                     residual,
                     residual_tol,
-                    objective_change,
                     objective_tol,
+                    step_tol,
                     beta_inf,
+                    line_search_attempts,
+                    cycle_started.elapsed().as_secs_f64(),
                 );
             } else {
-                let signed_obj_change = lastobjective - old_objective;
                 log::info!(
                     "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} Δobj={:+.3e} |δ|∞={:.3e} resid={:.3e} attempts={} t={:.3}s",
                     cycle,
