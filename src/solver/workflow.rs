@@ -1607,6 +1607,19 @@ fn fit_transformation_normal_model(
 }
 
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
+    // Single warm-start chokepoint: open a persistent cache session keyed
+    // on the FitRequest's family-shape fingerprint and attach it to the
+    // variant's BlockwiseFitOptions (or top-level slot). Family-specific
+    // fit functions then consult `options.cache_session` to seed θ from
+    // the last accepted iterate and checkpoint accepted iterates. This
+    // is what makes warm-start uniform across every model class — adding
+    // a new family does NOT require remembering to wire the cache.
+    let mut request = request;
+    if let Some(session) = crate::solver::persistent_warm_start::open_outer_session(
+        &request.cache_key(),
+    ) {
+        request.attach_cache_session(session);
+    }
     match request {
         FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
         FitRequest::GaussianLocationScale(request) => {
