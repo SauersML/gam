@@ -13,7 +13,9 @@ use gam::families::family_meta::{
     family_to_link, inverse_link_to_binomial_family, pretty_familyname,
 };
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
-use gam::families::survival_construction::survival_likelihood_modename;
+use gam::families::survival_construction::{
+    SavedSurvivalTimeBasis, survival_likelihood_modename,
+};
 use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
@@ -5381,12 +5383,10 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_baseline_shape = baseline_cfg.shape;
     payload.survival_baseline_rate = baseline_cfg.rate;
     payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.survival_time_basis = Some(time_build.basisname.clone());
-    payload.survival_time_degree = time_build.degree;
-    payload.survival_time_knots = time_build.knots.clone();
-    payload.survival_time_keep_cols = time_build.keep_cols.clone();
-    payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-    payload.survival_time_anchor = Some(time_anchor);
+    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+        &time_build,
+        time_anchor,
+    ));
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
     payload.survival_distribution = Some("probit".to_string());
@@ -5457,12 +5457,14 @@ fn build_survival_transformation_ffi_payload(
     payload.survival_baseline_shape = rp_result.baseline_cfg.shape;
     payload.survival_baseline_rate = rp_result.baseline_cfg.rate;
     payload.survival_baseline_makeham = rp_result.baseline_cfg.makeham;
-    payload.survival_time_basis = Some(rp_result.time_basisname);
-    payload.survival_time_degree = rp_result.time_degree;
-    payload.survival_time_knots = rp_result.time_knots;
-    payload.survival_time_keep_cols = rp_result.time_keep_cols;
-    payload.survival_time_smooth_lambda = rp_result.time_smooth_lambda;
-    payload.survival_time_anchor = Some(rp_result.time_anchor);
+    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis {
+        basisname: rp_result.time_basisname,
+        degree: rp_result.time_degree,
+        knots: rp_result.time_knots,
+        keep_cols: rp_result.time_keep_cols,
+        smooth_lambda: rp_result.time_smooth_lambda,
+        anchor: rp_result.time_anchor,
+    });
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some(likelihood_label);
     if let Some(timewiggle) = rp_result.baseline_timewiggle.as_ref() {
@@ -5803,12 +5805,10 @@ fn build_survival_location_scale_ffi_payload(
     payload.survival_baseline_shape = baseline_cfg.shape;
     payload.survival_baseline_rate = baseline_cfg.rate;
     payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.survival_time_basis = Some(time_build.basisname.clone());
-    payload.survival_time_degree = time_build.degree;
-    payload.survival_time_knots = time_build.knots.clone();
-    payload.survival_time_keep_cols = time_build.keep_cols.clone();
-    payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-    payload.survival_time_anchor = Some(time_anchor);
+    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+        &time_build,
+        time_anchor,
+    ));
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
     payload.survival_beta_time = Some(ls_result.fit.fit.beta_time().to_vec());
@@ -6009,13 +6009,11 @@ fn build_latent_window_ffi_payload(
     payload.survival_baseline_shape = baseline_cfg.shape;
     payload.survival_baseline_rate = baseline_cfg.rate;
     payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.survival_time_basis = Some(time_build.basisname.clone());
-    payload.survival_time_degree = time_build.degree;
-    payload.survival_time_knots = time_build.knots.clone();
-    payload.survival_time_keep_cols = time_build.keep_cols.clone();
-    payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+        &time_build,
+        time_anchor,
+    ));
     payload.survival_likelihood = Some(likelihood_label);
-    payload.survival_time_anchor = Some(time_anchor);
     payload.survival_beta_time = Some(fit.beta_time().to_vec());
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.training_headers = Some(dataset.headers.clone());
