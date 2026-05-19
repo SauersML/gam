@@ -8,7 +8,7 @@ use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::io::{self, IsTerminal, Stdout, Write};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const INTERACTIVE_DRAW_INTERVAL: Duration = Duration::from_millis(40);
@@ -90,6 +90,15 @@ struct VisualizerModel {
     history_cost_accepted: Vec<(f64, f64)>,
     history_cost_trial: Vec<(f64, f64)>,
     history_grad_log: Vec<(f64, f64)>,
+    // Most recent (iter, cost, grad_norm) pushed by the outer optimizer.
+    // `record_outer_accept` promotes this point into the accepted series
+    // when the trust-region accepts the step; rejected trials remain only
+    // in `history_cost_trial`. None until the first eval.
+    last_trial: Option<(f64, f64, f64)>,
+    // Monotone outer-eval counter used as the chart x-coordinate. Bridges
+    // run `eval_grad`/`eval_hessian` once per trial; this advances on each
+    // push so trial scatter and accepted line share a common axis.
+    outer_eval_counter: f64,
     start_time: Instant,
     current_iter: f64,
     best_cost: f64,
@@ -114,6 +123,8 @@ impl Default for VisualizerModel {
             history_cost_accepted: Vec::new(),
             history_cost_trial: Vec::new(),
             history_grad_log: Vec::new(),
+            last_trial: None,
+            outer_eval_counter: 0.0,
             start_time: Instant::now(),
             current_iter: 0.0,
             best_cost: f64::INFINITY,
