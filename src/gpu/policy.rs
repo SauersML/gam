@@ -108,25 +108,28 @@ impl DispatchPolicy {
 
         // The payload constants below model the dispatch crossover as
         // "minimum FLOPs to amortize an HtoD/DtoH transfer of this many
-        // bytes". Earlier values (256 MB gemm, 64 MB gemv/trsm) effectively
-        // disabled dispatch for any iterative solver whose design matrix
-        // is reused across cycles — biobank GLMs at n≈3×10⁵, p≈35 sit
-        // just below the old threshold despite easily winning on real
-        // hardware. The smaller values here put the crossover at workload
-        // sizes that match measured cuBLAS launch + transfer costs on
-        // modern Gen4 PCIe cards while leaving the existing dimension
-        // floors (xtwx_min_rows / gemv-via-flops) intact for tiny shapes.
+        // bytes". They are deliberately *fixed* shape-of-the-input
+        // numbers — they describe how much data a typical kernel of each
+        // family moves, not how fast the device is. The throughput and
+        // bandwidth that turn those payloads into FLOP thresholds come
+        // from the calibrated values passed in.
         let gemm_min_flops = flops_threshold(
             /*payload_bytes=*/ 32.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
+            cpu_gflops,
+            pcie_gb_per_s,
         );
         let gemv_min_flops = flops_threshold(
             /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
+            cpu_gflops,
+            pcie_gb_per_s,
         );
         let trsm_min_flops = flops_threshold(
             /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
             peak_gpu_gflops,
+            cpu_gflops,
+            pcie_gb_per_s,
         );
 
         // XᵀWX threshold scales inversely with speedup so biobank-scale
@@ -249,26 +252,38 @@ impl DispatchPolicy {
 }
 
 /// Compute the FLOP threshold above which GPU dispatch beats the host
-/// BLAS path, given a one-way PCIe payload in bytes and the device's
-/// peak FP64 throughput in GFLOPS.
+/// BLAS path, given a one-way PCIe payload in bytes and the measured
+/// GPU FP64 throughput, CPU FP64 throughput, and PCIe bandwidth.
 ///
 /// Solves `F / gpu + bytes / pcie ≤ F / cpu` for `F`:
 ///   `F ≥ bytes · gpu · cpu / (pcie · (gpu − cpu))`
 ///
-/// Returns `f64::INFINITY` when the GPU is slower than the host.
-fn crossover_flops(payload_bytes: f64, peak_gpu_gflops: f64) -> f64 {
-    if peak_gpu_gflops <= CPU_FP64_GFLOPS {
+/// Returns `f64::INFINITY` when the GPU is slower than the host (the
+/// runtime then unconditionally declines dispatch).
+fn crossover_flops(
+    payload_bytes: f64,
+    peak_gpu_gflops: f64,
+    cpu_gflops: f64,
+    pcie_gb_per_s: f64,
+) -> f64 {
+    if peak_gpu_gflops <= cpu_gflops {
         return f64::INFINITY;
     }
-    let cpu_flops_per_s = CPU_FP64_GFLOPS * 1e9;
+    let cpu_flops_per_s = cpu_gflops * 1e9;
     let gpu_flops_per_s = peak_gpu_gflops * 1e9;
-    let pcie_bytes_per_s = PCIE_GB_PER_S * 1e9;
+    let pcie_bytes_per_s = pcie_gb_per_s * 1e9;
     payload_bytes * cpu_flops_per_s * gpu_flops_per_s
         / (pcie_bytes_per_s * (gpu_flops_per_s - cpu_flops_per_s))
 }
 
-fn flops_threshold(payload_bytes: f64, peak_gpu_gflops: f64) -> u64 {
-    let threshold = crossover_flops(payload_bytes, peak_gpu_gflops).ceil();
+fn flops_threshold(
+    payload_bytes: f64,
+    peak_gpu_gflops: f64,
+    cpu_gflops: f64,
+    pcie_gb_per_s: f64,
+) -> u64 {
+    let threshold =
+        crossover_flops(payload_bytes, peak_gpu_gflops, cpu_gflops, pcie_gb_per_s).ceil();
     if !threshold.is_finite() || threshold >= u64::MAX as f64 {
         u64::MAX
     } else if threshold <= 0.0 {
