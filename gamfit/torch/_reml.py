@@ -523,6 +523,12 @@ def gaussian_reml_fit(
         Tuple of ``(coefficients, fitted, lam, reml_score)`` as torch tensors
         sharing ``x``'s device and dtype.
     """
+    # Symmetrize the penalty before the analytic backward sees it. The closed-
+    # form REML interior assumes ``S`` is symmetric, so an explicit
+    # ``0.5 * (S + Sᵀ)`` makes the backward consistent with the forward for any
+    # input (gradcheck included). torch's autograd chains through this op
+    # automatically; for an already-symmetric input it is a no-op at runtime.
+    penalty = 0.5 * (penalty + penalty.t())
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         x, y, penalty, weights, by, init_lambda, by_start_col
@@ -565,6 +571,7 @@ def gaussian_reml_fit_batched(
         ``lam`` and ``reml_score`` are length-``K`` tensors; ``coefficients``
         and ``fitted`` follow the engine's packed layout.
     """
+    penalty = 0.5 * (penalty + penalty.t())
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitBatchedFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         x, y, row_offsets, penalty, weights, by, init_lambda, by_start_col
@@ -608,6 +615,7 @@ def gaussian_reml_fit_positions(
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
+    penalty = 0.5 * (penalty + penalty.t())
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         t,
@@ -658,6 +666,7 @@ def gaussian_reml_fit_positions_batched(
     weights, by, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
     """
+    penalty = 0.5 * (penalty + penalty.t())
     apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsBatchedFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
         t,
