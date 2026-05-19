@@ -7894,7 +7894,7 @@ impl BernoulliMarginalSlopeFamily {
             policy.gemm_min_flops,
             2usize.saturating_mul(p_m.max(p_g).saturating_pow(2)),
         );
-        let target_rows = policy
+        let min_gpu_rows = policy
             .xtwx_min_rows
             .max(projection_rows.min(n))
             .max(gram_rows.min(n))
@@ -7911,7 +7911,17 @@ impl BernoulliMarginalSlopeFamily {
         let max_rows_by_memory = (GPU_MEMORY_BUDGET_BYTES / (scratch_cols * 8))
             .max(1024)
             .min(n.max(1));
-        (target_rows.min(max_rows_by_memory).min(n.max(1)), true)
+        let chunk_rows = max_rows_by_memory.min(n.max(1));
+        let chunk_reaches_device = chunk_rows >= min_gpu_rows
+            && (policy.route_gemm(chunk_rows, n_dirs, p_m)
+                || policy.route_gemm(chunk_rows, n_dirs, p_g)
+                || policy.route_xt_diag_y(chunk_rows, p_m, p_m)
+                || policy.route_xt_diag_y(chunk_rows, p_m, p_g)
+                || policy.route_xt_diag_y(chunk_rows, p_g, p_g));
+        if !chunk_reaches_device {
+            return (cpu_rows.min(n.max(1)), false);
+        }
+        (chunk_rows, true)
     }
 
     fn row_primary_psi_direction_from_map(
