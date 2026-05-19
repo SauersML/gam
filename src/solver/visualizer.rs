@@ -1377,6 +1377,11 @@ mod tests {
 
     #[test]
     fn enabled_session_uses_dumb_mode_when_not_attached_to_tty() {
+        // Must lock against the other new(true) tests: an enabled session
+        // installs itself into the static ACTIVE_FEED and clears it on
+        // Drop, so a concurrent test that asserts feed contents would
+        // observe stale or empty state if this test interleaved with it.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let session = VisualizerSession::new(true);
         assert!(session.is_active());
         assert!(!session.is_interactive());
