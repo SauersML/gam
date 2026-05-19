@@ -119,6 +119,7 @@ pub struct GaussianRemlScoreDerivatives {
 pub struct GaussianRemlFreeBScore {
     pub reml_score: f64,
     pub grad_coefficients: Array2<f64>,
+    pub grad_penalty: Array2<f64>,
     pub grad_log_lambda: f64,
     pub fitted: Array2<f64>,
     pub sigma2: Array1<f64>,
@@ -695,6 +696,24 @@ pub fn gaussian_reml_free_b_score(
     let mut reml_score = 0.5 * (d as f64) * (logdet_h - logdet_s);
     let mut grad_log_lambda = 0.5 * (d as f64) * (trace_h - cache.penalty_rank as f64);
     let mut grad_coefficients = Array2::<f64>::zeros((p, d));
+    let inverse_hessian = {
+        let xtwx = dense_xt_diag_x(x, weight.view());
+        let mut hessian = xtwx;
+        hessian += &(penalty.to_owned() * lambda);
+        hessian
+            .cholesky(Side::Lower)
+            .map_err(EstimationError::LinearSystemSolveFailed)?
+            .solve_mat(&Array2::<f64>::eye(p))
+    };
+    let penalty_pinv = gaussian_reml_penalty_pseudoinverse_from_cache(&cache);
+    let mut grad_penalty = Array2::<f64>::zeros((p, p));
+    for row in 0..p {
+        for col in 0..p {
+            grad_penalty[[row, col]] += 0.5
+                * (d as f64)
+                * (lambda * inverse_hessian[[col, row]] - penalty_pinv[[col, row]]);
+        }
+    }
     let mut sigma2 = Array1::<f64>::zeros(d);
 
     for output in 0..d {
@@ -715,11 +734,20 @@ pub fn gaussian_reml_free_b_score(
             grad_coefficients[[coeff, output]] =
                 scale * (-xtw_residual[[coeff, output]] + lambda * s_beta[[coeff, output]]);
         }
+        add_rank_one_penalty_vjp(0.5 * scale * lambda, beta_col, &mut grad_penalty);
+    }
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (grad_penalty[[i, j]] + grad_penalty[[j, i]]);
+            grad_penalty[[i, j]] = avg;
+            grad_penalty[[j, i]] = avg;
+        }
     }
 
     Ok(GaussianRemlFreeBScore {
         reml_score,
         grad_coefficients,
+        grad_penalty,
         grad_log_lambda,
         fitted,
         sigma2,
