@@ -284,6 +284,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "validate_formula",
             "design_matrix_array",
             "basis",
+            "duchon_function_norm_penalty",
             "duchon_operator_penalties",
             "thin_plate_penalty",
             "gaussian_weighted_ridge_array",
@@ -554,6 +555,40 @@ fn duchon_operator_penalties<'py>(
         matrices.tension.into_pyarray(py).unbind(),
         matrices.stiffness.into_pyarray(py).unbind(),
     ))
+}
+
+#[pyfunction(signature = (centers, m = 2, periodic = false, period = None))]
+fn duchon_function_norm_penalty<'py>(
+    py: Python<'py>,
+    centers: PyReadonlyArray1<'py, f64>,
+    m: usize,
+    periodic: bool,
+    period: Option<f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    validate_position_period("duchon", centers.as_array(), periodic, period)
+        .map_err(py_value_error)?;
+    if m == 0 {
+        return Err(py_value_error("Duchon m must be at least 1".to_string()));
+    }
+    let center_matrix = column_array(centers.as_array());
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
+        length_scale: None,
+        power: 0,
+        nullspace_order: duchon_nullspace_from_m(m),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic,
+    };
+    let built = build_duchon_basis(center_matrix.view(), &spec)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let penalty = built
+        .penalties
+        .first()
+        .ok_or_else(|| py_value_error("Duchon function-norm penalty was not built".to_string()))?
+        .clone();
+    Ok(penalty.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (centers, m = 2, length_scale = 1.0))]
@@ -3030,6 +3065,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
