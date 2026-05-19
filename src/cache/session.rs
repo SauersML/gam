@@ -233,6 +233,55 @@ mod tests {
     }
 
     #[test]
+    fn preload_takes_precedence_over_store_lookup() {
+        // Hierarchical near-match semantics: when a session is opened on
+        // a fresh key (no entry) but preloaded with a near-match payload
+        // from a different key, try_load returns the preloaded entry.
+        let (_d, s) = temp_session("preload-empty");
+        assert!(s.try_load().is_none(), "fresh key should have no entry");
+
+        let seeded = CachedEntry {
+            payload: b"from-prefix".to_vec(),
+            objective: Some(7.0),
+            iteration: Some(42),
+            kind: EntryKind::Final,
+            written_unix_secs: 0,
+        };
+        s.preload(seeded);
+
+        let got = s.try_load().expect("preloaded seed should be returned");
+        assert_eq!(got.payload, b"from-prefix");
+        assert_eq!(got.objective, Some(7.0));
+    }
+
+    #[test]
+    fn preload_consumed_on_first_try_load() {
+        // The preload slot is consumed after one read so subsequent calls
+        // fall back to the store. This makes the session a unified
+        // "load best seed, save under exact key" abstraction without
+        // duplicating reads.
+        let (_d, s) = temp_session("preload-consume");
+        s.checkpoint(b"exact", Some(2.0), Some(5));
+
+        let seeded = CachedEntry {
+            payload: b"seed".to_vec(),
+            objective: Some(99.0),
+            iteration: Some(1),
+            kind: EntryKind::Checkpoint,
+            written_unix_secs: 0,
+        };
+        s.preload(seeded);
+
+        // First try_load: seed (preferred over store).
+        let first = s.try_load().expect("first call should return seed");
+        assert_eq!(first.payload, b"seed");
+
+        // Second try_load: store fallback (seed already consumed).
+        let second = s.try_load().expect("second call should fall back to store");
+        assert_eq!(second.payload, b"exact");
+    }
+
+    #[test]
     fn second_session_reads_first_session_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let mut fp = Fingerprinter::new();
