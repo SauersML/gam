@@ -968,6 +968,7 @@ fn gaussian_reml_fit_positions<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
+    grad_edf = 0.0,
     forward_state = None,
     basis_order = 3,
     periodic = false,
@@ -988,6 +989,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
+    grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
     basis_order: usize,
     periodic: bool,
@@ -1016,6 +1018,7 @@ fn gaussian_reml_fit_positions_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score,
+        grad_edf,
         by.as_ref().map(|b| b.as_array()),
         by_start_col,
         forward_fit.as_ref(),
@@ -1098,6 +1101,7 @@ fn gaussian_reml_fit_positions_batched<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
+    grad_edf = None,
     forward_state = None,
     basis_order = 3,
     periodic = false,
@@ -1119,6 +1123,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    grad_edf: Option<PyReadonlyArray1<'py, f64>>,
     forward_state: Option<&Bound<'py, PyDict>>,
     basis_order: usize,
     periodic: bool,
@@ -1148,6 +1153,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score.as_ref().map(|g| g.as_array()),
+        grad_edf.as_ref().map(|g| g.as_array()),
         by.as_ref().map(|b| b.as_array()),
         by_start_col,
         forward_fits.as_deref(),
@@ -2197,6 +2203,7 @@ fn gaussian_reml_fit_positions_backward_impl(
     grad_coefficients: Option<ArrayView2<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: f64,
+    grad_edf: f64,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
     forward_fit: Option<&gam::gaussian_reml::GaussianRemlMultiResult>,
@@ -2235,6 +2242,7 @@ fn gaussian_reml_fit_positions_backward_impl(
             grad_coefficients,
             grad_fitted,
             grad_reml_score,
+            grad_edf,
         )
     } else {
         gaussian_reml_multi_closed_form_backward(
@@ -2247,6 +2255,7 @@ fn gaussian_reml_fit_positions_backward_impl(
             grad_coefficients,
             grad_fitted,
             grad_reml_score,
+            grad_edf,
         )
     }
     .map_err(|err| err.to_string())?;
@@ -2316,6 +2325,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
     grad_coefficients: Option<ArrayView3<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
+    grad_edf: Option<ArrayView1<'_, f64>>,
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
     forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
