@@ -6218,7 +6218,7 @@ mod tests {
     // lives in opt's `with_axis_step_caps` test surface.
 
     #[test]
-    fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
+    fn first_order_bridge_keeps_true_gradient_on_objective_stall() {
         let eval_calls = Arc::new(AtomicUsize::new(0));
         let problem = OuterProblem::new(1)
             .with_gradient(Derivative::Analytic)
@@ -6245,6 +6245,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
+        let stall_snapshot: Arc<Mutex<Option<OuterStallSnapshot>>> = Arc::new(Mutex::new(None));
         let mut bridge = OuterFirstOrderBridge {
             obj: &mut obj,
             layout: OuterThetaLayout::new(1, 0),
@@ -6252,8 +6253,16 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
+            objective_stall_rel_tol: Some(1.0e-6),
+            last_gradient_cost: Some(1000.0),
+            objective_stall_evals: 0,
+            stall_snapshot: Arc::clone(&stall_snapshot),
         };
 
+        // The first BFGS_OBJECTIVE_STALL_EVALS near-stall evals still
+        // return the true gradient — the run-length test trips only on
+        // the (N+1)th flat eval, so the optimizer never sees a fake
+        // gradient inside its tolerance window.
         let first = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
             .expect("first near-stall eval should still expose the true gradient");
         let second = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
@@ -6266,6 +6275,31 @@ mod tests {
         assert_eq!(third.gradient[0], 4.0);
         assert_eq!(bridge.last_g_norm, Some(4.0));
         assert_eq!(eval_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(bridge.objective_stall_evals, 3);
+        assert!(
+            stall_snapshot
+                .lock()
+                .expect("stall snapshot mutex poisoned")
+                .is_none(),
+            "no snapshot should be stashed before the run-length threshold trips",
+        );
+
+        // The fourth consecutive flat-cost eval crosses the threshold
+        // and aborts with a stashed snapshot carrying the true gradient
+        // and current point.
+        let fourth = FirstOrderObjective::eval_grad(&mut bridge, &array![0.0]);
+        assert!(
+            matches!(fourth, Err(ObjectiveEvalError::Fatal { .. })),
+            "fourth near-stall eval must abort with Fatal",
+        );
+        let snapshot = stall_snapshot
+            .lock()
+            .expect("stall snapshot mutex poisoned")
+            .take()
+            .expect("fourth near-stall eval must stash a snapshot");
+        assert_eq!(snapshot.last_gradient[0], 4.0);
+        assert_eq!(snapshot.last_gradient_norm, 4.0);
+        assert_eq!(eval_calls.load(Ordering::Relaxed), 4);
     }
 
     #[test]
