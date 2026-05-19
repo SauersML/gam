@@ -875,6 +875,26 @@ impl VisualizerSession {
         redraw_state(&self.state, &snapshot, true);
     }
 
+    /// Start a primary workflow whose total step count is unknown in advance.
+    /// Renders as `Workflow: <label> | step=N | objective=… | …` rather than a
+    /// percentage bar — used by callers like the Python bindings where the
+    /// pyffi entry point doesn't pre-compute a fit-step total and a perpetual
+    /// 0% bar would be misleading. The optimizer-pushed `objective` / `|grad|`
+    /// fields still populate via the same `record_outer_eval` path.
+    pub fn start_workflow_open_ended(&mut self, label: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.primary_lane = LaneState {
+                label: label.to_string(),
+                current: 0,
+                total: None,
+                done: false,
+            };
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
     pub fn advance_workflow(&mut self, current: usize) {
         let snapshot = {
             let mut model = lock_model(&self.model);
