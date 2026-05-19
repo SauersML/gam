@@ -18724,6 +18724,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            cache_session: None,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -18767,6 +18768,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            cache_session: None,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -18813,6 +18815,7 @@ mod tests {
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
+            cache_session: None,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
@@ -21819,20 +21822,24 @@ mod tests {
             ),
             "non-negligible predicted progress must not be hidden by the floor exit"
         );
-        // A positive-but-noise-level actual reduction must also be recognized
-        // as the floor — the sign of `actual_reduction` is round-off at the
-        // optimum and the loop should not spin a cycle further.
+        // A positive-but-noise-level `actual_reduction` must NOT trigger the
+        // floor (asymmetric guard). At rank-deficient optima the outer-gradient
+        // FD identity (`outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`,
+        // inner_tol=1e-12) relies on the trust-region loop running the same
+        // number of attempts at neighbouring λ probes; accepting positive-noise
+        // reductions exits a cycle earlier on the probe where round-off
+        // happened to land positive and decorrelates the null-space drift.
         let positive_noise_actual = 3.783e-10_f64;
         let positive_noise_trial = old_objective - positive_noise_actual;
         assert!(
-            joint_objective_floor_reached(
+            !joint_objective_floor_reached(
                 old_objective,
                 positive_noise_trial,
                 positive_noise_actual,
                 predicted_reduction,
                 objective_tol,
             ),
-            "noise-level positive actual reductions are floor hits, same as negative ones"
+            "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
         );
     }
 
