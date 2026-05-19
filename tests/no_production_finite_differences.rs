@@ -180,6 +180,46 @@ fn skip_block_comment(bytes: &[u8], mut i: usize) -> usize {
     bytes.len()
 }
 
+// Remove line comments, block comments, cooked strings, and raw strings from
+// the input. Markers like "finite difference" (space-separated English) and
+// "fd-" (with a hyphen) cannot appear in Rust identifiers, only in comments
+// and string literals. The test's purpose — flagging finite-difference
+// *computation* in production code — is only meaningful on executable
+// tokens. Stripping non-code spans before the marker scan keeps the test
+// from firing on math-context comments that compare analytic production
+// derivatives against the finite-difference references that test invariants
+// use.
+fn strip_comments_and_strings(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = Vec::<u8>::with_capacity(source.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(bytes, i + 2);
+            }
+            b'"' => {
+                i = skip_cooked_string(bytes, i + 1);
+            }
+            b'r' if raw_string_hashes_at(bytes, i).is_some() => {
+                let hashes = raw_string_hashes_at(bytes, i).expect("checked raw string");
+                i = skip_raw_string(bytes, i + 1 + hashes + 1, hashes);
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).expect("source was utf-8")
+}
+
 #[test]
 fn production_code_has_no_finite_difference_markers() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -191,7 +231,7 @@ fn production_code_has_no_finite_difference_markers() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read source file");
-        let production = strip_cfg_test_blocks(&source).to_lowercase();
+        let production = strip_comments_and_strings(&strip_cfg_test_blocks(&source)).to_lowercase();
         for marker in BANNED_PRODUCTION_MARKERS {
             if production.contains(marker) {
                 violations.push(format!("{} contains `{}`", path.display(), marker));
