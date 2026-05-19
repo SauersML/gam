@@ -91,6 +91,9 @@ def _reml_inputs(
     beta = rng.standard_normal((m, d))
     Y = X @ beta + 0.1 * rng.standard_normal((n, d))
     penalty = np.eye(m)
+    if m > 2:
+        penalty[2, 1] = 0.08
+        penalty[1, 2] = 0.08
     return X, Y, penalty
 
 
@@ -99,17 +102,17 @@ def test_gaussian_reml_fit_gradcheck() -> None:
     X, Y, penalty = _reml_inputs(seed=13)
     x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
 
-    def f(x_: torch.Tensor, y_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit(x_, y_, p_t)
+    def f(x_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
+        out = gt.gaussian_reml_fit(x_, y_, p_)
         # Combine all four outputs into a single scalar so gradcheck can chase
         # any subset of the backward paths.
         return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score
 
     assert torch.autograd.gradcheck(
         f,
-        (x_t, y_t),
+        (x_t, y_t, p_t),
         eps=_GRADCHECK_EPS,
         atol=_GRADCHECK_ATOL,
         rtol=_GRADCHECK_RTOL,
@@ -128,18 +131,20 @@ def test_gaussian_reml_fit_batched_gradcheck() -> None:
     beta = rng.standard_normal((m, d))
     Y = X @ beta + 0.1 * rng.standard_normal((n_total, d))
     penalty = np.eye(m)
+    penalty[2, 1] = 0.06
+    penalty[1, 2] = 0.06
     x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
     off_t = torch.tensor(offsets)
 
-    def f(x_: torch.Tensor, y_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit_batched(x_, y_, off_t, p_t)
+    def f(x_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
+        out = gt.gaussian_reml_fit_batched(x_, y_, off_t, p_)
         return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score.sum()
 
     assert torch.autograd.gradcheck(
         f,
-        (x_t, y_t),
+        (x_t, y_t, p_t),
         eps=_GRADCHECK_EPS,
         atol=_GRADCHECK_ATOL,
         rtol=_GRADCHECK_RTOL,
@@ -156,18 +161,20 @@ def test_gaussian_reml_fit_positions_gradcheck() -> None:
     knots = np.linspace(0.0, 1.0, 9)
     M = knots.size - 3 - 1
     penalty = np.eye(M)
+    penalty[2, 1] = 0.05
+    penalty[1, 2] = 0.05
     t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
     k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
 
-    def f(t_: torch.Tensor, y_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit_positions(t_, y_, "bspline", k_t, p_t)
+    def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
+        out = gt.gaussian_reml_fit_positions(t_, y_, "bspline", k_t, p_)
         return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score
 
     assert torch.autograd.gradcheck(
         f,
-        (t_t, y_t),
+        (t_t, y_t, p_t),
         eps=_GRADCHECK_EPS,
         atol=_GRADCHECK_ATOL,
         rtol=_GRADCHECK_RTOL,
@@ -188,19 +195,21 @@ def test_gaussian_reml_fit_positions_batched_gradcheck() -> None:
     knots = np.linspace(0.0, 1.0, 9)
     M = knots.size - 3 - 1
     penalty = np.eye(M)
+    penalty[2, 1] = 0.04
+    penalty[1, 2] = 0.04
     t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
     k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
+    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
     off_t = torch.tensor(offsets)
 
-    def f(t_: torch.Tensor, y_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit_positions_batched(t_, y_, off_t, "bspline", k_t, p_t)
+    def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
+        out = gt.gaussian_reml_fit_positions_batched(t_, y_, off_t, "bspline", k_t, p_)
         return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score.sum()
 
     assert torch.autograd.gradcheck(
         f,
-        (t_t, y_t),
+        (t_t, y_t, p_t),
         eps=_GRADCHECK_EPS,
         atol=_GRADCHECK_ATOL,
         rtol=_GRADCHECK_RTOL,
