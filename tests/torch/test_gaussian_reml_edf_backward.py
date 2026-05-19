@@ -4,6 +4,31 @@ These tests exercise the `grad_edf` route through the closed-form Gaussian REML
 analytic VJP pipeline: forward via the torch wrapper, then check that the
 gradient of `out.edf` (and composite linear combinations involving it) matches
 finite-difference references on every differentiable input.
+
+Why rank-deficient ``S``
+------------------------
+Real penalty matrices in GAMs are rank-deficient by construction: the null
+space holds the constant function (B-spline difference penalty), or constants
+plus linears (1-D Duchon m=2, classical smoothing splines), or a polynomial
+basis (thin-plate). That null space is what makes the smoother insensitive to
+the function's mean / slope while still penalizing curvature. The code paths
+that handle it — Moore-Penrose ``S⁺``, the rank-detection threshold on
+eigenvalues, ``log|S|₊`` (generalized log-determinant) — are precisely what
+``grad_penalty`` must differentiate correctly. So these tests use
+``S = a aᵀ`` with ``a`` of shape ``(p, p-1)``, giving a one-dimensional null
+space.
+
+FD on rank-deficient ``S`` — directional, in the range
+-------------------------------------------------------
+A naive entry-wise FD perturbation can push the smallest eigenvalue of ``S``
+slightly negative (numerical FP noise + rank-deficient base), at which point
+the REML core's strict PSD validation rejects the perturbed input and FD can't
+even be computed. The mathematically correct fix is to test the gradient
+along directions that respect the rank structure: random symmetric directions
+projected onto the *range* of ``S``. The perturbed ``S ± h·D`` then stays
+rank-deficient (same null space) and stays PSD up to FP, so the forward
+accepts it and FD is well-defined. Entry-wise FD is kept for the
+unconstrained inputs (``x``, ``y``, ``w``).
 """
 
 from __future__ import annotations
@@ -21,21 +46,20 @@ except ImportError:
 
 _F64 = torch.float64
 _RTOL = 5e-5
-_ATOL = 5e-7
+_ATOL = 1e-9
 _FD_STEP = 1e-5
+_RANGE_REL_TOL = 1e-10
 
 
 def _make_penalty(p: int, rng: np.random.Generator) -> np.ndarray:
-    """Build a positive-definite ``(p, p)`` penalty.
+    """Rank-deficient ``(p, p)`` PSD penalty with a one-dimensional null space.
 
-    A small diagonal ridge keeps the smallest eigenvalue well clear of the
-    REML core's PSD tolerance so finite-difference perturbations (which break
-    exact symmetry on individual entries) do not push the matrix into the
-    ill-conditioned rejection band.
+    Built as ``a aᵀ`` with ``a`` of shape ``(p, p-1)``. This matches the
+    structural property of every penalty in production: a non-trivial null
+    space (constants / polynomials) that ``log|S|₊`` and ``S⁺`` must handle.
     """
-
     a = rng.standard_normal((p, p - 1))
-    return (a @ a.T + 1e-2 * np.eye(p)).astype(np.float64)
+    return (a @ a.T).astype(np.float64)
 
 
 def _problem(seed: int = 0, n: int = 15, p: int = 4, d: int = 2):
@@ -57,7 +81,6 @@ def _fit_edf_value(
     x: np.ndarray, y: np.ndarray, s: np.ndarray, w: np.ndarray
 ) -> float:
     """Forward-only edf evaluation (used for finite differences)."""
-
     out = gaussian_reml_fit(
         _to_tensor(x),
         _to_tensor(y),
@@ -67,12 +90,50 @@ def _fit_edf_value(
     return float(out.edf.detach())
 
 
+def _project_to_range(
+    s: np.ndarray, rel_tol: float = _RANGE_REL_TOL
+) -> np.ndarray:
+    """Orthogonal projector onto the range of the symmetric part of ``s``.
+
+    Returns ``U Uᵀ`` where ``U`` columns are eigenvectors of strictly positive
+    eigenvalues. The threshold ``rel_tol·max|eig|`` matches the convention used
+    inside the REML eigenpair cache so the "range" tested here is the same one
+    the analytic helpers treat as the rank of ``S``.
+    """
+    sym = 0.5 * (s + s.T)
+    eigvals, eigvecs = np.linalg.eigh(sym)
+    scale = abs(eigvals).max() if eigvals.size else 0.0
+    threshold = scale * rel_tol
+    mask = eigvals > threshold
+    return eigvecs[:, mask] @ eigvecs[:, mask].T
+
+
+def _sample_range_directions(
+    s: np.ndarray, rng: np.random.Generator, k: int = 5
+) -> list[np.ndarray]:
+    """``k`` random unit-norm symmetric directions living in range(``s``)."""
+    projector = _project_to_range(s)
+    directions: list[np.ndarray] = []
+    for _ in range(k):
+        raw = rng.standard_normal(s.shape)
+        sym = 0.5 * (raw + raw.T)
+        projected = projector @ sym @ projector
+        # Re-symmetrize explicitly to absorb FP noise from the conjugation.
+        projected = 0.5 * (projected + projected.T)
+        norm = np.linalg.norm(projected)
+        if norm > 0.0:
+            projected = projected / norm
+        directions.append(projected)
+    return directions
+
+
 def _fd_grad(
     base: np.ndarray,
     indices: list[tuple[int, ...]],
     objective,
     h: float = _FD_STEP,
 ) -> dict[tuple[int, ...], float]:
+    """Centered entry-wise FD for unconstrained inputs (x, y, w)."""
     grads: dict[tuple[int, ...], float] = {}
     for idx in indices:
         plus = base.copy()
@@ -83,15 +144,23 @@ def _fd_grad(
     return grads
 
 
-def _rel_err(analytic: float, fd: float) -> float:
-    # Absolute tolerance floor: values that round-trip through the analytic
-    # backward at the f64-noise floor (e.g. when both the FD reference and
-    # the analytic land below ~1e-7) compare as exactly matching, since the
-    # relative error of two numerically-zero quantities is meaningless.
-    if abs(analytic) < 1e-7 and abs(fd) < 1e-7:
-        return 0.0
-    scale = max(abs(analytic), abs(fd), 1e-12)
-    return abs(analytic - fd) / scale
+def _fd_directional(
+    base: np.ndarray, direction: np.ndarray, objective, h: float = _FD_STEP
+) -> float:
+    """Centered FD along a matrix-valued direction. Used for ``S``."""
+    plus = objective(base + h * direction)
+    minus = objective(base - h * direction)
+    return (plus - minus) / (2.0 * h)
+
+
+def _analytic_directional(grad: np.ndarray, direction: np.ndarray) -> float:
+    """Frobenius inner product ``⟨grad, direction⟩``."""
+    return float(np.sum(grad * direction))
+
+
+def _matches(analytic: float, fd: float, rtol: float = _RTOL, atol: float = _ATOL) -> bool:
+    """``np.allclose``-style scalar comparison with absolute + relative slack."""
+    return abs(analytic - fd) <= atol + rtol * max(abs(analytic), abs(fd))
 
 
 def _sample_indices(
@@ -119,39 +188,48 @@ def test_edf_backward_matches_finite_difference() -> None:
     assert w.grad is not None
 
     rng = np.random.default_rng(11)
-    targets = {
+    # Unconstrained inputs: entry-wise FD.
+    unconstrained = {
         "x": (x_np, x.grad.detach().numpy(), _sample_indices(x_np.shape, rng, 5)),
         "y": (y_np, y.grad.detach().numpy(), _sample_indices(y_np.shape, rng, 5)),
-        "s": (s_np, s.grad.detach().numpy(), _sample_indices(s_np.shape, rng, 5)),
         "w": (w_np, w.grad.detach().numpy(), _sample_indices(w_np.shape, rng, 4)),
     }
-
-    for name, (base, analytic, idxs) in targets.items():
+    for name, (base, analytic, idxs) in unconstrained.items():
         def obj(arr: np.ndarray, name: str = name) -> float:
             if name == "x":
                 return _fit_edf_value(arr, y_np, s_np, w_np)
             if name == "y":
                 return _fit_edf_value(x_np, arr, s_np, w_np)
-            if name == "s":
-                return _fit_edf_value(x_np, y_np, arr, w_np)
             return _fit_edf_value(x_np, y_np, s_np, arr)
 
         fd = _fd_grad(base, idxs, obj)
         for idx, fd_val in fd.items():
             an_val = float(analytic[idx])
-            err = _rel_err(an_val, fd_val)
-            assert err < _RTOL, (
-                f"{name}{idx}: analytic={an_val:.6e} fd={fd_val:.6e} "
-                f"relerr={err:.2e}"
+            assert _matches(an_val, fd_val), (
+                f"{name}{idx}: analytic={an_val:.6e} fd={fd_val:.6e}"
             )
+
+    # ``S`` is constrained to be symmetric PSD and is rank-deficient by
+    # construction; test the gradient along random symmetric directions in
+    # range(S) so the perturbed S stays inside the PSD cone.
+    analytic_s = s.grad.detach().numpy()
+
+    def obj_s(arr: np.ndarray) -> float:
+        return _fit_edf_value(x_np, y_np, arr, w_np)
+
+    for direction in _sample_range_directions(s_np, rng, k=5):
+        fd_val = _fd_directional(s_np, direction, obj_s)
+        an_val = _analytic_directional(analytic_s, direction)
+        assert _matches(an_val, fd_val), (
+            f"s directional: analytic={an_val:.6e} fd={fd_val:.6e}"
+        )
 
 
 def test_edf_composite_backward_matches_finite_difference() -> None:
     """grad_edf must compose correctly with other upstream gradients."""
-
     x_np, y_np, s_np, w_np = _problem(seed=7)
 
-    coef_alpha = 1.0  # sum of coefficients
+    coef_alpha = 1.0
     edf_alpha = 3.7
     reml_alpha = -0.2
 
@@ -188,16 +266,13 @@ def test_edf_composite_backward_matches_finite_difference() -> None:
     fd = _fd_grad(x_np, idxs, scalar_obj)
     for idx, fd_val in fd.items():
         an_val = float(analytic[idx])
-        err = _rel_err(an_val, fd_val)
-        assert err < _RTOL, (
-            f"composite x{idx}: analytic={an_val:.6e} fd={fd_val:.6e} "
-            f"relerr={err:.2e}"
+        assert _matches(an_val, fd_val), (
+            f"composite x{idx}: analytic={an_val:.6e} fd={fd_val:.6e}"
         )
 
 
 def test_edf_batched_backward_matches_finite_difference() -> None:
     """Batched grad_edf is a length-K vector; one batch component at a time."""
-
     rng = np.random.default_rng(42)
     sizes = [12, 14, 13]
     p, d = 4, 2
@@ -210,9 +285,7 @@ def test_edf_batched_backward_matches_finite_difference() -> None:
     x_np = np.concatenate(x_blocks, axis=0)
     y_np = np.concatenate(y_blocks, axis=0)
     w_np = np.concatenate(w_blocks, axis=0)
-    offsets_np = np.concatenate(
-        [[0], np.cumsum(sizes)]
-    ).astype(np.uintp)
+    offsets_np = np.concatenate([[0], np.cumsum(sizes)]).astype(np.uintp)
 
     def fit_batch(
         x_arr: np.ndarray,
@@ -228,15 +301,12 @@ def test_edf_batched_backward_matches_finite_difference() -> None:
             weights=torch.as_tensor(w_arr, dtype=_F64),
         )
 
-    # Forward + backward on a chosen batch element's edf.
     target_batch = 1
     x_t = _to_tensor(x_np, requires_grad=True)
     y_t = _to_tensor(y_np, requires_grad=True)
     s_t = _to_tensor(s_np, requires_grad=True)
     w_t = _to_tensor(w_np, requires_grad=True)
-    out = fit_batch(x_t.detach().numpy(), y_t.detach().numpy(), s_t.detach().numpy(), w_t.detach().numpy())
 
-    # Re-do forward with requires_grad tensors so autograd graph is alive.
     out = gaussian_reml_fit_batched(
         x_t, y_t, torch.as_tensor(offsets_np), s_t, weights=w_t
     )
@@ -254,45 +324,36 @@ def test_edf_batched_backward_matches_finite_difference() -> None:
     block_start = int(offsets_np[target_batch])
     block_stop = int(offsets_np[target_batch + 1])
     rng2 = np.random.default_rng(55)
-    # Sample a few indices that lie inside the target batch's rows (otherwise
-    # the FD gradient is exactly zero by construction — boring but still a
-    # valid check; we focus on the active region).
-    x_idxs = [(int(rng2.integers(block_start, block_stop)), int(rng2.integers(0, p))) for _ in range(4)]
-    y_idxs = [(int(rng2.integers(block_start, block_stop)), int(rng2.integers(0, d))) for _ in range(4)]
-    s_idxs = _sample_indices(s_np.shape, rng2, 4)
+    x_idxs = [
+        (int(rng2.integers(block_start, block_stop)), int(rng2.integers(0, p)))
+        for _ in range(4)
+    ]
+    y_idxs = [
+        (int(rng2.integers(block_start, block_stop)), int(rng2.integers(0, d)))
+        for _ in range(4)
+    ]
     w_idxs = [(int(rng2.integers(block_start, block_stop)),) for _ in range(3)]
 
-    for name, base, idxs in (
-        ("x", x_np, x_idxs),
-        ("y", y_np, y_idxs),
-        ("s", s_np, s_idxs),
-        ("w", w_np, w_idxs),
-    ):
-        analytic_grad = {
-            "x": x_t.grad.detach().numpy(),
-            "y": y_t.grad.detach().numpy(),
-            "s": s_t.grad.detach().numpy(),
-            "w": w_t.grad.detach().numpy(),
-        }[name]
-
-        def obj(arr: np.ndarray, name: str = name) -> float:
-            if name == "x":
-                return edf_scalar(arr, y_np, s_np, w_np)
-            if name == "y":
-                return edf_scalar(x_np, arr, s_np, w_np)
-            if name == "s":
-                return edf_scalar(x_np, y_np, arr, w_np)
-            return edf_scalar(x_np, y_np, s_np, arr)
-
+    # Entry-wise FD for unconstrained inputs.
+    unconstrained = (
+        ("x", x_np, x_t.grad.detach().numpy(), x_idxs, lambda arr: edf_scalar(arr, y_np, s_np, w_np)),
+        ("y", y_np, y_t.grad.detach().numpy(), y_idxs, lambda arr: edf_scalar(x_np, arr, s_np, w_np)),
+        ("w", w_np, w_t.grad.detach().numpy(), w_idxs, lambda arr: edf_scalar(x_np, y_np, s_np, arr)),
+    )
+    for name, base, analytic, idxs, obj in unconstrained:
         fd = _fd_grad(base, idxs, obj)
         for idx, fd_val in fd.items():
-            an_val = float(analytic_grad[idx])
-            # When the perturbed entry sits outside the target batch's block,
-            # both analytic and FD should be zero — accept either way.
-            if abs(fd_val) < _ATOL and abs(an_val) < _ATOL:
-                continue
-            err = _rel_err(an_val, fd_val)
-            assert err < _RTOL, (
-                f"batched {name}{idx}: analytic={an_val:.6e} fd={fd_val:.6e} "
-                f"relerr={err:.2e}"
+            an_val = float(analytic[idx])
+            assert _matches(an_val, fd_val), (
+                f"batched {name}{idx}: analytic={an_val:.6e} fd={fd_val:.6e}"
             )
+
+    # ``S`` is shared across all batch problems; project FD perturbations into
+    # range(S) for the same reasons as the single-fit test.
+    analytic_s = s_t.grad.detach().numpy()
+    for direction in _sample_range_directions(s_np, rng2, k=5):
+        fd_val = _fd_directional(s_np, direction, lambda arr: edf_scalar(x_np, y_np, arr, w_np))
+        an_val = _analytic_directional(analytic_s, direction)
+        assert _matches(an_val, fd_val), (
+            f"batched s directional: analytic={an_val:.6e} fd={fd_val:.6e}"
+        )
