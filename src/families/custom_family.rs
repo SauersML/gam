@@ -9067,16 +9067,95 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     }
 }
 
-/// Solve the trust-region subproblem
-///
-///     min  m(δ) = -rhs·δ + ½ δ' (H + S + ε·I) δ
-///     s.t. ‖δ‖₂ ≤ Δ
-///
-/// via Moré–Sorensen / Hebden (1973) iteration on the dual variable λ_TR.
-///
-/// Why this exists. Linearly rescaling the unconstrained Newton step
-/// `δ_N = -(H+S+ε·I)⁻¹ rhs` by `Δ/‖δ_N‖` preserves the step's direction, but
-/// for ill-conditioned `H` that direction is dominated by `H`'s near-null
+/// Solve the dense trust-region Newton subproblem with Hebden damping instead
+/// of rescaling the unconstrained Newton direction. Rescaling preserves
+/// near-null components of `H + S` and can leave the iterate objective-flat
+/// but far from KKT stationarity.
+fn dense_more_sorensen_step(
+    hessian_dense: &Array2<f64>,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    base_solver_ridge: f64,
+    rhs: &Array1<f64>,
+    radius: f64,
+    initial_unconstrained_norm: f64,
+) -> Option<(Array1<f64>, f64)> {
+    let radius = radius.max(1.0e-12);
+    let total_p = rhs.len();
+    if hessian_dense.nrows() != total_p || hessian_dense.ncols() != total_p {
+        return None;
+    }
+
+    let mut h_pen_base = hessian_dense.clone();
+    add_joint_penalty_to_matrix(&mut h_pen_base, ranges, s_lambdas, base_solver_ridge);
+    let solver = crate::linalg::utils::StableSolver::new("joint Newton TR subproblem");
+
+    let max_abs_diag = h_pen_base
+        .diag()
+        .iter()
+        .copied()
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max)
+        .max(1.0e-12);
+    let mut lambda_tr = if initial_unconstrained_norm.is_finite()
+        && initial_unconstrained_norm > radius
+    {
+        let oversize = (initial_unconstrained_norm / radius - 1.0).max(0.0);
+        (oversize * max_abs_diag).clamp(1.0e-12, 1.0e18)
+    } else {
+        0.0
+    };
+
+    let radius_tol = (1.0e-3 * radius).max(1.0e-12);
+    let mut best: Option<(Array1<f64>, f64, f64)> = None;
+    for _ in 0..8 {
+        let mut lhs = h_pen_base.clone();
+        if lambda_tr > 0.0 {
+            for d in 0..total_p {
+                lhs[[d, d]] += lambda_tr;
+            }
+        }
+
+        let delta =
+            solver.solvevectorwithridge_retries(&lhs, rhs, JOINT_TRACE_STABILITY_RIDGE)?;
+        if !delta.iter().all(|v| v.is_finite()) {
+            lambda_tr = (lambda_tr * 4.0).max(1.0e-9);
+            continue;
+        }
+
+        let delta_norm = joint_trust_region_step_norm(&delta);
+        let err = (delta_norm - radius).abs();
+        if best.as_ref().is_none_or(|(_, _, e)| err < *e) {
+            best = Some((delta.clone(), lambda_tr, err));
+        }
+        if err <= radius_tol {
+            return Some((delta, lambda_tr));
+        }
+
+        let q = solver.solvevectorwithridge_retries(&lhs, &delta, JOINT_TRACE_STABILITY_RIDGE)?;
+        let q_norm = joint_trust_region_step_norm(&q);
+        if !q_norm.is_finite() || q_norm <= 0.0 {
+            break;
+        }
+
+        let secant = (delta_norm / q_norm).powi(2) * (delta_norm - radius) / radius;
+        let mut lambda_new = lambda_tr + secant;
+        if !lambda_new.is_finite() {
+            break;
+        }
+        if lambda_new < 0.0 {
+            lambda_new = 0.5 * lambda_tr;
+        }
+        let upper_jump = (lambda_tr.max(max_abs_diag) * 10.0).max(1.0);
+        if lambda_new > lambda_tr + upper_jump {
+            lambda_new = lambda_tr + upper_jump;
+        }
+        lambda_tr = lambda_new;
+    }
+
+    best.map(|(delta, lambda, _)| (delta, lambda))
+}
+
 fn apply_joint_penalized_hessian_into(
     source: &JointHessianSource,
     ranges: &[(usize, usize)],
@@ -10256,15 +10335,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // properly (Moré–Sorensen / Hebden damping); the constrained QP
             // and matrix-free PCG paths keep the rescaling fallback (their
             // step directions are not simple Newton solves).
-            let tr_rhs_pen = {
-                let penalty_beta_for_rhs = apply_joint_block_penalty(
-                    &ranges,
-                    &s_lambdas,
-                    &beta_joint,
-                    joint_mode_diagonal_ridge,
-                );
-                &grad_joint - &penalty_beta_for_rhs
-            };
             let tr_dense_unconstrained = joint_constraints.is_none()
                 && matches!(&joint_hessian_source, JointHessianSource::Dense(_));
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
@@ -10284,7 +10354,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &ranges,
                         &s_lambdas,
                         joint_solver_diagonal_ridge,
-                        &tr_rhs_pen,
+                        &rhs,
                         joint_trust_radius,
                         search_norm,
                     )
