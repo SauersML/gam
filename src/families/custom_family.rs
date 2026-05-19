@@ -9695,24 +9695,39 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // (they advance `cycle` via the iterator), unlike a `while` +
         // manual-counter rewrite.
         let inner_loop_hard_ceiling = inner_max_cycles.max(200);
+        // Verbose cadence for the inner joint-Newton log block. Boring cycles
+        // (first-attempt accepts with no convergence event) emit ONE compact
+        // one-liner instead of the 4-line pre-cycle/TR/cycle-summary/convergence
+        // block. Verbose cycles (first, last, every 20th, all rejections,
+        // convergence events) keep the full detail. JOINT_LOG_VERBOSE_PERIOD is
+        // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
+        // 1 compact line per remaining cycle (~210 lines), down from ~800.
+        const JOINT_LOG_VERBOSE_PERIOD: usize = 20;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
             }
+            let verbose_cycle = cycle == 0
+                || cycle + 1 == inner_max_cycles
+                || (cycle + 1) % JOINT_LOG_VERBOSE_PERIOD == 0;
             // Fires at the top of each inner joint-Newton cycle so CI logs can
             // distinguish "inner spin" (thousands of these) from "outer-assembly
             // spin" (zero of these). Emitted at info-level so the silent-grind
             // failure mode (e.g. CI hitting cmd timeout while PIRLS quietly
             // chews on the first outer-iter at biobank scale) is visible
-            // without enabling debug logs.
-            log::info!(
-                "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
-                cycle,
-                inner_max_cycles,
-                -current_log_likelihood,
-                current_penalty,
-                lastobjective,
-            );
+            // without enabling debug logs. Throttled to verbose-cadence cycles
+            // — the compact post-cycle one-liner below carries the same info
+            // on non-verbose cycles.
+            if verbose_cycle {
+                log::info!(
+                    "[PIRLS/blockwise joint-Newton] cycle {:>3}/{} | -loglik {:.6e} | penalty {:.6e} | objective {:.6e}",
+                    cycle,
+                    inner_max_cycles,
+                    -current_log_likelihood,
+                    current_penalty,
+                    lastobjective,
+                );
+            }
             // Per-cycle phase-timing accumulators. Surface where the inner
             // joint-Newton spends time so a 18-min silent cycle 0 (the
             // bernoulli marginal-slope FLEX biobank failure mode) becomes a
@@ -10514,21 +10529,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 objective_rejects += 1;
             }
-            if let Some(prev) = tr_log_sig.as_deref() {
-                if tr_log_first == tr_log_last {
-                    log::info!(
-                        "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
-                        cycle, tr_log_first, prev,
-                    );
-                } else {
-                    log::info!(
-                        "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
-                        cycle,
-                        tr_log_first,
-                        tr_log_last,
-                        tr_log_last - tr_log_first + 1,
-                        prev,
-                    );
+            // The per-attempt TR signature carries ρ, radius, step size — useful
+            // on rejections and rare events, redundant on routine first-attempt
+            // accepts. Emit on verbose cycles or whenever the search ran more
+            // than one attempt (multi-attempt cycles are inherently interesting).
+            let tr_log_interesting =
+                verbose_cycle || line_search_attempts > 1 || !accepted;
+            if tr_log_interesting {
+                if let Some(prev) = tr_log_sig.as_deref() {
+                    if tr_log_first == tr_log_last {
+                        log::info!(
+                            "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
+                            cycle, tr_log_first, prev,
+                        );
+                    } else {
+                        log::info!(
+                            "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
+                            cycle,
+                            tr_log_first,
+                            tr_log_last,
+                            tr_log_last - tr_log_first + 1,
+                            prev,
+                        );
+                    }
                 }
             }
             let line_search_elapsed = line_search_started.elapsed();
@@ -10700,15 +10723,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 accepted_joint_workspace.take(),
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
-            log::info!(
-                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
-                cycle,
-                hessian_and_qp_elapsed.as_secs_f64(),
-                line_search_elapsed.as_secs_f64(),
-                line_search_attempts,
-                grad_reload_elapsed.as_secs_f64(),
-                cycle_started.elapsed().as_secs_f64(),
-            );
+            if verbose_cycle {
+                log::info!(
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
+                    cycle,
+                    hessian_and_qp_elapsed.as_secs_f64(),
+                    line_search_elapsed.as_secs_f64(),
+                    line_search_attempts,
+                    grad_reload_elapsed.as_secs_f64(),
+                    cycle_started.elapsed().as_secs_f64(),
+                );
+            }
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
             cached_eval = eval;
@@ -10778,18 +10803,46 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // this, the only visible signal is the objective itself,
             // which is insufficient to choose the right algorithmic
             // remedy.
-            log::info!(
-                "[PIRLS/joint-Newton convergence] cycle {:>3} | proposal_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
-                cycle,
-                step_inf,
-                step_tol,
-                accepted_step_inf,
-                residual,
-                residual_tol,
-                objective_change,
-                objective_tol,
-                beta_inf,
-            );
+            //
+            // Verbose cycles (first, last, every JOINT_LOG_VERBOSE_PERIOD,
+            // near-convergence) emit the full criterion-by-criterion
+            // breakdown; routine cycles emit a single compact one-liner
+            // that still carries cycle/objective/Δobj/step/residual/time so
+            // a CI tail can confirm the solver is descending without
+            // drowning in 4 lines per cycle. Near-convergence (any tolerance
+            // criterion within an order of magnitude of firing) auto-promotes
+            // the cycle to verbose so the binding-criterion diagnostic is
+            // visible when it matters most.
+            let near_convergence = residual <= 10.0 * residual_tol
+                || step_inf <= 10.0 * step_tol
+                || objective_change <= 10.0 * objective_tol;
+            if verbose_cycle || near_convergence {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | proposal_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
+                    cycle,
+                    step_inf,
+                    step_tol,
+                    accepted_step_inf,
+                    residual,
+                    residual_tol,
+                    objective_change,
+                    objective_tol,
+                    beta_inf,
+                );
+            } else {
+                let signed_obj_change = lastobjective - old_objective;
+                log::info!(
+                    "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} Δobj={:+.3e} |δ|∞={:.3e} resid={:.3e} attempts={} t={:.3}s",
+                    cycle,
+                    inner_max_cycles,
+                    lastobjective,
+                    signed_obj_change,
+                    accepted_step_inf,
+                    residual,
+                    line_search_attempts,
+                    cycle_started.elapsed().as_secs_f64(),
+                );
+            }
 
             // KKT convergence: a small post-step residual is the
             // canonical optimality certificate for the penalized
