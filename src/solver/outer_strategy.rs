@@ -2011,20 +2011,6 @@ struct OuterFirstOrderBridge<'a> {
     /// cap conservatively LARGER than the truly-needed value, never
     /// smaller.
     last_g_norm: Option<f64>,
-    /// Local line-search trust budget on the **rho axes** (the first
-    /// `layout.rho_dim()` outer parameters = log-λ). When set, cost-only
-    /// probes whose `step_inf` on the rho block exceeds this cap are
-    /// rejected with a large finite cost before invoking the expensive
-    /// inner solve. Documented natural step on log-λ is ≈ 5.
-    line_search_step_cap_rho: Option<f64>,
-    /// Local line-search trust budget on the **psi axes** (the trailing
-    /// `layout.psi_dim` outer parameters = kappa / aniso-log-scales). The
-    /// kernel scale needs much tighter control than log-λ (≈ ln 2 per iter)
-    /// to avoid oscillating through orders of magnitude. Independent of
-    /// the rho cap so the survival-marginal-slope joint solver can give
-    /// rho the full step budget it needs without letting psi explode.
-    line_search_step_cap_psi: Option<f64>,
-    last_gradient_point: Option<Array1<f64>>,
     objective_stall_rel_tol: Option<f64>,
     last_gradient_cost: Option<f64>,
     objective_stall_evals: usize,
