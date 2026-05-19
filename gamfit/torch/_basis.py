@@ -184,9 +184,10 @@ def bspline_basis_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
+    knots_t = _resolve_knots_tensor(t, knots, degree=int(degree))
     deriv = _api.bspline_basis_derivative(
         to_numpy_f64(t),
-        to_numpy_f64(knots),
+        to_numpy_f64(knots_t),
         degree=int(degree),
         order=int(order),
         periodic=bool(periodic),
@@ -196,7 +197,7 @@ def bspline_basis_derivative(
 
 def duchon_basis_1d(
     t: torch.Tensor,
-    centers: torch.Tensor,
+    centers: Any = None,
     *,
     m: int = 2,
     periodic: bool = False,
@@ -219,13 +220,14 @@ def duchon_basis_1d(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
+    centers_t = _resolve_centers_tensor(t, centers)
     apply = cast(Callable[..., torch.Tensor], _DuchonBasis1dFn.apply)
-    return apply(t, centers, int(m), bool(periodic))
+    return apply(t, centers_t, int(m), bool(periodic))
 
 
 def duchon_basis_1d_derivative(
     t: torch.Tensor,
-    centers: torch.Tensor,
+    centers: Any = None,
     *,
     m: int = 2,
     order: int = 1,
@@ -255,9 +257,10 @@ def duchon_basis_1d_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
+    centers_t = _resolve_centers_tensor(t, centers)
     deriv = _api.duchon_basis_1d_derivative(
         to_numpy_f64(t),
-        to_numpy_f64(centers),
+        to_numpy_f64(centers_t),
         m=int(m),
         order=int(order),
         periodic=bool(periodic),
