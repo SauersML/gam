@@ -10725,17 +10725,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 accepted_joint_workspace.take(),
             )?;
             let grad_reload_elapsed = grad_reload_started.elapsed();
-            if verbose_cycle {
-                log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
-                    cycle,
-                    hessian_and_qp_elapsed.as_secs_f64(),
-                    line_search_elapsed.as_secs_f64(),
-                    line_search_attempts,
-                    grad_reload_elapsed.as_secs_f64(),
-                    cycle_started.elapsed().as_secs_f64(),
-                );
-            }
+            // Accepted-cycle timing breakdown is debug-only. The per-cycle
+            // info line below already includes total cycle time; emitting a
+            // four-phase split on every verbose cycle adds a redundant info
+            // line. Rejected cycles still keep the detailed phase log since
+            // the reject reason and per-phase split is the diagnostic.
+            log::debug!(
+                "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload={:.3}s total={:.3}s",
+                cycle,
+                hessian_and_qp_elapsed.as_secs_f64(),
+                line_search_elapsed.as_secs_f64(),
+                line_search_attempts,
+                grad_reload_elapsed.as_secs_f64(),
+                cycle_started.elapsed().as_secs_f64(),
+            );
             current_log_likelihood = log_likelihood;
             cached_joint_gradient = gradient;
             cached_eval = eval;
