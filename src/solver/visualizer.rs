@@ -152,8 +152,116 @@ enum VisualizerState {
 }
 
 pub struct VisualizerSession {
-    state: VisualizerState,
-    model: VisualizerModel,
+    state: SharedState,
+    model: SharedModel,
+}
+
+type SharedModel = Arc<Mutex<VisualizerModel>>;
+type SharedState = Arc<Mutex<VisualizerState>>;
+
+#[derive(Clone)]
+struct ActiveFeed {
+    model: SharedModel,
+    state: SharedState,
+}
+
+static ACTIVE_FEED: OnceLock<Mutex<Option<ActiveFeed>>> = OnceLock::new();
+
+fn active_feed_slot() -> &'static Mutex<Option<ActiveFeed>> {
+    ACTIVE_FEED.get_or_init(|| Mutex::new(None))
+}
+
+fn install_active_feed(feed: ActiveFeed) {
+    if let Ok(mut guard) = active_feed_slot().lock() {
+        *guard = Some(feed);
+    }
+}
+
+fn clear_active_feed() {
+    if let Ok(mut guard) = active_feed_slot().lock() {
+        *guard = None;
+    }
+}
+
+fn current_active_feed() -> Option<ActiveFeed> {
+    active_feed_slot()
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().cloned())
+}
+
+/// Hook for the outer optimizer: record a single objective+gradient evaluation
+/// as a trial point. Threads through `Arc<Mutex<...>>` so deep solver call
+/// stacks can publish samples without holding the session. No-op when no
+/// visualizer is active (e.g. unit tests, embedded use). The renderer is
+/// throttled internally (~40 ms interactive, ~1 s dumb) so spamming this from
+/// a tight loop is safe.
+pub fn record_outer_eval(cost: f64, grad_norm: f64) {
+    let Some(feed) = current_active_feed() else {
+        return;
+    };
+    let snapshot = {
+        let mut model = match feed.model.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        model.outer_eval_counter += 1.0;
+        let iter = model.outer_eval_counter;
+        model.current_iter = iter;
+        model.current_cost = cost;
+        model.current_grad = grad_norm;
+        model.current_eval_state = "trial".to_string();
+        if cost.is_finite() && cost.abs() < 1e15 {
+            push_sample(&mut model.history_cost_trial, (iter, cost));
+        }
+        if grad_norm.is_finite() {
+            let g_log = grad_norm.max(1e-12).log10();
+            push_sample(&mut model.history_grad_log, (iter, g_log));
+        }
+        model.last_trial = Some((iter, cost, grad_norm));
+        model.clone()
+    };
+    if let Ok(mut state) = feed.state.lock() {
+        match &mut *state {
+            VisualizerState::Disabled => {}
+            VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
+            VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
+        }
+    }
+}
+
+/// Hook for the outer optimizer: promote the most recent trial point into the
+/// accepted series after the optimizer's trust-region/line-search accepts it.
+/// Paired with `record_outer_eval` in the bridges. Safe to call from any
+/// thread; no-op when no visualizer is active or when no trial has been
+/// recorded yet.
+pub fn record_outer_accept() {
+    let Some(feed) = current_active_feed() else {
+        return;
+    };
+    let snapshot = {
+        let mut model = match feed.model.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some((iter, cost, _grad)) = model.last_trial {
+            if cost.is_finite() && cost.abs() < 1e15 {
+                push_sample(&mut model.history_cost_accepted, (iter, cost));
+                if cost < model.best_cost {
+                    model.best_cost = cost;
+                }
+            }
+            model.current_eval_state = "accepted".to_string();
+        }
+        model.clone()
+    };
+    if let Ok(mut state) = feed.state.lock() {
+        match &mut *state {
+            VisualizerState::Disabled => {}
+            VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
+            VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
+        }
+    }
 }
 
 struct InteractiveVisualizer {
@@ -594,9 +702,32 @@ fn sync_bar(bar: &ProgressBar, lane: &LaneState, model: &VisualizerModel) {
 impl Default for VisualizerSession {
     fn default() -> Self {
         Self {
-            state: VisualizerState::Disabled,
-            model: VisualizerModel::default(),
+            state: Arc::new(Mutex::new(VisualizerState::Disabled)),
+            model: Arc::new(Mutex::new(VisualizerModel::default())),
         }
+    }
+}
+
+fn lock_model(model: &SharedModel) -> std::sync::MutexGuard<'_, VisualizerModel> {
+    match model.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, VisualizerState> {
+    match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+fn redraw_state(state: &SharedState, snapshot: &VisualizerModel, force: bool) {
+    let mut state = lock_state(state);
+    match &mut *state {
+        VisualizerState::Disabled => {}
+        VisualizerState::Interactive(vis) => vis.maybe_draw(snapshot, force),
+        VisualizerState::Dumb(vis) => vis.maybe_draw(snapshot, force),
     }
 }
 
@@ -609,7 +740,7 @@ impl VisualizerSession {
         let notebook_or_noninteractive = should_use_text_only_progress();
         let interactive =
             !notebook_or_noninteractive && io::stdout().is_terminal() && io::stderr().is_terminal();
-        let state = if interactive {
+        let state_inner = if interactive {
             match InteractiveVisualizer::new() {
                 Ok(v) => VisualizerState::Interactive(v),
                 Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
@@ -617,19 +748,24 @@ impl VisualizerSession {
         } else {
             VisualizerState::Dumb(DumbVisualizer::new(true))
         };
-        Self {
-            state,
-            model: VisualizerModel::default(),
-        }
+        let session = Self {
+            state: Arc::new(Mutex::new(state_inner)),
+            model: Arc::new(Mutex::new(VisualizerModel::default())),
+        };
+        install_active_feed(ActiveFeed {
+            model: session.model.clone(),
+            state: session.state.clone(),
+        });
+        session
     }
 
     pub fn is_active(&self) -> bool {
-        !matches!(self.state, VisualizerState::Disabled)
+        !matches!(&*lock_state(&self.state), VisualizerState::Disabled)
     }
 
     #[cfg(test)]
     pub(crate) fn is_interactive(&self) -> bool {
-        matches!(self.state, VisualizerState::Interactive(_))
+        matches!(&*lock_state(&self.state), VisualizerState::Interactive(_))
     }
 
     pub fn update(
@@ -641,119 +777,158 @@ impl VisualizerSession {
         eval_state: &str,
         total_steps: Option<usize>,
     ) {
-        self.model.current_iter = iter;
-        self.model.current_cost = cost;
-        self.model.current_grad = grad_norm;
-        self.model.current_eval_state = eval_state.to_string();
-        self.model.current_status = status_msg.to_string();
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.current_iter = iter;
+            model.current_cost = cost;
+            model.current_grad = grad_norm;
+            model.current_eval_state = eval_state.to_string();
+            model.current_status = status_msg.to_string();
 
-        if let Some(total) = total_steps {
-            self.model.primary_lane.total = Some(total);
-            self.model.primary_lane.current = iter.max(0.0).round() as usize;
-        }
-
-        if cost.is_finite() && cost.abs() < 1e15 {
-            let target_series = if eval_state == "trial" {
-                &mut self.model.history_cost_trial
-            } else {
-                &mut self.model.history_cost_accepted
-            };
-            push_sample(target_series, (iter, cost));
-            if cost < self.model.best_cost {
-                self.model.best_cost = cost;
+            if let Some(total) = total_steps {
+                model.primary_lane.total = Some(total);
+                model.primary_lane.current = iter.max(0.0).round() as usize;
             }
-        }
 
-        if grad_norm.is_finite() {
-            let grad_log = grad_norm.max(1e-12).log10();
-            push_sample(&mut self.model.history_grad_log, (iter, grad_log));
-        }
+            if cost.is_finite() && cost.abs() < 1e15 {
+                let target_series = if eval_state == "trial" {
+                    &mut model.history_cost_trial
+                } else {
+                    &mut model.history_cost_accepted
+                };
+                push_sample(target_series, (iter, cost));
+                if cost < model.best_cost {
+                    model.best_cost = cost;
+                }
+            }
 
-        self.redraw(false);
+            if grad_norm.is_finite() {
+                let grad_log = grad_norm.max(1e-12).log10();
+                push_sample(&mut model.history_grad_log, (iter, grad_log));
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
     }
 
     pub fn set_stage(&mut self, stage: &str, detail: &str) {
-        self.model.current_stage = stage.to_string();
-        self.model.current_detail = detail.to_string();
-        self.model.current_status = detail.to_string();
-        self.redraw(true);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.current_stage = stage.to_string();
+            model.current_detail = detail.to_string();
+            model.current_status = detail.to_string();
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn start_workflow(&mut self, label: &str, total: usize) {
-        self.model.primary_lane = started_lane(label, total);
-        self.redraw(true);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.primary_lane = started_lane(label, total);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn advance_workflow(&mut self, current: usize) {
-        if self.model.primary_lane.label.is_empty() {
-            return;
-        }
-        advance_lane(&mut self.model.primary_lane, current);
-        self.redraw(false);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.primary_lane.label.is_empty() {
+                return;
+            }
+            advance_lane(&mut model.primary_lane, current);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
     }
 
     pub fn start_secondary_workflow(&mut self, label: &str, total: usize) {
-        self.model.secondary_lane = started_lane(label, total);
-        self.redraw(true);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.secondary_lane = started_lane(label, total);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn advance_secondary_workflow(&mut self, current: usize) {
-        if self.model.secondary_lane.label.is_empty() {
-            return;
-        }
-        advance_lane(&mut self.model.secondary_lane, current);
-        self.redraw(false);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.secondary_lane.label.is_empty() {
+                return;
+            }
+            advance_lane(&mut model.secondary_lane, current);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
     }
 
     pub fn finish_secondary_progress(&mut self, message: &str) {
-        if self.model.secondary_lane.label.is_empty() {
-            return;
-        }
-        if let Some(total) = self.model.secondary_lane.total {
-            self.model.secondary_lane.current = total;
-        }
-        self.model.secondary_lane.done = true;
-        self.push_diagnostic(message);
-        self.redraw(true);
-        self.model.secondary_lane = LaneState::default();
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.secondary_lane.label.is_empty() {
+                return;
+            }
+            if let Some(total) = model.secondary_lane.total {
+                model.secondary_lane.current = total;
+            }
+            model.secondary_lane.done = true;
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            let snap = model.clone();
+            model.secondary_lane = LaneState::default();
+            snap
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn finish_progress(&mut self, message: &str) {
-        if self.model.primary_lane.label.is_empty() {
-            return;
-        }
-        if let Some(total) = self.model.primary_lane.total {
-            self.model.primary_lane.current = total;
-        }
-        self.model.primary_lane.done = true;
-        self.push_diagnostic(message);
-        self.redraw(true);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.primary_lane.label.is_empty() {
+                return;
+            }
+            if let Some(total) = model.primary_lane.total {
+                model.primary_lane.current = total;
+            }
+            model.primary_lane.done = true;
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn push_diagnostic(&mut self, message: &str) {
-        self.model.diagnostics_lines.push(message.to_string());
-        if self.model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
-            let overflow = self.model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
-            self.model.diagnostics_lines.drain(0..overflow);
-        }
-        self.redraw(true);
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
     }
 
     pub fn teardown(&mut self) {
-        match &mut self.state {
+        clear_active_feed();
+        let snapshot = lock_model(&self.model).clone();
+        let mut state = lock_state(&self.state);
+        match &mut *state {
             VisualizerState::Disabled => {}
-            VisualizerState::Interactive(vis) => vis.teardown(&self.model),
-            VisualizerState::Dumb(vis) => vis.teardown(&self.model),
+            VisualizerState::Interactive(vis) => vis.teardown(&snapshot),
+            VisualizerState::Dumb(vis) => vis.teardown(&snapshot),
         }
-        self.state = VisualizerState::Disabled;
-    }
-
-    fn redraw(&mut self, force: bool) {
-        match &mut self.state {
-            VisualizerState::Disabled => {}
-            VisualizerState::Interactive(vis) => vis.maybe_draw(&self.model, force),
-            VisualizerState::Dumb(vis) => vis.maybe_draw(&self.model, force),
-        }
+        *state = VisualizerState::Disabled;
     }
 }
 
@@ -1132,15 +1307,19 @@ mod tests {
         assert!(bar.contains('▎') || bar.contains('▍') || bar.contains('▌') || bar.contains('▋'));
     }
 
+    fn snapshot(session: &VisualizerSession) -> VisualizerModel {
+        lock_model(&session.model).clone()
+    }
+
     #[test]
     fn dumb_renderer_throttles_to_seconds_and_formats_eta() {
         let mut session = VisualizerSession::new(false);
-        session.model.start_time = Instant::now() - Duration::from_secs(4);
+        lock_model(&session.model).start_time = Instant::now() - Duration::from_secs(4);
         session.set_stage("fit", "optimizing");
         session.start_workflow("REML", 10);
         session.advance_workflow(4);
         session.update(42.0, 1e-3, "optimizing", 4.0, "accepted", Some(10));
-        let lines = dumb_render_lines(&session.model);
+        let lines = dumb_render_lines(&snapshot(&session));
         assert!(lines.iter().any(|line| line.contains("Workflow: REML")));
         assert!(lines.iter().any(|line| line.contains("ETA:")));
     }
@@ -1148,7 +1327,7 @@ mod tests {
     #[test]
     fn dumb_renderer_suppresses_uninitialized_frames() {
         let session = VisualizerSession::new(false);
-        let lines = dumb_render_lines(&session.model);
+        let lines = dumb_render_lines(&snapshot(&session));
         assert!(lines.is_empty());
     }
 
@@ -1158,7 +1337,7 @@ mod tests {
         session.set_stage("fit", "loading survival data");
         session.start_workflow("Survival Fit", 5);
         session.advance_workflow(1);
-        let lines = dumb_render_lines(&session.model);
+        let lines = dumb_render_lines(&snapshot(&session));
         assert!(lines.iter().all(|line| !line.contains("n/a")));
         assert!(
             lines
@@ -1173,9 +1352,10 @@ mod tests {
         for idx in 0..20 {
             session.push_diagnostic(&format!("line {idx}"));
         }
-        assert_eq!(session.model.diagnostics_lines.len(), MAX_DIAGNOSTIC_LINES);
+        let snap = snapshot(&session);
+        assert_eq!(snap.diagnostics_lines.len(), MAX_DIAGNOSTIC_LINES);
         assert_eq!(
-            session.model.diagnostics_lines.first().map(String::as_str),
+            snap.diagnostics_lines.first().map(String::as_str),
             Some("line 10")
         );
     }
@@ -1185,11 +1365,12 @@ mod tests {
         let mut session = VisualizerSession::new(false);
         session.start_secondary_workflow("inner", 5);
         session.advance_secondary_workflow(2);
-        assert_eq!(session.model.secondary_lane.label, "inner");
+        assert_eq!(snapshot(&session).secondary_lane.label, "inner");
         session.finish_secondary_progress("done");
-        assert!(session.model.secondary_lane.label.is_empty());
+        let snap = snapshot(&session);
+        assert!(snap.secondary_lane.label.is_empty());
         assert_eq!(
-            session.model.diagnostics_lines.last().map(String::as_str),
+            snap.diagnostics_lines.last().map(String::as_str),
             Some("done")
         );
     }
@@ -1207,32 +1388,33 @@ mod tests {
         session.start_workflow("outer", 10);
         session.advance_workflow(5);
         session.finish_progress("outer complete");
+        let snap = snapshot(&session);
         assert_eq!(
-            session.model.diagnostics_lines.last().map(String::as_str),
+            snap.diagnostics_lines.last().map(String::as_str),
             Some("outer complete")
         );
-        assert!(session.model.primary_lane.done);
-        assert_eq!(session.model.primary_lane.current, 10);
+        assert!(snap.primary_lane.done);
+        assert_eq!(snap.primary_lane.current, 10);
     }
 
     #[test]
     fn workflow_normalizes_zero_total_and_never_goes_backwards() {
         let mut session = VisualizerSession::new(false);
         session.start_workflow("outer", 0);
-        assert_eq!(session.model.primary_lane.total, Some(1));
+        assert_eq!(snapshot(&session).primary_lane.total, Some(1));
         session.advance_workflow(1);
         session.advance_workflow(0);
-        assert_eq!(session.model.primary_lane.current, 1);
+        assert_eq!(snapshot(&session).primary_lane.current, 1);
     }
 
     #[test]
     fn secondary_workflow_ignores_advances_before_start() {
         let mut session = VisualizerSession::new(false);
         session.advance_secondary_workflow(3);
-        assert!(session.model.secondary_lane.label.is_empty());
+        assert!(snapshot(&session).secondary_lane.label.is_empty());
         session.start_secondary_workflow("inner", 2);
         session.advance_secondary_workflow(5);
-        assert_eq!(session.model.secondary_lane.current, 2);
+        assert_eq!(snapshot(&session).secondary_lane.current, 2);
     }
 
     #[test]
@@ -1240,7 +1422,36 @@ mod tests {
         let mut session = VisualizerSession::new(false);
         session.set_stage("fit", "optimizing");
         session.push_diagnostic("warning: matrix ill-conditioned");
-        let lines = dumb_render_lines(&session.model);
+        let lines = dumb_render_lines(&snapshot(&session));
         assert!(lines.first().is_some_and(|line| line.contains("[WARNING]")));
+    }
+
+    #[test]
+    fn record_outer_eval_populates_trial_series_when_session_is_active() {
+        // The accepted hook can only promote the most recent trial point, so
+        // a trial push must populate `last_trial`; otherwise the chart's
+        // accepted series stays empty even when the optimizer accepts steps.
+        let _session = VisualizerSession::new(true);
+        record_outer_eval(123.4, 1e-2);
+        let feed = current_active_feed().expect("feed registered");
+        let model = lock_model(&feed.model);
+        assert_eq!(model.history_cost_trial.len(), 1);
+        assert!(model.last_trial.is_some());
+        assert_eq!(model.current_eval_state, "trial");
+    }
+
+    #[test]
+    fn record_outer_accept_promotes_last_trial_into_accepted_series() {
+        // Promotion must reuse the trial's (iter, cost). Otherwise the chart
+        // would draw an accepted line at the wrong x-coordinate when the
+        // optimizer skips a trial via line-search caching.
+        let _session = VisualizerSession::new(true);
+        record_outer_eval(50.0, 1e-3);
+        record_outer_accept();
+        let feed = current_active_feed().expect("feed registered");
+        let model = lock_model(&feed.model);
+        assert_eq!(model.history_cost_accepted.len(), 1);
+        assert_eq!(model.history_cost_accepted[0].1, 50.0);
+        assert_eq!(model.current_eval_state, "accepted");
     }
 }
