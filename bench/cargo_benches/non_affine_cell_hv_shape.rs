@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
+use std::hint::black_box;
 
 fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
     (0..64)

@@ -1,9 +1,9 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{
     DenestedCubicCell, cell_moment_cache_key, evaluate_cell_moments,
 };
 use std::collections::HashMap;
+use std::hint::black_box;
 
 fn synthetic_biobank_cells(n_rows: usize, cells_per_row: usize) -> Vec<DenestedCubicCell> {
     let prototypes: Vec<_> = (0..128)

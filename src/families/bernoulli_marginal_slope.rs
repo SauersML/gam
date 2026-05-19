@@ -3575,12 +3575,23 @@ impl BernoulliBlockHessianAccumulator {
             .logslope_design
             .try_row_chunk(rows)
             .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-        self.h_mm += &crate::faer_ndarray::fast_xt_diag_x(&x, w_mm);
-        if w_mg.iter().any(|value| *value != 0.0) {
-            self.h_mg += &crate::faer_ndarray::fast_xt_diag_y(&x, w_mg, &g);
-        }
-        self.h_gg += &crate::faer_ndarray::fast_xt_diag_x(&g, w_gg);
+        self.add_weighted_design_grams_from_chunks(&x, &g, w_mm, w_mg, w_gg);
         Ok(())
+    }
+
+    fn add_weighted_design_grams_from_chunks(
+        &mut self,
+        x: &Array2<f64>,
+        g: &Array2<f64>,
+        w_mm: &Array1<f64>,
+        w_mg: &Array1<f64>,
+        w_gg: &Array1<f64>,
+    ) {
+        self.h_mm += &crate::faer_ndarray::fast_xt_diag_x(x, w_mm);
+        if w_mg.iter().any(|value| *value != 0.0) {
+            self.h_mg += &crate::faer_ndarray::fast_xt_diag_y(x, w_mg, g);
+        }
+        self.h_gg += &crate::faer_ndarray::fast_xt_diag_x(g, w_gg);
     }
 
     /// Batch the exact h/w pullback terms for one row chunk.
@@ -7796,6 +7807,114 @@ impl BernoulliMarginalSlopeFamily {
                 .assign(&d_beta_flat.slice(s![block_range.clone()]).to_owned());
         }
         Ok(out)
+    }
+
+    fn stacked_direction_block(
+        d_beta_flats: &[Array1<f64>],
+        range: std::ops::Range<usize>,
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((range.len(), d_beta_flats.len()));
+        for (dir_idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
+            out.column_mut(dir_idx)
+                .assign(&d_beta_flat.slice(s![range.clone()]));
+        }
+        out
+    }
+
+    fn row_primary_directions_from_projected(
+        local_row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        d_beta_flats: &[Array1<f64>],
+        marginal_projected: &Array2<f64>,
+        logslope_projected: &Array2<f64>,
+    ) -> Vec<Array1<f64>> {
+        let mut out = Vec::with_capacity(d_beta_flats.len());
+        for (dir_idx, d_beta_flat) in d_beta_flats.iter().enumerate() {
+            let mut direction = Array1::<f64>::zeros(primary.total);
+            direction[primary.q] = marginal_projected[[local_row, dir_idx]];
+            direction[primary.logslope] = logslope_projected[[local_row, dir_idx]];
+            if let (Some(block_range), Some(primary_range)) =
+                (slices.h.as_ref(), primary.h.as_ref())
+            {
+                direction
+                    .slice_mut(s![primary_range.start..primary_range.end])
+                    .assign(&d_beta_flat.slice(s![block_range.clone()]));
+            }
+            if let (Some(block_range), Some(primary_range)) =
+                (slices.w.as_ref(), primary.w.as_ref())
+            {
+                direction
+                    .slice_mut(s![primary_range.start..primary_range.end])
+                    .assign(&d_beta_flat.slice(s![block_range.clone()]));
+            }
+            out.push(direction);
+        }
+        out
+    }
+
+    fn batched_directional_derivative_chunk_rows(
+        n: usize,
+        slices: &BlockSlices,
+        n_dirs: usize,
+    ) -> (usize, bool) {
+        const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
+        const GPU_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+        let cpu_rows =
+            (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
+        let runtime = crate::gpu::GpuRuntime::global();
+        if !runtime.is_available() || n == 0 || n_dirs == 0 {
+            return (cpu_rows.min(n.max(1)), false);
+        }
+
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let policy = runtime.policy();
+        let full_work_reaches_device = policy.route_gemm(n, n_dirs, p_m)
+            || policy.route_gemm(n, n_dirs, p_g)
+            || policy.route_xt_diag_y(n, p_m, p_m)
+            || policy.route_xt_diag_y(n, p_m, p_g)
+            || policy.route_xt_diag_y(n, p_g, p_g);
+        if !full_work_reaches_device {
+            return (cpu_rows.min(n.max(1)), false);
+        }
+
+        let rows_for_flops = |min_flops: u64, flops_per_row: usize| -> usize {
+            if flops_per_row == 0 || min_flops == 0 {
+                1
+            } else {
+                min_flops.div_ceil(flops_per_row as u64) as usize
+            }
+        };
+        let projection_rows = rows_for_flops(
+            policy.gemm_min_flops,
+            2usize
+                .saturating_mul(p_m.max(p_g))
+                .saturating_mul(n_dirs),
+        );
+        let gram_rows = rows_for_flops(
+            policy.gemm_min_flops,
+            2usize.saturating_mul(p_m.max(p_g).saturating_pow(2)),
+        );
+        let target_rows = policy
+            .xtwx_min_rows
+            .max(projection_rows.min(n))
+            .max(gram_rows.min(n))
+            .max(1024);
+
+        // Per chunk we hold X_m, X_g, two projection matrices, and three
+        // direction-weight columns. Keep one GPU-fed chunk comfortably bounded.
+        let scratch_cols = slices
+            .marginal
+            .len()
+            .saturating_add(slices.logslope.len())
+            .saturating_add(5usize.saturating_mul(n_dirs))
+            .max(1);
+        let max_rows_by_memory = (GPU_MEMORY_BUDGET_BYTES / (scratch_cols * 8))
+            .max(1024)
+            .min(n.max(1));
+        (target_rows.min(max_rows_by_memory).min(n.max(1)), true)
     }
 
     fn row_primary_psi_direction_from_map(
@@ -13743,14 +13862,22 @@ impl BernoulliMarginalSlopeFamily {
                     })?
             }
         } else if dense_contiguous_rows {
-            let chunk_rows = {
-                const TARGET_CHUNK_FLOATS: usize = 1 << 17;
-                (TARGET_CHUNK_FLOATS / (3 * d_beta_flats.len()).max(1)).clamp(1024, n.max(1))
-            };
+            let marginal_dirs =
+                Self::stacked_direction_block(d_beta_flats, slices.marginal.clone());
+            let logslope_dirs =
+                Self::stacked_direction_block(d_beta_flats, slices.logslope.clone());
+            let (chunk_rows, gpu_sized_chunks) =
+                Self::batched_directional_derivative_chunk_rows(n, slices, d_beta_flats.len());
             let chunks = (0..n)
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
                 .collect::<Vec<_>>();
+            log::info!(
+                "[BMS batched dH chunks] rows_per_chunk={} chunks={} gpu_sized={}",
+                chunk_rows,
+                chunks.len(),
+                gpu_sized_chunks,
+            );
             let chunk_body =
                 |(start, end): (usize, usize)| -> Result<Vec<BernoulliBlockHessianAccumulator>, String> {
                     let n_dirs = d_beta_flats.len();
@@ -13765,18 +13892,30 @@ impl BernoulliMarginalSlopeFamily {
                     let mut w_gg = (0..n_dirs)
                         .map(|_| Array1::<f64>::zeros(len))
                         .collect::<Vec<_>>();
+                    let x_chunk = self
+                        .marginal_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                    let g_chunk = self
+                        .logslope_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                    let marginal_projected =
+                        crate::faer_ndarray::fast_ab(&x_chunk, &marginal_dirs);
+                    let logslope_projected =
+                        crate::faer_ndarray::fast_ab(&g_chunk, &logslope_dirs);
 
                     for row in start..end {
                         let local = row - start;
                         let row_ctx = Self::row_ctx(cache, row);
-                        let row_dirs = d_beta_flats
-                            .iter()
-                            .map(|d_beta_flat| {
-                                self.row_primary_direction_from_flat(
-                                    row, slices, primary, d_beta_flat,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
+                        let row_dirs = Self::row_primary_directions_from_projected(
+                            local,
+                            slices,
+                            primary,
+                            d_beta_flats,
+                            &marginal_projected,
+                            &logslope_projected,
+                        );
                         let thirds = self.row_primary_third_contracted_many_with_moments(
                             row,
                             block_states,
@@ -13794,17 +13933,17 @@ impl BernoulliMarginalSlopeFamily {
                     }
 
                     for idx in 0..n_dirs {
-                        accs[idx].add_weighted_design_grams(
-                            self,
-                            start..end,
+                        accs[idx].add_weighted_design_grams_from_chunks(
+                            &x_chunk,
+                            &g_chunk,
                             &w_mm[idx],
                             &w_mg[idx],
                             &w_gg[idx],
-                        )?;
+                        );
                     }
                     Ok(accs)
                 };
-            if run_rows_serial {
+            if run_rows_serial || gpu_sized_chunks {
                 let mut accs = make_accs();
                 for chunk in chunks {
                     let partial = chunk_body(chunk)?;

@@ -20374,6 +20374,34 @@ pub fn compute_geometric_constraint_transform(
     Ok((z, s_constrained))
 }
 
+/// Build a clamped B-spline full knot vector from 1-D data.
+///
+/// Thin public wrapper around
+/// [`internal::generate_full_knot_vector_quantile`] so external crates can
+/// request auto-derived knots without reimplementing the placement logic.
+pub fn auto_knot_vector_1d_quantile(
+    data: ArrayView1<'_, f64>,
+    num_internal_knots: usize,
+    degree: usize,
+) -> Result<Array1<f64>, BasisError> {
+    internal::generate_full_knot_vector_quantile(data, num_internal_knots, degree)
+}
+
+/// Place `num_centers` Duchon centers on 1-D data via the equal-mass strategy.
+///
+/// Thin public wrapper around [`select_equal_mass_centers`] specialised to a
+/// single covariate dimension. The returned vector is sorted.
+pub fn auto_centers_1d_equal_mass(
+    data: ArrayView1<'_, f64>,
+    num_centers: usize,
+) -> Result<Array1<f64>, BasisError> {
+    let column = data.to_owned().insert_axis(Axis(1));
+    let centers = select_equal_mass_centers(column.view(), num_centers)?;
+    let mut flat: Vec<f64> = centers.column(0).iter().copied().collect();
+    flat.sort_by(f64::total_cmp);
+    Ok(Array1::from_vec(flat))
+}
+
 /// Internal module for implementation details not exposed in the public API.
 pub(crate) mod internal {
     use super::*;
