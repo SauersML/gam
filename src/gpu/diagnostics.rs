@@ -73,9 +73,13 @@ pub(crate) fn log_library_unavailable(library: &'static str, reason: &str) {
 
 pub(crate) fn log_policy_cpu(op: &'static str, shape: String, reason: String) {
     activity::record_policy_decline(op);
-    log_route(format!(
-        "[GPU] CPU route | op={op} | shape={shape} | reason={reason}"
-    ));
+    if reason.starts_with("CUDA unavailable:") {
+        log_route(format!("[GPU] CPU route | op={op} | reason={reason}"));
+    } else {
+        log_route(format!(
+            "[GPU] CPU route | op={op} | shape={shape} | reason={reason}"
+        ));
+    }
 }
 
 pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
@@ -88,9 +92,15 @@ pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
 
 pub(crate) fn log_runtime_cpu(op: &'static str, backend: &'static str, shape: String) {
     activity::record_runtime_decline(op);
-    log_route(format!(
-        "[GPU] CPU route | op={op} | backend={backend} | shape={shape} | reason=device dispatch returned no result"
-    ));
+    if let Some(cpu_reason) = GpuRuntime::global().cpu_reason() {
+        log_route(format!(
+            "[GPU] CPU route | op={op} | backend={backend} | reason=CUDA unavailable: {cpu_reason}"
+        ));
+    } else {
+        log_route(format!(
+            "[GPU] CPU route | op={op} | backend={backend} | shape={shape} | reason=device dispatch returned no result"
+        ));
+    }
 }
 
 pub(crate) fn log_gpu_success(
