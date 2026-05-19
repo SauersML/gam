@@ -2047,8 +2047,8 @@ mod tests {
         // `signed_probit_logcdf_and_mills_ratio` is provably NaN-free on the
         // finite domain (every internal branch clamps `erfcx`/`cdf` away from
         // zero). Pin both NaN slots so the input gate cannot regress.
-        let err_eta = probit_survival_hazard_components(f64::NAN, 0.5)
-            .expect_err("NaN eta must be rejected");
+        let err_eta =
+            probit_survival_hazard_components(f64::NAN, 0.5).expect_err("NaN eta must be rejected");
         assert!(err_eta.contains("invalid survival index derivative"));
         let err_dt = probit_survival_hazard_components(1.0, f64::NAN)
             .expect_err("NaN eta_derivative must be rejected");
@@ -2125,8 +2125,14 @@ mod tests {
 
         let (cum, hazard) = royston_parmar_survival_hazard_components(eta, eta_t)
             .expect("RP left tail must remain valid");
-        assert_eq!(cum, 0.0, "left-tail cum_hazard should underflow to 0, got {cum}");
-        assert_eq!(hazard, 0.0, "left-tail hazard should underflow to 0, got {hazard}");
+        assert_eq!(
+            cum, 0.0,
+            "left-tail cum_hazard should underflow to 0, got {cum}"
+        );
+        assert_eq!(
+            hazard, 0.0,
+            "left-tail hazard should underflow to 0, got {hazard}"
+        );
 
         // Consumer: survival = exp(-0) = 1.
         let survival = (-cum).exp().clamp(0.0, 1.0);

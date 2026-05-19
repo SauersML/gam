@@ -15001,12 +15001,12 @@ fn derivative_quality_options_and_warm_start(
     const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
-    // The tightening exists so the implicit-function-theorem differentiation
-    // through the inner solve is at least as accurate as the outer optimizer's
-    // requested gradient scale. With zero ψ-derivative blocks there is no IFT
-    // pullback to make accurate — the joint-hyper objective collapses to the
-    // rho-only outer objective, and tightening here breaks that equivalence by
-    // fitting β to a tighter inner residual than the rho-only path uses. Keep
+    // The alignment exists so the implicit-function-theorem differentiation
+    // through the inner solve is resolved at the outer optimizer's requested
+    // gradient scale. With zero ψ-derivative blocks there is no IFT pullback to
+    // make accurate -- the joint-hyper objective collapses to the rho-only
+    // outer objective, and changing tolerance here breaks that equivalence by
+    // fitting β to a different inner residual than the rho-only path uses. Keep
     // the caller's inner_tol in that case.
     //
     // Do not hard-force f64-precision KKT solves for every ψ-bearing model:
@@ -15020,20 +15020,25 @@ fn derivative_quality_options_and_warm_start(
     let direct_joint_hyper_inner_tol = eval_options
         .outer_tol
         .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR);
-    let tighten = has_psi_derivatives
+    let align = has_psi_derivatives
         && eval_options.inner_max_cycles > 1
-        && eval_options.inner_tol > direct_joint_hyper_inner_tol;
-    if !tighten {
+        && eval_options.inner_tol != direct_joint_hyper_inner_tol;
+    if !align {
         return (eval_options, None);
     }
+    let tighten = eval_options.inner_tol > direct_joint_hyper_inner_tol;
     eval_options.inner_tol = direct_joint_hyper_inner_tol;
-    eval_options.inner_max_cycles = eval_options
-        .inner_max_cycles
-        .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
-    let strict_warm_start = warm_start.cloned().map(|mut warm| {
-        warm.inner.cached_inner = None;
-        warm
-    });
+    let strict_warm_start = if tighten {
+        eval_options.inner_max_cycles = eval_options
+            .inner_max_cycles
+            .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
+        warm_start.cloned().map(|mut warm| {
+            warm.inner.cached_inner = None;
+            warm
+        })
+    } else {
+        None
+    };
     (eval_options, strict_warm_start)
 }
 
@@ -17080,13 +17085,21 @@ mod tests {
             derivative_quality_options_and_warm_start(&options, None, true);
 
         assert_eq!(
-            eval_options.inner_tol, options.inner_tol,
-            "default exact joint-hyper eval should not tighten below the outer optimizer scale"
+            eval_options.inner_tol, options.outer_tol,
+            "default exact joint-hyper eval should use the outer optimizer scale"
         );
         assert_eq!(eval_options.inner_max_cycles, options.inner_max_cycles);
         assert!(
             strict_warm_start.is_none(),
-            "unchanged tolerance should not discard cached inner state"
+            "loosening to the outer scale should not discard cached inner state"
+        );
+        let biobank_scale_objective = 3.689e5;
+        let posted_residual = 6.788e-1;
+        let posted_objective_change = 4.209e-2;
+        let eval_tol = eval_options.inner_tol * (1.0 + biobank_scale_objective);
+        assert!(
+            posted_residual <= 2.0 * eval_tol && posted_objective_change <= eval_tol,
+            "the exact outer startup validation should accept numerically flat inner solves at outer scale"
         );
 
         let tighter_options = BlockwiseFitOptions {
