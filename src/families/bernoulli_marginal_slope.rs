@@ -15112,54 +15112,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         .map(|maybe| maybe.map(|(log_likelihood, workspace)| (log_likelihood, Some(workspace))))
     }
 
-    fn max_feasible_step_size(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        delta: &Array1<f64>,
-    ) -> Result<Option<f64>, String> {
-        self.validate_exact_block_state_shapes(block_states)?;
-        let beta = block_states.get(block_idx).ok_or_else(|| {
-            format!(
-                "bernoulli marginal-slope block index {block_idx} is out of bounds for {} states",
-                block_states.len()
-            )
-        })?;
-        if delta.len() != beta.beta.len() {
-            return Err(format!(
-                "bernoulli marginal-slope step length mismatch for block {block_idx}: delta={}, beta={}",
-                delta.len(),
-                beta.beta.len()
-            ));
-        }
-        // Trust-region-style step cap: limit the relative L2 change to
-        // ‖α·δ‖ ≤ 0.5·‖β‖ — half the current coefficient norm. This forces
-        // the outer optimizer to backtrack from absurdly large trial steps
-        // before paying the per-row evaluation cost, which dominates at
-        // biobank scale. When β is essentially zero (initial sweep), fall
-        // back to a finite absolute cap so the optimizer can still escape
-        // the origin.
-        let beta_norm_sq: f64 = beta.beta.iter().map(|v| v * v).sum();
-        let delta_norm_sq: f64 = delta.iter().map(|v| v * v).sum();
-        if delta_norm_sq <= 0.0 || !delta_norm_sq.is_finite() {
-            return Ok(None);
-        }
-        let delta_norm = delta_norm_sq.sqrt();
-        let beta_norm = beta_norm_sq.sqrt();
-        const BMS_STEP_CAP_FRACTION: f64 = 0.5;
-        const BMS_STEP_CAP_BETA_FLOOR: f64 = 1.0e-6;
-        const BMS_STEP_CAP_FALLBACK: f64 = 1.0;
-        let cap = if beta_norm < BMS_STEP_CAP_BETA_FLOOR {
-            BMS_STEP_CAP_FALLBACK / delta_norm
-        } else {
-            (BMS_STEP_CAP_FRACTION * beta_norm) / delta_norm
-        };
-        if !cap.is_finite() || cap <= 0.0 {
-            return Ok(None);
-        }
-        Ok(Some(cap))
-    }
-
     fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
