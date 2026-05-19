@@ -10823,13 +10823,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // breakdown; routine cycles emit a single compact one-liner
             // that still carries cycle/objective/Δobj/step/residual/time so
             // a CI tail can confirm the solver is descending without
-            // drowning in 4 lines per cycle. Near-convergence (any tolerance
-            // criterion within an order of magnitude of firing) auto-promotes
-            // the cycle to verbose so the binding-criterion diagnostic is
-            // visible when it matters most.
-            let near_convergence = residual <= 10.0 * residual_tol
-                || step_inf <= 10.0 * step_tol
-                || objective_change <= 10.0 * objective_tol;
+            // drowning in 4 lines per cycle. Near-convergence auto-promotes
+            // only when the *binding* criterion (residual, which is the one
+            // the convergence check at line ~10874 actually evaluates) is
+            // within an order of magnitude of firing. Tying this to obj_change
+            // or step_inf alone fires on every cycle of a slow descent where
+            // the step is small but residual is still 10⁵× above tol —
+            // defeating the throttle entirely.
+            let near_convergence = residual <= 10.0 * residual_tol;
             if verbose_cycle || near_convergence {
                 log::info!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | proposal_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
