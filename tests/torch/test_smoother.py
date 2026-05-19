@@ -267,6 +267,80 @@ def test_invalid_mode_rejected() -> None:
         gt.DuchonSmoother(domain=(0.0, 1.0), mode="bogus")
 
 
+def test_duchon_smoother_on_circular_data_seam_continuity_and_error_parity() -> None:
+    """Fit a 1-D :class:`DuchonSmoother` to noisy data on a circle and assert
+    the seam (``t=0`` vs. ``t=period``) behaves like an interior region:
+
+    1. ``predict(0) ≈ predict(period)`` — the curve is continuous across the seam.
+    2. The RMSE in a small window around the seam is not much larger than the
+       RMSE in interior windows of the same width.
+
+    Both assertions are expected to fail today: :class:`DuchonSmoother` is
+    parameterised on a bounded interval (no periodic boundary), so when it is
+    fed data living on a circle it (a) leaves an unconstrained jump at the
+    seam and (b) over-fits / under-fits the boundary region relative to the
+    interior. This test pins those failure modes so they cannot be silently
+    regressed away or silently fixed without a test update.
+    """
+    period = 2.0 * math.pi
+    n = 200
+    torch.manual_seed(0)
+    rng = np.random.default_rng(0)
+    t = torch.tensor(
+        np.linspace(0.0, period, n + 1)[:-1], dtype=torch.float64
+    )
+    truth = torch.sin(t) + 0.3 * torch.cos(2 * t) + 0.15 * torch.sin(3 * t)
+    y = truth + torch.tensor(0.10 * rng.standard_normal(n), dtype=torch.float64)
+
+    sm = gt.DuchonSmoother(domain=(0.0, period), n_centers=16).double()
+    with torch.no_grad():
+        out = sm(t, y)
+        v_at_zero = sm.predict(
+            torch.tensor([0.0], dtype=torch.float64), out.coefficients
+        ).item()
+        v_at_period = sm.predict(
+            torch.tensor([period - 1e-12], dtype=torch.float64), out.coefficients
+        ).item()
+
+    # (1) Continuity at the seam: identical points on the circle should map
+    # to the same value. A periodic smoother delivers machine-precision
+    # continuity (~1e-12); a non-periodic Duchon does not.
+    seam_jump = abs(v_at_zero - v_at_period)
+    assert seam_jump < 1e-3, (
+        f"seam jump {seam_jump:.4f} between pred(0)={v_at_zero:.4f} and "
+        f"pred(period)={v_at_period:.4f} — DuchonSmoother has no periodic "
+        f"boundary, so the endpoints float independently."
+    )
+
+    # (2) Seam window RMSE should be comparable to interior RMSE.
+    tt = torch.tensor(
+        np.linspace(0.0, period, 4001)[:-1], dtype=torch.float64
+    )
+    truth_dense = (
+        torch.sin(tt) + 0.3 * torch.cos(2 * tt) + 0.15 * torch.sin(3 * tt)
+    )
+    with torch.no_grad():
+        pred = sm.predict(tt, out.coefficients)
+    sq_err = (pred - truth_dense) ** 2
+
+    w = period / 40.0  # narrow window on each side of the seam
+    seam_mask = (tt < w) | (tt > period - w)
+    interior_masks = [
+        (tt > period * c - w) & (tt < period * c + w)
+        for c in (0.25, 0.5, 0.75)
+    ]
+    seam_rmse = float(sq_err[seam_mask].mean().sqrt())
+    interior_rmses = [
+        float(sq_err[m].mean().sqrt()) for m in interior_masks
+    ]
+    median_interior = float(np.median(interior_rmses))
+    assert seam_rmse < 1.5 * median_interior, (
+        f"seam RMSE {seam_rmse:.4f} is {seam_rmse / median_interior:.1f}× the "
+        f"median interior RMSE {median_interior:.4f} — DuchonSmoother degrades "
+        f"sharply near the boundary because of its non-periodic basis."
+    )
+
+
 def test_learned_mode_state_dict_round_trips_through_save_load() -> None:
     """A learned smoother's state must survive ``state_dict`` -> ``load_state_dict``."""
     sm_src = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")

@@ -38,10 +38,6 @@ try:
         gaussian_weighted_ridge_batch,
         smoothness_penalty,
     )
-    from ._cyclic_duchon import (
-        PeriodicFitOutput,
-        PeriodicSmoother,
-    )
     from ._reml import (
         GaussianRemlOutput,
         gaussian_reml_fit,
@@ -62,7 +58,6 @@ try:
         sphere_log_map,
     )
     from .modules import from_fitted
-    from ._smoother import DuchonSmoother, penalized_ridge_solve
 except ImportError as _exc:  # pragma: no cover - import-time guard
     if _exc.name == "torch":
         raise ImportError(
@@ -72,10 +67,7 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
     raise
 
 __all__ = [
-    "DuchonSmoother",
     "GaussianRemlOutput",
-    "PeriodicFitOutput",
-    "PeriodicSmoother",
     "alr",
     "bspline_basis",
     "bspline_basis_derivative",
@@ -91,7 +83,6 @@ __all__ = [
     "gaussian_weighted_ridge",
     "gaussian_weighted_ridge_batch",
     "inverse_alr",
-    "penalized_ridge_solve",
     "simplex_exp_map",
     "simplex_frechet_mean",
     "simplex_log_map",
