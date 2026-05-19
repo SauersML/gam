@@ -1,47 +1,41 @@
-"""1-D Duchon smoother with triple-operator penalty for :mod:`gamfit.torch`.
+"""1-D Duchon smoother for :mod:`gamfit.torch`.
 
-This is the open-interval companion to :class:`PeriodicSmoother`. It exposes
-the same two-mode convention:
+User-facing surface — two modes, set with the ``mode`` keyword:
 
-* ``mode="auto"`` (default) — gamfit selects the three smoothing weights
-  internally on every forward pass; no smoothing parameter is exposed on the
-  module and the caller does not have to think about ``λ``.
-* ``mode="learned"`` — smoothing is part of the module's trainable state
-  (one length-3 :class:`torch.nn.Parameter` named ``log_smoothing``, one entry
-  per penalty operator). Embed the module inside a larger ``nn.Module`` and
-  let the outer optimizer step it via the exposed ``smoothing_score`` on the
-  fit output.
+* ``mode="auto"`` (default) — gamfit handles smoothing internally on every
+  forward pass. The smoother has no learnable parameters; the caller does not
+  enumerate, index, or tune anything.
+* ``mode="learned"`` — gamfit holds smoothing as part of the smoother's
+  trainable state. The smoother behaves like any other :class:`torch.nn.Module`
+  with parameters: drop it into a larger model and pass
+  ``smoother.parameters()`` to your optimizer. You never touch those
+  parameters directly.
 
-The basis is the 1-D Duchon-``m`` natural basis (radial kernel
-:math:`r \\mapsto |r|^{2m-1}` plus polynomial null space of degree
-:math:`< m`), evaluated through the analytic
-:func:`gamfit.torch.duchon_basis_1d` primitive so the forward fit carries
-gradients through ``t``.
+Both modes share the same forward signature ``smoother(t, y, weights=None)``
+returning ``(coefficients, fitted, smoothing_score)``.
 
-The "triple operator" is the canonical shrinkage trio:
+For users who just want a fixed-``λ`` penalized ridge solve as a plain
+callable, :func:`penalized_ridge_solve` is exposed separately.
 
-- ``S₂`` — Gram of :math:`f''`, the curvature penalty (the standard
-  Duchon / thin-plate-spline term)
-- ``S₁`` — Gram of :math:`f'`, the slope penalty
-- ``S₀`` — Gram of :math:`f`, the value (L²) penalty
+---
 
-Each is a positive-semidefinite matrix obtained by Gauss–Legendre quadrature
-of the analytically-known basis derivatives over the smoother's domain.
-
-For users who just want the fixed-``λ`` ridge solve under any penalty,
-:func:`penalized_ridge_solve` exposes the underlying primitive directly.
+Implementation note (not part of the user contract). Internally the smoother
+regularizes with three operator penalties — mass (the value/L² operator),
+tension (the slope/first-derivative operator), and stiffness (the
+curvature/second-derivative operator) — each with its own strength. In
+``"learned"`` mode those strengths live as :class:`torch.nn.Parameter`\\s on
+the module so the outer optimizer can drive them. The number, names, and
+parameterisation of those internals are not part of the public surface and
+may change between versions.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import Callable
 
 import torch
 
 from ._cyclic_duchon import PeriodicFitOutput, _SmootherBase
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
 
 
 __all__ = ["DuchonSmoother", "penalized_ridge_solve"]
@@ -49,8 +43,7 @@ __all__ = ["DuchonSmoother", "penalized_ridge_solve"]
 
 # --------------------------------------------------------------------------- #
 # Low-level fixed-``λ`` penalized ridge solve. Differentiable through every
-# argument via :func:`torch.linalg.solve`; useful when the smoothing weights
-# are user-supplied (or part of a larger learnable module).
+# argument via :func:`torch.linalg.solve`.
 # --------------------------------------------------------------------------- #
 
 
@@ -107,7 +100,7 @@ def penalized_ridge_solve(
 
 
 # --------------------------------------------------------------------------- #
-# Closed-form Duchon-m=2 derivatives.
+# Closed-form Duchon-m=2 derivatives (internal).
 #
 # Radial basis function: η(r) = |r|^3 / 12.
 #   η'(r)  = r · |r| / 4
@@ -155,7 +148,6 @@ def _quadrature_gram(
     dtype = centers.dtype
     device = centers.device
     nodes_ref, weights_ref = _gauss_legendre(n_quad, dtype=dtype, device=device)
-    # Map [-1, 1] -> [lo, hi].
     half_width = (hi - lo) / 2.0
     midpoint = (hi + lo) / 2.0
     nodes = midpoint + half_width * nodes_ref
@@ -171,8 +163,8 @@ def _gauss_legendre(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Nodes and weights for Gauss–Legendre quadrature on ``[-1, 1]``.
 
-    Uses the Golub–Welsch eigenvalue construction so the result is fully
-    deterministic and works for any ``n >= 1`` without depending on numpy.
+    Golub–Welsch construction — fully deterministic, works for any ``n >= 2``
+    without depending on numpy.
     """
     if n < 2:
         raise ValueError(f"n_quad must be >= 2, got {n}")
@@ -194,52 +186,37 @@ _DEFAULT_N_QUAD: int = 96
 
 
 class DuchonSmoother(_SmootherBase):
-    """1-D Duchon smoother with a triple-operator penalty.
+    """1-D Duchon smoother on a bounded interval.
 
     Two modes:
 
-    - ``mode="auto"`` (default): each call to ``forward(t, y)`` fits the
-      smoother and returns the resulting curve. The three smoothing weights
-      are selected internally — no smoothing parameter is exposed on the
-      module.
-    - ``mode="learned"``: the three smoothing weights are a single length-3
-      :class:`torch.nn.Parameter` named ``log_smoothing``. Embed the module
-      inside a larger ``nn.Module`` and let an outer optimizer drive it via
-      ``out.smoothing_score``.
-
-    The penalty is a positive linear combination of three operators on the
-    smoother's domain ``[domain_lo, domain_hi]``:
-
-    - ``S₂`` — :math:`\\int (f'')^2`, the curvature penalty
-    - ``S₁`` — :math:`\\int (f')^2`, the slope penalty
-    - ``S₀`` — :math:`\\int f^2`, the value (L²) penalty
-
-    Each is a positive-semidefinite Gram matrix obtained from closed-form
-    basis derivatives integrated by Gauss–Legendre quadrature over the
-    domain.
+    - ``mode="auto"`` (default): on every ``forward(t, y)`` gamfit picks the
+      smoothing internally and returns the fitted curve. The smoother has no
+      learnable parameters.
+    - ``mode="learned"``: gamfit holds smoothing as part of the smoother's
+      trainable state. Embed the module inside a larger ``nn.Module`` and
+      pass ``smoother.parameters()`` to your optimizer; you never touch the
+      smoothing parameters directly.
 
     Parameters
     ----------
     domain : tuple of float
-        Smoother domain ``(domain_lo, domain_hi)`` (``domain_lo < domain_hi``).
-        The penalty Gram matrices are integrated over this interval.
+        ``(domain_lo, domain_hi)`` with ``domain_lo < domain_hi``. The
+        smoother is parameterised over this interval.
     n_centers : int, optional
         Number of equispaced radial centers placed across the domain. Ignored
         if ``centers`` is supplied. Default ``16``.
     centers : torch.Tensor, optional
         Explicit center locations. Must be 1-D with at least ``2`` entries.
     mode : str, optional
-        ``"auto"`` (default) or ``"learned"``. See above.
-    init_log_smoothing : tuple of three floats, optional
-        Initial ``log λ`` for the ``(S₂, S₁, S₀)`` penalties, in that order.
-        Default ``(0.0, 0.0, 0.0)``.
+        ``"auto"`` (default) or ``"learned"``.
     n_quad : int, optional
-        Number of Gauss–Legendre quadrature points used to build the penalty
-        Gram matrices at construction time. Default ``96``.
+        Internal quadrature resolution used to set up the smoother at
+        construction time. Default ``96``; safe to leave alone.
 
     Examples
     --------
-    Automatic smoothing — black box, no tuning required:
+    Automatic smoothing — no smoothing parameter to think about:
 
     >>> import torch, gamfit.torch as gt
     >>> sm = gt.DuchonSmoother(domain=(0.0, 1.0))
@@ -247,7 +224,8 @@ class DuchonSmoother(_SmootherBase):
     >>> y = torch.sin(2 * torch.pi * x)
     >>> out = sm(x, y)
 
-    Trainable inside a learning loop — three smoothing knobs:
+    Trainable inside a larger learning loop — just hand ``parameters()`` to
+    your optimizer:
 
     >>> sm = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
     >>> opt = torch.optim.Adam(sm.parameters(), lr=0.1)
@@ -258,7 +236,10 @@ class DuchonSmoother(_SmootherBase):
     ...     opt.step()
     """
 
-    log_smoothing: torch.nn.Parameter | None
+    # Internal note: the implementation parameterises smoothing as three
+    # operator strengths (mass / tension / stiffness). Both the count and the
+    # interpretation are implementation details — they live on the module so
+    # ``parameters()`` finds them, but the user never indexes or names them.
 
     def __init__(
         self,
@@ -267,7 +248,6 @@ class DuchonSmoother(_SmootherBase):
         n_centers: int = _DEFAULT_N_CENTERS,
         centers: torch.Tensor | None = None,
         mode: str = "auto",
-        init_log_smoothing: Iterable[float] = (0.0, 0.0, 0.0),
         n_quad: int = _DEFAULT_N_QUAD,
     ) -> None:
         domain_lo, domain_hi = float(domain[0]), float(domain[1])
@@ -291,69 +271,64 @@ class DuchonSmoother(_SmootherBase):
                     f"got shape {tuple(centers_t.shape)}"
                 )
 
-        init = tuple(float(v) for v in init_log_smoothing)
-        if len(init) != 3:
-            raise ValueError(
-                f"init_log_smoothing must have exactly 3 entries (S₂, S₁, S₀), "
-                f"got {len(init)}"
-            )
-
+        # Three internal operator strengths — see implementation note.
+        # Initialised at log(1) = 0; the auto mode replaces this every forward,
+        # the learned mode trains it.
         super().__init__(
             mode=mode,
             n_components=3,
-            init_log_smoothing=init,
+            init_log_smoothing=(0.0, 0.0, 0.0),
         )
 
         self._domain_lo = domain_lo
         self._domain_hi = domain_hi
         self._n_quad = int(n_quad)
 
-        # Compute the triple penalty Gram matrices once at construction. They
-        # depend only on centers and the domain, both fixed, so they are
-        # buffers (no autograd, move with the module).
-        s_curv = _quadrature_gram(
-            _duchon_basis_second_derivative, centers_t, domain_lo, domain_hi, self._n_quad
+        # Triple penalty Gram matrices (mass / tension / stiffness): built
+        # once at construction since they depend only on centers and domain.
+        # Registered as buffers so they ride along on .to(device)/.float()/etc.
+        s_stiffness = _quadrature_gram(
+            _duchon_basis_second_derivative,
+            centers_t,
+            domain_lo,
+            domain_hi,
+            self._n_quad,
         )
-        s_slope = _quadrature_gram(
-            _duchon_basis_first_derivative, centers_t, domain_lo, domain_hi, self._n_quad
+        s_tension = _quadrature_gram(
+            _duchon_basis_first_derivative,
+            centers_t,
+            domain_lo,
+            domain_hi,
+            self._n_quad,
         )
-        s_val = _quadrature_gram(
-            _duchon_basis_value, centers_t, domain_lo, domain_hi, self._n_quad
+        s_mass = _quadrature_gram(
+            _duchon_basis_value,
+            centers_t,
+            domain_lo,
+            domain_hi,
+            self._n_quad,
         )
-        # Symmetrize numerically (quadrature gives a symmetric matrix up to
-        # round-off; this enforces it exactly so downstream Cholesky stays
-        # happy).
-        for s in (s_curv, s_slope, s_val):
+        for s in (s_stiffness, s_tension, s_mass):
             s.copy_(0.5 * (s + s.t()))
 
         self.register_buffer("centers", centers_t)
-        self.register_buffer("_S_curv", s_curv)
-        self.register_buffer("_S_slope", s_slope)
-        self.register_buffer("_S_val", s_val)
+        self.register_buffer("_S_stiffness", s_stiffness)
+        self.register_buffer("_S_tension", s_tension)
+        self.register_buffer("_S_mass", s_mass)
 
     @property
     def domain(self) -> tuple[float, float]:
         return (self._domain_lo, self._domain_hi)
 
-    @property
-    def n_quad(self) -> int:
-        return self._n_quad
-
     def _build_basis(self, t: torch.Tensor) -> torch.Tensor:
-        # In-torch evaluation of the natural Duchon-2 basis. Keeping the basis
-        # evaluator in torch (instead of routing through the reduced gamfit
-        # primitive ``duchon_basis_1d``) means the penalty Gram matrices
-        # computed by quadrature live in the same column layout as the design
-        # matrix: ``k`` radial columns followed by ``1`` and ``t`` polynomial
-        # null space columns.
         centers: torch.Tensor = self.get_buffer("centers")
         return _duchon_basis_value(t, centers)
 
     def _penalty_components(self) -> tuple[torch.Tensor, ...]:
         return (
-            self.get_buffer("_S_curv"),
-            self.get_buffer("_S_slope"),
-            self.get_buffer("_S_val"),
+            self.get_buffer("_S_stiffness"),
+            self.get_buffer("_S_tension"),
+            self.get_buffer("_S_mass"),
         )
 
     def fit(

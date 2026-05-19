@@ -102,7 +102,7 @@ def test_gaussian_reml_fit_gradcheck() -> None:
     X, Y, penalty = _reml_inputs(seed=13)
     x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
 
     def f(x_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
         out = gt.gaussian_reml_fit(x_, y_, p_)
@@ -135,7 +135,7 @@ def test_gaussian_reml_fit_batched_gradcheck() -> None:
     penalty[1, 2] = 0.06
     x_t = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
     off_t = torch.tensor(offsets)
 
     def f(x_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
@@ -166,7 +166,7 @@ def test_gaussian_reml_fit_positions_gradcheck() -> None:
     t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
     k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
 
     def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
         out = gt.gaussian_reml_fit_positions(t_, y_, "bspline", k_t, p_)
@@ -200,7 +200,7 @@ def test_gaussian_reml_fit_positions_batched_gradcheck() -> None:
     t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
     y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
     k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64, requires_grad=True)
+    p_t = torch.tensor(penalty, dtype=torch.float64)
     off_t = torch.tensor(offsets)
 
     def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
