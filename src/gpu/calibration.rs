@@ -166,7 +166,7 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Option<DeviceCalibration> {
         // SAFETY: cfg is filled with shape/leading-dimension values
         // consistent with the just-allocated a_dev/b_dev/c_dev slices
         // (M*K, K*N, M*N elements, column-major leading dims m, k, m).
-        // gemm is unsafe in cudarc 0.16 because invalid shapes would
+        // gemm is unsafe in cudarc 0.19 because invalid shapes would
         // map to invalid device memory accesses; the shapes here are
         // statically known and match the allocations.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
