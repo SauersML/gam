@@ -666,7 +666,8 @@ pub fn gaussian_reml_free_b_score(
     }
 
     let weight = gaussian_reml_weights(n, weights)?;
-    let cache = gaussian_reml_eigen_cache(x, penalty, None, Some(weight.view()))?;
+    let cache =
+        build_gaussian_reml_eigen_cache_with_nullspace_dim(x, penalty, None, Some(weight.view()))?;
     if n <= cache.nullity {
         return Err(EstimationError::InvalidInput(format!(
             "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",
