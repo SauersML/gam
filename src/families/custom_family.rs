@@ -19338,6 +19338,186 @@ mod tests {
         assert_eq!(result.active_sets, vec![None, None]);
     }
 
+    /// Independent derivation and direct numerical proof of the
+    /// ρ ≈ 2 inner-PIRLS pathology pinned by the biobank saturated-probit
+    /// failure trace.
+    ///
+    /// # Mechanism
+    ///
+    /// Inner Newton on the penalized objective `f(β) = -ℓ(β) + ½βᵀSβ`
+    /// uses two different ridge values:
+    ///   * **APPLY** path (`apply_joint_penalized_hessian_into`, called
+    ///     inside `joint_quadratic_predicted_reduction`) uses
+    ///     `joint_solver_diagonal_ridge`, which equals
+    ///     `joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE +
+    ///     stabilizing_shift`, where the stabilizing shift is whatever
+    ///     positive quantity `stabilized_joint_solver_diagonal_ridge`
+    ///     adds to lift a negative-eigenvalue joint Hessian above the
+    ///     SPD floor.
+    ///   * **TRIAL OBJECTIVE** path (`total_quadratic_penalty`) uses
+    ///     only `joint_mode_diagonal_ridge` (= `effective_solverridge`),
+    ///     which is the true penalty in the objective `f` and does NOT
+    ///     include the stabilizing shift.
+    ///
+    /// Let `Δ = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge`
+    /// (the gap between the SOLVE / APPLY matrix and the TRUE Hessian).
+    /// For a Newton step `δ = (H_NLL + S + joint_solver_diagonal_ridge·I)⁻¹·rhs`,
+    /// the Newton identity gives `δᵀ·H_used·δ = rhs·δ`, so:
+    ///
+    ///     predicted = rhs·δ − ½·δᵀ·H_used·δ = ½·rhs·δ
+    ///     actual    = rhs·δ − ½·δᵀ·H_true·δ
+    ///               = rhs·δ − ½·(δᵀ·H_used·δ − Δ·‖δ‖²)
+    ///               = ½·rhs·δ + ½·Δ·‖δ‖²
+    ///     ρ = actual / predicted = 1 + Δ·‖δ‖² / (rhs·δ)
+    ///
+    /// When `δ ∈ null(H_true)` (e.g. the marginal-block cancellation
+    /// direction from `marginal_block_hessian_cancels_in_saturated_regime`
+    /// combined with an unpenalized direction in the smoothing penalty's
+    /// null space), `H_true·δ = 0`, so `H_used·δ = Δ·δ` and therefore
+    /// `rhs = Δ·δ`, giving `rhs·δ = Δ·‖δ‖²`. Substituting:
+    ///
+    ///     ρ = 1 + Δ·‖δ‖² / (Δ·‖δ‖²) = 2  EXACTLY.
+    ///
+    /// This is independent of `Δ`, of the data size, and of `‖δ‖` — it
+    /// is a structural consequence of "SOLVE/APPLY add a stabilizing
+    /// shift that TRIAL OBJECTIVE doesn't see" combined with "Newton
+    /// step lies in the null space of the true Hessian".
+    ///
+    /// # Test
+    ///
+    /// We construct a 2D synthetic case with H_NLL indefinite (one
+    /// negative eigenvalue, mimicking the entry-survival concave term),
+    /// `S = 0`, and `joint_mode_diagonal_ridge = 0` (i.e. the policy
+    /// does NOT include the ridge in the objective). The stabilizing
+    /// shift lifts the negative eigenvalue to the SPD floor; the Newton
+    /// step lies in the formerly-near-null direction; predicted and
+    /// actual are computed by the exact same routines the inner solver
+    /// uses; ρ comes out to exactly 2.0 to floating-point precision.
+    #[test]
+    fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
+        // Synthetic 2D NLL Hessian: indefinite (lambda_min = -1, lambda_max = 1).
+        // Mirrors the saturated-probit marginal block where the
+        // entry-survival concave contribution dominates the cancellation
+        // direction.
+        let h_nll = array![[-1.0, 0.0], [0.0, 1.0]];
+        let source = JointHessianSource::Dense(h_nll.clone());
+        let ranges = vec![(0, 2)];
+        // No smoothing penalty in this direction (mirrors the duchon-smooth
+        // polynomial null space).
+        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
+
+        // Stabilized solver ridge: should add ~1.0 to lift the
+        // -1 eigenvalue to the SPD floor (~ridge_floor).
+        let base = JOINT_TRACE_STABILITY_RIDGE;
+        let ridge_floor = 1.0e-12_f64;
+        let joint_mode_diagonal_ridge = 0.0_f64; // policy: ridge NOT in objective
+        // `stabilized_joint_solver_diagonal_ridge` consults the family only
+        // for `use_exact_newton_strict_spd`, which defaults to false; we
+        // simulate that branch by computing the shift directly via
+        // `exact_newton_stabilizing_shift`.
+        let mut lhs = h_nll.clone();
+        add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base);
+        let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor)
+            .expect("indefinite Hessian must yield a positive stabilizing shift");
+        assert!(
+            shift > 0.9,
+            "shift should lift the -1 eigenvalue; got {shift}"
+        );
+        let joint_solver_diagonal_ridge = base + shift;
+        let big_delta = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge;
+
+        // True Hessian (what TRIAL OBJECTIVE sees):
+        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I = diag(-1, 1)
+        // Used Hessian (what SOLVE / APPLY uses):
+        //   H_used = H_NLL + S + joint_solver_diagonal_ridge·I
+        //          = diag(-1 + Δ, 1 + Δ)   where Δ ≈ 1.0
+        // Newton step direction: dim 0 is the "near-null" direction of H_used
+        // (eigenvalue ~ ridge_floor); rhs targeting that direction gives a
+        // step entirely in dim 0.
+        let rhs = array![1.0_f64, 0.0];
+        let h_used_00 = -1.0 + joint_solver_diagonal_ridge;
+        let h_used_11 = 1.0 + joint_solver_diagonal_ridge;
+        let delta = array![rhs[0] / h_used_00, rhs[1] / h_used_11];
+
+        // Compute hpen_delta via the SAME helper the inner solver uses.
+        let mut hpen_delta = Array1::<f64>::zeros(2);
+        apply_joint_penalized_hessian_into(
+            &source,
+            &ranges,
+            &s_lambdas,
+            joint_solver_diagonal_ridge,
+            &delta,
+            &mut hpen_delta,
+        )
+        .expect("apply joint penalized hessian must succeed");
+
+        // Predicted = the exact formula the inner solver uses.
+        let predicted = joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &delta);
+
+        // Actual (true) reduction: f(β=0) − f(β+δ) for the true objective
+        //   f(β) = ½·βᵀ·H_NLL·β + bᵀ·β     (with b = −rhs because rhs = −∇f)
+        // taking β_start = 0:
+        //   actual = rhs·δ − ½·δᵀ·H_NLL·δ   (no S, no joint_mode_diagonal_ridge)
+        let mut h_nll_delta = Array1::<f64>::zeros(2);
+        crate::linalg::faer_ndarray::fast_av_view_into(&h_nll, &delta, h_nll_delta.view_mut());
+        let actual = rhs.dot(&delta) - 0.5 * delta.dot(&h_nll_delta);
+
+        let rho = actual / predicted;
+        eprintln!(
+            "[rho-2 proof] Δ = {big_delta:.6e}, rhs·δ = {rd:.6e}, Δ·‖δ‖² = {dn:.6e}, predicted = {predicted:.6e}, actual = {actual:.6e}, ρ = {rho:.10}",
+            rd = rhs.dot(&delta),
+            dn = big_delta * delta.dot(&delta),
+        );
+
+        // ρ must be EXACTLY 2 to floating-point precision (not just "close to 2").
+        // This is the structural fingerprint of the SOLVE/APPLY-vs-OBJECTIVE
+        // ridge-stabilization gap in the saturated regime.
+        assert!(
+            (rho - 2.0).abs() <= 1e-10,
+            "ρ should be EXACTLY 2 when Newton step lies in null(H_true) with stabilizing-shift gap; got {rho}",
+        );
+
+        // Sanity: the identity rhs·δ = Δ·‖δ‖² must hold (this is the
+        // mathematical core of why ρ = 2 specifically and not 1.5 or 3).
+        let rhs_dot_delta = rhs.dot(&delta);
+        let delta_sq_times_big_delta = big_delta * delta.dot(&delta);
+        assert!(
+            (rhs_dot_delta - delta_sq_times_big_delta).abs() <= 1e-10 * rhs_dot_delta.abs(),
+            "Newton-identity null-space condition: rhs·δ ({rhs_dot_delta}) should equal Δ·‖δ‖² ({delta_sq_times_big_delta})",
+        );
+
+        // And ρ = 2 holds AT ALL MAGNITUDES of δ — verify by scaling rhs:
+        for scale in [0.001_f64, 0.029, 1.0, 988.0] {
+            let scaled_rhs = &rhs * scale;
+            let scaled_delta = &delta * scale;
+            let mut scaled_hpen = Array1::<f64>::zeros(2);
+            apply_joint_penalized_hessian_into(
+                &source,
+                &ranges,
+                &s_lambdas,
+                joint_solver_diagonal_ridge,
+                &scaled_delta,
+                &mut scaled_hpen,
+            )
+            .expect("apply scaled");
+            let scaled_predicted =
+                joint_quadratic_predicted_reduction(&scaled_rhs, &scaled_hpen, &scaled_delta);
+            let mut scaled_h_nll_delta = Array1::<f64>::zeros(2);
+            crate::linalg::faer_ndarray::fast_av_view_into(
+                &h_nll,
+                &scaled_delta,
+                scaled_h_nll_delta.view_mut(),
+            );
+            let scaled_actual =
+                scaled_rhs.dot(&scaled_delta) - 0.5 * scaled_delta.dot(&scaled_h_nll_delta);
+            let scaled_rho = scaled_actual / scaled_predicted;
+            assert!(
+                (scaled_rho - 2.0).abs() <= 1e-10,
+                "ρ invariance under step rescaling broke at scale {scale}: got {scaled_rho}",
+            );
+        }
+    }
+
     #[test]
     fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
         let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
