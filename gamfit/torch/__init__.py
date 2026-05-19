@@ -38,10 +38,6 @@ try:
         gaussian_weighted_ridge_batch,
         smoothness_penalty,
     )
-    from ._cyclic_duchon import (
-        PeriodicSmoother,
-        SmootherFitOutput,
-    )
     from ._reml import (
         GaussianRemlOutput,
         gaussian_reml_fit,
@@ -72,8 +68,6 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
 
 __all__ = [
     "GaussianRemlOutput",
-    "PeriodicSmoother",
-    "SmootherFitOutput",
     "alr",
     "bspline_basis",
     "bspline_basis_derivative",
