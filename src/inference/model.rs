@@ -2729,6 +2729,19 @@ impl FittedModel {
                 "saved survival model is missing survival_time_basis metadata; refit".to_string(),
             );
         }
+        if matches!(self.family_state, FittedFamily::Survival { .. })
+            && self.survival_time_anchor.is_none()
+        {
+            // Pairs with the survival_time_basis check above: predict-side
+            // code unconditionally requires the anchor too (see
+            // `load_survival_time_basis_config_from_model`), so a model
+            // serialized without it would fail at the first predict call.
+            // Catching it here makes save fail fast — the same defence the
+            // basis check provides for the basisname field.
+            return Err(
+                "saved survival model is missing survival_time_anchor metadata; refit".to_string(),
+            );
+        }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
             || self.beta_link_wiggle.is_some()
@@ -3289,6 +3302,42 @@ mod tests {
         assert_eq!(payload.survival_time_keep_cols, Some(vec![0, 2]));
         assert_eq!(payload.survival_time_smooth_lambda, Some(0.5));
         assert_eq!(payload.survival_time_anchor, Some(0.25));
+    }
+
+    #[test]
+    fn validate_for_persistence_rejects_survival_without_time_anchor_metadata() {
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.3],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+        // Pass the time_basis presence check but deliberately omit the
+        // anchor — this is exactly the partial-write shape that the CLI's
+        // marginal-slope+time-wiggle save path had before the structural
+        // refactor (main.rs previously set basis/degree/knots/keep_cols/
+        // smooth_lambda but forgot the anchor).
+        payload.survival_time_basis = Some("ispline".to_string());
+
+        let err = FittedModel::from_payload(payload)
+            .validate_for_persistence()
+            .expect_err("survival model without time-anchor metadata should fail validation");
+        assert!(err.contains("missing survival_time_anchor"));
     }
 
     #[test]

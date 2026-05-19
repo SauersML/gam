@@ -4901,12 +4901,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_time_basis = Some(time_build.basisname.clone());
-            payload.survival_time_degree = time_build.degree;
-            payload.survival_time_knots = time_build.knots.clone();
-            payload.survival_time_keep_cols = time_build.keep_cols.clone();
-            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-            payload.survival_time_anchor = Some(time_anchor);
+            payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+                &time_build,
+                time_anchor,
+            ));
             set_saved_offset_columns(
                 &mut payload,
                 args.offset_column.clone(),
@@ -5190,11 +5188,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_time_basis = Some(time_build.basisname.clone());
-            payload.survival_time_degree = time_build.degree;
-            payload.survival_time_knots = time_build.knots.clone();
-            payload.survival_time_keep_cols = time_build.keep_cols.clone();
-            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+            payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+                &time_build,
+                time_anchor,
+            ));
             payload.survival_likelihood = Some(
                 if likelihood_mode == SurvivalLikelihoodMode::Latent {
                     "latent"
@@ -5203,7 +5200,6 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 }
                 .to_string(),
             );
-            payload.survival_time_anchor = Some(time_anchor);
             payload.survival_beta_time = Some(fit.beta_time().to_vec());
             set_saved_offset_columns(
                 &mut payload,
@@ -5625,11 +5621,14 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         payload.survival_baseline_shape = fitted_baseline_cfg.shape;
         payload.survival_baseline_rate = fitted_baseline_cfg.rate;
         payload.survival_baseline_makeham = fitted_baseline_cfg.makeham;
-        payload.survival_time_basis = Some(time_build.basisname.clone());
-        payload.survival_time_degree = time_build.degree;
-        payload.survival_time_knots = time_build.knots.clone();
-        payload.survival_time_keep_cols = time_build.keep_cols.clone();
-        payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+        // Bug fix: this CLI save path previously wrote 5 of 6 survival_time_*
+        // fields and silently omitted `survival_time_anchor`, mirroring the
+        // marginal-slope FFI regression. Routing the write through
+        // `apply_survival_time_basis` makes the omission impossible.
+        payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+            &time_build,
+            time_anchor,
+        ));
         payload.baseline_timewiggle_degree = prepared.timewiggle_build.as_ref().map(|w| w.degree);
         payload.baseline_timewiggle_knots =
             prepared.timewiggle_build.as_ref().map(|w| w.knots.to_vec());
@@ -13029,6 +13028,7 @@ mod tests {
         payload.survival_likelihood = Some("marginal-slope".to_string());
         payload.survival_distribution = Some("probit".to_string());
         payload.survival_time_basis = Some("ispline".to_string());
+        payload.survival_time_anchor = Some(0.0);
         payload.formula_logslope = Some("1".to_string());
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 1.0, sd: 2.0 });
