@@ -154,6 +154,13 @@ enum VisualizerState {
 pub struct VisualizerSession {
     state: SharedState,
     model: SharedModel,
+    // True when this session installed itself into the static ACTIVE_FEED
+    // (i.e. it's an enabled session). Only enabled sessions own the feed
+    // slot; disabled (default) sessions must NOT clear it on Drop, or a
+    // concurrent enabled session's optimizer pushes would silently land
+    // in a dead slot. Without this guard, tests that mix new(true) and
+    // new(false) in parallel race over the static slot.
+    owns_active_feed: bool,
 }
 
 type SharedModel = Arc<Mutex<VisualizerModel>>;
@@ -172,22 +179,29 @@ fn active_feed_slot() -> &'static Mutex<Option<ActiveFeed>> {
 }
 
 fn install_active_feed(feed: ActiveFeed) {
-    if let Ok(mut guard) = active_feed_slot().lock() {
-        *guard = Some(feed);
-    }
+    // Tolerate poison: if a previous holder panicked we still want to
+    // install our feed cleanly so subsequent optimizer pushes land in this
+    // session, not in a half-dead slot. Without this the second `new(true)`
+    // call after any panic would silently drop the install and the chart
+    // would stop receiving data for the rest of the process lifetime.
+    let mut guard = active_feed_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    *guard = Some(feed);
 }
 
 fn clear_active_feed() {
-    if let Ok(mut guard) = active_feed_slot().lock() {
-        *guard = None;
-    }
+    let mut guard = active_feed_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    *guard = None;
 }
 
 fn current_active_feed() -> Option<ActiveFeed> {
-    active_feed_slot()
+    let guard = active_feed_slot()
         .lock()
-        .ok()
-        .and_then(|g| g.as_ref().cloned())
+        .unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().cloned()
 }
 
 /// Hook for the outer optimizer: record a single objective+gradient evaluation
@@ -704,6 +718,7 @@ impl Default for VisualizerSession {
         Self {
             state: Arc::new(Mutex::new(VisualizerState::Disabled)),
             model: Arc::new(Mutex::new(VisualizerModel::default())),
+            owns_active_feed: false,
         }
     }
 }
@@ -751,6 +766,7 @@ impl VisualizerSession {
         let session = Self {
             state: Arc::new(Mutex::new(state_inner)),
             model: Arc::new(Mutex::new(VisualizerModel::default())),
+            owns_active_feed: true,
         };
         install_active_feed(ActiveFeed {
             model: session.model.clone(),
@@ -920,7 +936,10 @@ impl VisualizerSession {
     }
 
     pub fn teardown(&mut self) {
-        clear_active_feed();
+        if self.owns_active_feed {
+            clear_active_feed();
+            self.owns_active_feed = false;
+        }
         let snapshot = lock_model(&self.model).clone();
         let mut state = lock_state(&self.state);
         match &mut *state {
