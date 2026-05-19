@@ -1873,6 +1873,7 @@ fn gaussian_reml_fit_batched_backward_impl(
     grad_coefficients: Option<ArrayView3<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
+    grad_edf: Option<ArrayView1<'_, f64>>,
     forward_fits: Option<&[Option<gam::gaussian_reml::GaussianRemlMultiResult>]>,
 ) -> Result<BatchedGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -1937,6 +1938,7 @@ fn gaussian_reml_fit_batched_backward_impl(
                     grad_coefficients: grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..])),
                     grad_fitted: grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..])),
                     grad_reml_score: grad_reml_score.as_ref().map_or(0.0, |g| g[b]),
+                    grad_edf: grad_edf.as_ref().map_or(0.0, |g| g[b]),
                 },
             ));
         }
