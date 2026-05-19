@@ -209,6 +209,20 @@ jobs:
         # benchmark binaries or external services are required.
         run: python -m pytest tests/test_tables.py -v --tb=short
 
+      - name: Run survival API regression + save/load roundtrip tests
+        # `test_survival_api_regressions.py` covers fit-only smoke checks
+        # across survival likelihood modes; `test_survival_save_load_roundtrip.py`
+        # additionally fits → saves → loads → predicts and asserts the
+        # survival surface matches. That roundtrip is the canary for the
+        # class of bug where the pyffi save path forgets to populate a
+        # field the predict path needs (e.g., the survival-marginal-slope
+        # `survival_time_*` omission fixed in fa7f7b6c).
+        run: |
+          python -m pytest \
+            tests/test_survival_api_regressions.py \
+            tests/test_survival_save_load_roundtrip.py \
+            -v --tb=short
+
       - name: Run benchmark configuration / mapping tests
         # These are pure-Python contract tests over the bench/ orchestration
         # scripts (run_suite.py, fuzz_vs_mgcv.py, biobank_scale/runner.py).
