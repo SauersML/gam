@@ -1383,107 +1383,30 @@ def _numeric_matrix(values: Any, label: str) -> Any:
 
 
 # Default number of basis functions when the caller does not pin centers /
-# knots themselves. Matches mgcv's ``k = 10`` convention and is a sane
-# starting point for one-dimensional smooths; capped per-call against the
-# number of distinct data points so we never request more centers than
-# the data can support.
+# knots themselves. Matches mgcv's ``k = 10`` convention. The actual
+# placement (quantile knots, equal-mass centers, boundary clamping, ...)
+# is performed by the Rust engine; Python only forwards the request.
 _DEFAULT_BASIS_K = 10
 
 
-def _default_centers_from_t(t_arr: Any, k: int) -> Any:
-    """Place ``k`` Duchon centers at empirical quantiles of ``t``.
-
-    Quantile placement spends basis capacity where the data lives instead
-    of where uniform spacing happens to put it. The returned vector is
-    strictly increasing and lies within ``[min(t), max(t)]``.
-    """
-    import numpy as np
-
-    finite = t_arr[np.isfinite(t_arr)]
-    if finite.size == 0:
-        raise ValueError("cannot auto-derive centers from t containing no finite values")
-    lo = float(finite.min())
-    hi = float(finite.max())
-    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
-        raise ValueError(
-            "cannot auto-derive centers: t has zero range "
-            f"(min={lo!r}, max={hi!r}); supply centers explicitly"
-        )
-    k = max(int(k), 2)
-    # Probability levels are pulled in slightly from the boundary so the
-    # outermost centers do not collide with a single boundary point mass.
-    qs = np.linspace(1.0 / (k + 1), k / (k + 1), k)
-    centers = np.quantile(finite.astype(np.float64), qs).astype(np.float64)
-    centers.sort()
-    span = hi - lo
-    min_gap = max(span * 1e-6, np.finfo(np.float64).eps * 16.0)
-    for i in range(1, centers.size):
-        if centers[i] - centers[i - 1] < min_gap:
-            centers[i] = centers[i - 1] + min_gap
-    np.clip(centers, lo, hi, out=centers)
-    return centers
-
-
-def _default_knots_from_t(t_arr: Any, k_interior: int, degree: int) -> Any:
-    """Build a clamped B-spline full knot vector from ``t``.
-
-    Interior knots are placed at empirical quantiles; ``degree + 1`` copies
-    of ``min(t)`` and ``max(t)`` clamp the ends.
-    """
-    import numpy as np
-
-    finite = t_arr[np.isfinite(t_arr)]
-    if finite.size == 0:
-        raise ValueError("cannot auto-derive knots from t containing no finite values")
-    lo = float(finite.min())
-    hi = float(finite.max())
-    if lo >= hi:
-        raise ValueError(
-            "cannot auto-derive knots: t has zero range "
-            f"(min={lo!r}, max={hi!r}); supply knots explicitly"
-        )
-    k_interior = max(int(k_interior), 0)
-    degree = max(int(degree), 0)
-    interior: list[float]
-    if k_interior == 0:
-        interior = []
-    else:
-        qs = np.linspace(
-            1.0 / (k_interior + 1), k_interior / (k_interior + 1), k_interior
-        )
-        q = np.quantile(finite.astype(np.float64), qs).astype(np.float64)
-        q.sort()
-        span = hi - lo
-        min_gap = max(span * 1e-6, np.finfo(np.float64).eps * 16.0)
-        # De-duplicate and keep strictly interior.
-        cleaned: list[float] = []
-        prev = lo
-        for v in q:
-            v = float(min(max(v, lo + min_gap), hi - min_gap))
-            if v - prev < min_gap:
-                v = prev + min_gap
-            if v >= hi - min_gap:
-                break
-            cleaned.append(v)
-            prev = v
-        interior = cleaned
-    knots = [lo] * (degree + 1) + interior + [hi] * (degree + 1)
-    return np.asarray(knots, dtype=np.float64)
-
-
 def _resolve_centers(centers: Any, t_arr: Any, *, label: str = "centers") -> Any:
-    """Coerce ``centers`` (None / int / array) into a validated 1D float64 array.
+    """Coerce ``centers`` (None / int / array) into a 1D float64 array.
 
-    ``None`` requests the library default ``K = _DEFAULT_BASIS_K``. An ``int``
-    requests ``K`` centers. Anything else is forwarded to ``_numeric_vector``
-    unchanged.
+    Auto-derivation delegates to the Rust ``auto_centers_1d`` FFI export so
+    Python never reimplements basis-placement logic.
     """
     if centers is None:
-        return _default_centers_from_t(t_arr, _DEFAULT_BASIS_K)
+        return _numpy_module().asarray(
+            rust_module().auto_centers_1d(t_arr, int(_DEFAULT_BASIS_K)),
+            dtype=float,
+        )
     if isinstance(centers, int) and not isinstance(centers, bool):
         if centers < 2:
             raise ValueError(f"{label}: integer count must be >= 2, got {centers}")
-        return _default_centers_from_t(t_arr, centers)
+        return _numpy_module().asarray(
+            rust_module().auto_centers_1d(t_arr, int(centers)),
+            dtype=float,
+        )
     return _numeric_vector(centers, label)
 
 
@@ -1494,19 +1417,30 @@ def _resolve_knots(
     label: str = "knots",
     degree: int = 3,
 ) -> Any:
-    """Coerce ``knots`` (None / int / array) into a validated 1D float64 array.
+    """Coerce ``knots`` (None / int / array) into a 1D float64 array.
 
-    ``None`` builds a clamped B-spline knot vector with ``_DEFAULT_BASIS_K``
-    interior knots placed at quantiles of ``t``. An ``int`` overrides the
-    interior-knot count.
+    Auto-derivation delegates to the Rust ``auto_knots_1d`` FFI export.
     """
     if knots is None:
-        return _default_knots_from_t(t_arr, _DEFAULT_BASIS_K, degree)
+        return _numpy_module().asarray(
+            rust_module().auto_knots_1d(t_arr, int(_DEFAULT_BASIS_K), int(degree)),
+            dtype=float,
+        )
     if isinstance(knots, int) and not isinstance(knots, bool):
         if knots < 0:
             raise ValueError(f"{label}: integer interior-knot count must be >= 0, got {knots}")
-        return _default_knots_from_t(t_arr, knots, degree)
+        return _numpy_module().asarray(
+            rust_module().auto_knots_1d(t_arr, int(knots), int(degree)),
+            dtype=float,
+        )
     return _numeric_vector(knots, label)
+
+
+def _numpy_module() -> Any:
+    """Return the cached ``numpy`` module without polluting global imports."""
+    import numpy as np
+
+    return np
 
 
 def _resolve_basis_locations(

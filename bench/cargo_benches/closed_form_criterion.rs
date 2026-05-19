@@ -43,8 +43,8 @@
 //!       production.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use ndarray::{Array1, Array2};
+use std::hint::black_box;
 
 use gam::terms::basis::{
     MaternNu, closed_form_aniso_psi_derivatives_in_total_basis, closed_form_anisotropic_pair_block,
