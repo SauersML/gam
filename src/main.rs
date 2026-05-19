@@ -67,7 +67,7 @@ use gam::smooth::{
 };
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
-    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+    SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
     append_zero_tail_columns, baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
     build_survival_time_basis, build_survival_time_offsets_for_likelihood,
@@ -4534,12 +4534,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_baseline_shape = baseline_cfg.shape;
             payload.survival_baseline_rate = baseline_cfg.rate;
             payload.survival_baseline_makeham = baseline_cfg.makeham;
-            payload.survival_time_basis = Some(time_build.basisname.clone());
-            payload.survival_time_degree = time_build.degree;
-            payload.survival_time_knots = time_build.knots.clone();
-            payload.survival_time_keep_cols = time_build.keep_cols.clone();
-            payload.survival_time_smooth_lambda = time_build.smooth_lambda;
-            payload.survival_time_anchor = Some(time_anchor);
+            payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
+                &time_build,
+                time_anchor,
+            ));
             set_saved_offset_columns(
                 &mut payload,
                 args.offset_column.clone(),
