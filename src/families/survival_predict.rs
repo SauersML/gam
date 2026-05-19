@@ -349,7 +349,9 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                             model,
                             &row_time,
                             cov_row,
-                            r_eta_exit[0] + primary_offset[i],
+                            r_eta_exit[0],
+                            r_deriv_exit[0],
+                            primary_offset[i],
                         )
                     }
                     SurvivalLikelihoodMode::Latent
@@ -710,7 +712,9 @@ fn evaluate_rp_row(
     model: &SavedModel,
     row_time: &SurvivalTimeBuildOutput,
     cov_row: &Array1<f64>,
-    eta_offset_row: f64,
+    eta_time_offset_row: f64,
+    derivative_time_offset_row: f64,
+    primary_offset_row: f64,
 ) -> Result<(f64, f64, f64), String> {
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let saved_runtime = model.saved_prediction_runtime()?;
@@ -721,11 +725,60 @@ fn evaluate_rp_row(
         .map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
     let p = p_time + p_timewiggle + p_cov;
+    let beta = fit_saved.beta.clone();
+    if beta.len() != p {
+        return Err(format!(
+            "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
+            beta.len(),
+            p
+        ));
+    }
     let mut x_exit = Array2::<f64>::zeros((1, p));
     if p_time > 0 {
         x_exit
             .slice_mut(s![.., ..p_time])
             .assign(&row_time.x_exit_time.to_dense());
+    }
+    let mut eta_derivative = derivative_time_offset_row;
+    if p_time > 0 {
+        eta_derivative += row_time
+            .x_derivative_time
+            .dot(&beta.slice(s![..p_time]).to_owned())[0];
+    }
+    if let Some(runtime) = saved_timewiggle.as_ref() {
+        let knots = Array1::from_vec(runtime.knots.clone());
+        let beta_w = beta.slice(s![p_time..p_time + p_timewiggle]).to_owned();
+        let eta_exit_row = Array1::from_elem(1, eta_time_offset_row);
+        let derivative_exit_row = Array1::from_elem(1, derivative_time_offset_row);
+        let exit_design = match buildwiggle_block_input_from_knots(
+            eta_exit_row.view(),
+            &knots,
+            runtime.degree,
+            2,
+            false,
+        )?
+        .design
+        {
+            DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
+            _ => return Err("saved baseline-timewiggle exit design must be dense".to_string()),
+        };
+        if exit_design.ncols() != p_timewiggle {
+            return Err(format!(
+                "survival RP timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
+                exit_design.ncols(),
+                p_timewiggle
+            ));
+        }
+        x_exit
+            .slice_mut(s![.., p_time..p_time + p_timewiggle])
+            .assign(&exit_design);
+        let derivative_design = build_survival_timewiggle_derivative_design(
+            &eta_exit_row,
+            &derivative_exit_row,
+            &knots,
+            runtime.degree,
+        )?;
+        eta_derivative += derivative_design.dot(&beta_w)[0];
     }
     if p_cov > 0 {
         x_exit
@@ -736,15 +789,7 @@ fn evaluate_rp_row(
             .row_mut(0)
             .assign(cov_row);
     }
-    let beta = fit_saved.beta.clone();
-    if beta.len() != p {
-        return Err(format!(
-            "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
-            beta.len(),
-            p
-        ));
-    }
-    let offset_view = Array1::from_elem(1, eta_offset_row);
+    let offset_view = Array1::from_elem(1, eta_time_offset_row + primary_offset_row);
     let pred = predict_gam(
         x_exit.view(),
         beta.view(),
@@ -753,9 +798,32 @@ fn evaluate_rp_row(
     )
     .map_err(|e| format!("survival prediction failed: {e}"))?;
     let eta = pred.eta[0];
-    let surv = pred.mean[0].clamp(1e-300, 1.0);
-    let cum = -surv.ln();
-    Ok((eta, cum, cum.max(1e-12)))
+    let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
+    Ok((eta, cum, haz))
+}
+
+#[inline]
+fn royston_parmar_survival_hazard_components(
+    eta: f64,
+    eta_derivative: f64,
+) -> Result<(f64, f64), String> {
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
+        return Err(format!(
+            "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
+        ));
+    }
+    let cumulative_hazard = eta.exp();
+    let hazard = cumulative_hazard * eta_derivative;
+    if !(cumulative_hazard.is_finite()
+        && cumulative_hazard >= 0.0
+        && hazard.is_finite()
+        && hazard >= 0.0)
+    {
+        return Err(format!(
+            "saved Royston-Parmar survival prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, cumulative_hazard={cumulative_hazard}, hazard={hazard}"
+        ));
+    }
+    Ok((cumulative_hazard, hazard))
 }
 
 /// Batch evaluator for the location-scale survival likelihood mode.
@@ -1788,5 +1856,25 @@ mod tests {
         let err = probit_survival_hazard_components(1.0, 0.0)
             .expect_err("zero derivative should be invalid");
         assert!(err.contains("invalid survival index derivative"));
+    }
+
+    #[test]
+    fn royston_parmar_hazard_is_cumulative_hazard_derivative() {
+        let eta = 2.0_f64.ln();
+        let eta_t = 0.25;
+
+        let (cum, hazard) =
+            royston_parmar_survival_hazard_components(eta, eta_t).expect("valid components");
+
+        assert!((cum - 2.0).abs() <= 1e-14);
+        assert!((hazard - 0.5).abs() <= 1e-14);
+        assert_ne!(hazard, cum);
+    }
+
+    #[test]
+    fn royston_parmar_hazard_rejects_nonpositive_log_hazard_derivative() {
+        let err = royston_parmar_survival_hazard_components(0.0, 0.0)
+            .expect_err("zero derivative should be invalid");
+        assert!(err.contains("invalid log-cumulative-hazard derivative"));
     }
 }
