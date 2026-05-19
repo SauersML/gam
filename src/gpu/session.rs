@@ -40,7 +40,7 @@ use ndarray::{Array2, ArrayBase, Data, Ix1};
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::driver::{from_col_major, to_col_major, to_i32};
-use super::runtime::GpuRuntime;
+use super::runtime::{GpuRuntime, cuda_context_for};
 
 /// A device-resident column-major copy of an `Array2<f64>`. Holds the
 /// allocation alive for the session lifetime and serializes per-session
@@ -331,8 +331,22 @@ struct SessionCache {
 struct CacheEntry {
     key: usize,
     // Holds the host-side data alive while the cache stores its pointer.
+    // As long as the cache holds this Arc clone the `key` (which is the
+    // Arc's data-ptr cast to usize) is guaranteed not to alias another
+    // live allocation — pointer-as-identity stays sound.
     _arc_keepalive: Arc<Array2<f64>>,
-    session: Arc<DeviceXSession>,
+    outcome: CachedOutcome,
+}
+
+/// What the cache remembers about an Arc<Array2>: either a working
+/// session, or a sticky failure marker so we don't retry an upload that's
+/// known to fail (e.g. device OOM on a too-large X). Both outcomes go
+/// through the LRU so a transient failure on a huge X eventually evicts
+/// and gives the next caller a fresh chance.
+#[derive(Clone)]
+enum CachedOutcome {
+    Ready(Arc<DeviceXSession>),
+    Failed,
 }
 
 impl SessionCache {
@@ -344,34 +358,58 @@ impl SessionCache {
 
     fn get_or_upload(&self, x: &Arc<Array2<f64>>) -> Option<Arc<DeviceXSession>> {
         let key = Arc::as_ptr(x) as usize;
-        // Fast path: lookup. Move to back (most-recently-used) on hit.
-        {
+        // Fast path: cache hit (positive or sticky-negative).
+        if let Some(outcome) = self.lookup_and_promote(key) {
+            return match outcome {
+                CachedOutcome::Ready(session) => Some(session),
+                CachedOutcome::Failed => None,
+            };
+        }
+        // Slow path: do the upload outside the lock so concurrent uploads
+        // of *different* Arcs don't serialize on this mutex. Two threads
+        // racing on the *same* Arc both pay for an upload — wasted work
+        // by one — but the re-check below guarantees only one entry lands
+        // in the cache, so subsequent calls converge.
+        let our_outcome = match upload_x(x) {
+            Some(session) => CachedOutcome::Ready(Arc::new(session)),
+            None => CachedOutcome::Failed,
+        };
+        let final_outcome = {
             let mut guard = self.entries.lock().ok()?;
             if let Some(pos) = guard.iter().position(|e| e.key == key) {
-                let entry = guard.remove(pos)?;
-                let session = entry.session.clone();
+                // A peer thread beat us to the insert during our upload.
+                // Use their entry — our `our_outcome` Arc just drops via
+                // RAII, releasing whatever device memory we allocated.
+                let entry = guard.remove(pos).expect("position just queried");
+                let peer = entry.outcome.clone();
                 guard.push_back(entry);
-                return Some(session);
+                peer
+            } else {
+                let entry = CacheEntry {
+                    key,
+                    _arc_keepalive: x.clone(),
+                    outcome: our_outcome.clone(),
+                };
+                guard.push_back(entry);
+                while guard.len() > MAX_CACHE_ENTRIES {
+                    guard.pop_front();
+                }
+                our_outcome
             }
-        }
-        // Slow path: upload and insert. Note we drop the lock while doing
-        // the heavy upload so concurrent threads aren't serialized through
-        // it. Two threads racing on the same X just upload twice — the
-        // duplicate gets evicted by LRU.
-        let session = Arc::new(upload_x(x)?);
-        let entry = CacheEntry {
-            key,
-            _arc_keepalive: x.clone(),
-            session: session.clone(),
         };
-        {
-            let mut guard = self.entries.lock().ok()?;
-            guard.push_back(entry);
-            while guard.len() > MAX_CACHE_ENTRIES {
-                guard.pop_front();
-            }
+        match final_outcome {
+            CachedOutcome::Ready(session) => Some(session),
+            CachedOutcome::Failed => None,
         }
-        Some(session)
+    }
+
+    fn lookup_and_promote(&self, key: usize) -> Option<CachedOutcome> {
+        let mut guard = self.entries.lock().ok()?;
+        let pos = guard.iter().position(|e| e.key == key)?;
+        let entry = guard.remove(pos)?;
+        let outcome = entry.outcome.clone();
+        guard.push_back(entry);
+        Some(outcome)
     }
 }
 
@@ -389,15 +427,20 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
         return None;
     }
 
-    // Build a fresh cudarc context+stream for this session. `CudaContext::new`
-    // uses cuDevicePrimaryCtxRetain under the hood, so every caller for the
-    // same ordinal sees the same underlying CUcontext; allocations from
-    // different sessions on the same device are mutually addressable.
-    let ctx = CudaContext::new(device.ordinal).ok()?;
+    // Share the process-wide cached primary context for this device with
+    // every other consumer (calibration, blas dispatchers, future sessions
+    // on the same ordinal). Falls back to a fresh `CudaContext::new` —
+    // also a primary-context retain under the hood — if the cache misses,
+    // which only happens for devices that weren't probed at startup.
+    let ctx = match cuda_context_for(device.ordinal) {
+        Some(ctx) => ctx,
+        None => CudaContext::new(device.ordinal).ok()?,
+    };
     let stream = ctx.new_stream().ok()?;
     let blas = CudaBlas::new(stream.clone()).ok()?;
 
     // Pack X column-major on the host then ship in one memcpy.
+    let upload_start = std::time::Instant::now();
     let host_col_major: Vec<f64> = to_col_major(&x.view());
     let x_dev: CudaSlice<f64> = stream.clone_htod(&host_col_major).ok()?;
     let wy_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows.checked_mul(cols)?).ok()?;
@@ -405,6 +448,18 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
     let out_pp_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols.checked_mul(cols)?).ok()?;
     let out_n_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows).ok()?;
     let v_p_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols).ok()?;
+    let upload_elapsed = upload_start.elapsed().as_secs_f64();
+
+    // Surface the one-time X upload so the activity summary can answer
+    // "did this fit pay the resident-X cost yet?". Without this the
+    // first-iteration upload is invisible — every subsequent xtwx call
+    // gets logged via `log_gpu_success`, but the upload itself doesn't.
+    log::info!(
+        "[GPU] xt_diag_x_resident upload | device={} '{}' | shape=rows={rows} cols={cols} | bytes={} | elapsed={upload_elapsed:.3}s",
+        device.ordinal,
+        device.name,
+        format_bytes_for_log(rows.saturating_mul(cols).saturating_mul(std::mem::size_of::<f64>())),
+    );
 
     Some(DeviceXSession {
         rows,
@@ -421,6 +476,26 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
             v_p_dev,
         }),
     })
+}
+
+/// Local copy of the byte formatter used in the upload log line. The
+/// canonical formatter lives in `diagnostics` but is `pub(crate)` and
+/// scoped to its own log formatting helpers; mirroring the small bit of
+/// formatting here avoids re-exposing that surface.
+fn format_bytes_for_log(bytes: usize) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2}GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2}MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2}KiB", b / KIB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 #[cfg(test)]
