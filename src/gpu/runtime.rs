@@ -379,6 +379,16 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
             "libcuda (or platform equivalent) is not loadable on this host".to_string(),
         ));
     }
+    // Pre-flight libcublas check — calibration runs a real `cublasDgemm`,
+    // and every dispatch path also goes through cuBLAS. If libcublas can't
+    // be loaded the device set is unusable for our workloads, so we
+    // report the same "no driver" reason rather than letting cudarc panic
+    // mid-calibration.
+    if !libcublas_loadable() {
+        return Err(GpuProbeError::DriverLibraryMissing(
+            "libcublas (or platform equivalent) is not loadable on this host".to_string(),
+        ));
+    }
     let count = CudaContext::device_count().map_err(|err| {
         // No driver / unloadable libcuda surfaces as a DriverError here; we
         // map it to `DriverLibraryMissing` so the disabled-banner reads as
