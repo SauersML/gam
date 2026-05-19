@@ -1753,12 +1753,39 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
             return Ok(gpu_xtwx);
         }
     }
-    let chol = xtwx
-        .cholesky(Side::Lower)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
+    // Attempt Cholesky directly; on failure, retry with a tiny diagonal jitter
+    // proportional to the matrix trace. X'WX is symmetric positive semidefinite
+    // by construction, but FP noise (e.g. in a basis whose kernel block is only
+    // FP-orthogonal to its explicit polynomial nullspace columns, as the
+    // periodic Duchon basis is) can push the smallest eigenvalue slightly
+    // negative on adversarial inputs, intermittently failing Cholesky. A
+    // jitter of 1e-12 * trace/p shifts every eigenvalue up by an amount well
+    // below the natural scale of the well-conditioned eigenvalues but well
+    // above f64 FP noise, eliminating the spurious-failure regime.
+    if let Ok(chol) = xtwx.cholesky(Side::Lower) {
+        return Ok(chol.lower_triangular());
+    }
+    let p = xtwx.nrows();
+    let trace: f64 = (0..p).map(|i| xtwx[[i, i]]).sum();
+    if !trace.is_finite() || trace <= 0.0 {
+        return Err(EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
-        })?;
-    Ok(chol.lower_triangular())
+        });
+    }
+    let mut jitter = 1e-12 * trace / (p as f64);
+    for _ in 0..6 {
+        let mut jittered = xtwx.clone();
+        for i in 0..p {
+            jittered[[i, i]] += jitter;
+        }
+        if let Ok(chol) = jittered.cholesky(Side::Lower) {
+            return Ok(chol.lower_triangular());
+        }
+        jitter *= 10.0;
+    }
+    Err(EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    })
 }
 
 fn gaussian_penalty_positive_logdet(
