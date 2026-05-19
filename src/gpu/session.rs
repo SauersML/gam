@@ -458,7 +458,10 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
         "[GPU] xt_diag_x_resident upload | device={} '{}' | shape=rows={rows} cols={cols} | bytes={} | elapsed={upload_elapsed:.3}s",
         device.ordinal,
         device.name,
-        format_bytes_for_log(rows.saturating_mul(cols).saturating_mul(std::mem::size_of::<f64>())),
+        format_bytes_for_log(
+            rows.saturating_mul(cols)
+                .saturating_mul(std::mem::size_of::<f64>())
+        ),
     );
 
     Some(DeviceXSession {
