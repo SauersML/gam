@@ -660,24 +660,58 @@ impl PenaltyPseudologdet {
             .eigh(Side::Lower)
             .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
 
-        let (rank, nullity) = if let Some(m0) = structural_nullity {
-            let m0 = m0.min(p_dim);
-            (p_dim - m0, m0)
-        } else {
-            let threshold =
-                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-            let rank = evals.iter().filter(|&&e| e > threshold).count();
-            (rank, p_dim - rank)
+        // Rank/nullity determination.
+        //
+        // Two sources of nullspace evidence can co-exist:
+        //   (a) a structural hint `m0` from the caller (e.g., the
+        //       intersection of penalty kernels for `Σ_k λ_k S_k`), which
+        //       captures null directions the caller knows about by
+        //       construction — including those that ridge regularization
+        //       turns numerically positive but should still be treated as
+        //       null;
+        //   (b) the eigenspectrum itself, where any eigenvalue at or below
+        //       the noise floor `100 · p · ε_mach · ‖S‖` is numerically
+        //       indistinguishable from zero.
+        //
+        // The correct combined nullity is `max(m0, threshold-null)`. If we
+        // trusted the hint alone, a column unpenalized by *any* `S_k`
+        // (e.g., an intercept column outside every penalty block) would
+        // give `eigenvalue = 0` exactly, but `m0` — derived only from the
+        // `S_k`s — would still be 0; then `idx = nullity + col` would
+        // index the zero eigenvalue as "positive", `1/√0 = +∞` would
+        // contaminate `W`, and `λ_k · tr(Wᵀ S_k W) = NaN` (from `0 · ∞`)
+        // would surface downstream as "REML/LAML gradient contains
+        // non-finite entry". Conversely, if we trusted the threshold
+        // alone, a structural null direction inflated by ridge to
+        // `eigenvalue ≈ ridge` could leak into the positive eigenspace —
+        // for `ridge > threshold` the threshold filter keeps it, but the
+        // structural hint says it should be null.
+        //
+        // Taking the maximum nullity satisfies both:
+        //   - any structural null is preserved (lower bound on nullity);
+        //   - any numerical zero discovered in the spectrum is also
+        //     respected, even when the structural hint underestimates the
+        //     true kernel.
+        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let threshold_rank = evals.iter().filter(|&&e| e > threshold).count();
+        let threshold_nullity = p_dim - threshold_rank;
+        let nullity = match structural_nullity {
+            Some(m0) => m0.min(p_dim).max(threshold_nullity),
+            None => threshold_nullity,
         };
+        let rank = p_dim - nullity;
 
         // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
-        // Eigenvalues are ascending, so the last `rank` are the positive ones.
-        let value: f64 = evals
-            .iter()
-            .rev()
-            .take(rank)
-            .map(|&e| e.max(1e-300).ln())
-            .sum();
+        //
+        // Eigenvalues are ascending, so the last `rank` are the positive
+        // ones — and by the threshold combination above every one of them
+        // is strictly greater than the spectrum's noise floor, so the
+        // unguarded `ln` is finite and matches the W factor below.
+        // (Previously this site applied a `.max(1e-300)` clamp that
+        // silently fabricated a finite log for zero/near-zero eigenvalues
+        // even though the corresponding W column was filled with
+        // `1/√ev ≈ ∞`, leaving `value` and `W` inconsistent.)
+        let value: f64 = evals.iter().rev().take(rank).map(|&e| e.ln()).sum();
 
         // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
         // Eigenvalues are ascending, so positive eigenvalues are the last `rank`.
