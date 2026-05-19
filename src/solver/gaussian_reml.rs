@@ -1031,6 +1031,11 @@ fn validate_gaussian_reml_forward_fit(
     weights: Option<ArrayView1<'_, f64>>,
     fit: &GaussianRemlMultiResult,
 ) -> Result<(), EstimationError> {
+    // Fingerprint the canonicalized penalty: caches are keyed on the
+    // symmetric average, and the caller may hand us a raw input (e.g. a
+    // single-entry-perturbed matrix produced by ``torch.autograd.gradcheck``).
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
@@ -1479,6 +1484,8 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     penalty: ArrayView2<'_, f64>,
     nullspace_dim: Option<usize>,
 ) -> Vec<Result<GaussianRemlEigenCache, EstimationError>> {
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let k = xtwx_matrices.len();
     if k == 0 {
         return Vec::new();
