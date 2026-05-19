@@ -25,8 +25,8 @@ use ::opt::{
     SecondOrderObjective, SecondOrderSample, Solution, StepInfo, Tolerance, ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Bidirectional inner-PIRLS feedback channel.
 ///
