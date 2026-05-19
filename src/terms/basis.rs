@@ -6010,6 +6010,18 @@ pub struct CollocationOperatorMatrices {
     pub polynomial_block_cols: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct DuchonOperatorPenaltyMatrices {
+    pub mass: Array2<f64>,
+    pub tension: Array2<f64>,
+    pub stiffness: Array2<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinPlatePenaltyMatrix {
+    pub penalty: Array2<f64>,
+}
+
 fn default_normalization_scale() -> f64 {
     1.0
 }
@@ -11535,6 +11547,47 @@ pub fn build_duchon_collocation_operator_matrices(
         max_operator_derivative_order,
         &mut workspace,
     )
+}
+
+pub fn build_duchon_operator_penalty_matrices(
+    centers: ArrayView2<'_, f64>,
+    collocationweights: Option<ArrayView1<'_, f64>>,
+    length_scale: Option<f64>,
+    power: usize,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    identifiability_transform: Option<ArrayView2<'_, f64>>,
+) -> Result<DuchonOperatorPenaltyMatrices, BasisError> {
+    let ops = build_duchon_collocation_operator_matrices(
+        centers,
+        collocationweights,
+        length_scale,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        identifiability_transform,
+        2,
+    )?;
+    let (mass, _) = normalize_penalty(&symmetrize(&fast_ata(&ops.d0)));
+    let (tension, _) = normalize_penalty(&symmetrize(&fast_ata(&ops.d1)));
+    let (stiffness, _) = normalize_penalty(&symmetrize(&fast_ata(&ops.d2)));
+    Ok(DuchonOperatorPenaltyMatrices {
+        mass,
+        tension,
+        stiffness,
+    })
+}
+
+pub fn build_thin_plate_penalty_matrix(
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+) -> Result<ThinPlatePenaltyMatrix, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    let kernel_transform = thin_plate_kernel_constraint_nullspace(centers, &mut workspace.cache)?;
+    let (penalty, _) =
+        build_thin_plate_penalty_matrices(centers, length_scale, &kernel_transform, false)?;
+    let (penalty, _) = normalize_penalty(&penalty);
+    Ok(ThinPlatePenaltyMatrix { penalty })
 }
 
 pub fn build_duchon_collocation_operator_matriceswithworkspace(
