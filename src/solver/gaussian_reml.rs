@@ -812,6 +812,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 problem.grad_coefficients.as_ref().map(|g| g.view()),
                 problem.grad_fitted.as_ref().map(|g| g.view()),
                 problem.grad_reml_score,
+                problem.grad_edf,
             )?;
             validate_gaussian_reml_forward_fit(
                 problem.x.view(),
@@ -847,6 +848,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 problem.grad_coefficients.as_ref().map(|g| g.view()),
                 problem.grad_fitted.as_ref().map(|g| g.view()),
                 problem.grad_reml_score,
+                problem.grad_edf,
                 n,
                 p,
                 d,
@@ -1169,6 +1171,72 @@ fn add_reml_score_vjp(
         );
         add_rank_one_penalty_vjp(coef * lambda, beta.column(j), grad_penalty);
     }
+}
+
+/// VJP contribution from an upstream gradient on `edf`.
+///
+/// With `M = X^T W X + λ S`, `edf = trace(M^{-1} · X^T W X) = p - λ trace(M^{-1} S)`.
+/// Holding `λ` fixed, the direct partials are
+///   ∂edf/∂A = λ M^{-1} S M^{-1}      (A = X^T W X, symmetric)
+///   ∂edf/∂S = −λ M^{-1} A M^{-1} = −λ M^{-1} + λ² M^{-1} S M^{-1}
+///   ∂edf/∂λ = −trace(M^{-1} S) + λ trace((M^{-1} S)²)
+/// The λ-component is returned as the lambda_adjoint contribution and routed
+/// through the implicit-function chain by the caller (same path as
+/// `upstream_lambda` and `upstream_reml_score`).
+fn add_edf_vjp(
+    scale: f64,
+    x: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    lambda: f64,
+    inverse_hessian: &Array2<f64>,
+    grad_x: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
+    grad_weights: &mut Array1<f64>,
+) -> f64 {
+    // m_inv_s = M^{-1} S, then g_a = λ M^{-1} S M^{-1} = ∂edf/∂A.
+    let m_inv_s = dense_ab(inverse_hessian.view(), penalty);
+    let mut g_a = dense_ab(m_inv_s.view(), inverse_hessian.view());
+    g_a.mapv_inplace(|v| v * lambda);
+
+    // Chain ∂edf/∂A through A = X^T W X.
+    //   grad_X += scale · 2 · (W X) · G_A
+    //   grad_w_i += scale · (X G_A X^T)_{ii}
+    let xg = dense_ab(x, g_a.view());
+    for i in 0..x.nrows() {
+        let row_scale = 2.0 * scale * weights[i];
+        for k in 0..x.ncols() {
+            grad_x[[i, k]] += row_scale * xg[[i, k]];
+        }
+        let mut quad = 0.0;
+        for k in 0..x.ncols() {
+            quad += x[[i, k]] * xg[[i, k]];
+        }
+        grad_weights[i] += scale * quad;
+    }
+
+    // ∂edf/∂S = -λ M^{-1} + λ² M^{-1} S M^{-1} = -λ M^{-1} + λ · g_a
+    // (since g_a = λ M^{-1} S M^{-1}, so λ · g_a = λ² M^{-1} S M^{-1}).
+    for row in 0..grad_penalty.nrows() {
+        for col in 0..grad_penalty.ncols() {
+            grad_penalty[[row, col]] += scale
+                * (-lambda * inverse_hessian[[row, col]] + lambda * g_a[[row, col]]);
+        }
+    }
+
+    // ∂edf/∂λ (with A, S fixed) = -tr(M^{-1} S) + λ tr((M^{-1} S)²).
+    let p_dim = m_inv_s.nrows();
+    let mut tr_m_inv_s = 0.0;
+    for i in 0..p_dim {
+        tr_m_inv_s += m_inv_s[[i, i]];
+    }
+    let mut tr_squared = 0.0;
+    for i in 0..p_dim {
+        for j in 0..p_dim {
+            tr_squared += m_inv_s[[i, j]] * m_inv_s[[j, i]];
+        }
+    }
+    scale * (-tr_m_inv_s + lambda * tr_squared)
 }
 
 fn add_reml_rho_gradient_vjp(
