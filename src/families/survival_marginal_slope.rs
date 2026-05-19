@@ -16497,90 +16497,90 @@ mod tests {
         assert!(err.contains("non-finite signed margin"));
     }
 
-    /// Diagnostic probe for the ρ=2 inner-PIRLS pathology on biobank-scale
-    /// saturated probit fits. Computes the per-row primary Hessian for the
-    /// rigid path at a range of η magnitudes and reports
-    /// `h[0,0] + h[1,1]` — the exact quantity summed into the marginal-block
-    /// joint Hessian by `add_pullback_primary_hessian`. If this sum collapses
-    /// to ~0 under saturation, the marginal-block joint Hessian is
-    /// near-singular by exact cancellation between the (concave) entry
-    /// `+w·log Φ(−η₀)` term and the (convex) exit `−w·log Φ(−η₁)` / event
-    /// density `+w·η₁²/2` term, and Newton's quadratic model along that
-    /// direction is dominated by the penalty / ridge rather than by data.
+    /// Mechanism-of-ρ=2 proof for the inner-PIRLS pathology on biobank-scale
+    /// saturated probit fits.
+    ///
+    /// `add_pullback_primary_hessian` (line 9753) sums `h[0,0] + h[1,1]`
+    /// over rows into the marginal-block joint Hessian (β_marg enters both
+    /// `q0` and `q1` with the SAME `marginal_design` row, so the Jacobian
+    /// pullback adds the q0 and q1 second derivatives at the same slot).
+    ///
+    /// Mathematical facts pinned here:
+    ///   - Censored rows: `h[0,0] + h[1,1] = 0` to ULP at every η ≥ 0.
+    ///     The entry term `+w·log Φ(−η₀)` (concave, curvature −w·c²) and
+    ///     the exit term `−w·log Φ(−η₁)` (convex, curvature +w·c²) have
+    ///     equal-and-opposite second derivatives when q₀ = q₁.
+    ///   - Event rows: residual `+w·c²·(1/η² + O(1/η⁴))` from the Mills
+    ///     asymptotic. The event-density term `+w·η₁²/2` contributes
+    ///     exactly `+w·c²`; the entry-survival term contributes
+    ///     `−w·c²·(1 − 1/η²)`. Sum = `+w·c²/η²`.
+    ///
+    /// At biobank saturation (η ~ 988), the marginal-block joint Hessian
+    /// collapses to `O(w/η²) = O(1e-6)` per event row from the likelihood
+    /// side; censored contributions are 0 to ULP. The Newton step in that
+    /// block is then dominated by the smoothing penalty `S_marg`. When
+    /// the saturating direction lies in the null space of `S_marg`
+    /// (typical for the duchon-smooth's polynomial null space), the
+    /// effective curvature drops to the f64 ridge floor, the inner
+    /// Newton step is set by ridge alone, and `actual = rhs·δ` while
+    /// `predicted = ½·rhs·δ` — yielding ρ ≡ 2 to floating-point precision
+    /// as observed.
     #[test]
-    fn diagnose_marginal_block_hessian_cancellation_in_saturated_regime() {
+    fn marginal_block_hessian_cancels_in_saturated_regime() {
         let probit_scale = 1.0_f64;
         let w = 1.0_f64;
         let derivative_guard = 1e-6;
-        // Hold q0 = q1 = η so the entry/exit share the same probit margin
-        // (typical for biobank rows where entry and exit are close on the
-        // probit scale once X·β saturates).
         let qd1 = 1.0_f64;
         let g = 0.0_f64;
         let z = 0.0_f64;
 
-        eprintln!("\n=== Marginal-block Hessian cancellation diagnostic ===");
-        eprintln!(
-            "{:>6}  {:>4}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}",
-            "eta", "d", "h[0,0]", "h[1,1]", "h[0,0]+h[1,1]", "|h00|+|h11|", "cancel_frac"
-        );
-
-        for &eta in &[
-            0.5_f64, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 100.0, 500.0, 988.0,
-        ] {
-            for &d in &[0.0_f64, 1.0] {
-                let (_nll, _grad, hess) = row_primary_closed_form(
-                    eta,
-                    eta,
-                    qd1,
-                    g,
-                    z,
-                    w,
-                    d,
-                    derivative_guard,
-                    probit_scale,
-                )
-                .expect("rigid row at saturated eta");
-                let h00 = hess[0][0];
-                let h11 = hess[1][1];
-                let sum = h00 + h11;
-                let scale = h00.abs() + h11.abs();
-                let cancel_frac = if scale > 0.0 { sum.abs() / scale } else { 0.0 };
-                eprintln!(
-                    "{:>6.1}  {:>4.1}  {:>14.6e}  {:>14.6e}  {:>14.6e}  {:>14.6e}  {:>14.6e}",
-                    eta, d, h00, h11, sum, scale, cancel_frac
-                );
-            }
+        // Censored rows, q0 = q1 = η, at a wide range of saturations:
+        // cancellation must be ULP-exact for every η.
+        for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 500.0, 988.0] {
+            let (_nll, _grad, hess) = row_primary_closed_form(
+                eta, eta, qd1, g, z, w, 0.0, derivative_guard, probit_scale,
+            )
+            .expect("rigid censored row");
+            let sum = hess[0][0] + hess[1][1];
+            assert!(
+                sum.abs() <= 1e-12 * (hess[0][0].abs() + hess[1][1].abs()).max(1.0),
+                "censored cancellation broke at η={eta}: h[0,0]={:.3e} h[1,1]={:.3e} sum={:.3e}",
+                hess[0][0], hess[1][1], sum,
+            );
         }
-        // Probe: does the cancellation become exact in the saturated tail?
-        // If yes, the marginal-block joint Hessian collapses there and the
-        // Newton step in that block is set entirely by the penalty/ridge.
-        let (_, _, hess_sat_event) =
-            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
-                .expect("saturated event");
-        let (_, _, hess_sat_cens) =
-            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1e-6, 1.0)
-                .expect("saturated censored");
-        let event_sum = hess_sat_event[0][0] + hess_sat_event[1][1];
-        let cens_sum = hess_sat_cens[0][0] + hess_sat_cens[1][1];
-        let event_scale = hess_sat_event[0][0].abs() + hess_sat_event[1][1].abs();
-        let cens_scale = hess_sat_cens[0][0].abs() + hess_sat_cens[1][1].abs();
-        eprintln!(
-            "\nSATURATED EVENT row at η=988:  h[0,0]={:.6e}  h[1,1]={:.6e}  sum={:.6e}  rel={:.6e}",
-            hess_sat_event[0][0],
-            hess_sat_event[1][1],
-            event_sum,
-            event_sum.abs() / event_scale.max(1e-300),
+
+        // Event rows, q0 = q1 = η, deep saturation: residual scales as
+        // 1/η² by Mills asymptotic M(−η) = η + 1/η + O(1/η³).
+        for &eta in &[40.0_f64, 100.0, 500.0, 988.0] {
+            let (_nll, _grad, hess) = row_primary_closed_form(
+                eta, eta, qd1, g, z, w, 1.0, derivative_guard, probit_scale,
+            )
+            .expect("rigid event row");
+            let sum = hess[0][0] + hess[1][1];
+            let bound = 2.0 / (eta * eta);
+            assert!(
+                sum > 0.0 && sum <= bound,
+                "event cancellation residual at η={eta}: sum={:.3e} expected (0, {:.3e}]",
+                sum, bound,
+            );
+        }
+
+        // Cross-check at η = 988 (the user's biobank-scale saturation):
+        // both kinds of rows hit the predicted floor exactly.
+        let (_, _, ev) =
+            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0).unwrap();
+        let (_, _, ce) =
+            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1e-6, 1.0).unwrap();
+        let ev_sum = ev[0][0] + ev[1][1];
+        let ce_sum = ce[0][0] + ce[1][1];
+        assert!(
+            ev_sum > 0.0 && ev_sum < 2.0e-6,
+            "event saturated h[0,0]+h[1,1] = {ev_sum:.3e}, expected ~1/988² ≈ 1e-6",
         );
-        eprintln!(
-            "SATURATED CENS  row at η=988:  h[0,0]={:.6e}  h[1,1]={:.6e}  sum={:.6e}  rel={:.6e}",
-            hess_sat_cens[0][0],
-            hess_sat_cens[1][1],
-            cens_sum,
-            cens_sum.abs() / cens_scale.max(1e-300),
+        assert_eq!(
+            ce_sum, 0.0,
+            "censored saturated h[0,0]+h[1,1] must be EXACTLY 0, got {ce_sum:.3e}",
         );
-        // Force a failure so cargo prints the eprintln above.
-        panic!("DIAGNOSTIC OUTPUT — see eprintln above");
     }
 
     #[test]

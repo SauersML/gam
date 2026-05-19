@@ -77,7 +77,17 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     ctx.bind_to_thread()
         .map_err(|e| format!("bind_to_thread: {e}"))?;
 
-    let stream = ctx.default_stream();
+    // Use a *created* (non-blocking) stream rather than `default_stream()`'s
+    // legacy null stream. cudarc routes `alloc_zeros` through `cuMemAllocAsync`
+    // whenever the device reports `CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED`
+    // (true on every Pascal+ board, including T4), and `cuMemAllocAsync` with
+    // the legacy null stream is documented as undefined on older driver
+    // builds — exactly the configuration shipped on cloud T4 images. A real
+    // stream side-steps that whole class of failure and matches what the
+    // production session path uses.
+    let stream = ctx
+        .new_stream()
+        .map_err(|e| format!("new_stream: {e}"))?;
     let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas_init: {e}"))?;
 
     // -- Shape constants ----------------------------------------------------
