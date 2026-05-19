@@ -993,7 +993,10 @@ fn persistent_survival_transformation_key(
 ) -> String {
     let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
     hasher.write_str("gamfit-persistent-survival-transformation-working-pirls");
-    hasher.write_str(env!("CARGO_PKG_VERSION"));
+    // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
+    // library version bumps don't invalidate users' on-disk warm-start
+    // caches.
+    hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
     hasher.write_str(&format!("{:?}", spec.likelihood_mode));
     hasher.write_f64(spec.time_anchor);
     hasher.write_f64(spec.ridge_lambda);

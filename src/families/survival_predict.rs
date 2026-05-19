@@ -2041,6 +2041,31 @@ mod tests {
     }
 
     #[test]
+    fn probit_survival_hazard_rejects_nan_inputs() {
+        // The upstream input gate is the only line that rejects NaN — the
+        // output gate (`>= 0.0`) is dead-code for finite input because
+        // `signed_probit_logcdf_and_mills_ratio` is provably NaN-free on the
+        // finite domain (every internal branch clamps `erfcx`/`cdf` away from
+        // zero). Pin both NaN slots so the input gate cannot regress.
+        let err_eta = probit_survival_hazard_components(f64::NAN, 0.5)
+            .expect_err("NaN eta must be rejected");
+        assert!(err_eta.contains("invalid survival index derivative"));
+        let err_dt = probit_survival_hazard_components(1.0, f64::NAN)
+            .expect_err("NaN eta_derivative must be rejected");
+        assert!(err_dt.contains("invalid survival index derivative"));
+    }
+
+    #[test]
+    fn probit_survival_hazard_rejects_negative_time_derivative() {
+        // The CDF S(t) = Phi(-eta(t)) is monotone in t iff eta'(t) > 0. A
+        // negative slope would give a non-monotone survival curve, which is
+        // not a valid survival function.
+        let err = probit_survival_hazard_components(1.0, -0.5)
+            .expect_err("negative derivative should be invalid");
+        assert!(err.contains("invalid survival index derivative"));
+    }
+
+    #[test]
     fn royston_parmar_hazard_is_cumulative_hazard_derivative() {
         let eta = 2.0_f64.ln();
         let eta_t = 0.25;
@@ -2088,6 +2113,24 @@ mod tests {
         let err = royston_parmar_survival_hazard_components(f64::NAN, 0.5)
             .expect_err("NaN eta should be invalid");
         assert!(err.contains("invalid log-cumulative-hazard derivative"));
+    }
+
+    #[test]
+    fn royston_parmar_hazard_left_tail_collapses_to_zero() {
+        // η = log Λ(t); η → -∞ means Λ(t) → 0, so cum_hazard underflows to 0
+        // and hazard rate underflows to 0. Survival → 1. No error.
+        let eta = -1000.0_f64;
+        let eta_t = 2.0_f64;
+        assert_eq!(eta.exp(), 0.0, "test premise: exp(-1000) underflows to 0");
+
+        let (cum, hazard) = royston_parmar_survival_hazard_components(eta, eta_t)
+            .expect("RP left tail must remain valid");
+        assert_eq!(cum, 0.0, "left-tail cum_hazard should underflow to 0, got {cum}");
+        assert_eq!(hazard, 0.0, "left-tail hazard should underflow to 0, got {hazard}");
+
+        // Consumer: survival = exp(-0) = 1.
+        let survival = (-cum).exp().clamp(0.0, 1.0);
+        assert_eq!(survival, 1.0);
     }
 
     #[test]
