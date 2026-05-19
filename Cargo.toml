@@ -81,12 +81,6 @@ autodiff = "0.7.0"
 ad_trait = "0.3.0"
 criterion = "0.8"
 
-# TEMPORARY local patch — remove before committing. The published `opt`
-# is 0.5.9, but gam's current tree uses `Bfgs::with_axis_step_caps`
-# (added in unpublished 0.5.10 at the sibling workspace).
-[patch.crates-io]
-opt = { path = "../opt/opt" }
-
 [[bin]]
 name = "gam"
 path = "src/main.rs"
