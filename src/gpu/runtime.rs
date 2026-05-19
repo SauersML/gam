@@ -26,7 +26,6 @@ use cudarc::driver::sys::CUdevice_attribute_enum;
 use super::calibration::{DeviceCalibration, measure_device};
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
-use super::driver::CudaWorkingState;
 use super::policy::DispatchPolicy;
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
@@ -147,15 +146,6 @@ impl GpuRuntime {
     #[inline]
     pub fn cpu_reason(&self) -> Option<&str> {
         self.cpu_reason.as_deref()
-    }
-
-    /// Legacy accessor kept for API stability while the cuBLAS / cuSOLVER /
-    /// cuSPARSE wrappers still consume the hand-rolled driver context. The
-    /// parallel cudarc migration will retire it; for now this returns
-    /// `None` so callers transparently fall through to the CPU path until
-    /// they are rewritten on top of `cuda_context_for`.
-    pub fn cuda_working_state(&self) -> Option<&'static CudaWorkingState> {
-        None
     }
 
     pub fn plan_batched_work_for_devices(
