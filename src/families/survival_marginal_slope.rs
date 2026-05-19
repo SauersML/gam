@@ -20019,6 +20019,134 @@ mod tests {
     }
 
     #[test]
+    fn survival_psi_terms_inner_batched_matches_per_axis() {
+        // The batched first-order ψ row pass shares the per-row primary
+        // gradient/Hessian across axes; this asserts it produces the same
+        // ExactNewtonJointPsiTerms (objective, score, Hessian-operator action)
+        // as K serial calls to `psi_terms_inner_with_options`.
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+        let opts = BlockwiseFitOptions::default();
+
+        let per_axis_0 = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts)
+            .expect("per-axis 0")
+            .expect("some");
+        let per_axis_1 = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 1, None, &opts)
+            .expect("per-axis 1")
+            .expect("some");
+
+        let batched = family
+            .psi_terms_inner_batched_with_options(
+                &states,
+                &derivative_blocks,
+                &[0, 1],
+                None,
+                &opts,
+            )
+            .expect("batched")
+            .expect("batched simple-spatial path returned None unexpectedly");
+        assert_eq!(batched.len(), 2, "batched should yield one term per axis");
+
+        let per_axis = [&per_axis_0, &per_axis_1];
+        for (i, (lhs, rhs)) in per_axis.iter().zip(batched.iter()).enumerate() {
+            let obj_rel = ((rhs.objective_psi - lhs.objective_psi)
+                / lhs.objective_psi.abs().max(1.0))
+            .abs();
+            assert!(
+                obj_rel < 1e-12,
+                "axis {i} objective_psi rel {obj_rel} (per-axis={}, batched={})",
+                lhs.objective_psi,
+                rhs.objective_psi,
+            );
+            let score_rel = rel_diff_array1_survival(&rhs.score_psi, &lhs.score_psi);
+            assert!(score_rel < 1e-12, "axis {i} score_psi rel {score_rel}");
+
+            let op_a = lhs
+                .hessian_psi_operator
+                .as_ref()
+                .expect("per-axis Hessian operator");
+            let op_b = rhs
+                .hessian_psi_operator
+                .as_ref()
+                .expect("batched Hessian operator");
+            assert_eq!(op_a.dim(), op_b.dim(), "axis {i} operator dim mismatch");
+            let dim = op_a.dim();
+            let probe = Array1::from_shape_fn(dim, |j| {
+                ((j as i64 * 37 + 11).rem_euclid(7)) as f64 * 0.1 - 0.3
+            });
+            let a = op_a.mul_vec(&probe);
+            let b = op_b.mul_vec(&probe);
+            let op_rel = rel_diff_array1_survival(&a, &b);
+            assert!(op_rel < 1e-12, "axis {i} Hessian-action rel {op_rel}");
+        }
+    }
+
+    #[test]
+    fn survival_psi_terms_inner_batched_subsample_matches_per_axis() {
+        // Same equivalence under a half-row Horvitz-Thompson mask, exercising
+        // the per-row weight branch of the batched fast path.
+        use crate::families::marginal_slope_shared::OuterScoreSubsample;
+        let n = 200usize;
+        let family = make_block_psi_test_family(n);
+        let states = block_psi_test_block_states(&family, 0.15, 0.25);
+        let derivative_blocks = block_psi_test_dual_derivative_blocks(n);
+
+        let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+        let mut opts = BlockwiseFitOptions::default();
+        opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+            even_mask,
+            n,
+            0xC0FFEE,
+        )));
+
+        let per_axis_0 = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts)
+            .expect("per-axis 0")
+            .expect("some");
+        let per_axis_1 = family
+            .psi_terms_inner_with_options(&states, &derivative_blocks, 1, None, &opts)
+            .expect("per-axis 1")
+            .expect("some");
+
+        let batched = family
+            .psi_terms_inner_batched_with_options(
+                &states,
+                &derivative_blocks,
+                &[0, 1],
+                None,
+                &opts,
+            )
+            .expect("batched")
+            .expect("batched simple-spatial path returned None under subsample");
+        assert_eq!(batched.len(), 2);
+
+        let per_axis = [&per_axis_0, &per_axis_1];
+        for (i, (lhs, rhs)) in per_axis.iter().zip(batched.iter()).enumerate() {
+            let obj_rel = ((rhs.objective_psi - lhs.objective_psi)
+                / lhs.objective_psi.abs().max(1.0))
+            .abs();
+            assert!(obj_rel < 1e-12, "axis {i} subsample objective_psi rel {obj_rel}");
+            let score_rel = rel_diff_array1_survival(&rhs.score_psi, &lhs.score_psi);
+            assert!(score_rel < 1e-12, "axis {i} subsample score_psi rel {score_rel}");
+
+            let op_a = lhs.hessian_psi_operator.as_ref().unwrap();
+            let op_b = rhs.hessian_psi_operator.as_ref().unwrap();
+            let dim = op_a.dim();
+            let probe = Array1::from_shape_fn(dim, |j| {
+                ((j as i64 * 41 + 5).rem_euclid(11)) as f64 * 0.07 - 0.4
+            });
+            let a = op_a.mul_vec(&probe);
+            let b = op_b.mul_vec(&probe);
+            let op_rel = rel_diff_array1_survival(&a, &b);
+            assert!(op_rel < 1e-12, "axis {i} subsample Hessian-action rel {op_rel}");
+        }
+    }
+
+    #[test]
     fn survival_psi_second_order_terms_inner_subsample_full_equals_unsampled() {
         use crate::families::marginal_slope_shared::OuterScoreSubsample;
         let n = 200usize;
