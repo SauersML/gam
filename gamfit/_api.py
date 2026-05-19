@@ -617,19 +617,29 @@ def explain_error(exc: BaseException) -> str:
 
 def bspline_basis(
     t: Any,
-    knots: Any,
+    knots: Any = None,
     *,
     degree: int = 3,
     periodic: bool = False,
 ) -> Any:
-    """Evaluate the Rust B-spline basis as a NumPy array."""
+    """Evaluate the Rust B-spline basis as a NumPy array.
+
+    ``knots`` may be:
+
+    * ``None`` — auto-derive a clamped knot vector with quantile-spaced
+      interior knots inferred from ``t``.
+    * an ``int`` ``K`` — auto-derive with ``K`` interior knots.
+    * an array-like — used verbatim (must be a valid clamped knot vector).
+    """
     import numpy as np
 
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_knots(knots, t_np, label="knots", degree=int(degree))
     try:
         return np.asarray(
             rust_module().bspline_basis(
-                _numeric_vector(t, "t"),
-                _numeric_vector(knots, "knots"),
+                t_np,
+                knots_np,
                 int(degree),
                 bool(periodic),
             ),
@@ -641,20 +651,25 @@ def bspline_basis(
 
 def bspline_basis_derivative(
     t: Any,
-    knots: Any,
+    knots: Any = None,
     *,
     degree: int = 3,
     order: int = 1,
     periodic: bool = False,
 ) -> Any:
-    """Evaluate derivatives of the Rust B-spline basis as a NumPy array."""
+    """Evaluate derivatives of the Rust B-spline basis as a NumPy array.
+
+    ``knots`` accepts ``None`` / ``int`` / array — see :func:`bspline_basis`.
+    """
     import numpy as np
 
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_knots(knots, t_np, label="knots", degree=int(degree))
     try:
         return np.asarray(
             rust_module().bspline_basis_derivative(
-                _numeric_vector(t, "t"),
-                _numeric_vector(knots, "knots"),
+                t_np,
+                knots_np,
                 int(degree),
                 int(order),
                 bool(periodic),
@@ -667,19 +682,28 @@ def bspline_basis_derivative(
 
 def duchon_basis_1d(
     t: Any,
-    centers: Any,
+    centers: Any = None,
     *,
     m: int = 2,
     periodic: bool = False,
 ) -> Any:
-    """Evaluate the Rust one-dimensional Duchon basis as a NumPy array."""
+    """Evaluate the Rust one-dimensional Duchon basis as a NumPy array.
+
+    ``centers`` may be:
+
+    * ``None`` — auto-derive ``K = 10`` centers at empirical quantiles of ``t``.
+    * an ``int`` ``K`` — auto-derive ``K`` quantile centers.
+    * an array-like — used verbatim.
+    """
     import numpy as np
 
+    t_np = _numeric_vector(t, "t")
+    centers_np = _resolve_centers(centers, t_np, label="centers")
     try:
         return np.asarray(
             rust_module().duchon_basis_1d(
-                _numeric_vector(t, "t"),
-                _numeric_vector(centers, "centers"),
+                t_np,
+                centers_np,
                 int(m),
                 bool(periodic),
             ),
@@ -691,20 +715,25 @@ def duchon_basis_1d(
 
 def duchon_basis_1d_derivative(
     t: Any,
-    centers: Any,
+    centers: Any = None,
     *,
     m: int = 2,
     order: int = 1,
     periodic: bool = False,
 ) -> Any:
-    """Evaluate derivatives of the Rust one-dimensional Duchon basis."""
+    """Evaluate derivatives of the Rust one-dimensional Duchon basis.
+
+    ``centers`` accepts ``None`` / ``int`` / array — see :func:`duchon_basis_1d`.
+    """
     import numpy as np
 
+    t_np = _numeric_vector(t, "t")
+    centers_np = _resolve_centers(centers, t_np, label="centers")
     try:
         return np.asarray(
             rust_module().duchon_basis_1d_derivative(
-                _numeric_vector(t, "t"),
-                _numeric_vector(centers, "centers"),
+                t_np,
+                centers_np,
                 int(m),
                 int(order),
                 bool(periodic),
@@ -721,7 +750,12 @@ def smoothness_penalty(
     degree: int = 3,
     order: int = 2,
 ) -> tuple[Any, Any]:
-    """Return ``(S, null_basis)`` for the Rust B-spline difference penalty."""
+    """Return ``(S, null_basis)`` for the Rust B-spline difference penalty.
+
+    ``knots`` must be a knot vector here — auto-derivation requires
+    sample positions, which this penalty constructor does not take. Build
+    one with :func:`bspline_basis`'s defaults (or pass any 1D array).
+    """
     import numpy as np
 
     try:
@@ -952,8 +986,8 @@ def gaussian_reml_fit_positions(
     t: Any,
     y: Any,
     basis_kind: str,
-    knots_or_centers: Any,
-    penalty: Any,
+    knots_or_centers: Any = None,
+    penalty: Any | None = None,
     *,
     basis_order: int | None = None,
     periodic: bool = False,
@@ -963,17 +997,32 @@ def gaussian_reml_fit_positions(
     by: Any | None = None,
     by_start_col: int = 0,
 ) -> dict[str, Any]:
-    """Fit closed-form Gaussian REML from 1D positions and an internal basis."""
+    """Fit closed-form Gaussian REML from 1D positions and an internal basis.
+
+    ``knots_or_centers`` may be ``None``, an ``int`` (basis count), or an
+    array; the basis-location vector is auto-derived from ``t`` when not
+    supplied. ``penalty`` defaults to the identity of matching size when
+    omitted — a neutral ridge that lets REML pick ``lambda`` from data.
+    """
     import numpy as np
 
     order = _position_basis_order(basis_kind, basis_order)
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_basis_locations(
+        knots_or_centers,
+        t_np,
+        basis_kind=basis_kind,
+        label="knots_or_centers",
+        degree=order,
+    )
+    penalty_np = _resolve_penalty(penalty, knots_np, basis_kind=basis_kind, order=order)
     try:
         out = rust_module().gaussian_reml_fit_positions(
-            _numeric_vector(t, "t"),
+            t_np,
             _numeric_matrix(y, "y"),
             str(basis_kind),
-            _numeric_vector(knots_or_centers, "knots_or_centers"),
-            _numeric_matrix(penalty, "penalty"),
+            knots_np,
+            penalty_np,
             order,
             bool(periodic),
             None if period is None else float(period),
@@ -1267,6 +1316,152 @@ def _numeric_matrix(values: Any, label: str) -> Any:
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
     return arr
+
+
+# Default number of basis functions when the caller does not pin centers /
+# knots themselves. Matches mgcv's ``k = 10`` convention and is a sane
+# starting point for one-dimensional smooths; capped per-call against the
+# number of distinct data points so we never request more centers than
+# the data can support.
+_DEFAULT_BASIS_K = 10
+
+
+def _default_centers_from_t(t_arr: Any, k: int) -> Any:
+    """Place ``k`` Duchon centers at empirical quantiles of ``t``.
+
+    Quantile placement spends basis capacity where the data lives instead
+    of where uniform spacing happens to put it. The returned vector is
+    strictly increasing and lies within ``[min(t), max(t)]``.
+    """
+    import numpy as np
+
+    finite = t_arr[np.isfinite(t_arr)]
+    if finite.size == 0:
+        raise ValueError("cannot auto-derive centers from t containing no finite values")
+    lo = float(finite.min())
+    hi = float(finite.max())
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo >= hi:
+        raise ValueError(
+            "cannot auto-derive centers: t has zero range "
+            f"(min={lo!r}, max={hi!r}); supply centers explicitly"
+        )
+    k = max(int(k), 2)
+    # Probability levels are pulled in slightly from the boundary so the
+    # outermost centers do not collide with a single boundary point mass.
+    qs = np.linspace(1.0 / (k + 1), k / (k + 1), k)
+    centers = np.quantile(finite.astype(np.float64), qs).astype(np.float64)
+    centers.sort()
+    span = hi - lo
+    min_gap = max(span * 1e-6, np.finfo(np.float64).eps * 16.0)
+    for i in range(1, centers.size):
+        if centers[i] - centers[i - 1] < min_gap:
+            centers[i] = centers[i - 1] + min_gap
+    np.clip(centers, lo, hi, out=centers)
+    return centers
+
+
+def _default_knots_from_t(t_arr: Any, k_interior: int, degree: int) -> Any:
+    """Build a clamped B-spline full knot vector from ``t``.
+
+    Interior knots are placed at empirical quantiles; ``degree + 1`` copies
+    of ``min(t)`` and ``max(t)`` clamp the ends.
+    """
+    import numpy as np
+
+    finite = t_arr[np.isfinite(t_arr)]
+    if finite.size == 0:
+        raise ValueError("cannot auto-derive knots from t containing no finite values")
+    lo = float(finite.min())
+    hi = float(finite.max())
+    if lo >= hi:
+        raise ValueError(
+            "cannot auto-derive knots: t has zero range "
+            f"(min={lo!r}, max={hi!r}); supply knots explicitly"
+        )
+    k_interior = max(int(k_interior), 0)
+    degree = max(int(degree), 0)
+    interior: list[float]
+    if k_interior == 0:
+        interior = []
+    else:
+        qs = np.linspace(
+            1.0 / (k_interior + 1), k_interior / (k_interior + 1), k_interior
+        )
+        q = np.quantile(finite.astype(np.float64), qs).astype(np.float64)
+        q.sort()
+        span = hi - lo
+        min_gap = max(span * 1e-6, np.finfo(np.float64).eps * 16.0)
+        # De-duplicate and keep strictly interior.
+        cleaned: list[float] = []
+        prev = lo
+        for v in q:
+            v = float(min(max(v, lo + min_gap), hi - min_gap))
+            if v - prev < min_gap:
+                v = prev + min_gap
+            if v >= hi - min_gap:
+                break
+            cleaned.append(v)
+            prev = v
+        interior = cleaned
+    knots = [lo] * (degree + 1) + interior + [hi] * (degree + 1)
+    return np.asarray(knots, dtype=np.float64)
+
+
+def _resolve_centers(centers: Any, t_arr: Any, *, label: str = "centers") -> Any:
+    """Coerce ``centers`` (None / int / array) into a validated 1D float64 array.
+
+    ``None`` requests the library default ``K = _DEFAULT_BASIS_K``. An ``int``
+    requests ``K`` centers. Anything else is forwarded to ``_numeric_vector``
+    unchanged.
+    """
+    if centers is None:
+        return _default_centers_from_t(t_arr, _DEFAULT_BASIS_K)
+    if isinstance(centers, int) and not isinstance(centers, bool):
+        if centers < 2:
+            raise ValueError(f"{label}: integer count must be >= 2, got {centers}")
+        return _default_centers_from_t(t_arr, centers)
+    return _numeric_vector(centers, label)
+
+
+def _resolve_knots(
+    knots: Any,
+    t_arr: Any,
+    *,
+    label: str = "knots",
+    degree: int = 3,
+) -> Any:
+    """Coerce ``knots`` (None / int / array) into a validated 1D float64 array.
+
+    ``None`` builds a clamped B-spline knot vector with ``_DEFAULT_BASIS_K``
+    interior knots placed at quantiles of ``t``. An ``int`` overrides the
+    interior-knot count.
+    """
+    if knots is None:
+        return _default_knots_from_t(t_arr, _DEFAULT_BASIS_K, degree)
+    if isinstance(knots, int) and not isinstance(knots, bool):
+        if knots < 0:
+            raise ValueError(f"{label}: integer interior-knot count must be >= 0, got {knots}")
+        return _default_knots_from_t(t_arr, knots, degree)
+    return _numeric_vector(knots, label)
+
+
+def _resolve_basis_locations(
+    arg: Any,
+    t_arr: Any,
+    *,
+    basis_kind: str,
+    label: str = "knots_or_centers",
+    degree: int = 3,
+) -> Any:
+    """Resolve the basis-location argument for kind-dispatched primitives.
+
+    Mirrors :func:`_resolve_centers` for ``basis_kind == "duchon"`` and
+    :func:`_resolve_knots` for B-spline-like kinds.
+    """
+    kind = str(basis_kind).lower()
+    if kind == "duchon":
+        return _resolve_centers(arg, t_arr, label=label)
+    return _resolve_knots(arg, t_arr, label=label, degree=degree)
 
 
 def _numeric_tensor3(values: Any, label: str) -> Any:
