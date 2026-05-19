@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::device::GpuDeviceInfo;
 use super::policy::DispatchPolicy;
@@ -7,9 +8,11 @@ use super::runtime::GpuRuntime;
 
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &DispatchPolicy) {
     log::info!(
-        "[GPU] CUDA acceleration enabled\n  device: {}\n  compute: fp64_est={}GFLOP/s memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop gemv>={}flop spmv_rows>={} spmv_nnz>={} chol_p>={} syevd_p>={} trsm>={}flop",
+        "[GPU] CUDA acceleration enabled\n  device: {}\n  measured: fp64={} GFLOP/s h2d={:.1} GB/s d2h={:.1} GB/s memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop gemv>={}flop spmv_rows>={} spmv_nnz>={} chol_p>={} syevd_p>={} trsm>={}flop",
         device,
         format_float(device.peak_fp64_gflops()),
+        device.calibration.h2d_gb_s,
+        device.calibration.d2h_gb_s,
         format_bytes(device.total_memory_bytes),
         policy.xtwx_min_rows,
         format_count(policy.gemm_min_flops),
@@ -70,6 +73,7 @@ pub(crate) fn log_library_unavailable(library: &'static str, reason: &str) {
 }
 
 pub(crate) fn log_policy_cpu(op: &'static str, shape: String, reason: String) {
+    activity::record_policy_decline(op);
     log_route(format!(
         "[GPU] CPU route | op={op} | shape={shape} | reason={reason}"
     ));
@@ -84,6 +88,7 @@ pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
 }
 
 pub(crate) fn log_runtime_cpu(op: &'static str, backend: &'static str, shape: String) {
+    activity::record_runtime_decline(op);
     log_route(format!(
         "[GPU] CPU route | op={op} | backend={backend} | shape={shape} | reason=device dispatch returned no result"
     ));
@@ -99,6 +104,7 @@ pub(crate) fn log_gpu_success(
     d2h_bytes: usize,
     elapsed_s: f64,
 ) {
+    activity::record_success(op, flops, h2d_bytes, d2h_bytes, elapsed_s);
     log_route(format!(
         "[GPU] device route | op={op} | backend={backend} | device={} '{}' | shape={shape} | work={}flop | transfer=h2d:{} d2h:{} | elapsed={:.3}s",
         device.ordinal,
@@ -133,6 +139,7 @@ pub(crate) fn log_gpu_success_multi(
         );
         return;
     }
+    activity::record_success(op, flops, h2d_bytes, d2h_bytes, elapsed_s);
     let device_summary = devices
         .iter()
         .map(|device| format!("{} '{}'", device.ordinal, device.name))
