@@ -84,6 +84,12 @@ def _fd_grad(
 
 
 def _rel_err(analytic: float, fd: float) -> float:
+    # Absolute tolerance floor: values that round-trip through the analytic
+    # backward at the f64-noise floor (e.g. when both the FD reference and
+    # the analytic land below ~1e-7) compare as exactly matching, since the
+    # relative error of two numerically-zero quantities is meaningless.
+    if abs(analytic) < 1e-7 and abs(fd) < 1e-7:
+        return 0.0
     scale = max(abs(analytic), abs(fd), 1e-12)
     return abs(analytic - fd) / scale
 
