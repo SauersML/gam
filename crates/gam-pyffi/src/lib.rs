@@ -5274,6 +5274,12 @@ fn build_survival_marginal_slope_ffi_payload(
     frailty: gam::families::lognormal_kernel::FrailtySpec,
     ms_result: SurvivalMarginalSlopeFitResult,
 ) -> Result<FittedModelPayload, String> {
+    use gam::families::survival_construction::{
+        build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
+        parse_survival_time_basis_config, resolve_survival_time_anchor_value,
+        survival_baseline_targetname,
+    };
+
     let frozen_marginal = freeze_term_collection_from_design(
         &ms_result.marginalspec_resolved,
         &ms_result.marginal_design,
@@ -5297,6 +5303,58 @@ fn build_survival_marginal_slope_ffi_payload(
         .map_err(|err| format!("failed to re-parse survival marginal formula: {err}"))?;
     let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
         .ok_or_else(|| "survival marginal-slope FFI requires Surv(...) response".to_string())?;
+    let col_map: HashMap<String, usize> = dataset
+        .headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| (h.clone(), i))
+        .collect();
+    let entry_idx = *col_map
+        .get(&entryname)
+        .ok_or_else(|| format!("entry column '{entryname}' not found"))?;
+    let exit_idx = *col_map
+        .get(&exitname)
+        .ok_or_else(|| format!("exit column '{exitname}' not found"))?;
+    let n = dataset.values.nrows();
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let (t0, t1) = gam::families::survival_construction::normalize_survival_time_pair(
+            dataset.values[[i, entry_idx]],
+            dataset.values[[i, exit_idx]],
+            i,
+        )?;
+        age_entry[i] = t0;
+        age_exit[i] = t1;
+    }
+    let baseline_cfg = parse_survival_baseline_config(
+        &fit_config.baseline_target,
+        fit_config.baseline_scale,
+        fit_config.baseline_shape,
+        fit_config.baseline_rate,
+        fit_config.baseline_makeham,
+    )?;
+    let likelihood_mode = parse_survival_likelihood_mode(&fit_config.survival_likelihood)?;
+    let time_cfg = if parsed.timewiggle.is_some() {
+        gam::families::survival_construction::SurvivalTimeBasisConfig::None
+    } else {
+        parse_survival_time_basis_config(
+            &fit_config.time_basis,
+            fit_config.time_degree,
+            fit_config.time_num_internal_knots,
+            fit_config.time_smooth_lambda,
+        )?
+    };
+    let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
+    let time_build = build_survival_time_basis(
+        &age_entry,
+        &age_exit,
+        time_cfg,
+        Some((
+            fit_config.time_num_internal_knots,
+            fit_config.time_smooth_lambda,
+        )),
+    )?;
 
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -5316,8 +5374,21 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_entry = Some(entryname);
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
+    payload.survivalspec = Some("net".to_string());
+    payload.survival_baseline_target =
+        Some(survival_baseline_targetname(baseline_cfg.target).to_string());
+    payload.survival_baseline_scale = baseline_cfg.scale;
+    payload.survival_baseline_shape = baseline_cfg.shape;
+    payload.survival_baseline_rate = baseline_cfg.rate;
+    payload.survival_baseline_makeham = baseline_cfg.makeham;
+    payload.survival_time_basis = Some(time_build.basisname.clone());
+    payload.survival_time_degree = time_build.degree;
+    payload.survival_time_knots = time_build.knots.clone();
+    payload.survival_time_keep_cols = time_build.keep_cols.clone();
+    payload.survival_time_smooth_lambda = time_build.smooth_lambda;
+    payload.survival_time_anchor = Some(time_anchor);
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some("marginal-slope".to_string());
+    payload.survival_likelihood = Some(gam::families::survival_construction::survival_likelihood_modename(likelihood_mode).to_string());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
