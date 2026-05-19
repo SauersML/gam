@@ -245,6 +245,21 @@ fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
     fp.finalize()
 }
 
+/// Open a [`crate::cache::Session`] for outer-iterate (rho-axis) checkpoints.
+///
+/// Uses a different fingerprint tag than [`fingerprint_for_key`] so the
+/// outer-iterate keyspace is disjoint from the inner beta-record keyspace —
+/// the two layers persist different payload shapes and must not alias.
+pub(crate) fn open_outer_session(
+    key: &str,
+) -> Option<std::sync::Arc<crate::cache::Session>> {
+    let store = persistent_store()?;
+    let mut fp = Fingerprinter::new();
+    fp.absorb_str(b"outer-iterate-key", key);
+    let fp = fp.finalize();
+    Some(std::sync::Arc::new(crate::cache::Session::open(store, fp)))
+}
+
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
