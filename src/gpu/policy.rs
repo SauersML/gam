@@ -275,7 +275,6 @@ mod tests {
             compute_capability_major: major,
             compute_capability_minor: 0,
             sm_count: sms,
-            max_threads_per_multiprocessor: 2048,
             clock_rate_khz: 1_500_000,
             single_to_double_precision_perf_ratio: Some(if major >= 9 { 1 } else { 2 }),
             total_memory_bytes: 16 * 1024 * 1024 * 1024,
