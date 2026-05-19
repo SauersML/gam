@@ -116,6 +116,16 @@ pub struct GaussianRemlScoreDerivatives {
 }
 
 #[derive(Clone, Debug)]
+pub struct GaussianRemlFreeBScore {
+    pub reml_score: f64,
+    pub grad_coefficients: Array2<f64>,
+    pub grad_log_lambda: f64,
+    pub fitted: Array2<f64>,
+    pub sigma2: Array1<f64>,
+    pub edf: f64,
+}
+
+#[derive(Clone, Debug)]
 pub struct GaussianRemlBackwardResult {
     pub grad_x: Array2<f64>,
     pub grad_y: Array2<f64>,
