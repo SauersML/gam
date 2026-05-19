@@ -1426,11 +1426,18 @@ mod tests {
         assert!(lines.first().is_some_and(|line| line.contains("[WARNING]")));
     }
 
+    // The static `ACTIVE_FEED` registry is shared across the whole test
+    // process, and cargo runs tests in parallel by default. Any test that
+    // both constructs an enabled `VisualizerSession` and asserts on the
+    // global feed contents must serialize against every other such test,
+    // because a concurrent test's session would overwrite or clear our
+    // feed mid-assertion. Existing `new(false)` tests don't touch the
+    // static and are exempt from this lock.
+    static FEED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn record_outer_eval_populates_trial_series_when_session_is_active() {
-        // The accepted hook can only promote the most recent trial point, so
-        // a trial push must populate `last_trial`; otherwise the chart's
-        // accepted series stays empty even when the optimizer accepts steps.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _session = VisualizerSession::new(true);
         record_outer_eval(123.4, 1e-2);
         let feed = current_active_feed().expect("feed registered");
@@ -1442,9 +1449,7 @@ mod tests {
 
     #[test]
     fn record_outer_accept_promotes_last_trial_into_accepted_series() {
-        // Promotion must reuse the trial's (iter, cost). Otherwise the chart
-        // would draw an accepted line at the wrong x-coordinate when the
-        // optimizer skips a trial via line-search caching.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _session = VisualizerSession::new(true);
         record_outer_eval(50.0, 1e-3);
         record_outer_accept();
@@ -1453,5 +1458,20 @@ mod tests {
         assert_eq!(model.history_cost_accepted.len(), 1);
         assert_eq!(model.history_cost_accepted[0].1, 50.0);
         assert_eq!(model.current_eval_state, "accepted");
+    }
+
+    #[test]
+    fn dropping_session_clears_active_feed() {
+        // The Drop impl must call clear_active_feed before tearing down the
+        // renderer; otherwise a subsequent optimizer push would target a
+        // half-dead session and either write to a Disabled renderer (silent
+        // data loss for the chart) or, in tests, leak a stale Arc that
+        // racing tests then mutate.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let _session = VisualizerSession::new(true);
+            assert!(current_active_feed().is_some());
+        }
+        assert!(current_active_feed().is_none());
     }
 }
