@@ -46,7 +46,7 @@ except ImportError:
 
 _F64 = torch.float64
 _RTOL = 5e-5
-_ATOL = 1e-9
+_ATOL = 1e-10
 _FD_STEP = 1e-5
 _RANGE_REL_TOL = 1e-10
 

@@ -14,6 +14,29 @@ const EIGEN_REL_TOL: f64 = 1.0e-10;
 const GRAD_TOL: f64 = 1.0e-12;
 const MIN_DEVIANCE: f64 = 1.0e-300;
 
+/// Canonicalize a penalty matrix to its symmetric average.
+///
+/// Closed-form Gaussian REML treats `S` as symmetric throughout — the
+/// eigendecomposition, the pseudo-determinant `log|S|₊`, the rank detector,
+/// and every per-helper VJP all assume `S = Sᵀ`. To make that contract
+/// explicit (rather than implicit in `eigh(Side::Lower)` reading the lower
+/// triangle and silently ignoring the upper), every entry point that takes a
+/// penalty matrix replaces it with `0.5 (S + Sᵀ)` before any downstream use.
+/// For symmetric input this is a numerical no-op; for asymmetric input it
+/// defines the function as operating on the symmetric average.
+fn canonicalize_penalty(penalty: ArrayView2<'_, f64>) -> Array2<f64> {
+    let p = penalty.nrows();
+    let mut out = penalty.to_owned();
+    for i in 0..p {
+        for j in (i + 1)..p {
+            let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
+            out[[i, j]] = avg;
+            out[[j, i]] = avg;
+        }
+    }
+    out
+}
+
 #[derive(Clone, Debug)]
 pub struct GaussianRemlEigenCache {
     pub penalty_eigenvalues: Array1<f64>,
@@ -686,6 +709,11 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
     p: usize,
     d: usize,
 ) -> Result<GaussianRemlBackwardResult, EstimationError> {
+    // Backward sees the same symmetric S the forward used. Canonicalize on
+    // entry so an asymmetric input (e.g. a single-entry gradcheck perturbation
+    // around a symmetric base) cannot leak into the per-helper VJPs.
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let lambda = fit.lambda;
     let beta = &fit.coefficients;
     let residual = y.to_owned() - &fit.fitted;
@@ -1551,6 +1579,8 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     nullspace_dim: Option<usize>,
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let n = x.nrows();
     validate_gaussian_reml_design(x, penalty, weights)?;
     let weight = gaussian_reml_weights(n, weights)?;
@@ -1870,6 +1900,10 @@ fn prepare_gaussian_reml(
     weights: Option<ArrayView1<'_, f64>>,
     eigen_cache: Option<&GaussianRemlEigenCache>,
 ) -> Result<GaussianRemlPrepared, EstimationError> {
+    // Enforce the symmetric-S contract once at the central forward chokepoint;
+    // every closed-form forward path funnels through here.
+    let penalty_owned = canonicalize_penalty(penalty);
+    let penalty = penalty_owned.view();
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
