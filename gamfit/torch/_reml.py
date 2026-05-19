@@ -747,6 +747,22 @@ def _canonical_basis_name(basis_kind: str | None, basis: str | None) -> str:
     return str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
 
 
+def _resolve_effective_basis(
+    basis_kind: str | None,
+    basis: str | None,
+    basis_order: int | None,
+) -> tuple[str, str, int]:
+    """Return ``(display_kind, effective_kind, order)``.
+
+    Aliases ``thinplate`` (1D ≡ Duchon ``m=2``) and ``duchon_multipenalty``
+    onto the engine's Duchon basis, while keeping the user-supplied name
+    available for output state and penalty resolution.
+    """
+    display_kind = _canonical_basis_name(basis_kind, basis)
+    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
+    return display_kind, effective_kind, order
+
+
 def _canonical_penalty_tensor(
     locations: torch.Tensor,
     *,
@@ -765,11 +781,28 @@ def _canonical_penalty_tensor(
     )
     if isinstance(penalty, torch.Tensor):
         return penalty, log_lambda
-    if kind in {"duchon", "duchonspline"} and penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
+    triple_operator_request = (
+        (kind in {"duchon", "duchonspline"} and penalty_kind in {"triple-operator", "tripleoperator", "operator"})
+        or kind in {"duchonmultipenalty", "duchontripleoperator"}
+    )
+    if triple_operator_request:
         if periodic:
-            raise ValueError("basis='duchon' with triple_operator penalty is not periodic")
+            raise ValueError("triple-operator Duchon penalty is not defined for periodic bases")
+        # ``duchon_multipenalty`` carries triple-operator by definition; allow
+        # the explicit ``penalty="triple-operator"`` override on plain duchon
+        # but error on incompatible override strings for the multipenalty kind.
+        if kind in {"duchonmultipenalty", "duchontripleoperator"} and penalty_kind not in {
+            None,
+            "triple-operator",
+            "tripleoperator",
+            "operator",
+        }:
+            raise ValueError(
+                f"basis='duchon_multipenalty' only supports the triple-operator penalty; got {penalty!r}"
+            )
+        m = 2 if kind in {"duchonmultipenalty", "duchontripleoperator"} else int(basis_order)
         mass, tension, stiffness = _np_api._duchon_operator_penalties(
-            to_numpy_f64(locations), m=int(basis_order)
+            to_numpy_f64(locations), m=m
         )
         pieces = [
             from_numpy_like(mass, locations),
@@ -814,7 +847,7 @@ def _position_design(
     from ._basis import bspline_basis, duchon_basis_1d
 
     kind = basis_kind.strip().lower().replace("_", "").replace("-", "")
-    if kind in {"duchon", "duchonspline"}:
+    if kind in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps", "duchonmultipenalty", "duchontripleoperator"}:
         return duchon_basis_1d(t, locations, m=basis_order, periodic=periodic)
     if kind in {"bspline", "spline"}:
         return bspline_basis(t, locations, degree=basis_order, periodic=periodic)
@@ -867,15 +900,15 @@ def gaussian_reml_fit_positions(
     """
     from ._basis import _resolve_basis_locations_tensor
 
-    basis_kind = _canonical_basis_name(basis_kind, basis)
+    display_kind = _canonical_basis_name(basis_kind, basis)
     smoothing = str(smoothing).strip().lower()
-    order = _np_api._position_basis_order(basis_kind, basis_order)
+    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
     knots_t = _resolve_basis_locations_tensor(
-        t, knots_or_centers, basis_kind=basis_kind, degree=order
+        t, knots_or_centers, basis_kind=effective_kind, degree=order
     )
     penalty_t, score_log_lambda = _canonical_penalty_tensor(
         knots_t,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=bool(periodic),
         penalty=penalty,
@@ -890,7 +923,7 @@ def gaussian_reml_fit_positions(
         elif smoothing == "fixed":
             score_log_lambda = score_log_lambda.detach()
         x = _position_design(
-            t, knots_t, basis_kind=basis_kind, basis_order=order, periodic=bool(periodic)
+            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
         )
         if coefficients.ndim != 2:
             raise ValueError("non-batched coefficients must have shape (n_basis, n_outputs)")
@@ -918,7 +951,7 @@ def gaussian_reml_fit_positions(
             edf,
             knots_t,
             penalty_t,
-            str(basis_kind),
+            str(display_kind),
             int(order),
             bool(periodic),
             None if period is None else float(period),
@@ -933,8 +966,8 @@ def gaussian_reml_fit_positions(
         penalty_t,
         weights,
         by,
-        basis_kind,
-        basis_order,
+        effective_kind,
+        order,
         periodic,
         period,
         init_lambda,
@@ -948,7 +981,7 @@ def gaussian_reml_fit_positions(
         edf,
         knots_t,
         penalty_t,
-        str(basis_kind),
+        str(display_kind),
         int(order),
         bool(periodic),
         None if period is None else float(period),
@@ -995,15 +1028,15 @@ def gaussian_reml_fit_positions_batched(
     """
     from ._basis import _resolve_basis_locations_tensor
 
-    basis_kind = _canonical_basis_name(basis_kind, basis)
+    display_kind = _canonical_basis_name(basis_kind, basis)
     smoothing = str(smoothing).strip().lower()
-    order = _np_api._position_basis_order(basis_kind, basis_order)
+    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
     knots_t = _resolve_basis_locations_tensor(
-        t, knots_or_centers, basis_kind=basis_kind, degree=order
+        t, knots_or_centers, basis_kind=effective_kind, degree=order
     )
     penalty_t, score_log_lambda = _canonical_penalty_tensor(
         knots_t,
-        basis_kind=basis_kind,
+        basis_kind=display_kind,
         basis_order=order,
         periodic=bool(periodic),
         penalty=penalty,
@@ -1018,7 +1051,7 @@ def gaussian_reml_fit_positions_batched(
         elif smoothing == "fixed":
             score_log_lambda = score_log_lambda.detach()
         x = _position_design(
-            t, knots_t, basis_kind=basis_kind, basis_order=order, periodic=bool(periodic)
+            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
         )
         apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
         reml_score = apply_score(
@@ -1058,7 +1091,7 @@ def gaussian_reml_fit_positions_batched(
             edf,
             knots_t,
             penalty_t,
-            str(basis_kind),
+            str(display_kind),
             int(order),
             bool(periodic),
             None if period is None else float(period),
@@ -1074,8 +1107,8 @@ def gaussian_reml_fit_positions_batched(
         penalty_t,
         weights,
         by,
-        basis_kind,
-        basis_order,
+        effective_kind,
+        order,
         periodic,
         period,
         init_lambda,
@@ -1089,7 +1122,7 @@ def gaussian_reml_fit_positions_batched(
         edf,
         knots_t,
         penalty_t,
-        str(basis_kind),
+        str(display_kind),
         int(order),
         bool(periodic),
         None if period is None else float(period),
