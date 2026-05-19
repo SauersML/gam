@@ -199,20 +199,22 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         time_build.keep_cols.as_ref(),
         time_build.smooth_lambda,
     )?;
+    let mut time_anchor: Option<f64> = None;
     let mut time_anchor_row_cached: Option<Array1<f64>> = None;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
     ) {
-        let time_anchor = model
+        let anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
-        let time_anchor_row = evaluate_survival_time_basis_row(time_anchor, &resolved_time_cfg)?;
+        let time_anchor_row = evaluate_survival_time_basis_row(anchor, &resolved_time_cfg)?;
         center_survival_time_designs_at_anchor(
             &mut time_build.x_entry_time,
             &mut time_build.x_exit_time,
             &time_anchor_row,
         )?;
+        time_anchor = Some(anchor);
         time_anchor_row_cached = Some(time_anchor_row);
     }
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
@@ -256,7 +258,7 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         // Baseline offsets at the predict-data's age_entry / age_exit. Used to
         // build the predictor's `pred_input` (which we discard) — the actual
         // per-(row, t) offset is rebuilt inside `evaluate_marginal_slope_row`.
-        let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
+        let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
             build_survival_time_offsets_for_likelihood(
                 &age_entry,
                 &age_exit,
@@ -264,6 +266,17 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 saved_likelihood_mode,
                 None,
             )?;
+        add_survival_time_derivative_guard_offset(
+            &age_entry,
+            &age_exit,
+            time_anchor.ok_or_else(|| {
+                "saved survival marginal-slope model missing survival_time_anchor".to_string()
+            })?,
+            survival_derivative_guard_for_likelihood(saved_likelihood_mode),
+            &mut eta_offset_entry,
+            &mut eta_offset_exit,
+            &mut derivative_offset_exit,
+        )?;
         Some(build_marginal_slope_predict_context(
             model,
             data,
@@ -319,7 +332,7 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                         anchor_row,
                     )?;
                 }
-                let (_r_eta_entry, r_eta_exit, r_deriv_exit) =
+                let (mut r_eta_entry, mut r_eta_exit, mut r_deriv_exit) =
                     build_survival_time_offsets_for_likelihood(
                         &single_entry,
                         &single_exit,
@@ -327,6 +340,20 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                         saved_likelihood_mode,
                         None,
                     )?;
+                if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+                    add_survival_time_derivative_guard_offset(
+                        &single_entry,
+                        &single_exit,
+                        time_anchor.ok_or_else(|| {
+                            "saved survival marginal-slope model missing survival_time_anchor"
+                                .to_string()
+                        })?,
+                        survival_derivative_guard_for_likelihood(saved_likelihood_mode),
+                        &mut r_eta_entry,
+                        &mut r_eta_exit,
+                        &mut r_deriv_exit,
+                    )?;
+                }
 
                 match saved_likelihood_mode {
                     SurvivalLikelihoodMode::MarginalSlope => {
