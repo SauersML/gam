@@ -5,11 +5,11 @@
 //! Run with: `cargo bench --bench cell_moment_lru_biobank_shape`
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{
     CellMomentCacheStats, CellMomentLruCache, DenestedCubicCell, evaluate_cell_moments,
     evaluate_cell_moments_cached,
 };
+use std::hint::black_box;
 
 fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
     let mut cells = Vec::new();

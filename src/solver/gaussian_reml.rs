@@ -980,9 +980,7 @@ fn validate_gaussian_reml_backward_upstreams(
     upstream_reml_score: f64,
     upstream_edf: f64,
 ) -> Result<(), EstimationError> {
-    if !(upstream_lambda.is_finite()
-        && upstream_reml_score.is_finite()
-        && upstream_edf.is_finite())
+    if !(upstream_lambda.is_finite() && upstream_reml_score.is_finite() && upstream_edf.is_finite())
     {
         return Err(EstimationError::InvalidInput(
             "Gaussian REML backward upstream scalars must be finite".to_string(),
@@ -1272,8 +1270,8 @@ fn add_edf_vjp(
     // (since g_a = λ M^{-1} S M^{-1}, so λ · g_a = λ² M^{-1} S M^{-1}).
     for row in 0..grad_penalty.nrows() {
         for col in 0..grad_penalty.ncols() {
-            grad_penalty[[row, col]] += scale
-                * (-lambda * inverse_hessian[[row, col]] + lambda * g_a[[row, col]]);
+            grad_penalty[[row, col]] +=
+                scale * (-lambda * inverse_hessian[[row, col]] + lambda * g_a[[row, col]]);
         }
     }
 
@@ -1401,7 +1399,6 @@ fn gaussian_reml_penalty_pseudoinverse_from_cache(cache: &GaussianRemlEigenCache
     }
     dense_ab(scaled_basis.view(), cache.coefficient_basis.t())
 }
-
 
 fn add_deviance_profile_vjp(
     scale: f64,

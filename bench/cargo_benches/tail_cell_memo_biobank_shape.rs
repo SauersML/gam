@@ -4,11 +4,11 @@
 //! Run with: `cargo bench --bench tail_cell_memo_biobank_shape`
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{
     DenestedCubicCell, evaluate_cell_moments, evaluate_cell_moments_uncached,
     reset_tail_cell_moment_cache, set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats,
 };
+use std::hint::black_box;
 
 fn biobank_tail_cells(n_rows: usize) -> Vec<DenestedCubicCell> {
     let mut cells = Vec::with_capacity(2 * n_rows);
