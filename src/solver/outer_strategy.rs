@@ -4999,7 +4999,7 @@ fn run_outer_with_plan(
                 // The cap is enforced by shortening the BFGS direction
                 // before line search, not by sentinel costs from the
                 // bridge, so the line search sees real costs throughout.
-                if any_step_cap_set {
+                if config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some() {
                     let rho_dim = layout.rho_dim();
                     let axis_caps = ndarray::Array1::<f64>::from_shape_fn(seed.len(), |i| {
                         let cap = if i < rho_dim {

@@ -16542,7 +16542,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 outer_iterations: 0,
                 outer_gradient_norm: 0.0,
                 inner_cycles: inner.cycles,
-                outer_converged: true,
+                outer_converged: inner.converged,
                 geometry,
             },
             specs,
