@@ -229,13 +229,12 @@ pub struct SurvivalTransformationFitResult {
     pub resolvedspec: TermCollectionSpec,
     pub baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
     pub likelihood_mode: crate::families::survival_construction::SurvivalLikelihoodMode,
-    pub time_anchor: f64,
-    pub time_basisname: String,
+    /// Persistable snapshot of the time basis used during the fit. Replaces
+    /// six previously flat fields (basisname / degree / knots / keep_cols /
+    /// smooth_lambda / anchor) so the FFI save path consumes a single
+    /// source-of-truth value rather than threading siblings independently.
+    pub time_basis: crate::families::survival_construction::SavedSurvivalTimeBasis,
     pub time_base_ncols: usize,
-    pub time_degree: Option<usize>,
-    pub time_knots: Option<Vec<f64>>,
-    pub time_keep_cols: Option<Vec<usize>>,
-    pub time_smooth_lambda: Option<f64>,
     pub baseline_timewiggle: Option<TimeWiggleBlockInput>,
 }
 
@@ -1080,18 +1079,18 @@ fn fit_survival_transformation_model(
         };
     let fit = survival_unified_fit_result(beta, lambdas, &summary, &state)?;
 
+    let time_base_ncols = spec.time_build.x_exit_time.ncols();
+    let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
+        &spec.time_build,
+        spec.time_anchor,
+    );
     Ok(SurvivalTransformationFitResult {
         fit,
         resolvedspec,
         baseline_cfg: fitted_baseline_cfg,
         likelihood_mode: spec.likelihood_mode,
-        time_anchor: spec.time_anchor,
-        time_basisname: spec.time_build.basisname.clone(),
-        time_base_ncols: spec.time_build.x_exit_time.ncols(),
-        time_degree: spec.time_build.degree,
-        time_knots: spec.time_build.knots.clone(),
-        time_keep_cols: spec.time_build.keep_cols.clone(),
-        time_smooth_lambda: spec.time_build.smooth_lambda,
+        time_basis,
+        time_base_ncols,
         baseline_timewiggle: prepared.timewiggle_block,
     })
 }
