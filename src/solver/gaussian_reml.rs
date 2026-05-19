@@ -1196,7 +1196,11 @@ fn add_reml_rho_gradient_vjp(
             upstream_beta[[row, j]] = q_coef * k_beta[[row, j]];
         }
         let dp_coef = -scale * 0.5 * nu * q / (dp * dp);
-        add_rank_one_penalty_vjp((0.5 * q_coef + dp_coef) * lambda, beta.column(j), grad_penalty);
+        add_rank_one_penalty_vjp(
+            (0.5 * q_coef + dp_coef) * lambda,
+            beta.column(j),
+            grad_penalty,
+        );
         add_deviance_profile_vjp(
             dp_coef,
             j,
