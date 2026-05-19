@@ -38,6 +38,13 @@ try:
         gaussian_weighted_ridge_batch,
         smoothness_penalty,
     )
+    from ._cyclic_duchon import (
+        CyclicDuchonFitOutput,
+        CyclicDuchonTripleSmoother,
+        cyclic_duchon_bernoulli_basis,
+        cyclic_duchon_quadratic_fit,
+        cyclic_duchon_triple_penalty,
+    )
     from ._reml import (
         GaussianRemlOutput,
         gaussian_reml_fit,
@@ -67,12 +74,17 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
     raise
 
 __all__ = [
+    "CyclicDuchonFitOutput",
+    "CyclicDuchonTripleSmoother",
     "GaussianRemlOutput",
     "alr",
     "bspline_basis",
     "bspline_basis_derivative",
     "closure",
     "clr",
+    "cyclic_duchon_bernoulli_basis",
+    "cyclic_duchon_quadratic_fit",
+    "cyclic_duchon_triple_penalty",
     "duchon_basis_1d",
     "duchon_basis_1d_derivative",
     "from_fitted",
