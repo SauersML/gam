@@ -395,7 +395,6 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 /// sufficient: a 50-column operator can still mean 50 full row-streaming CTN,
 /// Duchon, or survival passes.
 pub(crate) const OUTER_HVP_MATERIALIZE_MAX_DIM: usize = 64;
-const BFGS_LINE_SEARCH_REJECT_COST: f64 = 1.0e300;
 const BFGS_OBJECTIVE_STALL_EVALS: usize = 3;
 
 /// Whether an analytic derivative is available for a given order.
@@ -2151,7 +2150,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             }
         }
         self.last_gradient_cost = Some(eval.cost);
-        self.last_gradient_point = Some(x.clone());
         log::info!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e} (first-order bridge, iter={})",
             stage_start.elapsed().as_secs_f64(),
@@ -4904,9 +4902,9 @@ fn run_outer_with_plan(
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let stall_signal: std::sync::Arc<std::sync::Mutex<Option<StallSignal>>> =
                     std::sync::Arc::new(std::sync::Mutex::new(None));
-                // The bridge anchors / stall-detector run whenever *any* cap is
-                // set — rho or psi — since either path needs the
-                // `last_gradient_point` anchor for the per-axis check.
+                // The stall-detector activates whenever any step cap is set —
+                // rho or psi — because either path indicates the caller is
+                // running a flat-surface-tolerant biobank fit.
                 let any_step_cap_set =
                     config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some();
                 let objective = OuterFirstOrderBridge {
@@ -4916,13 +4914,6 @@ fn run_outer_with_plan(
                     iter_count: 0,
                     g_norm_initial: None,
                     last_g_norm: None,
-                    line_search_step_cap_rho: config.bfgs_step_cap,
-                    line_search_step_cap_psi: config.bfgs_step_cap_psi,
-                    last_gradient_point: if any_step_cap_set {
-                        Some(seed.clone())
-                    } else {
-                        None
-                    },
                     objective_stall_rel_tol: if any_step_cap_set {
                         Some(config.tolerance)
                     } else {
@@ -4953,38 +4944,32 @@ fn run_outer_with_plan(
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter)
                     .with_initial_sample(seed.clone(), initial_sample);
+                // Native per-axis L∞ trust budget (opt 0.5.10
+                // `Bfgs::with_axis_step_caps`). Rho axes (the first
+                // `rho_dim` parameters = log-λ) get the rho cap; psi axes
+                // (trailing = kappa / aniso-log-scales) get the psi cap;
+                // unspecified caps default to `f64::INFINITY` (uncapped).
+                // The cap is enforced by shortening the BFGS direction
+                // before line search, not by sentinel costs from the
+                // bridge, so the line search sees real costs throughout.
                 if any_step_cap_set {
-                    // Per-axis initial inverse metric. Rho axes use the rho
-                    // cap; psi axes use the psi cap. Each diagonal entry
-                    // scales the first BFGS direction so `|H_0[i,i] * g_i| ≤
-                    // cap_i`, which is what keeps the first trial step from
-                    // immediately hitting the line-search reject path on
-                    // either block.
                     let rho_dim = layout.rho_dim();
-                    let metric_diag =
-                        ndarray::Array1::<f64>::from_shape_fn(seed_eval.gradient.len(), |i| {
-                            let cap = if i < rho_dim {
-                                config.bfgs_step_cap
-                            } else {
-                                config.bfgs_step_cap_psi
-                            };
-                            let g_abs = seed_eval.gradient[i].abs();
-                            match cap {
-                                Some(c) if g_abs > c => (c / g_abs).max(1.0e-12),
-                                _ => 1.0,
-                            }
-                        });
-                    if metric_diag.iter().any(|&v| v < 1.0) {
-                        let min_scale = metric_diag.iter().copied().fold(f64::INFINITY, f64::min);
-                        log::info!(
-                            "[OUTER/BFGS] initial inverse metric capped by first-trial step budget: step_cap_rho={:?} step_cap_psi={:?} min_diag_scale={:.3e}",
-                            config.bfgs_step_cap,
-                            config.bfgs_step_cap_psi,
-                            min_scale,
-                        );
-                        optimizer =
-                            optimizer.with_initial_metric(InitialMetric::Diagonal(metric_diag));
-                    }
+                    let axis_caps = ndarray::Array1::<f64>::from_shape_fn(seed.len(), |i| {
+                        let cap = if i < rho_dim {
+                            config.bfgs_step_cap
+                        } else {
+                            config.bfgs_step_cap_psi
+                        };
+                        cap.filter(|v| v.is_finite() && *v > 0.0)
+                            .unwrap_or(f64::INFINITY)
+                    });
+                    log::info!(
+                        "[OUTER/BFGS] axis step caps installed (opt-native): rho_dim={} step_cap_rho={:?} step_cap_psi={:?}",
+                        rho_dim,
+                        config.bfgs_step_cap,
+                        config.bfgs_step_cap_psi,
+                    );
+                    optimizer = optimizer.with_axis_step_caps(axis_caps);
                 }
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
@@ -6055,69 +6040,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn first_order_bridge_rejects_oversized_bfgs_cost_probe_before_objective() {
-        let cost_calls = Arc::new(AtomicUsize::new(0));
-        let eval_calls = Arc::new(AtomicUsize::new(0));
-        let problem = OuterProblem::new(1)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(DeclaredHessianForm::Unavailable);
-        let mut obj = problem.build_objective(
-            (),
-            {
-                let cost_calls = Arc::clone(&cost_calls);
-                move |_: &mut (), theta: &Array1<f64>| {
-                    cost_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(theta[0] * theta[0])
-                }
-            },
-            {
-                let eval_calls = Arc::clone(&eval_calls);
-                move |_: &mut (), theta: &Array1<f64>| {
-                    eval_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(OuterEval {
-                        cost: theta[0] * theta[0],
-                        gradient: array![2.0 * theta[0]],
-                        hessian: HessianResult::Unavailable,
-                    })
-                }
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        );
-        let mut bridge = OuterFirstOrderBridge {
-            obj: &mut obj,
-            layout: OuterThetaLayout::new(1, 0),
-            outer_inner_cap: None,
-            iter_count: 0,
-            g_norm_initial: None,
-            last_g_norm: None,
-            line_search_step_cap_rho: Some(0.5),
-            line_search_step_cap_psi: None,
-            last_gradient_point: None,
-            objective_stall_rel_tol: None,
-            last_gradient_cost: None,
-            objective_stall_evals: 0,
-            stall_signal: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
-
-        FirstOrderObjective::eval_grad(&mut bridge, &array![0.0])
-            .expect("seed gradient eval should establish the line-search anchor");
-        let rejected = ZerothOrderObjective::eval_cost(&mut bridge, &array![0.51])
-            .expect("oversized probe should be represented as a finite reject cost");
-        assert!(rejected > 1.0e250);
-        assert_eq!(
-            cost_calls.load(Ordering::Relaxed),
-            0,
-            "oversized BFGS probe must not run the expensive inner objective"
-        );
-
-        let accepted = ZerothOrderObjective::eval_cost(&mut bridge, &array![0.5])
-            .expect("probe at the trust budget should call the objective");
-        assert_eq!(accepted, 0.25);
-        assert_eq!(cost_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(eval_calls.load(Ordering::Relaxed), 1);
-    }
+    // The historical bridge-side `rejects_oversized_bfgs_cost_probe_before_objective`
+    // test exercised a mechanism (returning `BFGS_LINE_SEARCH_REJECT_COST`
+    // from `eval_cost` on overreach) that has been retired in favor of
+    // `opt::Bfgs::with_axis_step_caps` — the line-search direction is now
+    // shortened up front by opt itself, so the bridge never sees an
+    // oversized probe in the first place. The equivalent invariant now
+    // lives in opt's `with_axis_step_caps` test surface.
 
     #[test]
     fn first_order_bridge_keeps_true_gradient_on_objective_stall() {
@@ -6154,9 +6083,6 @@ mod tests {
             iter_count: 0,
             g_norm_initial: None,
             last_g_norm: None,
-            line_search_step_cap_rho: Some(0.5),
-            line_search_step_cap_psi: None,
-            last_gradient_point: Some(array![0.0]),
             objective_stall_rel_tol: Some(1.0e-6),
             last_gradient_cost: Some(1000.0),
             objective_stall_evals: 0,
