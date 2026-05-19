@@ -4329,6 +4329,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 linkwiggle_block: None,
                 initial_threshold_log_lambdas: None,
                 initial_log_sigma_log_lambdas: None,
+                cache_session: None,
+                cache_mirror_sessions: Vec::new(),
             }
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {

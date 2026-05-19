@@ -1431,7 +1431,11 @@ impl CublasRuntime {
         // SAFETY: every leading dimension and stride matches the packed
         // column-major host layout we just uploaded; result buffer has
         // batch * c_stride elements.
-        unsafe { self.blas.gemm_strided_batched(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
+        unsafe {
+            self.blas
+                .gemm_strided_batched(cfg, &a_dev, &b_dev, &mut c_dev)
+        }
+        .ok()?;
         let c_host: Vec<f64> = self.stream.clone_dtoh(&c_dev).ok()?;
 
         // Unpack column-major slabs back into a row-major Array3.

@@ -693,6 +693,12 @@ struct SurvivalLocationScaleSpec {
     pub log_sigma_block: CovariateBlockKind,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
+    /// Persistent warm-start cache session threaded from the workflow
+    /// dispatcher. See [`BlockwiseFitOptions::cache_session`].
+    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    /// Persistent warm-start mirror sessions; see
+    /// [`BlockwiseFitOptions::cache_mirror_sessions`].
+    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::cache::Session>>,
 }
 
 #[derive(Clone)]
@@ -736,6 +742,14 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Optional warm-start seed for the log-sigma-block log-smoothing parameters (ρ).
     /// Same semantics as `initial_threshold_log_lambdas`.
     pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
+    /// Persistent warm-start cache session, threaded from the workflow
+    /// dispatcher. See
+    /// [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
+    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
+    /// Persistent warm-start mirror sessions, threaded from the workflow
+    /// dispatcher. See
+    /// [`crate::families::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
+    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::cache::Session>>,
 }
 
 pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;
@@ -3885,6 +3899,8 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
         outer_max_iter: 60,
         outer_tol: 1e-5,
         compute_covariance: true,
+        cache_session: spec.cache_session.clone(),
+        cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
         ..BlockwiseFitOptions::default()
     }
 }
@@ -11279,6 +11295,8 @@ pub(crate) fn fit_survival_location_scale_terms(
             log_sigma_block,
             timewiggle_block: spec.timewiggle_block.clone(),
             linkwiggle_block,
+            cache_session: spec.cache_session.clone(),
+            cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
         })
     };
 
@@ -12634,6 +12652,8 @@ mod tests {
             }),
             timewiggle_block: None,
             linkwiggle_block: None,
+            cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
 
         let prepared = prepare_survival_location_scale_model(&spec)
@@ -12707,6 +12727,8 @@ mod tests {
             }),
             timewiggle_block: None,
             linkwiggle_block: None,
+            cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
 
         let prepared = prepare_survival_location_scale_model(&spec)
@@ -14679,6 +14701,8 @@ mod tests {
             }),
             timewiggle_block: None,
             linkwiggle_block: None,
+            cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         };
 
         match fit_survival_location_scale_with_geometry(spec).map(|(fit, _)| fit) {
