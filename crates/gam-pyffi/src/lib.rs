@@ -656,6 +656,7 @@ fn gaussian_reml_fit_backward<'py>(
     };
     out.set_item("grad_x", grad_x.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     if let Some(grad_by) = grad_by {
         out.set_item("grad_by", grad_by.into_pyarray(py))?;
@@ -1520,12 +1521,14 @@ struct BatchedGaussianRemlBackwardResult {
     statuses: Vec<String>,
     grad_x: Array2<f64>,
     grad_y: Array2<f64>,
+    grad_penalty: Array2<f64>,
     grad_weights: Array1<f64>,
 }
 
 struct PositionGaussianRemlBackwardResult {
     grad_t: Array1<f64>,
     grad_y: Array2<f64>,
+    grad_penalty: Array2<f64>,
     grad_weights: Array1<f64>,
     grad_by: Option<Array1<f64>>,
 }
@@ -1534,6 +1537,7 @@ struct BatchedPositionGaussianRemlBackwardResult {
     statuses: Vec<String>,
     grad_t: Array1<f64>,
     grad_y: Array2<f64>,
+    grad_penalty: Array2<f64>,
     grad_weights: Array1<f64>,
     grad_by: Option<Array1<f64>>,
 }
