@@ -10455,14 +10455,48 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 );
                 let old_radius = joint_trust_radius;
                 joint_trust_radius = trust_update.radius;
+                // Classify the outcome of this attempt so the diagnostic line
+                // says *why* the step was taken or rejected rather than just
+                // dumping numbers. The four phases partition the post-log
+                // branches below; computing them up front lets the log line
+                // and the dispatch agree.
+                let floor_reached = trust_update.accepted
+                    && joint_objective_floor_reached(
+                        old_objective,
+                        trialobjective,
+                        actual_reduction,
+                        predicted_reduction,
+                        objective_tol,
+                    );
+                let roundoff_slack =
+                    joint_objective_roundoff_slack(old_objective, trialobjective);
+                let secondary_ok = !floor_reached
+                    && trialobjective.is_finite()
+                    && trust_update.accepted
+                    && trialobjective <= old_objective + roundoff_slack;
+                let phase: &'static str = if floor_reached {
+                    "converged"
+                } else if secondary_ok {
+                    "accepted"
+                } else if trust_update.accepted {
+                    "stall"
+                } else {
+                    "reject"
+                };
+                let radius_held = (joint_trust_radius - old_radius).abs()
+                    <= 1e-12 * old_radius.abs().max(1.0);
+                let radius_field = if radius_held {
+                    format!("r={:.3e} (held)", old_radius)
+                } else {
+                    format!("r={:.3e}->{:.3e}", old_radius, joint_trust_radius)
+                };
                 let tr_attempt_sig = format!(
-                    "accepted={} rho={:.3e} actual_reduction={:.3e} predicted_reduction={:.3e} radius={:.3e}->{:.3e} step_norm={:.3e} step_inf={:.3e} proposal_inf={:.3e}",
-                    trust_update.accepted,
+                    "{:<9}  ρ={:+.3e}  Δobj={:+.3e}  pred={:+.3e}  {}  |δ|={:.3e}  |δ|∞={:.3e}  |prop|∞={:.3e}",
+                    phase,
                     trust_update.rho,
                     actual_reduction,
                     predicted_reduction,
-                    old_radius,
-                    joint_trust_radius,
+                    radius_field,
                     step_norm,
                     trial_step_inf,
                     step_inf,
@@ -10474,12 +10508,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     Some(prev) => {
                         if tr_log_first == tr_log_last {
                             log::info!(
-                                "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} {}",
+                                "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                                 cycle, tr_log_first, prev,
                             );
                         } else {
                             log::info!(
-                                "[PIRLS/joint-Newton/trust-region] cycle={} attempts={}..{} (×{}) {}",
+                                "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                                 cycle,
                                 tr_log_first,
                                 tr_log_last,
@@ -10497,36 +10531,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         tr_log_last = line_search_attempts;
                     }
                 }
-                if trust_update.accepted
-                    && joint_objective_floor_reached(
-                        old_objective,
-                        trialobjective,
-                        actual_reduction,
-                        predicted_reduction,
-                        objective_tol,
-                    )
-                {
+                if floor_reached {
                     for (b, old) in old_beta.iter().enumerate() {
                         states[b].beta.assign(old);
                     }
                     refresh_all_block_etas(family, specs, &mut states)?;
-                    log::info!(
-                        "[PIRLS/joint-Newton convergence] cycle {:>3} | objective floor reached: actual_reduction={:.3e} predicted_reduction={:.3e} objective_tol={:.3e}",
-                        cycle,
-                        actual_reduction,
-                        predicted_reduction,
-                        objective_tol,
-                    );
                     accepted = true;
                     converged = true;
                     break;
                 }
-                if trialobjective.is_finite()
-                    && trust_update.accepted
-                    && trialobjective
-                        <= old_objective
-                            + joint_objective_roundoff_slack(old_objective, trialobjective)
-                {
+                if secondary_ok {
                     current_penalty = trial_penalty;
                     if let Some(joint_active_set) = search_joint_active_set.as_ref() {
                         cached_active_sets =
@@ -10544,12 +10558,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             if let Some(prev) = tr_log_sig.as_deref() {
                 if tr_log_first == tr_log_last {
                     log::info!(
-                        "[PIRLS/joint-Newton/trust-region] cycle={} attempt={} {}",
+                        "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
                         cycle, tr_log_first, prev,
                     );
                 } else {
                     log::info!(
-                        "[PIRLS/joint-Newton/trust-region] cycle={} attempts={}..{} (×{}) {}",
+                        "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
                         cycle,
                         tr_log_first,
                         tr_log_last,
@@ -21845,6 +21859,71 @@ mod tests {
                 objective_tol,
             ),
             "non-negligible predicted progress must not be hidden by the floor exit"
+        );
+        // A positive-but-noise-level actual reduction must also be recognized
+        // as the floor — the sign of `actual_reduction` is round-off at the
+        // optimum and the loop should not spin a cycle further.
+        let positive_noise_actual = 3.783e-10_f64;
+        let positive_noise_trial = old_objective - positive_noise_actual;
+        assert!(
+            joint_objective_floor_reached(
+                old_objective,
+                positive_noise_trial,
+                positive_noise_actual,
+                predicted_reduction,
+                objective_tol,
+            ),
+            "noise-level positive actual reductions are floor hits, same as negative ones"
+        );
+    }
+
+    #[test]
+    fn joint_newton_decrement_floor_fires_at_biobank_noise_floor() {
+        // Exact reproduction of the spin observed at biobank scale: |f| ~ 1.2e5
+        // and the full Newton step's predicted reduction ½ gᵀ H⁻¹ g sitting at
+        // floating-point noise (~1e-15). The pre-line-search certificate
+        // must declare convergence so the trust-region loop is never entered.
+        let old_objective = 1.219002e5_f64;
+        let predicted_reduction = 9.481e-15_f64;
+        assert!(
+            joint_newton_decrement_floor_reached(old_objective, predicted_reduction),
+            "Newton decrement at floating-point noise must terminate the cycle"
+        );
+        assert!(
+            joint_newton_decrement_floor_reached(old_objective, -predicted_reduction),
+            "the certificate is sign-symmetric — round-off can flip the sign"
+        );
+
+        // A predicted reduction one part in 1e10 of |f| is far above the
+        // 128·EPS floor: must NOT certify convergence — there is real
+        // progress to make and the trust-region loop should run.
+        assert!(
+            !joint_newton_decrement_floor_reached(old_objective, 1.0e-5_f64),
+            "non-negligible predicted progress must not be hidden by the certificate"
+        );
+
+        // Tiny |f| (e.g. converged intercept-only fits): the certificate
+        // floor cannot collapse to zero; the 1.0 lower bound on max(|f|, 1)
+        // keeps the noise floor at 128·EPS in absolute terms.
+        let tiny_objective = 1.0e-3_f64;
+        assert!(
+            joint_newton_decrement_floor_reached(tiny_objective, 1.0e-15_f64),
+            "absolute noise floor must hold for tiny |f|"
+        );
+        assert!(
+            !joint_newton_decrement_floor_reached(tiny_objective, 1.0e-3_f64),
+            "non-noise predicted reductions on tiny |f| still indicate progress"
+        );
+
+        // NaN/Inf must not certify convergence — fall through to the
+        // existing trust-region handling.
+        assert!(
+            !joint_newton_decrement_floor_reached(old_objective, f64::NAN),
+            "NaN predicted reduction must never certify"
+        );
+        assert!(
+            !joint_newton_decrement_floor_reached(old_objective, f64::INFINITY),
+            "Infinite predicted reduction must never certify"
         );
     }
 
