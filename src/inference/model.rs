@@ -3244,6 +3244,54 @@ mod tests {
     }
 
     #[test]
+    fn apply_survival_time_basis_writes_all_required_fields() {
+        use crate::families::survival_construction::SavedSurvivalTimeBasis;
+
+        let fit = saved_fit(vec![
+            FittedBlock {
+                beta: array![0.1],
+                role: BlockRole::Time,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.2],
+                role: BlockRole::Mean,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+            FittedBlock {
+                beta: array![0.3],
+                role: BlockRole::Scale,
+                edf: 1.0,
+                lambdas: Array1::zeros(0),
+            },
+        ]);
+        let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
+
+        // Snapshot writes must match every persisted survival_time_* field —
+        // forgetting one is exactly the gamfit 0.1.69 marginal-slope save
+        // regression. Routing through `apply_survival_time_basis` is the
+        // structural contract that prevents that recurrence.
+        let snapshot = SavedSurvivalTimeBasis {
+            basisname: "royston-parmar".to_string(),
+            degree: Some(3),
+            knots: Some(vec![0.0, 1.0, 2.0]),
+            keep_cols: Some(vec![0, 2]),
+            smooth_lambda: Some(0.5),
+            anchor: 0.25,
+        };
+        payload.apply_survival_time_basis(&snapshot);
+
+        assert_eq!(payload.survival_time_basis.as_deref(), Some("royston-parmar"));
+        assert_eq!(payload.survival_time_degree, Some(3));
+        assert_eq!(payload.survival_time_knots, Some(vec![0.0, 1.0, 2.0]));
+        assert_eq!(payload.survival_time_keep_cols, Some(vec![0, 2]));
+        assert_eq!(payload.survival_time_smooth_lambda, Some(0.5));
+        assert_eq!(payload.survival_time_anchor, Some(0.25));
+    }
+
+    #[test]
     fn validate_for_persistence_rejects_survival_without_time_basis_metadata() {
         let fit = saved_fit(vec![
             FittedBlock {
