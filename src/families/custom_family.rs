@@ -9031,26 +9031,6 @@ fn joint_objective_floor_reached(
         && predicted_reduction.abs() <= objective_tol.max(slack)
 }
 
-// Pre-line-search Newton-decrement convergence test.
-//
-// For the unconstrained Newton step δ = H⁻¹ g, the model-predicted reduction
-// `g·δ − ½ δᵀHδ` reduces to `½ gᵀ H⁻¹ g = ½ λ²(β)`, the squared Newton
-// decrement (Boyd & Vandenberghe §9.5). When this falls below floating-point
-// noise relative to |f|, the local quadratic model itself certifies that no
-// step can improve f beyond round-off — *independent* of the step-size
-// proxy `‖δ‖_∞ ≤ step_tol`, which fails for ill-conditioned H along the
-// residual direction (a non-trivial ‖δ‖ corresponding to a near-null
-// curvature eigenvector). The constant 128·EPS provides headroom over the
-// natural round-off in `g·δ − ½ δᵀHδ`, two terms each of magnitude `‖g‖·‖δ‖`
-// whose difference is accurate to ~|f|·EPS.
-fn joint_newton_decrement_floor_reached(
-    old_objective: f64,
-    predicted_reduction: f64,
-) -> bool {
-    let noise_floor = old_objective.abs().max(1.0) * 128.0 * f64::EPSILON;
-    predicted_reduction.is_finite() && predicted_reduction.abs() <= noise_floor
-}
-
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -10162,69 +10142,26 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            // Newton-decrement certificate (Boyd & Vandenberghe §9.5).
+            // We do NOT add an analytic Newton-decrement pre-loop test here.
+            // It is tempting (and principled: ½ gᵀ H⁻¹ g is exactly the
+            // canonical convergence signal). But at rank-deficient optima
+            // (σ_min(H) ≲ ε_machine, e.g. HardPseudo with σ_min ~ 1e-10) the
+            // Newton step has a non-trivial component along H's near-null
+            // eigenvector that *does* move β by O(g / σ_min) per cycle. The
+            // outer-gradient identity ∇_λ L = ∂L/∂λ holds at KKT modulo
+            // O(‖rhs‖) — but only when consecutive λ probes converge to the
+            // *same* point in H's null space, which requires every probe to
+            // exhaust the same number of trust-region cycles. Exiting earlier
+            // at one λ than at another decorrelates the null-space drift and
+            // breaks `outerobjective_andgradient` FD checks at tight inner
+            // tolerances (regression test:
+            // `outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`,
+            // inner_tol=1e-12, noise floor ~1.3e-9).
             //
-            // The pre-loop KKT test above pairs ‖∇L − Sβ‖_∞ ≤ residual_tol
-            // with the *step-size proxy* ‖δ‖_∞ ≤ step_tol. The proxy is
-            // sharp for well-conditioned H but fails when H has a near-null
-            // eigendirection: the Newton step in that direction has a
-            // non-trivial 2-norm (and inf-norm) yet ½ δᵀHδ is at machine
-            // precision relative to |f|, so the line search cannot resolve
-            // ascent from descent. Spinning the trust-region loop in that
-            // state burns 24 redundant likelihood evaluations per cycle for
-            // no information gain (observed: cycles 51+ each spending ~2 s
-            // on round-off-level rho tests).
-            //
-            // The principled stop signal here is the model's *own* predicted
-            // reduction on the full (pre-truncation) Newton step. Computing
-            // it as `g·δ − ½ δᵀ H_pen δ` accounts for the QP-projected δ
-            // in the constrained case automatically, since `g` is `rhs`
-            // (the penalty-gradient-corrected residual) and `H_pen` is the
-            // operator both the inner solver and the search direction agree
-            // on. One Hv per cycle, dwarfed by the inner Hessian build.
-            //
-            // The certificate is the conjunction with the first-order
-            // condition `‖rhs‖ ≤ residual_tol`: model floor *and* gradient
-            // stationarity together pin down a true penalized optimum,
-            // never a saddle. We do NOT apply δ — β stays where it is, so
-            // round-off cannot perturb the fit.
-            if current_stationarity_residual <= residual_tol {
-                let mut hpen_full_delta = Array1::<f64>::zeros(total_p);
-                if apply_joint_penalized_hessian_into(
-                    &joint_hessian_source,
-                    &ranges,
-                    &s_lambdas,
-                    joint_solver_diagonal_ridge,
-                    &delta,
-                    &mut hpen_full_delta,
-                )
-                .is_ok()
-                {
-                    let full_predicted_reduction = joint_quadratic_predicted_reduction(
-                        &rhs,
-                        &hpen_full_delta,
-                        &delta,
-                    );
-                    if joint_newton_decrement_floor_reached(
-                        old_objective,
-                        full_predicted_reduction,
-                    ) {
-                        log::info!(
-                            "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement floor reached: lambda_sq_over_2={:.3e} | proposal_inf={:.3e} (tol={:.3e}) | residual={:.3e} (tol={:.3e})",
-                            cycle,
-                            full_predicted_reduction,
-                            step_inf,
-                            step_tol,
-                            current_stationarity_residual,
-                            residual_tol,
-                        );
-                        cached_joint_workspace = hessian_workspace_for_cycle;
-                        cycles_done = cycle;
-                        converged = true;
-                        break;
-                    }
-                }
-            }
+            // The trust-region loop's intra-attempt `joint_objective_floor_reached`
+            // already saves 23/24 of the wasted evals at the round-off-stuck
+            // state (the pre-loop test would have saved the 24th). The
+            // marginal 1/24 is not worth the rank-deficient fit-quality risk.
 
             // Trust-region retries preserve the objective-decrease guarantee
             // when the initial radius is too optimistic. If the Newton proposal
@@ -21874,56 +21811,6 @@ mod tests {
                 objective_tol,
             ),
             "noise-level positive actual reductions are floor hits, same as negative ones"
-        );
-    }
-
-    #[test]
-    fn joint_newton_decrement_floor_fires_at_biobank_noise_floor() {
-        // Exact reproduction of the spin observed at biobank scale: |f| ~ 1.2e5
-        // and the full Newton step's predicted reduction ½ gᵀ H⁻¹ g sitting at
-        // floating-point noise (~1e-15). The pre-line-search certificate
-        // must declare convergence so the trust-region loop is never entered.
-        let old_objective = 1.219002e5_f64;
-        let predicted_reduction = 9.481e-15_f64;
-        assert!(
-            joint_newton_decrement_floor_reached(old_objective, predicted_reduction),
-            "Newton decrement at floating-point noise must terminate the cycle"
-        );
-        assert!(
-            joint_newton_decrement_floor_reached(old_objective, -predicted_reduction),
-            "the certificate is sign-symmetric — round-off can flip the sign"
-        );
-
-        // A predicted reduction one part in 1e10 of |f| is far above the
-        // 128·EPS floor: must NOT certify convergence — there is real
-        // progress to make and the trust-region loop should run.
-        assert!(
-            !joint_newton_decrement_floor_reached(old_objective, 1.0e-5_f64),
-            "non-negligible predicted progress must not be hidden by the certificate"
-        );
-
-        // Tiny |f| (e.g. converged intercept-only fits): the certificate
-        // floor cannot collapse to zero; the 1.0 lower bound on max(|f|, 1)
-        // keeps the noise floor at 128·EPS in absolute terms.
-        let tiny_objective = 1.0e-3_f64;
-        assert!(
-            joint_newton_decrement_floor_reached(tiny_objective, 1.0e-15_f64),
-            "absolute noise floor must hold for tiny |f|"
-        );
-        assert!(
-            !joint_newton_decrement_floor_reached(tiny_objective, 1.0e-3_f64),
-            "non-noise predicted reductions on tiny |f| still indicate progress"
-        );
-
-        // NaN/Inf must not certify convergence — fall through to the
-        // existing trust-region handling.
-        assert!(
-            !joint_newton_decrement_floor_reached(old_objective, f64::NAN),
-            "NaN predicted reduction must never certify"
-        );
-        assert!(
-            !joint_newton_decrement_floor_reached(old_objective, f64::INFINITY),
-            "Infinite predicted reduction must never certify"
         );
     }
 

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libloading::Library;
 
+use super::calibration::{DeviceCalibration, measure_device};
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::driver::CudaWorkingState;
@@ -38,12 +39,10 @@ type CuDeviceGetAttribute = unsafe extern "C" fn(*mut i32, i32, CuDevice) -> CuR
 
 // CUDA driver `cuDeviceGetAttribute` enumerants pulled from `cuda.h`.
 // Hard-coded because we resolve symbols dynamically and can't include
-// the header. The FP32 cores/SM count is *not* a driver attribute on
-// any CUDA version; it's derived from the compute capability via the
-// architectural table in [`super::device::fp32_cores_per_sm`].
+// the header. All other throughput-relevant numbers (FP64 GFLOPS, PCIe
+// bandwidth) are measured at probe time via [`super::calibration`]
+// rather than read from attributes or compute-capability tables.
 const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
-const CU_DEVICE_ATTRIBUTE_CLOCK_RATE: i32 = 13;
-const CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO: i32 = 87;
 
 /// Reason that GPU probing failed; never surfaced to callers, only logged.
 #[derive(Debug)]
@@ -56,6 +55,9 @@ pub enum GpuProbeError {
     DriverCall { call: &'static str, code: CuResult },
     /// The driver reports zero usable devices.
     NoDevices,
+    /// All enumerated devices failed runtime calibration (dgemm or memcpy).
+    /// Callers fall through to CPU dispatch.
+    CalibrationFailed,
 }
 
 impl fmt::Display for GpuProbeError {
@@ -67,6 +69,9 @@ impl fmt::Display for GpuProbeError {
                 write!(f, "{call} returned CUDA driver error {code}")
             }
             Self::NoDevices => f.write_str("no CUDA devices reported by the driver"),
+            Self::CalibrationFailed => {
+                f.write_str("all CUDA devices failed runtime calibration")
+            }
         }
     }
 }
@@ -333,7 +338,8 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
         return Err(GpuProbeError::NoDevices);
     }
 
-    let mut devices = Vec::with_capacity(count as usize);
+    // ---- Phase 1: enumerate device descriptors -------------------------
+    let mut descriptors = Vec::with_capacity(count as usize);
     for ordinal in 0..count {
         let mut raw_device: CuDevice = 0;
         check(
@@ -371,44 +377,82 @@ fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
             },
             "cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)",
         )?;
-        let mut clock_rate_khz: i32 = 0;
-        check(
-            unsafe {
-                cu_device_get_attribute(
-                    &mut clock_rate_khz,
-                    CU_DEVICE_ATTRIBUTE_CLOCK_RATE,
-                    raw_device,
-                )
-            },
-            "cuDeviceGetAttribute(CLOCK_RATE)",
-        )?;
-        let mut single_to_double_precision_perf_ratio: i32 = 0;
-        let fp64_ratio_status = unsafe {
-            cu_device_get_attribute(
-                &mut single_to_double_precision_perf_ratio,
-                CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO,
-                raw_device,
-            )
-        };
-        devices.push(GpuDeviceInfo {
+        descriptors.push(GpuDeviceDescriptor {
             ordinal: ordinal as usize,
             name: c_name_to_string(&name_bytes),
             compute_capability_major: major,
             compute_capability_minor: minor,
             sm_count,
-            clock_rate_khz,
-            single_to_double_precision_perf_ratio: if fp64_ratio_status == 0 {
-                Some(single_to_double_precision_perf_ratio)
-            } else {
-                None
-            },
             total_memory_bytes,
         });
+    }
+
+    // ---- Phase 2: calibrate each device --------------------------------
+    // Run a real cublasDgemm + memcpy on every visible device and keep
+    // only the ones that complete successfully. Calibration replaces the
+    // earlier synthetic throughput proxy entirely — every dispatch
+    // threshold derives from the measured numbers.
+    let mut devices: Vec<GpuDeviceInfo> = Vec::with_capacity(descriptors.len());
+    for desc in descriptors {
+        let working = match CudaWorkingState::init(desc.ordinal) {
+            Some(state) => state,
+            None => {
+                log::warn!(
+                    "[GPU] device {} '{}' skipped: context init failed",
+                    desc.ordinal,
+                    desc.name
+                );
+                continue;
+            }
+        };
+        let start = std::time::Instant::now();
+        let calibration: DeviceCalibration = match measure_device(&working) {
+            Some(c) => c,
+            None => {
+                log::warn!(
+                    "[GPU] device {} '{}' skipped: calibration failed",
+                    desc.ordinal,
+                    desc.name
+                );
+                continue;
+            }
+        };
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        log::debug!(
+            "[GPU] device {} '{}' calibrated in {:.0} ms: fp64={:.0} GFLOPS h2d={:.1} GB/s d2h={:.1} GB/s",
+            desc.ordinal,
+            desc.name,
+            elapsed_ms,
+            calibration.fp64_gflops,
+            calibration.h2d_gb_s,
+            calibration.d2h_gb_s,
+        );
+        devices.push(GpuDeviceInfo {
+            ordinal: desc.ordinal,
+            name: desc.name,
+            compute_capability_major: desc.compute_capability_major,
+            compute_capability_minor: desc.compute_capability_minor,
+            sm_count: desc.sm_count,
+            total_memory_bytes: desc.total_memory_bytes,
+            calibration,
+        });
+    }
+    if devices.is_empty() {
+        return Err(GpuProbeError::CalibrationFailed);
     }
     // The `Symbol` bindings go out of scope at function exit; they don't
     // carry destructors with side effects. `library` itself is a `&'static`
     // handle owned by the `OnceLock` inside `load_cuda_driver`.
     Ok(devices)
+}
+
+struct GpuDeviceDescriptor {
+    ordinal: usize,
+    name: String,
+    compute_capability_major: i32,
+    compute_capability_minor: i32,
+    sm_count: i32,
+    total_memory_bytes: usize,
 }
 
 fn load_cuda_driver() -> Result<&'static Library, GpuProbeError> {
@@ -491,9 +535,12 @@ mod tests {
                 compute_capability_major: 9,
                 compute_capability_minor: 0,
                 sm_count: 132,
-                clock_rate_khz: 1_500_000,
-                single_to_double_precision_perf_ratio: Some(1),
                 total_memory_bytes: 80 * 1024 * 1024 * 1024,
+                calibration: DeviceCalibration {
+                    fp64_gflops: 30_000.0,
+                    h2d_gb_s: 25.0,
+                    d2h_gb_s: 25.0,
+                },
             },
             GpuDeviceInfo {
                 ordinal: 1,
@@ -501,9 +548,12 @@ mod tests {
                 compute_capability_major: 7,
                 compute_capability_minor: 5,
                 sm_count: 40,
-                clock_rate_khz: 1_200_000,
-                single_to_double_precision_perf_ratio: Some(32),
                 total_memory_bytes: 16 * 1024 * 1024 * 1024,
+                calibration: DeviceCalibration {
+                    fp64_gflops: 250.0,
+                    h2d_gb_s: 12.0,
+                    d2h_gb_s: 12.0,
+                },
             },
         ];
         let plans = runtime
