@@ -1039,7 +1039,15 @@ def gaussian_reml_fit_positions(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _coerce_gaussian_reml_payload(out, np)
+    return _attach_basis_state(
+        _coerce_gaussian_reml_payload(out, np),
+        knots_or_centers=knots_np,
+        penalty=penalty_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+        period=period,
+    )
 
 
 def gaussian_reml_fit_positions_backward(
@@ -1176,7 +1184,15 @@ def gaussian_reml_fit_positions_batched(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return _coerce_gaussian_reml_payload(out, np)
+    return _attach_basis_state(
+        _coerce_gaussian_reml_payload(out, np),
+        knots_or_centers=knots_np,
+        penalty=penalty_np,
+        basis_kind=basis_kind,
+        basis_order=order,
+        periodic=periodic,
+        period=period,
+    )
 
 
 def gaussian_reml_fit_positions_batched_backward(
