@@ -1,17 +1,25 @@
-//! cuBLAS routing for large f64 dense kernels.
+//! cuBLAS routing for large f64 dense kernels, built on `cudarc` 0.19's
+//! safe wrappers (`CudaContext` / `CudaStream` / `CudaBlas` / `Gemm` /
+//! `Gemv`). The two ops cudarc doesn't safe-wrap (`cublasDdgmm`,
+//! `cublasDtrsm_v2`) fall through to `cudarc::cublas::sys` directly.
+//!
+//! Public surface (`try_fast_*`) and the multi-device striping structure
+//! are unchanged; only the FFI underneath has moved off the hand-rolled
+//! libloading bindings.
 
-use libloading::Library;
-use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView3, Data, Ix1, Ix2, s};
+use cudarc::cublas::sys::{
+    cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
+};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig, StridedBatchedConfig};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use ndarray::{Array1, Array2, Array3, ArrayBase, ArrayView2, ArrayView3, Data, Ix1, Ix2, s};
 use std::ops::Range;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
-use super::driver::{
-    CudaWorkingState, DeviceAllocation, bytes_len, check_cuda, from_col_major, load_static_library,
-    to_col_major, to_i32, to_i64,
-};
-use super::runtime::GpuRuntime;
+use super::driver::{from_col_major, to_col_major, to_i32};
+use super::runtime::{GpuRuntime, cuda_context_for};
 
 #[inline]
 pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
@@ -62,12 +70,7 @@ pub fn try_fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 }
 
 /// Strided batched dense matrix multiply: `C[b] = A[b] · B[b]` (or transposed
-/// variants) for `b = 0..batch`, all in a single cuBLAS call. The strided
-/// form requires every batch element to share the same `(m, n, k)` shape; the
-/// per-batch leading dimensions are taken from the stacked Array3 layout
-/// (row-major from ndarray, repacked column-major internally for cuBLAS).
-/// Returns `None` if the policy threshold is not met, dimensions disagree,
-/// or any device call fails — callers fall back to per-batch dispatch.
+/// variants) for `b = 0..batch`, all in a single cuBLAS call.
 #[inline]
 pub fn try_fast_ab_strided_batched(
     a: ArrayView3<'_, f64>,
@@ -76,8 +79,7 @@ pub fn try_fast_ab_strided_batched(
     try_fast_gemm_strided_batched(a, b, false, false)
 }
 
-/// Strided batched `Aᵀ · B`. Same constraints as
-/// [`try_fast_ab_strided_batched`] but transposes A on the device per batch.
+/// Strided batched `Aᵀ · B`.
 #[inline]
 pub fn try_fast_atb_strided_batched(
     a: ArrayView3<'_, f64>,
@@ -86,8 +88,7 @@ pub fn try_fast_atb_strided_batched(
     try_fast_gemm_strided_batched(a, b, true, false)
 }
 
-/// Strided batched `A · Bᵀ`. Mirrors [`try_fast_ab_strided_batched`] but
-/// transposes B on the device per batch.
+/// Strided batched `A · Bᵀ`.
 #[inline]
 pub fn try_fast_abt_strided_batched(
     a: ArrayView3<'_, f64>,
@@ -96,16 +97,12 @@ pub fn try_fast_abt_strided_batched(
     try_fast_gemm_strided_batched(a, b, false, true)
 }
 
-/// Strided batched `A[b] · B` with `B` broadcast (same matrix for every batch
-/// element). Uses `cublasDgemmStridedBatched` with `strideB = 0` so the
-/// device-side B buffer is uploaded once. Designed for the K-way whitened-
-/// penalty step `L_b⁻¹ · S` of the batched REML cache build, where every
-/// problem shares the same penalty matrix S. Returns `None` when the policy
-/// declines or any device call fails.
+/// Strided batched `A[b] · B` with B broadcast (same matrix for every batch
+/// element). Uses `strideB = 0` so B is uploaded once.
 #[inline]
 pub fn try_fast_ab_broadcast_b_batched(
     a: ArrayView3<'_, f64>,
-    b: ndarray::ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
 ) -> Option<Array3<f64>> {
     let (batch, a_rows, a_cols) = a.dim();
     let (b_rows, b_cols) = b.dim();
@@ -158,12 +155,10 @@ pub fn try_fast_ab_broadcast_b_batched(
     }
 }
 
-/// Strided batched `A · B[b]ᵀ` with `A` broadcast. Mirrors
-/// [`try_fast_ab_broadcast_b_batched`] for the symmetric `S · L_b⁻ᵀ` step
-/// that follows the first whitening multiply in `L_b⁻¹ · S · L_b⁻ᵀ`.
+/// Strided batched `A · B[b]ᵀ` with A broadcast.
 #[inline]
 pub fn try_fast_a_broadcast_bt_batched(
-    a: ndarray::ArrayView2<'_, f64>,
+    a: ArrayView2<'_, f64>,
     b: ArrayView3<'_, f64>,
 ) -> Option<Array3<f64>> {
     let (a_rows, a_cols) = a.dim();
@@ -171,7 +166,6 @@ pub fn try_fast_a_broadcast_bt_batched(
     if batch == 0 {
         return None;
     }
-    // Compute A @ B[b]^T: result is (a_rows × b_rows).
     let m = a_rows;
     let k = a_cols;
     let n = b_rows;
@@ -524,7 +518,8 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.trsm(lower, rhs, CUBLAS_FILL_LOWER)) {
+    match with_runtime(|runtime| runtime.trsm(lower, rhs, cublasFillMode_t::CUBLAS_FILL_MODE_LOWER))
+    {
         Some((out, device)) => {
             diagnostics::log_gpu_success(
                 "trsm_lower",
@@ -572,7 +567,8 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.trsm(upper, rhs, CUBLAS_FILL_UPPER)) {
+    match with_runtime(|runtime| runtime.trsm(upper, rhs, cublasFillMode_t::CUBLAS_FILL_MODE_UPPER))
+    {
         Some((out, device)) => {
             diagnostics::log_gpu_success(
                 "trsm_upper",
@@ -635,6 +631,15 @@ fn route_trsm(p: usize, rhs_cols: usize) -> bool {
     p > 0 && rhs_cols > 0 && GpuRuntime::global().policy().route_trsm(p, rhs_cols)
 }
 
+#[inline]
+fn op(transpose: bool) -> cublasOperation_t {
+    if transpose {
+        cublasOperation_t::CUBLAS_OP_T
+    } else {
+        cublasOperation_t::CUBLAS_OP_N
+    }
+}
+
 fn with_runtime<T>(
     mut f: impl FnMut(&mut CublasRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
@@ -643,10 +648,7 @@ fn with_runtime<T>(
         return None;
     }
     let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
-    // Phase 1: non-blocking sweep. Skip devices that another thread is
-    // currently driving, so concurrent callers spread to idle GPUs instead
-    // of serializing on whichever slot the rotated cursor happens to point
-    // at. Compute failures fall through to the next device.
+    // Phase 1: non-blocking sweep. Skip devices another thread is driving.
     for offset in 0..runtimes.len() {
         let idx = (start + offset) % runtimes.len();
         if let Ok(mut runtime) = runtimes[idx].try_lock()
@@ -655,8 +657,7 @@ fn with_runtime<T>(
             return Some((out, runtime.device.clone()));
         }
     }
-    // Phase 2: every device was busy (or every Phase-1 attempt compute-failed).
-    // Fall back to a blocking acquisition so we still make forward progress.
+    // Phase 2: every device was busy; fall back to a blocking acquisition.
     for offset in 0..runtimes.len() {
         let idx = (start + offset) % runtimes.len();
         if let Ok(mut runtime) = runtimes[idx].lock()
@@ -675,26 +676,14 @@ fn cublas_runtimes() -> &'static [Mutex<CublasRuntime>] {
             GpuRuntime::global()
                 .devices()
                 .iter()
-                .filter_map(|device| {
-                    let cuda = match CudaWorkingState::init(device.ordinal) {
-                        Some(cuda) => cuda,
-                        None => {
-                            diagnostics::log_library_unavailable(
-                                "cuBLAS",
-                                &format!("CUDA context init failed for device {}", device.ordinal),
-                            );
-                            return None;
-                        }
-                    };
-                    match CublasRuntime::new(cuda, device.clone()) {
-                        Ok(runtime) => {
-                            diagnostics::log_library_ready("cuBLAS", &runtime.device);
-                            Some(Mutex::new(runtime))
-                        }
-                        Err(err) => {
-                            diagnostics::log_library_unavailable("cuBLAS", &err);
-                            None
-                        }
+                .filter_map(|device| match CublasRuntime::new(device.clone()) {
+                    Ok(runtime) => {
+                        diagnostics::log_library_ready("cuBLAS", &runtime.device);
+                        Some(Mutex::new(runtime))
+                    }
+                    Err(err) => {
+                        diagnostics::log_library_unavailable("cuBLAS", &err);
+                        None
                     }
                 })
                 .collect()
@@ -935,7 +924,7 @@ fn try_multi_gemm_strided_batched(
 
 fn try_multi_gemm_broadcast_b_strided_batched(
     a: ArrayView3<'_, f64>,
-    b: ndarray::ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
     transpose_a: bool,
     transpose_b: bool,
 ) -> Option<(Array3<f64>, Vec<GpuDeviceInfo>)> {
@@ -977,7 +966,7 @@ fn try_multi_gemm_broadcast_b_strided_batched(
 }
 
 fn try_multi_broadcast_a_gemm_strided_batched(
-    a: ndarray::ArrayView2<'_, f64>,
+    a: ArrayView2<'_, f64>,
     b: ArrayView3<'_, f64>,
     transpose_a: bool,
     transpose_b: bool,
@@ -1041,33 +1030,42 @@ fn assemble_batched_output(
     Some((out, devices))
 }
 
+// ---------------------------------------------------------------------------
+// CublasRuntime — owns one (CudaContext, CudaStream, CudaBlas) per device.
+// All methods bind the calling thread to the context first, then run the
+// op via cudarc's safe wrappers (Gemm / Gemv) or directly through the
+// `cublasD*` sys symbols for the few ops that aren't safe-wrapped.
+// ---------------------------------------------------------------------------
+
 struct CublasRuntime {
-    /// Borrowed driver + context owned by [`GpuRuntime`].
-    cuda: CudaWorkingState,
     device: GpuDeviceInfo,
-    /// cuBLAS entry points. The dlopen'd library is `Box::leak`'d inside
-    /// `load_static_library`, so these fn pointers stay valid for the
-    /// process — no owning field needed.
-    blas: CublasApi,
-    handle: usize,
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    blas: CudaBlas,
 }
 
+// `CudaBlas` is `Send + Sync` per cudarc's impl, and the surrounding
+// `Mutex<CublasRuntime>` serializes all access anyway. No explicit unsafe
+// impl needed.
+
 impl CublasRuntime {
-    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, String> {
-        let cublas_lib = load_static_library(cublas_library_candidates())?;
-        let blas = CublasApi::load(cublas_lib)?;
-        cuda.set_current()?;
-        let mut handle = 0_usize;
-        let create_status = unsafe { (blas.cublas_create)(&mut handle) };
-        if create_status != CUBLAS_STATUS_SUCCESS {
-            return Err(format!("cublasCreate failed with status {create_status}"));
-        }
+    fn new(device: GpuDeviceInfo) -> Result<Self, String> {
+        let ctx = cuda_context_for(device.ordinal)
+            .ok_or_else(|| format!("CudaContext unavailable for ordinal {}", device.ordinal))?;
+        ctx.bind_to_thread().map_err(|e| e.to_string())?;
+        let stream = ctx.new_stream().map_err(|e| e.to_string())?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|e| e.to_string())?;
         Ok(Self {
-            cuda,
             device,
+            ctx,
+            stream,
             blas,
-            handle,
         })
+    }
+
+    #[inline]
+    fn bind(&self) -> Option<()> {
+        self.ctx.bind_to_thread().ok()
     }
 
     fn gemm<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
@@ -1088,46 +1086,30 @@ impl CublasRuntime {
         if k != b_k {
             return None;
         }
+        self.bind()?;
 
         let a_host = to_col_major(a);
         let b_host = to_col_major(b);
-        let mut c_host = vec![0.0; m.checked_mul(n)?];
-        let bytes_a = bytes_len::<f64>(a_host.len())?;
-        let bytes_b = bytes_len::<f64>(b_host.len())?;
-        let bytes_c = bytes_len::<f64>(c_host.len())?;
+        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(&a_host).ok()?;
+        let b_dev: CudaSlice<f64> = self.stream.memcpy_stod(&b_host).ok()?;
+        let mut c_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(m.checked_mul(n)?).ok()?;
 
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
-            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
-            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
-            let alpha = 1.0;
-            let beta = 0.0;
-            let status = (self.blas.cublas_dgemm)(
-                self.handle,
-                cublas_op(transpose_a),
-                cublas_op(transpose_b),
-                to_i32(m)?,
-                to_i32(n)?,
-                to_i32(k)?,
-                &alpha,
-                a_dev.ptr,
-                to_i32(a_rows)?,
-                b_dev.ptr,
-                to_i32(b_rows)?,
-                &beta,
-                c_dev.ptr,
-                to_i32(m)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
-                "cuMemcpyDtoH",
-            )
-            .ok()?;
-        }
+        let cfg = GemmConfig::<f64> {
+            transa: op(transpose_a),
+            transb: op(transpose_b),
+            m: to_i32(m)?,
+            n: to_i32(n)?,
+            k: to_i32(k)?,
+            alpha: 1.0,
+            lda: to_i32(a_rows)?,
+            ldb: to_i32(b_rows)?,
+            beta: 0.0,
+            ldc: to_i32(m)?,
+        };
+        // SAFETY: cfg shape and leading dims match the column-major buffers
+        // we just uploaded; the slices live until after the dtov below.
+        unsafe { self.blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
+        let c_host: Vec<f64> = self.stream.memcpy_dtov(&c_dev).ok()?;
         Some(from_col_major(&c_host, m, n))
     }
 
@@ -1139,43 +1121,28 @@ impl CublasRuntime {
     ) -> Option<Array1<f64>> {
         let (rows, cols) = a.dim();
         let out_len = if transpose { cols } else { rows };
-        let a_host = to_col_major(a);
-        let x_host = v.to_vec();
-        let mut y_host = vec![0.0; out_len];
-        let bytes_a = bytes_len::<f64>(a_host.len())?;
-        let bytes_x = bytes_len::<f64>(x_host.len())?;
-        let bytes_y = bytes_len::<f64>(y_host.len())?;
+        self.bind()?;
 
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
-            let x_dev = self.alloc_copy(&x_host, bytes_x)?;
-            let y_dev = DeviceAllocation::new(&self.cuda.api, bytes_y)?;
-            let alpha = 1.0;
-            let beta = 0.0;
-            let status = (self.blas.cublas_dgemv)(
-                self.handle,
-                cublas_op(transpose),
-                to_i32(rows)?,
-                to_i32(cols)?,
-                &alpha,
-                a_dev.ptr,
-                to_i32(rows)?,
-                x_dev.ptr,
-                1,
-                &beta,
-                y_dev.ptr,
-                1,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(y_host.as_mut_ptr().cast(), y_dev.ptr, bytes_y),
-                "cuMemcpyDtoH",
-            )
-            .ok()?;
-        }
+        let a_host = to_col_major(a);
+        let x_host: Vec<f64> = v.iter().copied().collect();
+        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(&a_host).ok()?;
+        let x_dev: CudaSlice<f64> = self.stream.memcpy_stod(&x_host).ok()?;
+        let mut y_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(out_len).ok()?;
+
+        let cfg = GemvConfig::<f64> {
+            trans: op(transpose),
+            m: to_i32(rows)?,
+            n: to_i32(cols)?,
+            alpha: 1.0,
+            lda: to_i32(rows)?,
+            incx: 1,
+            beta: 0.0,
+            incy: 1,
+        };
+        // SAFETY: rows/cols come from `a.dim()`, lda = rows matches the
+        // column-major upload, increments are 1 for contiguous host vectors.
+        unsafe { self.blas.gemv(cfg, &a_dev, &x_dev, &mut y_dev) }.ok()?;
+        let y_host: Vec<f64> = self.stream.memcpy_dtov(&y_dev).ok()?;
         Some(Array1::from_vec(y_host))
     }
 
@@ -1191,68 +1158,69 @@ impl CublasRuntime {
         if rows != w.len() || rows != y.nrows() {
             return None;
         }
+        self.bind()?;
+
         let x_host = to_col_major(x);
         let y_host = to_col_major(y);
-        let w_host = w.to_vec();
-        let mut out_host = vec![0.0; x_cols.checked_mul(y_cols)?];
-        let bytes_x = bytes_len::<f64>(x_host.len())?;
-        let bytes_y = bytes_len::<f64>(y_host.len())?;
-        let bytes_w = bytes_len::<f64>(w_host.len())?;
-        let bytes_out = bytes_len::<f64>(out_host.len())?;
-
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let x_dev = self.alloc_copy(&x_host, bytes_x)?;
-            let y_dev = self.alloc_copy(&y_host, bytes_y)?;
-            let w_dev = self.alloc_copy(&w_host, bytes_w)?;
-            let wy_dev = DeviceAllocation::new(&self.cuda.api, bytes_y)?;
-            let scale_status = (self.blas.cublas_ddgmm)(
-                self.handle,
-                CUBLAS_SIDE_LEFT,
-                to_i32(rows)?,
-                to_i32(y_cols)?,
-                y_dev.ptr,
-                to_i32(rows)?,
-                w_dev.ptr,
-                1,
-                wy_dev.ptr,
-                to_i32(rows)?,
-            );
-            if scale_status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            let out_dev = DeviceAllocation::new(&self.cuda.api, bytes_out)?;
-            let alpha = 1.0;
-            let beta = 0.0;
-            let status = (self.blas.cublas_dgemm)(
-                self.handle,
-                CUBLAS_OP_T,
-                CUBLAS_OP_N,
-                to_i32(x_cols)?,
-                to_i32(y_cols)?,
-                to_i32(rows)?,
-                &alpha,
-                x_dev.ptr,
-                to_i32(rows)?,
-                wy_dev.ptr,
-                to_i32(rows)?,
-                &beta,
-                out_dev.ptr,
-                to_i32(x_cols)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(
-                    out_host.as_mut_ptr().cast(),
-                    out_dev.ptr,
-                    bytes_out,
-                ),
-                "cuMemcpyDtoH",
-            )
+        let w_host: Vec<f64> = w.iter().copied().collect();
+        let x_dev: CudaSlice<f64> = self.stream.memcpy_stod(&x_host).ok()?;
+        let y_dev: CudaSlice<f64> = self.stream.memcpy_stod(&y_host).ok()?;
+        let w_dev: CudaSlice<f64> = self.stream.memcpy_stod(&w_host).ok()?;
+        let mut wy_dev: CudaSlice<f64> = self
+            .stream
+            .alloc_zeros::<f64>(rows.checked_mul(y_cols)?)
             .ok()?;
+        let mut out_dev: CudaSlice<f64> = self
+            .stream
+            .alloc_zeros::<f64>(x_cols.checked_mul(y_cols)?)
+            .ok()?;
+
+        let rows_i = to_i32(rows)?;
+        let x_cols_i = to_i32(x_cols)?;
+        let y_cols_i = to_i32(y_cols)?;
+
+        // wy = diag(w) · Y via cublasDdgmm (no safe wrapper).
+        // SAFETY: shapes/leading dims match the column-major Y upload;
+        // pointers come from valid live CudaSlices.
+        let ddgmm_status = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (y_ptr, _r_y) = y_dev.device_ptr(&self.stream);
+            let (w_ptr, _r_w) = w_dev.device_ptr(&self.stream);
+            let (wy_ptr, _r_wy) = wy_dev.device_ptr_mut(&self.stream);
+            cudarc::cublas::sys::cublasDdgmm(
+                *self.blas.handle(),
+                cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                rows_i,
+                y_cols_i,
+                y_ptr as *const f64,
+                rows_i,
+                w_ptr as *const f64,
+                1,
+                wy_ptr as *mut f64,
+                rows_i,
+            )
+        };
+        if ddgmm_status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return None;
         }
+
+        // out = Xᵀ · wy
+        let cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: x_cols_i,
+            n: y_cols_i,
+            k: rows_i,
+            alpha: 1.0,
+            lda: rows_i,
+            ldb: rows_i,
+            beta: 0.0,
+            ldc: x_cols_i,
+        };
+        // SAFETY: shape/leading-dim values match the live device buffers
+        // (X is rows×x_cols col-major, wy is rows×y_cols col-major).
+        unsafe { self.blas.gemm(cfg, &x_dev, &wy_dev, &mut out_dev) }.ok()?;
+        let out_host: Vec<f64> = self.stream.memcpy_dtov(&out_dev).ok()?;
         Some(from_col_major(&out_host, x_cols, y_cols))
     }
 
@@ -1260,48 +1228,46 @@ impl CublasRuntime {
         &mut self,
         triangular: &ArrayBase<S1, Ix2>,
         rhs: &ArrayBase<S2, Ix2>,
-        uplo: i32,
+        uplo: cublasFillMode_t,
     ) -> Option<Array2<f64>> {
         let p = triangular.nrows();
         let rhs_cols = rhs.ncols();
-        let triangular_host = to_col_major(triangular);
-        let mut rhs_host = to_col_major(rhs);
-        let bytes_triangular = bytes_len::<f64>(triangular_host.len())?;
-        let bytes_rhs = bytes_len::<f64>(rhs_host.len())?;
+        self.bind()?;
 
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let triangular_dev = self.alloc_copy(&triangular_host, bytes_triangular)?;
-            let rhs_dev = self.alloc_copy(&rhs_host, bytes_rhs)?;
-            let alpha = 1.0;
-            let status = (self.blas.cublas_dtrsm)(
-                self.handle,
-                CUBLAS_SIDE_LEFT,
+        let tri_host = to_col_major(triangular);
+        let rhs_host = to_col_major(rhs);
+        let tri_dev: CudaSlice<f64> = self.stream.memcpy_stod(&tri_host).ok()?;
+        let mut rhs_dev: CudaSlice<f64> = self.stream.memcpy_stod(&rhs_host).ok()?;
+
+        let p_i = to_i32(p)?;
+        let rhs_cols_i = to_i32(rhs_cols)?;
+        let alpha = 1.0_f64;
+        // SAFETY: cublasDtrsm_v2 writes the solution in place into B.
+        // Shapes are p×p triangular and p×rhs_cols B, both column-major.
+        let status = unsafe {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let (tri_ptr, _r_t) = tri_dev.device_ptr(&self.stream);
+            let (rhs_ptr, _r_r) = rhs_dev.device_ptr_mut(&self.stream);
+            cudarc::cublas::sys::cublasDtrsm_v2(
+                *self.blas.handle(),
+                cublasSideMode_t::CUBLAS_SIDE_LEFT,
                 uplo,
-                CUBLAS_OP_N,
-                CUBLAS_DIAG_NON_UNIT,
-                to_i32(p)?,
-                to_i32(rhs_cols)?,
-                &alpha,
-                triangular_dev.ptr,
-                to_i32(p)?,
-                rhs_dev.ptr,
-                to_i32(p)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(
-                    rhs_host.as_mut_ptr().cast(),
-                    rhs_dev.ptr,
-                    bytes_rhs,
-                ),
-                "cuMemcpyDtoH trsm",
+                cublasOperation_t::CUBLAS_OP_N,
+                cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+                p_i,
+                rhs_cols_i,
+                &alpha as *const f64,
+                tri_ptr as *const f64,
+                p_i,
+                rhs_ptr as *mut f64,
+                p_i,
             )
-            .ok()?;
+        };
+        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            return None;
         }
-        Some(from_col_major(&rhs_host, p, rhs_cols))
+        let out_host: Vec<f64> = self.stream.memcpy_dtov(&rhs_dev).ok()?;
+        Some(from_col_major(&out_host, p, rhs_cols))
     }
 
     fn gemm_strided_batched(
@@ -1323,94 +1289,30 @@ impl CublasRuntime {
         let a_stride = a_rows.checked_mul(a_cols)?;
         let b_stride = b_rows.checked_mul(b_cols)?;
         let c_stride = m.checked_mul(n)?;
-        let a_total = batch.checked_mul(a_stride)?;
-        let b_total = batch.checked_mul(b_stride)?;
-        let c_total = batch.checked_mul(c_stride)?;
 
-        // Pack each batch element in column-major order. cuBLAS strided
-        // batched expects all elements contiguous in memory with a fixed
-        // stride between successive batch slices.
-        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
-        for batch_idx in 0..batch {
-            let slice = a.slice(s![batch_idx, .., ..]);
-            for col in 0..a_cols {
-                for row in 0..a_rows {
-                    a_host.push(slice[[row, col]]);
-                }
-            }
-        }
-        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
-        for batch_idx in 0..batch {
-            let slice = b.slice(s![batch_idx, .., ..]);
-            for col in 0..b_cols {
-                for row in 0..b_rows {
-                    b_host.push(slice[[row, col]]);
-                }
-            }
-        }
-        let mut c_host: Vec<f64> = vec![0.0; c_total];
-        let bytes_a = bytes_len::<f64>(a_host.len())?;
-        let bytes_b = bytes_len::<f64>(b_host.len())?;
-        let bytes_c = bytes_len::<f64>(c_host.len())?;
-
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
-            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
-            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
-            let alpha = 1.0_f64;
-            let beta = 0.0_f64;
-            let status = (self.blas.cublas_dgemm_strided_batched)(
-                self.handle,
-                cublas_op(transpose_a),
-                cublas_op(transpose_b),
-                to_i32(m)?,
-                to_i32(n)?,
-                to_i32(k)?,
-                &alpha,
-                a_dev.ptr,
-                to_i32(a_rows)?,
-                to_i64(a_stride)?,
-                b_dev.ptr,
-                to_i32(b_rows)?,
-                to_i64(b_stride)?,
-                &beta,
-                c_dev.ptr,
-                to_i32(m)?,
-                to_i64(c_stride)?,
-                to_i32(batch)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
-                "cuMemcpyDtoH strided batched C",
-            )
-            .ok()?;
-        }
-
-        // Unpack column-major slabs back into row-major Array3.
-        let mut out = Array3::<f64>::zeros((batch, m, n));
-        for batch_idx in 0..batch {
-            let start = batch_idx * c_stride;
-            let mut dest = out.slice_mut(s![batch_idx, .., ..]);
-            for col in 0..n {
-                for row in 0..m {
-                    dest[[row, col]] = c_host[start + col * m + row];
-                }
-            }
-        }
-        Some(out)
+        let a_host = pack_a3_col_major(a);
+        let b_host = pack_a3_col_major(b);
+        self.run_strided_batched(
+            &a_host,
+            &b_host,
+            transpose_a,
+            transpose_b,
+            batch,
+            m,
+            n,
+            k,
+            a_rows,
+            b_rows,
+            a_stride as i64,
+            b_stride as i64,
+            c_stride,
+        )
     }
 
-    /// Variant of [`gemm_strided_batched`] that broadcasts `B` (a single
-    /// matrix) over all K batch elements of `A`. cuBLAS sees `strideB = 0`
-    /// so the B buffer is uploaded exactly once.
     fn gemm_broadcast_b_strided_batched(
         &mut self,
         a: ArrayView3<'_, f64>,
-        b: ndarray::ArrayView2<'_, f64>,
+        b: ArrayView2<'_, f64>,
         transpose_a: bool,
         transpose_b: bool,
     ) -> Option<Array3<f64>> {
@@ -1425,84 +1327,30 @@ impl CublasRuntime {
         }
         let a_stride = a_rows.checked_mul(a_cols)?;
         let c_stride = m.checked_mul(n)?;
-        let a_total = batch.checked_mul(a_stride)?;
-        let b_total = b_rows.checked_mul(b_cols)?;
-        let c_total = batch.checked_mul(c_stride)?;
 
-        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
-        for batch_idx in 0..batch {
-            let slice = a.slice(s![batch_idx, .., ..]);
-            for col in 0..a_cols {
-                for row in 0..a_rows {
-                    a_host.push(slice[[row, col]]);
-                }
-            }
-        }
-        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
-        for col in 0..b_cols {
-            for row in 0..b_rows {
-                b_host.push(b[[row, col]]);
-            }
-        }
-        let mut c_host: Vec<f64> = vec![0.0; c_total];
-        let bytes_a = bytes_len::<f64>(a_host.len())?;
-        let bytes_b = bytes_len::<f64>(b_host.len())?;
-        let bytes_c = bytes_len::<f64>(c_host.len())?;
-
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
-            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
-            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
-            let alpha = 1.0_f64;
-            let beta = 0.0_f64;
-            let status = (self.blas.cublas_dgemm_strided_batched)(
-                self.handle,
-                cublas_op(transpose_a),
-                cublas_op(transpose_b),
-                to_i32(m)?,
-                to_i32(n)?,
-                to_i32(k)?,
-                &alpha,
-                a_dev.ptr,
-                to_i32(a_rows)?,
-                to_i64(a_stride)?,
-                b_dev.ptr,
-                to_i32(b_rows)?,
-                0_i64, // strideB = 0 => broadcast B across K batches
-                &beta,
-                c_dev.ptr,
-                to_i32(m)?,
-                to_i64(c_stride)?,
-                to_i32(batch)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
-                "cuMemcpyDtoH broadcast-B strided batched C",
-            )
-            .ok()?;
-        }
-        let mut out = Array3::<f64>::zeros((batch, m, n));
-        for batch_idx in 0..batch {
-            let start = batch_idx * c_stride;
-            let mut dest = out.slice_mut(s![batch_idx, .., ..]);
-            for col in 0..n {
-                for row in 0..m {
-                    dest[[row, col]] = c_host[start + col * m + row];
-                }
-            }
-        }
-        Some(out)
+        let a_host = pack_a3_col_major(a);
+        let b_host = to_col_major(&b);
+        // strideB = 0 broadcasts B across all batch elements.
+        self.run_strided_batched(
+            &a_host,
+            &b_host,
+            transpose_a,
+            transpose_b,
+            batch,
+            m,
+            n,
+            k,
+            a_rows,
+            b_rows,
+            a_stride as i64,
+            0,
+            c_stride,
+        )
     }
 
-    /// Mirror of [`gemm_broadcast_b_strided_batched`] for the symmetric
-    /// step where `A` is broadcast and `B` is strided per batch.
     fn broadcast_a_gemm_strided_batched(
         &mut self,
-        a: ndarray::ArrayView2<'_, f64>,
+        a: ArrayView2<'_, f64>,
         b: ArrayView3<'_, f64>,
         transpose_a: bool,
         transpose_b: bool,
@@ -1518,66 +1366,75 @@ impl CublasRuntime {
         }
         let b_stride = b_rows.checked_mul(b_cols)?;
         let c_stride = m.checked_mul(n)?;
-        let a_total = a_rows.checked_mul(a_cols)?;
-        let b_total = batch.checked_mul(b_stride)?;
+
+        let a_host = to_col_major(&a);
+        let b_host = pack_a3_col_major(b);
+        // strideA = 0 broadcasts A across all batch elements.
+        self.run_strided_batched(
+            &a_host,
+            &b_host,
+            transpose_a,
+            transpose_b,
+            batch,
+            m,
+            n,
+            k,
+            a_rows,
+            b_rows,
+            0,
+            b_stride as i64,
+            c_stride,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_strided_batched(
+        &mut self,
+        a_host: &[f64],
+        b_host: &[f64],
+        transpose_a: bool,
+        transpose_b: bool,
+        batch: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        a_rows: usize,
+        b_rows: usize,
+        stride_a: i64,
+        stride_b: i64,
+        c_stride: usize,
+    ) -> Option<Array3<f64>> {
+        self.bind()?;
         let c_total = batch.checked_mul(c_stride)?;
+        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(a_host).ok()?;
+        let b_dev: CudaSlice<f64> = self.stream.memcpy_stod(b_host).ok()?;
+        let mut c_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(c_total).ok()?;
 
-        let mut a_host: Vec<f64> = Vec::with_capacity(a_total);
-        for col in 0..a_cols {
-            for row in 0..a_rows {
-                a_host.push(a[[row, col]]);
-            }
-        }
-        let mut b_host: Vec<f64> = Vec::with_capacity(b_total);
-        for batch_idx in 0..batch {
-            let slice = b.slice(s![batch_idx, .., ..]);
-            for col in 0..b_cols {
-                for row in 0..b_rows {
-                    b_host.push(slice[[row, col]]);
-                }
-            }
-        }
-        let mut c_host: Vec<f64> = vec![0.0; c_total];
-        let bytes_a = bytes_len::<f64>(a_host.len())?;
-        let bytes_b = bytes_len::<f64>(b_host.len())?;
-        let bytes_c = bytes_len::<f64>(c_host.len())?;
+        let cfg = StridedBatchedConfig::<f64> {
+            gemm: GemmConfig::<f64> {
+                transa: op(transpose_a),
+                transb: op(transpose_b),
+                m: to_i32(m)?,
+                n: to_i32(n)?,
+                k: to_i32(k)?,
+                alpha: 1.0,
+                lda: to_i32(a_rows)?,
+                ldb: to_i32(b_rows)?,
+                beta: 0.0,
+                ldc: to_i32(m)?,
+            },
+            batch_size: to_i32(batch)?,
+            stride_a,
+            stride_b,
+            stride_c: c_stride as i64,
+        };
+        // SAFETY: every leading dimension and stride matches the packed
+        // column-major host layout we just uploaded; result buffer has
+        // batch * c_stride elements.
+        unsafe { self.blas.gemm_strided_batched(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
+        let c_host: Vec<f64> = self.stream.memcpy_dtov(&c_dev).ok()?;
 
-        unsafe {
-            self.cuda.set_current().ok()?;
-            let a_dev = self.alloc_copy(&a_host, bytes_a)?;
-            let b_dev = self.alloc_copy(&b_host, bytes_b)?;
-            let c_dev = DeviceAllocation::new(&self.cuda.api, bytes_c)?;
-            let alpha = 1.0_f64;
-            let beta = 0.0_f64;
-            let status = (self.blas.cublas_dgemm_strided_batched)(
-                self.handle,
-                cublas_op(transpose_a),
-                cublas_op(transpose_b),
-                to_i32(m)?,
-                to_i32(n)?,
-                to_i32(k)?,
-                &alpha,
-                a_dev.ptr,
-                to_i32(a_rows)?,
-                0_i64, // strideA = 0 => broadcast A across K batches
-                b_dev.ptr,
-                to_i32(b_rows)?,
-                to_i64(b_stride)?,
-                &beta,
-                c_dev.ptr,
-                to_i32(m)?,
-                to_i64(c_stride)?,
-                to_i32(batch)?,
-            );
-            if status != CUBLAS_STATUS_SUCCESS {
-                return None;
-            }
-            check_cuda(
-                (self.cuda.api.cu_memcpy_dtoh)(c_host.as_mut_ptr().cast(), c_dev.ptr, bytes_c),
-                "cuMemcpyDtoH broadcast-A strided batched C",
-            )
-            .ok()?;
-        }
+        // Unpack column-major slabs back into a row-major Array3.
         let mut out = Array3::<f64>::zeros((batch, m, n));
         for batch_idx in 0..batch {
             let start = batch_idx * c_stride;
@@ -1590,166 +1447,21 @@ impl CublasRuntime {
         }
         Some(out)
     }
-
-    unsafe fn alloc_copy<'a>(
-        &'a self,
-        values: &[f64],
-        bytes: usize,
-    ) -> Option<DeviceAllocation<'a>> {
-        let allocation = unsafe { DeviceAllocation::new(&self.cuda.api, bytes) }?;
-        check_cuda(
-            unsafe {
-                (self.cuda.api.cu_memcpy_htod)(allocation.ptr, values.as_ptr().cast(), bytes)
-            },
-            "cuMemcpyHtoD",
-        )
-        .ok()?;
-        Some(allocation)
-    }
 }
 
-impl Drop for CublasRuntime {
-    fn drop(&mut self) {
-        // The cuBLAS handle is library-local; destroying it here releases
-        // its small descriptor buffers. The CUDA context itself is owned
-        // by the shared [`CudaWorkingState`] and tears down once at
-        // process exit, not on every library runtime drop.
-        unsafe {
-            let _ = self.cuda.set_current();
-            let _ = (self.blas.cublas_destroy)(self.handle);
+/// Pack an Array3 (batch, rows, cols) row-major into a flat column-major
+/// buffer suitable for `cublasDgemmStridedBatched`. Each batch slab is
+/// `rows * cols` f64s contiguous in memory with stride = rows*cols.
+fn pack_a3_col_major(a: ArrayView3<'_, f64>) -> Vec<f64> {
+    let (batch, rows, cols) = a.dim();
+    let mut out = Vec::with_capacity(batch.saturating_mul(rows).saturating_mul(cols));
+    for batch_idx in 0..batch {
+        let slice = a.slice(s![batch_idx, .., ..]);
+        for col in 0..cols {
+            out.extend(slice.column(col).iter().copied());
         }
     }
-}
-
-type CublasStatus = i32;
-type CublasCreate = unsafe extern "C" fn(*mut usize) -> CublasStatus;
-type CublasDestroy = unsafe extern "C" fn(usize) -> CublasStatus;
-type CublasDgemm = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-    *const f64,
-    u64,
-    i32,
-) -> CublasStatus;
-type CublasDgemv = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-    *const f64,
-    u64,
-    i32,
-) -> CublasStatus;
-type CublasDdgmm =
-    unsafe extern "C" fn(usize, i32, i32, i32, u64, i32, u64, i32, u64, i32) -> CublasStatus;
-type CublasDtrsm = unsafe extern "C" fn(
-    usize,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    i32,
-    *const f64,
-    u64,
-    i32,
-    u64,
-    i32,
-) -> CublasStatus;
-type CublasDgemmStridedBatched = unsafe extern "C" fn(
-    usize,      // handle
-    i32,        // transa
-    i32,        // transb
-    i32,        // m
-    i32,        // n
-    i32,        // k
-    *const f64, // alpha
-    u64,        // A
-    i32,        // lda
-    i64,        // strideA
-    u64,        // B
-    i32,        // ldb
-    i64,        // strideB
-    *const f64, // beta
-    u64,        // C
-    i32,        // ldc
-    i64,        // strideC
-    i32,        // batchCount
-) -> CublasStatus;
-
-struct CublasApi {
-    cublas_create: CublasCreate,
-    cublas_destroy: CublasDestroy,
-    cublas_dgemm: CublasDgemm,
-    cublas_dgemv: CublasDgemv,
-    cublas_ddgmm: CublasDdgmm,
-    cublas_dtrsm: CublasDtrsm,
-    cublas_dgemm_strided_batched: CublasDgemmStridedBatched,
-}
-
-impl CublasApi {
-    fn load(library: &Library) -> Result<Self, String> {
-        unsafe {
-            Ok(Self {
-                cublas_create: *library
-                    .get(b"cublasCreate_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_destroy: *library
-                    .get(b"cublasDestroy_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_dgemm: *library
-                    .get(b"cublasDgemm_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_dgemv: *library
-                    .get(b"cublasDgemv_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_ddgmm: *library.get(b"cublasDdgmm\0").map_err(|e| e.to_string())?,
-                cublas_dtrsm: *library
-                    .get(b"cublasDtrsm_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cublas_dgemm_strided_batched: *library
-                    .get(b"cublasDgemmStridedBatched\0")
-                    .map_err(|e| e.to_string())?,
-            })
-        }
-    }
-}
-
-const CUBLAS_STATUS_SUCCESS: CublasStatus = 0;
-const CUBLAS_OP_N: i32 = 0;
-const CUBLAS_OP_T: i32 = 1;
-const CUBLAS_SIDE_LEFT: i32 = 0;
-const CUBLAS_FILL_LOWER: i32 = 0;
-const CUBLAS_FILL_UPPER: i32 = 1;
-const CUBLAS_DIAG_NON_UNIT: i32 = 0;
-
-#[inline]
-fn cublas_op(transpose: bool) -> i32 {
-    if transpose { CUBLAS_OP_T } else { CUBLAS_OP_N }
-}
-
-fn cublas_library_candidates() -> &'static [&'static str] {
-    if cfg!(target_os = "windows") {
-        &["cublas64_12.dll", "cublas64_11.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["/usr/local/cuda/lib/libcublas.dylib", "libcublas.dylib"]
-    } else {
-        &["libcublas.so.12", "libcublas.so.11", "libcublas.so"]
-    }
+    out
 }
 
 #[cfg(test)]
