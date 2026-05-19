@@ -5388,7 +5388,9 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_time_smooth_lambda = time_build.smooth_lambda;
     payload.survival_time_anchor = Some(time_anchor);
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some(gam::families::survival_construction::survival_likelihood_modename(likelihood_mode).to_string());
+    payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
+    payload.survival_distribution = Some("probit".to_string());
+    payload.link = Some("probit".to_string());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
