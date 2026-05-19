@@ -97,7 +97,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         # them and raise on any in-place mutation between forward and backward.
         # Keep the numpy aliases on ctx for performance — they are only read in
         # backward, which is gated by the version check.
-        _save_diff_tensors(ctx, x, y, weights, by)
+        _save_diff_tensors(ctx, x, y, penalty, weights, by)
         ctx.x_np = x_np
         ctx.y_np = y_np
         ctx.penalty_np = penalty_np
@@ -109,6 +109,7 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
+        ctx.penalty_ref = penalty
 
         coefficients = from_numpy_like(out["coefficients"], x)
         fitted = from_numpy_like(out["fitted"], x)
@@ -143,11 +144,12 @@ class _GaussianRemlFitFn(torch.autograd.Function):
         ref = ctx.ref
         grad_x = _wrap_optional(result.get("grad_x"), ref)
         grad_y = _wrap_optional(result.get("grad_y"), ref)
+        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
         grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
         grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
         # Order matches forward(...) positional args: x, y, penalty, weights, by,
         # init_lambda, by_start_col.
-        return grad_x, grad_y, None, grad_weights, grad_by, None, None
+        return grad_x, grad_y, grad_penalty, grad_weights, grad_by, None, None
 
 
 class _GaussianRemlFitBatchedFn(torch.autograd.Function):
@@ -183,7 +185,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
-        _save_diff_tensors(ctx, x, y, weights, by)
+        _save_diff_tensors(ctx, x, y, penalty, weights, by)
         ctx.x_np = x_np
         ctx.y_np = y_np
         ctx.offsets_np = offsets_np
@@ -196,6 +198,7 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
+        ctx.penalty_ref = penalty
 
         coefficients = from_numpy_like(out["coefficients"], x)
         fitted = from_numpy_like(out["fitted"], x)
@@ -231,11 +234,12 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         ref = ctx.ref
         grad_x = _wrap_optional(result.get("grad_x"), ref)
         grad_y = _wrap_optional(result.get("grad_y"), ref)
+        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
         grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
         grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
         # Order matches forward(...) positional args: x, y, row_offsets, penalty,
         # weights, by, init_lambda, by_start_col.
-        return grad_x, grad_y, None, None, grad_weights, grad_by, None, None
+        return grad_x, grad_y, None, grad_penalty, grad_weights, grad_by, None, None
 
 
 class _GaussianRemlFitPositionsFn(torch.autograd.Function):
@@ -279,7 +283,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
-        _save_diff_tensors(ctx, t, y, weights, by)
+        _save_diff_tensors(ctx, t, y, penalty, weights, by)
         ctx.t_np = t_np
         ctx.y_np = y_np
         ctx.knots_np = knots_np
@@ -296,6 +300,7 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = t
+        ctx.penalty_ref = penalty
 
         coefficients = from_numpy_like(out["coefficients"], t)
         fitted = from_numpy_like(out["fitted"], t)
@@ -335,11 +340,12 @@ class _GaussianRemlFitPositionsFn(torch.autograd.Function):
         ref = ctx.ref
         grad_t = _wrap_optional(result.get("grad_t"), ref)
         grad_y = _wrap_optional(result.get("grad_y"), ref)
+        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
         grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
         grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
         # Order matches forward(...): t, y, knots_or_centers, penalty, weights, by,
         # basis_kind, basis_order, periodic, period, init_lambda, by_start_col.
-        return grad_t, grad_y, None, None, grad_weights, grad_by, None, None, None, None, None, None
+        return grad_t, grad_y, None, grad_penalty, grad_weights, grad_by, None, None, None, None, None, None
 
 
 class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
@@ -386,7 +392,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
             by_start_col=by_start_col,
         )
 
-        _save_diff_tensors(ctx, t, y, weights, by)
+        _save_diff_tensors(ctx, t, y, penalty, weights, by)
         ctx.t_np = t_np
         ctx.y_np = y_np
         ctx.offsets_np = offsets_np
@@ -404,6 +410,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = t
+        ctx.penalty_ref = penalty
 
         coefficients = from_numpy_like(out["coefficients"], t)
         fitted = from_numpy_like(out["fitted"], t)
@@ -444,6 +451,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
         ref = ctx.ref
         grad_t = _wrap_optional(result.get("grad_t"), ref)
         grad_y = _wrap_optional(result.get("grad_y"), ref)
+        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
         grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
         grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
         # Order matches forward(...): t, y, row_offsets, knots_or_centers, penalty,
@@ -454,7 +462,7 @@ class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
             grad_y,
             None,
             None,
-            None,
+            grad_penalty,
             grad_weights,
             grad_by,
             None,
@@ -486,8 +494,7 @@ def gaussian_reml_fit(
     y:
         Response matrix of shape ``(N, D)``.
     penalty:
-        Penalty matrix of shape ``(M, M)``. Treated as structural;
-        backward returns ``None`` for this slot.
+        Penalty matrix of shape ``(M, M)``.
     weights:
         Optional row weights of shape ``(N,)``.
     init_lambda:
