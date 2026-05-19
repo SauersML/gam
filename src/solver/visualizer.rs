@@ -184,23 +184,17 @@ fn install_active_feed(feed: ActiveFeed) {
     // session, not in a half-dead slot. Without this the second `new(true)`
     // call after any panic would silently drop the install and the chart
     // would stop receiving data for the rest of the process lifetime.
-    let mut guard = active_feed_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
     *guard = Some(feed);
 }
 
 fn clear_active_feed() {
-    let mut guard = active_feed_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let mut guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
     *guard = None;
 }
 
 fn current_active_feed() -> Option<ActiveFeed> {
-    let guard = active_feed_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
     guard.as_ref().cloned()
 }
 
@@ -214,11 +208,8 @@ pub fn record_outer_eval(cost: f64, grad_norm: f64) {
     let Some(feed) = current_active_feed() else {
         return;
     };
-    let snapshot = {
-        let mut model = match feed.model.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+    {
+        let mut model = lock_model(&feed.model);
         model.outer_eval_counter += 1.0;
         let iter = model.outer_eval_counter;
         model.current_iter = iter;
@@ -233,15 +224,8 @@ pub fn record_outer_eval(cost: f64, grad_norm: f64) {
             push_sample(&mut model.history_grad_log, (iter, g_log));
         }
         model.last_trial = Some((iter, cost, grad_norm));
-        model.clone()
-    };
-    if let Ok(mut state) = feed.state.lock() {
-        match &mut *state {
-            VisualizerState::Disabled => {}
-            VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
-            VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
-        }
     }
+    maybe_redraw_throttled(&feed);
 }
 
 /// Hook for the outer optimizer: promote the most recent trial point into the
@@ -253,11 +237,8 @@ pub fn record_outer_accept() {
     let Some(feed) = current_active_feed() else {
         return;
     };
-    let snapshot = {
-        let mut model = match feed.model.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+    {
+        let mut model = lock_model(&feed.model);
         if let Some((iter, cost, _grad)) = model.last_trial {
             if cost.is_finite() && cost.abs() < 1e15 {
                 push_sample(&mut model.history_cost_accepted, (iter, cost));
@@ -267,14 +248,47 @@ pub fn record_outer_accept() {
             }
             model.current_eval_state = "accepted".to_string();
         }
-        model.clone()
-    };
-    if let Ok(mut state) = feed.state.lock() {
-        match &mut *state {
-            VisualizerState::Disabled => {}
-            VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
-            VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
+    }
+    maybe_redraw_throttled(&feed);
+}
+
+/// Throttled redraw helper for optimizer pushes. Avoids cloning the
+/// `VisualizerModel` on the hot path: only snapshots when the renderer's
+/// throttle says it's actually time to draw. At biobank scale (10⁴+ outer
+/// evals per fit) this matters — naively cloning a 1200-point history on
+/// every push is O(N²) total work just to render frames the throttle drops.
+///
+/// Lock order is model → state, matching `VisualizerSession`'s own methods.
+/// We pre-take the model snapshot before state to avoid deadlock with a
+/// concurrent session method that holds model and tries to take state.
+/// The cost is one bool check (the "due" predicate would race anyway): if
+/// the renderer becomes due between our snapshot and our state lock, we
+/// still render with a freshly-taken snapshot — correct, just possibly one
+/// frame earlier than the strict throttle would allow.
+fn maybe_redraw_throttled(feed: &ActiveFeed) {
+    // Cheap probe without crossing locks in the wrong order: peek at
+    // state's last_draw to decide whether to take the snapshot at all.
+    {
+        let state = lock_state(&feed.state);
+        let due = match &*state {
+            VisualizerState::Disabled => return,
+            VisualizerState::Interactive(vis) => {
+                vis.last_draw.elapsed() >= INTERACTIVE_DRAW_INTERVAL
+            }
+            VisualizerState::Dumb(vis) => vis.last_draw.elapsed() >= DUMB_DRAW_INTERVAL,
+        };
+        if !due {
+            return;
         }
+        // Drop the state lock here so we can take model → state in the
+        // canonical order on the path that actually clones+renders.
+    }
+    let snapshot = lock_model(&feed.model).clone();
+    let mut state = lock_state(&feed.state);
+    match &mut *state {
+        VisualizerState::Disabled => {}
+        VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
+        VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
     }
 }
 
@@ -1219,7 +1233,11 @@ fn cost_sparkline(series: &[(f64, f64)], slots: usize) -> Option<String> {
     if slots == 0 || series.len() < 3 {
         return None;
     }
-    let costs: Vec<f64> = series.iter().map(|(_, c)| *c).filter(|c| c.is_finite()).collect();
+    let costs: Vec<f64> = series
+        .iter()
+        .map(|(_, c)| *c)
+        .filter(|c| c.is_finite())
+        .collect();
     if costs.len() < 3 {
         return None;
     }
@@ -1306,10 +1324,7 @@ fn append_optimizer_metrics(parts: &mut Vec<String>, model: &VisualizerModel) {
         if has_best || has_delta {
             let mut extras: Vec<String> = Vec::new();
             if has_best {
-                extras.push(format!(
-                    "best={}",
-                    format_metric(model.best_cost, "{:.4}")
-                ));
+                extras.push(format!("best={}", format_metric(model.best_cost, "{:.4}")));
             }
             if has_delta {
                 let n = model.history_cost_accepted.len();

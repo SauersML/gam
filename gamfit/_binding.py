@@ -4,6 +4,8 @@ import importlib
 from functools import lru_cache
 from types import ModuleType
 
+from ._cuda import preload_cuda_libraries
+
 
 class RustExtensionUnavailableError(ImportError):
     """Raised when the compiled ``gamfit._rust`` extension cannot be imported.
@@ -27,6 +29,7 @@ class RustExtensionUnavailableError(ImportError):
 
 @lru_cache(maxsize=1)
 def rust_module() -> ModuleType:
+    preload_cuda_libraries()
     try:
         return importlib.import_module("gamfit._rust")
     except ImportError as exc:  # pragma: no cover - import environment specific
