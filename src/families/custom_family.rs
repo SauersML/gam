@@ -9276,6 +9276,7 @@ fn coefficient_line_search_options(
 ) -> BlockwiseFitOptions {
     let mut line_search_options = options.clone();
     line_search_options.outer_score_subsample = None;
+    line_search_options.auto_outer_subsample = false;
     line_search_options.early_exit_threshold = Some(early_exit_threshold);
     line_search_options
 }
