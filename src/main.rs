@@ -639,7 +639,12 @@ const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
 fn main() {
     gam::init_parallelism();
-    if let Err(e) = run() {
+    let result = run();
+    // Emit the GPU activity roll-up exactly once, regardless of success/
+    // failure path. Tells the user — and the log reader — how many kernels
+    // actually reached the device this run and what was kept on the host.
+    gam::gpu::flush_gpu_activity_summary();
+    if let Err(e) = result {
         eprintln!("error: {e}");
         if let Some(advice) = e.advice() {
             eprintln!("help: {advice}");
