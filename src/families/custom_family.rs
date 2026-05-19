@@ -19395,25 +19395,23 @@ mod tests {
     /// uses; ρ comes out to exactly 2.0 to floating-point precision.
     #[test]
     fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
-        // Synthetic 2D NLL Hessian: indefinite (eigenvalues -1, +1).
-        // Mirrors the saturated-probit marginal block, where the concave
-        // entry-survival term (`+w·log Φ(−η₀)`, second derivative ≈ −w)
-        // sums against the convex exit/event-density term (≈ +w) to give
-        // an INDEFINITE H_NLL: the eigenvalue is −w along the entry
-        // basis direction and +w along the exit basis direction. The
-        // sum h[0,0] + h[1,1] = 0 (proven separately) is exactly the
-        // marginal-block pullback's vanishing curvature, but the
-        // per-row 2×2 H_NLL is still indefinite.
-        let h_nll = array![[-1.0, 0.0], [0.0, 1.0]];
+        // Synthetic 3D joint Hessian with the structure of the
+        // saturated-probit failure case at biobank scale:
+        //   - dim 0: indefinite contribution (eigenvalue −1) from the
+        //     concave entry-survival term `+w·log Φ(−η₀)`. This triggers
+        //     the SPD stabilizer in the solver.
+        //   - dim 1: positive contribution (+1) from a non-saturated
+        //     coefficient direction.
+        //   - dim 2: ZERO from the marginal-block Hessian cancellation
+        //     proven separately in `marginal_block_hessian_cancels_in_saturated_regime`.
+        //     This is the saturating direction that sits in null(H_true).
+        let h_nll = array![[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
         let source = JointHessianSource::Dense(h_nll.clone());
-        let ranges = vec![(0, 2)];
-        // Smoothing penalty `S` is structured to put the saturating
-        // direction in null(H_NLL + S). This mirrors the duchon-smooth
-        // polynomial null space (order=1 in 3D has a constant in the
-        // null) intersecting the marginal-block cancellation direction.
-        // Choosing S = diag(1, 0) makes H_NLL + S = diag(0, 1), so
-        // direction (1, 0) is null in H_true (= H_NLL + S + 0·I).
-        let s_lambdas = vec![array![[1.0, 0.0], [0.0, 0.0]]];
+        let ranges = vec![(0, 3)];
+        // Smoothing penalty `S` is zero in the saturating direction
+        // (dim 2) — mirrors the duchon-smooth polynomial null space
+        // containing constants/linears.
+        let s_lambdas = vec![Array2::<f64>::zeros((3, 3))];
 
         // Stabilized solver ridge: should add ~1.0 to lift the
         // -1 eigenvalue to the SPD floor (~ridge_floor).
@@ -19436,20 +19434,21 @@ mod tests {
         let big_delta = joint_solver_diagonal_ridge - joint_mode_diagonal_ridge;
 
         // True Hessian (what TRIAL OBJECTIVE sees):
-        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I = diag(0, 1)
-        //   ⇒ dim 0 is a null direction of H_true.
+        //   H_true = H_NLL + S + joint_mode_diagonal_ridge·I
+        //          = diag(-1, 1, 0)
+        //   ⇒ dim 2 is a null direction of H_true.
         // Used Hessian (what SOLVE / APPLY uses):
         //   H_used = H_NLL + S + joint_solver_diagonal_ridge·I
-        //          = diag(Δ, 1 + Δ)   where Δ ≈ 1.0
-        //   ⇒ dim 0 has curvature Δ (purely from the stabilizing shift).
-        // rhs aimed entirely in dim 0 puts the Newton step in null(H_true).
-        let rhs = array![1.0_f64, 0.0];
-        let h_used_00 = 0.0 + joint_solver_diagonal_ridge;
-        let h_used_11 = 1.0 + joint_solver_diagonal_ridge;
-        let delta = array![rhs[0] / h_used_00, rhs[1] / h_used_11];
+        //          = diag(-1+Δ, 1+Δ, Δ)   where Δ ≈ 1.0
+        //   ⇒ dim 2 has curvature Δ (purely from the stabilizing shift,
+        //     which fires because dim 0 is negative).
+        // rhs aimed entirely in dim 2 puts the Newton step in null(H_true).
+        let rhs = array![0.0_f64, 0.0, 1.0];
+        let h_used_22 = 0.0 + joint_solver_diagonal_ridge;
+        let delta = array![0.0, 0.0, rhs[2] / h_used_22];
 
         // Compute hpen_delta via the SAME helper the inner solver uses.
-        let mut hpen_delta = Array1::<f64>::zeros(2);
+        let mut hpen_delta = Array1::<f64>::zeros(3);
         apply_joint_penalized_hessian_into(
             &source,
             &ranges,
@@ -19468,7 +19467,7 @@ mod tests {
         // taking β_start = 0 and using the Newton identity for the truth:
         //   actual = rhs·δ − ½·δᵀ·H_true·δ
         // where H_true = H_NLL + S + joint_mode_diagonal_ridge·I.
-        let mut h_true_delta = Array1::<f64>::zeros(2);
+        let mut h_true_delta = Array1::<f64>::zeros(3);
         apply_joint_penalized_hessian_into(
             &source,
             &ranges,
@@ -19508,7 +19507,7 @@ mod tests {
         for scale in [0.001_f64, 0.029, 1.0, 988.0] {
             let scaled_rhs = &rhs * scale;
             let scaled_delta = &delta * scale;
-            let mut scaled_hpen = Array1::<f64>::zeros(2);
+            let mut scaled_hpen = Array1::<f64>::zeros(3);
             apply_joint_penalized_hessian_into(
                 &source,
                 &ranges,
@@ -19520,7 +19519,7 @@ mod tests {
             .expect("apply scaled");
             let scaled_predicted =
                 joint_quadratic_predicted_reduction(&scaled_rhs, &scaled_hpen, &scaled_delta);
-            let mut scaled_h_true_delta = Array1::<f64>::zeros(2);
+            let mut scaled_h_true_delta = Array1::<f64>::zeros(3);
             apply_joint_penalized_hessian_into(
                 &source,
                 &ranges,
