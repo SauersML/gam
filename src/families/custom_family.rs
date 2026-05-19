@@ -2257,7 +2257,11 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
 ) -> Option<String> {
     let mut hasher = StableHasher::new();
     hasher.write_str("gamfit-persistent-block-warm-start");
-    hasher.write_str(env!("CARGO_PKG_VERSION"));
+    // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
+    // library version bumps don't invalidate users' on-disk warm-start
+    // caches. The schema tag bumps only on deliberate cache layout
+    // changes; same-schema lib versions share keys.
+    hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
     hasher.write_str(type_name::<F>());
     hasher.write_usize(specs.len());
     for spec in specs {
