@@ -17,9 +17,8 @@ that can sit alongside other modules in your training loop.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 from torch import nn
 
@@ -49,15 +48,11 @@ class _FittedGamModule(nn.Module):
         return self._model
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        if not isinstance(X, torch.Tensor):
-            raise TypeError("from_fitted module expects a torch.Tensor input")
         if X.dim() != 2:
             raise ValueError(
                 f"from_fitted module expects a 2-D (N, F) input, got shape {tuple(X.shape)}"
             )
-        x_np = to_numpy_f64(X)
-        out_np = self._model.predict_array(x_np)
-        out_np = np.ascontiguousarray(np.asarray(out_np, dtype=np.float64))
+        out_np = self._model.predict_array(to_numpy_f64(X))
         return from_numpy_like(out_np, X)
 
 
@@ -87,8 +82,4 @@ def from_fitted(model: "Model") -> nn.Module:
     >>> wrapped = from_fitted(model)
     >>> preds = wrapped(torch.as_tensor(X_test))
     """
-    if not hasattr(model, "predict_array"):
-        raise TypeError(
-            "from_fitted expects a fitted gamfit.Model with a predict_array method"
-        )
     return _FittedGamModule(model)
