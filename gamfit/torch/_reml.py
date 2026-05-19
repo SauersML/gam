@@ -78,11 +78,15 @@ class FrozenPositionPredictor(NamedTuple):
         from ._basis import bspline_basis, duchon_basis_1d
 
         kind = self.basis_kind.strip().lower().replace("_", "").replace("-", "")
-        if kind in {"duchon", "duchonspline"}:
+        # 1D thin-plate and duchon_multipenalty share Duchon's basis evaluation;
+        # only the penalty differs. So they evaluate through the same Duchon path.
+        if kind in {"duchon", "duchonspline", "duchonmultipenalty",
+                    "duchontripleoperator", "thinplate", "thinplatespline", "tps"}:
+            m = 2 if kind in {"thinplate", "thinplatespline", "tps"} else int(self.basis_order)
             basis = duchon_basis_1d(
                 t_new,
                 self.knots_or_centers.to(device=t_new.device, dtype=t_new.dtype),
-                m=self.basis_order,
+                m=m,
                 periodic=self.periodic,
             )
         elif kind in {"bspline", "spline"}:
