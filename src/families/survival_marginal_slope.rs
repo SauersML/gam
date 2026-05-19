@@ -16491,6 +16491,90 @@ mod tests {
         assert!(err.contains("non-finite signed margin"));
     }
 
+    /// Diagnostic probe for the ρ=2 inner-PIRLS pathology on biobank-scale
+    /// saturated probit fits. Computes the per-row primary Hessian for the
+    /// rigid path at a range of η magnitudes and reports
+    /// `h[0,0] + h[1,1]` — the exact quantity summed into the marginal-block
+    /// joint Hessian by `add_pullback_primary_hessian`. If this sum collapses
+    /// to ~0 under saturation, the marginal-block joint Hessian is
+    /// near-singular by exact cancellation between the (concave) entry
+    /// `+w·log Φ(−η₀)` term and the (convex) exit `−w·log Φ(−η₁)` / event
+    /// density `+w·η₁²/2` term, and Newton's quadratic model along that
+    /// direction is dominated by the penalty / ridge rather than by data.
+    #[test]
+    fn diagnose_marginal_block_hessian_cancellation_in_saturated_regime() {
+        let probit_scale = 1.0_f64;
+        let w = 1.0_f64;
+        let derivative_guard = 1e-6;
+        // Hold q0 = q1 = η so the entry/exit share the same probit margin
+        // (typical for biobank rows where entry and exit are close on the
+        // probit scale once X·β saturates).
+        let qd1 = 1.0_f64;
+        let g = 0.0_f64;
+        let z = 0.0_f64;
+
+        eprintln!("\n=== Marginal-block Hessian cancellation diagnostic ===");
+        eprintln!(
+            "{:>6}  {:>4}  {:>14}  {:>14}  {:>14}  {:>14}  {:>14}",
+            "eta", "d", "h[0,0]", "h[1,1]", "h[0,0]+h[1,1]", "|h00|+|h11|", "cancel_frac"
+        );
+
+        for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 20.0, 40.0, 100.0, 500.0, 988.0] {
+            for &d in &[0.0_f64, 1.0] {
+                let (_nll, _grad, hess) = row_primary_closed_form(
+                    eta,
+                    eta,
+                    qd1,
+                    g,
+                    z,
+                    w,
+                    d,
+                    derivative_guard,
+                    probit_scale,
+                )
+                .expect("rigid row at saturated eta");
+                let h00 = hess[0][0];
+                let h11 = hess[1][1];
+                let sum = h00 + h11;
+                let scale = h00.abs() + h11.abs();
+                let cancel_frac = if scale > 0.0 { sum.abs() / scale } else { 0.0 };
+                eprintln!(
+                    "{:>6.1}  {:>4.1}  {:>14.6e}  {:>14.6e}  {:>14.6e}  {:>14.6e}  {:>14.6e}",
+                    eta, d, h00, h11, sum, scale, cancel_frac
+                );
+            }
+        }
+        // Probe: does the cancellation become exact in the saturated tail?
+        // If yes, the marginal-block joint Hessian collapses there and the
+        // Newton step in that block is set entirely by the penalty/ridge.
+        let (_, _, hess_sat_event) =
+            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
+                .expect("saturated event");
+        let (_, _, hess_sat_cens) =
+            row_primary_closed_form(988.0, 988.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1e-6, 1.0)
+                .expect("saturated censored");
+        let event_sum = hess_sat_event[0][0] + hess_sat_event[1][1];
+        let cens_sum = hess_sat_cens[0][0] + hess_sat_cens[1][1];
+        let event_scale = hess_sat_event[0][0].abs() + hess_sat_event[1][1].abs();
+        let cens_scale = hess_sat_cens[0][0].abs() + hess_sat_cens[1][1].abs();
+        eprintln!(
+            "\nSATURATED EVENT row at η=988:  h[0,0]={:.6e}  h[1,1]={:.6e}  sum={:.6e}  rel={:.6e}",
+            hess_sat_event[0][0],
+            hess_sat_event[1][1],
+            event_sum,
+            event_sum.abs() / event_scale.max(1e-300),
+        );
+        eprintln!(
+            "SATURATED CENS  row at η=988:  h[0,0]={:.6e}  h[1,1]={:.6e}  sum={:.6e}  rel={:.6e}",
+            hess_sat_cens[0][0],
+            hess_sat_cens[1][1],
+            cens_sum,
+            cens_sum.abs() / cens_scale.max(1e-300),
+        );
+        // Force a failure so cargo prints the eprintln above.
+        panic!("DIAGNOSTIC OUTPUT — see eprintln above");
+    }
+
     #[test]
     fn row_primary_closed_form_rejects_nan_signed_margin() {
         let err = row_primary_closed_form(f64::NAN, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1e-6, 1.0)
