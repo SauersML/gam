@@ -1,8 +1,12 @@
 """Tests for :class:`gamfit.torch.DuchonSmoother` and :func:`penalized_ridge_solve`.
 
-Covers both modes of the user-facing 1-D Duchon smoother (automatic + learned,
-with the length-3 ``log_smoothing`` triple-operator parameter) plus a
-``gradcheck`` of the fixed-``λ`` ridge primitive that backs learned mode.
+These tests exercise only the public surface — the smoother's two modes
+(``"auto"``/``"learned"``), the standard ``nn.Module`` contract
+(``parameters()`` flows the right things into the outer optimizer), and the
+forward/predict/score outputs. The internal smoothing parameterisation is
+deliberately not poked at: gamfit may change how many internal smoothing
+strengths the module carries (currently three, possibly different in a
+future version) without breaking any of these tests.
 """
 
 from __future__ import annotations
@@ -92,71 +96,68 @@ def _smooth_problem(n: int = 64, seed: int = 0) -> tuple[torch.Tensor, torch.Ten
     return x, truth + noise
 
 
-def test_duchon_smoother_auto_mode_exposes_no_parameters() -> None:
+def test_auto_mode_exposes_no_trainable_parameters() -> None:
+    """``mode='auto'`` is a black box: the user sees zero ``nn.Parameter``\\s."""
     sm = gt.DuchonSmoother(domain=(0.0, 1.0))
     assert sm.mode == "auto"
     assert list(sm.parameters()) == []
+
+
+def test_auto_mode_fits_a_smooth_signal() -> None:
+    """Auto mode should drive RSS well below the response variance."""
+    sm = gt.DuchonSmoother(domain=(0.0, 1.0))
     x, y = _smooth_problem(seed=10)
     out = sm(x, y)
     rss = float(((out.fitted - y) ** 2).sum())
     naive_rss = float((y ** 2).sum())
-    assert rss < 0.5 * naive_rss, (rss, naive_rss)
+    assert rss < 0.25 * naive_rss, (rss, naive_rss)
 
 
-def test_duchon_smoother_learned_mode_exposes_three_parameters() -> None:
-    """Learned-mode ``log_smoothing`` is a single length-3 parameter (triple operator)."""
-    sm = gt.DuchonSmoother(
-        domain=(0.0, 1.0), mode="learned", init_log_smoothing=(1.0, 0.5, -0.5)
-    )
-    assert sm.mode == "learned"
+def test_learned_mode_exposes_parameters_that_flow_to_optimizer() -> None:
+    """``mode='learned'`` exposes some parameters via the standard nn.Module contract.
+
+    The user only relies on the ``parameters()`` iterator returning trainable
+    tensors — they never enumerate, index, or name those tensors.
+    """
+    sm = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
     params = list(sm.parameters())
-    assert len(params) == 1
-    assert params[0].numel() == 3
-    assert params[0].requires_grad
-    assert params[0].detach().tolist() == [1.0, 0.5, -0.5]
+    assert len(params) >= 1
+    for p in params:
+        assert isinstance(p, torch.nn.Parameter)
+        assert p.requires_grad
+        assert torch.isfinite(p).all()
 
 
-def test_duchon_smoother_learned_mode_carries_per_component_autograd() -> None:
-    """Every entry of ``log_smoothing`` must receive a finite gradient."""
-    torch.manual_seed(0)
+def test_learned_mode_backward_writes_grads_into_every_parameter() -> None:
+    """``backward(score)`` should produce a finite, nonzero grad on every parameter."""
     sm = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
     x, y = _smooth_problem(seed=11)
     out = sm(x, y)
     torch.autograd.backward(out.smoothing_score)
-    assert sm.log_smoothing is not None
-    grad = sm.log_smoothing.grad
-    assert grad is not None
-    assert grad.shape == (3,)
-    assert torch.isfinite(grad).all()
-    # Each operator should influence the score, not just one.
-    assert (grad.abs() > 0).all(), grad.tolist()
+    for p in sm.parameters():
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all()
+        assert float(p.grad.abs().sum()) > 0.0
 
 
-def test_duchon_smoother_learned_mode_drives_log_smoothing_toward_optimum() -> None:
-    """Adam descent on ``-smoothing_score`` should drive each weight toward a better region."""
+def test_learned_mode_outer_adam_improves_score() -> None:
+    """Adam on ``-out.smoothing_score`` should drive the score upward."""
     torch.manual_seed(0)
-    sm = gt.DuchonSmoother(
-        domain=(0.0, 1.0), mode="learned", init_log_smoothing=(8.0, 8.0, 8.0)
-    )
+    sm = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
     x, y = _smooth_problem(seed=11)
-    score_before = float(sm(x, y).smoothing_score.detach())
 
-    opt = torch.optim.Adam(sm.parameters(), lr=0.05)
-    for _ in range(150):
+    score_before = float(sm(x, y).smoothing_score.detach())
+    opt = torch.optim.Adam(sm.parameters(), lr=0.1)
+    for _ in range(200):
         opt.zero_grad()
         out = sm(x, y)
         torch.autograd.backward(-out.smoothing_score)
         opt.step()
-
     score_after = float(sm(x, y).smoothing_score.detach())
-    assert sm.log_smoothing is not None
     assert score_after > score_before, (score_before, score_after)
-    # Heavy oversmoothing should have been backed off in at least one operator.
-    final = sm.log_smoothing.detach().tolist()
-    assert min(final) < 7.0, final
 
 
-def test_duchon_smoother_predict_at_new_locations() -> None:
+def test_predict_at_new_locations() -> None:
     sm = gt.DuchonSmoother(domain=(0.0, 1.0))
     x_train, y_train = _smooth_problem(n=80, seed=13)
     out = sm(x_train, y_train)
@@ -167,7 +168,7 @@ def test_duchon_smoother_predict_at_new_locations() -> None:
     assert err < 0.05, err
 
 
-def test_duchon_smoother_modes_produce_consistent_shapes() -> None:
+def test_modes_produce_consistent_output_shapes() -> None:
     x, y = _smooth_problem(seed=12)
     sm_auto = gt.DuchonSmoother(domain=(0.0, 1.0))
     sm_learn = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
@@ -177,52 +178,41 @@ def test_duchon_smoother_modes_produce_consistent_shapes() -> None:
     assert out_auto.fitted.shape == out_learn.fitted.shape == y.shape
 
 
-def test_duchon_smoother_explicit_centers() -> None:
+def test_explicit_centers() -> None:
     centers = torch.tensor([0.0, 0.25, 0.4, 0.55, 0.75, 1.0], dtype=torch.float64)
     sm = gt.DuchonSmoother(domain=(0.0, 1.0), centers=centers)
-    assert sm.get_buffer("centers").shape == (6,)
     x, y = _smooth_problem(seed=14)
     out = sm(x, y)
-    # Basis width = n_centers + 2 polynomial nulls (1, t).
-    assert out.coefficients.shape[-1] == 8 if out.coefficients.dim() > 1 else True
-    assert out.coefficients.shape[0] == 8
+    assert out.fitted.shape == y.shape
+    assert math.isfinite(float(out.smoothing_score.detach()))
 
 
-def test_duchon_smoother_invalid_domain_rejected() -> None:
+def test_invalid_domain_rejected() -> None:
     with pytest.raises(ValueError, match="lo < hi"):
         gt.DuchonSmoother(domain=(1.0, 0.0))
 
 
-def test_duchon_smoother_invalid_init_length_rejected() -> None:
-    with pytest.raises(ValueError, match="3 entries"):
-        gt.DuchonSmoother(
-            domain=(0.0, 1.0), mode="learned", init_log_smoothing=(0.0, 0.0)
-        )
-
-
-def test_duchon_smoother_invalid_mode_rejected() -> None:
+def test_invalid_mode_rejected() -> None:
     with pytest.raises(ValueError, match="mode"):
         gt.DuchonSmoother(domain=(0.0, 1.0), mode="bogus")
 
 
-def test_duchon_smoother_per_operator_effect_on_fit() -> None:
-    """Increasing the curvature weight alone should produce a stiffer fit."""
-    x, y = _smooth_problem(n=80, seed=15)
-    sm_soft = gt.DuchonSmoother(
-        domain=(0.0, 1.0), mode="learned",
-        init_log_smoothing=(-4.0, -4.0, -4.0),
-    )
-    sm_stiff = gt.DuchonSmoother(
-        domain=(0.0, 1.0), mode="learned",
-        init_log_smoothing=(6.0, -4.0, -4.0),  # curvature dialled way up only
-    )
-    out_soft = sm_soft(x, y)
-    out_stiff = sm_stiff(x, y)
-    # Stiffer fit should be smoother — second-difference of the fitted values
-    # is smaller in absolute sum.
-    def total_variation(v: torch.Tensor) -> float:
-        return float(torch.abs(v[2:] - 2 * v[1:-1] + v[:-2]).sum())
+def test_learned_mode_state_dict_round_trips_through_save_load() -> None:
+    """A learned smoother's state must survive ``state_dict`` -> ``load_state_dict``."""
+    sm_src = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
+    x, y = _smooth_problem(seed=20)
+    # Drive the smoother away from its init so the state is non-trivial.
+    opt = torch.optim.Adam(sm_src.parameters(), lr=0.1)
+    for _ in range(20):
+        opt.zero_grad()
+        torch.autograd.backward(-sm_src(x, y).smoothing_score)
+        opt.step()
 
-    tv_soft = total_variation(out_soft.fitted.detach())
-    tv_stiff = total_variation(out_stiff.fitted.detach())
-    assert tv_stiff < tv_soft, (tv_soft, tv_stiff)
+    sm_dst = gt.DuchonSmoother(domain=(0.0, 1.0), mode="learned")
+    sm_dst.load_state_dict(sm_src.state_dict())
+    out_src = sm_src(x, y)
+    out_dst = sm_dst(x, y)
+    np.testing.assert_allclose(
+        out_src.fitted.detach().numpy(), out_dst.fitted.detach().numpy(),
+        rtol=0, atol=1e-12,
+    )
