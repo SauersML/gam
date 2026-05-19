@@ -584,6 +584,7 @@ fn gaussian_reml_fit<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = 0.0,
+    grad_edf = 0.0,
     forward_state = None,
     weights = None,
     init_lambda = None,
@@ -599,6 +600,7 @@ fn gaussian_reml_fit_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: f64,
+    grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
@@ -629,6 +631,7 @@ fn gaussian_reml_fit_backward<'py>(
             grad_coefficients.as_ref().map(|g| g.as_array()),
             grad_fitted.as_ref().map(|g| g.as_array()),
             grad_reml_score,
+            grad_edf,
         )
     } else {
         gaussian_reml_multi_closed_form_backward(
@@ -641,6 +644,7 @@ fn gaussian_reml_fit_backward<'py>(
             grad_coefficients.as_ref().map(|g| g.as_array()),
             grad_fitted.as_ref().map(|g| g.as_array()),
             grad_reml_score,
+            grad_edf,
         )
     }
     .map_err(|err| py_value_error(err.to_string()))?;
@@ -803,6 +807,7 @@ fn set_batched_gaussian_reml_dict_items<'py>(
     grad_coefficients = None,
     grad_fitted = None,
     grad_reml_score = None,
+    grad_edf = None,
     forward_state = None,
     weights = None,
     init_lambda = None,
@@ -819,6 +824,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
     grad_coefficients: Option<PyReadonlyArray3<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
     grad_reml_score: Option<PyReadonlyArray1<'py, f64>>,
+    grad_edf: Option<PyReadonlyArray1<'py, f64>>,
     forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     init_lambda: Option<f64>,
@@ -851,6 +857,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
         grad_reml_score.as_ref().map(|g| g.as_array()),
+        grad_edf.as_ref().map(|g| g.as_array()),
         forward_fits.as_deref(),
     )
     .map_err(py_value_error)?;
@@ -1891,6 +1898,7 @@ fn gaussian_reml_fit_batched_backward_impl(
         grad_coefficients,
         grad_fitted,
         grad_reml_score,
+        grad_edf,
     )?;
     if let Some(fits) = forward_fits {
         if fits.len() != batch {
@@ -1966,6 +1974,7 @@ fn gaussian_reml_fit_batched_backward_impl(
                 let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
                 let upstream_lambda = grad_lambda.as_ref().map_or(0.0, |g| g[b]);
                 let upstream_reml_score = grad_reml_score.as_ref().map_or(0.0, |g| g[b]);
+                let upstream_edf = grad_edf.as_ref().map_or(0.0, |g| g[b]);
                 let upstream_coefficients =
                     grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
                 let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
@@ -1981,6 +1990,7 @@ fn gaussian_reml_fit_batched_backward_impl(
                     upstream_coefficients,
                     upstream_fitted,
                     upstream_reml_score,
+                    upstream_edf,
                 );
                 match backward_result {
                     Ok(backward) => Ok((b, Some(backward))),
@@ -2110,6 +2120,7 @@ fn validate_batched_reml_upstreams(
     grad_coefficients: Option<ArrayView3<'_, f64>>,
     grad_fitted: Option<ArrayView2<'_, f64>>,
     grad_reml_score: Option<ArrayView1<'_, f64>>,
+    grad_edf: Option<ArrayView1<'_, f64>>,
 ) -> Result<(), String> {
     if let Some(grad_lambda) = grad_lambda {
         if grad_lambda.len() != batch {
@@ -2131,6 +2142,17 @@ fn validate_batched_reml_upstreams(
         }
         if grad_reml_score.iter().any(|value| !value.is_finite()) {
             return Err("grad_reml_score must contain only finite values".to_string());
+        }
+    }
+    if let Some(grad_edf) = grad_edf {
+        if grad_edf.len() != batch {
+            return Err(format!(
+                "grad_edf length mismatch: expected {batch}, got {}",
+                grad_edf.len()
+            ));
+        }
+        if grad_edf.iter().any(|value| !value.is_finite()) {
+            return Err("grad_edf must contain only finite values".to_string());
         }
     }
     if let Some(grad_coefficients) = grad_coefficients {
