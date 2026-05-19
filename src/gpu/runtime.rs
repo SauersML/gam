@@ -288,6 +288,14 @@ pub fn gpu_available() -> bool {
     GpuRuntime::global().is_available()
 }
 
+/// Force the one-shot GPU probe to run *now* rather than lazily on first
+/// dispatch. Call this once at process start so the `[GPU] CUDA acceleration
+/// enabled` (or `disabled`) banner — and the calibration log lines — land at
+/// the top of the run, not buried mid-fit. Idempotent.
+pub fn warm() {
+    let _ = GpuRuntime::global();
+}
+
 /// Convenience: the selected device, if any.
 #[inline]
 pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {

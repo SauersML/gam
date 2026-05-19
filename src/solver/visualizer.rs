@@ -62,6 +62,13 @@ pub fn init_logging() {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(LevelFilter::Info);
     }
+    // Probe + calibrate GPU once, up front. Without this the [GPU] banner
+    // wouldn't surface until the first dispatch site lazily woke the
+    // runtime — typically deep inside a fit, where it scrolls past
+    // unnoticed. Eager warm pays the ~hundreds-of-ms calibration once and
+    // makes the runtime's "are GPUs being used?" answer visible at the
+    // top of the log.
+    crate::gpu::warm();
 }
 
 fn install_multiprogress(mp: Option<MultiProgress>) {
