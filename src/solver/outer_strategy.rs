@@ -3712,6 +3712,13 @@ struct OuterConfig {
     /// and the best on-disk rho is prepended as a seed at the start of each
     /// plan attempt. Defaulted off so test-only paths skip filesystem I/O.
     cache_session: Option<Arc<CacheSession>>,
+    /// Optional mirror cache sessions. On successful finalize the encoded
+    /// payload is also written to each of these sessions (different keys,
+    /// shared store). Used for hierarchical broadcast: the converged ρ is
+    /// finalized to the exact-key (primary) AND the data-independent
+    /// seed-prefix key so the next fit with related structure can
+    /// warm-start from this one.
+    cache_mirror_sessions: Vec<Arc<CacheSession>>,
 }
 
 impl Default for OuterConfig {
@@ -3735,6 +3742,7 @@ impl Default for OuterConfig {
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         }
     }
 }
@@ -3776,6 +3784,7 @@ pub struct OuterProblem {
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
+    cache_mirror_sessions: Vec<Arc<CacheSession>>,
 }
 
 impl OuterProblem {
@@ -3806,6 +3815,7 @@ impl OuterProblem {
             bfgs_step_cap: None,
             bfgs_step_cap_psi: None,
             cache_session: None,
+            cache_mirror_sessions: Vec::new(),
         }
     }
 
@@ -3975,6 +3985,17 @@ impl OuterProblem {
         self
     }
 
+    /// Attach mirror cache sessions that receive a broadcast copy of
+    /// the final-result finalize write. See
+    /// [`OuterConfig::cache_mirror_sessions`].
+    pub fn with_cache_mirror_sessions(
+        mut self,
+        sessions: Vec<Arc<CacheSession>>,
+    ) -> Self {
+        self.cache_mirror_sessions = sessions;
+        self
+    }
+
     /// Override the fallback policy. Default is [`FallbackPolicy::Automatic`].
     ///
     /// Set [`FallbackPolicy::Disabled`] when the caller requires the primary
@@ -4023,6 +4044,7 @@ impl OuterProblem {
             bfgs_step_cap: self.bfgs_step_cap,
             bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
+            cache_mirror_sessions: self.cache_mirror_sessions.clone(),
         }
     }
 
@@ -4228,6 +4250,27 @@ impl OuterProblem {
                     result.iterations,
                     had_hit,
                 );
+            }
+            // Broadcast finalize to mirror keys. The seed-prefix mirror
+            // exists so future fits with related-but-not-identical
+            // structure can warm-start from this run via the dispatcher's
+            // prefix lookup.
+            for mirror in &config.cache_mirror_sessions {
+                let mirror_saved = mirror.finalize(
+                    &bytes,
+                    Some(result.final_value),
+                    Some(result.iterations as u64),
+                );
+                if mirror_saved {
+                    let mirror_hex = mirror.key().to_hex();
+                    log::info!(
+                        "[CACHE] save key={}.. context={} mirror final_obj={:.6e} iter={}",
+                        &mirror_hex[..8.min(mirror_hex.len())],
+                        context,
+                        result.final_value,
+                        result.iterations,
+                    );
+                }
             }
         }
         result
