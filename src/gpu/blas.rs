@@ -1090,8 +1090,8 @@ impl CublasRuntime {
 
         let a_host = to_col_major(a);
         let b_host = to_col_major(b);
-        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(&a_host).ok()?;
-        let b_dev: CudaSlice<f64> = self.stream.memcpy_stod(&b_host).ok()?;
+        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&a_host).ok()?;
+        let b_dev: CudaSlice<f64> = self.stream.clone_htod(&b_host).ok()?;
         let mut c_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(m.checked_mul(n)?).ok()?;
 
         let cfg = GemmConfig::<f64> {
@@ -1109,7 +1109,7 @@ impl CublasRuntime {
         // SAFETY: cfg shape and leading dims match the column-major buffers
         // we just uploaded; the slices live until after the dtov below.
         unsafe { self.blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
-        let c_host: Vec<f64> = self.stream.memcpy_dtov(&c_dev).ok()?;
+        let c_host: Vec<f64> = self.stream.clone_dtoh(&c_dev).ok()?;
         Some(from_col_major(&c_host, m, n))
     }
 
@@ -1125,8 +1125,8 @@ impl CublasRuntime {
 
         let a_host = to_col_major(a);
         let x_host: Vec<f64> = v.iter().copied().collect();
-        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(&a_host).ok()?;
-        let x_dev: CudaSlice<f64> = self.stream.memcpy_stod(&x_host).ok()?;
+        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&a_host).ok()?;
+        let x_dev: CudaSlice<f64> = self.stream.clone_htod(&x_host).ok()?;
         let mut y_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(out_len).ok()?;
 
         let cfg = GemvConfig::<f64> {
@@ -1142,7 +1142,7 @@ impl CublasRuntime {
         // SAFETY: rows/cols come from `a.dim()`, lda = rows matches the
         // column-major upload, increments are 1 for contiguous host vectors.
         unsafe { self.blas.gemv(cfg, &a_dev, &x_dev, &mut y_dev) }.ok()?;
-        let y_host: Vec<f64> = self.stream.memcpy_dtov(&y_dev).ok()?;
+        let y_host: Vec<f64> = self.stream.clone_dtoh(&y_dev).ok()?;
         Some(Array1::from_vec(y_host))
     }
 
@@ -1163,9 +1163,9 @@ impl CublasRuntime {
         let x_host = to_col_major(x);
         let y_host = to_col_major(y);
         let w_host: Vec<f64> = w.iter().copied().collect();
-        let x_dev: CudaSlice<f64> = self.stream.memcpy_stod(&x_host).ok()?;
-        let y_dev: CudaSlice<f64> = self.stream.memcpy_stod(&y_host).ok()?;
-        let w_dev: CudaSlice<f64> = self.stream.memcpy_stod(&w_host).ok()?;
+        let x_dev: CudaSlice<f64> = self.stream.clone_htod(&x_host).ok()?;
+        let y_dev: CudaSlice<f64> = self.stream.clone_htod(&y_host).ok()?;
+        let w_dev: CudaSlice<f64> = self.stream.clone_htod(&w_host).ok()?;
         let mut wy_dev: CudaSlice<f64> = self
             .stream
             .alloc_zeros::<f64>(rows.checked_mul(y_cols)?)
@@ -1220,7 +1220,7 @@ impl CublasRuntime {
         // SAFETY: shape/leading-dim values match the live device buffers
         // (X is rows×x_cols col-major, wy is rows×y_cols col-major).
         unsafe { self.blas.gemm(cfg, &x_dev, &wy_dev, &mut out_dev) }.ok()?;
-        let out_host: Vec<f64> = self.stream.memcpy_dtov(&out_dev).ok()?;
+        let out_host: Vec<f64> = self.stream.clone_dtoh(&out_dev).ok()?;
         Some(from_col_major(&out_host, x_cols, y_cols))
     }
 
@@ -1236,8 +1236,8 @@ impl CublasRuntime {
 
         let tri_host = to_col_major(triangular);
         let rhs_host = to_col_major(rhs);
-        let tri_dev: CudaSlice<f64> = self.stream.memcpy_stod(&tri_host).ok()?;
-        let mut rhs_dev: CudaSlice<f64> = self.stream.memcpy_stod(&rhs_host).ok()?;
+        let tri_dev: CudaSlice<f64> = self.stream.clone_htod(&tri_host).ok()?;
+        let mut rhs_dev: CudaSlice<f64> = self.stream.clone_htod(&rhs_host).ok()?;
 
         let p_i = to_i32(p)?;
         let rhs_cols_i = to_i32(rhs_cols)?;
@@ -1266,7 +1266,7 @@ impl CublasRuntime {
         if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return None;
         }
-        let out_host: Vec<f64> = self.stream.memcpy_dtov(&rhs_dev).ok()?;
+        let out_host: Vec<f64> = self.stream.clone_dtoh(&rhs_dev).ok()?;
         Some(from_col_major(&out_host, p, rhs_cols))
     }
 
@@ -1406,8 +1406,8 @@ impl CublasRuntime {
     ) -> Option<Array3<f64>> {
         self.bind()?;
         let c_total = batch.checked_mul(c_stride)?;
-        let a_dev: CudaSlice<f64> = self.stream.memcpy_stod(a_host).ok()?;
-        let b_dev: CudaSlice<f64> = self.stream.memcpy_stod(b_host).ok()?;
+        let a_dev: CudaSlice<f64> = self.stream.clone_htod(a_host).ok()?;
+        let b_dev: CudaSlice<f64> = self.stream.clone_htod(b_host).ok()?;
         let mut c_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(c_total).ok()?;
 
         let cfg = StridedBatchedConfig::<f64> {
@@ -1432,7 +1432,7 @@ impl CublasRuntime {
         // column-major host layout we just uploaded; result buffer has
         // batch * c_stride elements.
         unsafe { self.blas.gemm_strided_batched(cfg, &a_dev, &b_dev, &mut c_dev) }.ok()?;
-        let c_host: Vec<f64> = self.stream.memcpy_dtov(&c_dev).ok()?;
+        let c_host: Vec<f64> = self.stream.clone_dtoh(&c_dev).ok()?;
 
         // Unpack column-major slabs back into a row-major Array3.
         let mut out = Array3::<f64>::zeros((batch, m, n));
