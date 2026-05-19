@@ -9065,6 +9065,20 @@ fn joint_objective_floor_reached(
             ))
 }
 
+fn joint_objective_flat_step_tol(objective_tol: f64, step_tol: f64) -> f64 {
+    objective_tol.sqrt().max(step_tol)
+}
+
+fn joint_objective_flat_step_reached(
+    objective_change: f64,
+    accepted_step_inf: f64,
+    objective_tol: f64,
+    step_tol: f64,
+) -> bool {
+    objective_change <= objective_tol
+        && accepted_step_inf <= joint_objective_flat_step_tol(objective_tol, step_tol)
+}
+
 fn joint_trust_region_step_norm(delta: &Array1<f64>) -> f64 {
     delta.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -10936,8 +10950,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
-            let objective_flat_step_tol = objective_tol.sqrt().max(step_tol);
-            if objective_change <= objective_tol && accepted_step_inf <= objective_flat_step_tol {
+            let objective_flat_step_tol = joint_objective_flat_step_tol(objective_tol, step_tol);
+            if joint_objective_flat_step_reached(
+                objective_change,
+                accepted_step_inf,
+                objective_tol,
+                step_tol,
+            ) {
                 log::info!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat step certificate: step_inf={:.3e} <= sqrt(obj_tol)={:.3e}, obj_change={:.3e} <= tol={:.3e}, residual={:.3e}",
                     cycle,
@@ -22409,6 +22428,37 @@ mod tests {
                 objective_tol,
             ),
             "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
+        );
+    }
+
+    #[test]
+    fn joint_objective_flat_step_accepts_rho_only_biobank_tail() {
+        // Tail from the rho-only FLEX marginal-slope startup failure:
+        //
+        //   obj=7.947730e4 Δobj=-1.890e-4 accepted_|δ|∞=2.198e-1
+        //   |β|∞=4.908e2
+        //
+        // Exact outer startup validation only needs the inner mode resolved
+        // to the outer optimizer scale. The objective has already flattened
+        // and the accepted step is below sqrt(obj_tol), so the inner solve
+        // must certify instead of running to the 100-cycle cap and rejecting
+        // every seed before the outer solver starts.
+        let objective = 7.947730e4_f64;
+        let objective_change = 1.890e-4_f64;
+        let accepted_step_inf = 2.198e-1_f64;
+        let beta_inf = 4.908e2_f64;
+        let inner_tol = 1e-5_f64;
+        let objective_tol = inner_tol * (1.0 + objective.abs());
+        let step_tol = inner_tol * (1.0 + beta_inf);
+
+        assert!(
+            joint_objective_flat_step_reached(
+                objective_change,
+                accepted_step_inf,
+                objective_tol,
+                step_tol,
+            ),
+            "rho-only exact outer seed validation should accept the numerically flat inner tail"
         );
     }
 
