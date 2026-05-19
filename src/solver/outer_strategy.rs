@@ -3621,30 +3621,52 @@ fn solution_into_outer_result(
     }
 }
 
-/// Sanity-check an optimizer's "converged" claim against the actual final
-/// gradient.
+/// Effective absolute-gradient floor for outer-solution certification.
 ///
-/// Opt's [`GradientTolerance`] supports a `rel_initial_grad` shape: the
-/// solver terminates when `‖g‖ ≤ τ · ‖g_0‖`. That rule is fine when the
-/// optimizer makes real descent, but on a resumed-from-cache start where
-/// the line search accepts a near-zero step the ratio `‖g‖ / ‖g_0‖` stays
-/// at ≈ 1 — and the relative test fires at iter 1 with a gradient still
-/// far from zero. The optimizer reports "Converged by gradient", but the
+/// Mirrors the `abs` component of [`outer_gradient_tolerance_with_scale`]:
+/// the scalar tolerance, widened to `objective_scale · 1e-9` when the
+/// caller has declared the objective's natural magnitude. The rel-from-
+/// seed (`rel_initial_grad`) and rel-from-cost (`rel_cost`) components
+/// are NOT mirrored here — that's exactly the relative shape we refuse
+/// to trust on the certification side, because the optimizer's first-
+/// iter line search can accept a near-zero step where the ratio
+/// `‖g‖ / ‖g_0‖` stays at ≈ 1 and the relative rule fires without any
+/// real descent. The absolute floor is the one part of opt's threshold
+/// that has a magnitude meaning rather than a "fraction of the seed"
+/// meaning, so it's the safe component to certify against.
+fn outer_gradient_absolute_floor(tolerance: f64, objective_scale: Option<f64>) -> f64 {
+    let mut abs = tolerance;
+    if let Some(scale) = objective_scale {
+        let scaled_floor = scale * 1.0e-9;
+        if scaled_floor > abs {
+            abs = scaled_floor;
+        }
+    }
+    abs
+}
+
+/// Sanity-check a gradient-based optimizer's "converged" claim against
+/// the actual final gradient.
+///
+/// Opt's [`GradientTolerance`] threshold is the maximum of an absolute
+/// component, a `rel_initial_grad · ‖g_0‖` component, and a `rel_cost ·
+/// (1 + |f_0|)` component. The relative-from-seed component is the
+/// trust hazard: on a resumed-from-cache start where the first-iter
+/// line search accepts a near-zero step, `‖g‖ / ‖g_0‖` stays at ≈ 1
+/// and the rule can fire at iter 1 with a gradient still far from
+/// zero — the optimizer reports "Converged by gradient", but the
 /// iterate is not a stationary point.
 ///
-/// This helper applies the strict `‖g‖_∞ ≤ tolerance · (1 + ‖x‖_∞)` rule
-/// the runner uses elsewhere (axis-step-cap stall exit, derivative-free
-/// fallback gates). When the strict rule fails, the iterate is kept as
-/// the best point reached — but the `converged` certification is
-/// downgraded so the cache-save gate (which keys off
+/// This helper enforces only the absolute-with-magnitude-scaling rule:
+/// `‖g‖_∞ ≤ abs_floor · (1 + ‖x‖_∞)`, where `abs_floor` matches opt's
+/// own `abs` component (including the `objective_scale` widening for
+/// biobank-scale Gaussian fits — see
+/// [`outer_gradient_absolute_floor`]). When the strict rule fails,
+/// the iterate is kept as the best point reached, but the `converged`
+/// certification is downgraded so the cache-save gate (which keys off
 /// [`OuterResult::converged`]) does not persist a non-stationary point
-/// for the next run to resume from.
-///
-/// `tolerance` is the outer scalar tolerance ([`OuterConfig::tolerance`])
-/// — the same constant `outer_gradient_tolerance_with_scale` uses as
-/// `abs`, applied without the seed-grad-relative widening so this check
-/// is strictly tighter than what the optimizer accepted.
-fn validate_outer_gradient_convergence(solution: &Solution, tolerance: f64) -> bool {
+/// for future runs to resume from.
+fn validate_outer_gradient_convergence(solution: &Solution, abs_floor: f64) -> bool {
     let Some(gradient) = solution.final_gradient.as_ref() else {
         // No final gradient surfaced (e.g. derivative-free or fixed-point
         // exit). The optimizer's own status governs in that case — this
@@ -3659,7 +3681,7 @@ fn validate_outer_gradient_convergence(solution: &Solution, tolerance: f64) -> b
         .final_point
         .iter()
         .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    g_inf <= tolerance * (1.0 + x_inf)
+    g_inf <= abs_floor * (1.0 + x_inf)
 }
 
 /// Apply [`validate_outer_gradient_convergence`] to a "successful"
@@ -3669,11 +3691,12 @@ fn validate_outer_gradient_convergence(solution: &Solution, tolerance: f64) -> b
 /// as a converged result.
 fn certify_outer_solution(
     solution: Solution,
-    tolerance: f64,
+    config: &OuterConfig,
     context: &str,
     plan_used: OuterPlan,
 ) -> OuterResult {
-    let converged = validate_outer_gradient_convergence(&solution, tolerance);
+    let abs_floor = outer_gradient_absolute_floor(config.tolerance, config.objective_scale);
+    let converged = validate_outer_gradient_convergence(&solution, abs_floor);
     if !converged {
         let g_inf = solution
             .final_gradient
@@ -3685,9 +3708,11 @@ fn certify_outer_solution(
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         log::info!(
-            "[OUTER] {context}: optimizer reported success but gradient |g|_inf={:.3e} > tol*(1+|x|_inf)={:.3e}; downgrading converged flag (point retained for warm-start, not cache-saved)",
+            "[OUTER] {context}: optimizer reported success but gradient |g|_inf={:.3e} > abs_floor*(1+|x|_inf)={:.3e} (tolerance={:.3e}, objective_scale={:?}); downgrading converged flag (point retained for warm-start, not cache-saved)",
             g_inf,
-            tolerance * (1.0 + x_inf),
+            abs_floor * (1.0 + x_inf),
+            config.tolerance,
+            config.objective_scale,
         );
     }
     solution_into_outer_result(solution, converged, plan_used)
@@ -4966,12 +4991,7 @@ fn run_outer_with_plan(
                             .with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(certify_outer_solution(
-                            sol,
-                            config.tolerance,
-                            "ARC",
-                            *the_plan,
-                        )),
+                        Ok(sol) => Ok(certify_outer_solution(sol, &config, "ARC", *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
@@ -5144,12 +5164,7 @@ fn run_outer_with_plan(
                     ),
                 }
                 match outcome {
-                    Ok(sol) => Ok(certify_outer_solution(
-                        sol,
-                        config.tolerance,
-                        "BFGS",
-                        *the_plan,
-                    )),
+                    Ok(sol) => Ok(certify_outer_solution(sol, &config, "BFGS", *the_plan)),
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
