@@ -270,11 +270,14 @@ class _SmootherBase(torch.nn.Module):
     - ``"auto"``: weights are not parameters; on each forward we pick them
       internally (currently by REML profiled over each component using a short
       coordinate refinement) and return the resulting fit.
-    - ``"learned"``: weights are an ``nn.Parameter`` named ``log_smoothing``,
-      so the outer optimizer drives them via the exposed score.
+    - ``"learned"``: weights are held as an internal ``nn.Parameter``, so
+      ``self.parameters()`` exposes them automatically and the outer optimizer
+      drives them via the score. Callers do not name or index the parameter
+      directly; its presence, shape, and parameterisation are implementation
+      details that may change between versions.
     """
 
-    log_smoothing: torch.nn.Parameter | None
+    _log_smoothing: torch.nn.Parameter | None
 
     def __init__(
         self,
@@ -296,10 +299,10 @@ class _SmootherBase(torch.nn.Module):
         self._mode = mode
         init = torch.tensor(init_log_smoothing, dtype=torch.get_default_dtype())
         if mode == "learned":
-            self.log_smoothing = torch.nn.Parameter(init)
+            self._log_smoothing = torch.nn.Parameter(init)
             self.register_buffer("_log_smoothing_auto", torch.empty(0))
         else:
-            self.log_smoothing = None
+            self._log_smoothing = None
             self.register_buffer("_log_smoothing_auto", init.clone())
 
     @property
@@ -381,8 +384,8 @@ class _SmootherBase(torch.nn.Module):
     ) -> PeriodicFitOutput:
         X = self._build_basis(t)
         if self._mode == "learned":
-            assert self.log_smoothing is not None
-            log_weights = self.log_smoothing
+            assert self._log_smoothing is not None
+            log_weights = self._log_smoothing
         else:
             with torch.no_grad():
                 log_weights = self._auto_select(X, y, weights=weights)
