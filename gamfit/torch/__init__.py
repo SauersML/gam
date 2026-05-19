@@ -39,7 +39,9 @@ try:
         smoothness_penalty,
     )
     from ._reml import (
+        FrozenPositionPredictor,
         GaussianRemlOutput,
+        GaussianRemlPositionOutput,
         gaussian_reml_fit,
         gaussian_reml_fit_batched,
         gaussian_reml_fit_positions,
@@ -68,6 +70,8 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
 
 __all__ = [
     "GaussianRemlOutput",
+    "GaussianRemlPositionOutput",
+    "FrozenPositionPredictor",
     "alr",
     "bspline_basis",
     "bspline_basis_derivative",
