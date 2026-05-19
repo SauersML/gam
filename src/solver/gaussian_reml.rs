@@ -1965,6 +1965,11 @@ fn prepare_gaussian_reml(
         }
         let penalty_fingerprint = matrix_fingerprint(penalty);
         if cache.penalty_fingerprint != penalty_fingerprint {
+            eprintln!(
+                "[debug] prepare canonical fingerprint = {:#x}; cache fingerprint = {:#x}",
+                penalty_fingerprint, cache.penalty_fingerprint
+            );
+            eprintln!("[debug] canonical penalty:\n{:?}", penalty);
             return Err(EstimationError::InvalidInput(
                 "Gaussian REML eigen cache penalty mismatch".to_string(),
             ));
