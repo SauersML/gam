@@ -1613,6 +1613,39 @@ mod tests {
     }
 
     #[test]
+    fn open_ended_workflow_renders_step_form_with_objective() {
+        // Open-ended workflow is the pyffi entry-point lane: total is None,
+        // so the dumb renderer must fall through to the `step=N | objective=…`
+        // branch. The Python bindings rely on this — if it accidentally
+        // routed back to the percent-bar branch, every gamfit fit would
+        // display a stuck 0% bar for the entire run.
+        let mut session = VisualizerSession::new(false);
+        session.set_stage("fit", "optimizing");
+        session.start_workflow_open_ended("Fit");
+        {
+            let mut model = lock_model(&session.model);
+            model.current_cost = 12.5;
+            model.current_grad = 1e-3;
+            model.primary_lane.current = 7;
+        }
+        let lines = dumb_render_lines(&lock_model(&session.model).clone());
+        let lane_line = lines
+            .iter()
+            .find(|l| l.contains("Workflow: Fit"))
+            .expect("workflow lane present");
+        assert!(
+            lane_line.contains("step=7"),
+            "expected step= form, got: {lane_line}"
+        );
+        assert!(lane_line.contains("objective=12.5000"), "got: {lane_line}");
+        assert!(lane_line.contains("|grad|=1.000e-3"), "got: {lane_line}");
+        assert!(
+            !lane_line.contains('%'),
+            "open-ended lane must not show percent bar, got: {lane_line}"
+        );
+    }
+
+    #[test]
     fn sparkline_returns_none_for_too_few_or_flat_samples() {
         // < 3 samples: descent shape is undefined, no point rendering.
         assert!(cost_sparkline(&[], 8).is_none());
