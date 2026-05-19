@@ -1132,8 +1132,8 @@ struct BernoulliMarginalSlopeFamily {
     /// Per-fit counter of outer rho-gradient evaluations. Increments
     /// on every call to `batched_outer_gradient_terms`. Drives the
     /// two-phase auto-subsample schedule: while
-    /// `count < BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET` and the caller has
-    /// opted into `auto_outer_subsample`, the family installs a
+    /// `count < BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET` and
+    /// `auto_outer_subsample` is enabled, the family installs a
     /// stratified Horvitz–Thompson mask. Once the budget is
     /// exhausted, every subsequent eval reverts to full data so the
     /// final BFGS iterations satisfy the user's tight `outer_tol`
@@ -14845,9 +14845,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // counter is per-family-instance, so each fresh fit (which
         // constructs a new family) starts at Phase 1.
         //
-        // The mask is auto-derived only when the caller has explicitly
-        // opted in via `options.auto_outer_subsample` AND has not
-        // already supplied a mask of their own. All gating logic lives
+        // The mask is auto-derived only when `options.auto_outer_subsample`
+        // is enabled and the caller has not already supplied a mask of their
+        // own. All gating logic lives
         // in `maybe_install_auto_outer_subsample` so the survival
         // families can reuse the same schedule.
         let stratum_secondary: Vec<u8> = self
