@@ -99,11 +99,19 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub wiggle: Option<LinkWiggleConfig>,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub optimize_inverse_link: bool,
+    /// See [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
+    /// Threaded into the internally constructed `BlockwiseFitOptions` by
+    /// `fit_survival_location_scale_model`.
+    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
 }
 
 pub struct SurvivalTransformationFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalTransformationTermSpec,
+    /// See [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
+    /// Threaded into the internally constructed `BlockwiseFitOptions` by
+    /// `fit_survival_transformation_model`.
+    pub cache_session: Option<std::sync::Arc<crate::cache::Session>>,
 }
 
 #[derive(Clone)]
@@ -838,7 +846,11 @@ fn fit_survival_transformation_model(
 ) -> Result<SurvivalTransformationFitResult, String> {
     use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 
-    let SurvivalTransformationFitRequest { data, spec } = request;
+    let SurvivalTransformationFitRequest {
+        data,
+        spec,
+        cache_session: _cache_session,
+    } = request;
     let mut baseline_cfg = spec.baseline_cfg.clone();
     let covariate_design =
         build_term_collection_design(data, &spec.covariate_spec).map_err(|err| err.to_string())?;
@@ -2733,6 +2745,7 @@ fn materialize_survival<'a>(
                 wiggle: effective_linkwiggle_cfg.clone(),
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
                 optimize_inverse_link,
+                cache_session: None,
             })
         };
 
@@ -3117,6 +3130,7 @@ fn materialize_survival<'a>(
                     weibull_seed,
                     ridge_lambda: config.ridge_lambda,
                 },
+                cache_session: None,
             })
         }
         SurvivalLikelihoodMode::LocationScale => {

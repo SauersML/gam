@@ -249,6 +249,15 @@ struct ValidationPayload {
     supported_by_python: bool,
 }
 
+/// Snapshot of GPU dispatch activity since the process started, or `None`
+/// when no CUDA device was selected (CPU-only host). Useful at the end of
+/// a Python session to verify the GPU actually did work and which kernels
+/// reached the device.
+#[pyfunction]
+fn gpu_activity_summary() -> Option<String> {
+    gam::gpu::gpu_activity_summary()
+}
+
 #[pyfunction]
 fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let info = PyDict::new(py);
@@ -2910,6 +2919,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
+    module.add_function(wrap_pyfunction!(gpu_activity_summary, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
