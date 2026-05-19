@@ -121,26 +121,41 @@ impl DeviceXSession {
         let p_i = to_i32(p)?;
 
         // wy = diag(w) · X — ddgmm with SIDE_LEFT scales rows.
-        // No safe wrapper in cudarc 0.16, so we drop to sys directly.
-        // SAFETY: shapes/strides match the col-major X layout we
-        // uploaded above; n_i, p_i are i32-checked; pointers come from
-        // valid `CudaSlice<f64>`s living for the duration of this call.
-        let ddgmm_status = unsafe {
-            let (x_ptr, _record_x) = inner.x_dev.device_ptr(&stream);
-            let (w_ptr, _record_w) = inner.w_dev.device_ptr(&stream);
-            let (wy_ptr, _record_wy) = inner.wy_dev.device_ptr_mut(&stream);
-            cudarc::cublas::sys::cublasDdgmm(
-                *inner.blas.handle(),
-                cublasSideMode_t::CUBLAS_SIDE_LEFT,
-                n_i,
-                p_i,
-                x_ptr as *const f64,
-                n_i,
-                w_ptr as *const f64,
-                1,
-                wy_ptr as *mut f64,
-                n_i,
-            )
+        // No safe wrapper in cudarc 0.19 for cublasDdgmm, so we drop
+        // through to the sys-level binding (which is still
+        // dynamic-loaded via cudarc — no hand-rolled libloading).
+        // The handle is a Copy type (raw `*mut _`); copying it lets us
+        // release the immutable borrow of `inner.blas` before taking
+        // the mutable borrow on `inner.wy_dev`.
+        let handle = *inner.blas.handle();
+        let ddgmm_status = {
+            let SessionInner {
+                ref x_dev,
+                ref w_dev,
+                ref mut wy_dev,
+                ..
+            } = *inner;
+            // SAFETY: shapes/strides match the col-major X layout we
+            // uploaded above; n_i, p_i are i32-checked; pointers come
+            // from valid `CudaSlice<f64>`s living for the duration of
+            // this call.
+            unsafe {
+                let (x_ptr, _record_x) = x_dev.device_ptr(&stream);
+                let (w_ptr, _record_w) = w_dev.device_ptr(&stream);
+                let (wy_ptr, _record_wy) = wy_dev.device_ptr_mut(&stream);
+                cudarc::cublas::sys::cublasDdgmm(
+                    handle,
+                    cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                    n_i,
+                    p_i,
+                    x_ptr as *const f64,
+                    n_i,
+                    w_ptr as *const f64,
+                    1,
+                    wy_ptr as *mut f64,
+                    n_i,
+                )
+            }
         };
         if ddgmm_status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return None;
@@ -164,24 +179,25 @@ impl DeviceXSession {
         // layout. Gemm<f64>::gemm is unsafe in cudarc because shape
         // mismatches would cause invalid memory access — we've checked
         // all shapes against the resident X.
-        let SessionInner {
-            ref blas,
-            ref x_dev,
-            ref wy_dev,
-            ref mut out_pp_dev,
-            ..
-        } = *inner;
-        let gemm_ok = unsafe { blas.gemm(cfg, x_dev, wy_dev, out_pp_dev) }.is_ok();
+        let gemm_ok = {
+            let SessionInner {
+                ref blas,
+                ref x_dev,
+                ref wy_dev,
+                ref mut out_pp_dev,
+                ..
+            } = *inner;
+            unsafe { blas.gemm(cfg, x_dev, wy_dev, out_pp_dev) }.is_ok()
+        };
         if !gemm_ok {
             return None;
         }
 
-        // Download result.
-        let out_host: Vec<f64> = stream.memcpy_dtov(&inner.out_pp_dev).ok()?;
-        // The async memcpy returned above is queued on `stream`; the
-        // dtov call inserts the necessary stream sync before returning
-        // the host vec (see cudarc::driver::result::memcpy_dtoh_async +
-        // SyncOnDrop). Safe to consume.
+        // Download result. `clone_dtoh` is the post-0.19-deprecation
+        // name for `memcpy_dtov`: allocate a fresh Vec, copy the device
+        // slice into it, return it. The call inserts a stream sync
+        // before returning so the host vec is safe to consume.
+        let out_host: Vec<f64> = stream.clone_dtoh(&inner.out_pp_dev).ok()?;
         Some(from_col_major(&out_host, p, p))
     }
 
@@ -222,18 +238,20 @@ impl DeviceXSession {
         // SAFETY: x_dev is n*p, v_p_dev is p, out_n_dev is n. lda=n,
         // incx=1, incy=1 match the buffer layout. NO_TRANSPOSE consumes
         // X column-major as m×n = n×p.
-        let SessionInner {
-            ref blas,
-            ref x_dev,
-            ref v_p_dev,
-            ref mut out_n_dev,
-            ..
-        } = *inner;
-        let gemv_ok = unsafe { blas.gemv(cfg, x_dev, v_p_dev, out_n_dev) }.is_ok();
+        let gemv_ok = {
+            let SessionInner {
+                ref blas,
+                ref x_dev,
+                ref v_p_dev,
+                ref mut out_n_dev,
+                ..
+            } = *inner;
+            unsafe { blas.gemv(cfg, x_dev, v_p_dev, out_n_dev) }.is_ok()
+        };
         if !gemv_ok {
             return None;
         }
-        let y_host: Vec<f64> = stream.memcpy_dtov(&inner.out_n_dev).ok()?;
+        let y_host: Vec<f64> = stream.clone_dtoh(&inner.out_n_dev).ok()?;
         Some(ndarray::Array1::from_vec(y_host))
     }
 
@@ -381,7 +399,7 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
 
     // Pack X column-major on the host then ship in one memcpy.
     let host_col_major: Vec<f64> = to_col_major(&x.view());
-    let x_dev: CudaSlice<f64> = stream.memcpy_stod(&host_col_major).ok()?;
+    let x_dev: CudaSlice<f64> = stream.clone_htod(&host_col_major).ok()?;
     let wy_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows.checked_mul(cols)?).ok()?;
     let w_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows).ok()?;
     let out_pp_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols.checked_mul(cols)?).ok()?;
