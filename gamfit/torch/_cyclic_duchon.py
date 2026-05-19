@@ -18,6 +18,7 @@ penalty construction.
 
 from __future__ import annotations
 
+import math
 from math import comb, factorial
 from typing import NamedTuple
 
@@ -356,8 +357,13 @@ class _SmootherBase(torch.nn.Module):
                 for delta in grid.tolist():
                     trial = log_weights.clone()
                     trial[j] = log_weights[j] + delta
-                    _, _, score = self._fit_with(X, y, trial, weights=weights)
+                    try:
+                        _, _, score = self._fit_with(X, y, trial, weights=weights)
+                    except RuntimeError:
+                        continue
                     s = float(score.detach().item())
+                    if not math.isfinite(s):
+                        continue
                     if best_score is None or s > best_score:
                         best_score = s
                         best_val = float(trial[j].item())
@@ -483,3 +489,18 @@ class PeriodicSmoother(_SmootherBase):
 
     def _penalty_components(self) -> tuple[torch.Tensor, ...]:
         return (self._S0, self._S1, self._S2)
+
+    def fit(
+        self,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        weights: torch.Tensor | None = None,
+    ) -> PeriodicFitOutput:
+        """Fit the smoother to ``(t, y)`` and return the resulting curve.
+
+        Convenience alias for ``self(t, y, weights=weights)``. Designed for the
+        common happy path: ``PeriodicSmoother(period=...).fit(t, y).fitted``
+        gives a sensible regularized curve with no further configuration.
+        """
+        return self(t, y, weights=weights)
