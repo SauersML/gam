@@ -20,10 +20,10 @@ use ::opt::{
     Arc as ArcOptimizer, ArcError, Bfgs, BfgsError, Bounds, FallbackPolicy as OptFallbackPolicy,
     FirstOrderObjective, FirstOrderSample, FixedPoint, FixedPointError, FixedPointObjective,
     FixedPointSample, FixedPointStatus, GradientTolerance, HessianFallbackPolicy,
-    HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion,
-    MaxIterations, ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus,
-    OptimizerObserver, SecondOrderObjective, SecondOrderSample, Solution, StationarityKind,
-    StepInfo, Tolerance, ZerothOrderObjective,
+    HessianMaterialization, HessianOperator, HessianValue, MatrixFreeTrustRegion, MaxIterations,
+    ObjectiveEvalError, OperatorObjective, OperatorSample, OptimizationStatus, OptimizerObserver,
+    SecondOrderObjective, SecondOrderSample, Solution, StationarityKind, StepInfo, Tolerance,
+    ZerothOrderObjective,
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
@@ -8008,7 +8008,9 @@ mod tests {
         assert_eq!(payload.rho, vec![3.0]);
         // Strictly improving eval must bypass the 2-second rate limit.
         let _v1 = wrapped.eval_cost(&array![0.5]).unwrap();
-        let on_disk = session.try_load().expect("improving eval should checkpoint");
+        let on_disk = session
+            .try_load()
+            .expect("improving eval should checkpoint");
         let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
         assert!((payload.cost - 0.25).abs() < 1e-12);
         assert_eq!(payload.rho, vec![0.5]);
@@ -8038,7 +8040,10 @@ mod tests {
         // Hand-write the cached entry: rho = [2.5], cost = 0.25.
         let payload = encode_iterate(&array![2.5], 0.25, 0).expect("encode");
         session.finalize(&payload, Some(0.25), Some(0));
-        assert!(session.try_load().is_some(), "precondition: cache populated");
+        assert!(
+            session.try_load().is_some(),
+            "precondition: cache populated"
+        );
 
         let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
         // Use the AuxiliaryGradientFree class so a no-gradient problem

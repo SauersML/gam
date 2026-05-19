@@ -250,9 +250,7 @@ fn fingerprint_for_key(key: &str) -> crate::cache::Fingerprint {
 /// Uses a different fingerprint tag than [`fingerprint_for_key`] so the
 /// outer-iterate keyspace is disjoint from the inner beta-record keyspace —
 /// the two layers persist different payload shapes and must not alias.
-pub(crate) fn open_outer_session(
-    key: &str,
-) -> Option<std::sync::Arc<crate::cache::Session>> {
+pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cache::Session>> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", key);

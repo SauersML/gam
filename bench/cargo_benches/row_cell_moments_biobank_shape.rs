@@ -5,8 +5,8 @@
 //! `cargo bench --bench row_cell_moments_biobank_shape`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
+use std::hint::black_box;
 
 fn synthetic_row_cells(row: usize) -> [DenestedCubicCell; 5] {
     let shift = (row as f64).sin() * 0.02;
