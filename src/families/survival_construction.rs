@@ -82,6 +82,44 @@ pub enum SurvivalTimeBasisConfig {
     },
 }
 
+/// Persistable snapshot of the time-basis state used by a survival fit.
+///
+/// Every survival family routes through [`SurvivalTimeBuildOutput`] during
+/// the fit, but the FFI save path needs only the metadata — not the full
+/// design matrices. This struct is the single source of truth that flows
+/// from the workflow-level basis construction, through the family-specific
+/// fit result, into the saved-model payload via
+/// [`crate::inference::model::FittedModelPayload::apply_survival_time_basis`].
+///
+/// Threading this snapshot end-to-end eliminates the prior bug pattern
+/// where each FFI builder had to reconstruct the metadata from
+/// `fit_config` + the formula (silent drift risk; one builder forgetting
+/// to do so caused gamfit 0.1.69's marginal-slope save→load break).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedSurvivalTimeBasis {
+    pub basisname: String,
+    pub degree: Option<usize>,
+    pub knots: Option<Vec<f64>>,
+    pub keep_cols: Option<Vec<usize>>,
+    pub smooth_lambda: Option<f64>,
+    pub anchor: f64,
+}
+
+impl SavedSurvivalTimeBasis {
+    /// Build a snapshot from the realised time-basis state and the entry
+    /// anchor that was used during the fit.
+    pub fn from_build(build: &SurvivalTimeBuildOutput, anchor: f64) -> Self {
+        Self {
+            basisname: build.basisname.clone(),
+            degree: build.degree,
+            knots: build.knots.clone(),
+            keep_cols: build.keep_cols.clone(),
+            smooth_lambda: build.smooth_lambda,
+            anchor,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SurvivalTimeBuildOutput {
     pub x_entry_time: DesignMatrix,

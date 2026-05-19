@@ -434,6 +434,25 @@ impl FittedModelPayload {
         self.training_feature_ranges = Some(feature_ranges);
     }
 
+    /// Write the persistable time-basis snapshot for a survival model.
+    ///
+    /// This is the only path that should populate the `survival_time_*`
+    /// fields used by the loader. Routing every FFI builder through this
+    /// helper guarantees no builder can silently drop a field — the
+    /// gamfit 0.1.69 marginal-slope save→load bug was a builder that
+    /// missed `survival_time_basis`.
+    pub fn apply_survival_time_basis(
+        &mut self,
+        snapshot: &crate::families::survival_construction::SavedSurvivalTimeBasis,
+    ) {
+        self.survival_time_basis = Some(snapshot.basisname.clone());
+        self.survival_time_degree = snapshot.degree;
+        self.survival_time_knots = snapshot.knots.clone();
+        self.survival_time_keep_cols = snapshot.keep_cols.clone();
+        self.survival_time_smooth_lambda = snapshot.smooth_lambda;
+        self.survival_time_anchor = Some(snapshot.anchor);
+    }
+
     fn validate_payload_version(&self) -> Result<(), String> {
         if self.version != MODEL_PAYLOAD_VERSION {
             return Err(format!(
