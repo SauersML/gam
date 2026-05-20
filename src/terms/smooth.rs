@@ -1389,7 +1389,7 @@ fn resolve_group_columns(
     Ok(cols)
 }
 
-fn coefficient_group_leaf_column_components(
+fn coefficient_group_concatenated_column_components(
     name: &str,
     children_by_parent: &BTreeMap<String, Vec<String>>,
     resolved: &BTreeMap<String, BTreeSet<usize>>,
@@ -1404,7 +1404,7 @@ fn coefficient_group_leaf_column_components(
     };
     let mut components = Vec::new();
     for child in children {
-        components.extend(coefficient_group_leaf_column_components(
+        components.extend(coefficient_group_concatenated_column_components(
             child,
             children_by_parent,
             resolved,
@@ -1523,8 +1523,11 @@ fn realize_coefficient_groups(
     for group in groups {
         let cols = resolved.get(&group.name).expect("group was resolved above");
         let mut penalty = Array2::<f64>::zeros((p, p));
-        let penalty_components =
-            coefficient_group_leaf_column_components(&group.name, &children_by_parent, &resolved);
+        let penalty_components = coefficient_group_concatenated_column_components(
+            &group.name,
+            &children_by_parent,
+            &resolved,
+        );
         let active_cols = penalty_components
             .iter()
             .flat_map(|component| component.iter().copied())
@@ -1551,11 +1554,12 @@ fn realize_coefficient_groups(
         //   lambda_g* = (a_g + |g|/2 - 1)
         //               / (b_g + (beta_g - mu_g)' S_g (beta_g - mu_g) / 2).
         //
-        // Interior nodes use the same identity with |g| and the quadratic
-        // replaced by sums over descendant leaf factors.  In the standard
-        // term-collection path there is one rho coordinate per group, so we
-        // materialize that summed descendant penalty into the group's dense
-        // S_g.  Leaves reduce to the ordinary identity penalty.
+        // Interior nodes use the same identity with beta_g formed by
+        // concatenating child beta vectors.  Equivalently, |g| and the
+        // quadratic are sums over the recursively expanded child factors.  In
+        // the standard term-collection path there is one rho coordinate per
+        // group, so we materialize that summed child penalty into the group's
+        // dense S_g.  Leaves reduce to the ordinary identity penalty.
         for component in &penalty_components {
             for &col in component {
                 penalty[[col, col]] += 1.0;
