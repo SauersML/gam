@@ -299,7 +299,7 @@ impl From<Array2<f64>> for PenaltyMatrix {
 }
 
 /// Static specification for one parameter block in a custom family.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ParameterBlockSpec {
     pub name: String,
     pub design: DesignMatrix,
@@ -815,7 +815,12 @@ pub fn fit_custom_family_with_coefficient_groups<
     let realized =
         realize_coefficient_groups_for_custom_family(specs, groups, crate::types::RhoPrior::Flat)
             .map_err(CustomFamilyError::InvalidInput)?;
-    fit_custom_family(family, &realized.specs, options)
+    let RealizedCoefficientGroupSpecs {
+        specs: realized_specs,
+        rho_prior,
+        ..
+    } = realized;
+    fit_custom_family_with_rho_prior(family, &realized_specs, options, rho_prior)
 }
 
 fn custom_family_block_role(
@@ -10685,40 +10690,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
 
-        // Levenberg–Marquardt damping for the joint Newton system.
-        //
-        // The penalized Hessian (H + S_λ) goes near-singular when the
-        // outer ρ probes a region where the survival marginal-slope model
-        // has weakly-identified coefficients. PCG returns a Newton
-        // direction dominated by the small-eigenvalue subspace: |prop|∞
-        // blows up to 10³–10⁶ while the trust region clamps the accepted
-        // step in the same bad direction. Each clamped step shuffles β
-        // along the null mode without reducing the KKT residual — the
-        // exact 100-cycle oscillation pattern that triggers the outer
-        // first-order bridge with a 10⁷-magnitude stale-mode gradient.
-        //
-        // Marquardt damping solves (H + S_λ + μ·I) δ = rhs with μ grown
-        // when the previous cycle was rejected (or the unconstrained
-        // Newton overshot the trust radius by an order of magnitude) and
-        // shrunk when the previous cycle was a clean accept. Added as an
-        // extra `μ·v` term inside the PCG matvec — it does NOT route
-        // through the penalty path, so it touches only the inner Newton
-        // step direction. The penalized objective, the REML/LAML cost
-        // surface, and the envelope-theorem outer gradient are all
-        // evaluated against the original (H + S_λ), so the outer
-        // optimizer's contract is preserved.
-        const MARQUARDT_RIDGE_MIN: f64 = 1.0e-8;
-        const MARQUARDT_RIDGE_MAX: f64 = 1.0e8;
-        const MARQUARDT_RIDGE_GROW: f64 = 10.0;
-        const MARQUARDT_RIDGE_SHRINK: f64 = 0.1;
-        // Trigger threshold: when the unconstrained Newton |prop|∞ is at
-        // least this many times the trust radius, the direction is
-        // dominated by the small-eigenvalue subspace and LM damping is
-        // justified even before the TR explicitly rejects.
-        const MARQUARDT_NEWTON_OVERSHOOT_RATIO: f64 = 100.0;
-        let mut marquardt_ridge: f64 = 0.0;
-        let mut prev_cycle_rejected: bool = false;
-        let mut prev_cycle_newton_overshoot: bool = false;
+        // The exact joint-Hessian route solves the penalized Newton system
+        // directly. Extra damping must be wired through an accepted/rejected
+        // step policy before it belongs here; keep the matvec faithful to the
+        // objective until then.
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
@@ -10927,7 +10902,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
                     match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => {
-                            let lm_ridge = marquardt_ridge;
                             crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     // h_joint * v -> out (faer-backed, no alloc)
@@ -10945,12 +10919,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &mut pen,
                                     );
                                     *out += &*pen;
-                                    // Marquardt damping: adds μ·v to the
-                                    // Newton matvec without touching the
-                                    // penalty or REML/LAML cost surface.
-                                    if lm_ridge > 0.0 {
-                                        out.scaled_add(lm_ridge, v);
-                                    }
                                 },
                                 &rhs,
                                 &preconditioner_diag,
@@ -10970,7 +10938,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                         JointHessianSource::Operator { apply_into, .. } => {
                             let apply_h_into = Arc::clone(apply_into);
-                            let lm_ridge = marquardt_ridge;
                             crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     if let Err(error) = apply_h_into(v, out) {
@@ -10988,9 +10955,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &mut pen,
                                     );
                                     *out += &*pen;
-                                    if lm_ridge > 0.0 {
-                                        out.scaled_add(lm_ridge, v);
-                                    }
                                 },
                                 &rhs,
                                 &preconditioner_diag,
@@ -14032,6 +13996,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: crate::types::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
@@ -14043,6 +14008,7 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
         rho,
         &derivative_blocks,
         warm_start,
+        rho_prior,
         eval_mode,
     )
     .map_err(String::from)
@@ -14055,6 +14021,7 @@ fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync +
     layout: &PenaltyLabelLayout,
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: &crate::types::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     if !layout.has_tied_coordinates() {
@@ -14065,6 +14032,7 @@ fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync +
             &layout.penalty_counts,
             rho,
             warm_start,
+            rho_prior.clone(),
             eval_mode,
         );
     }
@@ -14082,6 +14050,7 @@ fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync +
         &layout.penalty_counts,
         &physical_rho,
         physical_warm_start.as_ref(),
+        crate::types::RhoPrior::Flat,
         eval_mode,
     )?;
     result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
@@ -14092,7 +14061,7 @@ fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync +
         None => crate::solver::outer_strategy::HessianResult::Unavailable,
     };
     result.warm_start.rho = rho.clone();
-    Ok(result)
+    add_labeled_rho_prior_to_outer_eval(result, rho, rho_prior, eval_mode)
 }
 
 #[cfg(test)]
@@ -14112,6 +14081,7 @@ fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static
         penalty_counts,
         rho,
         warm_start,
+        crate::types::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok((
@@ -14156,6 +14126,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: crate::types::RhoPrior,
 ) -> Result<
     (
         crate::solver::outer_strategy::EfsEval,
@@ -14242,6 +14213,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 include_logdet_s,
                 strict_spd,
                 options,
+                rho_prior.clone(),
                 family.pseudo_logdet_mode(),
                 compute_dh.as_ref(),
                 compute_dh_many.as_deref(),
@@ -14516,6 +14488,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 include_logdet_s,
                 strict_spd,
                 options,
+                rho_prior.clone(),
                 family.pseudo_logdet_mode(),
                 &compute_dh,
                 None,
@@ -15688,6 +15661,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             strict_spd,
             eval_mode,
             options,
+            rho_prior.clone(),
             family.pseudo_logdet_mode(),
             &compute_dh,
             compute_dh_many.as_deref(),
@@ -15807,6 +15781,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             strict_spd,
                             EvalMode::ValueOnly,
                             options,
+                            crate::types::RhoPrior::Flat,
                             family.pseudo_logdet_mode(),
                             compute_dh.as_ref(),
                             compute_dh_many.as_deref(),
@@ -15914,6 +15889,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             strict_spd,
             eval_mode,
             options,
+            rho_prior.clone(),
             family.pseudo_logdet_mode(),
             compute_dh.as_ref(),
             compute_dh_many.as_deref(),
@@ -16213,6 +16189,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         strict_spd,
         eval_mode,
         options,
+        rho_prior,
         family.pseudo_logdet_mode(),
         &compute_dh,
         None,
@@ -16259,6 +16236,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             .as_ref()
             .map(|w| &w.inner)
             .or_else(|| warm_start.map(|w| &w.inner)),
+        crate::types::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
@@ -16290,6 +16268,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
             .as_ref()
             .map(|w| &w.inner)
             .or_else(|| warm_start.map(|w| &w.inner)),
+        crate::types::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
@@ -16700,6 +16679,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         include_logdet_s,
         strict_spd,
         options,
+        crate::types::RhoPrior::Flat,
         family.pseudo_logdet_mode(),
         &compute_dh,
         compute_dh_many.as_deref(),
@@ -16752,6 +16732,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
             &penalty_counts,
             rho_current,
             warm_start.map(|w| &w.inner),
+            crate::types::RhoPrior::Flat,
         )
         .map_err(CustomFamilyError::from)?
     } else {
@@ -16799,6 +16780,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
             &penalty_counts,
             rho_current,
             warm_start.map(|w| &w.inner),
+            crate::types::RhoPrior::Flat,
         )
         .map_err(CustomFamilyError::from)?
     } else {
@@ -17711,6 +17693,15 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
+    fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
+}
+
+fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
+) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     let label_layout = penalty_label_layout(specs, penalty_counts)?;
     let rho0 = label_layout.initial_rho.clone();
@@ -17951,6 +17942,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             &label_layout,
             rho,
             warm_ref,
+            &rho_prior,
             if request_hessian {
                 EvalMode::ValueGradientHessian
             } else {
@@ -18026,6 +18018,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &label_layout,
                 rho,
                 warm_ref,
+                &rho_prior,
                 EvalMode::ValueOnly,
             ) {
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
@@ -18088,6 +18081,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &label_layout.penalty_counts,
                 rho,
                 warm_ref,
+                rho_prior.clone(),
             ) {
                 Ok((eval, warm, true)) => {
                     store_persistent_custom_family_warm_start(
@@ -19338,6 +19332,7 @@ mod tests {
             &rho,
             &[vec![]],
             None,
+            crate::types::RhoPrior::Flat,
             EvalMode::ValueGradientHessian,
         )
         .expect("single-block fallback with exact d2H should evaluate");
@@ -19353,6 +19348,7 @@ mod tests {
             &rho,
             &[vec![]],
             None,
+            crate::types::RhoPrior::Flat,
             EvalMode::ValueGradientHessian,
         )
         .expect("single-block fallback with zero d2H should evaluate");

@@ -149,7 +149,7 @@ fn cyclic_coefficient_group_hierarchy_is_rejected() {
 }
 
 #[test]
-fn standard_parent_group_penalty_is_sum_of_descendant_leaf_penalties() {
+fn standard_parent_group_penalty_concatenates_child_penalties() {
     let (x, _, _, _) = synthetic_two_score_data();
     let design = build_term_collection_design(x.view(), &two_linear_term_spec()).expect("design");
     let realized = design
@@ -281,7 +281,7 @@ fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
 }
 
 #[test]
-fn custom_family_parent_group_ties_descendant_leaf_penalties() {
+fn custom_family_parent_group_ties_concatenated_child_penalties() {
     let block_spec = |name: &str| ParameterBlockSpec {
         name: name.to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),

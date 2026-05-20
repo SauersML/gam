@@ -829,8 +829,8 @@ impl RemlConfig {
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
 use thiserror::Error;
 
 /// Small ridge added to the rho-space LAML Hessian before inversion, for
