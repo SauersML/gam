@@ -62,3 +62,17 @@ fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
     assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::LowRank);
     assert_marginal_preservation(q, &slopes, &covariance, 0.9);
 }
+
+#[test]
+fn survival_multi_z_eta_rejects_score_slope_dimension_mismatch() {
+    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let err = survival_marginal_slope_vector_eta(
+        0.2,
+        &[0.4, -0.8],
+        &[0.3],
+        &covariance,
+        1.0,
+    )
+    .expect_err("dimension mismatch must fail");
+    assert!(err.contains("dimension mismatch"));
+}
