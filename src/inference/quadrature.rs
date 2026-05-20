@@ -2684,7 +2684,7 @@ fn integrated_mixture_jet(
         d1 += weight * jet.d1;
         d2 += weight * jet.d2;
         d3 += weight * jet.d3;
-        if integrated_expectation_mode_rank(jet.mode) > integrated_expectation_mode_rank(mode) {
+        if jet.mode.rank() > mode.rank() {
             mode = jet.mode;
         }
         saw_positive_weight = true;
