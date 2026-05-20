@@ -395,7 +395,9 @@ Surv(entry, exit, event) ~ age + timewiggle(internal_knots=8)
 
 Same options as `linkwiggle`. Adds a spline offset to the survival time
 basis so the baseline hazard can deviate from a parametric form. Survival
-formulas only. See [survival.md](survival.md).
+formulas only, and the fit must use a non-linear scalar `baseline_target`
+such as `weibull`, `gompertz`, or `gompertz-makeham`. See
+[survival.md](survival.md).
 
 ## `survmodel` — survival configuration
 

@@ -22,7 +22,7 @@ use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys::CUdevice_attribute_enum;
@@ -33,6 +33,23 @@ use super::calibration::{DeviceCalibration, measure_device};
 use super::device::GpuDeviceInfo;
 use super::diagnostics;
 use super::policy::DispatchPolicy;
+
+static PROCESS_GPU_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Disable CUDA probing and dispatch for the current process.
+///
+/// This is intentionally process-local API rather than an environment flag.
+/// Embedders such as the Python extension do not own process teardown, so they
+/// cannot use the CLI's `_exit` path that skips CUDA shared-library
+/// destructors. They call this before any GPU warm-up occurs.
+pub fn disable_for_process() {
+    PROCESS_GPU_ENABLED.store(false, Ordering::SeqCst);
+}
+
+#[inline]
+fn process_gpu_enabled() -> bool {
+    PROCESS_GPU_ENABLED.load(Ordering::SeqCst)
+}
 
 /// Pre-flight: can libcuda be dlopen'd at all?
 ///
@@ -305,6 +322,18 @@ impl GpuRuntime {
     }
 
     fn probe() -> Self {
+        if !process_gpu_enabled() {
+            return Self {
+                selected_device: None,
+                devices: Vec::new(),
+                policy: DispatchPolicy::for_device(None),
+                cpu_reason: Some(
+                    "CUDA disabled by the embedding process before runtime initialization"
+                        .to_string(),
+                ),
+                dispatch_cursor: AtomicUsize::new(0),
+            };
+        }
         let probe_result = match panic::catch_unwind(probe_cuda_devices) {
             Ok(result) => result,
             Err(payload) => Err(GpuProbeError::DriverLibraryMissing(format!(
@@ -532,6 +561,9 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
 fn contexts() -> &'static [Arc<CudaContext>] {
     static CONTEXTS: OnceLock<Vec<Arc<CudaContext>>> = OnceLock::new();
     CONTEXTS.get_or_init(|| {
+        if !process_gpu_enabled() {
+            return Vec::new();
+        }
         // Guard against cudarc's panic-on-missing-libcuda: never call
         // `CudaContext::device_count()` unless we've verified libcuda is
         // dlopen'able. CPU-only hosts return an empty Vec here, and every
