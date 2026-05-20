@@ -1104,9 +1104,9 @@ fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMeta
 }
 
 fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<(), BasisError> {
-    if !shape.is_finite() || shape <= 0.0 {
+    if !shape.is_finite() || shape < 0.0 {
         return Err(BasisError::InvalidInput(format!(
-            "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
+            "Gamma precision hyperprior for penalty block '{label}' requires shape >= 0, got {shape}"
         )));
     }
     if !rate.is_finite() || rate < 0.0 {
@@ -1127,9 +1127,12 @@ where
     let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(design.penaltyinfo.len());
     for info in &design.penaltyinfo {
         let metadata = penalty_block_metadata(info);
-        let (shape, rate) = callback(&metadata).unwrap_or((1.0, 0.0));
-        validate_gamma_precision_prior(&metadata.label, shape, rate)?;
-        priors.push(crate::types::RhoPrior::GammaPrecision { shape, rate });
+        if let Some((shape, rate)) = callback(&metadata) {
+            validate_gamma_precision_prior(&metadata.label, shape, rate)?;
+            priors.push(crate::types::RhoPrior::GammaPrecision { shape, rate });
+        } else {
+            priors.push(crate::types::RhoPrior::Flat);
+        }
     }
     Ok(crate::types::RhoPrior::Independent(priors))
 }
