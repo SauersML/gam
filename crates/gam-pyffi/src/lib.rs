@@ -5375,7 +5375,7 @@ fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
             | ParsedTerm::SurvivalConfig { .. } => {}
-            | ParsedTerm::LogSlopeSurface { z_column, terms } => {
+            ParsedTerm::LogSlopeSurface { z_column, terms } => {
                 required.insert(z_column.clone());
                 add_formula_term_columns(required, terms);
             }
