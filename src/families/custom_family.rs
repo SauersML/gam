@@ -9860,6 +9860,36 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
         // 1 compact line per remaining cycle (~210 lines), down from ~800.
         const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
+        // Residual-stall detector for joint Newton. Distinct from the
+        // blockwise loglik-frozen divergence detector lower in the file:
+        // that one requires the log-likelihood to be unchanged for K
+        // cycles AND the per-block Newton step pinned at the cap.
+        //
+        // Biobank-scale survival marginal-slope hits a different pattern —
+        // the joint objective decreases monotonically by O(1) per cycle
+        // (so loglik is NOT frozen), the TR repeatedly clamps proposals
+        // with |prop|∞ >> trust_radius, and the post-step KKT residual
+        // oscillates in a band orders of magnitude above residual_tol
+        // without trending down. Burning the rest of the cycle budget on
+        // this pattern reaches inner_max_cycles "non-converged", which
+        // then drops the outer optimizer into the first-order bridge
+        // fallback with a stale-mode gradient that ‖g‖ ≈ 10⁷ kills BFGS
+        // line search at iter 0.
+        //
+        // Track the best residual seen and the number of cycles since
+        // any meaningful improvement (≥10% drop). Once we've burned at
+        // least RESIDUAL_STALL_MIN_CYCLES with no improvement AND the
+        // TR has been clamping aggressively, exit `converged=false` so
+        // the outer optimizer sees a non-converged signal while we still
+        // have a finite, in-range β to return (instead of running to the
+        // hard ceiling and then handing BFGS a junk gradient).
+        const RESIDUAL_STALL_NO_IMPROVE_CYCLES: usize = 30;
+        const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
+        const RESIDUAL_STALL_IMPROVEMENT_FACTOR: f64 = 0.9;
+        const RESIDUAL_STALL_TR_CLAMP_RATIO: f64 = 10.0;
+        let mut best_residual_seen: f64 = f64::INFINITY;
+        let mut cycles_since_residual_improved: usize = 0;
+        let mut tr_clamped_during_stall: bool = false;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
