@@ -3048,7 +3048,6 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
-    gam::gpu::disable_for_process();
     // Install the same stderr logger used by the CLI so long-running Rust
     // solver phases (including survival marginal-slope joint-Newton cycles)
     // are visible from Python without requiring a separate shell.
