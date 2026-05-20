@@ -5304,7 +5304,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let fit = match fit_model(FitRequest::SurvivalTransformation(
             SurvivalTransformationFitRequest {
                 data: ds.values.view(),
-                spec: gam::solver::workflow::SurvivalTransformationTermSpec {
+                spec: gam::SurvivalTransformationTermSpec {
                     age_entry: age_entry.clone(),
                     age_exit: age_exit.clone(),
                     event_target: event_target.clone(),
