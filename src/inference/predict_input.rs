@@ -16,7 +16,9 @@ use crate::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
     transformation_normal_pit_score,
 };
-use crate::inference::model::{FittedModel, PredictModelClass};
+use crate::inference::model::{
+    FittedModel, PredictModelClass, append_deployment_extension_columns,
+};
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
 use crate::term_builder::resolve_role_col;
@@ -129,15 +131,26 @@ pub fn build_predict_input_for_model(
             } else {
                 fit_saved.beta.clone()
             };
-            if beta.len() != design.design.ncols() {
+            let mean_design = if model.deployment_extensions.is_empty() {
+                design.design.clone()
+            } else {
+                DesignMatrix::from(append_deployment_extension_columns(
+                    model.payload(),
+                    design_input,
+                    col_map,
+                    training_headers,
+                    design.design.to_dense(),
+                )?)
+            };
+            if beta.len() != mean_design.ncols() {
                 return Err(format!(
                     "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
                     beta.len(),
-                    design.design.ncols()
+                    mean_design.ncols()
                 ));
             }
             Ok(PredictInput {
-                design: design.design.clone(),
+                design: mean_design,
                 offset: offset.clone(),
                 design_noise: None,
                 offset_noise: None,

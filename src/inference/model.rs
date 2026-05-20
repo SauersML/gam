@@ -26,7 +26,7 @@ use crate::types::{
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -366,12 +366,107 @@ pub struct SavedDeploymentExtension {
     pub kind: String,
     pub term: String,
     pub level: JsonValue,
+    pub level_bits: u64,
     pub coefficient_index: usize,
     pub coefficient_mean: f64,
+    pub coefficient_variance: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior: Option<JsonValue>,
+}
+
+/// Append deployment-only extension columns to the fitted design coordinate system.
+///
+/// No-refit group extension adds a new coefficient block after the fitted
+/// coefficient vector:
+///
+///   beta_ext = [beta_old, beta_new],    beta_new = mu_new.
+///
+/// For a new random-effect level g, the appended basis is the indicator
+/// e_g(x_i) = 1{x_i == g}.  The old fitted basis X_old is not rebuilt or
+/// reordered, so rows that do not exercise g have
+///
+///   eta_ext = X_old beta_old + 0 * beta_new = eta_old.
+///
+/// Rows at the new level get the exact prior-mean shift e_g beta_new.  This
+/// helper enforces the coordinate identity by requiring extension coefficient
+/// indices to be the consecutive tail columns of the base design.
+pub fn append_deployment_extension_columns(
+    model: &FittedModelPayload,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    base_design: Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if model.deployment_extensions.is_empty() {
+        return Ok(base_design);
+    }
+    if base_design.nrows() != data.nrows() {
+        return Err(format!(
+            "deployment extension design row mismatch: base design has {} rows but data has {}",
+            base_design.nrows(),
+            data.nrows()
+        ));
+    }
+    let spec = model.resolved_termspec.as_ref().ok_or_else(|| {
+        "deployment extension prediction requires saved resolved_termspec; refit".to_string()
+    })?;
+    let n = base_design.nrows();
+    let p_old = base_design.ncols();
+    let mut extensions: Vec<&SavedDeploymentExtension> =
+        model.deployment_extensions.iter().collect();
+    extensions.sort_by_key(|extension| extension.coefficient_index);
+    for (tail_idx, extension) in extensions.iter().enumerate() {
+        let expected = p_old + tail_idx;
+        if extension.coefficient_index != expected {
+            return Err(format!(
+                "deployment extension '{}' has coefficient index {}, expected append-only index {}",
+                extension.name, extension.coefficient_index, expected
+            ));
+        }
+    }
+
+    let mut out = Array2::<f64>::zeros((n, p_old + extensions.len()));
+    out.slice_mut(ndarray::s![.., ..p_old]).assign(&base_design);
+    for (tail_idx, extension) in extensions.into_iter().enumerate() {
+        if extension.kind != "random-effect-level" {
+            return Err(format!(
+                "unsupported deployment extension kind '{}' for '{}'",
+                extension.kind, extension.name
+            ));
+        }
+        let term = spec
+            .random_effect_terms
+            .iter()
+            .find(|term| term.name == extension.term)
+            .ok_or_else(|| {
+                format!(
+                    "deployment extension '{}' references unknown random-effect term '{}'",
+                    extension.name, extension.term
+                )
+            })?;
+        let prediction_col = training_headers
+            .and_then(|headers| headers.get(term.feature_col))
+            .and_then(|name| col_map.get(name))
+            .copied()
+            .unwrap_or(term.feature_col);
+        if prediction_col >= data.ncols() {
+            return Err(format!(
+                "deployment extension '{}' feature column {} out of bounds for {} prediction columns",
+                extension.name,
+                prediction_col,
+                data.ncols()
+            ));
+        }
+        let col = p_old + tail_idx;
+        for row in 0..n {
+            if data[[row, prediction_col]].to_bits() == extension.level_bits {
+                out[[row, col]] = 1.0;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
