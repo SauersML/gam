@@ -3308,6 +3308,53 @@ mod tests {
     }
 
     #[test]
+    fn scalar_rho_optimizer_chooses_lowest_cost_stationary_point() {
+        let cache = GaussianRemlEigenCache {
+            penalty_eigenvalues: array![5.2430192311066924e-05, 81734184.18548436],
+            eigenvectors: Array2::eye(2),
+            coefficient_basis: Array2::eye(2),
+            xtwx_fingerprint: 0,
+            penalty_fingerprint: 0,
+            logdet_xtwx: 0.0,
+            logdet_penalty_positive: 0.0,
+            penalty_rank: 2,
+            nullity: 0,
+        };
+        let prepared = GaussianRemlPrepared {
+            cache: cache.clone(),
+            ywy: array![0.5021347226586624],
+            projected_rhs_squared: array![[0.361060218768292], [0.01014486085547482]],
+            projected_rhs: array![
+                [0.361060218768292_f64.sqrt()],
+                [0.01014486085547482_f64.sqrt()]
+            ],
+            n_observations: 100,
+            n_outputs: 1,
+        };
+
+        let rho = optimize_rho(&prepared, None).expect("allocating rho optimizer");
+        let no_alloc_rho = optimize_rho_no_alloc(
+            &cache,
+            prepared.ywy.view(),
+            prepared.projected_rhs_squared.view(),
+            prepared.n_observations,
+            prepared.n_outputs,
+            None,
+        )
+        .expect("no-alloc rho optimizer");
+
+        assert!(
+            (rho - 4.3251059890).abs() < 1.0e-6,
+            "rho optimizer selected {rho}, expected the lower-cost later stationary point"
+        );
+        assert!(
+            (no_alloc_rho - rho).abs() < 1.0e-8,
+            "no-alloc optimizer selected {no_alloc_rho}, allocating selected {rho}"
+        );
+        assert!(prepared.evaluate(rho).cost < prepared.evaluate(-18.9277503549).cost);
+    }
+
+    #[test]
     fn backward_from_fit_matches_backward_with_refit() {
         // The Task 3 state round-trip in pyffi calls `_from_fit`; that path
         // must be numerically identical to the refitting `_backward` entry

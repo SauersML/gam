@@ -2755,7 +2755,7 @@ mod tests {
     use crate::estimate::EstimationError;
     use crate::linalg::faer_ndarray::FaerEigh;
     use faer::Mat;
-    use ndarray::{Array2, array};
+    use ndarray::{Array1, Array2, array};
 
     /// Build CanonicalPenalty values from full-width roots for tests.
     fn canonical_from_roots(rs_list: &[Array2<f64>], p: usize) -> Vec<CanonicalPenalty> {
