@@ -87,7 +87,7 @@ from gamfit.sklearn import GAMRegressor, GAMClassifier
 # Validate before you fit
 gamfit.validate_formula(train, "y ~ s(x) + group(site)")
 
-# Posterior sampling and predictive bands
+# Posterior sampling and mean bands
 posterior = model.sample(train, seed=42)
 bands = posterior.predict(test, level=0.95)
 
