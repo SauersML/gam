@@ -187,6 +187,11 @@ pub struct CauseSpecificRoystonParmarBlock {
     pub offset_derivative_exit: Array1<f64>,
 }
 
+/// Cause-specific competing-risks survival as a blockwise custom family.
+///
+/// Each cause is represented by one `ParameterBlockState`, so endpoint-specific
+/// coefficients, shared smoothing labels, and user-defined coefficient groups
+/// stay on the existing `CustomFamily` / `BlockwiseFitOptions` joint-fit path.
 #[derive(Debug, Clone)]
 pub struct CauseSpecificRoystonParmarFamily {
     blocks: Vec<CauseSpecificRoystonParmarBlock>,
