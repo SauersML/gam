@@ -59,6 +59,7 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             offset_eta_entry: offset_entry.clone(),
             offset_eta_exit: offset_exit.clone(),
             offset_derivative_exit: offset_derivative.clone(),
+            derivative_floor: 0.0,
         });
         specs.push(ParameterBlockSpec {
             name: format!("cause_{}", cause + 1),
