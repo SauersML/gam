@@ -1656,9 +1656,9 @@ pub trait OuterObjective {
 // `(rho, cost, eval_id)` to disk on each finite evaluation. The on-disk
 // [`crate::cache::Session`] rate-limits writes (≥2 s gap unless this iterate
 // strictly improves on the best-so-far) so a tight inner loop never thrashes
-// the filesystem. A subsequent run that opens a `Session` against the same
-// fingerprint reads the best-so-far iterate back and seeds the optimizer
-// from there — that is the whole resume-after-crash mechanism.
+// the filesystem. The same checkpoint is also broadcast to optional mirror
+// sessions, which lets interrupted exact-key runs seed later related fits via
+// their prefix key instead of waiting for a final converged write.
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct IteratePayload {
@@ -1698,14 +1698,20 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
 struct CheckpointingObjective<'a> {
     inner: &'a mut dyn OuterObjective,
     session: Arc<CacheSession>,
+    mirror_sessions: Vec<Arc<CacheSession>>,
     eval_counter: AtomicU64,
 }
 
 impl<'a> CheckpointingObjective<'a> {
-    fn new(inner: &'a mut dyn OuterObjective, session: Arc<CacheSession>) -> Self {
+    fn new(
+        inner: &'a mut dyn OuterObjective,
+        session: Arc<CacheSession>,
+        mirror_sessions: Vec<Arc<CacheSession>>,
+    ) -> Self {
         Self {
             inner,
             session,
+            mirror_sessions,
             eval_counter: AtomicU64::new(0),
         }
     }
@@ -1717,6 +1723,9 @@ impl<'a> CheckpointingObjective<'a> {
         let i = self.eval_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(bytes) = encode_iterate(rho, cost, i) {
             self.session.checkpoint(&bytes, Some(cost), Some(i));
+            for mirror in &self.mirror_sessions {
+                mirror.checkpoint(&bytes, Some(cost), Some(i));
+            }
         }
     }
 }
@@ -3813,12 +3822,12 @@ struct OuterConfig {
     /// and the best on-disk rho is prepended as a seed at the start of each
     /// plan attempt. Defaulted off so test-only paths skip filesystem I/O.
     cache_session: Option<Arc<CacheSession>>,
-    /// Optional mirror cache sessions. On successful finalize the encoded
-    /// payload is also written to each of these sessions (different keys,
-    /// shared store). Used for hierarchical broadcast: the converged ρ is
-    /// finalized to the exact-key (primary) AND the data-independent
-    /// seed-prefix key so the next fit with related structure can
-    /// warm-start from this one.
+    /// Optional mirror cache sessions. Checkpoints and successful finalize
+    /// writes are also written to each of these sessions (different keys,
+    /// shared store). Used for hierarchical broadcast: the current best ρ is
+    /// written to the exact-key (primary) AND the data-independent
+    /// seed-prefix key so the next fit with related structure can warm-start
+    /// from this one, even after an interrupted run.
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
 }
 
@@ -4327,7 +4336,11 @@ impl OuterProblem {
                 self.n_params,
             );
         }
-        let mut checkpointing = CheckpointingObjective::new(obj, Arc::clone(&session));
+        let mut checkpointing = CheckpointingObjective::new(
+            obj,
+            Arc::clone(&session),
+            config.cache_mirror_sessions.clone(),
+        );
         let result = run_outer(&mut checkpointing, &config, context);
         if let Ok(result) = result.as_ref()
             && result.final_value.is_finite()
