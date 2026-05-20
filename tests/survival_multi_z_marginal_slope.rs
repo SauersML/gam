@@ -1,7 +1,8 @@
 use gam::bernoulli_marginal_slope::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape};
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
-    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_scale,
+    survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
+    survival_marginal_slope_vector_scale,
 };
 use ndarray::array;
 
@@ -75,4 +76,44 @@ fn survival_multi_z_eta_rejects_score_slope_dimension_mismatch() {
     )
     .expect_err("dimension mismatch must fail");
     assert!(err.contains("dimension mismatch"));
+}
+
+#[test]
+fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
+    let q0 = -0.15;
+    let q1 = 0.55;
+    let qd1 = 0.8;
+    let slope = [0.31];
+    let z = [0.45];
+    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let probit_scale = 0.75;
+    let observed = probit_scale * slope[0];
+    let c = (1.0 + observed * observed).sqrt();
+    let eta0 = q0 * c + observed * z[0];
+    let eta1 = q1 * c + observed * z[0];
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+    let expected = 1.2
+        * ((1.0 - 1.0) * -normal_cdf(-eta1).ln() + normal_cdf(-eta0).ln()
+            - log_phi_eta1
+            - (qd1 * c).ln()
+            - log_phi_q1
+            - qd1.ln());
+    let actual = survival_marginal_slope_vector_neglog(
+        q0,
+        q1,
+        qd1,
+        &slope,
+        &z,
+        &covariance,
+        1.2,
+        1.0,
+        1e-6,
+        probit_scale,
+    )
+    .expect("vector neglog");
+    assert!(
+        (actual - expected).abs() <= 1e-14,
+        "actual={actual:.17e} expected={expected:.17e}"
+    );
 }
