@@ -2041,6 +2041,27 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    // Gamma(a, b) precision hyperprior identity.
+    //
+    // For one penalty block, lambda = exp(rho) and
+    // p(lambda) proportional to lambda^(a-1) exp(-b lambda). The
+    // REML/LAML objective is a negative log posterior in rho, so the
+    // hyperprior contributes
+    //
+    //     -log p(exp(rho)) = b exp(rho) - (a - 1) rho + constant.
+    //
+    // The likelihood/penalty part already contributes the usual
+    // nu_p/2 log(lambda) - lambda (beta-mu_p)' S_p (beta-mu_p)/2
+    // terms through the assembled
+    // penalty coordinates. Adding the term below gives the conditional MAP
+    // score
+    //
+    //     d/dlambda: (a - 1 + nu_p/2)/lambda
+    //         - (b + (beta-mu_p)' S_p (beta-mu_p)/2) = 0,
+    //
+    // hence lambda* = (a - 1 + nu_p/2)
+    //     / (b + (beta-mu_p)' S_p (beta-mu_p)/2), reducing to the existing
+    // MacKay/Tipping fixed point when (a, b) = (1, 0).
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
         match &self.rho_prior {
             RhoPrior::Flat => 0.0,
@@ -2059,10 +2080,12 @@ impl<'a> RemlState<'a> {
                         .sum::<f64>()
             }
             RhoPrior::GammaPrecision { shape, rate } => {
-                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                if *shape <= 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
                     return f64::INFINITY;
                 }
-                rho.iter().map(|&r| *rate * r.exp() - *shape * r).sum()
+                rho.iter()
+                    .map(|&r| *rate * r.exp() - (*shape - 1.0) * r)
+                    .sum()
             }
             RhoPrior::Independent(priors) => {
                 if priors.len() != rho.len() {
@@ -2082,14 +2105,14 @@ impl<'a> RemlState<'a> {
                             }
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
-                            if *shape < 0.0
+                            if *shape <= 0.0
                                 || *rate < 0.0
                                 || !shape.is_finite()
                                 || !rate.is_finite()
                             {
                                 f64::INFINITY
                             } else {
-                                *rate * r.exp() - *shape * r
+                                *rate * r.exp() - (*shape - 1.0) * r
                             }
                         }
                         RhoPrior::Independent(_) => f64::INFINITY,
@@ -2110,10 +2133,10 @@ impl<'a> RemlState<'a> {
                 rho.mapv(|r| (r - *mean) * inv_var)
             }
             RhoPrior::GammaPrecision { shape, rate } => {
-                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                if *shape <= 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
                     return Array1::from_elem(rho.len(), f64::NAN);
                 }
-                rho.mapv(|r| *rate * r.exp() - *shape)
+                rho.mapv(|r| *rate * r.exp() - (*shape - 1.0))
             }
             RhoPrior::Independent(priors) => {
                 if priors.len() != rho.len() {
@@ -2131,14 +2154,14 @@ impl<'a> RemlState<'a> {
                             }
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
-                            if *shape < 0.0
+                            if *shape <= 0.0
                                 || *rate < 0.0
                                 || !shape.is_finite()
                                 || !rate.is_finite()
                             {
                                 f64::NAN
                             } else {
-                                *rate * r.exp() - *shape
+                                *rate * r.exp() - (*shape - 1.0)
                             }
                         }
                         RhoPrior::Independent(_) => f64::NAN,
@@ -2164,7 +2187,7 @@ impl<'a> RemlState<'a> {
                 Some(hess)
             }
             RhoPrior::GammaPrecision { shape, rate } => {
-                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                if *shape <= 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
                     return Some(Array2::from_elem((rho.len(), rho.len()), f64::NAN));
                 }
                 let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
@@ -2190,7 +2213,7 @@ impl<'a> RemlState<'a> {
                             }
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
-                            if *shape < 0.0
+                            if *shape <= 0.0
                                 || *rate < 0.0
                                 || !shape.is_finite()
                                 || !rate.is_finite()
