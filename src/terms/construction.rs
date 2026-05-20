@@ -1145,6 +1145,16 @@ pub fn canonicalize_penalty_spec(
                 None,
             )
         }
+        PenaltySpec::DenseWithMean { matrix, prior_mean } => {
+            if matrix.nrows() != p || matrix.ncols() != p {
+                return Err(EstimationError::InvalidInput(format!(
+                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                    matrix.nrows(),
+                    matrix.ncols()
+                )));
+            }
+            (matrix.view(), 0..p, prior_mean, None, None)
+        }
     };
 
     let block_dim = col_range.len();
@@ -2237,15 +2247,20 @@ pub fn stable_reparameterizationwith_invariant(
         );
     }
 
+    let qs_array = mat_to_array(&qs);
     let canonical_transformed: Vec<CanonicalPenalty> = rs_transformed
         .par_iter()
-        .map(|r| CanonicalPenalty::from_dense_root(mat_to_array(r), p))
+        .zip(penalties.par_iter())
+        .map(|(r, cp)| {
+            let mean_transformed = qs_array.t().dot(&cp.full_width_prior_mean());
+            CanonicalPenalty::from_dense_root_with_mean(mat_to_array(r), p, mean_transformed)
+        })
         .collect();
     Ok(ReparamResult {
         s_transformed: mat_to_array(&s_truncated),
         log_det,
         det1: Array1::from(det1vec),
-        qs: mat_to_array(&qs),
+        qs: qs_array,
         canonical_transformed,
         e_transformed: mat_to_array(&e_transformed_mat),
         u_truncated: mat_to_array(&u_truncated_mat),

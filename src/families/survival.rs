@@ -1,5 +1,9 @@
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
+use crate::families::custom_family::{
+    BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
+};
+use crate::matrix::SymmetricMatrix;
 use crate::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
@@ -167,6 +171,185 @@ pub struct CauseSpecificSurvivalExpanded {
     pub offset_eta_entry: Array1<f64>,
     pub offset_eta_exit: Array1<f64>,
     pub offset_derivative_exit: Array1<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CauseSpecificRoystonParmarBlock {
+    pub age_entry: Array1<f64>,
+    pub age_exit: Array1<f64>,
+    pub event_target: Array1<u8>,
+    pub sampleweight: Array1<f64>,
+    pub x_entry: Array2<f64>,
+    pub x_exit: Array2<f64>,
+    pub x_derivative: Array2<f64>,
+    pub offset_eta_entry: Array1<f64>,
+    pub offset_eta_exit: Array1<f64>,
+    pub offset_derivative_exit: Array1<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CauseSpecificRoystonParmarFamily {
+    blocks: Vec<CauseSpecificRoystonParmarBlock>,
+}
+
+impl CauseSpecificRoystonParmarFamily {
+    pub fn new(blocks: Vec<CauseSpecificRoystonParmarBlock>) -> Result<Self, String> {
+        if blocks.is_empty() {
+            return Err("cause-specific survival family requires at least one endpoint".to_string());
+        }
+        for (idx, block) in blocks.iter().enumerate() {
+            validate_cause_specific_block(block)
+                .map_err(|err| format!("cause-specific survival block {}: {err}", idx + 1))?;
+        }
+        Ok(Self { blocks })
+    }
+
+    pub fn cause_count(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Result<(), String> {
+    let n = block.event_target.len();
+    let p = block.x_exit.ncols();
+    if n == 0 || p == 0 {
+        return Err("empty event vector or coefficient block".to_string());
+    }
+    if block.age_entry.len() != n
+        || block.age_exit.len() != n
+        || block.sampleweight.len() != n
+        || block.x_entry.nrows() != n
+        || block.x_exit.nrows() != n
+        || block.x_derivative.nrows() != n
+        || block.x_entry.ncols() != p
+        || block.x_derivative.ncols() != p
+        || block.offset_eta_entry.len() != n
+        || block.offset_eta_exit.len() != n
+        || block.offset_derivative_exit.len() != n
+    {
+        return Err("dimension mismatch".to_string());
+    }
+    if block.age_entry.iter().any(|v| !v.is_finite())
+        || block.age_exit.iter().any(|v| !v.is_finite())
+        || block.sampleweight.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || block.event_target.iter().any(|&v| v > 1)
+        || block.x_entry.iter().any(|v| !v.is_finite())
+        || block.x_exit.iter().any(|v| !v.is_finite())
+        || block.x_derivative.iter().any(|v| !v.is_finite())
+        || block.offset_eta_entry.iter().any(|v| !v.is_finite())
+        || block.offset_eta_exit.iter().any(|v| !v.is_finite())
+        || block.offset_derivative_exit.iter().any(|v| !v.is_finite())
+    {
+        return Err("non-finite input".to_string());
+    }
+    Ok(())
+}
+
+fn evaluate_cause_specific_block(
+    block: &CauseSpecificRoystonParmarBlock,
+    beta: &Array1<f64>,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let n = block.event_target.len();
+    let p = block.x_exit.ncols();
+    if beta.len() != p {
+        return Err(format!(
+            "beta length mismatch: got {}, expected {p}",
+            beta.len()
+        ));
+    }
+    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
+    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
+    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
+    let mut log_likelihood = 0.0;
+    let mut w_exit = Array1::<f64>::zeros(n);
+    let mut w_entry = Array1::<f64>::zeros(n);
+    let mut w_event = Array1::<f64>::zeros(n);
+    let mut w_event_inv_deriv = Array1::<f64>::zeros(n);
+    let mut w_event_outer = Array1::<f64>::zeros(n);
+
+    for i in 0..n {
+        let weight = block.sampleweight[i];
+        if weight <= 0.0 {
+            continue;
+        }
+        if block.age_exit[i] < block.age_entry[i] {
+            return Err(format!("age_exit < age_entry at row {i}"));
+        }
+        let has_entry = block.age_entry[i] > 1e-8;
+        let h_exit = eta_exit[i].exp();
+        let h_entry = if has_entry { eta_entry[i].exp() } else { 0.0 };
+        if !(h_exit.is_finite() && h_entry.is_finite()) {
+            return Err(format!("non-finite cumulative hazard at row {i}"));
+        }
+        log_likelihood -= weight * (h_exit - h_entry);
+        w_exit[i] = weight * h_exit;
+        w_entry[i] = weight * h_entry;
+        if block.event_target[i] > 0 {
+            let deriv = derivative[i];
+            if !(deriv.is_finite() && deriv > 0.0) {
+                return Err(format!(
+                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                ));
+            }
+            log_likelihood += weight * (eta_exit[i] + deriv.ln());
+            w_event[i] = weight;
+            w_event_inv_deriv[i] = weight / deriv;
+            w_event_outer[i] = weight / (deriv * deriv);
+        }
+    }
+
+    let mut nll_gradient = fast_atv(&block.x_exit, &w_exit);
+    nll_gradient -= &fast_atv(&block.x_entry, &w_entry);
+    nll_gradient -= &fast_atv(&block.x_exit, &w_event);
+    nll_gradient -= &fast_atv(&block.x_derivative, &w_event_inv_deriv);
+    let gradient = -nll_gradient;
+
+    let mut hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
+    hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
+    hessian += &fast_xt_diag_x(&block.x_derivative, &w_event_outer);
+    Ok((log_likelihood, gradient, hessian))
+}
+
+impl CustomFamily for CauseSpecificRoystonParmarFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        if block_states.len() != self.blocks.len() {
+            return Err(format!(
+                "cause-specific survival expected {} endpoint blocks, got {}",
+                self.blocks.len(),
+                block_states.len()
+            ));
+        }
+        let mut log_likelihood = 0.0;
+        let mut blockworking_sets = Vec::with_capacity(self.blocks.len());
+        for (block, state) in self.blocks.iter().zip(block_states.iter()) {
+            let (ll, gradient, hessian) = evaluate_cause_specific_block(block, &state.beta)?;
+            log_likelihood += ll;
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        Ok(FamilyEvaluation {
+            log_likelihood,
+            blockworking_sets,
+        })
+    }
+
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+        if block_states.len() != self.blocks.len() {
+            return Err(format!(
+                "cause-specific survival expected {} endpoint blocks, got {}",
+                self.blocks.len(),
+                block_states.len()
+            ));
+        }
+        let mut log_likelihood = 0.0;
+        for (block, state) in self.blocks.iter().zip(block_states.iter()) {
+            let (ll, _, _) = evaluate_cause_specific_block(block, &state.beta)?;
+            log_likelihood += ll;
+        }
+        Ok(log_likelihood)
+    }
 }
 
 pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8, String> {
@@ -351,6 +534,129 @@ pub fn expand_cause_specific_survival_flat_inputs(
         offset_eta_exit: joint_offset_exit,
         offset_derivative_exit: joint_offset_derivative,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct CauseSpecificSurvivalFamily {
+    event_codes: Array1<u8>,
+    weights: Array1<f64>,
+    log_derivative_exit: Array1<f64>,
+    cause_count: usize,
+}
+
+impl CauseSpecificSurvivalFamily {
+    pub fn new(
+        event_codes: Array1<u8>,
+        weights: Array1<f64>,
+        derivative_exit: Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = event_codes.len();
+        if n == 0 {
+            return Err("cause-specific survival family requires at least one row".to_string());
+        }
+        if weights.len() != n || derivative_exit.len() != n {
+            return Err("cause-specific survival family input size mismatch".to_string());
+        }
+        if weights.iter().any(|value| !value.is_finite() || *value < 0.0) {
+            return Err("cause-specific survival weights must be finite and non-negative".to_string());
+        }
+        if derivative_exit
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err(
+                "cause-specific survival derivative offsets must be finite and positive"
+                    .to_string(),
+            );
+        }
+        let cause_count = cause_count_from_event_codes(event_codes.view());
+        Ok(Self {
+            event_codes,
+            weights,
+            log_derivative_exit: derivative_exit.mapv(f64::ln),
+            cause_count,
+        })
+    }
+
+    pub fn cause_count(&self) -> usize {
+        self.cause_count
+    }
+
+    pub fn nrows(&self) -> usize {
+        self.event_codes.len()
+    }
+}
+
+impl crate::custom_family::CustomFamily for CauseSpecificSurvivalFamily {
+    fn evaluate(
+        &self,
+        block_states: &[crate::custom_family::ParameterBlockState],
+    ) -> Result<crate::custom_family::FamilyEvaluation, String> {
+        if block_states.len() != self.cause_count {
+            return Err(format!(
+                "cause-specific survival expected {} endpoint blocks, got {}",
+                self.cause_count,
+                block_states.len()
+            ));
+        }
+        let n = self.nrows();
+        let mut log_likelihood = 0.0;
+        let mut blockworking_sets = Vec::with_capacity(self.cause_count);
+        for (cause, state) in block_states.iter().enumerate() {
+            if state.eta.len() != n {
+                return Err(format!(
+                    "cause-specific survival endpoint {} eta length mismatch: got {}, expected {n}",
+                    cause + 1,
+                    state.eta.len()
+                ));
+            }
+            let cause_code = (cause + 1) as u8;
+            let mut working_weights = Array1::<f64>::zeros(n);
+            let mut working_response = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let w = self.weights[i];
+                if w <= 0.0 {
+                    working_response[i] = state.eta[i];
+                    continue;
+                }
+                let eta = state.eta[i];
+                if !eta.is_finite() {
+                    return Err(format!(
+                        "cause-specific survival endpoint {} row {} has non-finite eta {eta}",
+                        cause + 1,
+                        i
+                    ));
+                }
+                let mu = eta.exp();
+                if !mu.is_finite() {
+                    return Err(format!(
+                        "cause-specific survival endpoint {} row {} exp(eta) overflowed",
+                        cause + 1,
+                        i
+                    ));
+                }
+                let event = f64::from(self.event_codes[i] == cause_code);
+                log_likelihood += w * (event * (eta + self.log_derivative_exit[i]) - mu);
+                working_weights[i] = w * mu;
+                working_response[i] = eta + (event - mu) / mu;
+            }
+            blockworking_sets.push(crate::custom_family::BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            });
+        }
+        Ok(crate::custom_family::FamilyEvaluation {
+            log_likelihood,
+            blockworking_sets,
+        })
+    }
+
+    fn log_likelihood_only(
+        &self,
+        block_states: &[crate::custom_family::ParameterBlockState],
+    ) -> Result<f64, String> {
+        self.evaluate(block_states).map(|evaluation| evaluation.log_likelihood)
+    }
 }
 
 fn compress_positive_collinear_constraints(

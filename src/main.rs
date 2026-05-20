@@ -1290,6 +1290,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             } else {
                 None
             },
+            coefficient_groups: Vec::new(),
+            penalty_block_gamma_priors: Vec::new(),
         })) {
             Ok(FitResult::Standard(result)) => {
                 log::info!(
@@ -4743,7 +4745,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             age_exit: age_exit.clone(),
             event_target: event_target.mapv(f64::from),
             weights: weights.clone(),
-            z: z.clone(),
+            z: z.clone().insert_axis(Axis(1)),
             base_link: survival_marginal_slope_base_link.clone(),
             marginalspec: termspec.clone(),
             marginal_offset: threshold_offset.clone(),

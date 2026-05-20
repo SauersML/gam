@@ -3264,9 +3264,12 @@ fn materialize_survival<'a>(
                     age_exit: age_exit.clone(),
                     event_target: event.clone(),
                     weights: weights.clone(),
-                    z: marginal_z.clone().ok_or_else(|| {
-                        "marginal-slope survival requires z_column in FitConfig".to_string()
-                    })?,
+                    z: marginal_z
+                        .clone()
+                        .ok_or_else(|| {
+                            "marginal-slope survival requires z_column in FitConfig".to_string()
+                        })?
+                        .insert_axis(Axis(1)),
                     base_link: resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?,
                     marginalspec: termspec.clone(),
                     marginal_offset: threshold_offset.clone(),

@@ -80,6 +80,11 @@ pub enum CoefficientPriorMean {
         metadata: Array1<f64>,
         evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
     },
+    KernelBasis {
+        covariates: Array1<f64>,
+        amplitude: f64,
+        kernel: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    },
 }
 
 impl std::fmt::Debug for CoefficientPriorMean {
@@ -94,6 +99,15 @@ impl std::fmt::Debug for CoefficientPriorMean {
             Self::Functional { metadata, .. } => f
                 .debug_struct("Functional")
                 .field("metadata_len", &metadata.len())
+                .finish_non_exhaustive(),
+            Self::KernelBasis {
+                covariates,
+                amplitude,
+                ..
+            } => f
+                .debug_struct("KernelBasis")
+                .field("covariate_len", &covariates.len())
+                .field("amplitude", amplitude)
                 .finish_non_exhaustive(),
         }
     }
@@ -124,6 +138,18 @@ impl CoefficientPriorMean {
         }
     }
 
+    pub fn kernel_basis(
+        covariates: Array1<f64>,
+        amplitude: f64,
+        kernel: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    ) -> Self {
+        Self::KernelBasis {
+            covariates,
+            amplitude,
+            kernel,
+        }
+    }
+
     pub(crate) fn evaluate(
         &self,
         block_dim: usize,
@@ -144,6 +170,20 @@ impl CoefficientPriorMean {
                 metadata,
                 evaluator,
             } => evaluator(metadata),
+            Self::KernelBasis {
+                covariates,
+                amplitude,
+                kernel,
+            } => {
+                if !amplitude.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: coefficient prior mean amplitude must be finite, got {amplitude}"
+                    )));
+                }
+                let mut values = kernel(covariates);
+                values *= *amplitude;
+                values
+            }
         };
         if values.len() != block_dim {
             return Err(EstimationError::InvalidInput(format!(
@@ -181,6 +221,12 @@ pub enum PenaltySpec {
     },
     /// Full dense penalty matrix (`p x p`).
     Dense(Array2<f64>),
+    /// Full dense penalty matrix with a programmatic prior mean in the same
+    /// global coefficient basis.
+    DenseWithMean {
+        matrix: Array2<f64>,
+        prior_mean: CoefficientPriorMean,
+    },
 }
 
 impl std::fmt::Debug for PenaltySpec {
@@ -207,6 +253,14 @@ impl std::fmt::Debug for PenaltySpec {
                 .debug_tuple("Dense")
                 .field(&format_args!("{}×{}", m.nrows(), m.ncols()))
                 .finish(),
+            PenaltySpec::DenseWithMean { matrix, prior_mean } => f
+                .debug_struct("DenseWithMean")
+                .field(
+                    "matrix",
+                    &format_args!("{}×{}", matrix.nrows(), matrix.ncols()),
+                )
+                .field("prior_mean", prior_mean)
+                .finish(),
         }
     }
 }
@@ -221,6 +275,10 @@ impl PenaltySpec {
                 debug_assert_eq!(m.ncols(), p);
                 0..p
             }
+            PenaltySpec::DenseWithMean { matrix, .. } => {
+                debug_assert_eq!(matrix.ncols(), p);
+                0..p
+            }
         }
     }
 
@@ -228,7 +286,7 @@ impl PenaltySpec {
     pub fn op(&self) -> Option<&std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>> {
         match self {
             PenaltySpec::Block { op, .. } => op.as_ref(),
-            PenaltySpec::Dense(_) => None,
+            PenaltySpec::Dense(_) | PenaltySpec::DenseWithMean { .. } => None,
         }
     }
 
@@ -259,6 +317,7 @@ impl PenaltySpec {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             PenaltySpec::Dense(m) => m.clone(),
+            PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
             PenaltySpec::Block {
                 local, col_range, ..
             } => {
@@ -281,6 +340,10 @@ impl PenaltySpec {
             PenaltySpec::Dense(m) => {
                 debug_assert_eq!(m.nrows(), p_total);
                 m.clone()
+            }
+            PenaltySpec::DenseWithMean { matrix, .. } => {
+                debug_assert_eq!(matrix.nrows(), p_total);
+                matrix.clone()
             }
             PenaltySpec::Block {
                 local, col_range, ..
@@ -1932,6 +1995,15 @@ fn validate_penalty_specs(
                         "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
                         m.nrows(),
                         m.ncols()
+                    )));
+                }
+            }
+            PenaltySpec::DenseWithMean { matrix, .. } => {
+                if matrix.nrows() != p || matrix.ncols() != p {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                        matrix.nrows(),
+                        matrix.ncols()
                     )));
                 }
             }

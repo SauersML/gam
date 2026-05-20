@@ -178,6 +178,61 @@ def simplex_exp_map(
     raise ValueError("simplex coordinates must be 'clr' or 'alr'")
 
 
+_SPHERE_ANTIPODAL_TOL = 1e-12
+
+
+def _append_sphere_candidate(
+    candidates: list[torch.Tensor], candidate: torch.Tensor
+) -> None:
+    c = candidate.reshape(-1)
+    norm = torch.linalg.norm(c)
+    if bool((~_tc.isfinite(norm)).any()) or float(norm) <= 0.0:
+        return
+    c = c / norm
+    for existing in candidates:
+        if abs(float(torch.dot(existing, c))) > 1.0 - 1e-10:
+            return
+    candidates.append(c)
+
+
+def _sphere_orthogonal_unit(vector: torch.Tensor) -> torch.Tensor:
+    v = vector.reshape(-1)
+    axis = _tc.zeros_like(v)
+    axis[int(torch.argmin(v.abs()).item())] = 1.0
+    tangent = axis - torch.dot(axis, v) * v
+    norm = torch.linalg.norm(tangent)
+    if float(norm) <= 0.0:
+        raise ValueError("cannot construct a tangent direction for the spherical mean")
+    return tangent / norm
+
+
+def _sphere_frechet_objective(
+    values: torch.Tensor, weights: torch.Tensor, base: torch.Tensor
+) -> torch.Tensor:
+    dots = (values @ base).clamp(-1.0, 1.0)
+    theta = dots.acos()
+    return (weights * theta * theta).sum()
+
+
+def _sphere_mean_candidates(values: torch.Tensor, weights: torch.Tensor) -> list[torch.Tensor]:
+    candidates: list[torch.Tensor] = []
+    extrinsic = (values * weights[:, None]).sum(dim=0)
+    _append_sphere_candidate(candidates, extrinsic)
+
+    moment = (values * weights[:, None]).transpose(0, 1) @ values
+    _, eigvecs = torch.linalg.eigh(moment)
+    for j in range(eigvecs.shape[1]):
+        _append_sphere_candidate(candidates, eigvecs[:, j])
+        _append_sphere_candidate(candidates, -eigvecs[:, j])
+
+    for row in values[: min(values.shape[0], 16)]:
+        _append_sphere_candidate(candidates, row)
+
+    if not candidates:
+        candidates.append(_sphere_orthogonal_unit(values[0]))
+    return candidates
+
+
 def sphere_frechet_mean(
     values: torch.Tensor,
     weights: torch.Tensor | None = None,
@@ -188,57 +243,45 @@ def sphere_frechet_mean(
     """Intrinsic Fréchet/Karcher mean on the unit sphere."""
     y = _normalize_sphere_tensor(values)
     w = _normalized_weights_tensor(y.shape[0], weights, y)
-    mu = (y * w[:, None]).sum(dim=0)
-    norm = torch.linalg.norm(mu)
-    mu = _tc.where(norm <= 1e-14, y[0], mu / norm.clamp_min(1e-300))
-    for _ in range(max_iter):
-        logs = sphere_log_map(y, mu)
-        step = (logs * w[:, None]).sum(dim=0)
-        step_norm = torch.linalg.norm(step)
-        if bool(step_norm < tol):
-            break
-        mu = sphere_exp_map(step.reshape(1, -1), mu)[0]
-    return mu
+    best_mu = None
+    best_obj = float("inf")
+    for candidate in _sphere_mean_candidates(y, w):
+        mu = candidate.clone()
+        try:
+            for _ in range(max_iter):
+                logs = sphere_log_map(y, mu)
+                step = (logs * w[:, None]).sum(dim=0)
+                step_norm = torch.linalg.norm(step)
+                if bool(step_norm < tol):
+                    break
+                mu = sphere_exp_map(step.reshape(1, -1), mu)[0]
+        except ValueError:
+            continue
+        obj = float(_sphere_frechet_objective(y, w, mu))
+        if obj < best_obj:
+            best_obj = obj
+            best_mu = mu
+    if best_mu is None:
+        raise ValueError("spherical Fréchet mean is not identifiable for these points")
+    return best_mu
 
 
 def sphere_log_map(values: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-    """Log map from the unit sphere to the ambient tangent space at ``base``.
-
-    At antipodes (dot ≈ −1) the log is non-unique; pick a deterministic
-    π-length tangent perpendicular to ``base`` so callers (e.g. the Fréchet
-    mean iteration) make progress instead of stalling at zero.
-    """
+    """Log map from the unit sphere to the ambient tangent space at ``base``."""
     y = _normalize_sphere_tensor(values)
     if not isinstance(base, torch.Tensor):
         raise TypeError("base must be a torch.Tensor")
     b = _normalize_sphere_tensor(base.to(device=y.device, dtype=y.dtype).reshape(1, -1))[0]
     dots = (y @ b).clamp(-1.0, 1.0)
     theta = dots.acos()
+    if bool((dots <= -1.0 + _SPHERE_ANTIPODAL_TOL).any()):
+        raise ValueError("spherical log map is undefined at antipodal points")
     tangent = y - dots[:, None] * b.reshape(1, -1)
     sin_theta = theta.sin()
     scale = _tc.ones_like(theta)
-    regular = sin_theta > 1e-12
-    scale = _tc.where(regular, theta / sin_theta.clamp_min(1e-300), scale)
+    mask = sin_theta > 1e-12
+    scale = _tc.where(mask, theta / sin_theta.clamp_min(1e-300), scale)
     out = tangent * scale[:, None]
-
-    # Antipodal substitution: tangent ≈ 0, dot < 0 ⇒ replace with π · ê
-    # where ê ⟂ b is built from the standard basis vector least aligned with b.
-    k = int(torch.argmin(b.abs()).item())
-    e = _tc.zeros_like(b)
-    e[k] = 1.0
-    e = e - torch.dot(e, b) * b
-    n = torch.linalg.norm(e)
-    if float(n) <= 1e-12:
-        e = _tc.zeros_like(b)
-        e[(k + 1) % b.shape[0]] = 1.0
-        e = e - torch.dot(e, b) * b
-        n = torch.linalg.norm(e)
-    e = e / n.clamp_min(1e-300)
-    import math as _math
-    pi_e = _math.pi * e.reshape(1, -1)
-    antipodal = ((~regular) & (dots < 0.0))[:, None]
-    out = _tc.where(antipodal, pi_e.expand_as(out), out)
-
     return _tc.where((theta < 1e-12)[:, None], _tc.zeros_like(out), out)
 
 
