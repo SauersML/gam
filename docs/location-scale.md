@@ -59,7 +59,7 @@ preds = model.predict(test_df, interval=0.95)
 ```
 
 `effective_se` is the delta-method standard error on the linear
-predictor; `mean_lower` / `mean_upper` are the response-scale credible
+predictor; `mean_lower` / `mean_upper` are response-scale pointwise Wald
 bands at the requested `interval`.
 
 For survival location-scale, predictions are a

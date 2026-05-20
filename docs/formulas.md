@@ -127,7 +127,7 @@ second-order difference penalty. Options:
 | `k` (or `basis_dim`) | auto from data | Total basis dimension. |
 | `knots` | auto | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
-| `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
+| `penalty_order` | 2 | Finite-difference order in the spline penalty (1 = first differences, 2 = second differences). |
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 | `bc` | `free` | Apply the same endpoint boundary condition on both ends: `free`, `clamped`, or `anchored`. |

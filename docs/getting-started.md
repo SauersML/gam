@@ -83,7 +83,7 @@ preds = model.predict([{"x": 1.5}, {"x": 2.5}])
 ```
 
 Returns the linear predictor (`eta`) and the response-scale mean (`mean`),
-in the same table format passed in. For credible intervals:
+in the same table format passed in. For pointwise Wald intervals:
 
 ```python
 preds = model.predict([{"x": 1.5}, {"x": 2.5}], interval=0.95)

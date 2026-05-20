@@ -157,8 +157,9 @@ gamfit.fit(
 ![two-surface marginal-slope viz over a joint Duchon smooth](docs/images/marginal_slope_3d.png)
 
 Two predicted-probability surfaces over the same `(pc1, pc2)` plane —
-one at `z = 0`, one at `z = +2`. The vertical gap between them is the
-spatially-varying score effect.
+one at `z = 0`, one at `z = +2`. The vertical gap is the risk difference
+for that score contrast; the modeled score effect is the smooth
+probit-scale slope.
 
 ### Survival with on-demand surfaces
 

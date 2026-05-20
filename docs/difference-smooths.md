@@ -61,8 +61,9 @@ ordered-factor contrasts.
 
 ## Pointwise vs simultaneous bands
 
-`difference_smooth(..., simultaneous=False)` returns pointwise credible
-bands. At each grid value the interval uses the joint coefficient covariance:
+`difference_smooth(..., simultaneous=False)` returns pointwise
+coefficient-covariance bands. At each grid value the interval uses the joint
+coefficient covariance:
 
 ```text
 se(x) = sqrt(diag(X_delta V X_delta^T))

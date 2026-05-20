@@ -8,8 +8,9 @@ versa).
 
 ![two-surface marginal-slope viz over a joint Duchon smooth](images/marginal_slope_3d.png)
 
-The vertical gap between the two surfaces is the score effect, and that
-gap is itself a smooth function of where you stand in covariate space.
+The vertical gap between the two probability surfaces is the risk
+difference for that score contrast. The modeled score effect itself lives
+on the probit/log-slope scale and varies smoothly across covariate space.
 
 Two flavours:
 

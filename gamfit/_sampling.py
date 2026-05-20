@@ -4,7 +4,7 @@ The :class:`PosteriorSamples` object returned by :meth:`gamfit.Model.sample`
 is the user-facing surface for posterior reasoning.  It is intentionally
 numpy-first: the raw `(n_draws, n_coeffs)` matrix is exposed as a numpy
 array and every derived statistic (means, standard deviations, credible
-intervals, posterior predictive draws) is also numpy.  Subscripting,
+intervals, fitted-mean draws) is also numpy.  Subscripting,
 iteration, length, `.save` / `PosteriorSamples.load`, a notebook-friendly
 HTML repr, and trace plots all come along for free.
 
@@ -104,10 +104,10 @@ _NO_MODEL: bytes = b""
 
 @dataclass(frozen=True, eq=False)
 class PosteriorPredictive:
-    """Per-row posterior predictive draws on the link and response scales.
+    """Per-row posterior fitted-mean draws on the link and response scales.
 
     Returned by :meth:`PosteriorSamples.predict_draws`, this container
-    holds the full ``(n_draws, n_rows)`` matrices of predictive draws
+    holds the full ``(n_draws, n_rows)`` matrices of fitted-mean draws
     on both the linear-predictor (``eta``) and response (``mean``)
     scales, along with link/class metadata used to re-apply the inverse
     link on demand.
@@ -166,7 +166,7 @@ class PosteriorPredictive:
 
     @property
     def n_draws(self) -> int:
-        """Number of posterior predictive draws.
+        """Number of posterior fitted-mean draws.
 
         Returns
         -------
@@ -199,7 +199,7 @@ class PosteriorPredictive:
         return int(self.eta.shape[1])
 
     def summary(self, level: float = 0.95) -> dict[str, Any]:
-        """Collapse predictive draws to per-row credible bands.
+        """Collapse fitted-mean draws to per-row credible bands.
 
         Parameters
         ----------
@@ -711,14 +711,14 @@ class PosteriorSamples:
         chunk_size: int | None = 4096,
         level: float = 0.95,
     ) -> dict[str, Any]:
-        """Posterior predictive credible bands on new data.
+        """Posterior credible bands for eta and E[y | x] on new data.
 
         Parameters
         ----------
         new_data : Any
             Tabular new data (DataFrame, dict of columns, or any
             object accepted by the engine's table normaliser) at which
-            to evaluate the predictive distribution.
+            to evaluate the posterior fitted means.
         chunk_size : int or None, optional
             Number of prediction rows processed at once. Default
             ``4096``. Pass ``None`` to disable chunking and form the
@@ -773,7 +773,7 @@ class PosteriorSamples:
         )
 
     def predict_draws(self, new_data: Any) -> PosteriorPredictive:
-        """Full posterior predictive draws on new data.
+        """Full posterior fitted-mean draws on new data.
 
         Parameters
         ----------
@@ -1129,7 +1129,7 @@ def _apply_inverse_link(eta: Any, family_kind: str) -> Any:
     if kind == "log":
         return np.exp(eta_arr)
     raise NotImplementedError(
-        f"posterior predictive on response scale is not yet wired for "
+        f"posterior fitted-mean draws on response scale are not wired for "
         f"family_kind={family_kind!r}; access posterior.predict_draws(...).eta "
         f"for link-scale draws or use model.predict(new_data, interval=...) "
         f"for class-specific bands."
@@ -1143,7 +1143,7 @@ def _posterior_predict_bands(
     level: float,
     chunk_size: int | None,
 ) -> dict[str, Any]:
-    """Per-row posterior predictive credible bands, optionally chunked.
+    """Per-row posterior credible bands for eta and E[y | x], optionally chunked.
 
     Walks ``X[start:stop, :]`` chunks through ``samples @ X_chunk.T`` and
     immediately collapses each ``(n_draws, chunk_rows)`` block to per-row

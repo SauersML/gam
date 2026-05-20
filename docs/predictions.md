@@ -19,7 +19,7 @@ model.predict(
 
 | Kwarg | Default | Meaning |
 | --- | --- | --- |
-| `interval` | `None` | Credible interval level in `(0, 1)`, e.g. `0.95`. Honoured by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian / binomial location-scale; ignored for survival (use `with_uncertainty=`), transformation-normal, and marginal-slope. |
+| `interval` | `None` | Pointwise Wald interval level in `(0, 1)`, e.g. `0.95`. Honoured by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian / binomial location-scale; ignored for survival (use `with_uncertainty=`), transformation-normal, and marginal-slope. |
 | `return_type` | `None` | `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"`, or `None` (infer from input or training kind). |
 | `id_column` | `None` | Name of a column in `data` to preserve in the output. |
 | `with_uncertainty` | `False` | Survival models: delta-method SEs on the survival surface and linear predictor. |
@@ -38,7 +38,7 @@ For the 1-D-array classes (transformation-normal, Bernoulli marginal-slope),
 passing `id_column=` or `return_type=` flips the output back to a
 two-column table — see [data-input.md](data-input.md#numpy-gotcha-transformation-normal-marginal-slope).
 
-## Credible intervals on standard models
+## Wald intervals on standard models
 
 ```python
 preds = model.predict(test_df, interval=0.95)
@@ -46,12 +46,12 @@ preds = model.predict(test_df, interval=0.95)
 ```
 
 These intervals come from the asymptotic frequentist covariance of the
-fitted coefficients propagated through the link function. For full posterior
-credible bands (with smoothing-parameter conditional uncertainty), use
+fitted coefficients propagated through the link function. For posterior
+credible bands conditional on the fitted smoothing parameters, use
 [posterior sampling](posterior-sampling.md).
 
 For a multi-D smooth, calling `predict(interval=0.95)` gives you both the
-fitted mean and a pointwise predictive SE; the SE is largest where the
+fitted mean and a pointwise SE for the fitted mean; the SE is largest where the
 covariates are sparse:
 
 ![data → fitted mean → predictive SE](images/surface_fit_hero.png)
@@ -151,8 +151,9 @@ lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
 For other survival modes (transformation, Weibull, marginal-slope, latent),
-use `Model.sample(...)` + `PosteriorSamples.predict_draws(...)` for
-posterior uncertainty. See [posterior-sampling.md](posterior-sampling.md).
+`Model.sample(...)` returns posterior coefficient draws, but
+`PosteriorSamples.predict_draws(...)` is restricted to standard
+non-link-wiggle GAMs. See [posterior-sampling.md](posterior-sampling.md).
 
 ## Getting the raw design matrix
 

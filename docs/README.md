@@ -94,7 +94,7 @@ gamfit.validate_formula(train, "y ~ s(x) + group(site)")
 # 2. Fit.
 model = gamfit.fit(train, "y ~ s(x) + group(site)")
 
-# 3. Predict with credible intervals.
+# 3. Predict with pointwise Wald intervals.
 test = pd.DataFrame({"x": [1.5, 3.5], "site": ["A", "B"]})
 print(model.predict(test, interval=0.95))
 
@@ -105,7 +105,7 @@ print(model.diagnose(train).metrics)
 # 5. Posterior draws + bands.
 posterior = model.sample(train, seed=42)
 print(posterior)                              # convergence summary
-print(posterior.predict(test, level=0.95))    # posterior predictive bands
+print(posterior.predict(test, level=0.95))    # posterior mean bands
 
 # 6. Persist.
 model.save("model.gam")
