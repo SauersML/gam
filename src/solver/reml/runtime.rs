@@ -3289,7 +3289,8 @@ impl<'a> RemlState<'a> {
     }
 
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
-    /// expansion `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`,
+    /// expansion
+    /// `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k(β_cur-μ_k))`,
     /// surfacing the outcome (Predicted vs Noop) so callers can map directly
     /// onto `WarmStartPredictionSource` without re-deriving noop-ness via an
     /// O(p) array comparison against the cached β.
@@ -3687,7 +3688,7 @@ impl<'a> RemlState<'a> {
         // measured against the OLD predictor.
         //
         // Without this wipe, the IFT predictor would seed PIRLS with
-        // `β_new − H_old^{-1} · (e^{ρ_old_k} S_k · β_new)` — using the
+        // `β_new − H_old^{-1} · (e^{ρ_old_k} S_k · (β_new-μ_k))` — using the
         // new β as a substitute for the old β in a Jacobian
         // calibrated against the old β. That is mathematically wrong
         // and would produce arbitrary predictions, not just degraded
@@ -5630,11 +5631,11 @@ impl<'a> RemlState<'a> {
     /// is justified and L(ρ) < ∞):
     ///
     ///   ∂_{ρ_k} log L(ρ)
-    ///   = -0.5 * exp(ρ_k) * E_{π(β|y,ρ)}[ βᵀ S_k β ].
+    ///   = -0.5 * exp(ρ_k) * E_{π(β|y,ρ)}[ (β-μ_k)ᵀ S_k (β-μ_k) ].
     ///
     /// Laplace bridge to implemented terms:
     /// - If π(β|y,ρ) is approximated locally by N(β̂, H^{-1}), then
-    ///     E[βᵀ S_k β] ≈ β̂ᵀ S_k β̂ + tr(H^{-1} S_k),
+    ///     E[(β-μ_k)ᵀ S_k(β-μ_k)] ≈ (β̂-μ_k)ᵀ S_k(β̂-μ_k) + tr(H^{-1} S_k),
     ///   giving the familiar quadratic + trace structure.
     /// - In this code those appear as:
     ///     0.5 * β̂ᵀ S_k^ρ β̂,
@@ -6274,7 +6275,7 @@ impl<'a> RemlState<'a> {
         // whose ranges don't cover all of `range(S_λ)`. The result is a
         // spurious nonzero outer gradient at large `λ_k` (where the
         // unbalanced trace term dominates the `λ_k tr(S_λ⁺ S_k)` and
-        // `λ_k β'S_k β` terms that should cancel to zero), which makes
+        // `λ_k(β-μ_k)'S_k(β-μ_k)` terms that should cancel to zero), which makes
         // ARC's deterministic-replay detector fire on a flat REML surface
         // and surfaces "SurvivalLocationScaleFamily expects 3 blocks,
         // got 0" panics in the downstream refit path.
@@ -8216,7 +8217,7 @@ mod ift_warm_start_tests {
     }
 
     /// Verify the IFT predictor satisfies the linearized FOC:
-    /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur`.
+    /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · (β_cur-μ_k)`.
     /// Tested in the original-basis path (`frame_was_original = true`).
     #[test]
     fn ift_predictor_satisfies_linearized_foc_original_basis() {
@@ -8276,7 +8277,7 @@ mod ift_warm_start_tests {
             .expect("IFT predictor should accept small Δρ");
 
         // Check the linearized FOC residual:
-        //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur ≈ 0
+        //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · (β_cur-μ_k) ≈ 0
         let dbeta = &predicted.0 - &beta_cur;
         let lhs = h_pen.dot(&dbeta);
         let mut rhs = Array1::<f64>::zeros(p);
@@ -8354,14 +8355,15 @@ mod ift_warm_start_tests {
             }
         }
 
-        // Precompute the per-penalty `S_k · β_cur` blocks the same way
+        // Precompute the per-penalty `S_k · (β_cur-μ_k)` blocks the same way
         // updatewarm_start_from does at cache-write time.
         let lambda_s_beta_blocks: Vec<ndarray::Array1<f64>> = canonical
             .iter()
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                cp.local.dot(&beta_block)
+                let centered = &beta_block - &cp.prior_mean;
+                cp.local.dot(&centered)
             })
             .collect();
 
@@ -8734,7 +8736,7 @@ mod ift_warm_start_tests {
         }
     }
 
-    /// Parallel `S_k · β` mat-vec across penalties (the rayon par_iter
+    /// Parallel `S_k · (β-μ_k)` mat-vec across penalties (the rayon par_iter
     /// pattern used at IFT cache-write time in updatewarm_start_from)
     /// must produce bit-equivalent output to the serial version. The
     /// parallelization is across penalties (each penalty's mat-vec is
@@ -8769,7 +8771,8 @@ mod ift_warm_start_tests {
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                cp.local.dot(&beta_block)
+                let centered = &beta_block - &cp.prior_mean;
+                cp.local.dot(&centered)
             })
             .collect();
         // Parallel (matches the writer at line ~2272).
@@ -8778,7 +8781,8 @@ mod ift_warm_start_tests {
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                cp.local.dot(&beta_block)
+                let centered = &beta_block - &cp.prior_mean;
+                cp.local.dot(&centered)
             })
             .collect();
         assert_eq!(serial.len(), parallel.len());
