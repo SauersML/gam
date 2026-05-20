@@ -47,7 +47,7 @@ use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
     WigglePenaltyConfig,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -659,7 +659,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
     let fitted = if !request.coefficient_groups.is_empty()
         || !request.penalty_block_gamma_priors.is_empty()
     {
-        fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
+        let fitted = fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
             request.data,
             request.y.view(),
             request.weights.view(),
@@ -670,7 +670,13 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.family,
             &request.options,
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        crate::terms::smooth::FittedTermCollectionWithSpec {
+            fit: fitted.fit,
+            design: fitted.design,
+            resolvedspec: request.spec.clone(),
+            adaptive_diagnostics: fitted.adaptive_diagnostics,
+        }
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data,
