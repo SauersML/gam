@@ -412,6 +412,33 @@ pub struct CoefficientGroupSpec {
     pub initial_log_precision: Option<f64>,
 }
 
+impl CoefficientGroupSpec {
+    pub fn new(label: impl Into<String>, coefficients: Vec<CoefficientLabel>) -> Self {
+        Self {
+            label: label.into(),
+            coefficients,
+            parent: None,
+            prior: None,
+            initial_log_precision: None,
+        }
+    }
+
+    pub fn with_parent(mut self, parent: impl Into<String>) -> Self {
+        self.parent = Some(parent.into());
+        self
+    }
+
+    pub fn with_prior(mut self, prior: CoefficientGroupPrior) -> Self {
+        self.prior = Some(prior);
+        self
+    }
+
+    pub fn with_initial_log_precision(mut self, initial_log_precision: f64) -> Self {
+        self.initial_log_precision = Some(initial_log_precision);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RealizedCoefficientGroup {
     pub label: String,
