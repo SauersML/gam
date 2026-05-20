@@ -10287,7 +10287,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .fold(0.0_f64, f64::max);
             let step_tol = inner_tol * (1.0 + beta_inf);
             let objective_tol = inner_tol * (1.0 + old_objective.abs());
-            let residual_tol = objective_tol;
+            // Scale the KKT residual tolerance against the natural magnitude
+            // of ‖Sβ − ∇L‖∞ (i.e. max(‖∇L‖∞, ‖Sβ‖∞)), not the objective. The
+            // gradient and Sβ scale independently of the likelihood — at
+            // biobank scale with |β|∞ ~ 10²–10³ and non-trivial smoothing,
+            // ‖Sβ‖∞ can sit orders of magnitude above |obj| and FP noise
+            // alone keeps the residual above any obj-scaled tol, so KKT is
+            // never certified even when the iterate is the true optimum.
+            let grad_inf = grad_joint
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max);
+            let penalty_inf = penalty_beta
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max);
+            let residual_tol = inner_tol * (1.0 + grad_inf.max(penalty_inf));
             let current_stationarity_residual =
                 exact_newton_joint_stationarity_inf_norm_from_gradient(
                     &grad_joint,
@@ -11012,7 +11027,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .fold(0.0_f64, f64::max);
             let step_tol = inner_tol * (1.0 + beta_inf);
             let objective_tol = inner_tol * (1.0 + lastobjective.abs());
-            let residual_tol = objective_tol;
+            // KKT residual tolerance must scale with the natural magnitude of
+            // ‖Sβ − ∇L‖∞ (i.e. ‖∇L‖∞ ~ ‖Sβ‖∞ near stationarity), not the
+            // objective. At biobank scale with |β|∞ in the 10²–10³ range the
+            // gradient/penalty norms can sit orders of magnitude above |obj|
+            // and FP noise alone keeps the residual above any obj-scaled tol.
+            let grad_inf = gradient
+                .iter()
+                .map(|x: &f64| x.abs())
+                .fold(0.0_f64, f64::max);
+            let residual_tol = inner_tol * (1.0 + grad_inf);
 
             // Per-cycle observability for the convergence test. Surfaces
             // WHICH criterion is binding (proposed step, accepted step,
