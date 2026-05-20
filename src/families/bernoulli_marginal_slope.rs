@@ -27170,9 +27170,13 @@ mod tests {
         assert_eq!(counter(), 15, "final counter should be 15 distinct ρ");
 
         // With auto_outer_subsample = false the guard short-circuits; a
-        // fresh family's counter must remain at 0 across many calls.
+        // fresh family's counter must remain at 0 across many calls. The
+        // `BlockwiseFitOptions` default is `auto_outer_subsample = true`
+        // (biobank-scale marginal-slope fits opt in automatically), so the
+        // disable half of the test must request the off state explicitly.
         let family_off = make_block_psi_test_family(n);
-        let opts_off = BlockwiseFitOptions::default();
+        let mut opts_off = BlockwiseFitOptions::default();
+        opts_off.auto_outer_subsample = false;
         for step in 0..5 {
             let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
             family_off
