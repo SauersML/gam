@@ -8554,7 +8554,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ))
         })?;
     let outer_iterations = outer_result.iterations;
-    let outer_grad_norm = outer_result.final_grad_norm;
+    let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(f64::NAN);
     let theta_star = outer_result.rho;
     let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
     let adaptive_lambda_start = rho_dim;
@@ -13120,10 +13120,12 @@ fn try_exact_joint_spatial_aniso_optimization(
         ))
     })?;
     log::trace!(
-        "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+        "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
         result.iterations,
         result.final_value,
-        result.final_grad_norm,
+        result
+            .final_grad_norm
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.6e}")),
     );
     // No sum-to-zero enforcement needed: ψ coordinates are unconstrained during
     // optimization. The decomposition into (ψ̄, η) happens in apply_tospec.
@@ -13419,10 +13421,12 @@ fn try_exact_joint_spatial_isotropic_optimization(
         ))
     })?;
     log::trace!(
-        "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={:.6e}",
+        "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
         result.iterations,
         result.final_value,
-        result.final_grad_norm,
+        result
+            .final_grad_norm
+            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.6e}")),
     );
     Ok((result.rho, result.final_value))
 }
