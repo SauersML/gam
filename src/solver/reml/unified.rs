@@ -8999,7 +8999,6 @@ fn build_outer_hessian_operator(
     let mut coords = Vec::with_capacity(total);
     for idx in 0..k {
         let coord = &solution.penalty_coords[idx];
-        let penalty_a_k_beta_vec = rho_penalty_a_k_betas[idx].clone();
         let curvature_a_k_beta = rho_curvature_a_k_betas[idx].clone();
         let v_k = coord_vs[idx].clone();
         let correction = coord_corrections[idx].as_ref();
