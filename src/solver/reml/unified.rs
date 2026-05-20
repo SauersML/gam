@@ -6444,10 +6444,13 @@ pub fn reml_laml_evaluate(
         .into_par_iter()
         .map(|idx| {
             let coord = &solution.penalty_coords[idx];
-            let a_k_beta = &rho_penalty_a_k_betas[idx];
 
-            // Cost derivative: a_i = ½ β̂ᵀ Aₖ β̂.
-            let a_i = 0.5 * solution.beta.dot(a_k_beta);
+            // Cost derivative for the shifted penalty:
+            // a_i = ½ λₖ (β̂ - μₖ)' Sₖ (β̂ - μₖ).
+            //
+            // The β-gradient derivative is λₖSₖ(β̂-μₖ); dotting it with β̂
+            // would drop the μₖ'λₖSₖμₖ half of the chain rule.
+            let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
 
             // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
             //
@@ -7100,10 +7103,6 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
-pub(crate) fn prefer_callback_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
-    callback_outer_hessian_scale_decision(n, p, k).prefers_operator
-}
-
 /// Selects the matrix-free outer-Hessian representation once a Hessian HVP
 /// kernel is available. Decision is cost-driven via the `(n, p, K)` crossover
 /// plus a callback-specific row-pair workload crossover: the operator and
@@ -7614,9 +7613,15 @@ fn compute_outer_hessian(
         None => v_ks_storage.as_deref().expect("storage set"),
     };
 
-    // Precompute a_k = ½ β̂ᵀ Aₖ β̂ for profiled Gaussian correction.
+    // Precompute a_k = ½ λₖ(β̂-μₖ)'Sₖ(β̂-μₖ) for profiled Gaussian correction.
     let rho_a_vals: Vec<f64> = (0..k)
-        .map(|idx| 0.5 * solution.beta.dot(&penalty_a_k_betas[idx]))
+        .map(|idx| {
+            0.5 * penalty_a_k_quadratic(
+                &solution.penalty_coords[idx],
+                &solution.beta,
+                lambdas[idx],
+            )
+        })
         .collect();
 
     // Build pure Aₖ = λₖ Rₖᵀ Rₖ and Ḣₖ = Aₖ + correction for all k.
@@ -9014,7 +9019,7 @@ fn build_outer_hessian_operator(
             (Some(dense_hop), Some(matrix)) => Some(dense_hop.rotate_to_eigenbasis(matrix)),
             _ => None,
         };
-        let a_i = 0.5 * solution.beta.dot(&penalty_a_k_beta_vec);
+        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambdas[idx]);
         coords.push(OuterHessianCoord {
             a: a_i,
             g: curvature_a_k_beta,
@@ -15444,7 +15449,6 @@ mod tests {
     #[test]
     fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
         assert!(!prefer_outer_hessian_operator(155_980, 19, 23));
-        assert!(prefer_callback_outer_hessian_operator(155_980, 19, 23));
         assert!(use_outer_hessian_operator_path(155_980, 19, 23, true));
         assert!(!use_outer_hessian_operator_path(155_980, 19, 23, false));
         assert!(!use_outer_hessian_operator_path(1_000, 19, 23, true));
@@ -15453,7 +15457,6 @@ mod tests {
     #[test]
     fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover() {
         assert!(prefer_outer_hessian_operator(195_780, 33, 8));
-        assert!(!prefer_callback_outer_hessian_operator(195_780, 33, 8));
         assert!(!use_outer_hessian_operator_path(195_780, 33, 8, true));
         assert!(use_outer_hessian_operator_path(195_780, 512, 8, true));
         assert!(use_outer_hessian_operator_path(195_780, 33, 32, true));
