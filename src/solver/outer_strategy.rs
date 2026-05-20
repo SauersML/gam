@@ -5145,14 +5145,40 @@ fn run_outer_with_plan(
                         last_solution,
                         max_attempts,
                         failure_reason,
-                    }) => Err(EstimationError::RemlOptimizationFailed(
-                        bfgs_line_search_failure_message(
-                            context,
-                            &last_solution,
-                            max_attempts,
-                            failure_reason,
-                        ),
-                    )),
+                    }) => {
+                        // At iter == 0 the line search never accepted any step,
+                        // so `last_solution` is just the seed iterate. There is
+                        // no "best progress so far" to report — surfacing it as
+                        // a converged-flag-false outer result lets the fallback
+                        // ladder try a degraded plan (EFS, or a different seed)
+                        // before declaring failure. Once at least one iter has
+                        // been accepted, BFGS' internal state is meaningful and
+                        // a line-search failure is a real signal that the
+                        // direction approximation has gone bad; in that case
+                        // hard-fail so the user sees a precise diagnostic
+                        // rather than a silent partial fit. This restores the
+                        // pre-6578e884 fallthrough for the seed-stall case
+                        // while keeping the post-progress hard-fail discipline.
+                        if last_solution.iterations == 0 {
+                            log::warn!(
+                                "[OUTER] {context}: BFGS line search failed at iter=0 \
+                                 (reason={failure_reason:?}, max_attempts={max_attempts}, \
+                                 |g|={:.3e}); falling through to strategy ladder \
+                                 instead of hard-failing — the seed is stale, not the optimizer",
+                                last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                            );
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        } else {
+                            Err(EstimationError::RemlOptimizationFailed(
+                                bfgs_line_search_failure_message(
+                                    context,
+                                    &last_solution,
+                                    max_attempts,
+                                    failure_reason,
+                                ),
+                            ))
+                        }
+                    }
                     Err(BfgsError::ObjectiveFailed { message }) => {
                         Err(EstimationError::RemlOptimizationFailed(format!(
                             "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
