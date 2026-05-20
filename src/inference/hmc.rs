@@ -1299,6 +1299,57 @@ mod tests {
     }
 
     #[test]
+    fn link_wiggle_cloglog_gradient_matches_its_log_likelihood() {
+        let x = array![[1.0], [1.0], [1.0], [1.0]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let weights = array![1.0, 1.2, 0.8, 1.4];
+        let penalty_base = Array2::zeros((1, 1));
+        let penalty_link = Array2::zeros((1, 1));
+        let mode_beta = array![-0.8];
+        let mode_theta = array![0.04];
+        let hessian = Array2::eye(2);
+        let spline = LinkWiggleSplineArtifacts {
+            knot_range: (-1.5, 0.5),
+            knot_vector: Array1::from_vec(vec![-1.5, -1.5, -1.5, 0.5, 0.5, 0.5]),
+            degree: 2,
+        };
+
+        let posterior = LinkWigglePosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty_base.view(),
+            penalty_link.view(),
+            mode_beta.view(),
+            mode_theta.view(),
+            hessian.view(),
+            spline,
+            NutsFamily::BinomialCLogLog,
+            1.0,
+        )
+        .expect("cloglog link-wiggle posterior");
+
+        let z = array![0.2, -0.03];
+        let (_, grad) = posterior.compute_logp_and_grad(&z);
+        let eps = 1e-6;
+        for j in 0..z.len() {
+            let mut z_plus = z.clone();
+            let mut z_minus = z.clone();
+            z_plus[j] += eps;
+            z_minus[j] -= eps;
+            let (lp, _) = posterior.compute_logp_and_grad(&z_plus);
+            let (lm, _) = posterior.compute_logp_and_grad(&z_minus);
+            let fd = (lp - lm) / (2.0 * eps);
+            assert!(
+                (grad[j] - fd).abs() < 1e-6,
+                "link-wiggle cloglog gradient mismatch at {j}: analytic={}, fd={}",
+                grad[j],
+                fd
+            );
+        }
+    }
+
+    #[test]
     fn nuts_logitgradient_matches_finite_difference() {
         let x = array![[1.0, -0.5], [0.2, 0.7], [-1.0, 0.3], [0.5, -1.2]];
         let y = array![1.0, 0.0, 1.0, 0.0];

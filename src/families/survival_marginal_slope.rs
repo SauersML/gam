@@ -148,6 +148,7 @@ struct SurvivalMarginalSlopeFamily {
     event: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
     z: Arc<Array2<f64>>,
+    score_covariance: MarginalSlopeCovariance,
     gaussian_frailty_sd: Option<f64>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
@@ -2668,6 +2669,60 @@ fn rigid_observed_scale(g: f64, probit_scale: f64) -> f64 {
 #[inline]
 fn rigid_observed_eta(q: f64, g: f64, z: f64, probit_scale: f64) -> f64 {
     q * rigid_observed_scale(g, probit_scale) + rigid_observed_logslope(g, probit_scale) * z
+}
+
+pub fn survival_marginal_slope_vector_scale(
+    slopes: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    marginal_slope_preserving_scale(slopes, covariance, probit_scale)
+}
+
+pub fn survival_marginal_slope_vector_eta(
+    q: f64,
+    z: &[f64],
+    slopes: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    if z.len() != slopes.len() {
+        return Err(format!(
+            "survival marginal-slope vector score/slope dimension mismatch: z={}, slopes={}",
+            z.len(),
+            slopes.len()
+        ));
+    }
+    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
+    let linear = z
+        .iter()
+        .zip(slopes.iter())
+        .map(|(&zi, &ri)| probit_scale * ri * zi)
+        .sum::<f64>();
+    Ok(q * c + linear)
+}
+
+fn standardize_latent_z_matrix_with_policy(
+    z: &Array2<f64>,
+    weights: &Array1<f64>,
+    context: &str,
+    policy: &LatentZPolicy,
+) -> Result<(Array2<f64>, LatentZNormalization), String> {
+    if z.ncols() == 0 {
+        return Err(format!("{context} requires at least one z column"));
+    }
+    let mut out = Array2::<f64>::zeros(z.raw_dim());
+    let mut first_norm = LatentZNormalization { mean: 0.0, sd: 1.0 };
+    for col in 0..z.ncols() {
+        let input = z.column(col).to_owned();
+        let (standardized, normalization) =
+            standardize_latent_z_with_policy(&input, weights, context, policy)?;
+        if col == 0 {
+            first_norm = normalization;
+        }
+        out.column_mut(col).assign(&standardized);
+    }
+    Ok((out, first_norm))
 }
 
 /// Derivatives of c(g) = √(1 + (s_f g)^2) up to 4th order in the raw slope g.
