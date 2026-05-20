@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{fast_atv, fast_xt_diag_x, fast_xt_diag_y};
+use crate::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
 use crate::families::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
 };
@@ -270,9 +270,9 @@ fn evaluate_cause_specific_block(
             beta.len()
         ));
     }
-    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
-    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
-    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
+    let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
+    let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
+    let derivative = fast_av(&block.x_derivative, beta) + &block.offset_derivative_exit;
     let mut log_likelihood = 0.0;
     let mut w_exit = Array1::<f64>::zeros(n);
     let mut w_entry = Array1::<f64>::zeros(n);
@@ -430,8 +430,8 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         if delta.len() != state.beta.len() || block.x_derivative.ncols() != delta.len() {
             return Err("cause-specific survival feasible-step dimension mismatch".to_string());
         }
-        let derivative = block.x_derivative.dot(&state.beta) + &block.offset_derivative_exit;
-        let derivative_delta = block.x_derivative.dot(delta);
+        let derivative = fast_av(&block.x_derivative, &state.beta) + &block.offset_derivative_exit;
+        let derivative_delta = fast_av(&block.x_derivative, delta);
         let mut alpha_max = 1.0_f64;
         for i in 0..derivative.len() {
             if block.sampleweight[i] <= 0.0 {
@@ -513,12 +513,12 @@ fn cause_specific_hessian_directional_derivative(
     if beta.len() != p || d_beta.len() != p {
         return Err("cause-specific survival Hessian derivative dimension mismatch".to_string());
     }
-    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
-    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
-    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
-    let d_eta_entry = block.x_entry.dot(d_beta);
-    let d_eta_exit = block.x_exit.dot(d_beta);
-    let d_derivative = block.x_derivative.dot(d_beta);
+    let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
+    let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
+    let derivative = fast_av(&block.x_derivative, beta) + &block.offset_derivative_exit;
+    let d_eta_entry = fast_av(&block.x_entry, d_beta);
+    let d_eta_exit = fast_av(&block.x_exit, d_beta);
+    let d_derivative = fast_av(&block.x_derivative, d_beta);
     let mut w_exit = Array1::<f64>::zeros(block.event_target.len());
     let mut w_entry = Array1::<f64>::zeros(block.event_target.len());
     let mut w_derivative = Array1::<f64>::zeros(block.event_target.len());
@@ -562,9 +562,9 @@ fn cause_specific_hessian_second_directional_derivative(
             "cause-specific survival second Hessian derivative dimension mismatch".to_string(),
         );
     }
-    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
-    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
-    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
+    let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
+    let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
+    let derivative = fast_av(&block.x_derivative, beta) + &block.offset_derivative_exit;
     let u_eta_entry = block.x_entry.dot(d_beta_u);
     let u_eta_exit = block.x_exit.dot(d_beta_u);
     let u_derivative = block.x_derivative.dot(d_beta_u);
