@@ -649,8 +649,21 @@ fn main() {
         if let Some(advice) = e.advice() {
             eprintln!("help: {advice}");
         }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
         std::process::exit(1);
     }
+    // Every output artifact has been written and flushed by `run()`. Skip the
+    // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +
+    // libcudart at-exit teardown is known to interleave badly with glibc and
+    // abort with "double free or corruption (!prev)" *after* every meaningful
+    // piece of work has finished, which turns a fully successful run into a
+    // non-zero exit in any wrapper (Python `subprocess.run(..., check=True)`,
+    // `set -e` shells, CI). The kernel reclaims GPU memory, pinned host
+    // buffers, memmaps, and the rayon thread-pool at process exit.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    std::process::exit(0);
 }
 
 fn run() -> CliResult<()> {
