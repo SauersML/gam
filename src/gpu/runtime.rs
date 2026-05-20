@@ -98,9 +98,7 @@ pub fn libcublas_loadable() -> bool {
         // persistent `culib()` handle below — that way the mapping
         // visible to `detect_cuda_library_conflicts` is exactly the
         // one CudaBlas::new will use, not a transient probe.
-        if unsafe { cudarc::cublas::sys::is_culib_present() }
-            && force_init_culib_persistent()
-        {
+        if unsafe { cudarc::cublas::sys::is_culib_present() } && force_init_culib_persistent() {
             return verify_no_cuda_library_conflicts();
         }
         // Fall back to the bundled-wheel preload only if the system
@@ -199,7 +197,10 @@ fn detect_cuda_library_conflicts() -> Result<(), String> {
             .and_then(|s| s.to_str())
             .unwrap_or("");
         if let Some(family) = cuda_library_family(name) {
-            by_family.entry(family).or_default().insert(path.to_string());
+            by_family
+                .entry(family)
+                .or_default()
+                .insert(path.to_string());
         }
     }
     let conflicts: Vec<(&'static str, Vec<String>)> = by_family
