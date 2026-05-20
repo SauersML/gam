@@ -39,6 +39,18 @@ fn survival_multi_z_k1_diagonal_matches_scalar_eta_bitwise() {
 }
 
 #[test]
+fn survival_multi_z_k1_scale_reduces_to_original_scalar_unit_variance() {
+    let slope = [0.31];
+    let probit_scale = 0.75;
+    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
+    let observed = probit_scale * slope[0];
+    let expected = (1.0 + observed * observed).sqrt();
+    let actual =
+        survival_marginal_slope_vector_scale(&slope, &covariance, probit_scale).expect("scale");
+    assert_eq!(actual.to_bits(), expected.to_bits());
+}
+
+#[test]
 fn survival_multi_z_k2_full_covariance_preserves_identity() {
     let q = -0.22;
     let z = [0.6, -1.1];
