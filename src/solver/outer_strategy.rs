@@ -3631,6 +3631,59 @@ fn solution_into_outer_result(
     }
 }
 
+fn format_top_abs_components(values: &Array1<f64>, label: &str, max_items: usize) -> String {
+    if values.is_empty() {
+        return format!("{label}=<empty>");
+    }
+    let mut ranked: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    ranked.sort_by(|(_, left), (_, right)| {
+        right
+            .abs()
+            .partial_cmp(&left.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let parts: Vec<String> = ranked
+        .into_iter()
+        .take(max_items)
+        .map(|(idx, value)| format!("{idx}:{value:.3e}"))
+        .collect();
+    format!("{label}=[{}]", parts.join(", "))
+}
+
+fn bfgs_line_search_failure_message(
+    context: &str,
+    solution: &Solution,
+    max_attempts: usize,
+    failure_reason: impl std::fmt::Debug,
+) -> String {
+    let grad_norm = solution
+        .final_gradient_norm
+        .or_else(|| {
+            solution
+                .final_gradient
+                .as_ref()
+                .map(|gradient| gradient.iter().map(|v| v * v).sum::<f64>().sqrt())
+        })
+        .unwrap_or(f64::NAN);
+    let gradient_detail = solution
+        .final_gradient
+        .as_ref()
+        .map(|gradient| format_top_abs_components(gradient, "top_abs_gradient", 6))
+        .unwrap_or_else(|| "top_abs_gradient=<unavailable>".to_string());
+    format!(
+        "{context}: BFGS line search failed; reason={failure_reason:?} \
+         max_attempts={max_attempts} iterations={} final_value={:.6e} \
+         |g|={:.3e} func_evals={} grad_evals={} {} {}",
+        solution.iterations,
+        solution.final_value,
+        grad_norm,
+        solution.func_evals,
+        solution.grad_evals,
+        format_top_abs_components(&solution.final_point, "top_abs_rho", 6),
+        gradient_detail,
+    )
+}
+
 /// Configuration for the outer optimization runner.
 #[derive(Clone, Debug)]
 struct OuterConfig {
@@ -5056,7 +5109,11 @@ fn run_outer_with_plan(
                         bfgs_elapsed,
                         last_solution.final_value
                     ),
-                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => log::info!(
+                    Err(BfgsError::LineSearchFailed {
+                        last_solution,
+                        max_attempts,
+                        failure_reason,
+                    }) => log::info!(
                         // Same rationale as the MaxIterationsReached
                         // arm: surface `in N iters` so the runner can
                         // include line-search-failed runs in the
@@ -5065,10 +5122,13 @@ fn run_outer_with_plan(
                         // immediately) is a different signal from
                         // failure at iter 50 (the optimizer made
                         // substantial progress before stalling).
-                        "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e}",
+                        "[OUTER summary] BFGS line-search failed in {} iters elapsed={:.3}s final_value={:.6e} reason={:?} max_attempts={} |g|={:.3e}",
                         last_solution.iterations,
                         bfgs_elapsed,
-                        last_solution.final_value
+                        last_solution.final_value,
+                        failure_reason,
+                        max_attempts,
+                        last_solution.final_gradient_norm.unwrap_or(f64::NAN),
                     ),
                     Err(e) => log::info!(
                         "[OUTER summary] BFGS failed elapsed={:.3}s err={:?}",
@@ -5081,9 +5141,18 @@ fn run_outer_with_plan(
                     Err(BfgsError::MaxIterationsReached { last_solution }) => {
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
-                    Err(BfgsError::LineSearchFailed { last_solution, .. }) => {
-                        Ok(solution_into_outer_result(*last_solution, false, *the_plan))
-                    }
+                    Err(BfgsError::LineSearchFailed {
+                        last_solution,
+                        max_attempts,
+                        failure_reason,
+                    }) => Err(EstimationError::RemlOptimizationFailed(
+                        bfgs_line_search_failure_message(
+                            context,
+                            &last_solution,
+                            max_attempts,
+                            failure_reason,
+                        ),
+                    )),
                     Err(BfgsError::ObjectiveFailed { message }) => {
                         Err(EstimationError::RemlOptimizationFailed(format!(
                             "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
