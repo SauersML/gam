@@ -4,7 +4,7 @@ use gam::pirls::{PirlsStatus, WorkingModelPirlsOptions, runworking_model_pirls};
 use gam::survival::{
     CauseSpecificRoystonParmarBlock, CauseSpecificRoystonParmarFamily, MonotonicityPenalty,
     PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs, SurvivalSpec,
-    WorkingModelSurvival,
+    WorkingModelSurvival, survival_event_code_from_value,
 };
 use gam::types::Coefficients;
 use ndarray::{Array1, Array2};
@@ -18,6 +18,19 @@ fn event_codes(cause_count: usize, event_counts: &[usize], n: usize) -> Array1<u
     }
     events.resize(n, 0);
     Array1::from_vec(events)
+}
+
+#[test]
+fn auto_detects_small_integer_competing_risk_event_codes() {
+    let values = [0.0, 1.0, 2.0, 3.0];
+    let codes = values
+        .into_iter()
+        .enumerate()
+        .map(|(row, value)| survival_event_code_from_value(value, row))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("small integer event codes should parse");
+    assert_eq!(codes, vec![0, 1, 2, 3]);
+    assert!(survival_event_code_from_value(1.25, 0).is_err());
 }
 
 fn fit_constant_exposure_cause_specific(

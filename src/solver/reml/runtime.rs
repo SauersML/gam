@@ -110,7 +110,7 @@ fn hash_canonical_penalties(
         hasher.write_usize(penalty.nullity);
         hash_array2(hasher, &penalty.root);
         hash_array2(hasher, &penalty.local);
-        hash_array1(hasher, &penalty.prior_mean);
+        hash_array_view(hasher, penalty.prior_mean.view());
         hasher.write_usize(penalty.positive_eigenvalues.len());
         for &value in &penalty.positive_eigenvalues {
             hasher.write_f64(value);
