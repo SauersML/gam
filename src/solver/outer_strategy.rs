@@ -3710,24 +3710,7 @@ fn solution_into_outer_result(
     }
 }
 
-fn format_top_abs_components(values: &Array1<f64>, label: &str, max_items: usize) -> String {
-    if values.is_empty() {
-        return format!("{label}=<empty>");
-    }
-    let mut ranked: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
-    ranked.sort_by(|(_, left), (_, right)| {
-        right
-            .abs()
-            .partial_cmp(&left.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let parts: Vec<String> = ranked
-        .into_iter()
-        .take(max_items)
-        .map(|(idx, value)| format!("{idx}:{value:.3e}"))
-        .collect();
-    format!("{label}=[{}]", parts.join(", "))
-}
+use crate::inference::diagnostics::format_top_abs as format_top_abs_components;
 
 fn bfgs_line_search_failure_message(
     context: &str,
