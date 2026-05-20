@@ -1294,6 +1294,23 @@ pub struct BatchedOuterGradientTerms {
 
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
+    /// Family-owned fingerprint for persistent coefficient warm-starts.
+    ///
+    /// The generic block specs contain design matrices, offsets, penalties,
+    /// and dimensions, but they deliberately do not know the family response
+    /// vector or likelihood-side data stored on `Self`. Reusing β across
+    /// different responses is mathematically unsafe, so persistent block-level
+    /// warm-starts are enabled only for families that provide a fingerprint of
+    /// the data that defines their likelihood. Outer ρ cache remains available
+    /// independently through `BlockwiseFitOptions::cache_session`.
+    fn persistent_warm_start_fingerprint(
+        &self,
+        _specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
+    ) -> Option<String> {
+        None
+    }
+
     /// Evaluate log-likelihood and per-block working quantities at current block predictors.
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String>;
 
@@ -2779,6 +2796,7 @@ fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
 }
 
 fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
+    family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Option<String> {
@@ -2790,6 +2808,7 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     // changes; same-schema lib versions share keys.
     hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
     hasher.write_str(type_name::<F>());
+    hasher.write_str(&family.persistent_warm_start_fingerprint(specs, options)?);
     hasher.write_usize(specs.len());
     for spec in specs {
         hasher.write_str(&spec.name);
@@ -2804,13 +2823,11 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
             hasher.write_usize(dim);
         }
         hash_cf_array_view(&mut hasher, spec.initial_log_lambdas.view());
-        match spec.initial_beta.as_ref() {
-            Some(beta) => {
-                hasher.write_bool(true);
-                hash_cf_array_view(&mut hasher, beta.view());
-            }
-            None => hasher.write_bool(false),
-        }
+        // Deliberately exclude `initial_beta`: it is an optimization hint, not
+        // model geometry. Survival marginal-slope pilots write data-dependent
+        // hints here; hashing them made the warm-start key depend on the thing
+        // the cache is supposed to replace, guaranteeing self-invalidating
+        // misses on every improved seed.
     }
     hasher.write_usize(options.inner_max_cycles);
     hasher.write_f64(options.inner_tol);
@@ -2840,11 +2857,12 @@ fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String
 }
 
 fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
+    family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_len: usize,
 ) -> (Option<String>, Option<ConstrainedWarmStart>) {
-    let Some(key) = persistent_custom_family_key::<F>(specs, options) else {
+    let Some(key) = persistent_custom_family_key::<F>(family, specs, options) else {
         return (None, None);
     };
     let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
@@ -17708,7 +17726,7 @@ fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'sta
     let label_layout = penalty_label_layout(specs, penalty_counts)?;
     let rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, persistent_warm_start) =
-        load_persistent_custom_family_warm_start::<F>(specs, options, rho0.len());
+        load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
 
     if rho0.is_empty() {
         let mut inner = inner_blockwise_fit(
