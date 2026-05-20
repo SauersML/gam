@@ -11512,26 +11512,26 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
-        struct Acc {
-            objective: f64,
+        struct BatchedPsiAxisAcc {
+            objective_psi: f64,
             score_t: Array1<f64>,
             score_m: Array1<f64>,
             score_g: Array1<f64>,
             score_h: Array1<f64>,
             score_w: Array1<f64>,
-            hess: BlockHessianAccumulator,
+            hessian: BlockHessianAccumulator,
         }
-        let make_accs = || -> Vec<Acc> {
+        let make_accs = || -> Vec<BatchedPsiAxisAcc> {
             (0..k)
                 .map(|_| {
-                    Acc {
-                        objective: 0.0,
+                    BatchedPsiAxisAcc {
+                        objective_psi: 0.0,
                         score_t: Array1::zeros(p_t),
                         score_m: Array1::zeros(p_m),
                         score_g: Array1::zeros(p_g),
                         score_h: Array1::zeros(p_h),
                         score_w: Array1::zeros(p_w),
-                        hess: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
                     }
                 })
                 .collect()
@@ -11543,7 +11543,7 @@ impl SurvivalMarginalSlopeFamily {
         let folded = chunked_row_reduction(
             row_iter.as_slice(),
             make_accs,
-            |row, accs: &mut Vec<Acc>| -> Result<(), String> {
+            |row, accs: &mut Vec<BatchedPsiAxisAcc>| -> Result<(), String> {
                 let w = row_weights[row];
 
                 // Fetch (f_pi, f_pipi) UNWEIGHTED once per row. Mutating
@@ -11575,7 +11575,7 @@ impl SurvivalMarginalSlopeFamily {
                     let acc = &mut accs[axis_idx];
 
                     // objective_psi += w * (f_pi · dir)
-                    acc.objective += w * f_pi.dot(&dir);
+                    acc.objective_psi += w * f_pi.dot(&dir);
 
                     // score_psi += w * (f_pi · loading) * psi_row, routed to
                     // the marginal or logslope block depending on axis.
@@ -11607,26 +11607,26 @@ impl SurvivalMarginalSlopeFamily {
                     if w != 1.0 {
                         right_primary.mapv_inplace(|v| v * w);
                     }
-                    acc.hess.add_rank1_psi_cross(
+                    acc.hessian.add_rank1_psi_cross(
                         self,
                         row,
                         axis.block_idx,
                         &psi_row,
                         &right_primary,
                     )?;
-                    acc.hess.add_pullback(self, row, &third)?;
+                    acc.hessian.add_pullback(self, row, &third)?;
                 }
                 Ok(())
             },
-            |total: &mut Vec<Acc>, chunk: Vec<Acc>| {
+            |total: &mut Vec<BatchedPsiAxisAcc>, chunk: Vec<BatchedPsiAxisAcc>| {
                 for (t, c) in total.iter_mut().zip(chunk.into_iter()) {
-                    t.objective += c.objective;
+                    t.objective_psi += c.objective_psi;
                     t.score_t += &c.score_t;
                     t.score_m += &c.score_m;
                     t.score_g += &c.score_g;
                     t.score_h += &c.score_h;
                     t.score_w += &c.score_w;
-                    t.hess.add(&c.hess);
+                    t.hessian.add(&c.hessian);
                 }
             },
         )?;
@@ -11654,11 +11654,11 @@ impl SurvivalMarginalSlopeFamily {
                     .assign(&acc.score_w);
             }
             out.push(ExactNewtonJointPsiTerms {
-                objective_psi: acc.objective,
+                objective_psi: acc.objective_psi,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
                 hessian_psi_operator: Some(std::sync::Arc::new(
-                    acc.hess.into_operator(slices.clone()),
+                    acc.hessian.into_operator(slices.clone()),
                 )),
             });
         }
@@ -15246,9 +15246,16 @@ impl SurvivalMarginalSlopeFamily {
             )
         };
 
-        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope): MixedAcc =
-            (0..self.n)
-                .into_par_iter()
+        let (
+            ll,
+            grad_time,
+            grad_marginal,
+            grad_logslope,
+            hess_time,
+            hess_marginal,
+            hess_logslope,
+        ): MixedAcc = (0..self.n)
+            .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
                     let (row_nll, f_pi, f_pipi) =
                         self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
