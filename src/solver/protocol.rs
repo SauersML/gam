@@ -103,23 +103,6 @@ impl MarginalSlopeCalibrationProtocol {
         )
     }
 
-    /// Probit marginal-slope with only the score-warp block enabled.
-    pub fn probit_with_score_wiggle() -> Self {
-        Self::probit(
-            Some(DeviationBlockConfig::triple_penalty_default()),
-            None,
-            Self::default_latent_score(),
-        )
-    }
-
-    /// Probit marginal-slope with only the link-deviation block enabled.
-    pub fn probit_with_link_wiggle() -> Self {
-        Self::probit(
-            None,
-            Some(DeviationBlockConfig::triple_penalty_default()),
-            Self::default_latent_score(),
-        )
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -140,13 +123,4 @@ impl SurvivalMarginalSlopeProtocol {
         }
     }
 
-    pub fn gompertz_makeham_probit_with_score_and_link_wiggle() -> Self {
-        Self::gompertz_makeham_probit(
-            MarginalSlopeCalibrationProtocol::probit_with_score_and_link_wiggle(),
-        )
-    }
-
-    pub fn gompertz_makeham_probit_rigid() -> Self {
-        Self::gompertz_makeham_probit(MarginalSlopeCalibrationProtocol::probit_rigid())
-    }
 }
