@@ -9101,14 +9101,13 @@ fn dense_more_sorensen_step(
         .map(f64::abs)
         .fold(0.0_f64, f64::max)
         .max(1.0e-12);
-    let mut lambda_tr = if initial_unconstrained_norm.is_finite()
-        && initial_unconstrained_norm > radius
-    {
-        let oversize = (initial_unconstrained_norm / radius - 1.0).max(0.0);
-        (oversize * max_abs_diag).clamp(1.0e-12, 1.0e18)
-    } else {
-        0.0
-    };
+    let mut lambda_tr =
+        if initial_unconstrained_norm.is_finite() && initial_unconstrained_norm > radius {
+            let oversize = (initial_unconstrained_norm / radius - 1.0).max(0.0);
+            (oversize * max_abs_diag).clamp(1.0e-12, 1.0e18)
+        } else {
+            0.0
+        };
 
     let radius_tol = (1.0e-3 * radius).max(1.0e-12);
     let mut best: Option<(Array1<f64>, f64, f64)> = None;
@@ -9120,8 +9119,7 @@ fn dense_more_sorensen_step(
             }
         }
 
-        let delta =
-            solver.solvevectorwithridge_retries(&lhs, rhs, JOINT_TRACE_STABILITY_RIDGE)?;
+        let delta = solver.solvevectorwithridge_retries(&lhs, rhs, JOINT_TRACE_STABILITY_RIDGE)?;
         if !delta.iter().all(|v| v.is_finite()) {
             lambda_tr = (lambda_tr * 4.0).max(1.0e-9);
             continue;
@@ -10345,37 +10343,36 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
                 let search_norm = joint_trust_region_step_norm(&search_delta);
-                let mut trial_delta = if search_norm.is_finite()
-                    && search_norm <= joint_trust_radius
-                {
-                    // Unconstrained Newton step already fits in the trust
-                    // region — take it as-is.
-                    search_delta.clone()
-                } else if tr_dense_unconstrained
-                    && let JointHessianSource::Dense(h_dense) = &joint_hessian_source
-                    && let Some((tr_delta, _lambda_tr)) = dense_more_sorensen_step(
-                        h_dense,
-                        &ranges,
-                        &s_lambdas,
-                        joint_solver_diagonal_ridge,
-                        &rhs,
-                        joint_trust_radius,
-                        search_norm,
-                    )
-                {
-                    // Proper damped Newton step: δ = -(H+S+(ε+λ_TR)·I)⁻¹ rhs
-                    // with λ_TR ≥ 0 chosen so ‖δ‖ ≈ Δ. This regularizes the
-                    // near-null eigenvectors that the legacy rescale-based
-                    // truncation amplified.
-                    tr_delta
-                } else {
-                    // Fallback for paths Moré–Sorensen does not own
-                    // (constrained QP, matrix-free PCG, dense subproblem
-                    // failure): rescale the unconstrained direction.
-                    let mut fallback = search_delta.clone();
-                    truncate_joint_step_to_radius(&mut fallback, joint_trust_radius);
-                    fallback
-                };
+                let mut trial_delta =
+                    if search_norm.is_finite() && search_norm <= joint_trust_radius {
+                        // Unconstrained Newton step already fits in the trust
+                        // region — take it as-is.
+                        search_delta.clone()
+                    } else if tr_dense_unconstrained
+                        && let JointHessianSource::Dense(h_dense) = &joint_hessian_source
+                        && let Some((tr_delta, _lambda_tr)) = dense_more_sorensen_step(
+                            h_dense,
+                            &ranges,
+                            &s_lambdas,
+                            joint_solver_diagonal_ridge,
+                            &rhs,
+                            joint_trust_radius,
+                            search_norm,
+                        )
+                    {
+                        // Proper damped Newton step: δ = -(H+S+(ε+λ_TR)·I)⁻¹ rhs
+                        // with λ_TR ≥ 0 chosen so ‖δ‖ ≈ Δ. This regularizes the
+                        // near-null eigenvectors that the legacy rescale-based
+                        // truncation amplified.
+                        tr_delta
+                    } else {
+                        // Fallback for paths Moré–Sorensen does not own
+                        // (constrained QP, matrix-free PCG, dense subproblem
+                        // failure): rescale the unconstrained direction.
+                        let mut fallback = search_delta.clone();
+                        truncate_joint_step_to_radius(&mut fallback, joint_trust_radius);
+                        fallback
+                    };
                 let mut barrier_ceiling = 1.0_f64;
                 for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                     let block_delta = trial_delta.slice(s![start..end]).to_owned();
@@ -22453,9 +22450,8 @@ mod tests {
         let residual_tol = inner_tol * (1.0 + objective);
         let step_tol = 1.242e-3_f64;
         let objective_tol = residual_tol;
-        let old_flat_step_predicate =
-            objective_change <= objective_tol
-                && accepted_step_inf <= objective_tol.sqrt().max(step_tol);
+        let old_flat_step_predicate = objective_change <= objective_tol
+            && accepted_step_inf <= objective_tol.sqrt().max(step_tol);
 
         assert!(
             old_flat_step_predicate,
