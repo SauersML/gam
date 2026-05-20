@@ -3384,20 +3384,57 @@ impl ImplicitHyperOperator {
                 .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
             let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
 
-            // Fused inner-product accumulation.
-            for i_local in 0..chunk_n {
-                let i = start + i_local;
-                let w_i = w[i];
-                let dxf_row = dxf_chunk.row(i_local);
-                let xf_row = xf_chunk.row(i_local);
-                for k in 0..rank {
-                    design_total += dxf_row[k] * w_i * xf_row[k];
-                }
-                if let Some(c) = c_opt {
-                    let c_i = c[i];
+            // Fused inner-product accumulation. Use slice access where
+            // possible so the inner loops vectorize without bounds checks.
+            let dxf_std = dxf_chunk.is_standard_layout();
+            let xf_std = xf_chunk.is_standard_layout();
+            if dxf_std && xf_std {
+                let dxf_slice = dxf_chunk
+                    .as_slice()
+                    .expect("dxf chunk standard layout");
+                let xf_slice = xf_chunk
+                    .as_slice_memory_order()
+                    .expect("xf chunk row-major slice");
+                for i_local in 0..chunk_n {
+                    let i = start + i_local;
+                    let w_i = w[i];
+                    let off = i_local * rank;
+                    let drow = &dxf_slice[off..off + rank];
+                    let xrow = &xf_slice[off..off + rank];
+                    let mut acc = 0.0_f64;
                     for k in 0..rank {
-                        let v = xf_row[k];
-                        correction_total += c_i * v * v;
+                        acc += drow[k] * xrow[k];
+                    }
+                    design_total += w_i * acc;
+                    if let Some(c) = c_opt {
+                        let c_i = c[i];
+                        let mut acc2 = 0.0_f64;
+                        for k in 0..rank {
+                            let v = xrow[k];
+                            acc2 += v * v;
+                        }
+                        correction_total += c_i * acc2;
+                    }
+                }
+            } else {
+                for i_local in 0..chunk_n {
+                    let i = start + i_local;
+                    let w_i = w[i];
+                    let dxf_row = dxf_chunk.row(i_local);
+                    let xf_row = xf_chunk.row(i_local);
+                    let mut acc = 0.0_f64;
+                    for k in 0..rank {
+                        acc += dxf_row[k] * xf_row[k];
+                    }
+                    design_total += w_i * acc;
+                    if let Some(c) = c_opt {
+                        let c_i = c[i];
+                        let mut acc2 = 0.0_f64;
+                        for k in 0..rank {
+                            let v = xf_row[k];
+                            acc2 += v * v;
+                        }
+                        correction_total += c_i * acc2;
                     }
                 }
             }
