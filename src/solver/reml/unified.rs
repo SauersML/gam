@@ -3558,17 +3558,20 @@ impl ImplicitHyperOperator {
                 .row_chunk_first_raw_all_axes(start..end)
                 .expect("radial scalar evaluation failed during implicit hyper batched projected_matrix");
 
+            // Precompute W · xf_chunk once per chunk; reused across every
+            // axis as `Dᵀ (W X)` instead of building `Dᵀ W = W · D` per axis.
+            let mut wxf_chunk = xf_chunk.to_owned();
+            for i_local in 0..(end - start) {
+                let w_i = w[start + i_local];
+                let mut row = wxf_chunk.row_mut(i_local);
+                for col in 0..rank {
+                    row[col] *= w_i;
+                }
+            }
             for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
-                let mut weighted_dxf = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
-                for i_local in 0..(end - start) {
-                    let w_i = w[start + i_local];
-                    let mut row = weighted_dxf.row_mut(i_local);
-                    for col in 0..rank {
-                        row[col] *= w_i;
-                    }
-                }
-                let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
+                let m = crate::faer_ndarray::fast_atb(&dxf_chunk, &wxf_chunk);
                 out[slot] += &m;
                 out[slot] += &m.t();
 
@@ -3576,8 +3579,9 @@ impl ImplicitHyperOperator {
                     let mut weighted_xf = xf_chunk.to_owned();
                     for i_local in 0..(end - start) {
                         let c_i = c[start + i_local];
+                        let mut row = weighted_xf.row_mut(i_local);
                         for col in 0..rank {
-                            weighted_xf[[i_local, col]] *= c_i;
+                            row[col] *= c_i;
                         }
                     }
                     out[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
@@ -7583,14 +7587,35 @@ fn trace_logdet_hessian_crosses_dense_spectral_drifts(
     for matrix in dense_drifts {
         rotated.push(dense_hop.rotate_to_eigenbasis(matrix));
     }
-    for drift in ext_drifts {
-        let projected = match drift {
-            DriftDerivResult::Dense(matrix) => dense_hop.rotate_to_eigenbasis(matrix),
-            DriftDerivResult::Operator(operator) => {
-                dense_hop.projected_operator(&dense_hop.eigenvectors, operator.as_ref())
+
+    // Batch the projected_operator calls for implicit operator drifts so the
+    // chunked design sweep (kernel scalars + GEMMs) is traversed once and
+    // shared across all matching axes.
+    let mut ext_rotated: Vec<Option<Array2<f64>>> = (0..ext_drifts.len()).map(|_| None).collect();
+    let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+    for (i, drift) in ext_drifts.iter().enumerate() {
+        match drift {
+            DriftDerivResult::Dense(matrix) => {
+                ext_rotated[i] = Some(dense_hop.rotate_to_eigenbasis(matrix));
             }
-        };
-        rotated.push(projected);
+            DriftDerivResult::Operator(operator) => {
+                op_terms.push((i, 1.0, operator.as_ref()));
+            }
+        }
+    }
+    if !op_terms.is_empty() {
+        let batched = projected_operator_terms_batched(
+            ext_drifts.len(),
+            &op_terms,
+            &dense_hop.eigenvectors,
+            &dense_hop.projected_factor_cache,
+        );
+        for (i, _, _) in &op_terms {
+            ext_rotated[*i] = Some(batched[*i].clone());
+        }
+    }
+    for r in ext_rotated {
+        rotated.push(r.expect("every ext drift contributes a rotation"));
     }
 
     let mut out = Array2::<f64>::zeros((total, total));
@@ -10182,37 +10207,38 @@ pub fn compute_hybrid_efs_update(
             let parallel_gram_pairs = pair_count >= HYBRID_EFS_GRAM_PAIR_PAR_THRESHOLD
                 && rayon::current_thread_index().is_none();
             if let Some(dense_hop) = hop.as_dense_spectral() {
-                let projected_drifts: Vec<Array2<f64>> = if parallel_psi_drifts {
-                    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                    (0..n_psi)
-                        .into_par_iter()
-                        .map(|idx| {
-                            if let Some(op) = drift_ops[idx].as_ref() {
-                                dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
-                            } else {
-                                dense_hop.projected_matrix(
-                                    dense_drifts[idx]
-                                        .as_ref()
-                                        .expect("dense drift should be cached"),
-                                )
-                            }
-                        })
-                        .collect()
-                } else {
-                    (0..n_psi)
-                        .map(|idx| {
-                            if let Some(op) = drift_ops[idx].as_ref() {
-                                dense_hop.projected_operator(&dense_hop.w_factor, op.as_ref())
-                            } else {
-                                dense_hop.projected_matrix(
-                                    dense_drifts[idx]
-                                        .as_ref()
-                                        .expect("dense drift should be cached"),
-                                )
-                            }
-                        })
-                        .collect()
-                };
+                // Batch the operator-backed drifts so the chunked X·F sweep
+                // is shared across all matching axes (compute_xf runs once,
+                // kernel scalars are batched).
+                let mut projected_drifts: Vec<Option<Array2<f64>>> =
+                    (0..n_psi).map(|_| None).collect();
+                let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+                for idx in 0..n_psi {
+                    if let Some(op) = drift_ops[idx].as_ref() {
+                        op_terms.push((idx, 1.0, op.as_ref()));
+                    } else {
+                        projected_drifts[idx] = Some(dense_hop.projected_matrix(
+                            dense_drifts[idx]
+                                .as_ref()
+                                .expect("dense drift should be cached"),
+                        ));
+                    }
+                }
+                if !op_terms.is_empty() {
+                    let batched = projected_operator_terms_batched(
+                        n_psi,
+                        &op_terms,
+                        &dense_hop.w_factor,
+                        &dense_hop.projected_factor_cache,
+                    );
+                    for (idx, _, _) in &op_terms {
+                        projected_drifts[*idx] = Some(batched[*idx].clone());
+                    }
+                }
+                let projected_drifts: Vec<Array2<f64>> = projected_drifts
+                    .into_iter()
+                    .map(|m| m.expect("projected drift filled"))
+                    .collect();
                 if parallel_gram_pairs {
                     use rayon::iter::{IntoParallelIterator, ParallelIterator};
                     let pairs: Vec<(usize, usize)> = (0..n_psi)
