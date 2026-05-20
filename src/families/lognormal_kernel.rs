@@ -167,21 +167,11 @@ impl ProbitFrailtyScaleJet {
 }
 
 #[inline]
-fn mode_rank(mode: IntegratedExpectationMode) -> u8 {
-    match mode {
-        IntegratedExpectationMode::ExactClosedForm => 0,
-        IntegratedExpectationMode::ExactSpecialFunction => 1,
-        IntegratedExpectationMode::ControlledAsymptotic => 2,
-        IntegratedExpectationMode::QuadratureFallback => 3,
-    }
-}
-
-#[inline]
 fn worst_mode(
     a: IntegratedExpectationMode,
     b: IntegratedExpectationMode,
 ) -> IntegratedExpectationMode {
-    if mode_rank(a) >= mode_rank(b) { a } else { b }
+    if a.rank() >= b.rank() { a } else { b }
 }
 
 // ─── Log-space kernel infrastructure ──────────────────────────────────────────
