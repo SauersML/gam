@@ -1952,30 +1952,6 @@ fn validate_second_order_seed_hessian(
     Ok(())
 }
 
-fn finite_efs_eval_or_error(
-    context: &str,
-    layout: OuterThetaLayout,
-    eval: EfsEval,
-) -> Result<EfsEval, ObjectiveEvalError> {
-    layout.validate_efs_eval(&eval, context)?;
-    finite_cost_or_error(context, eval.cost)?;
-    if let Some((idx, value)) = eval.steps.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-        let coord_kind = match eval.psi_indices.as_deref() {
-            Some(indices) if indices.contains(&idx) => "ψ",
-            Some(_) => "ρ/τ",
-            None => "ρ",
-        };
-        return Err(ObjectiveEvalError::recoverable(format!(
-            "{context}: objective returned a non-finite {coord_kind} EFS step at \
-             coord {idx} (step[{idx}]={value}, rho_dim={}, psi_dim={}, n_params={})",
-            layout.rho_dim(),
-            layout.psi_dim,
-            layout.n_params,
-        )));
-    }
-    Ok(eval)
-}
-
 struct OuterFirstOrderBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -2024,19 +2000,19 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        // Drive the outer-aware inner-PIRLS cap based on the iter count,
-        // BEFORE invoking the inner solve. Cap stays fixed within a single
-        // outer iter (line-search probes go through `eval_cost`, which
-        // never touches the atomic). A cap of 0 means "no cap from this
-        // source"; the inner solver still honors `pirls_max_iterations`
-        // and the screening cap (combined via min).
+        // Drive the outer-aware inner-PIRLS cap from accepted outer
+        // iterations, BEFORE invoking the inner solve. Cap stays fixed
+        // within line-search cost probes (`eval_cost` never touches the
+        // atomic). A cap of 0 means "no cap from this source"; the inner
+        // solver still honors `pirls_max_iterations` and the screening cap.
         if let Some(feedback) = self.outer_inner_cap.as_ref() {
             let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
                 (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
                 _ => None,
             };
             let snapshot = feedback.snapshot();
-            let cap = first_order_inner_cap_schedule(self.iter_count, g_ratio, snapshot);
+            let accepted_iter = feedback.accepted_iter.load(Ordering::Relaxed);
+            let cap = first_order_inner_cap_schedule(accepted_iter, g_ratio, snapshot);
             let prev = feedback.cap.swap(cap, Ordering::Relaxed);
             if prev != cap {
                 let ratio_str = match g_ratio {
@@ -2060,7 +2036,8 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                     None => "no-history".to_string(),
                 };
                 log::info!(
-                    "[OUTER schedule] inner-PIRLS cap transition iter={} g_ratio={} {} prev={} new={} ({})",
+                    "[OUTER schedule] inner-PIRLS cap transition accepted_iter={} eval_count={} g_ratio={} {} prev={} new={} ({})",
+                    accepted_iter,
                     self.iter_count,
                     ratio_str,
                     snap_str,
@@ -3183,6 +3160,43 @@ struct OuterFixedPointBridge<'a> {
     consecutive_psi_zero_iters: usize,
 }
 
+impl OuterFixedPointBridge<'_> {
+    fn reject_nonstationary_tiny_psi_step(
+        &self,
+        step: &Array1<f64>,
+        psi_indices: Option<&[usize]>,
+        psi_gradient: Option<&Array1<f64>>,
+        cost: f64,
+    ) -> Result<(), ObjectiveEvalError> {
+        let Some(psi_indices) = psi_indices else {
+            return Ok(());
+        };
+        let Some(psi_gradient) = psi_gradient else {
+            return Ok(());
+        };
+        let psi_step_inf = psi_indices
+            .iter()
+            .map(|&idx| step[idx].abs())
+            .fold(0.0_f64, f64::max);
+        let psi_grad_inf = psi_gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if psi_step_inf <= self.fixed_point_tolerance && psi_grad_inf > self.fixed_point_tolerance {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{} HybridEFS ψ nonstationary: ||Δψ||∞={:.3e} <= tol={:.3e} \
+                 but raw ||gψ||∞={:.3e} (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                EFS_FIRST_ORDER_FALLBACK_MARKER,
+                psi_step_inf,
+                self.fixed_point_tolerance,
+                psi_grad_inf,
+                self.layout.rho_dim(),
+                self.layout.psi_dim,
+                self.layout.n_params,
+                cost,
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Maximum number of α halvings for the cost line search wrapping the EFS
 /// step.
 ///
@@ -3278,32 +3292,33 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 eval.cost,
             )));
         }
-        let status = if let Some(ref barrier_cfg) = self.barrier_config {
+        if let Some(ref barrier_cfg) = self.barrier_config {
             if let Some(ref beta) = eval.beta {
                 let ref_diag = 1.0;
                 let threshold = 0.01;
                 if barrier_cfg.barrier_curvature_is_significant(beta, ref_diag, threshold) {
-                    FixedPointStatus::Stop
-                } else {
-                    FixedPointStatus::Continue
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "{} EFS barrier curvature significant \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        eval.cost,
+                    )));
                 }
-            } else {
-                FixedPointStatus::Continue
             }
-        } else {
-            FixedPointStatus::Continue
-        };
-
-        if matches!(status, FixedPointStatus::Stop) {
-            return Ok(FixedPointSample {
-                value: eval.cost,
-                step: Array1::zeros(x.len()),
-                status,
-            });
         }
+        let status = FixedPointStatus::Continue;
 
         let raw_step = Array1::from_vec(eval.steps);
         let psi_indices = eval.psi_indices.clone();
+        self.reject_nonstationary_tiny_psi_step(
+            &raw_step,
+            psi_indices.as_deref(),
+            eval.psi_gradient.as_ref(),
+            eval.cost,
+        )?;
         let max_step_abs = raw_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
         let current_cost = eval.cost;
 
@@ -5171,14 +5186,26 @@ fn run_outer_with_plan(
                         last_solution,
                         max_attempts,
                         failure_reason,
-                    }) => Err(EstimationError::RemlOptimizationFailed(
-                        bfgs_line_search_failure_message(
-                            context,
-                            &last_solution,
-                            max_attempts,
-                            failure_reason,
-                        ),
-                    )),
+                    }) => {
+                        if last_solution.final_value.is_finite()
+                            && last_solution.final_point.iter().all(|v| v.is_finite())
+                            && last_solution
+                                .final_gradient
+                                .as_ref()
+                                .map_or(true, |g| g.iter().all(|v| v.is_finite()))
+                        {
+                            Ok(solution_into_outer_result(*last_solution, false, *the_plan))
+                        } else {
+                            Err(EstimationError::RemlOptimizationFailed(
+                                bfgs_line_search_failure_message(
+                                    context,
+                                    &last_solution,
+                                    max_attempts,
+                                    failure_reason,
+                                ),
+                            ))
+                        }
+                    }
                     Err(BfgsError::ObjectiveFailed { message }) => {
                         Err(EstimationError::RemlOptimizationFailed(format!(
                             "BFGS solver failed: ObjectiveFailed {{ message: {message:?} }}"
@@ -5190,11 +5217,15 @@ fn run_outer_with_plan(
                 }
             }
             Solver::Efs => {
-                let seed_eval = obj
-                    .eval_efs(&seed)
-                    .map_err(|err| into_objective_error("outer EFS eval failed", err));
-                let seed_eval = match seed_eval {
-                    Ok(seed_eval) => seed_eval,
+                let mut objective = OuterFixedPointBridge {
+                    obj,
+                    layout,
+                    barrier_config: cap.barrier_config.clone(),
+                    fixed_point_tolerance: config.tolerance,
+                    consecutive_psi_zero_iters: 0,
+                };
+                let initial_sample = match objective.eval_step(&seed) {
+                    Ok(sample) => sample,
                     Err(err) => {
                         let err = match err {
                             ObjectiveEvalError::Recoverable { message }
@@ -5212,25 +5243,6 @@ fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                 };
-                let seed_eval =
-                    finite_efs_eval_or_error("outer EFS eval failed", layout, seed_eval).map_err(
-                        |err| match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        },
-                    );
-                if let Err(err) = seed_eval {
-                    if requests_immediate_first_order_fallback(&err.to_string()) {
-                        return Err(err);
-                    }
-                    log::warn!(
-                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
-                    );
-                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
-                    continue 'seed_attempts;
-                }
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
@@ -5239,16 +5251,11 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-                let objective = OuterFixedPointBridge {
-                    obj,
-                    layout,
-                    barrier_config: cap.barrier_config.clone(),
-                    consecutive_psi_zero_iters: 0,
-                };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter);
+                    .with_max_iterations(max_iter)
+                    .with_initial_sample(seed.clone(), initial_sample);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
@@ -5260,11 +5267,15 @@ fn run_outer_with_plan(
                 }
             }
             Solver::HybridEfs => {
-                let seed_eval = obj
-                    .eval_efs(&seed)
-                    .map_err(|err| into_objective_error("outer EFS eval failed", err));
-                let seed_eval = match seed_eval {
-                    Ok(seed_eval) => seed_eval,
+                let mut objective = OuterFixedPointBridge {
+                    obj,
+                    layout,
+                    barrier_config: cap.barrier_config.clone(),
+                    fixed_point_tolerance: config.tolerance,
+                    consecutive_psi_zero_iters: 0,
+                };
+                let initial_sample = match objective.eval_step(&seed) {
+                    Ok(sample) => sample,
                     Err(err) => {
                         let err = match err {
                             ObjectiveEvalError::Recoverable { message }
@@ -5282,25 +5293,6 @@ fn run_outer_with_plan(
                         continue 'seed_attempts;
                     }
                 };
-                let seed_eval =
-                    finite_efs_eval_or_error("outer EFS eval failed", layout, seed_eval).map_err(
-                        |err| match err {
-                            ObjectiveEvalError::Recoverable { message }
-                            | ObjectiveEvalError::Fatal { message } => {
-                                EstimationError::RemlOptimizationFailed(message)
-                            }
-                        },
-                    );
-                if let Err(err) = seed_eval {
-                    if requests_immediate_first_order_fallback(&err.to_string()) {
-                        return Err(err);
-                    }
-                    log::warn!(
-                        "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
-                    );
-                    rejection_reasons.push((seed_idx, "validation", err.to_string()));
-                    continue 'seed_attempts;
-                }
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
@@ -5309,16 +5301,11 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
-                let objective = OuterFixedPointBridge {
-                    obj,
-                    layout,
-                    barrier_config: cap.barrier_config.clone(),
-                    consecutive_psi_zero_iters: 0,
-                };
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter);
+                    .with_max_iterations(max_iter)
+                    .with_initial_sample(seed.clone(), initial_sample);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
@@ -6080,6 +6067,7 @@ mod tests {
             obj: &mut obj,
             layout: cap.theta_layout(),
             barrier_config: None,
+            fixed_point_tolerance: 1e-8,
             consecutive_psi_zero_iters: 0,
         };
 

@@ -3373,6 +3373,14 @@ impl SurvivalMarginalSlopeFamily {
         Ok(value)
     }
 
+    fn observed_score_projection(&self, row: usize) -> f64 {
+        if self.score_dim() == 1 {
+            self.z[[row, 0]]
+        } else {
+            self.z.row(row).sum()
+        }
+    }
+
     fn integration_score_basis_coefficients(
         &self,
         local_idx: usize,
@@ -5222,7 +5230,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
         let chi = eval_coeff4_at(&obs.dc_da, z_obs);
@@ -5237,7 +5245,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<ObservedDenestedCellPartials, String> {
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         if self.score_dim() == 1 {
             return shared_observed_denested_cell_partials(
                 z_obs,
@@ -5745,7 +5753,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
@@ -5975,7 +5983,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
@@ -8096,7 +8104,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         // Observed-point quantities and their dir-extensions
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let chi_val = eval_coeff4_at(&obs.dc_da, z_obs);
@@ -9222,7 +9230,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let z_obs = self.z[[row, 0]];
+        let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let scale = self.probit_frailty_scale();
 
