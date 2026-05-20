@@ -379,26 +379,6 @@ fn fill_embedded_symmetric_upper_columns(
     );
 }
 
-pub fn sparse_to_dense_symmetric_upper_public(matrix: &SparseColMat<usize, f64>) -> Array2<f64> {
-    let mut dense = Array2::<f64>::zeros((matrix.nrows(), matrix.ncols()));
-    let (symbolic, values) = matrix.parts();
-    let col_ptr = symbolic.col_ptr();
-    let row_idx = symbolic.row_idx();
-    for col in 0..matrix.ncols() {
-        let start = col_ptr[col];
-        let end = col_ptr[col + 1];
-        for idx in start..end {
-            let row = row_idx[idx];
-            let value = values[idx];
-            dense[[row, col]] += value;
-            if row != col {
-                dense[[col, row]] += value;
-            }
-        }
-    }
-    dense
-}
-
 pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     matrix: &SparseColMat<usize, f64>,
     vector: &ArrayBase<S, Ix1>,
