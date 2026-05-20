@@ -123,6 +123,25 @@ impl WarmStartStore {
     /// Corrupt or schema-mismatched candidates are silently cleaned up and
     /// skipped.
     pub fn lookup(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
+        self.lookup_with(key, entry_better)
+    }
+
+    /// Look up the newest valid entry for `key`, or `None` if no valid entry
+    /// exists.
+    ///
+    /// Unlike [`Self::lookup`], this deliberately ignores objective values.
+    /// Use this for near-match seed namespaces where entries may come from
+    /// different folds, diseases, or row sets, and objective magnitudes are
+    /// not comparable. Exact-key resume should keep using [`Self::lookup`].
+    pub fn lookup_latest(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
+        self.lookup_with(key, entry_newer)
+    }
+
+    fn lookup_with(
+        &self,
+        key: &Fingerprint,
+        better: fn(&OnDiskMeta, &OnDiskMeta) -> bool,
+    ) -> Result<Option<CachedEntry>, StoreError> {
         let dir = self.key_dir(key);
         if !dir.exists() {
             return Ok(None);
@@ -165,7 +184,7 @@ impl WarmStartStore {
             best = match best {
                 None => Some((meta, path)),
                 Some((cur, cur_path)) => {
-                    if entry_better(&meta, &cur) {
+                    if better(&meta, &cur) {
                         Some((meta, path))
                     } else {
                         Some((cur, cur_path))
@@ -408,7 +427,7 @@ fn entry_better(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
                 match (candidate.kind, current.kind) {
                     (EntryKind::Final, EntryKind::Checkpoint) => true,
                     (EntryKind::Checkpoint, EntryKind::Final) => false,
-                    _ => candidate.written_unix_secs > current.written_unix_secs,
+                    _ => entry_newer(candidate, current),
                 }
             } else {
                 c < d
@@ -416,7 +435,22 @@ fn entry_better(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
         }
         (Some(_), None) => true,
         (None, Some(_)) => false,
-        (None, None) => candidate.written_unix_secs > current.written_unix_secs,
+        (None, None) => entry_newer(candidate, current),
+    }
+}
+
+fn entry_newer(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
+    let candidate_stamp =
+        (candidate.written_unix_secs, candidate.written_nanos, candidate_kind_rank(candidate.kind));
+    let current_stamp =
+        (current.written_unix_secs, current.written_nanos, candidate_kind_rank(current.kind));
+    candidate_stamp > current_stamp
+}
+
+fn candidate_kind_rank(kind: EntryKind) -> u8 {
+    match kind {
+        EntryKind::Checkpoint => 0,
+        EntryKind::Final => 1,
     }
 }
 
