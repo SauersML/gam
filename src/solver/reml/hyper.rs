@@ -232,18 +232,6 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
         out
     }
 
-    fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.p, self.p));
-        let mut basis = Array1::<f64>::zeros(self.p);
-        for j in 0..self.p {
-            basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
-    }
-
     fn is_implicit(&self) -> bool {
         matches!(&self.x_tau_i, TauDesignTerm::Implicit(_))
             || matches!(&self.x_tau_j, TauDesignTerm::Implicit(_))
@@ -280,18 +268,6 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
             .x_design
             .transpose_vector_multiply(&(&self.c_x_tau_u_plus_d_cross * &x_v));
         term1 + term2 + term3
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.p, self.p));
-        let mut basis = Array1::<f64>::zeros(self.p);
-        for j in 0..self.p {
-            basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
     }
 
     fn is_implicit(&self) -> bool {
@@ -358,18 +334,6 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
             self.firth_op
                 .hphi_tau_partial_apply(&self.x_tau_dense, &self.tau_kernel, &rhs);
         base - firth_out.column(0).to_owned()
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.p, self.p));
-        let mut basis = Array1::<f64>::zeros(self.p);
-        for j in 0..self.p {
-            basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
     }
 
     fn is_implicit(&self) -> bool {
@@ -449,18 +413,6 @@ impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
             &rhs,
         );
         base - firth_out.column(0).to_owned()
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.p, self.p));
-        let mut basis = Array1::<f64>::zeros(self.p);
-        for j in 0..self.p {
-            basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
-            basis[j] = 0.0;
-        }
-        out
     }
 
     fn is_implicit(&self) -> bool {
