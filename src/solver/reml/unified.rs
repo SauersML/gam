@@ -3373,6 +3373,47 @@ impl ImplicitHyperOperator {
         cache.get_or_insert_with(key, || self.compute_xf(factor))
     }
 
+    fn projected_chunk_contribution(
+        &self,
+        xf: ArrayView2<'_, f64>,
+        u_knot: &Array2<f64>,
+        w: &[f64],
+        c_opt: Option<&[f64]>,
+        rank: usize,
+        start: usize,
+        end: usize,
+    ) -> Array2<f64> {
+        let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+        let kd_chunk = self
+            .implicit_deriv
+            .row_chunk_first_raw(self.axis, start..end)
+            .expect("radial scalar evaluation failed during implicit hyper projected_matrix");
+        let mut weighted_dxf = crate::faer_ndarray::fast_ab(&kd_chunk, u_knot);
+        for i_local in 0..(end - start) {
+            let w_i = w[start + i_local];
+            let mut row = weighted_dxf.row_mut(i_local);
+            for col in 0..rank {
+                row[col] *= w_i;
+            }
+        }
+        let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+        let mut partial = Array2::<f64>::zeros((rank, rank));
+        partial += &m;
+        partial += &m.t();
+        if let Some(c) = c_opt {
+            let mut weighted_xf = xf_chunk.to_owned();
+            for i_local in 0..(end - start) {
+                let c_i = c[start + i_local];
+                let mut row = weighted_xf.row_mut(i_local);
+                for col in 0..rank {
+                    row[col] *= c_i;
+                }
+            }
+            partial += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
+        }
+        partial
+    }
+
     fn trace_projected_chunk_reduction(
         &self,
         xf: ArrayView2<'_, f64>,
@@ -3536,49 +3577,49 @@ impl ImplicitHyperOperator {
             .max(512)
             .min(n_obs);
 
-        let w = self.w_diag.as_ref();
-        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
-        let mut projected = Array2::<f64>::zeros((rank, rank));
-        let mut start = 0usize;
-        while start < n_obs {
-            let end = (start + chunk_rows).min(n_obs);
-            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-            let kd_chunk = self
-                .implicit_deriv
-                .row_chunk_first_raw(self.axis, start..end)
-                .expect("radial scalar evaluation failed during implicit hyper projected_matrix");
-            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
-
-            let mut weighted_dxf = dxf_chunk;
-            for i_local in 0..(end - start) {
-                let w_i = w[start + i_local];
-                let mut row = weighted_dxf.row_mut(i_local);
-                for col in 0..rank {
-                    row[col] *= w_i;
-                }
+        let w_array = self.w_diag.as_ref();
+        let w = w_array
+            .as_slice()
+            .expect("w_diag must be contiguous for slice access");
+        let c_opt = self
+            .c_x_psi_beta
+            .as_ref()
+            .map(|arc| arc.as_slice().expect("c_x_psi_beta must be contiguous"));
+        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
+        let use_parallel = num_chunks >= 2
+            && rayon::current_thread_index().is_none()
+            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
+        let mut projected = if use_parallel {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunk_rows;
+                    let end = (start + chunk_rows).min(n_obs);
+                    self.projected_chunk_contribution(
+                        xf, &u_knot, w, c_opt, rank, start, end,
+                    )
+                })
+                .reduce(
+                    || Array2::<f64>::zeros((rank, rank)),
+                    |mut acc, partial| {
+                        acc += &partial;
+                        acc
+                    },
+                )
+        } else {
+            let mut projected = Array2::<f64>::zeros((rank, rank));
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let partial = self.projected_chunk_contribution(
+                    xf, &u_knot, w, c_opt, rank, start, end,
+                );
+                projected += &partial;
+                start = end;
             }
-
-            // Dᵀ W X and Xᵀ W D are transposes of each other; compute one
-            // GEMM and add both the result and its transpose.
-            let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
-            projected += &m;
-            projected += &m.t();
-
-            // Fuse the c·X correction into the same chunk pass to avoid a
-            // second sweep over the xf slice.
-            if let Some(c) = c_opt {
-                let mut weighted_xf = xf_chunk.to_owned();
-                for i_local in 0..(end - start) {
-                    let c_i = c[start + i_local];
-                    let mut row = weighted_xf.row_mut(i_local);
-                    for col in 0..rank {
-                        row[col] *= c_i;
-                    }
-                }
-                projected += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
-            }
-            start = end;
-        }
+            projected
+        };
 
         let s_f = self.s_psi.dot(factor);
         projected += &factor.t().dot(&s_f);
