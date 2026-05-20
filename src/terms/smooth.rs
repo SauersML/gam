@@ -1493,6 +1493,24 @@ fn realize_coefficient_groups(
                 )));
             }
         }
+        if let Some(children) = children_by_parent.get(&group.name) {
+            let mut child_union = BTreeSet::<usize>::new();
+            for child in children {
+                let child_cols = resolved
+                    .get(child)
+                    .expect("child group columns should exist after resolution");
+                child_union.extend(child_cols.iter().copied());
+            }
+            let parent_cols = resolved
+                .get(&group.name)
+                .expect("parent group columns should exist after resolution");
+            if &child_union != parent_cols {
+                return Err(BasisError::InvalidInput(format!(
+                    "coefficient group '{}' has children but its coefficients are not exactly the union of its child groups; nested supergroups concatenate child coefficients",
+                    group.name
+                )));
+            }
+        }
     }
 
     let mut penalty_specs: Vec<PenaltySpec> = design
