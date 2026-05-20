@@ -1199,10 +1199,10 @@ class Model:
 
         Returns ``(point, lower, upper, coverage_breakdown)``.  The first
         three entries are numpy arrays on the response-mean scale.  The
-        breakdown is one dict per prediction row, keyed by group label; each
-        value includes the signed eta-variance contribution plus a normalized
-        nonnegative ``width_fraction`` / ``ci_width`` attribution for the
-        returned interval width.
+        breakdown is one dict per prediction row.  Group-label entries contain
+        the within-group covariance-block contribution ``x_g' Cov_g,g x_g``;
+        ``"__cross_terms__"`` carries the cross-block terms needed to reconstruct
+        the total prediction variance.
         """
         import numpy as np
 
@@ -1238,39 +1238,103 @@ class Model:
             raise ValueError("prediction interval payload has inconsistent row count")
 
         cov = cov_flat.reshape(cov_n, cov_n)
-        cov_design = design @ cov
-        signed_by_coefficient = design * cov_design
         eta_variance = np.einsum("ij,jk,ik->i", design, cov, design)
         labels, label_info, label_indices = _coverage_provenance_groups(state, cov_n)
+
+        # Variance decomposition.
+        #
+        # Partition beta and the row design vector x by provenance label:
+        #   beta = (beta_1, ..., beta_K),  x = (x_1, ..., x_K)
+        # and conformably block V = Cov(beta) into V_g,h.  Then
+        #
+        #   Var[x beta] = x V x'
+        #               = sum_g x_g V_g,g x_g'
+        #                 + 2 sum_{g<h} x_g V_g,h x_h'.
+        #
+        # The per-group contribution reported below is the recognized diagonal
+        # block term sigma_g^2(x) = x_g V_g,g x_g'.  Cross-block covariance is
+        # exposed separately, so group terms plus cross terms reconstruct the
+        # total variance used by the interval calculation.
+        label_arrays = {
+            label: np.asarray(indices, dtype=int)
+            for label, indices in label_indices.items()
+        }
+        group_variance = {
+            label: np.einsum(
+                "ij,jk,ik->i",
+                design[:, indices],
+                cov[np.ix_(indices, indices)],
+                design[:, indices],
+            )
+            for label, indices in label_arrays.items()
+            if indices.size
+        }
 
         breakdown: list[dict[str, dict[str, Any]]] = []
         widths = np.maximum(upper - lower, 0.0)
         for row_idx in range(design.shape[0]):
-            signed = {
-                label: float(signed_by_coefficient[row_idx, indices].sum())
-                for label, indices in label_indices.items()
-            }
-            positive = {label: max(value, 0.0) for label, value in signed.items()}
-            positive_total = sum(positive.values())
-            variance = float(max(eta_variance[row_idx], 0.0))
             width = float(widths[row_idx])
             row_breakdown: dict[str, dict[str, Any]] = {}
+            group_sum = 0.0
+            active_labels: list[str] = []
             for label in labels:
-                signed_value = signed.get(label, 0.0)
-                width_fraction = (
-                    positive[label] / positive_total if positive_total > 0.0 else 0.0
-                )
-                variance_fraction = signed_value / variance if variance > 0.0 else 0.0
+                indices = label_arrays.get(label)
+                if indices is None or not indices.size:
+                    continue
+                variance = float(group_variance[label][row_idx])
+                group_sum += variance
+                row_design = design[row_idx, indices]
+                if np.any(row_design != 0.0) or variance != 0.0:
+                    active_labels.append(label)
                 entry: dict[str, Any] = {
-                    "ci_width": float(width * width_fraction),
-                    "width_fraction": float(width_fraction),
-                    "variance": float(signed_value),
-                    "variance_fraction": float(variance_fraction),
+                    "variance": variance,
+                    "standard_error": float(np.sqrt(max(variance, 0.0))),
+                    "component": "within_group_covariance_block",
                 }
                 info = label_info.get(label)
                 if info:
                     entry.update(info)
                 row_breakdown[label] = entry
+
+            pairwise: list[dict[str, Any]] = []
+            pairwise_sum = 0.0
+            for left_pos, left in enumerate(active_labels):
+                left_indices = label_arrays[left]
+                x_left = design[row_idx, left_indices]
+                for right in active_labels[left_pos + 1:]:
+                    right_indices = label_arrays[right]
+                    x_right = design[row_idx, right_indices]
+                    cross_variance = 2.0 * float(
+                        x_left
+                        @ cov[np.ix_(left_indices, right_indices)]
+                        @ x_right
+                    )
+                    pairwise_sum += cross_variance
+                    if cross_variance != 0.0:
+                        pairwise.append(
+                            {
+                                "left": left,
+                                "right": right,
+                                "variance": cross_variance,
+                            }
+                        )
+
+            total_variance = float(eta_variance[row_idx])
+            cross_variance = total_variance - group_sum
+            row_breakdown["__cross_terms__"] = {
+                "variance": cross_variance,
+                "pairwise": pairwise,
+                "pairwise_sum": float(pairwise_sum),
+                "component": "between_group_covariance_blocks",
+            }
+            row_breakdown["__total__"] = {
+                "variance": total_variance,
+                "standard_error": float(np.sqrt(max(total_variance, 0.0))),
+                "ci_width": width,
+                "group_variance_sum": float(group_sum),
+                "cross_variance": cross_variance,
+                "reconstructed_variance": float(group_sum + cross_variance),
+            }
             breakdown.append(row_breakdown)
 
         return point, lower, upper, breakdown
