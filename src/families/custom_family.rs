@@ -9135,12 +9135,25 @@ fn dense_more_sorensen_step(
         }
 
         let q = solver.solvevectorwithridge_retries(&lhs, &delta, JOINT_TRACE_STABILITY_RIDGE)?;
-        let q_norm = joint_trust_region_step_norm(&q);
-        if !q_norm.is_finite() || q_norm <= 0.0 {
+        // Moré–Sorensen 1983 (Algorithm 2.2): the secular equation
+        //     φ(λ) = 1/Δ − 1/‖δ(λ)‖ = 0
+        // has Newton step
+        //     λ_new = λ + (‖δ‖² / w²) · (‖δ‖ − Δ) / Δ,
+        // where w² ≡ δᵀ(H+λI)⁻¹δ. Since q satisfies (H+λI) q = δ we have
+        // δ·q = δᵀ(H+λI)⁻¹δ = w², so the denominator is the dot product —
+        // *not* ‖q‖² = δᵀ(H+λI)⁻²δ, which differs from w² by a factor of
+        // O(cond(H+λI)). An earlier version of this loop used ‖q‖² and
+        // therefore overshot the secant step by that factor on every
+        // ill-conditioned subproblem, wasting most of the 8 iterations
+        // clamped to `upper_jump` instead of landing on ‖δ‖ ≈ Δ. With the
+        // correct denominator the iteration recovers the standard
+        // Moré–Sorensen quadratic-rate convergence on the boundary.
+        let w_norm_sq = delta.dot(&q);
+        if !w_norm_sq.is_finite() || w_norm_sq <= 0.0 {
             break;
         }
 
-        let secant = (delta_norm / q_norm).powi(2) * (delta_norm - radius) / radius;
+        let secant = delta_norm.powi(2) / w_norm_sq * (delta_norm - radius) / radius;
         let mut lambda_new = lambda_tr + secant;
         if !lambda_new.is_finite() {
             break;
