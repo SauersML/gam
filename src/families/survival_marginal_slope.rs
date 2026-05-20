@@ -331,6 +331,17 @@ fn build_per_z_score_warp_deviation_block_from_seed(
         });
     }
 
+    // Vector-z score warp is the direct sum of K scalar warp spaces:
+    //
+    //     h_i = sum_{k=1}^K W_k(z_{ik}) beta_k .
+    //
+    // The coefficient vector is laid out as [beta_1 | ... | beta_K],
+    // and the row design is the horizontal concatenation of the K scalar
+    // designs.  Penalties are block-local on each coordinate slice, giving
+    // each W_k its own smoothing parameter unless a later grouping layer
+    // intentionally ties precision labels.  When K=1, the direct sum has
+    // one component and the function has already returned the exact legacy
+    // scalar block above.
     let p = base.runtime.basis_dim();
     let n = z.nrows();
     let mut design = Array2::<f64>::zeros((n, p * score_dim));
@@ -3151,6 +3162,119 @@ impl SurvivalMarginalSlopeFamily {
         score_warp_component_beta(runtime, beta_h, coord)
     }
 
+    #[inline]
+    fn zero_score_warp_span() -> exact_kernel::LocalSpanCubic {
+        exact_kernel::LocalSpanCubic {
+            left: 0.0,
+            right: 1.0,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.0,
+            c3: 0.0,
+        }
+    }
+
+    fn add_local_span_cubic(
+        left: f64,
+        right: f64,
+        target: &mut exact_kernel::LocalSpanCubic,
+        span: exact_kernel::LocalSpanCubic,
+    ) {
+        target.left = left;
+        target.right = right;
+        target.c0 += span.c0;
+        target.c1 += span.c1;
+        target.c2 += span.c2;
+        target.c3 += span.c3;
+    }
+
+    fn score_warp_local_cubic_at(
+        &self,
+        beta_h: Option<&Array1<f64>>,
+        value: f64,
+    ) -> Result<exact_kernel::LocalSpanCubic, String> {
+        let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) else {
+            return Ok(Self::zero_score_warp_span());
+        };
+        if self.score_dim() == 1 {
+            return runtime.local_cubic_at(beta_h, value);
+        }
+        let mut sum = Self::zero_score_warp_span();
+        for coord in 0..self.score_dim() {
+            let local_beta = score_warp_component_beta(runtime, beta_h, coord)?;
+            let span = runtime.local_cubic_at(&local_beta, value)?;
+            if coord == 0 {
+                sum = exact_kernel::LocalSpanCubic {
+                    left: span.left,
+                    right: span.right,
+                    c0: 0.0,
+                    c1: 0.0,
+                    c2: 0.0,
+                    c3: 0.0,
+                };
+            }
+            Self::add_local_span_cubic(span.left, span.right, &mut sum, span);
+        }
+        Ok(sum)
+    }
+
+    fn score_warp_observed_value(
+        &self,
+        row: usize,
+        beta_h: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        let (Some(runtime), Some(beta_h)) = (self.score_warp.as_ref(), beta_h) else {
+            return Ok(0.0);
+        };
+        let mut value = 0.0;
+        for coord in 0..self.score_dim() {
+            let local_beta = score_warp_component_beta(runtime, beta_h, coord)?;
+            let z_coord = self.z[[row, coord]];
+            value += runtime.local_cubic_at(&local_beta, z_coord)?.evaluate(z_coord);
+        }
+        Ok(value)
+    }
+
+    fn integration_score_basis_coefficients(
+        &self,
+        local_idx: usize,
+        z_basis: f64,
+        multiplier: f64,
+    ) -> Result<[f64; 4], String> {
+        let runtime = self
+            .score_warp
+            .as_ref()
+            .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
+        let (_, basis_idx) = self.score_warp_coord_basis_index(local_idx)?;
+        let basis_span = runtime.basis_cubic_at(basis_idx, z_basis)?;
+        Ok(exact_kernel::score_basis_cell_coefficients(
+            basis_span, multiplier,
+        ))
+    }
+
+    fn observed_score_basis_coefficients(
+        &self,
+        row: usize,
+        local_idx: usize,
+        z_obs: f64,
+        multiplier: f64,
+    ) -> Result<[f64; 4], String> {
+        let runtime = self
+            .score_warp
+            .as_ref()
+            .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
+        if self.score_dim() == 1 {
+            let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
+            return Ok(exact_kernel::score_basis_cell_coefficients(
+                basis_span, multiplier,
+            ));
+        }
+        let (coord, basis_idx) = self.score_warp_coord_basis_index(local_idx)?;
+        let z_coord = self.z[[row, coord]];
+        let basis_span = runtime.basis_cubic_at(basis_idx, z_coord)?;
+        Ok([multiplier * basis_span.evaluate(z_coord), 0.0, 0.0, 0.0])
+    }
+
     fn logslope_vector_for_row(
         &self,
         row: usize,
@@ -4404,16 +4528,6 @@ impl SurvivalMarginalSlopeFamily {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
-    fn require_supported_flex_score_geometry(&self) -> Result<(), String> {
-        if self.score_warp.is_some() && self.score_dim() > 1 {
-            return Err(
-                "survival marginal-slope per-z score-warp block is expanded, but the exact flexible row kernel still awaits task-01 vector primary-slope plumbing; K=1 retains the existing scalar row-kernel path"
-                    .to_string(),
-            );
-        }
-        Ok(())
-    }
-
     fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
         if self.score_warp.is_some() && self.flex_score_beta(block_states)?.is_none() {
             return Err("missing survival score-warp block state".to_string());
@@ -4421,7 +4535,6 @@ impl SurvivalMarginalSlopeFamily {
         if self.link_dev.is_some() && self.flex_link_beta(block_states)?.is_none() {
             return Err("missing survival link-deviation block state".to_string());
         }
-        self.require_supported_flex_score_geometry()?;
         Ok(self.flex_active())
     }
 
@@ -4459,15 +4572,51 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<Vec<exact_kernel::DenestedPartitionCell>, String> {
-        shared_denested_partition_cells(
+        if self.score_dim() == 1 {
+            return shared_denested_partition_cells(
+                a,
+                b,
+                self.score_warp.as_ref(),
+                beta_h,
+                self.link_dev.as_ref(),
+                beta_w,
+                self.probit_frailty_scale(),
+            );
+        }
+        let score_breaks = self
+            .score_warp
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
+        let link_breaks = self
+            .link_dev
+            .as_ref()
+            .map(|runtime| runtime.breakpoints().to_vec())
+            .unwrap_or_default();
+        let mut cells = exact_kernel::build_denested_partition_cells_with_tails(
             a,
             b,
-            self.score_warp.as_ref(),
-            beta_h,
-            self.link_dev.as_ref(),
-            beta_w,
-            self.probit_frailty_scale(),
-        )
+            &score_breaks,
+            &link_breaks,
+            |z| self.score_warp_local_cubic_at(beta_h, z),
+            |u| {
+                if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w) {
+                    runtime.local_cubic_at(beta_w, u)
+                } else {
+                    Ok(Self::zero_score_warp_span())
+                }
+            },
+        )?;
+        let scale = self.probit_frailty_scale();
+        if scale != 1.0 {
+            for partition_cell in &mut cells {
+                partition_cell.cell.c0 *= scale;
+                partition_cell.cell.c1 *= scale;
+                partition_cell.cell.c2 *= scale;
+                partition_cell.cell.c3 *= scale;
+            }
+        }
+        Ok(cells)
     }
 
     fn evaluate_denested_survival_calibration(
@@ -4851,16 +5000,68 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<ObservedDenestedCellPartials, String> {
-        shared_observed_denested_cell_partials(
-            self.z[[row, 0]],
-            a,
-            b,
-            self.score_warp.as_ref(),
-            beta_h,
-            self.link_dev.as_ref(),
-            beta_w,
-            self.probit_frailty_scale(),
-        )
+        let z_obs = self.z[[row, 0]];
+        if self.score_dim() == 1 {
+            return shared_observed_denested_cell_partials(
+                z_obs,
+                a,
+                b,
+                self.score_warp.as_ref(),
+                beta_h,
+                self.link_dev.as_ref(),
+                beta_w,
+                self.probit_frailty_scale(),
+            );
+        }
+
+        // Observed vector-z contribution is the row-wise direct-sum value
+        //     h_i = sum_k W_k(z_ik) beta_k.
+        // In the denested additive transport, h_i enters as b*h_i at the
+        // observed row.  Holding z_i fixed makes this a constant coefficient
+        // in the observed polynomial while preserving the standard link
+        // partials in a and b.
+        let h_obs = self.score_warp_observed_value(row, beta_h)?;
+        let u_obs = a + b * z_obs;
+        let link_span = if let (Some(runtime), Some(beta_w)) = (self.link_dev.as_ref(), beta_w) {
+            runtime.local_cubic_at(beta_w, u_obs)?
+        } else {
+            Self::zero_score_warp_span()
+        };
+        let (d0, d1, d2, d3) = exact_kernel::transformed_link_cubic(link_span, a, b);
+        let coeff_raw = [a + b * h_obs + d0, b + d1, d2, d3];
+        let shift = a - link_span.left;
+        let alpha1 = link_span.c1;
+        let alpha2 = link_span.c2;
+        let alpha3 = link_span.c3;
+        let dc_da_raw = [
+            1.0 + alpha1 + 2.0 * alpha2 * shift + 3.0 * alpha3 * shift * shift,
+            b * (2.0 * alpha2 + 6.0 * alpha3 * shift),
+            3.0 * alpha3 * b * b,
+            0.0,
+        ];
+        let dc_db_raw = [
+            h_obs,
+            1.0 + alpha1 + 2.0 * alpha2 * shift + 3.0 * alpha3 * shift * shift,
+            2.0 * b * (alpha2 + 3.0 * alpha3 * shift),
+            3.0 * alpha3 * b * b,
+        ];
+        let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) =
+            exact_kernel::link_basis_cell_second_partials(link_span, a, b);
+        let (dc_daaa_raw, dc_daab_raw, dc_dabb_raw, dc_dbbb_raw) =
+            exact_kernel::link_basis_cell_third_partials(link_span);
+        let scale = self.probit_frailty_scale();
+        Ok(ObservedDenestedCellPartials {
+            coeff: scale_coeff4(coeff_raw, scale),
+            dc_da: scale_coeff4(dc_da_raw, scale),
+            dc_db: scale_coeff4(dc_db_raw, scale),
+            dc_daa: scale_coeff4(dc_daa_raw, scale),
+            dc_dab: scale_coeff4(dc_dab_raw, scale),
+            dc_dbb: scale_coeff4(dc_dbb_raw, scale),
+            dc_daaa: scale_coeff4(dc_daaa_raw, scale),
+            dc_daab: scale_coeff4(dc_daab_raw, scale),
+            dc_dabb: scale_coeff4(dc_dabb_raw, scale),
+            dc_dbbb: scale_coeff4(dc_dbbb_raw, scale),
+        })
     }
 
     fn denested_cell_primary_fixed_partials(
