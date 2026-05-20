@@ -109,6 +109,7 @@ pub use solver::workflow::{
     LinkWiggleConfig, MaterializedModel, StandardBinomialWiggleConfig, StandardFitRequest,
     StandardFitResult, SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
     SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
-    SurvivalTransformationFitResult, TransformationNormalFitRequest, fit_from_formula, fit_model,
-    is_binary_response, materialize, resolve_family, resolve_offset_column, resolve_weight_column,
+    SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
+    TransformationNormalFitRequest, fit_from_formula, fit_model, is_binary_response, materialize,
+    resolve_family, resolve_offset_column, resolve_weight_column,
 };
