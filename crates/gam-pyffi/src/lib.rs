@@ -4886,9 +4886,7 @@ fn parse_precision_hyperpriors(
     }
 }
 
-fn nonempty_group_metadata(
-    metadata: GroupMetadata,
-) -> Option<GroupMetadata> {
+fn nonempty_group_metadata(metadata: GroupMetadata) -> Option<GroupMetadata> {
     if metadata.is_empty() {
         None
     } else {
@@ -4896,9 +4894,7 @@ fn nonempty_group_metadata(
     }
 }
 
-fn group_metadata_from_groups(
-    groups: serde_json::Value,
-) -> Result<Option<GroupMetadata>, String> {
+fn group_metadata_from_groups(groups: serde_json::Value) -> Result<Option<GroupMetadata>, String> {
     match groups {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::Object(map) => {
