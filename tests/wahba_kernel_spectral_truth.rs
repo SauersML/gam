@@ -3,9 +3,12 @@
 //! The Wahba reproducing kernel on S² with smoothness order m is
 //!     K_m(p, q) = (1 / 4π) · Σ_{l ≥ 1} (2l + 1) · [l(l + 1)]^(-m) · P_l(cos γ)
 //! where γ = arc-distance(p, q) and P_l is the unnormalized Legendre
-//! polynomial of degree l. This series converges absolutely for any m ≥ 1
-//! (terms decay like l^{1 - 2m}), so truncating at L = 200 gives the
-//! "truth" against which the closed-form polynomial in
+//! polynomial of degree l. The l-th term scales like l^{1 − 2m}, so the
+//! series converges absolutely for m ≥ 2 and is only conditionally
+//! convergent (and divergent at γ = 0) for m = 1: at γ = 0 the m = 1
+//! sum behaves like ½π · Σ 1/l, the harmonic series. For m = 1 we
+//! therefore probe at γ > 0 only; for m ≥ 2 truncating at L = 200 gives
+//! the "truth" against which the closed-form polynomial in
 //! `wahba_sphere_kernel_from_cos` is exact (up to an additive constant
 //! the closed form may subtract for normalization).
 //!

@@ -75,11 +75,17 @@ seam-continuous and singularity-free is entirely a property of the basis
   pole artefacts. A spherical-harmonic alternative is also available
   (`method=harmonic, max_degree=L`); both are documented in
   [the formula reference](formulas.md#intrinsic-s2-sphere-smooth).
-- **Möbius strip.** The half-twist means you have to go around twice
-  before returning to the start, so the period of `u` is `4π`, not
-  `2π`. The fitter does not know the strip is non-orientable — it only
-  knows that the marginal in `u` wraps with period `4π` — and the
-  recovered embedding happens to be Möbius because the input points are.
+- **Möbius embedding (4π double-cover).** The demo uses the standard
+  embedding `F(u, v) = ((1 + ½v cos(u/2)) cos u, (1 + ½v cos(u/2)) sin u,
+  ½v sin(u/2))`, which satisfies `F(u+2π, v) = F(u, −v)` and
+  `F(u+4π, v) = F(u, v)`. We give the smoother the latter, ordinary
+  periodicity (period `4π` in `u`), so the *predictor manifold* the
+  smoother sees is the orientable cylinder `S¹ × [−v, v]` — not a true
+  one-sided Möbius strip. The fitted surface in ℝ³ still looks Möbius
+  because the embedding is Möbius; the basis/penalty themselves do not
+  encode the twisted identification `(u, v) ∼ (u+2π, −v)`. A true Möbius
+  basis (twisted boundary condition) is a separate construction not
+  exposed by the formula DSL today.
 
 ## Why use a geometric smooth over an ordinary smooth?
 

@@ -12,12 +12,12 @@ use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::fast_av;
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
-    build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed, padded_deviation_seed,
-    project_monotone_feasible_beta, push_deviation_aux_blockspecs,
-    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
-    unary_derivatives_sqrt,
+    MarginalSlopeCovariance, build_link_deviation_block_from_knots_design_seed_and_weights,
+    build_score_warp_deviation_block_from_seed, marginal_slope_covariance_from_scores,
+    marginal_slope_preserving_scale, padded_deviation_seed, project_monotone_feasible_beta,
+    push_deviation_aux_blockspecs, signed_probit_neglog_derivatives_up_to_fourth,
+    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
+    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -73,7 +73,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub age_exit: Array1<f64>,
     pub event_target: Array1<f64>,
     pub weights: Array1<f64>,
-    pub z: Array1<f64>,
+    pub z: Array2<f64>,
     pub base_link: InverseLink,
     pub marginalspec: TermCollectionSpec,
     pub marginal_offset: Array1<f64>,
@@ -147,7 +147,7 @@ struct SurvivalMarginalSlopeFamily {
     n: usize,
     event: Arc<Array1<f64>>,
     weights: Arc<Array1<f64>>,
-    z: Arc<Array1<f64>>,
+    z: Arc<Array2<f64>>,
     gaussian_frailty_sd: Option<f64>,
     derivative_guard: f64,
     /// Time block: 3 designs sharing one beta vector.
@@ -2900,7 +2900,7 @@ impl SurvivalMarginalSlopeFamily {
             .collect();
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
-            self.z.as_slice().expect("z must be contiguous"),
+            self.z.column(0).as_slice().expect("z column must be contiguous"),
             Some(&event_secondary),
             &beta_proxy,
             &self.auto_subsample_phase_counter,
@@ -2958,7 +2958,7 @@ impl SurvivalMarginalSlopeFamily {
                         q_geom.q1,
                         q_geom.qd1,
                         g,
-                        self.z[i],
+                        self.z[[i, 0]],
                         self.weights[i],
                         self.event[i],
                         guard,
@@ -3019,7 +3019,7 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[row];
+        let zi = self.z[[row, 0]];
         let q_geom = self.row_dynamic_q_values(row, block_states)?;
 
         let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
@@ -4461,7 +4461,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
     ) -> Result<(f64, f64), String> {
-        let z_obs = self.z[row];
+        let z_obs = self.z[[row, 0]];
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
         let chi = eval_coeff4_at(&obs.dc_da, z_obs);
@@ -4477,7 +4477,7 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<ObservedDenestedCellPartials, String> {
         shared_observed_denested_cell_partials(
-            self.z[row],
+            self.z[[row, 0]],
             a,
             b,
             self.score_warp.as_ref(),
@@ -4936,7 +4936,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let z_obs = self.z[row];
+        let z_obs = self.z[[row, 0]];
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
@@ -5167,7 +5167,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let z_obs = self.z[row];
+        let z_obs = self.z[[row, 0]];
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let eta = eval_coeff4_at(&obs.coeff, z_obs);
@@ -5635,7 +5635,7 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[row];
+        let zi = self.z[[row, 0]];
 
         // Primary scalar jets: q0, q1, qd1, g.
         // Stack-allocated fixed-capacity buffers (k ≤ 4 by precondition above)
@@ -5779,7 +5779,7 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[row];
+        let zi = self.z[[row, 0]];
 
         // Primary scalar jets: q0, q1, qd1, g. Fixed-capacity stack buffers
         // (k ≤ 8) avoid heap allocation in the per-row hot loop.
@@ -5967,7 +5967,7 @@ impl SurvivalMarginalSlopeFamily {
             q_geom.q1,
             q_geom.qd1,
             g,
-            self.z[row],
+            self.z[[row, 0]],
             self.weights[row],
             self.event[row],
             self.derivative_guard,
@@ -7281,7 +7281,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         // Observed-point quantities and their dir-extensions
-        let z_obs = self.z[row];
+        let z_obs = self.z[[row, 0]];
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
         let chi_val = eval_coeff4_at(&obs.dc_da, z_obs);
@@ -8408,7 +8408,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let z_obs = self.z[row];
+        let z_obs = self.z[[row, 0]];
         let u_obs = a + b * z_obs;
         let scale = self.probit_frailty_scale();
 
@@ -12325,7 +12325,7 @@ impl SurvivalMarginalSlopeFamily {
                         q_geom.q1,
                         q_geom.qd1,
                         block_states[2].eta[row],
-                        self.z[row],
+                        self.z[[row, 0]],
                         self.weights[row],
                         self.event[row],
                         self.derivative_guard,
@@ -15180,7 +15180,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     if spec.age_exit.len() != n
         || spec.event_target.len() != n
         || spec.weights.len() != n
-        || spec.z.len() != n
+        || spec.z.nrows() != n
         || spec.marginal_offset.len() != n
         || spec.logslope_offset.len() != n
     {
@@ -15190,7 +15190,7 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
             spec.age_exit.len(),
             spec.event_target.len(),
             spec.weights.len(),
-            spec.z.len(),
+            spec.z.nrows(),
             spec.marginal_offset.len(),
             spec.logslope_offset.len()
         ));
