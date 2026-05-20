@@ -547,6 +547,30 @@ fn expand_custom_group_base_prior(
     }
 }
 
+fn coefficient_group_leaf_penalty_components(
+    label: &str,
+    children_by_parent: &BTreeMap<String, Vec<String>>,
+    group_sets: &BTreeMap<String, BTreeSet<(usize, usize)>>,
+) -> Vec<BTreeSet<(usize, usize)>> {
+    let Some(children) = children_by_parent.get(label) else {
+        return vec![
+            group_sets
+                .get(label)
+                .expect("coefficient group set should exist")
+                .clone(),
+        ];
+    };
+    let mut components = Vec::new();
+    for child in children {
+        components.extend(coefficient_group_leaf_penalty_components(
+            child,
+            children_by_parent,
+            group_sets,
+        ));
+    }
+    components
+}
+
 pub fn realize_coefficient_groups_for_custom_family(
     specs: &[ParameterBlockSpec],
     groups: &[CoefficientGroupSpec],
@@ -612,6 +636,15 @@ pub fn realize_coefficient_groups_for_custom_family(
         .iter()
         .map(|group| (group.label.clone(), group.parent.clone()))
         .collect();
+    let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+    for group in groups {
+        if let Some(parent) = group.parent.as_ref() {
+            children_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(group.label.clone());
+        }
+    }
     for group in &realized_groups {
         let mut path = BTreeSet::<String>::new();
         let mut cursor = Some(group.label.as_str());
@@ -680,39 +713,62 @@ pub fn realize_coefficient_groups_for_custom_family(
         };
         priors.push(group_prior);
 
-        let mut by_block = BTreeMap::<usize, Vec<usize>>::new();
-        for &(block_idx, column) in &group.coefficients {
-            by_block.entry(block_idx).or_default().push(column);
-        }
-        for (block_idx, columns) in by_block {
-            let p = realized_specs[block_idx].design.ncols();
-            let mut matrix = Array2::<f64>::zeros((p, p));
-            for column in columns {
-                matrix[[column, column]] = 1.0;
+        // Hierarchical Gamma precision update.
+        //
+        // For one Gaussian coefficient group with fixed beta and precision
+        // lambda,
+        //
+        //   p(beta_g | lambda) p(lambda)
+        //     ∝ lambda^{|g|/2} exp[-lambda q_g/2]
+        //       lambda^{a_g-1} exp[-b_g lambda],
+        //   q_g = (beta_g - mu_g)' S_g (beta_g - mu_g).
+        //
+        // Maximizing the log posterior in lambda gives
+        //
+        //   lambda* = (a_g + |g|/2 - 1) / (b_g + q_g/2).
+        //
+        // If a node has descendants, the parent precision is a single
+        // lambda multiplying the product of descendant Gaussian factors:
+        // replace |g| and q_g by sums over descendant leaf components.  We
+        // preserve that identity by emitting one physical penalty piece per
+        // descendant leaf and tying those pieces with the parent's precision
+        // label.  This is not a block-sum shortcut: overlapping leaves remain
+        // separate factors, so their log normalizers and quadratic
+        // contributions both add.
+        let penalty_components = coefficient_group_leaf_penalty_components(
+            &group.label,
+            &children_by_parent,
+            &group_sets,
+        );
+        for component in penalty_components {
+            let mut by_block = BTreeMap::<usize, Vec<usize>>::new();
+            for &(block_idx, column) in &component {
+                by_block.entry(block_idx).or_default().push(column);
             }
-            realized_specs[block_idx]
-                .penalties
-                .push(PenaltyMatrix::Dense(matrix).with_precision_label(group.label.clone()));
-            realized_specs[block_idx].nullspace_dims.push(
-                p.saturating_sub(
-                    group
-                        .coefficients
-                        .iter()
-                        .filter(|(b, _)| *b == block_idx)
-                        .count(),
-                ),
-            );
-            let mut rho =
-                Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
-            if !realized_specs[block_idx].initial_log_lambdas.is_empty() {
-                let old_len = realized_specs[block_idx].initial_log_lambdas.len();
-                rho.slice_mut(s![..old_len])
-                    .assign(&realized_specs[block_idx].initial_log_lambdas);
+            for (block_idx, columns) in by_block {
+                let p = realized_specs[block_idx].design.ncols();
+                let mut matrix = Array2::<f64>::zeros((p, p));
+                for column in &columns {
+                    matrix[[*column, *column]] = 1.0;
+                }
+                realized_specs[block_idx]
+                    .penalties
+                    .push(PenaltyMatrix::Dense(matrix).with_precision_label(group.label.clone()));
+                realized_specs[block_idx]
+                    .nullspace_dims
+                    .push(p.saturating_sub(columns.len()));
+                let mut rho =
+                    Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
+                if !realized_specs[block_idx].initial_log_lambdas.is_empty() {
+                    let old_len = realized_specs[block_idx].initial_log_lambdas.len();
+                    rho.slice_mut(s![..old_len])
+                        .assign(&realized_specs[block_idx].initial_log_lambdas);
+                }
+                let last = rho.len() - 1;
+                rho[last] = group.initial_log_precision;
+                realized_specs[block_idx].initial_log_lambdas = rho;
+                penalty_labels.push(group.label.clone());
             }
-            let last = rho.len() - 1;
-            rho[last] = group.initial_log_precision;
-            realized_specs[block_idx].initial_log_lambdas = rho;
-            penalty_labels.push(group.label.clone());
         }
     }
 
