@@ -2963,6 +2963,11 @@ impl MarginalSlopeCovariance {
                 total
             }
             Self::LowRank(factor) => {
+                // Sigma = L L'. The Gaussian-probit scale only needs
+                // r' Sigma r = ||L' r||^2. Equivalently,
+                // det(I + L' r r' L) = 1 + ||L' r||^2 by the matrix
+                // determinant lemma, so the low-rank path never builds
+                // the full K x K covariance.
                 let mut total = 0.0;
                 for r in 0..factor.ncols() {
                     let mut projection = 0.0;
@@ -2984,6 +2989,32 @@ impl MarginalSlopeCovariance {
     }
 }
 
+// Marginal-slope probit identity.
+//
+// For a row with latent scores z | a ~ N(0, Sigma(a)) and probit index
+//
+//     eta = c(a) q(t, a) + r(a)' z,
+//
+// the preservation target is
+//
+//     E_z[Phi(-eta) | a] = Phi(-q(t, a)).
+//
+// If X = r' z is N(0, v) with v = r' Sigma r, then for independent
+// E ~ N(0, 1),
+//
+//     E[Phi(-(c q + X))]
+//       = P(E <= -c q - X)
+//       = P(E + X <= -c q)
+//       = Phi(-c q / sqrt(1 + v)).
+//
+// Thus the target holds for every q exactly when
+//
+//     c(a) = sqrt(1 + r(a)' Sigma(a) r(a)).
+//
+// `probit_scale` maps the raw log-slope surface to the observed probit
+// gradient r(a). K=1 with diagonal variance 1 gives the original scalar
+// formula sqrt(1 + r^2); full and low-rank covariances differ only in the
+// shape-specific evaluation of the same quadratic form.
 pub fn marginal_slope_covariance_from_scores(
     scores: ArrayView2<'_, f64>,
     weights: &Array1<f64>,
