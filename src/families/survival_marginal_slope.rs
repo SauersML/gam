@@ -433,7 +433,33 @@ fn build_per_z_score_warp_aux_blockspec(
         projected.slice_mut(s![range]).assign(&local);
     }
     block.initial_beta = Some(projected);
-    block.intospec("score_warp_dev")
+    let mut spec = block.intospec("score_warp_dev")?;
+    if prepared.score_dim > 1 {
+        // The physical penalty order mirrors the direct-sum coefficient
+        // layout: all penalties for beta_1, then beta_2, ..., beta_K.  Giving
+        // each coordinate-local penalty a distinct precision label makes the
+        // default MAP problem one-lambda-per-W_k; task-04 coefficient-group
+        // penalties can still introduce intentionally shared precision
+        // factors without accidentally tying these base smoothness penalties.
+        if spec.penalties.len() % prepared.score_dim != 0 {
+            return Err(format!(
+                "survival score-warp penalty count {} is not divisible by K={}",
+                spec.penalties.len(),
+                prepared.score_dim
+            ));
+        }
+        let penalties_per_coord = spec.penalties.len() / prepared.score_dim;
+        for coord in 0..prepared.score_dim {
+            for penalty_idx in 0..penalties_per_coord {
+                let flat_idx = coord * penalties_per_coord + penalty_idx;
+                let label = format!("score_warp_dev[z{coord}].penalty{penalty_idx}");
+                spec.penalties[flat_idx] = spec.penalties[flat_idx]
+                    .clone()
+                    .with_precision_label(label);
+            }
+        }
+    }
+    Ok(spec)
 }
 
 // ── Block layout ──────────────────────────────────────────────────────
