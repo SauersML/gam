@@ -13,6 +13,7 @@ use gam::types::{
 };
 use ndarray::{Array1, Array2};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -166,6 +167,81 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
         inner_cycles: 0,
     })
     .expect("minimal survival fit result must be valid")
+}
+
+fn minimal_standard_model_with_group_metadata(
+    group_metadata: Option<BTreeMap<String, Value>>,
+) -> FittedModel {
+    let mut payload = FittedModelPayload::new(
+        MODEL_PAYLOAD_VERSION,
+        "y ~ group(g)".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodFamily::GaussianIdentity,
+            link: Some(LinkFunction::Identity),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "gaussian".to_string(),
+    );
+    payload.fit_result = Some(minimal_fit_result(FittedLinkState::Standard(None)));
+    payload.data_schema = Some(gam::inference::model::DataSchema { columns: vec![] });
+    payload.group_metadata = group_metadata;
+    FittedModel::from_payload(payload)
+}
+
+#[test]
+fn saved_model_group_metadata_is_optional_and_roundtrips() {
+    let mut group_metadata = BTreeMap::new();
+    group_metadata.insert(
+        "alpha".to_string(),
+        serde_json::json!({
+            "source": "registry-a",
+            "batch": 7,
+            "scores": [0.25, 0.75],
+            "audited": true
+        }),
+    );
+    group_metadata.insert(
+        "beta".to_string(),
+        serde_json::json!({
+            "source": "registry-b",
+            "batch": 8,
+            "tags": ["heldout", "priority"],
+            "audited": false
+        }),
+    );
+
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("group-metadata-model.json");
+    let model = minimal_standard_model_with_group_metadata(Some(group_metadata.clone()));
+    model.save_to_path(&path).expect("save model");
+
+    let saved = read_saved_model_json(&path);
+    assert_eq!(
+        saved_model_payload(&saved).get("group_metadata"),
+        Some(&serde_json::to_value(&group_metadata).expect("group metadata json"))
+    );
+
+    let loaded = FittedModel::load_from_path(&path).expect("load model");
+    let FittedModel::Standard { payload } = loaded else {
+        panic!("expected standard model");
+    };
+    assert_eq!(payload.group_metadata, Some(group_metadata));
+
+    let legacy_json = serde_json::to_string(&minimal_standard_model_with_group_metadata(None))
+        .expect("serialize legacy-shaped model");
+    assert!(
+        !legacy_json.contains("group_metadata"),
+        "missing group_metadata is the legacy wire shape"
+    );
+    let legacy_model: FittedModel =
+        serde_json::from_str(&legacy_json).expect("deserialize legacy-shaped model");
+    let FittedModel::Standard { payload } = legacy_model else {
+        panic!("expected standard model");
+    };
+    assert_eq!(payload.group_metadata, None);
 }
 
 #[test]

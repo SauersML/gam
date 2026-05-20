@@ -6018,6 +6018,50 @@ fn build_diagonal_penalty_from_kronecker(
     PirlsPenalty::Diagonal {
         diag,
         positive_indices,
+        linear_shift: Array1::zeros(p),
+        constant_shift: 0.0,
+    }
+}
+
+fn canonical_prior_shift(
+    penalties: &[crate::construction::CanonicalPenalty],
+    lambdas: &[f64],
+    p: usize,
+) -> (Array1<f64>, f64) {
+    let mut linear = Array1::<f64>::zeros(p);
+    let mut constant = 0.0;
+    for (idx, cp) in penalties.iter().enumerate() {
+        let Some(&lambda) = lambdas.get(idx) else {
+            continue;
+        };
+        if lambda == 0.0 {
+            continue;
+        }
+        linear += &cp.prior_linear_shift(lambda);
+        constant += cp.prior_constant_shift(lambda);
+    }
+    (linear, constant)
+}
+
+fn attach_penalty_shift(
+    penalty: &mut PirlsPenalty,
+    linear_shift: Array1<f64>,
+    constant_shift: f64,
+) {
+    match penalty {
+        PirlsPenalty::Dense {
+            linear_shift: target,
+            constant_shift: constant,
+            ..
+        }
+        | PirlsPenalty::Diagonal {
+            linear_shift: target,
+            constant_shift: constant,
+            ..
+        } => {
+            *target = linear_shift;
+            *constant = constant_shift;
+        }
     }
 }
 
