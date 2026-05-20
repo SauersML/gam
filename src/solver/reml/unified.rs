@@ -3442,17 +3442,20 @@ impl ImplicitHyperOperator {
                 .expect("radial scalar evaluation failed during implicit hyper projected_matrix");
             let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
 
-            let mut weighted_dxf = dxf_chunk.clone();
+            let mut weighted_dxf = dxf_chunk;
             for i_local in 0..(end - start) {
-                let i = start + i_local;
-                let w_i = w[i];
+                let w_i = w[start + i_local];
+                let mut row = weighted_dxf.row_mut(i_local);
                 for col in 0..rank {
-                    weighted_dxf[[i_local, col]] *= w_i;
+                    row[col] *= w_i;
                 }
             }
 
-            projected += &crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
-            projected += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_dxf);
+            // Dᵀ W X and Xᵀ W D are transposes of each other; compute one
+            // GEMM and add both the result and its transpose.
+            let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+            projected += &m;
+            projected += &m.t();
             start = end;
         }
 
@@ -3525,16 +3528,17 @@ impl ImplicitHyperOperator {
 
             for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
-                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
-                let mut weighted_dxf = dxf_chunk.clone();
+                let mut weighted_dxf = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
                 for i_local in 0..(end - start) {
                     let w_i = w[start + i_local];
+                    let mut row = weighted_dxf.row_mut(i_local);
                     for col in 0..rank {
-                        weighted_dxf[[i_local, col]] *= w_i;
+                        row[col] *= w_i;
                     }
                 }
-                out[slot] += &crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
-                out[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_dxf);
+                let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+                out[slot] += &m;
+                out[slot] += &m.t();
 
                 if let Some(c) = c_opt {
                     let mut weighted_xf = xf_chunk.to_owned();

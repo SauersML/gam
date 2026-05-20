@@ -58,6 +58,18 @@ pub(crate) struct PersistentBlockWarmStartRecord {
     pub rho: Vec<f64>,
     pub block_beta: Vec<Vec<f64>>,
     pub active_sets: Vec<Option<Vec<usize>>>,
+    #[serde(default)]
+    pub inner_log_likelihood: Option<f64>,
+    #[serde(default)]
+    pub inner_penalty_value: Option<f64>,
+    #[serde(default)]
+    pub inner_cycles: Option<usize>,
+    #[serde(default)]
+    pub inner_converged: Option<bool>,
+    #[serde(default)]
+    pub inner_block_logdet_h: Option<f64>,
+    #[serde(default)]
+    pub inner_block_logdet_s: Option<f64>,
 }
 
 impl PersistentBlockWarmStartRecord {
@@ -80,6 +92,12 @@ impl PersistentBlockWarmStartRecord {
             rho: Vec::new(),
             block_beta: Vec::new(),
             active_sets: Vec::new(),
+            inner_log_likelihood: None,
+            inner_penalty_value: None,
+            inner_cycles: None,
+            inner_converged: None,
+            inner_block_logdet_h: None,
+            inner_block_logdet_s: None,
         }
     }
 
@@ -111,6 +129,10 @@ impl PersistentBlockWarmStartRecord {
                 .zip(block_dims.iter())
                 .all(|(beta, dim)| beta.len() == *dim && beta.iter().all(|v| v.is_finite()))
             && self.active_sets.len() == block_dims.len()
+            && self.inner_log_likelihood.is_none_or(f64::is_finite)
+            && self.inner_penalty_value.is_none_or(f64::is_finite)
+            && self.inner_block_logdet_h.is_none_or(f64::is_finite)
+            && self.inner_block_logdet_s.is_none_or(f64::is_finite)
     }
 }
 
