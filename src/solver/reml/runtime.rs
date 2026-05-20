@@ -2041,10 +2041,10 @@ impl<'a> RemlState<'a> {
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
-        match self.rho_prior {
+        match &self.rho_prior {
             RhoPrior::Flat => 0.0,
             RhoPrior::Normal { mean, sd } => {
-                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
                     return f64::INFINITY;
                 }
                 let inv_var = 1.0 / (sd * sd);
@@ -2057,27 +2057,104 @@ impl<'a> RemlState<'a> {
                         })
                         .sum::<f64>()
             }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                    return f64::INFINITY;
+                }
+                rho.iter()
+                    .map(|&r| rate * r.exp() - shape * r)
+                    .sum::<f64>()
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != rho.len() {
+                    return f64::INFINITY;
+                }
+                priors
+                    .iter()
+                    .zip(rho.iter())
+                    .map(|(prior, &r)| match prior {
+                        RhoPrior::Flat => 0.0,
+                        RhoPrior::Normal { mean, sd } => {
+                            if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                                f64::INFINITY
+                            } else {
+                                let d = r - mean;
+                                0.5 * d * d / (sd * sd)
+                            }
+                        }
+                        RhoPrior::GammaPrecision { shape, rate } => {
+                            if *shape < 0.0
+                                || *rate < 0.0
+                                || !shape.is_finite()
+                                || !rate.is_finite()
+                            {
+                                f64::INFINITY
+                            } else {
+                                rate * r.exp() - shape * r
+                            }
+                        }
+                        RhoPrior::Independent(_) => f64::INFINITY,
+                    })
+                    .sum()
+            }
         }
     }
 
     fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
-        match self.rho_prior {
+        match &self.rho_prior {
             RhoPrior::Flat => Array1::zeros(rho.len()),
             RhoPrior::Normal { mean, sd } => {
-                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
                     return Array1::from_elem(rho.len(), f64::NAN);
                 }
                 let inv_var = 1.0 / (sd * sd);
                 rho.mapv(|r| (r - mean) * inv_var)
             }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                rho.mapv(|r| rate * r.exp() - shape)
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != rho.len() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                let mut grad = Array1::<f64>::zeros(rho.len());
+                for (i, (prior, &r)) in priors.iter().zip(rho.iter()).enumerate() {
+                    grad[i] = match prior {
+                        RhoPrior::Flat => 0.0,
+                        RhoPrior::Normal { mean, sd } => {
+                            if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                                f64::NAN
+                            } else {
+                                (r - mean) / (sd * sd)
+                            }
+                        }
+                        RhoPrior::GammaPrecision { shape, rate } => {
+                            if *shape < 0.0
+                                || *rate < 0.0
+                                || !shape.is_finite()
+                                || !rate.is_finite()
+                            {
+                                f64::NAN
+                            } else {
+                                rate * r.exp() - shape
+                            }
+                        }
+                        RhoPrior::Independent(_) => f64::NAN,
+                    };
+                }
+                grad
+            }
         }
     }
 
     fn compute_configured_rho_prior_hess(&self, rho: &Array1<f64>) -> Option<Array2<f64>> {
-        match self.rho_prior {
+        match &self.rho_prior {
             RhoPrior::Flat => None,
             RhoPrior::Normal { mean, sd } => {
-                if sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
                     return Some(Array2::from_elem((rho.len(), rho.len()), f64::NAN));
                 }
                 let inv_var = 1.0 / (sd * sd);
@@ -2086,6 +2163,50 @@ impl<'a> RemlState<'a> {
                     hess[[i, i]] = inv_var;
                 }
                 Some(hess)
+            }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                if *shape < 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                    return Some(Array2::from_elem((rho.len(), rho.len()), f64::NAN));
+                }
+                let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
+                for i in 0..rho.len() {
+                    hess[[i, i]] = rate * rho[i].exp();
+                }
+                Some(hess)
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != rho.len() {
+                    return Some(Array2::from_elem((rho.len(), rho.len()), f64::NAN));
+                }
+                let mut hess = Array2::<f64>::zeros((rho.len(), rho.len()));
+                let mut any = false;
+                for (i, (prior, &r)) in priors.iter().zip(rho.iter()).enumerate() {
+                    let value = match prior {
+                        RhoPrior::Flat => 0.0,
+                        RhoPrior::Normal { mean, sd } => {
+                            if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                                f64::NAN
+                            } else {
+                                1.0 / (sd * sd)
+                            }
+                        }
+                        RhoPrior::GammaPrecision { shape, rate } => {
+                            if *shape < 0.0
+                                || *rate < 0.0
+                                || !shape.is_finite()
+                                || !rate.is_finite()
+                            {
+                                f64::NAN
+                            } else {
+                                rate * r.exp()
+                            }
+                        }
+                        RhoPrior::Independent(_) => f64::NAN,
+                    };
+                    hess[[i, i]] = value;
+                    any |= value != 0.0;
+                }
+                if any { Some(hess) } else { None }
             }
         }
     }

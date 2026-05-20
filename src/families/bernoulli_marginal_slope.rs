@@ -2780,8 +2780,13 @@ fn rigid_prescale_intercept_derivative_abs(
 
 #[inline]
 fn rigid_observed_eta(marginal_eta: f64, logslope: f64, z: f64, probit_scale: f64) -> f64 {
-    rigid_intercept_from_marginal(marginal_eta, logslope, probit_scale)
-        + rigid_observed_logslope(logslope, probit_scale) * z
+    marginal_slope_standard_normal_scalar_eta(marginal_eta, logslope, z, probit_scale)
+}
+
+#[inline]
+fn marginal_slope_standard_normal_scalar_eta(q: f64, slope: f64, z: f64, probit_scale: f64) -> f64 {
+    let observed_slope = rigid_observed_logslope(slope, probit_scale);
+    q * (1.0 + observed_slope * observed_slope).sqrt() + observed_slope * z
 }
 
 fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
@@ -2836,6 +2841,314 @@ fn lse_accumulate(log_max: &mut f64, sum: &mut f64, log_term: f64) {
     } else {
         *sum += (log_term - *log_max).exp();
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarginalSlopeCovarianceShape {
+    Diagonal,
+    Full,
+    LowRank,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarginalSlopeCovariance {
+    Diagonal(Array1<f64>),
+    Full(Array2<f64>),
+    /// Low-rank factor L with Sigma = L L^T.
+    LowRank(Array2<f64>),
+}
+
+impl MarginalSlopeCovariance {
+    pub fn shape(&self) -> MarginalSlopeCovarianceShape {
+        match self {
+            Self::Diagonal(_) => MarginalSlopeCovarianceShape::Diagonal,
+            Self::Full(_) => MarginalSlopeCovarianceShape::Full,
+            Self::LowRank(_) => MarginalSlopeCovarianceShape::LowRank,
+        }
+    }
+
+    pub fn dim(&self) -> usize {
+        match self {
+            Self::Diagonal(diag) => diag.len(),
+            Self::Full(cov) => cov.nrows(),
+            Self::LowRank(factor) => factor.nrows(),
+        }
+    }
+
+    pub fn validate(&self, context: &str) -> Result<(), String> {
+        match self {
+            Self::Diagonal(diag) => {
+                if diag.is_empty() {
+                    return Err(format!("{context} diagonal covariance is empty"));
+                }
+                for (idx, &value) in diag.iter().enumerate() {
+                    if !(value.is_finite() && value >= 0.0) {
+                        return Err(format!(
+                            "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
+                        ));
+                    }
+                }
+            }
+            Self::Full(cov) => {
+                if cov.nrows() == 0 || cov.nrows() != cov.ncols() {
+                    return Err(format!(
+                        "{context} full covariance must be non-empty and square, got {}x{}",
+                        cov.nrows(),
+                        cov.ncols()
+                    ));
+                }
+                for i in 0..cov.nrows() {
+                    for j in 0..cov.ncols() {
+                        let value = cov[[i, j]];
+                        if !value.is_finite() {
+                            return Err(format!(
+                                "{context} full covariance entry ({i},{j}) is non-finite"
+                            ));
+                        }
+                        if (value - cov[[j, i]]).abs()
+                            > 1e-10 * (1.0 + value.abs().max(cov[[j, i]].abs()))
+                        {
+                            return Err(format!(
+                                "{context} full covariance must be symmetric at ({i},{j})"
+                            ));
+                        }
+                    }
+                }
+            }
+            Self::LowRank(factor) => {
+                if factor.nrows() == 0 {
+                    return Err(format!(
+                        "{context} low-rank covariance factor has zero rows"
+                    ));
+                }
+                for ((i, j), &value) in factor.indexed_iter() {
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn quadratic_form(&self, vector: &[f64]) -> Result<f64, String> {
+        self.validate("marginal-slope covariance")?;
+        if vector.len() != self.dim() {
+            return Err(format!(
+                "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
+                vector.len(),
+                self.dim()
+            ));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err("marginal-slope covariance vector contains non-finite values".to_string());
+        }
+        let value = match self {
+            Self::Diagonal(diag) => vector
+                .iter()
+                .zip(diag.iter())
+                .map(|(&v, &sigma)| v * v * sigma)
+                .sum::<f64>(),
+            Self::Full(cov) => {
+                let mut total = 0.0;
+                for i in 0..cov.nrows() {
+                    let mut row_dot = 0.0;
+                    for j in 0..cov.ncols() {
+                        row_dot += cov[[i, j]] * vector[j];
+                    }
+                    total += vector[i] * row_dot;
+                }
+                total
+            }
+            Self::LowRank(factor) => {
+                let mut total = 0.0;
+                for r in 0..factor.ncols() {
+                    let mut projection = 0.0;
+                    for k in 0..factor.nrows() {
+                        projection += factor[[k, r]] * vector[k];
+                    }
+                    total += projection * projection;
+                }
+                total
+            }
+        };
+        if value.is_finite() && value >= -1e-10 {
+            Ok(value.max(0.0))
+        } else {
+            Err(format!(
+                "marginal-slope covariance quadratic form must be non-negative, got {value}"
+            ))
+        }
+    }
+}
+
+pub fn marginal_slope_covariance_from_scores(
+    scores: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+) -> Result<MarginalSlopeCovariance, String> {
+    let (n, k) = scores.dim();
+    if k == 0 {
+        return Err("marginal-slope score matrix must have at least one column".to_string());
+    }
+    if weights.len() != n {
+        return Err(format!(
+            "marginal-slope covariance weight length mismatch: weights={}, rows={n}",
+            weights.len()
+        ));
+    }
+    let total_weight = weights.iter().copied().sum::<f64>();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Err("marginal-slope covariance needs positive finite total weight".to_string());
+    }
+    let mut mean = Array1::<f64>::zeros(k);
+    for i in 0..n {
+        let weight = weights[i];
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(format!(
+                "marginal-slope covariance weight {i} must be finite and non-negative, got {weight}"
+            ));
+        }
+        for j in 0..k {
+            let score = scores[[i, j]];
+            if !score.is_finite() {
+                return Err(format!(
+                    "marginal-slope covariance score ({i},{j}) is non-finite"
+                ));
+            }
+            mean[j] += weight * score;
+        }
+    }
+    mean.mapv_inplace(|value| value / total_weight);
+
+    let mut cov = Array2::<f64>::zeros((k, k));
+    for i in 0..n {
+        let weight = weights[i];
+        for a in 0..k {
+            let da = scores[[i, a]] - mean[a];
+            for b in 0..=a {
+                let value = weight * da * (scores[[i, b]] - mean[b]) / total_weight;
+                cov[[a, b]] += value;
+                if a != b {
+                    cov[[b, a]] += value;
+                }
+            }
+        }
+    }
+
+    let diag_max = (0..k).fold(0.0_f64, |acc, idx| acc.max(cov[[idx, idx]].abs()));
+    let mut offdiag_max = 0.0_f64;
+    for i in 0..k {
+        for j in 0..k {
+            if i != j {
+                offdiag_max = offdiag_max.max(cov[[i, j]].abs());
+            }
+        }
+    }
+    if k == 1 || offdiag_max <= 1e-10 * (1.0 + diag_max) {
+        return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
+    }
+
+    use crate::faer_ndarray::FaerEigh;
+    let (evals, evecs) = cov
+        .eigh(faer::Side::Lower)
+        .map_err(|err| format!("marginal-slope covariance eigendecomposition failed: {err}"))?;
+    let max_eval = evals
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    let rank_tol = 1e-10 * max_eval.max(1.0);
+    let positive: Vec<(usize, f64)> = evals
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value > rank_tol).then_some((idx, value)))
+        .collect();
+    if positive.len() < k {
+        let mut factor = Array2::<f64>::zeros((k, positive.len()));
+        for (col, (idx, value)) in positive.iter().enumerate() {
+            let scale = value.sqrt();
+            for row in 0..k {
+                factor[[row, col]] = evecs[[row, *idx]] * scale;
+            }
+        }
+        Ok(MarginalSlopeCovariance::LowRank(factor))
+    } else {
+        Ok(MarginalSlopeCovariance::Full(cov))
+    }
+}
+
+pub fn marginal_slope_preserving_scale(
+    slopes: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    if !probit_scale.is_finite() {
+        return Err(format!(
+            "marginal-slope probit scale must be finite, got {probit_scale}"
+        ));
+    }
+    let observed_slopes = slopes
+        .iter()
+        .map(|&slope| probit_scale * slope)
+        .collect::<Vec<_>>();
+    let variance = covariance.quadratic_form(&observed_slopes)?;
+    Ok((1.0 + variance).sqrt())
+}
+
+pub fn marginal_slope_probit_eta(
+    q: f64,
+    z: &[f64],
+    slopes: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    if z.len() != slopes.len() {
+        return Err(format!(
+            "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
+            z.len(),
+            slopes.len()
+        ));
+    }
+    if slopes.len() != covariance.dim() {
+        return Err(format!(
+            "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
+            slopes.len(),
+            covariance.dim()
+        ));
+    }
+    if !q.is_finite() || z.iter().any(|value| !value.is_finite()) {
+        return Err("marginal-slope probit eta inputs must be finite".to_string());
+    }
+    let scale = marginal_slope_preserving_scale(slopes, covariance, probit_scale)?;
+    let linear = z
+        .iter()
+        .zip(slopes.iter())
+        .map(|(&score, &slope)| probit_scale * slope * score)
+        .sum::<f64>();
+    Ok(q * scale + linear)
+}
+
+pub fn marginal_slope_probit_neglog(
+    q: f64,
+    z: &[f64],
+    slopes: &[f64],
+    y: f64,
+    weight: f64,
+    covariance: &MarginalSlopeCovariance,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    if !(weight.is_finite() && weight >= 0.0) || !y.is_finite() {
+        return Err(format!(
+            "marginal-slope probit neglog requires finite non-negative weight and finite y, got weight={weight}, y={y}"
+        ));
+    }
+    let eta = marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)?;
+    let signed = (2.0 * y - 1.0) * eta;
+    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
+    if !logcdf.is_finite() {
+        return Err("marginal-slope probit neglog produced non-finite log-CDF".to_string());
+    }
+    Ok(-weight * logcdf)
 }
 
 /// Log-space residual evaluator for the empirical-frailty intercept calibration.
@@ -3078,7 +3391,7 @@ impl RigidProbitKernel {
         let c_inv3 = 1.0 / (c * c * c);
         let c_inv5 = c_inv3 / (c * c);
         let c_inv7 = c_inv5 / (c * c);
-        let eta = q * c + observed_logslope * z;
+        let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
         let m = s * eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
         let (k1, k2, k3, k4) = signed_probit_neglog_derivatives_up_to_fourth(m, w)?;
@@ -3121,9 +3434,7 @@ impl RigidProbitKernel {
         probit_scale: f64,
     ) -> Result<f64, String> {
         let s = 2.0 * y - 1.0;
-        let observed_logslope = rigid_observed_logslope(g, probit_scale);
-        let c = (1.0 + observed_logslope * observed_logslope).sqrt();
-        let eta = q * c + observed_logslope * z;
+        let eta = marginal_slope_standard_normal_scalar_eta(q, g, z, probit_scale);
         let m = s * eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
         if !logcdf.is_finite() {
