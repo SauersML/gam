@@ -31,5 +31,5 @@ pub mod session;
 pub mod store;
 
 pub use key::{Fingerprint, Fingerprinter};
-pub use session::Session;
+pub use session::{LoadSource, LoadedEntry, Session};
 pub use store::{CachedEntry, EntryKind, StoreError, StoreOptions, WarmStartStore};
