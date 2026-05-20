@@ -3613,15 +3613,11 @@ fn solution_into_outer_result(
     converged: bool,
     plan_used: OuterPlan,
 ) -> OuterResult {
-    let final_grad_norm = solution
-        .final_gradient_norm
-        .or(solution.final_step_norm)
-        .unwrap_or(0.0);
     OuterResult {
         rho: solution.final_point,
         final_value: solution.final_value,
         iterations: solution.iterations,
-        final_grad_norm,
+        final_grad_norm: solution.final_gradient_norm,
         final_gradient: solution.final_gradient,
         final_hessian: solution.final_hessian,
         converged,
@@ -4306,8 +4302,8 @@ pub struct OuterResult {
     pub final_value: f64,
     /// Total outer iterations across all solver restarts.
     pub iterations: usize,
-    /// Final gradient norm.
-    pub final_grad_norm: f64,
+    /// Final gradient norm, when the solver computed an actual gradient.
+    pub final_grad_norm: Option<f64>,
     /// Final gradient when the solver is gradient-based.
     pub final_gradient: Option<Array1<f64>>,
     /// Final Hessian when the solver tracks one.
@@ -4382,7 +4378,7 @@ fn run_outer(
             rho: Array1::zeros(0),
             final_value: cost,
             iterations: 0,
-            final_grad_norm: 0.0,
+            final_grad_norm: Some(0.0),
             final_gradient: None,
             final_hessian: None,
             converged: true,
@@ -4470,7 +4466,16 @@ fn run_outer(
                     // not materially shrink — the deterministic
                     // optimizer with the same seed and trust radius
                     // would replay the same trajectory.
-                    let cur_grad_norm = result.final_grad_norm;
+                    let Some(cur_grad_norm) = result.final_grad_norm else {
+                        log::info!(
+                            "[OUTER] {context}: ARC attempt exhausted budget at \
+                             iter={} cost={:.6e} without a final gradient norm; \
+                             falling through to degraded plan",
+                            result.iterations,
+                            result.final_value,
+                        );
+                        break Ok(result);
+                    };
                     if let Some(prev_g) = prev_attempt_grad_norm {
                         let progressed = cur_grad_norm.is_finite()
                             && prev_g.is_finite()
@@ -4587,6 +4592,30 @@ fn run_outer_with_plan(
         )));
     }
 
+    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
+        (
+            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
+            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
+        )
+    });
+    let bounds_template = (lower, upper);
+    let mut projected_seeds = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let projected = project_to_bounds(&seed, Some(&bounds_template));
+        if !projected_seeds
+            .iter()
+            .any(|existing: &Array1<f64>| existing == &projected)
+        {
+            projected_seeds.push(projected);
+        }
+    }
+    seeds = projected_seeds;
+    if seeds.is_empty() {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "no bounded seeds generated for outer optimization ({context})"
+        )));
+    }
+
     let screening_enabled = config.screening_cap.is_some();
     let seed_budget = effective_seed_budget(
         config.seed_config.seed_budget,
@@ -4624,14 +4653,6 @@ fn run_outer_with_plan(
             seeds.len(),
         );
     }
-
-    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
-        (
-            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
-            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
-        )
-    });
-    let bounds_template = (lower, upper);
 
     let mut best: Option<OuterResult> = None;
     // Accumulate every per-seed rejection with its 0-based seed index and the
@@ -5339,7 +5360,7 @@ fn run_outer_with_plan(
                         rho: point,
                         final_value: cost,
                         iterations: polls,
-                        final_grad_norm: 0.0,
+                        final_grad_norm: None,
                         final_gradient: None,
                         final_hessian: None,
                         converged: true,
@@ -5352,7 +5373,7 @@ fn run_outer_with_plan(
                             rho: point,
                             final_value: cost,
                             iterations: polls,
-                            final_grad_norm: 0.0,
+                            final_grad_norm: None,
                             final_gradient: None,
                             final_hessian: None,
                             converged: false,
@@ -7205,7 +7226,7 @@ mod tests {
             rho: array![0.0],
             final_value: 9.0,
             iterations: 1,
-            final_grad_norm: 1.0,
+            final_grad_norm: Some(1.0),
             final_gradient: None,
             final_hessian: None,
             converged: false,
@@ -7220,7 +7241,7 @@ mod tests {
             rho: array![1.0],
             final_value: 1.0,
             iterations: 1,
-            final_grad_norm: 1.0,
+            final_grad_norm: Some(1.0),
             final_gradient: None,
             final_hessian: None,
             converged: false,
@@ -7235,7 +7256,7 @@ mod tests {
             rho: array![2.0],
             final_value: 5.0,
             iterations: 1,
-            final_grad_norm: 0.0,
+            final_grad_norm: Some(0.0),
             final_gradient: None,
             final_hessian: None,
             converged: true,

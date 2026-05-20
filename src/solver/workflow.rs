@@ -154,8 +154,12 @@ where
 {
     if !result.converged {
         return Err(format!(
-            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={:.3e})",
-            result.iterations, result.final_value, result.final_grad_norm
+            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            result.iterations,
+            result.final_value,
+            result
+                .final_grad_norm
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}"))
         ));
     }
     recover(&result.rho).ok_or_else(|| {
@@ -3955,7 +3959,7 @@ mod tests {
             rho,
             final_value: 1.25,
             iterations: 7,
-            final_grad_norm: 0.5,
+            final_grad_norm: Some(0.5),
             final_gradient: None,
             final_hessian: None,
             converged,
