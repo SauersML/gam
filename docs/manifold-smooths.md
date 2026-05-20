@@ -44,7 +44,8 @@ closer inspection:
 
 The script regenerates a full-length, full-speed MP4 alongside the
 GIF and PNG — run the [reproduction recipe](#reproducing-the-demo)
-below to get it locally.
+below to get it locally. Source browsers can also open
+[the MP4 asset](images/geometric_shapes_demo_slow.mp4) directly.
 
 ## The six shapes and the formulas behind them
 

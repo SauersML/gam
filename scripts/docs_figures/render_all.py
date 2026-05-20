@@ -368,13 +368,10 @@ def render_3d_compare(surfaces: dict[str, np.ndarray]) -> None:
 # ---------------------------------------------------------------------------
 # Figure 6: Marginal-slope-style two-surface viz over (pc1, pc2)
 #
-# The current local gamfit build hits a "missing latent_measure" bug on the
-# bernoulli-marginal-slope predict path.  We get the same visual story with
-# a regular binomial GAM whose RHS is a joint Duchon smooth over
-# (pc1, pc2, z), then evaluate at two values of z.  The vertical gap
-# between the two surfaces *is* the spatially-varying score effect — exactly
-# what the marginal-slope decomposition expresses, computed via the
-# capability that's reliable in this build.
+# The visual uses a regular binomial GAM whose RHS is a joint Duchon smooth
+# over (pc1, pc2, z), then evaluates the fitted surface at two score values.
+# The vertical gap between the two surfaces shows the spatially-varying score
+# effect that marginal-slope models expose explicitly.
 # ---------------------------------------------------------------------------
 def render_marginal_slope_3d() -> None:
     log("[marginal-slope] generating synthetic data")
@@ -505,15 +502,9 @@ def safe(
 def main() -> None:
     log("=== render_all start ===")
     data = make_regression()
-    log("[main] fitting hero smooth (matern preferred, thin-plate fallback)")
-    hero_smooth = "Matérn"
-    try:
-        model = gamfit.fit(data, "y ~ matern(x1, x2)")
-    except Exception as exc:
-        log(f"[main] matern failed ({exc!s}); falling back to thin-plate")
-        hero_smooth = "thin-plate"
-        model = gamfit.fit(data, "y ~ thinplate(x1, x2)")
-    log(f"[main] hero {hero_smooth} fit done")
+    log("[main] fitting hero smooth (Matérn)")
+    model = gamfit.fit(data, "y ~ matern(x1, x2)")
+    log("[main] hero Matérn fit done")
 
     result = safe("hero", render_hero, data, model)
     if result is None:

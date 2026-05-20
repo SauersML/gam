@@ -283,7 +283,7 @@ boundary-condition rows (Wood §5.4.1), so the constrained smooth honours
 the condition exactly. Aliases: `bc_left|left_bc|start_bc`, plus
 `bc_right|right_bc|end_bc`. Values: `free|none|open`, `clamped|zero_derivative`,
 `anchored|zero|zero_value`. Per-side anchor overrides: `anchor_<side>`,
-`<side>_anchor`, falling back to global `anchor`/`anchor_value`/`value`.
+`<side>_anchor`, then global `anchor`/`anchor_value`/`value`.
 
 ### Intrinsic S² (sphere) smooth
 

@@ -146,8 +146,8 @@ model.model_class                  # full class string
 - **Scale your covariates** for Stage 1. Set `scale_dimensions=True` when
   fitting transformation-normal on a handful of PCs.
 - **Sampling / posterior:** Bernoulli marginal-slope and
-  transformation-normal models fall back to the Gaussian Laplace
-  approximation for `Model.sample(...)`. Survival marginal-slope uses
+  transformation-normal models use the Gaussian Laplace approximation for
+  `Model.sample(...)`. Survival marginal-slope uses
   exact NUTS over the joint coefficient vector. See
   [posterior-sampling.md](posterior-sampling.md).
 - **Predict output:** Bernoulli marginal-slope returns a 1-D array of
