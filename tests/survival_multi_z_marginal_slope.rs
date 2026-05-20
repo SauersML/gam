@@ -64,6 +64,40 @@ fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
 }
 
 #[test]
+fn survival_multi_z_low_rank_scale_matches_matrix_determinant_lemma() {
+    let slopes = [0.25, -0.32, 0.08, 0.21];
+    let probit_scale = 0.9;
+    let factor = array![[1.0, 0.0], [0.2, 0.4], [-0.3, 0.5], [0.7, -0.1]];
+    let covariance = MarginalSlopeCovariance::LowRank(factor.clone());
+    let observed: Vec<f64> = slopes.iter().map(|&slope| probit_scale * slope).collect();
+
+    let mut projected_norm2 = 0.0;
+    for col in 0..factor.ncols() {
+        let mut projection = 0.0;
+        for row in 0..factor.nrows() {
+            projection += factor[[row, col]] * observed[row];
+        }
+        projected_norm2 += projection * projection;
+    }
+    let determinant_lemma_scale = (1.0_f64 + projected_norm2).sqrt();
+    let low_rank_scale =
+        survival_marginal_slope_vector_scale(&slopes, &covariance, probit_scale).expect("scale");
+    assert!(
+        (low_rank_scale - determinant_lemma_scale).abs() <= 1e-15,
+        "low_rank_scale={low_rank_scale:.17e} determinant_lemma_scale={determinant_lemma_scale:.17e}"
+    );
+
+    let dense_covariance = MarginalSlopeCovariance::Full(factor.dot(&factor.t()));
+    let dense_scale =
+        survival_marginal_slope_vector_scale(&slopes, &dense_covariance, probit_scale)
+            .expect("dense scale");
+    assert!(
+        (low_rank_scale - dense_scale).abs() <= 1e-15,
+        "low_rank_scale={low_rank_scale:.17e} dense_scale={dense_scale:.17e}"
+    );
+}
+
+#[test]
 fn survival_multi_z_eta_rejects_score_slope_dimension_mismatch() {
     let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
     let err = survival_marginal_slope_vector_eta(0.2, &[0.4, -0.8], &[0.3], &covariance, 1.0)
