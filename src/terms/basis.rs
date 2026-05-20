@@ -15684,9 +15684,21 @@ fn prepare_duchon_derivative_contextwithworkspace(
     Ok((centers, identifiability_transform))
 }
 
-fn periodic_duchon_domain_from_centers(
-    centers: ArrayView2<'_, f64>,
-) -> Result<(f64, f64), BasisError> {
+/// Validate a 1D periodic Duchon center matrix, compute the circular
+/// domain ``[left, left + period]``, and drop any centers that are
+/// periodically equivalent to ``left`` past the first occurrence.
+///
+/// All periodic Duchon code paths (`build_periodic_duchon_basis_1d`,
+/// `build_periodic_duchon_basis_log_kappa_derivatives…`) must use the
+/// *same* collapsed centers, otherwise the kernel-column count diverges
+/// between the design build and its log-κ derivative — producing
+/// `ShapeError` mismatches at the consumer (e.g. the finite-difference
+/// regression test against the analytic derivative). Centralising the
+/// collapse in one helper makes it impossible to add a new periodic path
+/// that forgets the dedup.
+fn prepare_periodic_duchon_centers_1d(
+    centers: Array2<f64>,
+) -> Result<(Array2<f64>, f64, f64), BasisError> {
     if centers.ncols() != 1 {
         return Err(BasisError::InvalidInput(
             "periodic Duchon smooths currently require exactly one covariate".to_string(),
@@ -15703,7 +15715,9 @@ fn periodic_duchon_domain_from_centers(
     if !left.is_finite() || !right.is_finite() || left >= right {
         return Err(BasisError::InvalidRange(left, right));
     }
-    Ok((left, right - left))
+    let period = right - left;
+    let centers = collapse_periodic_endpoint(centers, left, period);
+    Ok((centers, left, period))
 }
 
 fn fill_periodic_duchon_kernel_psi_matrices(
@@ -15769,7 +15783,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     })?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
-    let (left, period) = periodic_duchon_domain_from_centers(centers.view())?;
+    let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
@@ -18683,11 +18697,7 @@ fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) -> Result<f64
 /// remove every such duplicate (tested under the periodic metric with a
 /// tolerance scaled to ``period``); the remaining centers correspond to
 /// geometrically distinct points on the circle.
-fn collapse_periodic_endpoint(
-    centers: Array2<f64>,
-    left: f64,
-    period: f64,
-) -> Array2<f64> {
+fn collapse_periodic_endpoint(centers: Array2<f64>, left: f64, period: f64) -> Array2<f64> {
     if period <= 0.0 || !period.is_finite() {
         return centers;
     }
@@ -18697,13 +18707,23 @@ fn collapse_periodic_endpoint(
     let tol = period.max(1.0) * 1.0e-10;
     let col = centers.column(0);
     let n_rows = col.len();
+    // Keep the first center that maps to the circle point of ``left`` and
+    // drop every subsequent center in the same equivalence class. A
+    // naive "always keep index 0, drop other left-equivalents" rule loses
+    // the geometric point entirely when the user passes centers in
+    // unsorted order — e.g. ``[5, 0, period]`` would collapse to ``[5]``
+    // because both ``0`` and ``period`` are left-equivalents at indices
+    // ``> 0``.
+    let mut seen_left = false;
     let keep: Vec<usize> = (0..n_rows)
         .filter(|&i| {
-            if i == 0 {
-                return true;
+            if periodic_distance_1d(col[i], left, period) <= tol {
+                if seen_left {
+                    return false;
+                }
+                seen_left = true;
             }
-            // Drop any center within ``tol`` of ``left`` modulo ``period``.
-            periodic_distance_1d(col[i], left, period) > tol
+            true
         })
         .collect();
     if keep.len() == n_rows {
@@ -18724,23 +18744,11 @@ fn build_periodic_duchon_basis_1d(
     centers: Array2<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    if data.ncols() != 1 || centers.ncols() != 1 {
+    if data.ncols() != 1 {
         return Err(BasisError::InvalidInput(
             "periodic Duchon smooths currently require exactly one covariate".to_string(),
         ));
     }
-    let left = centers
-        .column(0)
-        .iter()
-        .fold(f64::INFINITY, |a, &b| a.min(b));
-    let right = centers
-        .column(0)
-        .iter()
-        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-    if !left.is_finite() || !right.is_finite() || left >= right {
-        return Err(BasisError::InvalidRange(left, right));
-    }
-    let period = right - left;
     // ``left + period`` is the same circle point as ``left``. If the user
     // supplied centers spanning ``[left, left+period]`` (the natural way to
     // describe a closed periodic lattice and what the position-API validator
@@ -18750,12 +18758,10 @@ fn build_periodic_duchon_basis_1d(
     // and the REML whitening transform amplifies machine noise into a ~10⁻⁶
     // negative eigenvalue, tripping the solver's PSD check.
     //
-    // Drop the periodically duplicate center so the K kernel columns
-    // correspond to K geometrically distinct circle points. ``left`` and
-    // ``period`` stay valid (we drop the rightmost center, so ``left`` is
-    // unchanged and the circumference is still the user's declared
-    // ``period``).
-    let centers = collapse_periodic_endpoint(centers, left, period);
+    // ``prepare_periodic_duchon_centers_1d`` validates the center matrix,
+    // computes ``(left, period)`` and drops the periodically duplicate
+    // center, in one place that every periodic Duchon code path shares.
+    let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     // The user encodes the Duchon order ``m`` in ``spec.nullspace_order``
     // (``Zero → m=1``, ``Linear → m=2``, ``Degree(d) → m=d+1``). Periodicity
     // forces the *constraint* nullspace to ``{constants}`` (the only
