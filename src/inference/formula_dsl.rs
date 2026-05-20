@@ -395,6 +395,34 @@ mod tests {
         .expect_err("logslope formula should be rejected");
         assert!(err.contains("cannot also appear in --logslope-formula"));
     }
+
+    #[test]
+    fn logslope_surface_declarations_are_additive() {
+        let parsed = parse_formula("y ~ s(pc1) + logslope(z2, s(pc2)) + logslope(z3, x3)")
+            .expect("parse additive logslope surfaces");
+        assert_eq!(parsed.terms.len(), 1);
+        assert_eq!(parsed.logslope_surfaces.len(), 2);
+        assert_eq!(parsed.logslope_surfaces[0].z_column, "z2");
+        assert_eq!(parsed.logslope_surfaces[0].terms.len(), 1);
+        assert_eq!(parsed.logslope_surfaces[1].z_column, "z3");
+        assert_eq!(parsed.logslope_surfaces[1].terms.len(), 1);
+    }
+
+    #[test]
+    fn marginal_slope_z_column_validator_reserves_all_surface_z_columns() {
+        let main = parse_formula("y ~ x").expect("parse main");
+        let logslope = parse_formula("y ~ s(pc1) + logslope(z2, s(z3)) + logslope(z3, x)")
+            .expect("parse logslope surfaces");
+        let err = validate_marginal_slope_z_column_exclusion(
+            &main,
+            &logslope,
+            "z1",
+            "bernoulli marginal-slope",
+            "--logslope-formula",
+        )
+        .expect_err("surface formula should reject another reserved z coordinate");
+        assert!(err.contains("reserves z column 'z3'"));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,6 +476,36 @@ pub struct ParsedFormula {
 pub struct LogSlopeSurfaceSpec {
     pub z_column: String,
     pub terms: Vec<ParsedTerm>,
+}
+
+pub fn marginal_slope_logslope_surfaces(
+    logslope_formula: &ParsedFormula,
+    default_z_column: &str,
+) -> Result<Vec<LogSlopeSurfaceSpec>, String> {
+    let mut surfaces = Vec::new();
+    if !logslope_formula.terms.is_empty() {
+        surfaces.push(LogSlopeSurfaceSpec {
+            z_column: default_z_column.to_string(),
+            terms: logslope_formula.terms.clone(),
+        });
+    }
+    surfaces.extend(logslope_formula.logslope_surfaces.clone());
+    if surfaces.is_empty() {
+        surfaces.push(LogSlopeSurfaceSpec {
+            z_column: default_z_column.to_string(),
+            terms: Vec::new(),
+        });
+    }
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    for surface in &surfaces {
+        if !seen.insert(surface.z_column.clone()) {
+            return Err(format!(
+                "logslope formula declares z column '{}' more than once; each z coordinate needs exactly one log-slope surface",
+                surface.z_column
+            ));
+        }
+    }
+    Ok(surfaces)
 }
 
 #[derive(Clone, Debug)]
@@ -514,31 +572,26 @@ pub fn validate_marginal_slope_z_column_exclusion(
     context: &str,
     logslope_label: &str,
 ) -> Result<(), String> {
-    let z_columns = logslope_formula
-        .logslope_surfaces
-        .iter()
-        .map(|surface| surface.z_column.as_str())
-        .chain(std::iter::once(z_column));
-    for z_column in z_columns {
+    let surfaces = marginal_slope_logslope_surfaces(logslope_formula, z_column)?;
+    for z_column in surfaces.iter().map(|surface| surface.z_column.as_str()) {
         if parsed_terms_reference_column(&main_formula.terms, z_column) {
             return Err(format!(
                 "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
             ));
         }
     }
-    if logslope_formula.logslope_surfaces.is_empty()
-        && parsed_terms_reference_column(&logslope_formula.terms, z_column)
-    {
-        return Err(format!(
-            "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
-        ));
-    }
-    for surface in &logslope_formula.logslope_surfaces {
-        if parsed_terms_reference_column(&surface.terms, &surface.z_column) {
+    for reserved in surfaces.iter().map(|surface| surface.z_column.as_str()) {
+        if parsed_terms_reference_column(&logslope_formula.terms, reserved) {
             return Err(format!(
-                "{context} reserves z column '{}' as the auxiliary latent score for its log-slope surface; it cannot also appear in {logslope_label}",
-                surface.z_column
+                "{context} reserves z column '{reserved}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
             ));
+        }
+        for surface in &surfaces {
+            if parsed_terms_reference_column(&surface.terms, reserved) {
+                return Err(format!(
+                    "{context} reserves z column '{reserved}' as an auxiliary latent score; it cannot also appear in {logslope_label}"
+                ));
+            }
         }
     }
     Ok(())
@@ -1226,6 +1279,11 @@ pub fn validate_auxiliary_formula_controls(
             "survmodel(...) is only supported in the main survival formula, not {flag_name}"
         ));
     }
+    if !parsed_formula.logslope_surfaces.is_empty() && flag_name != "--logslope-formula" {
+        return Err(format!(
+            "logslope(...) is only supported in --logslope-formula, not {flag_name}"
+        ));
+    }
     Ok(())
 }
 
@@ -1296,13 +1354,6 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
             other => terms.push(other),
         }
     }
-    if !logslope_surfaces.is_empty() && !terms.is_empty() {
-        return Err(
-            "logslope(...) declarations must own the full log-slope formula; do not mix wrapped and unwrapped log-slope terms"
-                .to_string(),
-        );
-    }
-
     // Reject self-referential formulas like `y ~ smooth(y)` or `y ~ y`: the
     // response is its own predictor, which is a trivial identity fit and
     // almost certainly a user mistake. Only flag the simple-identifier case

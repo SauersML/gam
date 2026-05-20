@@ -1020,6 +1020,28 @@ impl CoefficientGroupPrior {
             }
         }
     }
+
+    fn validate(&self, context: &str) -> Result<(), BasisError> {
+        match *self {
+            Self::Flat => Ok(()),
+            Self::NormalLogPrecision { mean, sd } => {
+                if !mean.is_finite() {
+                    return Err(BasisError::InvalidInput(format!(
+                        "{context} Normal log-precision prior requires finite mean, got {mean}"
+                    )));
+                }
+                if !sd.is_finite() || sd <= 0.0 {
+                    return Err(BasisError::InvalidInput(format!(
+                        "{context} Normal log-precision prior requires sd > 0, got {sd}"
+                    )));
+                }
+                Ok(())
+            }
+            Self::GammaPrecision { shape, rate } => {
+                validate_gamma_precision_prior(context, shape, rate)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1161,21 +1183,85 @@ fn realize_keyed_penalty_block_gamma_priors(
     Ok(prior)
 }
 
+fn validate_rho_prior_coordinate(
+    prior: &crate::types::RhoPrior,
+    context: &str,
+) -> Result<(), BasisError> {
+    match prior {
+        crate::types::RhoPrior::Flat => Ok(()),
+        crate::types::RhoPrior::Normal { mean, sd } => {
+            if !mean.is_finite() {
+                return Err(BasisError::InvalidInput(format!(
+                    "{context} Normal log-precision prior requires finite mean, got {mean}"
+                )));
+            }
+            if !sd.is_finite() || *sd <= 0.0 {
+                return Err(BasisError::InvalidInput(format!(
+                    "{context} Normal log-precision prior requires sd > 0, got {sd}"
+                )));
+            }
+            Ok(())
+        }
+        crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+            validate_gamma_precision_prior(context, *shape, *rate)
+        }
+        crate::types::RhoPrior::Independent(_) => Err(BasisError::InvalidInput(format!(
+            "{context} must be a scalar rho prior, not a nested Independent prior"
+        ))),
+    }
+}
+
+fn expand_base_rho_prior(
+    base_prior: &crate::types::RhoPrior,
+    base_count: usize,
+    context: &str,
+) -> Result<Vec<crate::types::RhoPrior>, BasisError> {
+    match base_prior {
+        crate::types::RhoPrior::Independent(priors) => {
+            if priors.len() != base_count {
+                return Err(BasisError::InvalidInput(format!(
+                    "{context} base Independent rho prior length mismatch: got {}, expected {base_count}",
+                    priors.len()
+                )));
+            }
+            for (idx, prior) in priors.iter().enumerate() {
+                validate_rho_prior_coordinate(prior, &format!("{context} base prior {idx}"))?;
+            }
+            Ok(priors.clone())
+        }
+        prior => {
+            validate_rho_prior_coordinate(prior, context)?;
+            Ok((0..base_count).map(|_| prior.clone()).collect())
+        }
+    }
+}
+
 fn combine_group_rho_prior(
     base_prior: &crate::types::RhoPrior,
     base_count: usize,
     groups: &[CoefficientGroupSpec],
-) -> crate::types::RhoPrior {
+) -> Result<crate::types::RhoPrior, BasisError> {
     let mut priors = Vec::with_capacity(base_count + groups.len());
-    priors.extend((0..base_count).map(|_| base_prior.clone()));
-    priors.extend(groups.iter().map(|group| {
-        group
-            .prior
-            .as_ref()
-            .map(CoefficientGroupPrior::to_rho_prior)
-            .unwrap_or_else(|| base_prior.clone())
-    }));
-    crate::types::RhoPrior::Independent(priors)
+    priors.extend(expand_base_rho_prior(
+        base_prior,
+        base_count,
+        "coefficient groups",
+    )?);
+    for group in groups {
+        let context = format!("coefficient group '{}'", group.name);
+        let prior = match group.prior.as_ref() {
+            Some(prior) => {
+                prior.validate(&context)?;
+                prior.to_rho_prior()
+            }
+            None => {
+                validate_rho_prior_coordinate(base_prior, &context)?;
+                base_prior.clone()
+            }
+        };
+        priors.push(prior);
+    }
+    Ok(crate::types::RhoPrior::Independent(priors))
 }
 
 fn insert_range(
@@ -1308,11 +1394,25 @@ fn realize_coefficient_groups(
     let p = design.design.ncols();
     let mut names = BTreeSet::<String>::new();
     for group in groups {
+        if group.name.trim().is_empty() {
+            return Err(BasisError::InvalidInput(
+                "coefficient group name must not be empty".to_string(),
+            ));
+        }
         if !names.insert(group.name.clone()) {
             return Err(BasisError::InvalidInput(format!(
                 "duplicate coefficient group '{}'",
                 group.name
             )));
+        }
+        if group.selectors.is_empty() {
+            return Err(BasisError::InvalidInput(format!(
+                "coefficient group '{}' contains no selectors",
+                group.name
+            )));
+        }
+        if let Some(prior) = group.prior.as_ref() {
+            prior.validate(&format!("coefficient group '{}'", group.name))?;
         }
     }
 
@@ -1320,7 +1420,28 @@ fn realize_coefficient_groups(
     for group in groups {
         resolved.insert(group.name.clone(), resolve_group_columns(design, group)?);
     }
+    let parent_by_name: BTreeMap<String, Option<String>> = groups
+        .iter()
+        .map(|group| (group.name.clone(), group.parent.clone()))
+        .collect();
     for group in groups {
+        let mut path = BTreeSet::<String>::new();
+        let mut cursor = Some(group.name.as_str());
+        while let Some(name) = cursor {
+            if !path.insert(name.to_string()) {
+                return Err(BasisError::InvalidInput(format!(
+                    "coefficient group hierarchy contains a cycle involving '{name}'"
+                )));
+            }
+            cursor = parent_by_name
+                .get(name)
+                .ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "coefficient group hierarchy references unknown group '{name}'"
+                    ))
+                })?
+                .as_deref();
+        }
         if let Some(parent) = group.parent.as_ref() {
             let parent_cols = resolved.get(parent).ok_or_else(|| {
                 BasisError::InvalidInput(format!(
@@ -1370,7 +1491,7 @@ fn realize_coefficient_groups(
     Ok(RealizedCoefficientGroups {
         penalty_specs,
         nullspace_dims,
-        rho_prior: combine_group_rho_prior(base_prior, design.penalties.len(), groups),
+        rho_prior: combine_group_rho_prior(base_prior, design.penalties.len(), groups)?,
         group_column_indices,
     })
 }

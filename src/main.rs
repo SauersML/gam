@@ -266,8 +266,10 @@ struct FitArgs {
     /// want a non-default binomial link.
     #[arg(long = "predict-noise", alias = "predict-variance")]
     predict_noise: Option<String>,
-    /// Secondary RHS-only formula for the ancestry-varying log-slope surface
+    /// Secondary RHS-only formula for ancestry-varying log-slope surface(s)
     /// in the Bernoulli marginal-slope family. Pass terms only, not `y ~ ...`.
+    /// Use additive `logslope(z_col, terms...)` declarations for vector-z
+    /// marginal-slope models.
     /// `linkwiggle(...)` here routes into the anchored score-warp block for
     /// marginal-slope families.
     #[arg(long = "logslope-formula")]
@@ -4965,14 +4967,24 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?,
             );
+            payload.resolved_termspec_logslopes = payload
+                .resolved_termspec_logslope
+                .as_ref()
+                .map(|spec| vec![spec.clone()]);
             payload.formula_logslope = Some(logslope_formula);
             payload.z_column = args.z_column.clone();
+            payload.formula_logslopes = payload
+                .formula_logslope
+                .as_ref()
+                .map(|formula| vec![formula.clone()]);
+            payload.z_columns = payload.z_column.as_ref().map(|z| vec![z.clone()]);
             payload.latent_z_normalization = Some(SavedLatentZNormalization {
                 mean: fit.z_normalization.mean,
                 sd: fit.z_normalization.sd,
             });
             payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
             payload.logslope_baseline = Some(fit.baseline_slope);
+            payload.logslope_baselines = Some(vec![fit.baseline_slope]);
             payload.score_warp_runtime = fit
                 .score_warp_runtime
                 .as_ref()
@@ -6877,15 +6889,34 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.data_schema = Some(data_schema);
     payload.formula_logslope = Some(logslope_formula);
     payload.z_column = Some(z_column);
+    payload.formula_logslopes = Some(vec![
+        payload
+            .formula_logslope
+            .as_ref()
+            .expect("formula_logslope just set")
+            .clone(),
+    ]);
+    payload.z_columns = Some(vec![
+        payload
+            .z_column
+            .as_ref()
+            .expect("z_column just set")
+            .clone(),
+    ]);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
     payload.latent_z_rank_int_calibration = latent_z_rank_int_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
+    payload.logslope_baselines = Some(vec![baseline_logslope]);
     payload.link = Some(base_link.saved_string());
     payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
+    payload.resolved_termspec_logslopes = payload
+        .resolved_termspec_logslope
+        .as_ref()
+        .map(|spec| vec![spec.clone()]);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
     SavedModel::from_payload(payload)
@@ -7592,6 +7623,10 @@ fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
             | ParsedTerm::SurvivalConfig { .. } => {}
+            | ParsedTerm::LogSlopeSurface { z_column, terms } => {
+                out.insert(z_column.clone());
+                collect_term_column_names(terms, out);
+            }
         }
     }
 }
@@ -7606,6 +7641,10 @@ fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, S
         out.insert(parsed.response.clone());
     }
     collect_term_column_names(&parsed.terms, &mut out);
+    for surface in &parsed.logslope_surfaces {
+        out.insert(surface.z_column.clone());
+        collect_term_column_names(&surface.terms, &mut out);
+    }
     Ok(out.into_iter().collect())
 }
 
