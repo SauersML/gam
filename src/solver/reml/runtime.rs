@@ -4008,7 +4008,6 @@ impl<'a> RemlState<'a> {
             self.y.len(),
             hessian_op,
             self.build_penalty_coords(),
-            self.build_penalty_means(beta.len()),
             penalty_logdet,
             super::unified::DispersionHandling::ProfiledGaussian,
         )
