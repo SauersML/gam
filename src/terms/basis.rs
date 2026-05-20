@@ -18607,11 +18607,7 @@ fn periodic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
 /// remove every such duplicate (tested under the periodic metric with a
 /// tolerance scaled to ``period``); the remaining centers correspond to
 /// geometrically distinct points on the circle.
-fn collapse_periodic_endpoint(
-    centers: Array2<f64>,
-    left: f64,
-    period: f64,
-) -> Array2<f64> {
+fn collapse_periodic_endpoint(centers: Array2<f64>, left: f64, period: f64) -> Array2<f64> {
     if period <= 0.0 || !period.is_finite() {
         return centers;
     }
