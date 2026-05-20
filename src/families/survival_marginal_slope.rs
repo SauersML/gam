@@ -1950,6 +1950,12 @@ impl BlockHessianAccumulator {
     }
 }
 
+impl std::ops::AddAssign<&BlockHessianAccumulator> for BlockHessianAccumulator {
+    fn add_assign(&mut self, other: &BlockHessianAccumulator) {
+        self.add(other);
+    }
+}
+
 impl BlockHessianAccumulator {
     /// Lifted pullback: J^T H J + Σ_a f_a K_a using actual Jacobians
     fn add_pullback_with_q_geometry(
@@ -11506,27 +11512,27 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
-        type Acc = (
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            BlockHessianAccumulator,
-        );
+        struct Acc {
+            objective: f64,
+            score_t: Array1<f64>,
+            score_m: Array1<f64>,
+            score_g: Array1<f64>,
+            score_h: Array1<f64>,
+            score_w: Array1<f64>,
+            hess: BlockHessianAccumulator,
+        }
         let make_accs = || -> Vec<Acc> {
             (0..k)
                 .map(|_| {
-                    (
-                        0.0,
-                        Array1::zeros(p_t),
-                        Array1::zeros(p_m),
-                        Array1::zeros(p_g),
-                        Array1::zeros(p_h),
-                        Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-                    )
+                    Acc {
+                        objective: 0.0,
+                        score_t: Array1::zeros(p_t),
+                        score_m: Array1::zeros(p_m),
+                        score_g: Array1::zeros(p_g),
+                        score_h: Array1::zeros(p_h),
+                        score_w: Array1::zeros(p_w),
+                        hess: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    }
                 })
                 .collect()
         };
@@ -11569,74 +11575,90 @@ impl SurvivalMarginalSlopeFamily {
                     let acc = &mut accs[axis_idx];
 
                     // objective_psi += w * (f_pi · dir)
-                    acc.0 += w * f_pi.dot(&dir);
+                    acc.objective += w * f_pi.dot(&dir);
 
                     // score_psi += w * (f_pi · loading) * psi_row, routed to
                     // the marginal or logslope block depending on axis.
                     let s1 = w * f_pi.dot(&axis.loading);
                     match axis.block_idx {
-                        1 => acc.2.scaled_add(s1, &psi_row),
-                        _ => acc.3.scaled_add(s1, &psi_row),
+                        1 => acc.score_m.scaled_add(s1, &psi_row),
+                        _ => acc.score_g.scaled_add(s1, &psi_row),
                     }
 
                     let mut pb = f_pipi.dot(&dir);
                     if w != 1.0 {
                         pb.mapv_inplace(|v| v * w);
                     }
-                    self.accumulate_score_blockwise(row, &pb, &mut acc.1, &mut acc.2, &mut acc.3)?;
+                    self.accumulate_score_blockwise(
+                        row,
+                        &pb,
+                        &mut acc.score_t,
+                        &mut acc.score_m,
+                        &mut acc.score_g,
+                    )?;
                     self.accumulate_score_identity_blocks(
                         None,
                         &pb,
-                        Some(&mut acc.4),
-                        Some(&mut acc.5),
+                        Some(&mut acc.score_h),
+                        Some(&mut acc.score_w),
                     );
 
                     let mut right_primary = f_pipi.dot(&axis.loading);
                     if w != 1.0 {
                         right_primary.mapv_inplace(|v| v * w);
                     }
-                    acc.6.add_rank1_psi_cross(
+                    acc.hess.add_rank1_psi_cross(
                         self,
                         row,
                         axis.block_idx,
                         &psi_row,
                         &right_primary,
                     )?;
-                    acc.6.add_pullback(self, row, &third)?;
+                    acc.hess.add_pullback(self, row, &third)?;
                 }
                 Ok(())
             },
             |total: &mut Vec<Acc>, chunk: Vec<Acc>| {
                 for (t, c) in total.iter_mut().zip(chunk.into_iter()) {
-                    t.0 += c.0;
-                    t.1 += &c.1;
-                    t.2 += &c.2;
-                    t.3 += &c.3;
-                    t.4 += &c.4;
-                    t.5 += &c.5;
-                    t.6.add(&c.6);
+                    t.objective += c.objective;
+                    t.score_t += &c.score_t;
+                    t.score_m += &c.score_m;
+                    t.score_g += &c.score_g;
+                    t.score_h += &c.score_h;
+                    t.score_w += &c.score_w;
+                    t.hess.add(&c.hess);
                 }
             },
         )?;
 
         let mut out: Vec<ExactNewtonJointPsiTerms> = Vec::with_capacity(k);
-        for (obj, st, sm, sg, sh, sw, hess_acc) in folded.into_iter() {
+        for acc in folded.into_iter() {
             let mut score_psi = Array1::zeros(slices.total);
-            score_psi.slice_mut(s![slices.time.clone()]).assign(&st);
-            score_psi.slice_mut(s![slices.marginal.clone()]).assign(&sm);
-            score_psi.slice_mut(s![slices.logslope.clone()]).assign(&sg);
+            score_psi
+                .slice_mut(s![slices.time.clone()])
+                .assign(&acc.score_t);
+            score_psi
+                .slice_mut(s![slices.marginal.clone()])
+                .assign(&acc.score_m);
+            score_psi
+                .slice_mut(s![slices.logslope.clone()])
+                .assign(&acc.score_g);
             if let Some(range) = slices.score_warp.as_ref() {
-                score_psi.slice_mut(s![range.clone()]).assign(&sh);
+                score_psi
+                    .slice_mut(s![range.clone()])
+                    .assign(&acc.score_h);
             }
             if let Some(range) = slices.link_dev.as_ref() {
-                score_psi.slice_mut(s![range.clone()]).assign(&sw);
+                score_psi
+                    .slice_mut(s![range.clone()])
+                    .assign(&acc.score_w);
             }
             out.push(ExactNewtonJointPsiTerms {
-                objective_psi: obj,
+                objective_psi: acc.objective,
                 score_psi,
                 hessian_psi: Array2::zeros((0, 0)),
                 hessian_psi_operator: Some(std::sync::Arc::new(
-                    hess_acc.into_operator(slices.clone()),
+                    acc.hess.into_operator(slices.clone()),
                 )),
             });
         }
