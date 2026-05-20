@@ -9067,6 +9067,10 @@ fn truncate_joint_step_to_radius(delta: &mut Array1<f64>, radius: f64) -> f64 {
     }
 }
 
+fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
+    residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
+}
+
 /// Solve the dense trust-region Newton subproblem with Hebden damping instead
 /// of rescaling the unconstrained Newton direction. Rescaling preserves
 /// near-null components of `H + S` and can leave the iterate objective-flat
@@ -11021,30 +11025,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // cycle-0 termination, leaving inner_max_cycles=1 callers
             // unable to certify convergence on a problem that was
             // solved exactly in one Newton step.
-            if residual <= residual_tol {
-                converged = true;
-                break;
-            }
-            // Large survival marginal-slope fits can enter a statistically
-            // flat basin where each accepted exact-Newton step changes the
-            // objective by less than the requested inner accuracy, but the
-            // projected residual lands just above the absolute KKT threshold
-            // because the remaining gradient mass is at the row-summed
-            // arithmetic noise floor. Requiring thousands of additional
-            // identical descent cycles gives the outer optimizer no more
-            // useful hyperparameter information; it only rejects every seed as
-            // "inner did not converge". Accept this narrow plateau only when
-            // the objective has already converged and stationarity is within a
-            // small factor of the same scale-aware tolerance.
-            if objective_change <= objective_tol && residual <= 2.0 * residual_tol {
-                log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | objective-flat KKT certificate: residual={:.3e} <= 2*tol={:.3e}, obj_change={:.3e} <= tol={:.3e}",
-                    cycle,
-                    residual,
-                    2.0 * residual_tol,
-                    objective_change,
-                    objective_tol,
-                );
+            if joint_inner_kkt_converged(residual, residual_tol) {
                 converged = true;
                 break;
             }
@@ -22451,6 +22432,42 @@ mod tests {
                 objective_tol,
             ),
             "positive-noise reductions must NOT trigger the floor; symmetric exit breaks rank-deficient FD identity"
+        );
+    }
+
+    #[test]
+    fn joint_inner_convergence_rejects_objective_flat_non_kkt_stall() {
+        // Direct reproduction of the bad 0.1.79 log shape:
+        //
+        //   obj=4.472714e5 Δobj=5.381e-2 |δ|∞=2.794e-2
+        //   residual=5.980e1 tol=4.473e-1
+        //
+        // The objective and step are both flat at this scale, but the KKT
+        // residual is 134x tolerance. Accepting this as an inner optimum makes
+        // the envelope-theorem outer gradient invalid, which is what surfaced
+        // as outer BFGS objective stalls with |g|≈1e14-1e16.
+        let objective = 4.472714e5_f64;
+        let objective_change = 5.381e-2_f64;
+        let accepted_step_inf = 2.794e-2_f64;
+        let residual = 5.980e1_f64;
+        let residual_tol = 4.473e-1_f64;
+        let step_tol = 1.242e-3_f64;
+        let objective_tol = residual_tol;
+        let old_flat_step_predicate =
+            objective_change <= objective_tol
+                && accepted_step_inf <= objective_tol.sqrt().max(step_tol);
+
+        assert!(
+            old_flat_step_predicate,
+            "the historical objective-flat/step-flat predicate would have accepted this stalled inner solve"
+        );
+        assert!(
+            !joint_inner_kkt_converged(residual, residual_tol),
+            "inner convergence must require KKT residual <= tolerance"
+        );
+        assert!(
+            !joint_inner_kkt_converged(1.5 * residual_tol, residual_tol),
+            "near-miss residual slack would still invalidate the outer envelope gradient"
         );
     }
 
