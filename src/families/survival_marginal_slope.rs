@@ -14283,17 +14283,8 @@ impl SurvivalMarginalSlopeFamily {
 
                     // ── Build dJ arrays for both directions ────────────
                     // (same code as first directional, for d and e)
-                    let build_dj = |dh0: f64,
-                                    dh1: f64,
-                                    ddr_val: f64|
-                     -> (
-                        Vec<f64>,
-                        Vec<f64>,
-                        Vec<f64>,
-                        Vec<f64>,
-                        Vec<f64>,
-                        Vec<f64>,
-                    ) {
+                    type DjArrays = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>);
+                    let build_dj = |dh0: f64, dh1: f64, ddr_val: f64| -> DjArrays {
                         let mut j0t = vec![0.0f64; p_time];
                         let mut j1t = vec![0.0f64; p_time];
                         let mut jdt = vec![0.0f64; p_time];
