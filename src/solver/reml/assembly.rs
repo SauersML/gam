@@ -224,6 +224,7 @@ pub struct InnerAssembly<'dp> {
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,
     pub rho_curvature_scale: f64,
+    pub rho_prior: crate::types::RhoPrior,
     pub hessian_logdet_correction: f64,
     pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
 
@@ -256,6 +257,7 @@ impl<'dp> InnerAssembly<'dp> {
             self.dispersion,
         );
         builder = builder.rho_curvature_scale(self.rho_curvature_scale);
+        builder = builder.rho_prior(self.rho_prior);
         builder = builder.hessian_logdet_correction(self.hessian_logdet_correction);
         builder = builder.penalty_subspace_trace(self.penalty_subspace_trace);
 

@@ -12564,6 +12564,7 @@ fn build_custom_family_inner_assembly<'dp>(
             include_logdet_s,
         },
         rho_curvature_scale,
+        rho_prior: crate::types::RhoPrior::Flat,
         hessian_logdet_correction,
         penalty_subspace_trace: None,
         deriv_provider: Some(deriv_provider),

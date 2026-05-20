@@ -81,11 +81,69 @@ fn fit_constant_exposure_cause_specific(
         linear_constraints: None,
         initial_lm_lambda: None,
     };
-    let beta0 = Array1::from_iter(event_counts.iter().map(|&count| {
-        ((count as f64 + 0.5) / n as f64).ln()
-    }));
+    let beta0 = Array1::from_iter(
+        event_counts
+            .iter()
+            .map(|&count| ((count as f64 + 0.5) / n as f64).ln()),
+    );
     let summary = runworking_model_pirls(&mut model, Coefficients::new(beta0), &opts, |_| {})
         .expect("joint cause-specific survival fit");
+    assert_eq!(summary.status, PirlsStatus::Converged);
+    summary.beta.as_ref().to_owned()
+}
+
+fn fit_constant_exposure_single_endpoint(event_count: usize, n: usize) -> Array1<f64> {
+    gam::init_parallelism();
+    let mut events = Array1::<u8>::zeros(n);
+    for i in 0..event_count {
+        events[i] = 1;
+    }
+    let age_entry = Array1::zeros(n);
+    let age_exit = Array1::ones(n);
+    let weights = Array1::ones(n);
+    let x_entry = Array2::ones((n, 1));
+    let x_exit = Array2::ones((n, 1));
+    let x_derivative = Array2::zeros((n, 1));
+    let offset_entry = Array1::zeros(n);
+    let offset_exit = Array1::zeros(n);
+    let offset_derivative = Array1::ones(n);
+    let event_competing = Array1::<u8>::zeros(n);
+    let mut model = WorkingModelSurvival::from_engine_inputswith_offsets(
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: events.view(),
+            event_competing: event_competing.view(),
+            sampleweight: weights.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
+        },
+        Some(SurvivalBaselineOffsets {
+            eta_entry: offset_entry.view(),
+            eta_exit: offset_exit.view(),
+            derivative_exit: offset_derivative.view(),
+        }),
+        PenaltyBlocks::new(Vec::new()),
+        MonotonicityPenalty { tolerance: 0.0 },
+        SurvivalSpec::Net,
+    )
+    .expect("build single-endpoint survival model");
+    let opts = WorkingModelPirlsOptions {
+        max_iterations: 80,
+        convergence_tolerance: 1e-10,
+        max_step_halving: 30,
+        min_step_size: 1e-14,
+        firth_bias_reduction: false,
+        coefficient_lower_bounds: None,
+        linear_constraints: None,
+        initial_lm_lambda: None,
+    };
+    let beta0 = Array1::from_vec(vec![((event_count as f64 + 0.5) / n as f64).ln()]);
+    let summary = runworking_model_pirls(&mut model, Coefficients::new(beta0), &opts, |_| {})
+        .expect("single endpoint survival fit");
     assert_eq!(summary.status, PirlsStatus::Converged);
     summary.beta.as_ref().to_owned()
 }
@@ -127,7 +185,7 @@ fn single_cause_expansion_matches_single_endpoint_baseline() {
     let n = 900;
     let event_count = 117;
     let joint_beta = fit_constant_exposure_cause_specific(1, &[event_count], n);
-    let baseline_beta = fit_constant_exposure_cause_specific(1, &[event_count], n);
+    let baseline_beta = fit_constant_exposure_single_endpoint(event_count, n);
     assert!(
         (joint_beta[0] - baseline_beta[0]).abs() <= 1e-12,
         "K=1 expanded beta differs from baseline: joint={}, baseline={}",

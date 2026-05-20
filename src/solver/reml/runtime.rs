@@ -3998,6 +3998,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             super::unified::DispersionHandling::ProfiledGaussian,
         )
+        .rho_prior(self.rho_prior.clone())
         .nullspace_dim_override(nullspace_dim)
         .build();
 
@@ -6107,6 +6108,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,
+            rho_prior: self.rho_prior.clone(),
             hessian_logdet_correction,
             penalty_subspace_trace,
             deriv_provider: Some(ctx.deriv_provider),
