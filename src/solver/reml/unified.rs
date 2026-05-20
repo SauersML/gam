@@ -6435,9 +6435,14 @@ pub fn reml_laml_evaluate(
         let large_linear_work =
             n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
         let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-        let scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
-        let callback_prefers_operator =
-            callback_operator_kernel && prefer_callback_outer_hessian_operator(n_obs, k_outer);
+        let generic_scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
+        let callback_prefers_operator = callback_operator_kernel
+            && prefer_callback_outer_hessian_operator(n_obs, p_dim, k_outer);
+        let scale_prefers_operator = if callback_operator_kernel {
+            callback_prefers_operator
+        } else {
+            generic_scale_prefers_operator
+        };
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
         let use_operator = hessian_kernel.is_some()
             && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
@@ -6456,9 +6461,9 @@ pub fn reml_laml_evaluate(
             "large_k"
         } else if large_p {
             "large_p"
-        } else if large_n_and_moderate_p {
+        } else if !callback_operator_kernel && large_n_and_moderate_p {
             "large_n_moderate_p"
-        } else if large_linear_work {
+        } else if !callback_operator_kernel && large_linear_work {
             "large_linear_work"
         } else {
             "below_crossover"
@@ -6606,14 +6611,26 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     large_p || large_n_and_moderate_p || large_linear_work || large_k
 }
 
-pub(crate) fn prefer_callback_outer_hessian_operator(n: usize, k: usize) -> bool {
-    n.saturating_mul(k).saturating_mul(k) >= CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD
+pub(crate) fn prefer_callback_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
+    let large_p = p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
+    let large_k = k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
+    let large_callback_row_pair_work =
+        n.saturating_mul(k).saturating_mul(k) >= CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD;
+    large_p || large_k || large_callback_row_pair_work
 }
 
 /// Selects the matrix-free outer-Hessian representation once a Hessian HVP
 /// kernel is available. Decision is cost-driven via the `(n, p, K)` crossover
 /// plus a callback-specific row-pair workload crossover: the operator and
 /// dense paths produce identical math, so they only differ in assembly cost.
+///
+/// Callback-backed kernels deliberately do not inherit the generic
+/// large-`n`, moderate-`p` route. At small coefficient dimension their
+/// operator logdet projections still stream row kernels over all observations
+/// per outer-HVP, while the dense path can assemble the small `K x K` Hessian
+/// directly. The callback path only flips to matrix-free for genuinely wide
+/// bases, many outer coordinates, or enough row-pair work to amortize those
+/// repeated projections.
 ///
 /// Real fast HVP capability (a family-supplied directional θθ operator) is
 /// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
@@ -6624,8 +6641,11 @@ pub(crate) fn use_outer_hessian_operator_path(
     k: usize,
     callback_kernel: bool,
 ) -> bool {
-    prefer_outer_hessian_operator(n, p, k)
-        || (callback_kernel && prefer_callback_outer_hessian_operator(n, k))
+    if callback_kernel {
+        prefer_callback_outer_hessian_operator(n, p, k)
+    } else {
+        prefer_outer_hessian_operator(n, p, k)
+    }
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
@@ -14872,10 +14892,19 @@ mod tests {
     #[test]
     fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
         assert!(!prefer_outer_hessian_operator(155_980, 19, 23));
-        assert!(prefer_callback_outer_hessian_operator(155_980, 23));
+        assert!(prefer_callback_outer_hessian_operator(155_980, 19, 23));
         assert!(use_outer_hessian_operator_path(155_980, 19, 23, true));
         assert!(!use_outer_hessian_operator_path(155_980, 19, 23, false));
         assert!(!use_outer_hessian_operator_path(1_000, 19, 23, true));
+    }
+
+    #[test]
+    fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover() {
+        assert!(prefer_outer_hessian_operator(195_780, 33, 8));
+        assert!(!prefer_callback_outer_hessian_operator(195_780, 33, 8));
+        assert!(!use_outer_hessian_operator_path(195_780, 33, 8, true));
+        assert!(use_outer_hessian_operator_path(195_780, 512, 8, true));
+        assert!(use_outer_hessian_operator_path(195_780, 33, 32, true));
     }
 
     #[test]

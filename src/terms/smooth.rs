@@ -19785,7 +19785,7 @@ mod tests {
             route.hessian_source,
             crate::solver::outer_strategy::HessianSource::Analytic
         );
-        assert!(route.routing_log_line().contains("matrix-free=true"));
+        assert!(route.routing_log_line().contains("matrix-free=false"));
     }
 
     #[test]

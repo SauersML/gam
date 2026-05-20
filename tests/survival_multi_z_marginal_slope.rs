@@ -51,6 +51,49 @@ fn survival_multi_z_k2_full_covariance_preserves_identity() {
 }
 
 #[test]
+fn survival_multi_z_shared_slope_neglog_uses_row_sum_and_covariance_quadratic() {
+    let q0 = 0.15;
+    let q1 = 0.55;
+    let qd1 = 0.9;
+    let shared_slope = -0.22;
+    let z = [0.6, -1.1];
+    let covariance = MarginalSlopeCovariance::Full(array![[1.3, 0.4], [0.4, 0.7]]);
+    let probit_scale = 0.85;
+    let weight = 1.3;
+    let event = 1.0;
+
+    let observed = [probit_scale * shared_slope, probit_scale * shared_slope];
+    let c = (1.0 + covariance.quadratic_form(&observed).expect("r Sigma r")).sqrt();
+    let linear = observed[0] * z.iter().sum::<f64>();
+    let eta0 = q0 * c + linear;
+    let eta1 = q1 * c + linear;
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let expected = weight
+        * (normal_cdf(-eta0).ln()
+            - (1.0 - event) * normal_cdf(-eta1).ln()
+            - event * log_phi_eta1
+            - event * (qd1 * c).ln());
+
+    let actual = survival_marginal_slope_vector_neglog(
+        q0,
+        q1,
+        qd1,
+        &[shared_slope, shared_slope],
+        &z,
+        &covariance,
+        weight,
+        event,
+        1e-6,
+        probit_scale,
+    )
+    .expect("vector neglog");
+    assert!(
+        (actual - expected).abs() <= 1e-14,
+        "actual={actual:.17e} expected={expected:.17e}"
+    );
+}
+
+#[test]
 fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
     let q = 0.19;
     let z = [-0.4, 0.8, 1.2, -1.5];
