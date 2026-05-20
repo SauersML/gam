@@ -6062,6 +6062,7 @@ fn nonconverged_outer_efs_result(
             beta: None,
             psi_gradient: None,
             psi_indices: None,
+            inner_hessian_diag_scale: None,
         },
         constrained_warm_start_from_inner(rho, inner),
         false,
@@ -13537,6 +13538,7 @@ fn unified_joint_efs_eval(
             } else {
                 Some(hybrid.psi_indices)
             },
+            inner_hessian_diag_scale: None,
         })
     } else {
         Ok(crate::solver::outer_strategy::EfsEval {
@@ -13549,6 +13551,7 @@ fn unified_joint_efs_eval(
             beta: Some(inner_solution.beta.clone()),
             psi_gradient: None,
             psi_indices: None,
+            inner_hessian_diag_scale: None,
         })
     }
 }
