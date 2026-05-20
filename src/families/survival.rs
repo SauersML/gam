@@ -1868,6 +1868,7 @@ impl WorkingModelSurvival {
                 include_logdet_s: true,
             },
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             deriv_provider: Some(Box::new(provider)),
