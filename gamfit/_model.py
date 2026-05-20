@@ -1194,15 +1194,14 @@ class Model:
         rows: Any,
         *,
         coverage: float = 0.95,
-    ) -> tuple[Any, Any, Any, list[dict[str, dict[str, Any]]]]:
+    ) -> tuple[Any, Any, Any, dict[str, Any]]:
         """Predict with covariance-based confidence intervals and group attribution.
 
-        Returns ``(point, lower, upper, coverage_breakdown)``.  The first
-        three entries are numpy arrays on the response-mean scale.  The
-        breakdown is one dict per prediction row.  Group-label entries contain
-        the within-group covariance-block contribution ``x_g' Cov_g,g x_g``;
-        ``"__cross_terms__"`` carries the cross-block terms needed to reconstruct
-        the total prediction variance.
+        Returns ``(point, lower, upper, per_group_variance_contributions)``.
+        The first three entries are numpy arrays on the response-mean scale.
+        The fourth entry is a covariance-block variance decomposition:
+        per-group arrays contain ``x_g' Cov(beta_g, beta_g) x_g`` and
+        cross-term arrays contain ``2 x_g' Cov(beta_g, beta_h) x_h``.
         """
         import numpy as np
 
@@ -1270,74 +1269,73 @@ class Model:
             if indices.size
         }
 
-        breakdown: list[dict[str, dict[str, Any]]] = []
         widths = np.maximum(upper - lower, 0.0)
-        for row_idx in range(design.shape[0]):
-            width = float(widths[row_idx])
-            row_breakdown: dict[str, dict[str, Any]] = {}
-            group_sum = 0.0
-            active_labels: list[str] = []
-            for label in labels:
-                indices = label_arrays.get(label)
-                if indices is None or not indices.size:
+        group_payload: dict[str, dict[str, Any]] = {}
+        for label in labels:
+            variance = group_variance.get(label)
+            if variance is None:
+                continue
+            entry: dict[str, Any] = {
+                "variance": variance,
+                "standard_error": np.sqrt(np.maximum(variance, 0.0)),
+                "component": "within_group_covariance_block",
+            }
+            info = label_info.get(label)
+            if info:
+                entry.update(info)
+            group_payload[label] = entry
+
+        pairwise_cross_terms: list[dict[str, Any]] = []
+        cross_variance = np.zeros(design.shape[0], dtype=float)
+        for left_pos, left in enumerate(labels):
+            left_indices = label_arrays.get(left)
+            if left_indices is None or not left_indices.size:
+                continue
+            x_left = design[:, left_indices]
+            for right in labels[left_pos + 1:]:
+                right_indices = label_arrays.get(right)
+                if right_indices is None or not right_indices.size:
                     continue
-                variance = float(group_variance[label][row_idx])
-                group_sum += variance
-                row_design = design[row_idx, indices]
-                if np.any(row_design != 0.0) or variance != 0.0:
-                    active_labels.append(label)
-                entry: dict[str, Any] = {
-                    "variance": variance,
-                    "standard_error": float(np.sqrt(max(variance, 0.0))),
-                    "component": "within_group_covariance_block",
-                }
-                info = label_info.get(label)
-                if info:
-                    entry.update(info)
-                row_breakdown[label] = entry
+                x_right = design[:, right_indices]
+                pair_variance = 2.0 * np.einsum(
+                    "ij,jk,ik->i",
+                    x_left,
+                    cov[np.ix_(left_indices, right_indices)],
+                    x_right,
+                )
+                cross_variance = cross_variance + pair_variance
+                pairwise_cross_terms.append(
+                    {
+                        "left": left,
+                        "right": right,
+                        "variance": pair_variance,
+                    }
+                )
 
-            pairwise: list[dict[str, Any]] = []
-            pairwise_sum = 0.0
-            for left_pos, left in enumerate(active_labels):
-                left_indices = label_arrays[left]
-                x_left = design[row_idx, left_indices]
-                for right in active_labels[left_pos + 1:]:
-                    right_indices = label_arrays[right]
-                    x_right = design[row_idx, right_indices]
-                    cross_variance = 2.0 * float(
-                        x_left
-                        @ cov[np.ix_(left_indices, right_indices)]
-                        @ x_right
-                    )
-                    pairwise_sum += cross_variance
-                    if cross_variance != 0.0:
-                        pairwise.append(
-                            {
-                                "left": left,
-                                "right": right,
-                                "variance": cross_variance,
-                            }
-                        )
-
-            total_variance = float(eta_variance[row_idx])
-            cross_variance = total_variance - group_sum
-            row_breakdown["__cross_terms__"] = {
+        group_variance_sum = sum(group_variance.values(), np.zeros(design.shape[0], dtype=float))
+        reconstructed_variance = group_variance_sum + cross_variance
+        per_group_variance_contributions: dict[str, Any] = {
+            "groups": group_payload,
+            "cross_terms": {
                 "variance": cross_variance,
-                "pairwise": pairwise,
-                "pairwise_sum": float(pairwise_sum),
+                "pairwise": pairwise_cross_terms,
                 "component": "between_group_covariance_blocks",
-            }
-            row_breakdown["__total__"] = {
-                "variance": total_variance,
-                "standard_error": float(np.sqrt(max(total_variance, 0.0))),
-                "ci_width": width,
-                "group_variance_sum": float(group_sum),
+            },
+            "total": {
+                "variance": eta_variance,
+                "standard_error": np.sqrt(np.maximum(eta_variance, 0.0)),
+                "ci_width": widths,
+                "group_variance_sum": group_variance_sum,
                 "cross_variance": cross_variance,
-                "reconstructed_variance": float(group_sum + cross_variance),
-            }
-            breakdown.append(row_breakdown)
+                "reconstructed_variance": reconstructed_variance,
+            },
+            "metadata": {
+                "coverage": coverage,
+                "covariance_corrected": bool(state.get("covariance_corrected", False)),
+            },
+        }
 
-        return point, lower, upper, breakdown
+        return point, lower, upper, per_group_variance_contributions
 
     def difference_smooth(
         self,
