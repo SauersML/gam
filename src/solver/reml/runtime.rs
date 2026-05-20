@@ -6795,6 +6795,7 @@ impl<'a> RemlState<'a> {
                 beta: Some(beta_for_barrier),
                 psi_gradient,
                 psi_indices,
+                inner_hessian_diag_scale: None,
             }
         } else {
             let steps = compute_efs_update(
@@ -6808,6 +6809,7 @@ impl<'a> RemlState<'a> {
                 beta: Some(beta_for_barrier),
                 psi_gradient: None,
                 psi_indices: None,
+                inner_hessian_diag_scale: None,
             }
         };
 
