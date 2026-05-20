@@ -794,6 +794,8 @@ pub struct CanonicalPenalty {
     /// Cached at construction time to avoid recomputing root^T * root
     /// in hot paths (penalty assembly, trace products).
     pub local: Array2<f64>,
+    /// Block-local prior mean used to center this penalty.
+    pub prior_mean: Array1<f64>,
     /// Positive eigenvalues of the local penalty matrix (length = rank).
     /// Cached at construction time for REML logdet block-factored paths.
     pub positive_eigenvalues: Vec<f64>,
@@ -817,6 +819,7 @@ impl std::fmt::Debug for CanonicalPenalty {
                 "local",
                 &format_args!("{}×{}", self.local.nrows(), self.local.ncols()),
             )
+            .field("prior_mean_len", &self.prior_mean.len())
             .field("positive_eigenvalues", &self.positive_eigenvalues)
             .field("op", &self.op.as_ref().map(|o| o.dim()))
             .finish()
@@ -828,6 +831,11 @@ impl CanonicalPenalty {
     /// Used to wrap reparam-transformed roots for consumers that expect
     /// `&[CanonicalPenalty]`.
     pub fn from_dense_root(root: Array2<f64>, p: usize) -> Self {
+        Self::from_dense_root_with_mean(root, p, Array1::zeros(p))
+    }
+
+    pub fn from_dense_root_with_mean(root: Array2<f64>, p: usize, prior_mean: Array1<f64>) -> Self {
+        debug_assert_eq!(prior_mean.len(), p);
         let local = root.t().dot(&root);
         let positive_eigenvalues = Vec::new(); // not needed for TK paths
         Self {
@@ -836,6 +844,7 @@ impl CanonicalPenalty {
             total_dim: p,
             nullity: 0,
             local,
+            prior_mean,
             positive_eigenvalues,
             op: None,
         }
@@ -918,6 +927,37 @@ impl CanonicalPenalty {
         let v_block = v.slice(s![self.col_range.start..self.col_range.end]);
         let rv = self.root.dot(&v_block);
         scale * rv.dot(&rv)
+    }
+
+    /// Compute `scale * S_k * prior_mean` embedded into the global basis.
+    pub fn prior_linear_shift(&self, scale: f64) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.total_dim);
+        if self.rank() == 0 || scale == 0.0 || self.prior_mean.iter().all(|&v| v == 0.0) {
+            return out;
+        }
+        let block = self.local.dot(&self.prior_mean) * scale;
+        out.slice_mut(s![self.col_range.start..self.col_range.end])
+            .assign(&block);
+        out
+    }
+
+    /// Compute `scale * prior_mean' S_k prior_mean`.
+    pub fn prior_constant_shift(&self, scale: f64) -> f64 {
+        if self.rank() == 0 || scale == 0.0 || self.prior_mean.iter().all(|&v| v == 0.0) {
+            return 0.0;
+        }
+        scale * self.prior_mean.dot(&self.local.dot(&self.prior_mean))
+    }
+
+    /// Embed this block's prior mean into the global coefficient basis.
+    pub fn full_width_prior_mean(&self) -> Array1<f64> {
+        if self.col_range.start == 0 && self.col_range.end == self.total_dim {
+            return self.prior_mean.clone();
+        }
+        let mut out = Array1::<f64>::zeros(self.total_dim);
+        out.slice_mut(s![self.col_range.start..self.col_range.end])
+            .assign(&self.prior_mean);
+        out
     }
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
@@ -1059,10 +1099,11 @@ pub fn canonicalize_penalty_spec(
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
     use crate::estimate::PenaltySpec;
 
-    let (local_matrix, col_range, hint, op) = match spec {
+    let (local_matrix, col_range, prior_mean_spec, hint, op) = match spec {
         PenaltySpec::Block {
             local,
             col_range,
+            prior_mean,
             structure_hint,
             op,
         } => {
@@ -1083,6 +1124,7 @@ pub fn canonicalize_penalty_spec(
             (
                 local.view(),
                 col_range.clone(),
+                prior_mean,
                 structure_hint.as_ref(),
                 op.clone(),
             )
@@ -1095,11 +1137,18 @@ pub fn canonicalize_penalty_spec(
                     m.ncols()
                 )));
             }
-            (m.view(), 0..p, None, None)
+            (
+                m.view(),
+                0..p,
+                &crate::estimate::CoefficientPriorMean::Zero,
+                None,
+                None,
+            )
         }
     };
 
     let block_dim = col_range.len();
+    let prior_mean = prior_mean_spec.evaluate(block_dim, &format!("{context}: penalty {idx}"))?;
 
     // ── Ridge fast path: closed-form, no eigendecomposition ──
     if let Some(PenaltyStructureHint::Ridge(scale)) = hint {
@@ -1121,6 +1170,7 @@ pub fn canonicalize_penalty_spec(
             total_dim: p,
             nullity: 0,
             local: local_sym,
+            prior_mean,
             positive_eigenvalues: vec![*scale; block_dim],
             op,
         }));
@@ -1146,6 +1196,7 @@ pub fn canonicalize_penalty_spec(
             total_dim: p,
             nullity,
             local: local_sym,
+            prior_mean,
             positive_eigenvalues,
             op,
         }));
@@ -1201,6 +1252,7 @@ pub fn canonicalize_penalty_spec(
         total_dim: p,
         nullity: analysis.nullity,
         local,
+        prior_mean,
         positive_eigenvalues,
         op,
     }))
@@ -2701,6 +2753,7 @@ mod tests {
                     total_dim: p,
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(p),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -3081,6 +3134,7 @@ mod tests {
             total_dim,
             nullity: 0,
             local,
+            prior_mean: Array1::zeros(block_dim),
             positive_eigenvalues: Vec::new(),
             op: None,
         }

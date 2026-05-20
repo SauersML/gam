@@ -1424,6 +1424,12 @@ class Model:
         """
         return self._training_table_kind
 
+    @property
+    def group_metadata(self) -> dict[str, Any] | None:
+        """Per-group metadata persisted with the fitted model, if present."""
+        value = self.summary().get("group_metadata")
+        return dict(value) if isinstance(value, dict) else None
+
     def _model_class_from_summary(self) -> str:
         value = self.summary().get("model_class")
         if value is None:
