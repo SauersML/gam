@@ -447,15 +447,6 @@ impl DeclaredHessianForm {
         !matches!(self, DeclaredHessianForm::Unavailable)
     }
 
-    /// True when the declaration commits to a matrix-free path.
-    pub fn is_operator_only(self) -> bool {
-        matches!(self, DeclaredHessianForm::Operator { .. })
-    }
-
-    /// True when the declaration commits to a dense path.
-    pub fn is_dense_only(self) -> bool {
-        matches!(self, DeclaredHessianForm::Dense)
-    }
 }
 
 /// Bridge for the partial migration from the legacy `Derivative`-only

@@ -5429,16 +5429,43 @@ impl ImplicitDesignPsiDerivative {
                 }
             }
         } else {
-            for (local, i) in rows.clone().enumerate() {
-                let base = i * self.n_knots;
-                for j in 0..self.n_knots {
-                    let idx = base + j;
-                    let phi = self.phi_values[idx];
-                    let q = self.q_values[idx];
-                    let cphi = c * phi;
-                    for a in 0..n_axes {
-                        let s = self.axis_components[[idx, a]];
-                        out[a][[local, j]] = q * s + cphi;
+            // axis_components is laid out as (total_rows*n_knots, n_axes).
+            // Read each row once via a slice to avoid n_axes strided indexed
+            // accesses per (i, j) pair.
+            let axis_std = self.axis_components.is_standard_layout();
+            let axis_slice_opt = if axis_std {
+                self.axis_components.as_slice()
+            } else {
+                None
+            };
+            if let Some(axis_slice) = axis_slice_opt {
+                let n_total_axes = self.axis_components.ncols();
+                for (local, i) in rows.clone().enumerate() {
+                    let base = i * self.n_knots;
+                    for j in 0..self.n_knots {
+                        let idx = base + j;
+                        let phi = self.phi_values[idx];
+                        let q = self.q_values[idx];
+                        let cphi = c * phi;
+                        let axis_row = &axis_slice[idx * n_total_axes
+                            ..idx * n_total_axes + n_total_axes];
+                        for a in 0..n_axes {
+                            out[a][[local, j]] = q * axis_row[a] + cphi;
+                        }
+                    }
+                }
+            } else {
+                for (local, i) in rows.clone().enumerate() {
+                    let base = i * self.n_knots;
+                    for j in 0..self.n_knots {
+                        let idx = base + j;
+                        let phi = self.phi_values[idx];
+                        let q = self.q_values[idx];
+                        let cphi = c * phi;
+                        for a in 0..n_axes {
+                            let s = self.axis_components[[idx, a]];
+                            out[a][[local, j]] = q * s + cphi;
+                        }
                     }
                 }
             }

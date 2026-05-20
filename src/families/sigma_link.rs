@@ -224,31 +224,6 @@ pub fn logb_sigma_derivs_up_to_third_scalar(eta: f64) -> (f64, f64, f64, f64) {
     (jet.sigma, jet.d1, jet.d2, jet.d3)
 }
 
-pub fn logb_sigma_derivs_up_to_third(
-    eta: ArrayView1<'_, f64>,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>) {
-    let n = eta.len();
-    let mut sigma = Array1::<f64>::uninit(n);
-    let mut d1 = Array1::<f64>::uninit(n);
-    let mut d2 = Array1::<f64>::uninit(n);
-    let mut d3 = Array1::<f64>::uninit(n);
-    for i in 0..n {
-        let jet = logb_sigma_jet3_scalar(eta[i]);
-        sigma[i].write(jet.sigma);
-        d1[i].write(jet.d1);
-        d2[i].write(jet.d2);
-        d3[i].write(jet.d3);
-    }
-    unsafe {
-        (
-            sigma.assume_init(),
-            d1.assume_init(),
-            d2.assume_init(),
-            d3.assume_init(),
-        )
-    }
-}
-
 #[inline]
 pub(crate) fn logb_sigma_jet4_scalar(eta: f64) -> SigmaJet4 {
     let s = safe_exp(eta);
