@@ -73,5 +73,8 @@ fn omitted_gamma_prior_matches_uninformed_fit_bitwise() {
 
     assert_eq!(base.fit.lambdas.to_vec(), empty.fit.lambdas.to_vec());
     assert_eq!(base.fit.beta.to_vec(), empty.fit.beta.to_vec());
-    assert_eq!(base.fit.reml_score.to_bits(), empty.fit.reml_score.to_bits());
+    assert_eq!(
+        base.fit.reml_score.to_bits(),
+        empty.fit.reml_score.to_bits()
+    );
 }

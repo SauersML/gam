@@ -10169,8 +10169,14 @@ mod tests {
             penalty_shrinkage_floor: None,
             kronecker_factored: None,
         };
-        let (fit, _) = fit_model_for_fixed_rho(LogSmoothingParamsView::new(rho.view()), problem, penalty, &config, None)
-            .expect("fixed rho fit");
+        let (fit, _) = fit_model_for_fixed_rho(
+            LogSmoothingParamsView::new(rho.view()),
+            problem,
+            penalty,
+            &config,
+            None,
+        )
+        .expect("fixed rho fit");
         fit.beta_transformed.as_ref().clone()
     }
 
@@ -10208,17 +10214,12 @@ mod tests {
 
     #[test]
     fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
-        let x = array![
-            [1.0, 0.0],
-            [1.0, 1.0],
-            [1.0, 2.0],
-            [1.0, 3.0],
-            [1.0, 4.0],
-        ];
+        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0],];
         let y = array![0.5, 1.0, 1.5, 2.0, 2.5];
         let base_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0);
-        let zero_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0)
-            .with_prior_mean(crate::estimate::CoefficientPriorMean::constant(Array1::zeros(2)));
+        let zero_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0).with_prior_mean(
+            crate::estimate::CoefficientPriorMean::constant(Array1::zeros(2)),
+        );
         let rho = array![0.25];
         let beta_default =
             fixed_gaussian_beta(x.clone(), y.clone(), vec![base_penalty], rho.clone());

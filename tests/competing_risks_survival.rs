@@ -82,7 +82,10 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
         ..BlockwiseFitOptions::default()
     };
     let fit = fit_custom_family(&family, &specs, &options).expect("joint custom-family fit");
-    assert!(fit.outer_converged, "custom-family inner solve did not converge");
+    assert!(
+        fit.outer_converged,
+        "custom-family inner solve did not converge"
+    );
     Array1::from_iter(fit.block_states.iter().map(|state| state.beta[0]))
 }
 

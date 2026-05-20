@@ -639,13 +639,19 @@ pub fn realize_coefficient_groups_for_custom_family(
 
     for group in &realized_groups {
         outer_labels.push(group.label.clone());
-        priors.push(
-            group
-                .prior
-                .as_ref()
-                .map(CoefficientGroupPrior::to_rho_prior)
-                .unwrap_or(crate::types::RhoPrior::Flat),
-        );
+        let group_prior = match group.prior.as_ref() {
+            Some(prior) => prior.to_rho_prior(),
+            None => match &base_prior {
+                crate::types::RhoPrior::Independent(_) => {
+                    return Err(format!(
+                        "coefficient group '{}' must declare a prior when base_prior is Independent",
+                        group.label
+                    ));
+                }
+                prior => prior.clone(),
+            },
+        };
+        priors.push(group_prior);
 
         let mut by_block = BTreeMap::<usize, Vec<usize>>::new();
         for &(block_idx, column) in &group.coefficients {
@@ -6236,6 +6242,129 @@ fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
         at += len;
     }
     out
+}
+
+#[derive(Clone, Debug)]
+struct PenaltyLabelLayout {
+    penalty_counts: Vec<usize>,
+    physical_to_outer: Vec<usize>,
+    initial_rho: Array1<f64>,
+}
+
+impl PenaltyLabelLayout {
+    fn physical_count(&self) -> usize {
+        self.physical_to_outer.len()
+    }
+
+    fn has_tied_coordinates(&self) -> bool {
+        self.initial_rho.len() != self.physical_to_outer.len()
+    }
+}
+
+fn penalty_label_layout(
+    specs: &[ParameterBlockSpec],
+    penalty_counts: Vec<usize>,
+) -> Result<PenaltyLabelLayout, String> {
+    let mut label_to_outer = BTreeMap::<String, usize>::new();
+    let mut physical_to_outer = Vec::<usize>::new();
+    let mut initial = Vec::<f64>::new();
+
+    for (block_idx, spec) in specs.iter().enumerate() {
+        for penalty_idx in 0..spec.penalties.len() {
+            let label = spec.penalties[penalty_idx]
+                .precision_label()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            let rho0 = spec.initial_log_lambdas[penalty_idx];
+            let outer = if let Some(&outer) = label_to_outer.get(&label) {
+                let first = initial[outer];
+                if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                    return Err(format!(
+                        "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
+                    ));
+                }
+                outer
+            } else {
+                let outer = initial.len();
+                label_to_outer.insert(label, outer);
+                initial.push(rho0);
+                outer
+            };
+            physical_to_outer.push(outer);
+        }
+    }
+
+    Ok(PenaltyLabelLayout {
+        penalty_counts,
+        physical_to_outer,
+        initial_rho: Array1::from_vec(initial),
+    })
+}
+
+fn expand_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if rho.len() != layout.initial_rho.len() {
+        return Err(format!(
+            "log-lambda label coordinate mismatch: got {}, expected {}",
+            rho.len(),
+            layout.initial_rho.len()
+        ));
+    }
+    let mut expanded = Array1::<f64>::zeros(layout.physical_count());
+    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
+        expanded[physical] = rho[outer];
+    }
+    Ok(expanded)
+}
+
+fn split_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Vec<Array1<f64>>, String> {
+    let expanded = expand_labeled_log_lambdas(rho, layout)?;
+    split_log_lambdas(&expanded, &layout.penalty_counts)
+}
+
+fn aggregate_labeled_gradient(
+    gradient: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if gradient.len() != layout.physical_count() {
+        return Err(format!(
+            "physical gradient length mismatch: got {}, expected {}",
+            gradient.len(),
+            layout.physical_count()
+        ));
+    }
+    let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
+    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
+        out[outer] += gradient[physical];
+    }
+    Ok(out)
+}
+
+fn aggregate_labeled_hessian(
+    hessian: &Array2<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array2<f64>, String> {
+    if hessian.nrows() != layout.physical_count() || hessian.ncols() != layout.physical_count() {
+        return Err(format!(
+            "physical Hessian shape mismatch: got {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            layout.physical_count(),
+            layout.physical_count()
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((layout.initial_rho.len(), layout.initial_rho.len()));
+    for (i, &oi) in layout.physical_to_outer.iter().enumerate() {
+        for (j, &oj) in layout.physical_to_outer.iter().enumerate() {
+            out[[oi, oj]] += hessian[[i, j]];
+        }
+    }
+    Ok(out)
 }
 
 fn split_log_lambdas(

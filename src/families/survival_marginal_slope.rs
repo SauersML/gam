@@ -366,9 +366,6 @@ fn build_per_z_score_warp_deviation_block_from_seed(
                 | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix, .. } => {
                     matrix.clone()
                 }
-                crate::solver::estimate::PenaltySpec::DenseWithMean { matrix, .. } => {
-                    matrix.clone()
-                }
                 crate::solver::estimate::PenaltySpec::Block { local, .. } => local.clone(),
             };
             block
