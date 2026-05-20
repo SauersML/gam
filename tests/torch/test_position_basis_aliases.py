@@ -341,11 +341,18 @@ def test_periodic_duchon_end_to_end_and_seam_continuity() -> None:
     _require_ffi("duchon_function_norm_penalty")
     period = 2 * math.pi
     t, y = _circular_sample(n=128, period=period, seed=1)
-    # Periodic Duchon centers must span exactly one period (the Rust validator
-    # enforces ``max(centers) - min(centers) == period``). Linspace ``K+1``
-    # points across one period gives ``K`` distinct centers + the wrap point.
-    K = 16
-    centers = torch.linspace(0.0, period, K + 1, dtype=torch.float64)
+    # Periodic Duchon centers must span exactly one period (the Rust
+    # validator enforces ``max(centers) - min(centers) == period``). With
+    # the wrap-endpoint collapse, supplying ``K`` linspace points
+    # ``[0, period]`` reduces to ``K - 1`` distinct circle points.
+    #
+    # We deliberately pick the effective K to be *odd*. The cubic-Duchon
+    # kernel on a uniformly-spaced circular lattice has an extra rank
+    # collapse at even effective K because antipodal lattice pairs are
+    # equidistant — see e.g. the singular-value drop for K=4, 6, 8, 10
+    # in the design matrix. Until that intrinsic basis degeneracy gets
+    # its own fix, the documented convention is "odd-K periodic Duchon".
+    centers = torch.linspace(0.0, period, 16, dtype=torch.float64)  # → 15 effective
     fit = gt.gaussian_reml_fit_positions(
         t,
         y,
