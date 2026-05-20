@@ -840,6 +840,7 @@ fn custom_family_block_role(
         "threshold" => BlockRole::Threshold,
         "log_sigma" | "scale" | "logslope_surface" => BlockRole::Scale,
         "time" | "time_transform" | "time_surface" => BlockRole::Time,
+        name if name.starts_with("time_cause_") => BlockRole::Time,
         "wiggle" | "linkwiggle" => BlockRole::LinkWiggle,
         _ if index == 0 => BlockRole::Location,
         _ => BlockRole::Scale,
@@ -18131,9 +18132,9 @@ fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'sta
             custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
         ));
     }
+    let outer_grad_norm = outer_result.final_grad_norm_or_nan();
     let rho_star = outer_result.rho;
     let outer_iters = outer_result.iterations;
-    let outer_grad_norm = outer_result.final_grad_norm_or_nan();
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
