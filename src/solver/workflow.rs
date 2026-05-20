@@ -78,6 +78,7 @@ pub struct StandardFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,
     pub wiggle_options: Option<BlockwiseFitOptions>,
+    pub coefficient_groups: Vec<CoefficientGroupSpec>,
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
 }
 
@@ -651,7 +652,25 @@ fn fixed_gaussian_shift_frailty_from_spec(
 }
 
 fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
-    let fitted = if request.penalty_block_gamma_priors.is_empty() {
+    if !request.coefficient_groups.is_empty() && !request.penalty_block_gamma_priors.is_empty() {
+        return Err(
+            "coefficient_groups and penalty_block_gamma_priors both define precision priors; use one coordinate system per fit"
+                .to_string(),
+        );
+    }
+    let fitted = if !request.coefficient_groups.is_empty() {
+        fit_term_collection_with_coefficient_groups(
+            request.data,
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
+            &request.spec,
+            &request.coefficient_groups,
+            request.family,
+            &request.options,
+        )
+        .map_err(|e| e.to_string())?
+    } else if request.penalty_block_gamma_priors.is_empty() {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data,
             request.y.clone(),
@@ -2058,6 +2077,12 @@ pub struct FitConfig {
     /// parameters. Group-local priors, including catalog-metadata-informed
     /// Gamma precision hyperpriors, are resolved during design setup.
     pub coefficient_groups: Vec<CoefficientGroupSpec>,
+
+    /// Optional per-existing-penalty-block Gamma(shape, rate) precision
+    /// hyperpriors keyed by penalty-block label. This is the
+    /// catalog-metadata-informed-prior hook for models that do not need a new
+    /// user-defined coefficient group.
+    pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
 }
 
 impl Default for FitConfig {
@@ -2096,6 +2121,7 @@ impl Default for FitConfig {
             resource_policy: None,
             group_metadata: None,
             coefficient_groups: Vec::new(),
+            penalty_block_gamma_priors: Vec::new(),
         }
     }
 }
@@ -2618,6 +2644,7 @@ fn materialize_standard<'a>(
             kappa_options,
             wiggle,
             wiggle_options: None,
+            coefficient_groups: config.coefficient_groups.clone(),
             penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
         }),
         inference_notes,
