@@ -18473,8 +18473,7 @@ mod tests {
         // Acquire the debug-stash session before the eval so a concurrent
         // test cannot interleave its writes into our captures. The session
         // also clears any leftover stash from a prior aborted run.
-        let _stash_session =
-            crate::solver::estimate::reml::unified::debug_stash::test_session();
+        let _stash_session = crate::solver::estimate::reml::unified::debug_stash::test_session();
         let (cost_at_zero, grad_at_zero, _hess) = evaluate_joint_reml_outer_eval_at_theta(
             &mut evaluator,
             cache.design(),
@@ -18772,8 +18771,7 @@ mod tests {
         .expect("hyper dirs present");
         // Acquire the debug-stash session so a concurrent test can't
         // interleave its writes into the captures we're about to read.
-        let _stash_session =
-            crate::solver::estimate::reml::unified::debug_stash::test_session();
+        let _stash_session = crate::solver::estimate::reml::unified::debug_stash::test_session();
         let _ = evaluate_joint_reml_outer_eval_at_theta(
             &mut evaluator,
             cache.design(),
