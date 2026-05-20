@@ -18599,6 +18599,82 @@ fn periodic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     dx.min(period - dx).abs()
 }
 
+/// 2m-th Bernoulli polynomial ``B_{2m}(t)``, evaluated on ``t ∈ [0, 1]``.
+///
+/// Closed forms for the orders the Duchon stack actually uses:
+///   * ``B₂(t)  = t² − t + 1/6``
+///   * ``B₄(t)  = t⁴ − 2t³ + t² − 1/30``
+///   * ``B₆(t)  = t⁶ − 3t⁵ + (5/2)t⁴ − (1/2)t² + 1/42``
+///   * ``B₈(t)  = t⁸ − 4t⁷ + (14/3)t⁶ − (7/3)t⁴ + (2/3)t² − 1/30``
+///
+/// Defined for ``t ∈ [0, 1]`` then extended periodically (the caller has
+/// already reduced ``r/period`` modulo 1).
+fn even_bernoulli_polynomial(degree: usize, t: f64) -> Result<f64, BasisError> {
+    let t2 = t * t;
+    match degree {
+        2 => Ok(t2 - t + 1.0 / 6.0),
+        4 => Ok(t2 * t2 - 2.0 * t2 * t + t2 - 1.0 / 30.0),
+        6 => {
+            let t4 = t2 * t2;
+            let t6 = t4 * t2;
+            Ok(t6 - 3.0 * t4 * t + 2.5 * t4 - 0.5 * t2 + 1.0 / 42.0)
+        }
+        8 => {
+            let t4 = t2 * t2;
+            let t6 = t4 * t2;
+            let t8 = t4 * t4;
+            Ok(t8 - 4.0 * t6 * t + (14.0 / 3.0) * t6 - (7.0 / 3.0) * t4
+                + (2.0 / 3.0) * t2
+                - 1.0 / 30.0)
+        }
+        other => Err(BasisError::InvalidInput(format!(
+            "periodic Duchon Bernoulli kernel only implemented for B_{{2m}} with m ∈ {{1, 2, 3, 4}}; got degree {other}"
+        ))),
+    }
+}
+
+/// Periodic Green's function of the iterated 1D Laplacian ``(d²/dx²)^m`` on
+/// the circle of circumference ``period``, modulo the constant nullspace.
+///
+/// Returns ``(-1)^(m+1) · B_{2m}(r / period)`` where ``B_{2m}`` is the
+/// ``2m``-th Bernoulli polynomial extended periodically. The Fourier series
+/// is
+///
+/// ```text
+///     2 · (-1)^(m+1) · (2π)^{2m} / (2m)! · Σ_{n≥1} cos(2π n t) / n^{2m}
+/// ```
+///
+/// so every nonzero harmonic carries weight ``∝ 1/n^{2m}`` and the kernel
+/// matrix is full rank (modulo the constant direction) on **any** lattice of
+/// ``K`` distinct circle points — uniform or not, even or odd ``K``. The
+/// sign ``(-1)^(m+1)`` makes every Fourier coefficient positive, so the
+/// kernel matrix is positive semidefinite with rank ``K − 1`` (a single
+/// zero eigenvalue along the constants).
+///
+/// **Contrast with the polyharmonic kernel evaluated at wrapped distance**:
+/// for ``m = 2`` the polyharmonic path computes ``φ(r) = c · r``, which is
+/// the triangle wave on the circle. The triangle wave's Fourier series
+/// carries only **odd** harmonics; sampled on a uniform K-lattice with even
+/// K, the discrete DFT lands exactly on the zero (even-harmonic) modes and
+/// the kernel matrix loses ``K/2 − 1`` singular values. The Bernoulli
+/// kernel is the actual Green's function the operator demands and does not
+/// suffer that lattice-parity degeneracy.
+fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) -> Result<f64, BasisError> {
+    if !period.is_finite() || period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic Duchon kernel requires positive finite period; got {period}"
+        )));
+    }
+    if m == 0 {
+        return Err(BasisError::InvalidInput(
+            "periodic Duchon order m must be at least 1".to_string(),
+        ));
+    }
+    let t = (r / period).rem_euclid(1.0);
+    let sign = if m % 2 == 1 { 1.0 } else { -1.0 };
+    Ok(sign * even_bernoulli_polynomial(2 * m, t)?)
+}
+
 /// Drop centers that periodically identify with the leftmost anchor.
 ///
 /// When the user describes a closed periodic lattice by including BOTH
@@ -18680,6 +18756,17 @@ fn build_periodic_duchon_basis_1d(
     // unchanged and the circumference is still the user's declared
     // ``period``).
     let centers = collapse_periodic_endpoint(centers, left, period);
+    // The user encodes the Duchon order ``m`` in ``spec.nullspace_order``
+    // (``Zero → m=1``, ``Linear → m=2``, ``Degree(d) → m=d+1``). Periodicity
+    // forces the *constraint* nullspace to ``{constants}`` (the only
+    // polynomial that is itself periodic), but the *kernel* must still
+    // encode full ``m``-th-order smoothness. The right kernel for that is
+    // the periodic Green's function of ``(d²/dx²)^m`` — the Bernoulli
+    // polynomial ``B_{2m}(r/period)`` — not the polyharmonic kernel
+    // ``r^{2p+2s-d}`` evaluated at wrapped distance (which collapses to the
+    // triangle wave ``r^1`` after the periodic constraint forces ``p=1`` and
+    // produces zero singular values on even-K uniform lattices).
+    let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
@@ -18729,7 +18816,16 @@ fn build_periodic_duchon_basis_1d(
     // pure-Duchon vs. hybrid-Matern branch is the same for every row, so a
     // single-time dispatch saves N·K conditional branches at biobank scale.
     let amp = kernel_amp;
-    if let Some(ppc) = pure_poly_coeff.as_ref() {
+    if pure_poly_coeff.is_some() {
+        // Pure polyharmonic case (no Matern length-scale). Use the periodic
+        // Green's function — Bernoulli ``B_{2m}(r/period)`` — directly. This
+        // is the actual Green's function of ``(d²/dx²)^m`` on the circle
+        // modulo constants. Every Fourier mode contributes with weight
+        // ``∝ 1/n^{2m}``, so the kernel matrix is full rank (modulo the
+        // constant direction) on any K-point lattice — uniform or not, even
+        // or odd K. The triangle-wave kernel ``r`` that the polyharmonic
+        // dispatch would emit here only has odd Fourier modes and collapses
+        // on even-K uniform lattices.
         raw_kernel
             .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
             .into_par_iter()
@@ -18741,7 +18837,13 @@ fn build_periodic_duchon_basis_1d(
                     let x = wrap_to_period(data[[i, 0]], left, period);
                     for j in 0..k_centers {
                         let r = periodic_distance_1d(x, centers_col0[j], period);
-                        out_row[j] = ppc.eval(r) * amp;
+                        match periodic_duchon_kernel_bernoulli(r, user_m, period) {
+                            Ok(v) => out_row[j] = v,
+                            Err(_) => {
+                                err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        }
                     }
                 }
             });
@@ -18789,8 +18891,11 @@ fn build_periodic_duchon_basis_1d(
     let mut center_kernel = Array2::<f64>::zeros((centers.nrows(), centers.nrows()));
     fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
         let r = periodic_distance_1d(centers[[i, 0]], centers[[j, 0]], period);
-        if let Some(ppc) = pure_poly_coeff.as_ref() {
-            Ok(ppc.eval(r) * kernel_amp)
+        if pure_poly_coeff.is_some() {
+            // Same Bernoulli Green's function the design uses — keeps the
+            // penalty ``ω = z' K_centers z`` exactly the Gram matrix of the
+            // smoother in its native basis, with no scale mismatch.
+            periodic_duchon_kernel_bernoulli(r, user_m, period)
         } else {
             Ok(duchon_matern_kernel_general_from_distance(
                 r,
