@@ -18637,9 +18637,10 @@ fn even_bernoulli_polynomial(degree: usize, t: f64) -> Result<f64, BasisError> {
             let t4 = t2 * t2;
             let t6 = t4 * t2;
             let t8 = t4 * t4;
-            Ok(t8 - 4.0 * t6 * t + (14.0 / 3.0) * t6 - (7.0 / 3.0) * t4
-                + (2.0 / 3.0) * t2
-                - 1.0 / 30.0)
+            Ok(
+                t8 - 4.0 * t6 * t + (14.0 / 3.0) * t6 - (7.0 / 3.0) * t4 + (2.0 / 3.0) * t2
+                    - 1.0 / 30.0,
+            )
         }
         other => Err(BasisError::InvalidInput(format!(
             "periodic Duchon Bernoulli kernel only implemented for B_{{2m}} with m ∈ {{1, 2, 3, 4}}; got degree {other}"
