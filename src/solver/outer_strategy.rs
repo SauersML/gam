@@ -3151,6 +3151,7 @@ struct OuterFixedPointBridge<'a> {
     layout: OuterThetaLayout,
     barrier_config: Option<BarrierConfig>,
     fixed_point_tolerance: f64,
+    cached_initial_sample: Option<(Array1<f64>, FixedPointSample)>,
     /// Consecutive HybridEFS iterations whose ψ block was zeroed after
     /// exhausting backtracking. When this reaches
     /// [`MAX_CONSECUTIVE_PSI_STAGNATION`], the bridge surfaces the
@@ -3161,6 +3162,10 @@ struct OuterFixedPointBridge<'a> {
 }
 
 impl OuterFixedPointBridge<'_> {
+    fn cache_initial_sample(&mut self, x: Array1<f64>, sample: FixedPointSample) {
+        self.cached_initial_sample = Some((x, sample));
+    }
+
     fn reject_nonstationary_tiny_psi_step(
         &self,
         step: &Array1<f64>,
@@ -3256,6 +3261,16 @@ const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 1;
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer EFS eval failed")?;
+        if let Some((seed_x, sample)) = self.cached_initial_sample.take() {
+            if seed_x.len() == x.len()
+                && seed_x
+                    .iter()
+                    .zip(x.iter())
+                    .all(|(a, b)| (a - b).abs() <= 1e-12 * (1.0 + a.abs().max(b.abs())))
+            {
+                return Ok(sample);
+            }
+        }
         let eval = self
             .obj
             .eval_efs(x)
@@ -5222,6 +5237,7 @@ fn run_outer_with_plan(
                     layout,
                     barrier_config: cap.barrier_config.clone(),
                     fixed_point_tolerance: config.tolerance,
+                    cached_initial_sample: None,
                     consecutive_psi_zero_iters: 0,
                 };
                 let initial_sample = match objective.eval_step(&seed) {
@@ -5251,11 +5267,11 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                objective.cache_initial_sample(seed.clone(), initial_sample);
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
@@ -5272,6 +5288,7 @@ fn run_outer_with_plan(
                     layout,
                     barrier_config: cap.barrier_config.clone(),
                     fixed_point_tolerance: config.tolerance,
+                    cached_initial_sample: None,
                     consecutive_psi_zero_iters: 0,
                 };
                 let initial_sample = match objective.eval_step(&seed) {
@@ -5301,11 +5318,11 @@ fn run_outer_with_plan(
                 let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                objective.cache_initial_sample(seed.clone(), initial_sample);
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
@@ -6068,6 +6085,7 @@ mod tests {
             layout: cap.theta_layout(),
             barrier_config: None,
             fixed_point_tolerance: 1e-8,
+            cached_initial_sample: None,
             consecutive_psi_zero_iters: 0,
         };
 
