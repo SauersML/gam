@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
+from ._cuda import cuda_diagnostics, format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
