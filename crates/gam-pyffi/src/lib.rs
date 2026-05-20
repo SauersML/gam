@@ -3985,8 +3985,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         _ => PyFitConfig::default(),
     };
     let mut fit_config = FitConfig::default();
-    fit_config.group_metadata =
-        parse_group_metadata(py_config.group_metadata, py_config.groups)?;
+    fit_config.group_metadata = parse_group_metadata(py_config.group_metadata, py_config.groups)?;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
@@ -4129,9 +4128,9 @@ fn parse_group_metadata(
         (Some(metadata), None) => Ok(nonempty_group_metadata(metadata)),
         (None, Some(groups)) => group_metadata_from_groups(groups),
         (None, None) => Ok(None),
-        (Some(_), Some(_)) => Err(
-            "fit config accepts either group_metadata or groups metadata, not both".to_string(),
-        ),
+        (Some(_), Some(_)) => {
+            Err("fit config accepts either group_metadata or groups metadata, not both".to_string())
+        }
     }
 }
 

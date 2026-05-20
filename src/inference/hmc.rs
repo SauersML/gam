@@ -895,28 +895,32 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
 /// CLogLog link: μ = 1 − exp(−exp(η))
 /// log p(y|η) = Σ [y·log(1−exp(−exp(η))) + (1−y)·(−exp(η))]
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
+#[inline]
+fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> (f64, f64) {
+    let eta_i = eta.clamp(-700.0, 700.0);
+    let exp_eta = eta_i.exp();
+    let log_mu = if exp_eta <= std::f64::consts::LN_2 {
+        (-(-exp_eta).exp_m1()).ln()
+    } else {
+        (-(-exp_eta).exp()).ln_1p()
+    };
+    let log_one_minus_mu = -exp_eta;
+    let grad_log_mu = (eta_i - exp_eta - log_mu).exp();
+    let ll_i = y * log_mu + (1.0 - y) * log_one_minus_mu;
+    let residual_i = y * grad_log_mu - (1.0 - y) * exp_eta;
+    (ll_i, residual_i)
+}
+
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.n_samples;
     let pairs: Vec<(f64, f64)> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let exp_eta = eta_i.exp();
-            let neg_exp_eta = (-exp_eta).clamp(-700.0, 0.0);
-            let exp_neg_exp_eta = neg_exp_eta.exp();
-            let log_mu = (-exp_neg_exp_eta).ln_1p();
-            let log_one_minus_mu = -exp_eta;
-            let ll_i = w_i * (y_i * log_mu + (1.0 - y_i) * log_one_minus_mu);
-            let grad_y1 = if log_mu.is_finite() && log_mu > -700.0 {
-                exp_eta * (neg_exp_eta - log_mu).exp()
-            } else {
-                1.0
-            };
-            let grad_y0 = -exp_eta;
-            (ll_i, w_i * (y_i * grad_y1 + (1.0 - y_i) * grad_y0))
+            let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i);
+            (w_i * ll_i, w_i * residual_i)
         })
         .collect();
     let mut residual = Array1::<f64>::zeros(n);
@@ -3530,12 +3534,15 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    let neg_exp_eta = (-eta_i.exp()).max(-700.0);
-                    let log_mu = neg_exp_eta.ln_1p().min(0.0).max(-700.0);
-                    let log_1m_mu = neg_exp_eta.min(0.0).max(-700.0);
+                    // μ = 1 − exp(−exp(η));  1−μ = exp(−exp(η))
+                    // ⇒ log(1−μ) = −exp(η);   log μ = log1p(−exp(−exp(η))).
+                    let neg_s = (-eta_i.exp()).max(-700.0); // −exp(η), clamped
+                    let log_1m_mu = neg_s.min(0.0).max(-700.0);
+                    let one_m_mu_raw = neg_s.exp().clamp(0.0, 1.0); // exp(−exp(η))
+                    let log_mu = (-one_m_mu_raw).ln_1p().min(0.0).max(-700.0);
                     ll_acc += w_i * (y_i * log_mu + (1.0 - y_i) * log_1m_mu);
                     let exp_eta = eta_i.exp().min(1e300);
-                    let exp_neg_exp_eta = neg_exp_eta.exp();
+                    let exp_neg_exp_eta = one_m_mu_raw;
                     let mu = (1.0 - exp_neg_exp_eta).clamp(1e-15, 1.0 - 1e-15);
                     let dmudeta = exp_eta * exp_neg_exp_eta;
                     residual[i] = w_i * (y_i - mu) * dmudeta / (mu * (1.0 - mu)).max(1e-30);
@@ -4354,7 +4361,7 @@ impl JointBetaRhoPosterior {
 
         // ---- Prior on ρ ----
         let mut rho_prior = 0.0;
-        match self.rho_prior {
+        match &self.rho_prior {
             RhoPrior::Flat => {}
             RhoPrior::Normal { mean, sd } => {
                 let inv_var = 1.0 / (sd * sd);
@@ -4362,6 +4369,37 @@ impl JointBetaRhoPosterior {
                     let d = rho[k] - mean;
                     rho_prior -= 0.5 * inv_var * d * d;
                     grad_rho[k] -= inv_var * d;
+                }
+            }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                for k in 0..n_rho {
+                    let lambda = rho[k].exp();
+                    rho_prior += (shape - 1.0) * rho[k] - rate * lambda;
+                    grad_rho[k] += (shape - 1.0) - rate * lambda;
+                }
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != n_rho {
+                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                }
+                for k in 0..n_rho {
+                    match &priors[k] {
+                        RhoPrior::Flat => {}
+                        RhoPrior::Normal { mean, sd } => {
+                            let inv_var = 1.0 / (sd * sd);
+                            let d = rho[k] - mean;
+                            rho_prior -= 0.5 * inv_var * d * d;
+                            grad_rho[k] -= inv_var * d;
+                        }
+                        RhoPrior::GammaPrecision { shape, rate } => {
+                            let lambda = rho[k].exp();
+                            rho_prior += (shape - 1.0) * rho[k] - rate * lambda;
+                            grad_rho[k] += (shape - 1.0) - rate * lambda;
+                        }
+                        RhoPrior::Independent(_) => {
+                            return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                        }
+                    }
                 }
             }
         }

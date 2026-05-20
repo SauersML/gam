@@ -56,7 +56,7 @@ below to get it locally. Source browsers can also open
 | **Wobbly cylinder** (one periodic axis, one open axis) | `θ` ∈ [0, 2π), `h` ∈ [0, 1] | `x ~ te(theta, h, periodic=[0], period=[2*pi, None], k=[26,12])` |
 | **Lumpy sphere** (intrinsic S² with multiple bulges + a deep crater) | `lat`, `lon` (radians) | `x ~ sphere(lat, lon, radians=true, k=100)` |
 | **Bumpy torus** (two periodic axes, period 2π in each) | `u`, `v` ∈ [0, 2π) | `x ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi], k=[20,16])` |
-| **Möbius strip** (periodic with period **4π**, single non-orientable edge) | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
+| **Möbius embedding (4π double-cover)** — the smoother sees an orientable cylinder `S¹ × [−v,v]` with period **4π** in `u`; the embedding in ℝ³ happens to trace out a Möbius strip because `F(u+2π,v) = F(u,−v)` in the data. The smoother does *not* enforce the twisted identification `(u,v) ∼ (u+2π,−v)`. | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
 
 The three coordinate fits per shape are independent — there is no shared
 parameter and no joint loss. The fact that the reassembled surfaces are

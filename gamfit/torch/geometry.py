@@ -202,7 +202,12 @@ def sphere_frechet_mean(
 
 
 def sphere_log_map(values: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-    """Log map from the unit sphere to the ambient tangent space at ``base``."""
+    """Log map from the unit sphere to the ambient tangent space at ``base``.
+
+    At antipodes (dot ≈ −1) the log is non-unique; pick a deterministic
+    π-length tangent perpendicular to ``base`` so callers (e.g. the Fréchet
+    mean iteration) make progress instead of stalling at zero.
+    """
     y = _normalize_sphere_tensor(values)
     if not isinstance(base, torch.Tensor):
         raise TypeError("base must be a torch.Tensor")
@@ -212,9 +217,28 @@ def sphere_log_map(values: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
     tangent = y - dots[:, None] * b.reshape(1, -1)
     sin_theta = theta.sin()
     scale = _tc.ones_like(theta)
-    mask = sin_theta > 1e-12
-    scale = _tc.where(mask, theta / sin_theta.clamp_min(1e-300), scale)
+    regular = sin_theta > 1e-12
+    scale = _tc.where(regular, theta / sin_theta.clamp_min(1e-300), scale)
     out = tangent * scale[:, None]
+
+    # Antipodal substitution: tangent ≈ 0, dot < 0 ⇒ replace with π · ê
+    # where ê ⟂ b is built from the standard basis vector least aligned with b.
+    k = int(torch.argmin(b.abs()).item())
+    e = _tc.zeros_like(b)
+    e[k] = 1.0
+    e = e - torch.dot(e, b) * b
+    n = torch.linalg.norm(e)
+    if float(n) <= 1e-12:
+        e = _tc.zeros_like(b)
+        e[(k + 1) % b.shape[0]] = 1.0
+        e = e - torch.dot(e, b) * b
+        n = torch.linalg.norm(e)
+    e = e / n.clamp_min(1e-300)
+    import math as _math
+    pi_e = _math.pi * e.reshape(1, -1)
+    antipodal = ((~regular) & (dots < 0.0))[:, None]
+    out = _tc.where(antipodal, pi_e.expand_as(out), out)
+
     return _tc.where((theta < 1e-12)[:, None], _tc.zeros_like(out), out)
 
 

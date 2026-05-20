@@ -5048,6 +5048,32 @@ fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64, phi: f64)
     }
 }
 
+fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: usize) -> Option<f64> {
+    match prior {
+        crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+        crate::types::RhoPrior::Independent(priors) => {
+            priors.get(idx).and_then(|prior| match prior {
+                crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[inline]
+fn efs_q_eff_with_gamma_rate(
+    base_q_eff: f64,
+    lambda: f64,
+    prior: &crate::types::RhoPrior,
+    idx: usize,
+) -> f64 {
+    match gamma_precision_rate_for_rho(prior, idx) {
+        Some(rate) if rate.is_finite() && rate > 0.0 => base_q_eff + 2.0 * rate * lambda,
+        _ => base_q_eff,
+    }
+}
+
 /// EFS step expressed in terms of the *full* outer gradient
 /// `g_full = ∂V_total/∂ρ_i` and the penalty-quadratic curvature scale
 /// `q_eff`:
@@ -8930,7 +8956,12 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
         let coord = &solution.penalty_coords[idx];
         let lambda = rho[idx].exp();
         let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
-        let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
+        let q_eff = efs_q_eff_with_gamma_rate(
+            efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
+            lambda,
+            &solution.rho_prior,
+            idx,
+        );
         if let Some(step) = efs_log_step_from_grad(q_eff, gradient[idx]) {
             steps[idx] = step;
         }
@@ -9090,7 +9121,12 @@ pub fn compute_hybrid_efs_update(
                     let coord = &solution.penalty_coords[idx];
                     let lambda = rho[idx].exp();
                     let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
-                    let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
+                    let q_eff = efs_q_eff_with_gamma_rate(
+                        efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
+                        lambda,
+                        &solution.rho_prior,
+                        idx,
+                    );
                     (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
                 })
                 .collect()
@@ -9100,7 +9136,12 @@ pub fn compute_hybrid_efs_update(
                     let coord = &solution.penalty_coords[idx];
                     let lambda = rho[idx].exp();
                     let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
-                    let q_eff = efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale);
+                    let q_eff = efs_q_eff_with_gamma_rate(
+                        efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
+                        lambda,
+                        &solution.rho_prior,
+                        idx,
+                    );
                     (idx, efs_log_step_from_grad(q_eff, gradient[idx]))
                 })
                 .collect()
@@ -13809,6 +13850,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 2,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::Fixed {
@@ -14112,6 +14154,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 3,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::Fixed {
@@ -14352,6 +14395,7 @@ mod tests {
                 h_proj_inverse,
             })),
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 2.0,
             dispersion: DispersionHandling::Fixed {
@@ -14466,6 +14510,7 @@ mod tests {
                 h_proj_inverse: array![[1.0 / h_proj]],
             })),
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 1.0,
             dispersion: DispersionHandling::Fixed {
@@ -14579,6 +14624,7 @@ mod tests {
                 h_proj_inverse: array![[1.0 / h_proj]],
             })),
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 1.0,
             dispersion: DispersionHandling::Fixed {
@@ -14726,6 +14772,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 320_000,
             nullspace_dim: 1.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -14815,6 +14862,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 10,
             nullspace_dim: 0.0,
             // Use Fixed dispersion so the gradient is exactly the
@@ -14983,6 +15031,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 100,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -15036,6 +15085,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: x.nrows(),
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::Fixed {
@@ -15136,6 +15186,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 1,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::Fixed {
@@ -15211,6 +15262,7 @@ mod tests {
                 h_proj_inverse: array![[1.0 / h[[1, 1]]]],
             })),
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 10,
             nullspace_dim: 1.0,
             dispersion: DispersionHandling::Fixed {
@@ -15385,6 +15437,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -15435,6 +15488,7 @@ mod tests {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
@@ -17150,6 +17204,7 @@ mod tests {
             hessian_logdet_correction,
             penalty_subspace_trace,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: (p - r_rank) as f64,
             dispersion: DispersionHandling::Fixed {

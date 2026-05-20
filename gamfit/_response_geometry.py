@@ -167,7 +167,14 @@ def sphere_frechet_mean(
 
 
 def sphere_log_map(values: Any, base: Any) -> Any:
-    """Log map from the unit sphere to the ambient tangent space at ``base``."""
+    """Log map from the unit sphere to the ambient tangent space at ``base``.
+
+    At the antipode (dot = −1) the Riemannian log is non-unique; any unit
+    tangent vector scaled by π is a valid representative. To keep the
+    Fréchet-mean iteration well posed we pick a deterministic non-zero
+    tangent: project the standard basis vector least aligned with ``base``
+    onto the tangent plane and rescale to length π.
+    """
     import numpy as np
 
     y = _normalize_sphere(values)
@@ -177,10 +184,30 @@ def sphere_log_map(values: Any, base: Any) -> Any:
     tangent = y - dots[:, None] * b.reshape(1, -1)
     sin_theta = np.sin(theta)
     scale = np.ones_like(theta)
-    mask = sin_theta > 1e-12
-    scale[mask] = theta[mask] / sin_theta[mask]
-    scale[~mask] = 1.0
+    regular = sin_theta > 1e-12
+    scale[regular] = theta[regular] / sin_theta[regular]
     out = tangent * scale[:, None]
+
+    # Antipodal: tangent ≈ 0 but theta ≈ π. Substitute a canonical π-length
+    # tangent perpendicular to b.
+    antipodal = (~regular) & (dots < 0.0)
+    if np.any(antipodal):
+        k = int(np.argmin(np.abs(b)))
+        e = np.zeros_like(b)
+        e[k] = 1.0
+        e = e - float(np.dot(e, b)) * b
+        n = float(np.linalg.norm(e))
+        if n <= 1e-12:
+            # b nearly aligned with e_k; pick the next axis instead.
+            k2 = (k + 1) % b.shape[0]
+            e = np.zeros_like(b)
+            e[k2] = 1.0
+            e = e - float(np.dot(e, b)) * b
+            n = float(np.linalg.norm(e))
+        e = e / max(n, 1e-300)
+        out[antipodal, :] = np.pi * e.reshape(1, -1)
+
+    # Coincident points (theta ≈ 0): zero tangent.
     out[theta < 1e-12, :] = 0.0
     return out
 
