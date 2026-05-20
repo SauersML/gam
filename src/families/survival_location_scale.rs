@@ -3292,6 +3292,18 @@ fn drop_leading_penalty_columns(
                         .to_owned(),
                 ))
             }
+            PenaltyMatrix::Labeled { label, inner } => {
+                structural_nullspace_exact = false;
+                let dense = inner.to_dense();
+                Some(
+                    PenaltyMatrix::Dense(
+                        dense
+                            .slice(s![fixed_cols..full_dim, fixed_cols..full_dim])
+                            .to_owned(),
+                    )
+                    .with_precision_label(label.clone()),
+                )
+            }
         };
 
         if let Some(reduced) = reduced {
