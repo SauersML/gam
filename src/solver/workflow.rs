@@ -3433,6 +3433,7 @@ fn materialize_survival<'a>(
                     logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
                         "marginal-slope survival is missing logslope spec".to_string()
                     })?,
+                    logslopespecs: None,
                     logslope_offset: log_sigma_offset.clone(),
                     score_warp: marginal_slope_score_warp.clone(),
                     link_dev: marginal_slope_link_dev.clone(),

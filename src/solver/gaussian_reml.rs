@@ -2220,7 +2220,7 @@ fn optimize_rho(
     push_candidate(&mut candidates, RHO_LOWER);
     push_candidate(&mut candidates, RHO_UPPER);
     if let Some(rho0) = init_rho {
-        push_candidate(&mut candidates, rho0);
+        push_candidate(&mut candidates, rho0.clamp(RHO_LOWER, RHO_UPPER));
     }
 
     candidates
