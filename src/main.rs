@@ -4776,6 +4776,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             },
             timewiggle_block: prepared.timewiggle_block.clone(),
             logslopespec: logslopespec.clone(),
+            logslopespecs: None,
             logslope_offset: log_sigma_offset.clone(),
             score_warp: routed_score_warp.clone(),
             link_dev: routed_link_dev.clone(),
