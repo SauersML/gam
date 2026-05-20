@@ -2413,52 +2413,6 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
-    /// Debug-only: return `log|U_Sᵀ H U_S|_+` — the *projected* Hessian
-    /// log-determinant on the identified `range(S_+)` subspace, evaluated
-    /// at the PIRLS state driven to convergence at this `rho`.
-    ///
-    /// Production REML/LAML cost reads this quantity via
-    /// `hop.logdet() + hessian_logdet_correction` (the latter carries the
-    /// `log|H_proj| − hop.logdet()` correction from the dense_assembly
-    /// rank-deficiency fix).  Returning the same sum here gives tests a
-    /// matching finite-difference reference: centered-differencing the
-    /// projected logdet across nearby `theta` values produces the analytic
-    /// `d/dψ log|H_proj|` that production's trace formula computes — *not*
-    /// the full-space `d/dψ log|H_full|`, which differs by the `null(S)`
-    /// directions' contribution and is the wrong finite-difference reference
-    /// for the projected LAML cost identity.  Used by
-    /// `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
-    /// INVARIANT 2.
-    #[cfg(test)]
-    pub(crate) fn objective_logdet_h_proj(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<f64, EstimationError> {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        let assembly =
-            self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly, false)?;
-        let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
-            + assembly.hessian_logdet_correction;
-        Ok(logdet)
-    }
-
-    /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at the
-    /// PIRLS state produced by driving the solver to convergence at this `rho`.
-    /// Used by the iso-κ Duchon FD probe to test whether the analytic
-    /// `c · dη/dψ_total` per-row diagonal matches FD `c · (η_+ − η_−) / 2h`.
-    #[cfg(test)]
-    pub(crate) fn debug_eta_w_c(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let pr = self.execute_pirls_if_needed(rho)?;
-        Ok((
-            pr.final_eta.clone(),
-            pr.finalweights.clone(),
-            pr.solve_c_array.clone(),
-        ))
-    }
-
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
         let active_tol = 1e-8;
@@ -6429,10 +6383,9 @@ impl<'a> RemlState<'a> {
         // gate keeps the rank-deficient LAML fix active for every
         // non-Gaussian-Identity family (where the leakage is real and
         // the projected kernel is the only formula that matches the
-        // cost identity — pinned by
-        // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`)
-        // while keeping the classical `log|H|` cost identity for
-        // canonical Gaussian, where the leakage is identically zero.
+        // cost identity) while keeping the classical `log|H|` cost
+        // identity for canonical Gaussian, where the leakage is
+        // identically zero.
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
