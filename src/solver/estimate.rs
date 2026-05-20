@@ -1391,10 +1391,11 @@ fn compute_smoothing_correction(
     // Step 1: Compute the Jacobian J = d(beta)/d(rho) in transformed space.
     //
     // Exact implicit-function identity at the inner optimum:
-    //   dβ̂/dρ_k = -H^{-1}(S_k^ρ β̂),   S_k^ρ = λ_k S_k, λ_k = exp(ρ_k).
+    //   dβ̂/dρ_k = -H^{-1}(S_k^ρ (β̂ - μ_k)),   S_k^ρ = λ_k S_k,
+    //   λ_k = exp(ρ_k).
     //
     // In transformed coordinates with root penalties S_k = R_kᵀR_k:
-    //   S_k β̂ = R_kᵀ(R_k β̂),
+    //   S_k (β̂ - μ_k) = R_kᵀ(R_k (β̂ - μ_k)),
     // so each Jacobian column is one linear solve with H.
 
     // Use the same objective-consistent inner Hessian surface used by REML:
@@ -1437,10 +1438,11 @@ fn compute_smoothing_correction(
         if cp.rank() == 0 {
             continue;
         }
-        // S_k β — block-local: R^T (R β[block]), embedded into p-vector.
+        // S_k(β - μ) — block-local: R^T (R (β[block] - μ)), embedded into p-vector.
         let r = &cp.col_range;
         let beta_block = beta_trans.slice(s![r.start..r.end]);
-        let r_beta = cp.root.dot(&beta_block);
+        let centered = &beta_block - &cp.prior_mean;
+        let r_beta = cp.root.dot(&centered);
         let mut s_k_beta = Array1::<f64>::zeros(n_coeffs_trans);
         for a in 0..cp.block_dim() {
             s_k_beta[r.start + a] = (0..cp.rank())
@@ -1448,7 +1450,7 @@ fn compute_smoothing_correction(
                 .sum::<f64>();
         }
 
-        // dβ/dρ_k = -H^{-1}(λ_k S_k β)
+        // dβ/dρ_k = -H^{-1}(λ_k S_k(β - μ))
         let rhs = s_k_beta.mapv(|v| -lambdas[k] * v);
         let delta = h_chol.solvevec(&rhs);
 
@@ -3458,7 +3460,7 @@ where
             edf_by_block[kk] = edf_k;
         }
 
-        // O(n⁻¹) frequentist bias correction vector b̂ = H⁻¹ S(λ̂) β̂.
+        // O(n⁻¹) frequentist bias correction vector b̂ = H⁻¹ S(λ̂)(β̂ - μ).
         // Computed in transformed PIRLS basis (where the factorization above lives)
         // and then mapped to the original coefficient basis via Qs.
         // Frequentist bias of the linear predictor at x is -s_*(x)^T b̂; the
@@ -3471,11 +3473,12 @@ where
             .iter()
             .enumerate()
         {
-            // S_k β: only the col_range of beta couples through local penalty.
+            // S_k(β - μ): only the col_range of beta couples through local penalty.
             let r = &cp.col_range;
             let local = cp.local_ref();
             let beta_block = beta_t.slice(ndarray::s![r.clone()]);
-            let local_beta = local.dot(&beta_block);
+            let centered = &beta_block - &cp.prior_mean;
+            let local_beta = local.dot(&centered);
             let lam_k = lambdas[kk];
             let mut acc = s_beta_t.slice_mut(ndarray::s![r.clone()]);
             acc.scaled_add(lam_k, &local_beta);
@@ -3527,7 +3530,7 @@ where
     let finalgrad_norm = if finalgrad_norm_rho.is_finite() {
         finalgrad_norm_rho
     } else {
-        outer_result.final_grad_norm.unwrap_or(f64::NAN)
+        outer_result.final_grad_norm_or_nan()
     };
 
     if opts.compute_inference {

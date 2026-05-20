@@ -596,9 +596,7 @@ where
             "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
             result.iterations,
             result.final_value,
-            result
-                .final_grad_norm
-                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+            result.final_grad_norm_report(),
         ));
     }
     survival_baseline_config_from_theta(target, &result.rho)
@@ -700,9 +698,7 @@ where
             "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
             result.iterations,
             result.final_value,
-            result
-                .final_grad_norm
-                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+            result.final_grad_norm_report(),
         ));
     }
     survival_baseline_config_from_theta(target, &result.rho)
@@ -808,9 +804,7 @@ where
             "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
             result.iterations,
             result.final_value,
-            result
-                .final_grad_norm
-                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+            result.final_grad_norm_report(),
         ));
     }
     survival_baseline_config_from_theta(target, &result.rho)

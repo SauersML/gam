@@ -185,6 +185,7 @@ pub struct CauseSpecificRoystonParmarBlock {
     pub offset_eta_entry: Array1<f64>,
     pub offset_eta_exit: Array1<f64>,
     pub offset_derivative_exit: Array1<f64>,
+    pub derivative_floor: f64,
 }
 
 /// Cause-specific competing-risks survival as a blockwise custom family.
@@ -249,6 +250,8 @@ fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Res
         || block.offset_eta_entry.iter().any(|v| !v.is_finite())
         || block.offset_eta_exit.iter().any(|v| !v.is_finite())
         || block.offset_derivative_exit.iter().any(|v| !v.is_finite())
+        || !block.derivative_floor.is_finite()
+        || block.derivative_floor < 0.0
     {
         return Err("non-finite input".to_string());
     }
@@ -360,6 +363,246 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         }
         Ok(log_likelihood)
     }
+
+    fn likelihood_blocks_uncoupled(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
+        true
+    }
+
+    fn coefficient_hessian_cost(
+        &self,
+        specs: &[crate::families::custom_family::ParameterBlockSpec],
+    ) -> u64 {
+        crate::families::custom_family::default_coefficient_hessian_cost(specs)
+    }
+
+    fn block_linear_constraints(
+        &self,
+        _: &[ParameterBlockState],
+        block_idx: usize,
+        spec: &crate::families::custom_family::ParameterBlockSpec,
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
+        let block = self.blocks.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected block index < {}, got {block_idx}",
+                self.blocks.len()
+            )
+        })?;
+        if block.x_derivative.ncols() != spec.design.ncols() {
+            return Err(format!(
+                "cause-specific survival derivative design has {} columns but block '{}' has {}",
+                block.x_derivative.ncols(),
+                spec.name,
+                spec.design.ncols()
+            ));
+        }
+        let rhs = block
+            .offset_derivative_exit
+            .mapv(|offset| block.derivative_floor - offset);
+        Ok(Some(LinearInequalityConstraints {
+            a: block.x_derivative.clone(),
+            b: rhs,
+        }))
+    }
+
+    fn max_feasible_step_size(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        let block = self.blocks.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected block index < {}, got {block_idx}",
+                self.blocks.len()
+            )
+        })?;
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected {} block states, got {}",
+                self.blocks.len(),
+                block_states.len()
+            )
+        })?;
+        if delta.len() != state.beta.len() || block.x_derivative.ncols() != delta.len() {
+            return Err("cause-specific survival feasible-step dimension mismatch".to_string());
+        }
+        let derivative = block.x_derivative.dot(&state.beta) + &block.offset_derivative_exit;
+        let derivative_delta = block.x_derivative.dot(delta);
+        let mut alpha_max = 1.0_f64;
+        for i in 0..derivative.len() {
+            if block.sampleweight[i] <= 0.0 {
+                continue;
+            }
+            let current = derivative[i] - block.derivative_floor;
+            let slope = derivative_delta[i];
+            if slope < 0.0 {
+                if current <= 0.0 {
+                    return Ok(Some(0.0));
+                }
+                alpha_max = alpha_max.min(0.995 * current / -slope);
+            }
+        }
+        Ok(Some(alpha_max.clamp(0.0, 1.0)))
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let block = self.blocks.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected block index < {}, got {block_idx}",
+                self.blocks.len()
+            )
+        })?;
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected {} block states, got {}",
+                self.blocks.len(),
+                block_states.len()
+            )
+        })?;
+        Ok(Some(cause_specific_hessian_directional_derivative(
+            block,
+            &state.beta,
+            d_beta,
+        )?))
+    }
+
+    fn exact_newton_hessian_second_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let block = self.blocks.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected block index < {}, got {block_idx}",
+                self.blocks.len()
+            )
+        })?;
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "cause-specific survival expected {} block states, got {}",
+                self.blocks.len(),
+                block_states.len()
+            )
+        })?;
+        Ok(Some(
+            cause_specific_hessian_second_directional_derivative(
+                block,
+                &state.beta,
+                d_beta_u,
+                d_beta_v,
+            )?,
+        ))
+    }
+}
+
+fn cause_specific_hessian_directional_derivative(
+    block: &CauseSpecificRoystonParmarBlock,
+    beta: &Array1<f64>,
+    d_beta: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
+    let p = block.x_exit.ncols();
+    if beta.len() != p || d_beta.len() != p {
+        return Err("cause-specific survival Hessian derivative dimension mismatch".to_string());
+    }
+    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
+    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
+    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
+    let d_eta_entry = block.x_entry.dot(d_beta);
+    let d_eta_exit = block.x_exit.dot(d_beta);
+    let d_derivative = block.x_derivative.dot(d_beta);
+    let mut w_exit = Array1::<f64>::zeros(block.event_target.len());
+    let mut w_entry = Array1::<f64>::zeros(block.event_target.len());
+    let mut w_derivative = Array1::<f64>::zeros(block.event_target.len());
+
+    for i in 0..block.event_target.len() {
+        let weight = block.sampleweight[i];
+        if weight <= 0.0 {
+            continue;
+        }
+        let has_entry = block.age_entry[i] > 1e-8;
+        w_exit[i] = weight * eta_exit[i].exp() * d_eta_exit[i];
+        if has_entry {
+            w_entry[i] = weight * eta_entry[i].exp() * d_eta_entry[i];
+        }
+        if block.event_target[i] > 0 {
+            let deriv = derivative[i];
+            if !(deriv.is_finite() && deriv > 0.0) {
+                return Err(format!(
+                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                ));
+            }
+            w_derivative[i] = -2.0 * weight * d_derivative[i] / (deriv * deriv * deriv);
+        }
+    }
+
+    let mut d_hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
+    d_hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
+    d_hessian += &fast_xt_diag_x(&block.x_derivative, &w_derivative);
+    Ok(d_hessian)
+}
+
+fn cause_specific_hessian_second_directional_derivative(
+    block: &CauseSpecificRoystonParmarBlock,
+    beta: &Array1<f64>,
+    d_beta_u: &Array1<f64>,
+    d_beta_v: &Array1<f64>,
+) -> Result<Array2<f64>, String> {
+    let p = block.x_exit.ncols();
+    if beta.len() != p || d_beta_u.len() != p || d_beta_v.len() != p {
+        return Err(
+            "cause-specific survival second Hessian derivative dimension mismatch".to_string(),
+        );
+    }
+    let eta_entry = block.x_entry.dot(beta) + &block.offset_eta_entry;
+    let eta_exit = block.x_exit.dot(beta) + &block.offset_eta_exit;
+    let derivative = block.x_derivative.dot(beta) + &block.offset_derivative_exit;
+    let u_eta_entry = block.x_entry.dot(d_beta_u);
+    let u_eta_exit = block.x_exit.dot(d_beta_u);
+    let u_derivative = block.x_derivative.dot(d_beta_u);
+    let v_eta_entry = block.x_entry.dot(d_beta_v);
+    let v_eta_exit = block.x_exit.dot(d_beta_v);
+    let v_derivative = block.x_derivative.dot(d_beta_v);
+    let mut w_exit = Array1::<f64>::zeros(block.event_target.len());
+    let mut w_entry = Array1::<f64>::zeros(block.event_target.len());
+    let mut w_derivative = Array1::<f64>::zeros(block.event_target.len());
+
+    for i in 0..block.event_target.len() {
+        let weight = block.sampleweight[i];
+        if weight <= 0.0 {
+            continue;
+        }
+        let has_entry = block.age_entry[i] > 1e-8;
+        w_exit[i] = weight * eta_exit[i].exp() * u_eta_exit[i] * v_eta_exit[i];
+        if has_entry {
+            w_entry[i] = weight * eta_entry[i].exp() * u_eta_entry[i] * v_eta_entry[i];
+        }
+        if block.event_target[i] > 0 {
+            let deriv = derivative[i];
+            if !(deriv.is_finite() && deriv > 0.0) {
+                return Err(format!(
+                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                ));
+            }
+            w_derivative[i] =
+                6.0 * weight * u_derivative[i] * v_derivative[i] / deriv.powi(4);
+        }
+    }
+
+    let mut d2_hessian = fast_xt_diag_x(&block.x_exit, &w_exit);
+    d2_hessian -= &fast_xt_diag_x(&block.x_entry, &w_entry);
+    d2_hessian += &fast_xt_diag_x(&block.x_derivative, &w_derivative);
+    Ok(d2_hessian)
 }
 
 pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8, String> {

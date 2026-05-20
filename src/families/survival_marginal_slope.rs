@@ -45,9 +45,10 @@ use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
+    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, LinkFunction};
@@ -2932,6 +2933,178 @@ pub fn survival_marginal_slope_vector_neglog(
             - event * ad1.ln()))
 }
 
+fn marginal_slope_covariance_matvec(
+    covariance: &MarginalSlopeCovariance,
+    vector: &[f64],
+) -> Result<Vec<f64>, String> {
+    covariance.validate("survival marginal-slope covariance matvec")?;
+    if vector.len() != covariance.dim() {
+        return Err(format!(
+            "survival marginal-slope covariance matvec dimension mismatch: vector={}, covariance={}",
+            vector.len(),
+            covariance.dim()
+        ));
+    }
+    Ok(match covariance {
+        MarginalSlopeCovariance::Diagonal(diag) => vector
+            .iter()
+            .zip(diag.iter())
+            .map(|(&v, &sigma)| sigma * v)
+            .collect(),
+        MarginalSlopeCovariance::Full(cov) => {
+            let mut out = vec![0.0; cov.nrows()];
+            for i in 0..cov.nrows() {
+                for j in 0..cov.ncols() {
+                    out[i] += cov[[i, j]] * vector[j];
+                }
+            }
+            out
+        }
+        MarginalSlopeCovariance::LowRank(factor) => {
+            let mut projected = vec![0.0; factor.ncols()];
+            for r in 0..factor.ncols() {
+                for k in 0..factor.nrows() {
+                    projected[r] += factor[[k, r]] * vector[k];
+                }
+            }
+            let mut out = vec![0.0; factor.nrows()];
+            for k in 0..factor.nrows() {
+                for r in 0..factor.ncols() {
+                    out[k] += factor[[k, r]] * projected[r];
+                }
+            }
+            out
+        }
+    })
+}
+
+fn row_primary_closed_form_vector(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+    let k = slopes.len();
+    if z.len() != k || covariance.dim() != k {
+        return Err(format!(
+            "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+            k,
+            z.len(),
+            covariance.dim()
+        ));
+    }
+    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
+    let sigma_g = marginal_slope_covariance_matvec(covariance, slopes)?;
+    let s2 = probit_scale * probit_scale;
+    let mut c1 = vec![0.0; k];
+    for a in 0..k {
+        c1[a] = s2 * sigma_g[a] / c;
+    }
+    let mut c2 = Array2::<f64>::zeros((k, k));
+    for a in 0..k {
+        for b in 0..k {
+            let sigma_ab = match covariance {
+                MarginalSlopeCovariance::Diagonal(diag) => {
+                    if a == b { diag[a] } else { 0.0 }
+                }
+                MarginalSlopeCovariance::Full(cov) => cov[[a, b]],
+                MarginalSlopeCovariance::LowRank(factor) => {
+                    let mut value = 0.0;
+                    for r in 0..factor.ncols() {
+                        value += factor[[a, r]] * factor[[b, r]];
+                    }
+                    value
+                }
+            };
+            c2[[a, b]] = s2 * sigma_ab / c - (s2 * sigma_g[a]) * (s2 * sigma_g[b]) / (c * c * c);
+        }
+    }
+
+    let linear = probit_scale
+        * slopes
+            .iter()
+            .zip(z.iter())
+            .map(|(&g, &zi)| g * zi)
+            .sum::<f64>();
+    let eta0 = q0 * c + linear;
+    let eta1 = q1 * c + linear;
+    let ad1 = qd1 * c;
+    if survival_derivative_guard_violated(qd1, derivative_guard) {
+        return Err(format!(
+            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+        ));
+    }
+    if !(ad1.is_finite() && ad1 > 0.0) {
+        return Err(format!(
+            "survival marginal-slope transformed derivative must be positive, got {ad1}"
+        ));
+    }
+
+    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let nll =
+        w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * ad1.ln());
+
+    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
+    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
+    let phi_u1 = w * d * eta1;
+    let phi_u2 = w * d;
+    let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+    let td_u1 = w * d * nl_u1;
+    let td_u2 = w * d * nl_u2;
+    let u1_eta0 = -e0_k1;
+    let u1_eta1 = -e1_k1 + phi_u1;
+    let u1_ad1 = td_u1;
+    let u2_eta0 = e0_k2;
+    let u2_eta1 = e1_k2 + phi_u2;
+    let u2_ad1 = td_u2;
+
+    let dim = 3 + k;
+    let mut grad = Array1::<f64>::zeros(dim);
+    let mut hess = Array2::<f64>::zeros((dim, dim));
+    grad[0] = u1_eta0 * c;
+    grad[1] = u1_eta1 * c;
+    grad[2] = u1_ad1 * c;
+    hess[[0, 0]] = u2_eta0 * c * c;
+    hess[[1, 1]] = u2_eta1 * c * c;
+    hess[[2, 2]] = u2_ad1 * c * c;
+    for a in 0..k {
+        let idx = 3 + a;
+        let dlin = probit_scale * z[a];
+        let deta0 = q0 * c1[a] + dlin;
+        let deta1 = q1 * c1[a] + dlin;
+        let dad1 = qd1 * c1[a];
+        grad[idx] = u1_eta0 * deta0 + u1_eta1 * deta1 + u1_ad1 * dad1;
+        hess[[0, idx]] = u2_eta0 * c * deta0 + u1_eta0 * c1[a];
+        hess[[idx, 0]] = hess[[0, idx]];
+        hess[[1, idx]] = u2_eta1 * c * deta1 + u1_eta1 * c1[a];
+        hess[[idx, 1]] = hess[[1, idx]];
+        hess[[2, idx]] = u2_ad1 * c * dad1 + u1_ad1 * c1[a];
+        hess[[idx, 2]] = hess[[2, idx]];
+        for b in 0..k {
+            let jdx = 3 + b;
+            let dlin_b = probit_scale * z[b];
+            let deta0_b = q0 * c1[b] + dlin_b;
+            let deta1_b = q1 * c1[b] + dlin_b;
+            let dad1_b = qd1 * c1[b];
+            hess[[idx, jdx]] = u2_eta0 * deta0 * deta0_b
+                + u1_eta0 * q0 * c2[[a, b]]
+                + u2_eta1 * deta1 * deta1_b
+                + u1_eta1 * q1 * c2[[a, b]]
+                + u2_ad1 * dad1 * dad1_b
+                + u1_ad1 * qd1 * c2[[a, b]];
+        }
+    }
+    Ok((nll, grad, hess))
+}
+
 fn standardize_latent_z_matrix_with_policy(
     z: &Array2<f64>,
     weights: &Array1<f64>,
@@ -3429,6 +3602,15 @@ impl SurvivalMarginalSlopeFamily {
         logslope_eta: &Array1<f64>,
     ) -> Result<Vec<f64>, String> {
         let k = self.score_dim();
+        if self.logslope_surface_ranges.len() == k && k > 1 {
+            let beta = &logslope_eta; // unreachable for per-surface layouts; kept for error context.
+            if beta.len() == self.n {
+                return Err(
+                    "survival marginal-slope internal logslope vector requested scalar eta for a per-z surface layout"
+                        .to_string(),
+                );
+            }
+        }
         if logslope_eta.len() == self.n {
             return Ok(vec![logslope_eta[row]; k]);
         }
@@ -3441,6 +3623,39 @@ impl SurvivalMarginalSlopeFamily {
             logslope_eta.len(),
             self.n
         ))
+    }
+
+    fn per_z_logslope_active(&self) -> bool {
+        self.score_dim() > 1 && self.logslope_surface_ranges.len() == self.score_dim()
+    }
+
+    fn logslope_surface_values_for_row(
+        &self,
+        row: usize,
+        beta_logslope: &Array1<f64>,
+    ) -> Result<Vec<f64>, String> {
+        let k = self.score_dim();
+        if !self.per_z_logslope_active() {
+            return self.logslope_vector_for_row(row, beta_logslope);
+        }
+        let g_row = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("logslope_surface_values_for_row logslope row chunk: {e}"))?;
+        let row_view = g_row.row(0);
+        let mut out = Vec::with_capacity(k);
+        for range in &self.logslope_surface_ranges {
+            out.push(row_view.slice(s![range.clone()]).dot(&beta_logslope.slice(s![range.clone()])));
+        }
+        Ok(out)
+    }
+
+    fn logslope_surface_row(&self, row: usize) -> Result<Array1<f64>, String> {
+        let chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("logslope_surface_row logslope row chunk: {e}"))?;
+        Ok(chunk.row(0).to_owned())
     }
 
     fn shared_logslope_covariance_scale(&self) -> Result<f64, String> {
@@ -3543,7 +3758,11 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         probit_scale: f64,
     ) -> Result<f64, String> {
-        let slopes = self.logslope_vector_for_row(row, &block_states[2].eta)?;
+        let slopes = if self.per_z_logslope_active() {
+            self.logslope_surface_values_for_row(row, &block_states[2].beta)?
+        } else {
+            self.logslope_vector_for_row(row, &block_states[2].eta)?
+        };
         let z = self.z.row(row).to_vec();
         survival_marginal_slope_vector_neglog(
             q_geom.q0,
@@ -14466,6 +14685,9 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
+        if self.per_z_logslope_active() {
+            return self.evaluate_blockwise_exact_newton_per_z(block_states);
+        }
         if self.effective_flex_active(block_states)? {
             return self.evaluate_blockwise_exact_newton_flexible(block_states);
         }
@@ -14526,6 +14748,150 @@ impl SurvivalMarginalSlopeFamily {
                 logslope_csr.as_ref(),
             )
         }
+    }
+
+    fn evaluate_blockwise_exact_newton_per_z(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<FamilyEvaluation, String> {
+        if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
+            return Err(
+                "survival marginal-slope per-z logslope surfaces currently require the rigid row kernel"
+                    .to_string(),
+            );
+        }
+        let slices = block_slices(self, block_states);
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+        let beta_time = &block_states[0].beta;
+        let beta_logslope = &block_states[2].beta;
+        let probit_scale = self.probit_frailty_scale();
+        let (ll, grad_t, grad_m, grad_g, hess_t, hess_m, hess_g) = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(p_t),
+                        Array1::<f64>::zeros(p_m),
+                        Array1::<f64>::zeros(p_g),
+                        Array2::<f64>::zeros((p_t, p_t)),
+                        Array2::<f64>::zeros((p_m, p_m)),
+                        Array2::<f64>::zeros((p_g, p_g)),
+                    )
+                },
+                |mut acc, row| -> Result<_, String> {
+                    let q0 = self.design_entry.dot_row(row, beta_time)
+                        + self.offset_entry[row]
+                        + block_states[1].eta[row];
+                    let q1 = self.design_exit.dot_row(row, beta_time)
+                        + self.offset_exit[row]
+                        + block_states[1].eta[row];
+                    let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                        + self.derivative_offset_exit[row];
+                    let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
+                    let z = self.z.row(row).to_vec();
+                    let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &z,
+                        &self.score_covariance,
+                        self.weights[row],
+                        self.event[row],
+                        self.derivative_guard,
+                        probit_scale,
+                    )?;
+                    acc.0 -= nll;
+                    self.design_entry
+                        .axpy_row_into(row, -f_pi[0], &mut acc.1.view_mut())?;
+                    self.design_exit
+                        .axpy_row_into(row, -f_pi[1], &mut acc.1.view_mut())?;
+                    self.design_derivative_exit
+                        .axpy_row_into(row, -f_pi[2], &mut acc.1.view_mut())?;
+                    self.marginal_design
+                        .axpy_row_into(row, -(f_pi[0] + f_pi[1]), &mut acc.2.view_mut())?;
+                    let g_row = self.logslope_surface_row(row)?;
+                    for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
+                        let alpha = -f_pi[3 + coord];
+                        for col in range.clone() {
+                            acc.3[col] += alpha * g_row[col];
+                        }
+                    }
+                    let time_designs = [
+                        &self.design_entry,
+                        &self.design_exit,
+                        &self.design_derivative_exit,
+                    ];
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            time_designs[a]
+                                .row_outer_into(row, time_designs[b], f_pipi[[a, b]], &mut acc.4)?;
+                        }
+                    }
+                    let alpha_mm =
+                        f_pipi[[0, 0]] + f_pipi[[0, 1]] + f_pipi[[1, 0]] + f_pipi[[1, 1]];
+                    self.marginal_design
+                        .syr_row_into(row, alpha_mm, &mut acc.5)?;
+                    for (a, range_a) in self.logslope_surface_ranges.iter().enumerate() {
+                        for (b, range_b) in self.logslope_surface_ranges.iter().enumerate() {
+                            let alpha = f_pipi[[3 + a, 3 + b]];
+                            if alpha == 0.0 {
+                                continue;
+                            }
+                            for ca in range_a.clone() {
+                                let va = g_row[ca] * alpha;
+                                for cb in range_b.clone() {
+                                    acc.6[[ca, cb]] += va * g_row[cb];
+                                }
+                            }
+                        }
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(p_t),
+                        Array1::<f64>::zeros(p_m),
+                        Array1::<f64>::zeros(p_g),
+                        Array2::<f64>::zeros((p_t, p_t)),
+                        Array2::<f64>::zeros((p_m, p_m)),
+                        Array2::<f64>::zeros((p_g, p_g)),
+                    )
+                },
+                |mut a, b| -> Result<_, String> {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    a.3 += &b.3;
+                    a.4 += &b.4;
+                    a.5 += &b.5;
+                    a.6 += &b.6;
+                    Ok(a)
+                },
+            )?;
+        Ok(FamilyEvaluation {
+            log_likelihood: ll,
+            blockworking_sets: vec![
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_t,
+                    hessian: SymmetricMatrix::Dense(hess_t),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_m,
+                    hessian: SymmetricMatrix::Dense(hess_m),
+                },
+                BlockWorkingSet::ExactNewton {
+                    gradient: grad_g,
+                    hessian: SymmetricMatrix::Dense(hess_g),
+                },
+            ],
+        })
     }
 
     /// Blockwise exact-Newton for the flexible (score-warp / link-deviation)
