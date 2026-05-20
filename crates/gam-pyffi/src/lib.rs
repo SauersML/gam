@@ -96,6 +96,12 @@ struct PyFitConfig {
 
     firth: Option<bool>,
 
+    // Integration seam for task 04's group abstraction. The proposed group
+    // type can pass either `group_metadata` directly or `groups` entries with
+    // `{name|id|key, metadata}`; fitting ignores it and persistence carries it.
+    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
+    groups: Option<serde_json::Value>,
+
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
     frailty_kind: Option<String>,

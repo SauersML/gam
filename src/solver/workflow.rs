@@ -47,8 +47,9 @@ use crate::types::{
     WigglePenaltyConfig,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use serde_json::Value as JsonValue;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -1162,7 +1163,7 @@ fn fit_survival_transformation_model(
             .map_err(|err| err.to_string())?;
     let dense_cov_design = covariate_design.design.to_dense();
     let p_cov = dense_cov_design.ncols();
-    let event_competing = Array1::<u8>::zeros(spec.event_target.len());
+    let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view());
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
@@ -1220,35 +1221,106 @@ fn fit_survival_transformation_model(
             let dense_time_entry = prepared.time_design_entry.to_dense();
             let dense_time_exit = prepared.time_design_exit.to_dense();
             let dense_time_derivative = prepared.time_design_derivative.to_dense();
-            let mut model =
-                crate::families::royston_parmar::working_model_from_time_covariateshared(
-                    PenaltyBlocks::new(penalty_blocks.clone()),
+            let (mut model, penalty_blocks) = if cause_count <= 1 {
+                let event_competing = Array1::<u8>::zeros(spec.event_target.len());
+                let model =
+                    crate::families::royston_parmar::working_model_from_time_covariateshared(
+                        PenaltyBlocks::new(penalty_blocks.clone()),
+                        MonotonicityPenalty { tolerance: 0.0 },
+                        SurvivalSpec::Net,
+                        crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
+                            age_entry: spec.age_entry.view(),
+                            age_exit: spec.age_exit.view(),
+                            event_target: spec.event_target.view(),
+                            event_competing: event_competing.view(),
+                            weights: spec.weights.view(),
+                            time_entry: dense_time_entry.view(),
+                            time_exit: dense_time_exit.view(),
+                            time_derivative: dense_time_derivative.view(),
+                            covariates: dense_cov_design.view(),
+                            monotonicity_constraint_rows: None,
+                            monotonicity_constraint_offsets: None,
+                            eta_offset_entry: Some(eta_offset_entry.view()),
+                            eta_offset_exit: Some(eta_offset_exit.view()),
+                            derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
+                        },
+                    )
+                    .map_err(|err| format!("failed to construct survival model: {err}"))?;
+                (model, penalty_blocks)
+            } else {
+                let mut flat_entry = Array2::<f64>::zeros((spec.event_target.len(), p));
+                let mut flat_exit = Array2::<f64>::zeros((spec.event_target.len(), p));
+                let mut flat_derivative = Array2::<f64>::zeros((spec.event_target.len(), p));
+                flat_entry
+                    .slice_mut(s![.., ..p_time_total])
+                    .assign(&dense_time_entry);
+                flat_exit
+                    .slice_mut(s![.., ..p_time_total])
+                    .assign(&dense_time_exit);
+                flat_derivative
+                    .slice_mut(s![.., ..p_time_total])
+                    .assign(&dense_time_derivative);
+                if p_cov > 0 {
+                    flat_entry
+                        .slice_mut(s![.., p_time_total..])
+                        .assign(&dense_cov_design);
+                    flat_exit
+                        .slice_mut(s![.., p_time_total..])
+                        .assign(&dense_cov_design);
+                }
+                let expanded = crate::survival::expand_cause_specific_survival_flat_inputs(
+                    spec.age_entry.view(),
+                    spec.age_exit.view(),
+                    spec.event_target.view(),
+                    spec.weights.view(),
+                    flat_entry.view(),
+                    flat_exit.view(),
+                    flat_derivative.view(),
+                    Some(crate::survival::SurvivalBaselineOffsets {
+                        eta_entry: eta_offset_entry.view(),
+                        eta_exit: eta_offset_exit.view(),
+                        derivative_exit: prepared.derivative_offset_exit.view(),
+                    }),
+                )
+                .map_err(|err| format!("failed to expand cause-specific survival model: {err}"))?;
+                let expanded_penalties = crate::survival::expand_cause_specific_penalty_blocks(
+                    &PenaltyBlocks::new(penalty_blocks),
+                    cause_count,
+                    p,
+                )
+                .map_err(|err| format!("failed to expand cause-specific penalties: {err}"))?;
+                let model = crate::families::royston_parmar::working_model_from_flattened(
+                    expanded_penalties.clone(),
                     MonotonicityPenalty { tolerance: 0.0 },
                     SurvivalSpec::Net,
-                    crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
-                        age_entry: spec.age_entry.view(),
-                        age_exit: spec.age_exit.view(),
-                        event_target: spec.event_target.view(),
-                        event_competing: event_competing.view(),
-                        weights: spec.weights.view(),
-                        time_entry: dense_time_entry.view(),
-                        time_exit: dense_time_exit.view(),
-                        time_derivative: dense_time_derivative.view(),
-                        covariates: dense_cov_design.view(),
+                    crate::families::royston_parmar::RoystonParmarInputs {
+                        age_entry: expanded.age_entry.view(),
+                        age_exit: expanded.age_exit.view(),
+                        event_target: expanded.event_target.view(),
+                        event_competing: expanded.event_competing.view(),
+                        weights: expanded.sampleweight.view(),
+                        x_entry: expanded.x_entry.view(),
+                        x_exit: expanded.x_exit.view(),
+                        x_derivative: expanded.x_derivative.view(),
                         monotonicity_constraint_rows: None,
                         monotonicity_constraint_offsets: None,
-                        eta_offset_entry: Some(eta_offset_entry.view()),
-                        eta_offset_exit: Some(eta_offset_exit.view()),
-                        derivative_offset_exit: Some(prepared.derivative_offset_exit.view()),
+                        eta_offset_entry: Some(expanded.offset_eta_entry.view()),
+                        eta_offset_exit: Some(expanded.offset_eta_exit.view()),
+                        derivative_offset_exit: Some(expanded.offset_derivative_exit.view()),
                     },
                 )
-                .map_err(|err| format!("failed to construct survival model: {err}"))?;
-            if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull {
+                .map_err(|err| {
+                    format!("failed to construct cause-specific survival model: {err}")
+                })?;
+                (model, expanded_penalties.blocks)
+            };
+            if cause_count <= 1 && spec.likelihood_mode != SurvivalLikelihoodMode::Weibull {
                 model
                     .set_structural_monotonicity(true, p_time_total)
                     .map_err(|err| format!("failed to enable structural monotonicity: {err}"))?;
             }
-            let mut beta0 = Array1::<f64>::zeros(p);
+            let joint_p = p * cause_count;
+            let mut beta0 = Array1::<f64>::zeros(joint_p);
             if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none()
             {
                 let (scale, shape) = spec
@@ -1259,15 +1331,21 @@ fn fit_survival_transformation_model(
                         "weibull built-in time basis has {p_time_total} columns but needs 2 to seed scale/shape"
                     ));
                 }
-                beta0[0] = -shape * scale.ln();
-                beta0[1] = shape;
+                for cause in 0..cause_count {
+                    let offset = cause * p;
+                    beta0[offset] = -shape * scale.ln();
+                    beta0[offset + 1] = shape;
+                }
             }
             let structural_lower_bounds =
                 if spec.likelihood_mode != SurvivalLikelihoodMode::Weibull && p_time_total > 0 {
-                    let mut lb = Array1::from_elem(p, f64::NEG_INFINITY);
-                    for j in 0..p_time_total {
-                        lb[j] = 0.0;
-                        beta0[j] = 1e-4;
+                    let mut lb = Array1::from_elem(joint_p, f64::NEG_INFINITY);
+                    for cause in 0..cause_count {
+                        let offset = cause * p;
+                        for j in 0..p_time_total {
+                            lb[offset + j] = 0.0;
+                            beta0[offset + j] = 1e-4;
+                        }
                     }
                     Some(lb)
                 } else {
@@ -1380,18 +1458,20 @@ fn fit_survival_transformation_model(
         .update_state(&beta)
         .map_err(|err| format!("failed to evaluate survival optimum: {err}"))?;
     let lambdas = Array1::from_iter(penalty_blocks.iter().map(|block| block.lambda));
-    let fitted_baseline_cfg =
-        if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull && spec.timewiggle.is_none() {
-            let time_beta = beta
-                .slice(s![..spec.time_build.x_exit_time.ncols()])
-                .to_owned();
-            fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
-                "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                    .to_string()
-            })?
-        } else {
-            baseline_cfg
-        };
+    let fitted_baseline_cfg = if cause_count == 1
+        && spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && spec.timewiggle.is_none()
+    {
+        let time_beta = beta
+            .slice(s![..spec.time_build.x_exit_time.ncols()])
+            .to_owned();
+        fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
+            "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                .to_string()
+        })?
+    } else {
+        baseline_cfg
+    };
     let fit = survival_unified_fit_result(beta, lambdas, &summary, &state)?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
@@ -1952,6 +2032,11 @@ pub struct FitConfig {
     /// planning spatial bases (TPS / Matern / Duchon) during term construction.
     /// When `None`, the default-library policy is used.
     pub resource_policy: Option<crate::resource::ResourcePolicy>,
+
+    /// Optional per-group metadata supplied by the caller. Fitting ignores this
+    /// field; saved-model builders pass it through so deployment consumers can
+    /// recover group provenance.
+    pub group_metadata: Option<BTreeMap<String, JsonValue>>,
 }
 
 impl Default for FitConfig {
@@ -1988,6 +2073,7 @@ impl Default for FitConfig {
             transformation_normal: false,
             firth: false,
             resource_policy: None,
+            group_metadata: None,
         }
     }
 }
@@ -2638,6 +2724,14 @@ fn materialize_survival<'a>(
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = data.values.nrows();
     let event = data.values.column(event_idx).to_owned();
+    let event_codes = Array1::from_iter(
+        event
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, value)| crate::survival::survival_event_code_from_value(value, i))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
@@ -2653,6 +2747,18 @@ fn materialize_survival<'a>(
     }
 
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    let cause_count = crate::survival::cause_count_from_event_codes(event_codes.view());
+    if cause_count > 1
+        && !matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+        )
+    {
+        return Err(format!(
+            "cause-specific competing risks with {cause_count} causes are currently supported for survival_likelihood='transformation' and 'weibull'; got '{}'",
+            config.survival_likelihood
+        ));
+    }
     if parsed.linkwiggle.is_some()
         && !matches!(
             survival_mode,
@@ -3467,7 +3573,7 @@ fn materialize_survival<'a>(
                 spec: SurvivalTransformationTermSpec {
                     age_entry: age_entry.clone(),
                     age_exit: age_exit.clone(),
-                    event_target: event.mapv(|value| if value >= 0.5 { 1 } else { 0 }),
+                    event_target: event_codes.clone(),
                     weights: weights.clone(),
                     covariate_spec: termspec.clone(),
                     covariate_offset: threshold_offset.clone(),

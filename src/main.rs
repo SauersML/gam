@@ -65,7 +65,9 @@ use gam::smooth::{
     SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
-use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+use gam::survival::{
+    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value,
+};
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
@@ -4177,7 +4179,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         let ev = ds.values[[i, event_col]];
         age_entry[i] = t0;
         age_exit[i] = t1;
-        event_target[i] = if ev >= 0.5 { 1 } else { 0 };
+        event_target[i] = survival_event_code_from_value(ev, i)?;
+    }
+    let cause_count = gam::survival::cause_count_from_event_codes(event_target.view());
+    if cause_count > 1
+        && !matches!(
+            likelihood_mode,
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+        )
+    {
+        return Err(format!(
+            "cause-specific competing risks with {cause_count} causes are currently supported for --survival-likelihood transformation and weibull"
+        ));
     }
     let mut baseline_cfg = initial_survival_baseline_config_for_fit(
         &baseline_target_raw,
