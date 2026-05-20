@@ -1389,6 +1389,30 @@ fn resolve_group_columns(
     Ok(cols)
 }
 
+fn coefficient_group_leaf_column_components(
+    name: &str,
+    children_by_parent: &BTreeMap<String, Vec<String>>,
+    resolved: &BTreeMap<String, BTreeSet<usize>>,
+) -> Vec<BTreeSet<usize>> {
+    let Some(children) = children_by_parent.get(name) else {
+        return vec![
+            resolved
+                .get(name)
+                .expect("coefficient group columns should exist")
+                .clone(),
+        ];
+    };
+    let mut components = Vec::new();
+    for child in children {
+        components.extend(coefficient_group_leaf_column_components(
+            child,
+            children_by_parent,
+            resolved,
+        ));
+    }
+    components
+}
+
 fn realize_coefficient_groups(
     design: &TermCollectionDesign,
     groups: &[CoefficientGroupSpec],
@@ -1427,6 +1451,15 @@ fn realize_coefficient_groups(
         .iter()
         .map(|group| (group.name.clone(), group.parent.clone()))
         .collect();
+    let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+    for group in groups {
+        if let Some(parent) = group.parent.as_ref() {
+            children_by_parent
+                .entry(parent.clone())
+                .or_default()
+                .push(group.name.clone());
+        }
+    }
     for group in groups {
         let mut path = BTreeSet::<String>::new();
         let mut cursor = Some(group.name.as_str());
@@ -1472,22 +1505,52 @@ fn realize_coefficient_groups(
     for group in groups {
         let cols = resolved.get(&group.name).expect("group was resolved above");
         let mut penalty = Array2::<f64>::zeros((p, p));
+        let penalty_components =
+            coefficient_group_leaf_column_components(&group.name, &children_by_parent, &resolved);
+        let active_cols = penalty_components
+            .iter()
+            .flat_map(|component| component.iter().copied())
+            .collect::<BTreeSet<_>>();
         let local_mean = group
             .prior_mean
-            .evaluate(cols.len(), &format!("coefficient group '{}'", group.name))
+            .evaluate(
+                active_cols.len(),
+                &format!("coefficient group '{}'", group.name),
+            )
             .map_err(|err| BasisError::InvalidInput(err.to_string()))?;
         let mut prior_mean = Array1::<f64>::zeros(p);
-        for &col in cols {
-            penalty[[col, col]] = 1.0;
+        // Hierarchical Gamma precision update.
+        //
+        // For a leaf group,
+        //
+        //   p(beta_g | lambda_g) p(lambda_g)
+        //     ∝ lambda_g^{|g|/2}
+        //       exp[-lambda_g (beta_g - mu_g)' S_g (beta_g - mu_g) / 2]
+        //       lambda_g^{a_g-1} exp[-b_g lambda_g],
+        //
+        // so fixed-beta MAP gives
+        //
+        //   lambda_g* = (a_g + |g|/2 - 1)
+        //               / (b_g + (beta_g - mu_g)' S_g (beta_g - mu_g) / 2).
+        //
+        // Interior nodes use the same identity with |g| and the quadratic
+        // replaced by sums over descendant leaf factors.  In the standard
+        // term-collection path there is one rho coordinate per group, so we
+        // materialize that summed descendant penalty into the group's dense
+        // S_g.  Leaves reduce to the ordinary identity penalty.
+        for component in &penalty_components {
+            for &col in component {
+                penalty[[col, col]] += 1.0;
+            }
         }
-        for (mean_idx, &col) in cols.iter().enumerate() {
+        for (mean_idx, &col) in active_cols.iter().enumerate() {
             prior_mean[col] = local_mean[mean_idx];
         }
         penalty_specs.push(PenaltySpec::DenseWithMean {
             matrix: penalty,
             prior_mean: crate::solver::estimate::CoefficientPriorMean::constant(prior_mean),
         });
-        nullspace_dims.push(p.saturating_sub(cols.len()));
+        nullspace_dims.push(p.saturating_sub(active_cols.len()));
         group_column_indices.push((group.name.clone(), cols.iter().copied().collect()));
     }
 

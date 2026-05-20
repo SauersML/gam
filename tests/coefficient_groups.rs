@@ -149,6 +149,45 @@ fn cyclic_coefficient_group_hierarchy_is_rejected() {
 }
 
 #[test]
+fn standard_parent_group_penalty_is_sum_of_descendant_leaf_penalties() {
+    let (x, _, _, _) = synthetic_two_score_data();
+    let design = build_term_collection_design(x.view(), &two_linear_term_spec()).expect("design");
+    let realized = design
+        .realize_coefficient_groups(
+            &[
+                CoefficientGroupSpec {
+                    name: "publication_level".to_string(),
+                    selectors: vec![
+                        CoefficientSelector::LinearTerm("score_a".to_string()),
+                        CoefficientSelector::LinearTerm("score_b".to_string()),
+                    ],
+                    parent: None,
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+                CoefficientGroupSpec {
+                    name: "score_a_leaf".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
+                    parent: Some("publication_level".to_string()),
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+            ],
+            &RhoPrior::Flat,
+        )
+        .expect("nested standard coefficient group");
+
+    match &realized.penalty_specs[0] {
+        PenaltySpec::DenseWithMean { matrix, .. } => {
+            assert_eq!(matrix[[1, 1]], 1.0);
+            assert_eq!(matrix[[2, 2]], 0.0);
+        }
+        other => panic!("expected dense parent penalty, got {other:?}"),
+    }
+    assert_eq!(realized.nullspace_dims[0], 2);
+}
+
+#[test]
 fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
     let block_spec = |name: &str| ParameterBlockSpec {
         name: name.to_string(),
@@ -199,6 +238,65 @@ fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
             shape: 3.0,
             rate: 2.0,
         }])
+    );
+}
+
+#[test]
+fn custom_family_parent_group_ties_descendant_leaf_penalties() {
+    let block_spec = |name: &str| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
+        offset: Array1::zeros(4),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+    };
+    let groups = vec![
+        CustomCoefficientGroupSpec::new(
+            "endpoint_supergroup",
+            vec![
+                coefficient_label("risk_a", 0),
+                coefficient_label("risk_b", 1),
+            ],
+        )
+        .with_prior(CustomCoefficientGroupPrior::GammaPrecision {
+            shape: 2.0,
+            rate: 0.5,
+        }),
+        CustomCoefficientGroupSpec::new("risk_a_leaf", vec![coefficient_label("risk_a", 0)])
+            .with_parent("endpoint_supergroup"),
+        CustomCoefficientGroupSpec::new("risk_b_leaf", vec![coefficient_label("risk_b", 1)])
+            .with_parent("endpoint_supergroup"),
+    ];
+
+    let realized = realize_coefficient_groups_for_custom_family(
+        &[block_spec("risk_a"), block_spec("risk_b")],
+        &groups,
+        RhoPrior::Flat,
+    )
+    .expect("nested cross-block coefficient group");
+
+    assert_eq!(
+        realized.outer_labels,
+        vec!["endpoint_supergroup", "risk_a_leaf", "risk_b_leaf"]
+    );
+    assert_eq!(
+        realized.penalty_labels,
+        vec![
+            "endpoint_supergroup",
+            "endpoint_supergroup",
+            "risk_a_leaf",
+            "risk_b_leaf",
+        ]
+    );
+    assert_eq!(
+        realized.specs[0].penalties[0].precision_label(),
+        Some("endpoint_supergroup")
+    );
+    assert_eq!(
+        realized.specs[1].penalties[0].precision_label(),
+        Some("endpoint_supergroup")
     );
 }
 
