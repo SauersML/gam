@@ -172,6 +172,13 @@ fn standard_parent_group_penalty_is_sum_of_descendant_leaf_penalties() {
                     prior: None,
                     prior_mean: CoefficientPriorMean::Zero,
                 },
+                CoefficientGroupSpec {
+                    name: "score_b_leaf".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_b".to_string())],
+                    parent: Some("publication_level".to_string()),
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
             ],
             &RhoPrior::Flat,
         )
@@ -180,11 +187,43 @@ fn standard_parent_group_penalty_is_sum_of_descendant_leaf_penalties() {
     match &realized.penalty_specs[0] {
         PenaltySpec::DenseWithMean { matrix, .. } => {
             assert_eq!(matrix[[1, 1]], 1.0);
-            assert_eq!(matrix[[2, 2]], 0.0);
+            assert_eq!(matrix[[2, 2]], 1.0);
         }
         other => panic!("expected dense parent penalty, got {other:?}"),
     }
-    assert_eq!(realized.nullspace_dims[0], 2);
+    assert_eq!(realized.nullspace_dims[0], 1);
+}
+
+#[test]
+fn nested_group_rejects_parent_coefficients_not_covered_by_children() {
+    let (x, _, _, _) = synthetic_two_score_data();
+    let design = build_term_collection_design(x.view(), &two_linear_term_spec()).expect("design");
+    let err = design
+        .realize_coefficient_groups(
+            &[
+                CoefficientGroupSpec {
+                    name: "publication_level".to_string(),
+                    selectors: vec![
+                        CoefficientSelector::LinearTerm("score_a".to_string()),
+                        CoefficientSelector::LinearTerm("score_b".to_string()),
+                    ],
+                    parent: None,
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+                CoefficientGroupSpec {
+                    name: "score_a_leaf".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
+                    parent: Some("publication_level".to_string()),
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+            ],
+            &RhoPrior::Flat,
+        )
+        .expect_err("parent coefficients outside child concatenation must fail");
+
+    assert!(err.to_string().contains("union of its child groups"));
 }
 
 #[test]
@@ -298,6 +337,39 @@ fn custom_family_parent_group_ties_descendant_leaf_penalties() {
         realized.specs[1].penalties[0].precision_label(),
         Some("endpoint_supergroup")
     );
+}
+
+#[test]
+fn custom_family_nested_group_rejects_uncovered_parent_coefficients() {
+    let block_spec = |name: &str| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
+        offset: Array1::zeros(4),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+    };
+    let groups = vec![
+        CustomCoefficientGroupSpec::new(
+            "endpoint_supergroup",
+            vec![
+                coefficient_label("risk_a", 0),
+                coefficient_label("risk_b", 1),
+            ],
+        ),
+        CustomCoefficientGroupSpec::new("risk_a_leaf", vec![coefficient_label("risk_a", 0)])
+            .with_parent("endpoint_supergroup"),
+    ];
+
+    let err = realize_coefficient_groups_for_custom_family(
+        &[block_spec("risk_a"), block_spec("risk_b")],
+        &groups,
+        RhoPrior::Flat,
+    )
+    .expect_err("parent coefficients outside child concatenation must fail");
+
+    assert!(err.contains("union of its child groups"));
 }
 
 #[test]

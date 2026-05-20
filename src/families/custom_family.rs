@@ -678,6 +678,24 @@ pub fn realize_coefficient_groups_for_custom_family(
                 ));
             }
         }
+        if let Some(children) = children_by_parent.get(&group.label) {
+            let mut child_union = BTreeSet::<(usize, usize)>::new();
+            for child in children {
+                let child_set = group_sets
+                    .get(child)
+                    .expect("child group set should exist after resolution");
+                child_union.extend(child_set.iter().copied());
+            }
+            let parent_set = group_sets
+                .get(&group.label)
+                .expect("parent group set should exist after resolution");
+            if &child_union != parent_set {
+                return Err(format!(
+                    "coefficient group '{}' has children but its coefficients are not exactly the union of its child groups; nested supergroups concatenate child coefficients",
+                    group.label
+                ));
+            }
+        }
     }
 
     let mut realized_specs = specs.to_vec();
