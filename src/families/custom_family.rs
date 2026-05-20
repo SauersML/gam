@@ -6080,7 +6080,7 @@ fn nonconverged_outer_efs_result(
             beta: None,
             psi_gradient: None,
             psi_indices: None,
-            inner_hessian_diag_scale: None,
+            inner_hessian_scale: None,
         },
         constrained_warm_start_from_inner(rho, inner),
         false,
@@ -13537,6 +13537,9 @@ fn unified_joint_efs_eval(
         .ok_or_else(|| "outer gradient must be contiguous for EFS".to_string())?;
 
     if has_psi {
+        let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
+            inner_solution.hessian_op.as_ref(),
+        );
         let hybrid = crate::estimate::reml::unified::compute_hybrid_efs_update(
             &inner_solution,
             rho_slice,
@@ -13556,9 +13559,12 @@ fn unified_joint_efs_eval(
             } else {
                 Some(hybrid.psi_indices)
             },
-            inner_hessian_diag_scale: None,
+            inner_hessian_scale,
         })
     } else {
+        let inner_hessian_scale = crate::estimate::reml::unified::hessian_operator_geometric_scale(
+            inner_solution.hessian_op.as_ref(),
+        );
         Ok(crate::solver::outer_strategy::EfsEval {
             cost: result.cost,
             steps: crate::estimate::reml::unified::compute_efs_update(
@@ -13569,7 +13575,7 @@ fn unified_joint_efs_eval(
             beta: Some(inner_solution.beta.clone()),
             psi_gradient: None,
             psi_indices: None,
-            inner_hessian_diag_scale: None,
+            inner_hessian_scale,
         })
     }
 }

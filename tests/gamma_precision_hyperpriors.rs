@@ -81,5 +81,9 @@ fn omitted_gamma_prior_matches_uninformed_fit_bitwise() {
     for (b, e) in base.fit.beta.iter().zip(empty.fit.beta.iter()) {
         assert_relative_eq!(b, e, max_relative = 1e-12);
     }
-    assert_relative_eq!(base.fit.reml_score, empty.fit.reml_score, max_relative = 1e-12);
+    assert_relative_eq!(
+        base.fit.reml_score,
+        empty.fit.reml_score,
+        max_relative = 1e-12
+    );
 }
