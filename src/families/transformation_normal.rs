@@ -7276,6 +7276,7 @@ fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
         PenaltyMatrix::Blockwise { local, .. } => {
             matrix_diag_mean_abs(local).max(matrix_frobenius_rms(local))
         }
+        PenaltyMatrix::Labeled { inner, .. } => penalty_diag_scale(inner),
     }
 }
 
@@ -10008,6 +10009,7 @@ fn build_tensor_penalties_kronecker(
         let right = match s_cov {
             PenaltyMatrix::Dense(right) => right,
             penalty @ PenaltyMatrix::Blockwise { .. } => penalty.to_dense(),
+            PenaltyMatrix::Labeled { inner, .. } => inner.to_dense(),
             PenaltyMatrix::KroneckerFactored { .. } => {
                 return Err(
                     "transformation covariate penalties must be single-block, not already Kronecker-factored"
@@ -14123,6 +14125,7 @@ fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f6
     match penalty {
         PenaltyMatrix::Dense(matrix) => Ok(matrix.clone()),
         PenaltyMatrix::Blockwise { .. } => Ok(penalty.to_dense()),
+        PenaltyMatrix::Labeled { inner, .. } => extract_covariate_penalty_factor(inner),
         PenaltyMatrix::KroneckerFactored { .. } => Err(
             "transformation covariate psi penalties must be single-block, not already Kronecker-factored"
                 .to_string(),

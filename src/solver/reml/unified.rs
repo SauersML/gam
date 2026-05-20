@@ -1173,6 +1173,48 @@ impl BarrierConfig {
         Ok(-self.tau * slacks.iter().map(|&d| d.ln()).sum::<f64>())
     }
 
+    /// Scale-free detection of barrier-dominated geometry: returns `true` when
+    /// one (or a small handful of) β coordinates sit so much closer to the
+    /// boundary than the rest that the barrier diagonal `τ / (β_j − l_j)²` is
+    /// locally concentrated and EFS — which assumes Hessian ≈ X'WX + S and
+    /// ignores the barrier drift — becomes unreliable.
+    ///
+    /// Concretely, with slacks Δ_j = β_j − l_j, returns `true` iff
+    /// `min_j Δ_j  <  ratio · median_j Δ_j`. This depends only on the slack
+    /// *ratios*, so it is independent of the absolute scale of β, of τ, and
+    /// of the inner Hessian magnitude — the three quantities the old
+    /// `barrier_curvature_is_significant(_, ref_diag=1.0, _)` heuristic
+    /// conflated.
+    ///
+    /// `ratio` of 0.1 means "the tightest slack is at least 10× tighter than
+    /// the typical slack." Returns `true` on infeasible β.
+    pub fn barrier_curvature_locally_concentrated(
+        &self,
+        beta: &Array1<f64>,
+        ratio: f64,
+    ) -> bool {
+        let mut slacks = match self.slacks(beta) {
+            Some(s) => s,
+            None => return true, // infeasible → conservatively unreliable
+        };
+        if slacks.is_empty() {
+            return false;
+        }
+        let min_slack = slacks.iter().copied().fold(f64::INFINITY, f64::min);
+        // Sort to find the median; len ≥ 1 so this is well-defined.
+        slacks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = if slacks.len() % 2 == 1 {
+            slacks[slacks.len() / 2]
+        } else {
+            let mid = slacks.len() / 2;
+            0.5 * (slacks[mid - 1] + slacks[mid])
+        };
+        if !median.is_finite() || median <= 0.0 {
+            return true;
+        }
+        min_slack < ratio * median
+    }
+
     /// Check whether the barrier curvature is non-negligible relative to a
     /// reference Hessian diagonal scale.
     ///
@@ -6572,54 +6614,25 @@ pub fn reml_laml_evaluate(
             hessian_kernel,
             Some(OuterHessianDerivativeKernel::Callback { .. })
         );
-        // Decompose the routing decision so the [OUTER hessian-route] log
-        // can attribute *which* clause selected the path, including the
-        // projected rank-deficient route at biobank-shape large k.
-        let large_p = p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
-        let large_n_and_moderate_p = n_obs >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
-            && p_dim >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
-        let large_linear_work =
-            n_obs.saturating_mul(p_dim) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
-        let large_k = k_outer >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-        let generic_scale_prefers_operator = prefer_outer_hessian_operator(n_obs, p_dim, k_outer);
-        let callback_prefers_operator = callback_operator_kernel
-            && prefer_callback_outer_hessian_operator(n_obs, p_dim, k_outer);
-        let scale_prefers_operator = if callback_operator_kernel {
-            callback_prefers_operator
-        } else {
-            generic_scale_prefers_operator
-        };
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
-        let use_operator = hessian_kernel.is_some()
-            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
-        // Reason mnemonic: which clause carried the routing.  This is purely
-        // a log-telemetry attribution — the actual routing decision is made
-        // above by `use_operator`.  When `choice=dense`, only "kernel_absent"
-        // or "below_crossover" can be the reason (a Callback kernel does NOT
-        // by itself flip the choice; see `use_outer_hessian_operator_path`).
-        let route_reason = if hessian_kernel.is_none() {
-            "kernel_absent"
-        } else if has_subspace_trace && (scale_prefers_operator || callback_prefers_operator) {
-            "subspace_projected_operator"
-        } else if callback_prefers_operator {
-            "callback_row_pair_work"
-        } else if large_k {
-            "large_k"
-        } else if large_p {
-            "large_p"
-        } else if !callback_operator_kernel && large_n_and_moderate_p {
-            "large_n_moderate_p"
-        } else if !callback_operator_kernel && large_linear_work {
-            "large_linear_work"
-        } else {
-            "below_crossover"
-        };
-        let route_choice = if use_operator { "operator" } else { "dense" };
+        let route_plan = outer_hessian_route_plan(
+            n_obs,
+            p_dim,
+            k_outer,
+            hessian_kernel.is_some(),
+            callback_operator_kernel,
+            has_subspace_trace,
+        );
+        let use_operator = route_plan.use_operator;
+        let route_choice = route_plan.choice();
+        let route_reason = route_plan.reason;
         log::info!(
             "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} \
              callback_kernel={callback_operator_kernel} subspace_trace={has_subspace_trace} \
-             scale_prefers_operator={scale_prefers_operator}"
+             scale_prefers_operator={} dense_workspace_bytes={}",
+            route_plan.scale_prefers_operator,
+            route_plan.dense_workspace_bytes,
         );
         let assembly_start = std::time::Instant::now();
         let result = if use_operator {
@@ -6733,36 +6746,173 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// contractions over the upper-triangular coordinate pairs.
 pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OuterHessianRoutePlan {
+    use_operator: bool,
+    reason: &'static str,
+    scale_prefers_operator: bool,
+    dense_workspace_bytes: usize,
+}
+
+impl OuterHessianRoutePlan {
+    fn choice(self) -> &'static str {
+        if self.use_operator {
+            "operator"
+        } else {
+            "dense"
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OuterHessianScaleDecision {
+    prefers_operator: bool,
+    reason: &'static str,
+}
+
+fn saturating_f64_matrix_bytes(rows: usize, cols: usize) -> usize {
+    rows.saturating_mul(cols)
+        .saturating_mul(std::mem::size_of::<f64>())
+}
+
+fn outer_hessian_dense_workspace_bytes(p: usize, k: usize) -> usize {
+    // Dense assembly keeps first-order drifts for each coordinate and uses at
+    // least one transient second-order drift while filling the K x K Hessian.
+    // Charge a small safety multiple so the route never depends on fitting a
+    // single p x p matrix while the actual dense path holds several.
+    let drift_count = k.saturating_mul(2).saturating_add(3).max(1);
+    saturating_f64_matrix_bytes(p, p).saturating_mul(drift_count)
+}
+
+fn outer_hessian_dense_workspace_budget_bytes() -> usize {
+    crate::resource::ResourcePolicy::default_library().max_single_materialization_bytes
+}
+
+fn dense_outer_hessian_workspace_fits(p: usize, k: usize) -> bool {
+    outer_hessian_dense_workspace_bytes(p, k) <= outer_hessian_dense_workspace_budget_bytes()
+}
+
+fn generic_outer_hessian_scale_decision(n: usize, p: usize, k: usize) -> OuterHessianScaleDecision {
+    if !dense_outer_hessian_workspace_fits(p, k) {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "dense_memory_budget",
+        };
+    }
+    if k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_k",
+        };
+    }
+    if p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_p",
+        };
+    }
+    if n >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
+        && p >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N
+    {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_n_moderate_p",
+        };
+    }
+    if n.saturating_mul(p) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_linear_work",
+        };
+    }
+    OuterHessianScaleDecision {
+        prefers_operator: false,
+        reason: "below_crossover",
+    }
+}
+
+fn callback_outer_hessian_scale_decision(
+    n: usize,
+    p: usize,
+    k: usize,
+) -> OuterHessianScaleDecision {
+    if !dense_outer_hessian_workspace_fits(p, k) {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "dense_memory_budget",
+        };
+    }
+    if k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_k",
+        };
+    }
+    if p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "large_p",
+        };
+    }
+    if n.saturating_mul(k).saturating_mul(k) >= CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD {
+        return OuterHessianScaleDecision {
+            prefers_operator: true,
+            reason: "callback_row_pair_work",
+        };
+    }
+    OuterHessianScaleDecision {
+        prefers_operator: false,
+        reason: "below_crossover",
+    }
+}
+
+fn outer_hessian_route_plan(
+    n: usize,
+    p: usize,
+    k: usize,
+    kernel_available: bool,
+    callback_kernel: bool,
+    subspace_trace: bool,
+) -> OuterHessianRoutePlan {
+    let dense_workspace_bytes = outer_hessian_dense_workspace_bytes(p, k);
+    if !kernel_available {
+        return OuterHessianRoutePlan {
+            use_operator: false,
+            reason: "kernel_absent",
+            scale_prefers_operator: false,
+            dense_workspace_bytes,
+        };
+    }
+
+    let scale = if callback_kernel {
+        callback_outer_hessian_scale_decision(n, p, k)
+    } else {
+        generic_outer_hessian_scale_decision(n, p, k)
+    };
+    let reason = if subspace_trace && scale.prefers_operator {
+        "subspace_projected_operator"
+    } else {
+        scale.reason
+    };
+    OuterHessianRoutePlan {
+        use_operator: scale.prefers_operator,
+        reason,
+        scale_prefers_operator: scale.prefers_operator,
+        dense_workspace_bytes,
+    }
+}
+
 /// Predicate for selecting the matrix-free Hv-operator outer-Hessian
 /// representation over the dense `K × K` assembly.  Cost selects
 /// representation, never capability — the operator path delivers the same
-/// math as the dense path with `O(n · p)` HVPs instead of dense `p × p`
-/// assembly.
-///
-/// Each clause is one independent crossover regime; any one firing routes
-/// the evaluator to the operator path.
+/// math as the dense path while avoiding large dense `p × p` drift storage
+/// and pairwise row assembly when the model says those dominate.
 pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
-    // Wide coefficient basis: dense `p × p` assembly itself dominates.
-    let large_p = p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
-    // Tall design with moderate width: per-row work dominates even when `p`
-    // alone is below the wide-basis threshold.
-    let large_n_and_moderate_p = n >= MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD
-        && p >= MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N;
-    // Linear-work fallback: `n · p` crosses the assembly-cost crossover even
-    // when neither `n` nor `p` individually trip a per-axis threshold.
-    let large_linear_work = n.saturating_mul(p) >= MATRIX_FREE_OUTER_HESSIAN_NP_THRESHOLD;
-    // Many smoothing parameters: per-outer-eval cost is `O(K · n · p²)`, so
-    // `K` itself can drive the crossover regardless of `(n, p)`.
-    let large_k = k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-    large_p || large_n_and_moderate_p || large_linear_work || large_k
+    generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
 pub(crate) fn prefer_callback_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
-    let large_p = p >= MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD;
-    let large_k = k >= MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD;
-    let large_callback_row_pair_work =
-        n.saturating_mul(k).saturating_mul(k) >= CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD;
-    large_p || large_k || large_callback_row_pair_work
+    callback_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
 /// Selects the matrix-free outer-Hessian representation once a Hessian HVP
@@ -6787,11 +6937,7 @@ pub(crate) fn use_outer_hessian_operator_path(
     k: usize,
     callback_kernel: bool,
 ) -> bool {
-    if callback_kernel {
-        prefer_callback_outer_hessian_operator(n, p, k)
-    } else {
-        prefer_outer_hessian_operator(n, p, k)
-    }
+    outer_hessian_route_plan(n, p, k, true, callback_kernel, false).use_operator
 }
 
 fn is_hessian_unavailable(error: &str) -> bool {
@@ -8833,28 +8979,56 @@ fn build_outer_hessian_operator(
         let pairs: Vec<(usize, usize)> = (0..total)
             .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
             .collect();
-        let entries: Vec<((usize, usize), f64)> = pairs
+        let pair_drifts: Vec<((usize, usize), Vec<DriftDerivResult>)> = pairs
             .into_par_iter()
             .map(|(ii, jj)| {
                 let beta_i = coords[ii].v.mapv(|value| -value);
                 let beta_j = coords[jj].v.mapv(|value| -value);
-                let trace = compute_drift_deriv_traces(
-                    hop.as_ref(),
-                    coords[ii].b_depends_on_beta,
-                    coords[jj].b_depends_on_beta,
-                    coords[ii].ext_index,
-                    coords[jj].ext_index,
-                    &beta_i,
-                    &beta_j,
-                    solution.fixed_drift_deriv.as_ref(),
-                    subspace,
-                );
-                ((ii, jj), trace)
+                let mut drifts = Vec::new();
+                if let Some(drift_fn) = solution.fixed_drift_deriv.as_ref() {
+                    if coords[ii].b_depends_on_beta
+                        && let Some(ext_i) = coords[ii].ext_index
+                        && let Some(result) = drift_fn(ext_i, &beta_j)
+                    {
+                        drifts.push(result);
+                    }
+                    if coords[jj].b_depends_on_beta
+                        && let Some(ext_j) = coords[jj].ext_index
+                        && let Some(result) = drift_fn(ext_j, &beta_i)
+                    {
+                        drifts.push(result);
+                    }
+                }
+                ((ii, jj), drifts)
             })
             .collect();
-        for ((ii, jj), trace) in entries {
-            m_pair_trace[[ii, jj]] = trace;
-            m_pair_trace[[jj, ii]] = trace;
+
+        let mut term_pairs = Vec::new();
+        let mut term_drifts = Vec::new();
+        for ((ii, jj), drifts) in pair_drifts {
+            for drift in drifts {
+                term_pairs.push((ii, jj));
+                term_drifts.push(drift);
+            }
+        }
+
+        if !term_drifts.is_empty() {
+            let term_traces = if let Some(kernel) = subspace {
+                penalty_subspace_trace_drifts_batched(kernel, &term_drifts)
+            } else if let Some(ds) = hop.as_exact_dense_spectral() {
+                dense_spectral_trace_logdet_drifts_batched(ds, &term_drifts)
+            } else {
+                term_drifts
+                    .iter()
+                    .map(|drift| drift.trace_logdet(hop.as_ref()))
+                    .collect()
+            };
+            for ((ii, jj), trace) in term_pairs.into_iter().zip(term_traces.into_iter()) {
+                m_pair_trace[[ii, jj]] += trace;
+                if ii != jj {
+                    m_pair_trace[[jj, ii]] += trace;
+                }
+            }
         }
     }
 
@@ -15077,6 +15251,28 @@ mod tests {
         assert!(!use_outer_hessian_operator_path(195_780, 33, 8, true));
         assert!(use_outer_hessian_operator_path(195_780, 512, 8, true));
         assert!(use_outer_hessian_operator_path(195_780, 33, 32, true));
+
+        let plan = outer_hessian_route_plan(195_780, 33, 8, true, true, false);
+        assert!(!plan.use_operator);
+        assert_eq!(plan.choice(), "dense");
+        assert_eq!(plan.reason, "below_crossover");
+        assert!(!plan.scale_prefers_operator);
+    }
+
+    #[test]
+    fn outer_hessian_route_respects_dense_workspace_budget() {
+        let plan = outer_hessian_route_plan(10_000, 10_000, 2, true, true, false);
+        assert!(plan.use_operator);
+        assert_eq!(plan.reason, "dense_memory_budget");
+        assert!(plan.dense_workspace_bytes > outer_hessian_dense_workspace_budget_bytes());
+    }
+
+    #[test]
+    fn outer_hessian_route_reports_kernel_absent_before_scale_model() {
+        let plan = outer_hessian_route_plan(1_000_000, 10_000, 64, false, false, false);
+        assert!(!plan.use_operator);
+        assert_eq!(plan.reason, "kernel_absent");
+        assert!(!plan.scale_prefers_operator);
     }
 
     #[test]
