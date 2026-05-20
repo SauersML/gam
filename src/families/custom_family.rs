@@ -2873,6 +2873,32 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
         return (Some(key), None);
     }
     let active_sets = normalize_active_sets(record.active_sets);
+    let cached_inner = match (
+        record.inner_log_likelihood,
+        record.inner_penalty_value,
+        record.inner_cycles,
+        record.inner_converged,
+        record.inner_block_logdet_h,
+        record.inner_block_logdet_s,
+    ) {
+        (
+            Some(log_likelihood),
+            Some(penalty_value),
+            Some(cycles),
+            Some(converged),
+            Some(block_logdet_h),
+            Some(block_logdet_s),
+        ) => Some(CachedInnerMode {
+            log_likelihood,
+            penalty_value,
+            cycles,
+            converged,
+            block_logdet_h,
+            block_logdet_s,
+            joint_workspace: None,
+        }),
+        _ => None,
+    };
     log::info!("[warm-start-cache] restored custom-family persistent warm start key={key}");
     (
         Some(key),
@@ -2884,7 +2910,7 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
                 .map(Array1::from_vec)
                 .collect(),
             active_sets,
-            cached_inner: None,
+            cached_inner,
         }),
     )
 }
@@ -2918,6 +2944,19 @@ fn store_persistent_custom_family_warm_start(
         .map(|beta| beta.to_vec())
         .collect();
     record.active_sets = warm_start.active_sets.clone();
+    if let Some(cached) = warm_start.cached_inner.as_ref()
+        && cached.log_likelihood.is_finite()
+        && cached.penalty_value.is_finite()
+        && cached.block_logdet_h.is_finite()
+        && cached.block_logdet_s.is_finite()
+    {
+        record.inner_log_likelihood = Some(cached.log_likelihood);
+        record.inner_penalty_value = Some(cached.penalty_value);
+        record.inner_cycles = Some(cached.cycles);
+        record.inner_converged = Some(cached.converged);
+        record.inner_block_logdet_h = Some(cached.block_logdet_h);
+        record.inner_block_logdet_s = Some(cached.block_logdet_s);
+    }
     if let Err(err) = store_block_record(&record) {
         log::warn!("[warm-start-cache] failed to persist custom-family warm start: {err}");
     }
