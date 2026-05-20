@@ -5526,13 +5526,12 @@ impl SurvivalMarginalSlopeFamily {
         rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
 
-        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+        if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
                     &scale_coeff4(
-                        exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                        self.observed_score_basis_coefficients(row, local_idx, z_obs, b)?,
                         scale,
                     ),
                     z_obs,
@@ -5760,13 +5759,12 @@ impl SurvivalMarginalSlopeFamily {
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
         tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
 
-        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+        if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 rho[idx] = eval_coeff4_at(
                     &scale_coeff4(
-                        exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                        self.observed_score_basis_coefficients(row, local_idx, z_obs, b)?,
                         scale,
                     ),
                     z_obs,
@@ -5805,7 +5803,9 @@ impl SurvivalMarginalSlopeFamily {
         for u in 0..p {
             for v in u..p {
                 let r_uv = self
-                    .observed_fixed_eta_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
+                    .observed_fixed_eta_second_partial(
+                        primary, &obs, row, u, v, z_obs, u_obs, a, b,
+                    )?;
                 let chi_uv_fixed = self
                     .observed_fixed_chi_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
 
@@ -7923,16 +7923,15 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+        if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 g_u_fixed[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    self.observed_score_basis_coefficients(row, local_idx, z_obs, b)?,
                     scale,
                 );
                 g_bu_fixed[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
                     scale,
                 );
             }
@@ -9011,16 +9010,15 @@ impl SurvivalMarginalSlopeFamily {
         g_abbu_fixed[primary.g] = [0.0; 4];
         g_bbbu_fixed[primary.g] = [0.0; 4];
 
-        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+        if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                 let idx = h_range.start + local_idx;
                 g_u_fixed[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    self.observed_score_basis_coefficients(row, local_idx, z_obs, b)?,
                     scale,
                 );
                 g_bu_fixed[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
                     scale,
                 );
             }
