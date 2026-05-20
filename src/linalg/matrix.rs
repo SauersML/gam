@@ -420,12 +420,42 @@ fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2
 #[inline]
 fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
     let p = matrix.ncols();
-    let mut diag = Array1::<f64>::zeros(p);
     let n = matrix.nrows();
+    let large = (n as u64) * (p as u64) >= DENSE_ROW_PARALLEL_MIN_NP;
+    let parallel = large && rayon::current_thread_index().is_none();
     // Fast path: if the matrix is row-major contiguous, read each row as a
     // slice and avoid n*p bounds-checked indexing.
     if matrix.is_standard_layout() {
         if let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice()) {
+            if parallel {
+                return (0..n)
+                    .into_par_iter()
+                    .fold(
+                        || vec![0.0_f64; p],
+                        |mut acc, i| {
+                            let wi = w[i].max(0.0);
+                            if wi != 0.0 {
+                                let row = &x[i * p..i * p + p];
+                                for j in 0..p {
+                                    let xij = row[j];
+                                    acc[j] += wi * xij * xij;
+                                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || vec![0.0_f64; p],
+                        |mut a, b| {
+                            for (av, bv) in a.iter_mut().zip(b) {
+                                *av += bv;
+                            }
+                            a
+                        },
+                    )
+                    .into();
+            }
+            let mut diag = Array1::<f64>::zeros(p);
             let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
             for i in 0..n {
                 let wi = w[i].max(0.0);
@@ -441,6 +471,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
             return diag;
         }
     }
+    let mut diag = Array1::<f64>::zeros(p);
     for i in 0..n {
         let wi = weights[i].max(0.0);
         if wi == 0.0 {
