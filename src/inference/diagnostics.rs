@@ -36,6 +36,28 @@ pub static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub const MIN_EIG_DIAG_EVERY: usize = 200;
 pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
 
+/// Diagnostic formatter shared across the outer optimizer and the custom-family
+/// fitter: shows the `max_items` entries of `values` with largest absolute
+/// value, formatted as `label=[i:value, ...]`.
+pub fn format_top_abs(values: &Array1<f64>, label: &str, max_items: usize) -> String {
+    if values.is_empty() {
+        return format!("{label}=<empty>");
+    }
+    let mut ranked: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    ranked.sort_by(|(_, left), (_, right)| {
+        right
+            .abs()
+            .partial_cmp(&left.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let parts: Vec<String> = ranked
+        .into_iter()
+        .take(max_items)
+        .map(|(idx, value)| format!("{idx}:{value:.3e}"))
+        .collect();
+    format!("{label}=[{}]", parts.join(", "))
+}
+
 /// Rate-limited check for Hessian minimum eigenvalue diagnostics.
 /// Returns true if this eigenvalue warrants a diagnostic message.
 pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
