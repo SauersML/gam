@@ -53,8 +53,8 @@ location-scale, latent), pick the family with `baseline_target=`:
 
 | `baseline_target` | Extra parameters | Use when |
 | --- | --- | --- |
-| `"linear"` | — | Linear log-cumulative-hazard baseline; the constant-hazard model is the special Weibull case with shape 1. |
-| `"weibull"` | `baseline_scale`, `baseline_shape` (both > 0) | Monotone hazard. |
+| `"linear"` | — | No parametric baseline target; the default I-spline time basis estimates a monotone log-cumulative-hazard baseline. |
+| `"weibull"` | `baseline_scale`, `baseline_shape` (both > 0) | Monotone hazard: increasing if shape > 1, decreasing if shape < 1, constant if shape = 1. |
 | `"gompertz"` | `baseline_rate` (> 0) | Exponentially-rising hazard (e.g. mortality with age). |
 | `"gompertz-makeham"` | `baseline_rate`, `baseline_makeham` (both > 0) | Gompertz + an age-independent additive hazard floor. |
 
@@ -69,7 +69,8 @@ gamfit.fit(df,
 
 ## Time-wiggle: flexible baseline departures
 
-In any survival formula, drop in a spline offset to the baseline:
+With a non-linear scalar baseline target, drop in a spline offset to the
+baseline:
 
 ```
 Surv(entry, exit, event) ~ s(bmi) + timewiggle(internal_knots=8)
@@ -78,7 +79,10 @@ Surv(entry, exit, event) ~ s(bmi) + timewiggle(internal_knots=8)
 `timewiggle` takes the same options as `linkwiggle` (`internal_knots`,
 `degree`, `penalty_order`, `double_penalty`) and lets the baseline hazard
 or cumulative hazard flex away from the parametric form. Use it when the
-rough shape is, say, Gompertz but the data should make small corrections.
+rough shape is, say, Weibull or Gompertz but the data should make small
+corrections. With `survival_likelihood="transformation"`, set
+`baseline_target` to `weibull`, `gompertz`, or `gompertz-makeham` when using
+`timewiggle(...)`.
 
 ## Frailty
 
@@ -170,6 +174,7 @@ df = pd.DataFrame({
 model = gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age) + s(bmi) + timewiggle(internal_knots=6)",
     survival_likelihood="transformation",
+    baseline_target="weibull",
 )
 
 # Population survival curves on a grid
