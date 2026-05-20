@@ -21,7 +21,7 @@ use crate::families::bernoulli_marginal_slope::{
     unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
@@ -273,6 +273,161 @@ struct ThetaHints {
     link_dev_beta: Option<Array1<f64>>,
 }
 
+#[derive(Clone)]
+struct PerZScoreWarpPrepared {
+    block: ParameterBlockInput,
+    runtime: DeviationRuntime,
+    score_dim: usize,
+}
+
+impl PerZScoreWarpPrepared {
+    #[inline]
+    fn basis_dim(&self) -> usize {
+        self.runtime.basis_dim()
+    }
+
+    #[inline]
+    fn total_basis_dim(&self) -> usize {
+        self.basis_dim() * self.score_dim
+    }
+}
+
+fn score_warp_component_range(
+    runtime: &DeviationRuntime,
+    coord: usize,
+) -> std::ops::Range<usize> {
+    let p = runtime.basis_dim();
+    coord * p..(coord + 1) * p
+}
+
+fn score_warp_component_beta<'a>(
+    runtime: &DeviationRuntime,
+    beta: &'a Array1<f64>,
+    coord: usize,
+) -> Result<Array1<f64>, String> {
+    let range = score_warp_component_range(runtime, coord);
+    if range.end > beta.len() {
+        return Err(format!(
+            "survival score-warp coefficient block is too short for z coordinate {coord}: need {}, got {}",
+            range.end,
+            beta.len()
+        ));
+    }
+    Ok(beta.slice(s![range]).to_owned())
+}
+
+fn build_per_z_score_warp_deviation_block_from_seed(
+    z: &Array2<f64>,
+    cfg: &DeviationBlockConfig,
+) -> Result<PerZScoreWarpPrepared, String> {
+    let score_dim = z.ncols();
+    if score_dim == 0 {
+        return Err("survival score-warp requires at least one z coordinate".to_string());
+    }
+    let z_primary = z.column(0).to_owned();
+    let base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
+    if score_dim == 1 {
+        return Ok(PerZScoreWarpPrepared {
+            block: base.block,
+            runtime: base.runtime,
+            score_dim,
+        });
+    }
+
+    let p = base.runtime.basis_dim();
+    let n = z.nrows();
+    let mut design = Array2::<f64>::zeros((n, p * score_dim));
+    for coord in 0..score_dim {
+        let z_coord = z.column(coord).to_owned();
+        let coord_design = base.runtime.design(&z_coord)?;
+        if coord_design.nrows() != n || coord_design.ncols() != p {
+            return Err(format!(
+                "survival score-warp design shape mismatch for z coordinate {coord}: got {}x{}, expected {n}x{p}",
+                coord_design.nrows(),
+                coord_design.ncols()
+            ));
+        }
+        design
+            .slice_mut(s![.., coord * p..(coord + 1) * p])
+            .assign(&coord_design);
+    }
+
+    let mut block = base.block.clone();
+    block.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design));
+    block.offset = Array1::zeros(n);
+    block.initial_beta = Some(Array1::zeros(p * score_dim));
+    block.initial_log_lambdas = None;
+    let base_penalties = base.block.penalties.clone();
+    let base_nullspaces = base.block.nullspace_dims.clone();
+    block.penalties.clear();
+    block.nullspace_dims.clear();
+    for coord in 0..score_dim {
+        let col_range = coord * p..(coord + 1) * p;
+        for (penalty_idx, penalty) in base_penalties.iter().enumerate() {
+            let local = match penalty {
+                crate::solver::estimate::PenaltySpec::Dense(matrix) => matrix.clone(),
+                crate::solver::estimate::PenaltySpec::DenseWithMean { matrix, .. } => {
+                    matrix.clone()
+                }
+                crate::solver::estimate::PenaltySpec::Block { local, .. } => local.clone(),
+            };
+            block
+                .penalties
+                .push(crate::solver::estimate::PenaltySpec::Block {
+                    local,
+                    col_range: col_range.clone(),
+                    prior_mean: crate::estimate::CoefficientPriorMean::Zero,
+                    structure_hint: None,
+                    op: None,
+                });
+            block.nullspace_dims.push(
+                base_nullspaces
+                    .get(penalty_idx)
+                    .copied()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+
+    Ok(PerZScoreWarpPrepared {
+        block,
+        runtime: base.runtime,
+        score_dim,
+    })
+}
+
+fn build_per_z_score_warp_aux_blockspec(
+    prepared: &PerZScoreWarpPrepared,
+    rho: Array1<f64>,
+    beta_hint: Option<Array1<f64>>,
+) -> Result<ParameterBlockSpec, String> {
+    let mut block = prepared.block.clone();
+    block.initial_log_lambdas = Some(rho);
+    let total_p = prepared.total_basis_dim();
+    let candidate = beta_hint.unwrap_or_else(|| Array1::<f64>::zeros(total_p));
+    if candidate.len() != total_p {
+        return Err(format!(
+            "survival score-warp beta hint length mismatch: got {}, expected {total_p}",
+            candidate.len()
+        ));
+    }
+    let mut projected = Array1::<f64>::zeros(total_p);
+    for coord in 0..prepared.score_dim {
+        let range = score_warp_component_range(&prepared.runtime, coord);
+        let proposed = candidate.slice(s![range.clone()]).to_owned();
+        let zero = Array1::<f64>::zeros(prepared.basis_dim());
+        let local = project_monotone_feasible_beta(
+            &prepared.runtime,
+            &zero,
+            &proposed,
+            &format!("score_warp_dev[z{coord}]"),
+        )?;
+        projected.slice_mut(s![range]).assign(&local);
+    }
+    block.initial_beta = Some(projected);
+    block.intospec("score_warp_dev")
+}
+
 // ── Block layout ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -304,7 +459,7 @@ fn block_slices(
     let logslope = marginal.end..marginal.end + family.logslope_design.ncols();
     let mut cursor = logslope.end;
     let score_warp = family.score_warp.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim();
+        let range = cursor..cursor + runtime.basis_dim() * family.score_dim();
         cursor = range.end;
         range
     });
@@ -347,7 +502,7 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
     let g = 3usize;
     let mut cursor = 4usize;
     let h = family.score_warp.as_ref().map(|runtime| {
-        let range = cursor..cursor + runtime.basis_dim();
+        let range = cursor..cursor + runtime.basis_dim() * family.score_dim();
         cursor = range.end;
         range
     });
@@ -2687,6 +2842,13 @@ pub fn survival_marginal_slope_vector_eta(
     covariance: &MarginalSlopeCovariance,
     probit_scale: f64,
 ) -> Result<f64, String> {
+    if z.len() != covariance.dim() {
+        return Err(format!(
+            "survival marginal-slope vector eta: score/covariance dimension mismatch: z={}, covariance={}",
+            z.len(),
+            covariance.dim()
+        ));
+    }
     marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
@@ -2967,6 +3129,39 @@ impl SurvivalMarginalSlopeFamily {
     fn score_dim(&self) -> usize {
         debug_assert_eq!(self.score_covariance.dim(), self.z.ncols());
         self.z.ncols()
+    }
+
+    fn score_warp_basis_dim(&self) -> usize {
+        self.score_warp
+            .as_ref()
+            .map_or(0, DeviationRuntime::basis_dim)
+    }
+
+    fn score_warp_coord_basis_index(&self, local_idx: usize) -> Result<(usize, usize), String> {
+        let basis_dim = self.score_warp_basis_dim();
+        if basis_dim == 0 {
+            return Err("survival score-warp coordinate lookup without score-warp runtime".to_string());
+        }
+        let coord = local_idx / basis_dim;
+        if coord >= self.score_dim() {
+            return Err(format!(
+                "survival score-warp local index {local_idx} exceeds K={} per-z blocks with basis dim {basis_dim}",
+                self.score_dim()
+            ));
+        }
+        Ok((coord, local_idx % basis_dim))
+    }
+
+    fn score_warp_beta_for_coord(
+        &self,
+        beta_h: &Array1<f64>,
+        coord: usize,
+    ) -> Result<Array1<f64>, String> {
+        let runtime = self
+            .score_warp
+            .as_ref()
+            .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
+        score_warp_component_beta(runtime, beta_h, coord)
     }
 
     fn logslope_vector_for_row(
@@ -4609,7 +4804,22 @@ impl SurvivalMarginalSlopeFamily {
             let beta_h = self
                 .flex_score_beta(block_states)?
                 .ok_or_else(|| "missing survival score-warp coefficients".to_string())?;
-            runtime.monotonicity_feasible(beta_h, "survival marginal-slope score-warp")?;
+            let expected = runtime.basis_dim() * self.score_dim();
+            if beta_h.len() != expected {
+                return Err(format!(
+                    "survival score-warp beta length mismatch: got {}, expected {expected} for K={} and basis dim {}",
+                    beta_h.len(),
+                    self.score_dim(),
+                    runtime.basis_dim()
+                ));
+            }
+            for coord in 0..self.score_dim() {
+                let local_beta = self.score_warp_beta_for_coord(beta_h, coord)?;
+                runtime.monotonicity_feasible(
+                    &local_beta,
+                    &format!("survival marginal-slope score-warp[z{coord}]"),
+                )?;
+            }
         }
         if let Some(runtime) = &self.link_dev {
             let beta_w = self
