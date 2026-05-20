@@ -11784,36 +11784,35 @@ impl SurvivalMarginalSlopeFamily {
             None
         };
 
-        type Acc = (
-            f64,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            BlockHessianAccumulator,
-        );
-        let make_acc = || -> Acc {
-            (
-                0.0,
-                Array1::zeros(p_t),
-                Array1::zeros(p_m),
-                Array1::zeros(p_g),
-                Array1::zeros(p_h),
-                Array1::zeros(p_w),
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-            )
+        struct JointPsiPsiAcc {
+            objective: f64,
+            score_t: Array1<f64>,
+            score_m: Array1<f64>,
+            score_g: Array1<f64>,
+            score_h: Array1<f64>,
+            score_w: Array1<f64>,
+            hessian: BlockHessianAccumulator,
+        }
+        let make_acc = || -> JointPsiPsiAcc {
+            JointPsiPsiAcc {
+                objective: 0.0,
+                score_t: Array1::zeros(p_t),
+                score_m: Array1::zeros(p_m),
+                score_g: Array1::zeros(p_g),
+                score_h: Array1::zeros(p_h),
+                score_w: Array1::zeros(p_w),
+                hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            }
         };
 
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Process fixed row chunks in parallel and merge local cross-block
         // accumulators in row-chunk order for deterministic timewiggle assembly.
-        let (objective_psi_psi, score_t, score_m, score_g, score_h, score_w, acc) =
-            chunked_row_reduction(
-                row_iter.as_slice(),
-                make_acc,
-                |row, a| -> Result<(), String> {
+        let acc = chunked_row_reduction(
+            row_iter.as_slice(),
+            make_acc,
+            |row, a| -> Result<(), String> {
                     // Compute psi design rows once; derive directions from them.
                     let psi_row_i = psi_map_i
                         .row_vector(row)
@@ -11952,61 +11951,73 @@ impl SurvivalMarginalSlopeFamily {
                         fourth.mapv_inplace(|v| v * w);
                     }
 
-                    a.0 += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
+                    a.objective += dir_i.dot(&f_pipi.dot(&dir_j)) + f_pi.dot(&dir_ij);
 
                     // Score
                     if has_ij {
                         let s_ij = f_pi.dot(&loading_i);
                         let psi_ij = psi_row_ij.as_ref().unwrap();
                         match block_idx_i {
-                            1 => a.2.scaled_add(s_ij, psi_ij),
-                            _ => a.3.scaled_add(s_ij, psi_ij),
+                            1 => a.score_m.scaled_add(s_ij, psi_ij),
+                            _ => a.score_g.scaled_add(s_ij, psi_ij),
                         }
                     }
                     let s_i = loading_i.dot(&f_pipi.dot(&dir_j));
                     match block_idx_i {
-                        1 => a.2.scaled_add(s_i, &psi_row_i),
-                        _ => a.3.scaled_add(s_i, &psi_row_i),
+                        1 => a.score_m.scaled_add(s_i, &psi_row_i),
+                        _ => a.score_g.scaled_add(s_i, &psi_row_i),
                     }
                     let s_j = loading_j.dot(&f_pipi.dot(&dir_i));
                     match block_idx_j {
-                        1 => a.2.scaled_add(s_j, &psi_row_j),
-                        _ => a.3.scaled_add(s_j, &psi_row_j),
+                        1 => a.score_m.scaled_add(s_j, &psi_row_j),
+                        _ => a.score_g.scaled_add(s_j, &psi_row_j),
                     }
                     let pb1 = f_pipi.dot(&dir_ij);
                     if let Some(q) = q_geom.as_ref() {
                         self.accumulate_score_with_q_geometry(
-                            row, q, &pb1, &mut a.1, &mut a.2, &mut a.3,
+                            row, q, &pb1, &mut a.score_t, &mut a.score_m, &mut a.score_g,
                         )?;
                     } else {
-                        self.accumulate_score_blockwise(row, &pb1, &mut a.1, &mut a.2, &mut a.3)?;
+                        self.accumulate_score_blockwise(
+                            row,
+                            &pb1,
+                            &mut a.score_t,
+                            &mut a.score_m,
+                            &mut a.score_g,
+                        )?;
                     }
                     self.accumulate_score_identity_blocks(
                         flex_primary.as_ref(),
                         &pb1,
-                        Some(&mut a.4),
-                        Some(&mut a.5),
+                        Some(&mut a.score_h),
+                        Some(&mut a.score_w),
                     );
                     let pb2 = third_i.dot(&dir_j);
                     if let Some(q) = q_geom.as_ref() {
                         self.accumulate_score_with_q_geometry(
-                            row, q, &pb2, &mut a.1, &mut a.2, &mut a.3,
+                            row, q, &pb2, &mut a.score_t, &mut a.score_m, &mut a.score_g,
                         )?;
                     } else {
-                        self.accumulate_score_blockwise(row, &pb2, &mut a.1, &mut a.2, &mut a.3)?;
+                        self.accumulate_score_blockwise(
+                            row,
+                            &pb2,
+                            &mut a.score_t,
+                            &mut a.score_m,
+                            &mut a.score_g,
+                        )?;
                     }
                     self.accumulate_score_identity_blocks(
                         flex_primary.as_ref(),
                         &pb2,
-                        Some(&mut a.4),
-                        Some(&mut a.5),
+                        Some(&mut a.score_h),
+                        Some(&mut a.score_w),
                     );
 
                     // Hessian
                     if has_ij {
                         let rp_ij = f_pipi.dot(&loading_i);
                         if let Some(q) = q_geom.as_ref() {
-                            a.6.add_rank1_psi_cross_with_q_geometry(
+                            a.hessian.add_rank1_psi_cross_with_q_geometry(
                                 self,
                                 row,
                                 q,
@@ -12015,7 +12026,7 @@ impl SurvivalMarginalSlopeFamily {
                                 &rp_ij,
                             )?;
                         } else {
-                            a.6.add_rank1_psi_cross(
+                            a.hessian.add_rank1_psi_cross(
                                 self,
                                 row,
                                 block_idx_i,
@@ -12025,7 +12036,7 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
                     let scalar_ij = loading_i.dot(&f_pipi.dot(&loading_j));
-                    a.6.add_psi_psi_outer(
+                    a.hessian.add_psi_psi_outer(
                         block_idx_i,
                         &psi_row_i,
                         block_idx_j,
@@ -12034,7 +12045,7 @@ impl SurvivalMarginalSlopeFamily {
                     );
                     let rp_i = third_j.t().dot(&loading_i);
                     if let Some(q) = q_geom.as_ref() {
-                        a.6.add_rank1_psi_cross_with_q_geometry(
+                        a.hessian.add_rank1_psi_cross_with_q_geometry(
                             self,
                             row,
                             q,
@@ -12043,11 +12054,12 @@ impl SurvivalMarginalSlopeFamily {
                             &rp_i,
                         )?;
                     } else {
-                        a.6.add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i)?;
+                        a.hessian
+                            .add_rank1_psi_cross(self, row, block_idx_i, &psi_row_i, &rp_i)?;
                     }
                     let rp_j = third_i.t().dot(&loading_j);
                     if let Some(q) = q_geom.as_ref() {
-                        a.6.add_rank1_psi_cross_with_q_geometry(
+                        a.hessian.add_rank1_psi_cross_with_q_geometry(
                             self,
                             row,
                             q,
@@ -12056,13 +12068,15 @@ impl SurvivalMarginalSlopeFamily {
                             &rp_j,
                         )?;
                     } else {
-                        a.6.add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j)?;
+                        a.hessian
+                            .add_rank1_psi_cross(self, row, block_idx_j, &psi_row_j, &rp_j)?;
                     }
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(fourth.nrows());
-                        a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
+                        a.hessian
+                            .add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
                     } else {
-                        a.6.add_pullback(self, row, &fourth)?;
+                        a.hessian.add_pullback(self, row, &fourth)?;
                     }
                     let mut third_ij =
                         self.row_primary_third_contracted_general(row, block_states, &dir_ij)?;
@@ -12071,70 +12085,77 @@ impl SurvivalMarginalSlopeFamily {
                     }
                     if let Some(q) = q_geom.as_ref() {
                         let zero_grad = Array1::zeros(third_ij.nrows());
-                        a.6.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_ij)?;
+                        a.hessian
+                            .add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_ij)?;
                     } else {
-                        a.6.add_pullback(self, row, &third_ij)?;
+                        a.hessian.add_pullback(self, row, &third_ij)?;
                     }
 
                     // Timewiggle psi corrections for ψ_i (terms 1,2,4,5 of eq 47)
                     if let Some(lift_i) = psi_lift_i.as_ref() {
                         let q = q_geom.as_ref().unwrap();
                         // U_i^α cross terms with third_j Hessian
-                        a.6.add_timewiggle_psi_u_cross(self, row, q, lift_i, &third_j)?;
+                        a.hessian
+                            .add_timewiggle_psi_u_cross(self, row, q, lift_i, &third_j)?;
                         // Second pullback weighted by T_j[dir_j] applied to dir_i
                         let hu_i = f_pipi.dot(&dir_i);
-                        a.6.add_second_pullback_weighted(q, &hu_i);
+                        a.hessian.add_second_pullback_weighted(q, &hu_i);
                         // K^{BC,α_i} weighted by gradient
-                        a.6.add_timewiggle_psi_kappa_alpha(self, lift_i, &f_pi);
+                        a.hessian.add_timewiggle_psi_kappa_alpha(self, lift_i, &f_pi);
                     }
                     // Timewiggle psi corrections for ψ_j
                     if let Some(lift_j) = psi_lift_j.as_ref() {
                         let q = q_geom.as_ref().unwrap();
-                        a.6.add_timewiggle_psi_u_cross(self, row, q, lift_j, &third_i)?;
+                        a.hessian
+                            .add_timewiggle_psi_u_cross(self, row, q, lift_j, &third_i)?;
                         let hu_j = f_pipi.dot(&dir_j);
-                        a.6.add_second_pullback_weighted(q, &hu_j);
+                        a.hessian.add_second_pullback_weighted(q, &hu_j);
                         if psi_lift_i.is_none() {
                             // Only add gradient-weighted K^α for j if we didn't already
                             // add it for i (when both are marginal, it's already covered)
-                            a.6.add_timewiggle_psi_kappa_alpha(self, lift_j, &f_pi);
+                            a.hessian.add_timewiggle_psi_kappa_alpha(self, lift_j, &f_pi);
                         }
                     }
 
                     Ok(())
-                },
-                |total, chunk| {
-                    total.0 += chunk.0;
-                    total.1 += &chunk.1;
-                    total.2 += &chunk.2;
-                    total.3 += &chunk.3;
-                    total.4 += &chunk.4;
-                    total.5 += &chunk.5;
-                    total.6.add(&chunk.6);
-                },
-            )?;
+            },
+            |total, chunk| {
+                total.objective += chunk.objective;
+                total.score_t += &chunk.score_t;
+                total.score_m += &chunk.score_m;
+                total.score_g += &chunk.score_g;
+                total.score_h += &chunk.score_h;
+                total.score_w += &chunk.score_w;
+                total.hessian.add(&chunk.hessian);
+            },
+        )?;
 
         let mut score_psi_psi = Array1::zeros(slices.total);
         score_psi_psi
             .slice_mut(s![slices.time.clone()])
-            .assign(&score_t);
+            .assign(&acc.score_t);
         score_psi_psi
             .slice_mut(s![slices.marginal.clone()])
-            .assign(&score_m);
+            .assign(&acc.score_m);
         score_psi_psi
             .slice_mut(s![slices.logslope.clone()])
-            .assign(&score_g);
+            .assign(&acc.score_g);
         if let Some(range) = slices.score_warp.as_ref() {
-            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_h);
+            score_psi_psi
+                .slice_mut(s![range.clone()])
+                .assign(&acc.score_h);
         }
         if let Some(range) = slices.link_dev.as_ref() {
-            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_w);
+            score_psi_psi
+                .slice_mut(s![range.clone()])
+                .assign(&acc.score_w);
         }
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
-            objective_psi_psi,
+            objective_psi_psi: acc.objective,
             score_psi_psi,
             hessian_psi_psi: Array2::zeros((0, 0)),
-            hessian_psi_psi_operator: Some(Box::new(acc.into_operator(slices))),
+            hessian_psi_psi_operator: Some(Box::new(acc.hessian.into_operator(slices))),
         }))
     }
 
