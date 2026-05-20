@@ -10898,7 +10898,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             current_penalty =
                 total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
             lastobjective = -current_log_likelihood + current_penalty;
-            let objective_change = (lastobjective - old_objective).abs();
             let accepted_step_inf = states
                 .iter()
                 .zip(old_beta.iter())
@@ -22447,10 +22446,11 @@ mod tests {
         // the envelope-theorem outer gradient invalid, which is what surfaced
         // as outer BFGS objective stalls with |g|≈1e14-1e16.
         let objective = 4.472714e5_f64;
+        let inner_tol = 1.0e-6_f64;
         let objective_change = 5.381e-2_f64;
         let accepted_step_inf = 2.794e-2_f64;
         let residual = 5.980e1_f64;
-        let residual_tol = 4.473e-1_f64;
+        let residual_tol = inner_tol * (1.0 + objective);
         let step_tol = 1.242e-3_f64;
         let objective_tol = residual_tol;
         let old_flat_step_predicate =
