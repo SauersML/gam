@@ -11202,6 +11202,67 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+
+            // Residual-stall early-exit. The strict and noise-floor
+            // certificates above require the KKT residual to land within
+            // a small multiple of residual_tol. On survival marginal-slope
+            // at biobank scale the residual oscillates in a band that is
+            // orders of magnitude above tol without trending down — the
+            // outer ρ has pushed inner H into a near-singular geometry
+            // where the unconstrained Newton proposal blows up (|prop|∞
+            // 10³–10⁶), the TR clamps it, and each clamped step shuffles
+            // β by O(1) without driving ‖∇L − Sβ‖∞ closer to KKT.
+            //
+            // Spending the remaining cycle budget on this pattern hits
+            // inner_max_cycles "non-converged", which then routes the
+            // outer optimizer through the first-order bridge with a stale
+            // same-ρ inner mode and a gradient of magnitude 10⁷ that kills
+            // BFGS line search at iter 0 (the failure mode pinned in the
+            // commit messages of 6578e884 and 1c181d1f).
+            //
+            // Track the best residual seen so far and the number of
+            // cycles since any meaningful improvement (≥ 10 % drop). Once
+            // the inner has burned at least RESIDUAL_STALL_MIN_CYCLES
+            // without progress AND the accepted step kept hitting the
+            // trust-region clamp, return `converged = false` with the
+            // current finite β. The outer wrapper will see the same
+            // non-converged signal it would have at inner_max_cycles —
+            // but now it sees it after ~40 cycles instead of 100, and
+            // (more importantly) without the bridge's stale-gradient
+            // amplification, because the inner mode cache has not yet
+            // been "blessed" as same-ρ converged.
+            if residual.is_finite() {
+                if residual < RESIDUAL_STALL_IMPROVEMENT_FACTOR * best_residual_seen {
+                    best_residual_seen = residual;
+                    cycles_since_residual_improved = 0;
+                    tr_clamped_during_stall = false;
+                } else {
+                    cycles_since_residual_improved =
+                        cycles_since_residual_improved.saturating_add(1);
+                    if accepted_step_inf
+                        >= RESIDUAL_STALL_TR_CLAMP_RATIO * joint_trust_radius.max(1.0e-12)
+                        || accepted_step_inf >= 0.5 * joint_trust_radius
+                    {
+                        tr_clamped_during_stall = true;
+                    }
+                }
+            }
+            if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
+                && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
+                && tr_clamped_during_stall
+            {
+                log::warn!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} (best_seen={:.3e}, no-improve cycles={}) accepted_|δ|∞={:.3e} r={:.3e}; near-singular joint Hessian — returning unconverged with finite β so the outer optimizer backs off this ρ region instead of running to inner_max_cycles and triggering the stale-mode bridge gradient.",
+                    cycle,
+                    residual,
+                    best_residual_seen,
+                    cycles_since_residual_improved,
+                    accepted_step_inf,
+                    joint_trust_radius,
+                );
+                converged = false;
+                break;
+            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
