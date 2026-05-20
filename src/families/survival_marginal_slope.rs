@@ -11778,7 +11778,7 @@ impl SurvivalMarginalSlopeFamily {
             None
         };
 
-        struct JointPsiPsiAcc {
+        struct JointPsiSecondOrderAcc {
             objective_psi_psi: f64,
             score_t: Array1<f64>,
             score_m: Array1<f64>,
@@ -11787,8 +11787,8 @@ impl SurvivalMarginalSlopeFamily {
             score_w: Array1<f64>,
             hessian: BlockHessianAccumulator,
         }
-        let make_acc = || -> JointPsiPsiAcc {
-            JointPsiPsiAcc {
+        let make_acc = || -> JointPsiSecondOrderAcc {
+            JointPsiSecondOrderAcc {
                 objective_psi_psi: 0.0,
                 score_t: Array1::zeros(p_t),
                 score_m: Array1::zeros(p_m),
