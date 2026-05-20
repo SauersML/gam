@@ -4169,24 +4169,58 @@ pub(crate) fn exact_intersection_nullity(
     if penalties.len() != nullspace_dims.len() {
         return 0;
     }
-    // If any penalty is full rank, the intersection nullspace is {0}.
-    if nullspace_dims.iter().any(|&m| m == 0) {
+
+    // Compute the FULL-SPACE nullity of each penalty matrix directly from its
+    // eigenspectrum. The `nullspace_dims` parameter is treated as advisory
+    // only: some callers (e.g. `compute_block_penalty_logdet_derivs` when fed
+    // canonical penalties embedded into the full p_total × p_total space) pass
+    // BLOCK-LOCAL nullities — the dimension of the null space of the penalty
+    // restricted to its own column range — but the matrices themselves are
+    // zero outside that range. The block-local nullity is then *strictly
+    // smaller* than the full-space nullity by exactly (p − block_dim), and the
+    // earlier "if any block_nullity == 0 then intersection = {0}" early-exit
+    // collapsed the intersection to 0 even when the unpenalized rows / columns
+    // outside every penalty's block sit in every nullspace at once.
+    //
+    // Reading the nullity off the eigenspectrum guarantees correctness
+    // regardless of how the caller packed its matrices: for a PSD matrix the
+    // count of eigenvalues at or below `positive_eigenvalue_threshold` is the
+    // exact dimension of the nullspace.
+    let p = penalties[0].nrows();
+    let eigh_results: Vec<_> = penalties
+        .iter()
+        .map(|p_k| p_k.eigh(faer::Side::Lower))
+        .collect();
+    if eigh_results.iter().any(|r| r.is_err()) {
+        return 0;
+    }
+    let eigh_results: Vec<_> = eigh_results.into_iter().map(|r| r.unwrap()).collect();
+    let actual_nullities: Vec<usize> = eigh_results
+        .iter()
+        .map(|(evals, _)| {
+            let slice = evals.as_slice().unwrap();
+            let threshold = positive_eigenvalue_threshold(slice);
+            slice.iter().filter(|&&e| e <= threshold).count()
+        })
+        .collect();
+
+    // If any penalty is full rank IN THE FULL p-SPACE, the intersection
+    // nullspace is {0}. (A penalty whose own block is full rank but that lives
+    // in a larger zero-padded p_total has a non-empty full-space nullspace —
+    // exactly the columns it doesn't touch.)
+    if actual_nullities.iter().any(|&m| m == 0) {
         return 0;
     }
 
-    // Single penalty: nullity is exact from structural info.
+    // Single penalty: nullity is the dimension of its full-space nullspace.
     if penalties.len() == 1 {
-        return nullspace_dims[0];
+        return actual_nullities[0];
     }
 
     // Multiple penalties: intersect nullspace bases iteratively.
     // Eigendecompose S_1, get its nullspace basis (bottom m_1 eigenvectors).
-    let p = penalties[0].nrows();
-    let (_, vecs0) = match penalties[0].eigh(faer::Side::Lower) {
-        Ok(ev) => ev,
-        Err(_) => return 0,
-    };
-    let m0 = nullspace_dims[0].min(p);
+    let (_, vecs0) = &eigh_results[0];
+    let m0 = actual_nullities[0].min(p);
     // Null basis: bottom m0 eigenvectors (ascending order from eigh).
     // N has shape (p, current_dim).
     let mut n_basis = Array2::<f64>::zeros((p, m0));
@@ -4195,6 +4229,7 @@ pub(crate) fn exact_intersection_nullity(
             n_basis[[row, col]] = vecs0[[row, col]];
         }
     }
+    let _ = nullspace_dims; // advisory; we use the eigenspectrum-derived values
     const SHARED_DIR_THRESHOLD: f64 = 0.99;
 
     for k in 1..penalties.len() {
@@ -4203,12 +4238,10 @@ pub(crate) fn exact_intersection_nullity(
             return 0;
         }
 
-        // Eigendecompose S_k, get its nullspace basis.
-        let (_, vecs_k) = match penalties[k].eigh(faer::Side::Lower) {
-            Ok(ev) => ev,
-            Err(_) => return 0,
-        };
-        let mk = nullspace_dims[k].min(p);
+        // Use the eigendecomposition computed at the start of this routine to
+        // pull the nullspace basis of S_k.
+        let (_, vecs_k) = &eigh_results[k];
+        let mk = actual_nullities[k].min(p);
         let mut nk_basis = Array2::<f64>::zeros((p, mk));
         for col in 0..mk {
             for row in 0..p {
