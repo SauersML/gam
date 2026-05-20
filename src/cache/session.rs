@@ -102,6 +102,22 @@ impl Session {
         self.store.lookup(&self.key).ok().flatten()
     }
 
+    /// Read the currently available warm-start entry without consuming a
+    /// preloaded near-match seed.
+    ///
+    /// This is intentionally separate from [`Self::try_load`]: callers that
+    /// only need to make a scheduling decision (for example, whether to run an
+    /// expensive cold-start pilot) must not drain the preloaded seed that the
+    /// outer optimizer is about to consume.
+    pub fn peek_load(&self) -> Option<CachedEntry> {
+        if let Ok(slot) = self.preloaded.lock()
+            && let Some(entry) = slot.as_ref()
+        {
+            return Some(entry.clone());
+        }
+        self.store.lookup(&self.key).ok().flatten()
+    }
+
     /// Persist a mid-fit checkpoint. Rate-limited; returns true if a write
     /// actually happened. Always writes when the new objective strictly
     /// improves on the best-so-far observed in this session.
@@ -279,6 +295,31 @@ mod tests {
         // Second try_load: store fallback (seed already consumed).
         let second = s.try_load().expect("second call should fall back to store");
         assert_eq!(second.payload, b"exact");
+    }
+
+    #[test]
+    fn peek_load_does_not_consume_preloaded_seed() {
+        let (_d, s) = temp_session("preload-peek");
+        let seeded = CachedEntry {
+            payload: b"seed".to_vec(),
+            objective: Some(3.0),
+            iteration: Some(9),
+            kind: EntryKind::Final,
+            written_unix_secs: 0,
+        };
+        s.preload(seeded);
+
+        let peeked = s.peek_load().expect("peek should see preloaded seed");
+        assert_eq!(peeked.payload, b"seed");
+
+        let loaded = s
+            .try_load()
+            .expect("try_load should still receive the preloaded seed");
+        assert_eq!(loaded.payload, b"seed");
+        assert!(
+            s.try_load().is_none(),
+            "preloaded seed should be consumed only by try_load"
+        );
     }
 
     #[test]
