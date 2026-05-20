@@ -348,10 +348,6 @@ pub fn coefficient_label(block: impl Into<String>, column: usize) -> Coefficient
     CoefficientLabel::by_block_name(block, column)
 }
 
-pub fn coefficient_label_by_block_index(block: usize, column: usize) -> CoefficientLabel {
-    CoefficientLabel::by_block_index(block, column)
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoefficientGroupPrior {
     Flat,
@@ -433,10 +429,6 @@ impl CoefficientGroupSpec {
         self
     }
 
-    pub fn with_initial_log_precision(mut self, initial_log_precision: f64) -> Self {
-        self.initial_log_precision = Some(initial_log_precision);
-        self
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -799,28 +791,6 @@ pub fn realize_coefficient_groups_for_custom_family(
         rho_prior: crate::types::RhoPrior::Independent(priors),
         outer_labels,
     })
-}
-
-pub fn fit_custom_family_with_coefficient_groups<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    groups: &[CoefficientGroupSpec],
-    options: &BlockwiseFitOptions,
-) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
-    if groups.is_empty() {
-        return fit_custom_family(family, specs, options);
-    }
-    let realized =
-        realize_coefficient_groups_for_custom_family(specs, groups, crate::types::RhoPrior::Flat)
-            .map_err(CustomFamilyError::InvalidInput)?;
-    let RealizedCoefficientGroupSpecs {
-        specs: realized_specs,
-        rho_prior,
-        ..
-    } = realized;
-    fit_custom_family_with_rho_prior(family, &realized_specs, options, rho_prior)
 }
 
 fn custom_family_block_role(

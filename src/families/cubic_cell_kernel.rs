@@ -1277,11 +1277,6 @@ pub struct CellMomentCacheStats {
 
 impl CellMomentCacheStats {
     #[inline]
-    pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.hits.load(Ordering::Relaxed),
@@ -2992,23 +2987,6 @@ fn evaluate_affine_cell_derivative_state(
     Ok(CellDerivativeMomentState {
         branch: ExactCellBranch::Affine,
         moments: moments.into(),
-    })
-}
-
-pub fn evaluate_affine_cell_state_with_scratch<'a>(
-    cell: DenestedCubicCell,
-    max_degree: usize,
-    scratch: &'a mut CellMomentScratch,
-) -> Result<CellMomentStateRef<'a>, String> {
-    let alpha = cell.c0;
-    let beta = cell.c1;
-    let value = affine_value_from_moment_primitive(alpha, beta, cell.left, cell.right);
-    let out = scratch.prepare_moments(max_degree + 1);
-    affine_anchor_moment_vector_into(alpha, beta, cell.left, cell.right, max_degree, out);
-    Ok(CellMomentStateRef {
-        branch: ExactCellBranch::Affine,
-        value,
-        moments: out,
     })
 }
 

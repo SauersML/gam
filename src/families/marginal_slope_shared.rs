@@ -1236,16 +1236,6 @@ pub fn outer_row_weights_by_index(
     }
 }
 
-/// Phase-2 placeholder. The intent is to debug-assert (in callers that are
-/// known to be _outer-only_ score/gradient passes) that no inner-PIRLS
-/// codepath consults the subsample. For Phase 1 this is a no-op so the
-/// signature can be threaded into Phase-2 hot loops without touching call
-/// sites later.
-#[inline]
-pub fn assert_outer_only(_opts: &crate::custom_family::BlockwiseFitOptions, _context: &str) {
-    // intentionally empty in Phase 1
-}
-
 /// Deterministic-order parallel reduction over a row-index slice.
 ///
 /// Splits `rows` into a fixed number of contiguous chunks
