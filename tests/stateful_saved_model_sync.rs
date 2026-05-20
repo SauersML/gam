@@ -236,8 +236,10 @@ fn saved_model_group_metadata_is_optional_and_roundtrips() {
         !legacy_json.contains("group_metadata"),
         "missing group_metadata is the legacy wire shape"
     );
-    let legacy_model: FittedModel =
-        serde_json::from_str(&legacy_json).expect("deserialize legacy-shaped model");
+    let legacy_path = dir.path().join("legacy-group-metadata-model.json");
+    std::fs::write(&legacy_path, legacy_json).expect("write legacy-shaped model");
+    let legacy_model = FittedModel::load_from_path(&legacy_path)
+        .expect("load legacy-shaped model without group_metadata");
     let FittedModel::Standard { payload } = legacy_model else {
         panic!("expected standard model");
     };
