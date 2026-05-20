@@ -7696,6 +7696,7 @@ impl SurvivalMarginalSlopeFamily {
             self.add_dense_submatrix(
                 joint_hessian,
                 joint_range,
+                joint_range,
                 primary_hessian.slice(s![primary_range.clone(), primary_range.clone()]),
             );
         }
@@ -9292,6 +9293,7 @@ impl SurvivalMarginalSlopeFamily {
                             &[0.0; 4],
                             &[0.0; 4],
                             &[0.0; 4],
+                            &[0.0; 4],
                             &st.moments,
                         )?;
                         f_uv_d12[[u, v]] += d12v;
@@ -9714,6 +9716,7 @@ impl SurvivalMarginalSlopeFamily {
                     z_obs,
                 ),
                 0.0,
+                0.0,
                 ad1,
                 ad2,
                 ad12,
@@ -9842,6 +9845,7 @@ impl SurvivalMarginalSlopeFamily {
                         ),
                         z_obs,
                     ),
+                    0.0,
                     0.0,
                     ad1,
                     ad2,
@@ -11502,7 +11506,15 @@ impl SurvivalMarginalSlopeFamily {
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
 
-        type Acc = (f64, Array1<f64>, BlockHessianAccumulator);
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockHessianAccumulator,
+        );
         let make_accs = || -> Vec<Acc> {
             (0..k)
                 .map(|_| {
@@ -11750,7 +11762,15 @@ impl SurvivalMarginalSlopeFamily {
             None
         };
 
-        type Acc = (f64, Array1<f64>, BlockHessianAccumulator);
+        type Acc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockHessianAccumulator,
+        );
         let make_acc = || -> Acc {
             (
                 0.0,
@@ -14263,7 +14283,17 @@ impl SurvivalMarginalSlopeFamily {
 
                     // ── Build dJ arrays for both directions ────────────
                     // (same code as first directional, for d and e)
-                    let build_dj = |dh0: f64, dh1: f64, ddr_val: f64| -> (Vec<f64>,) {
+                    let build_dj = |dh0: f64,
+                                    dh1: f64,
+                                    ddr_val: f64|
+                     -> (
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                        Vec<f64>,
+                    ) {
                         let mut j0t = vec![0.0f64; p_time];
                         let mut j1t = vec![0.0f64; p_time];
                         let mut jdt = vec![0.0f64; p_time];
@@ -14600,6 +14630,7 @@ impl SurvivalMarginalSlopeFamily {
                         self.add_dense_submatrix(
                             &mut acc,
                             joint_range,
+                            joint_range,
                             t_ud.slice(s![primary_range.clone(), primary_range.clone()]),
                         );
                     }
@@ -14686,6 +14717,7 @@ impl SurvivalMarginalSlopeFamily {
                         }
                         self.add_dense_submatrix(
                             &mut acc,
+                            joint_range,
                             joint_range,
                             q_de.slice(s![primary_range.clone(), primary_range.clone()]),
                         );
@@ -14952,7 +14984,13 @@ impl SurvivalMarginalSlopeFamily {
         let (ll, grad, hess) = (0..self.n)
             .into_par_iter()
             .try_fold(
-                || (0.0, Array1::<f64>::zeros(total), Array2::<f64>::zeros((total, total))),
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(total),
+                        Array2::<f64>::zeros((total, total)),
+                    )
+                },
                 |mut acc, row| -> Result<_, String> {
                     let q0 = self.design_entry.dot_row(row, beta_time)
                         + self.offset_entry[row]
@@ -14990,15 +15028,17 @@ impl SurvivalMarginalSlopeFamily {
                         .map_err(|e| {
                             format!("evaluate_exact_newton_joint_dense_per_z derivative row: {e}")
                         })?;
-                    let marginal = self
-                        .marginal_design
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| {
-                            format!("evaluate_exact_newton_joint_dense_per_z marginal row: {e}")
-                        })?;
-                    j.slice_mut(s![0, slices.time.clone()]).assign(&entry.row(0));
+                    let marginal =
+                        self.marginal_design
+                            .try_row_chunk(row..row + 1)
+                            .map_err(|e| {
+                                format!("evaluate_exact_newton_joint_dense_per_z marginal row: {e}")
+                            })?;
+                    j.slice_mut(s![0, slices.time.clone()])
+                        .assign(&entry.row(0));
                     j.slice_mut(s![1, slices.time.clone()]).assign(&exit.row(0));
-                    j.slice_mut(s![2, slices.time.clone()]).assign(&deriv.row(0));
+                    j.slice_mut(s![2, slices.time.clone()])
+                        .assign(&deriv.row(0));
                     j.slice_mut(s![0, slices.marginal.clone()])
                         .assign(&marginal.row(0));
                     j.slice_mut(s![1, slices.marginal.clone()])
@@ -15036,7 +15076,13 @@ impl SurvivalMarginalSlopeFamily {
                 },
             )
             .try_reduce(
-                || (0.0, Array1::<f64>::zeros(total), Array2::<f64>::zeros((total, total))),
+                || {
+                    (
+                        0.0,
+                        Array1::<f64>::zeros(total),
+                        Array2::<f64>::zeros((total, total)),
+                    )
+                },
                 |mut a, b| -> Result<_, String> {
                     a.0 += b.0;
                     a.1 += &b.1;
@@ -15087,7 +15133,11 @@ impl SurvivalMarginalSlopeFamily {
     fn evaluate_blockwise_exact_newton_mixed(
         &self,
         block_states: &[ParameterBlockState],
-        time_csrs: Option<&(Arc<faer::sparse::SparseRowMat<usize, f64>>,)>,
+        time_csrs: Option<&(
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+        )>,
         marginal_csr: Option<&Arc<faer::sparse::SparseRowMat<usize, f64>>>,
         logslope_csr: Option<&Arc<faer::sparse::SparseRowMat<usize, f64>>>,
     ) -> Result<FamilyEvaluation, String> {
@@ -15152,7 +15202,15 @@ impl SurvivalMarginalSlopeFamily {
             (sym.row_ptr(), sym.col_idx(), csr.val())
         });
 
-        type MixedAcc = (f64, Array1<f64>, BlockwiseHessianAccumulator);
+        type MixedAcc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            BlockwiseHessianAccumulator,
+            BlockwiseHessianAccumulator,
+            BlockwiseHessianAccumulator,
+        );
 
         let make_acc = || -> MixedAcc {
             (
@@ -15259,7 +15317,12 @@ impl SurvivalMarginalSlopeFamily {
                             for a in 0..3 {
                                 for b in 0..3 {
                                     designs[a]
-                                        .row_outer_into(row, designs[b], f_pipi[[a, b]], hess_time)
+                                        .row_outer_into(
+                                            row,
+                                            designs[b],
+                                            f_pipi[[a, b]],
+                                            &mut *hess_time,
+                                        )
                                         .expect("time row_outer_into dim mismatch");
                                 }
                             }
@@ -15306,7 +15369,7 @@ impl SurvivalMarginalSlopeFamily {
                     match &mut acc.5 {
                         BlockwiseHessianAccumulator::Dense(hess_marginal) => {
                             self.marginal_design
-                                .syr_row_into(row, alpha_m, hess_marginal)
+                                .syr_row_into(row, alpha_m, &mut *hess_marginal)
                                 .expect(
                                     "survival marginal block syr should match block dimensions",
                                 );
@@ -15334,7 +15397,7 @@ impl SurvivalMarginalSlopeFamily {
                     match &mut acc.6 {
                         BlockwiseHessianAccumulator::Dense(hess_logslope) => {
                             self.logslope_design
-                                .syr_row_into(row, alpha_g, hess_logslope)
+                                .syr_row_into(row, alpha_g, &mut *hess_logslope)
                                 .expect(
                                     "survival logslope block syr should match block dimensions",
                                 );
@@ -15495,7 +15558,11 @@ impl SurvivalMarginalSlopeFamily {
     fn evaluate_blockwise_exact_newton_sparse(
         &self,
         block_states: &[ParameterBlockState],
-        time_csrs: &(Arc<faer::sparse::SparseRowMat<usize, f64>>,),
+        time_csrs: &(
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+            Arc<faer::sparse::SparseRowMat<usize, f64>>,
+        ),
         marginal_csr: &Arc<faer::sparse::SparseRowMat<usize, f64>>,
         logslope_csr: &Arc<faer::sparse::SparseRowMat<usize, f64>>,
     ) -> Result<FamilyEvaluation, String> {
@@ -15545,7 +15612,15 @@ impl SurvivalMarginalSlopeFamily {
         let g_v = logslope_csr.val();
 
         // Accumulator type: gradients dense, Hessians sparse value buffers.
-        type SAcc = (f64, Array1<f64>, SparseHessianAccumulator);
+        type SAcc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            SparseHessianAccumulator,
+            SparseHessianAccumulator,
+            SparseHessianAccumulator,
+        );
 
         let make_acc = || -> SAcc {
             (
@@ -15852,7 +15927,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
         if self.per_z_logslope_active() {
             return Ok(Some(
-                self.evaluate_exact_newton_joint_dense_per_z(block_states)?.2,
+                self.evaluate_exact_newton_joint_dense_per_z(block_states)?
+                    .2,
             ));
         }
         Ok(Some(
@@ -17434,6 +17510,10 @@ pub fn fit_survival_marginal_slope_terms(
             let sigma_aux = crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 None,
                 Array2::zeros((0, 0)),
+                Array2::zeros((0, 0)),
+                None,
+                None,
+                None,
                 None,
             );
             derivative_blocks
@@ -19397,6 +19477,9 @@ mod tests {
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
                 None,
+                None,
+                None,
+                None,
             )],
             Vec::new(),
         ];
@@ -19475,11 +19558,17 @@ mod tests {
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
                 None,
+                None,
+                None,
+                None,
             )],
             vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 None,
                 array![[0.3, 0.8]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
             Vec::new(),
@@ -19556,6 +19645,9 @@ mod tests {
                 None,
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
             Vec::new(),
@@ -19638,6 +19730,9 @@ mod tests {
                 None,
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
             Vec::new(),
@@ -20127,11 +20222,17 @@ mod tests {
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
                 None,
+                None,
+                None,
+                None,
             )],
             vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 None,
                 array![[0.3, 0.8]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
             Vec::new(),
@@ -20205,6 +20306,9 @@ mod tests {
                 None,
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
             Vec::new(),
@@ -21225,11 +21329,17 @@ mod tests {
                 array![[1.0, -0.4]],
                 Array2::zeros((2, 2)),
                 None,
+                None,
+                None,
+                None,
             )],
             vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 None,
                 array![[0.6, 0.3]],
                 Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
                 None,
             )],
         ];
@@ -21691,6 +21801,9 @@ mod tests {
                 x_psi,
                 Array2::zeros((1, 1)),
                 None,
+                None,
+                None,
+                None,
             )],
             Vec::new(),
         ]
@@ -21714,11 +21827,17 @@ mod tests {
                 x_psi_m,
                 Array2::zeros((1, 1)),
                 None,
+                None,
+                None,
+                None,
             )],
             vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
                 None,
                 x_psi_g,
                 Array2::zeros((1, 1)),
+                None,
+                None,
+                None,
                 None,
             )],
         ]
