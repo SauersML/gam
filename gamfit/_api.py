@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, overload
 
@@ -71,6 +72,7 @@ def _build_fit_payload(
     scale_dimensions: bool | None,
     adaptive_regularization: bool | None,
     firth: bool | None,
+    precision_hyperpriors: Any | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -95,6 +97,7 @@ def _build_fit_payload(
         "scale_dimensions": scale_dimensions,
         "adaptive_regularization": adaptive_regularization,
         "firth": firth,
+        "precision_hyperpriors": precision_hyperpriors,
     }
     for key, value in kwarg_items.items():
         if value is not None:
@@ -192,6 +195,7 @@ def fit(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
+    precision_hyperpriors: Any | None = None,
     response_geometry: str | None = None,
     response_columns: list[str] | tuple[str, ...] | None = None,
     response_coordinates: str | None = None,
@@ -358,6 +362,9 @@ def fit(
         "response_reference",
     ):
         rust_config.pop(key, None)
+    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
+        precision_hyperpriors, formula, headers, rows
+    )
     payload = _build_fit_payload(
         family=family,
         offset=offset,
@@ -378,6 +385,7 @@ def fit(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        precision_hyperpriors=resolved_precision_hyperpriors,
         config=rust_config or None,
     )
     try:
@@ -413,6 +421,7 @@ def fit_array(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
+    precision_hyperpriors: Any | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model:
     """Fit directly from numeric NumPy-compatible arrays.
@@ -443,6 +452,7 @@ def fit_array(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        precision_hyperpriors=precision_hyperpriors,
         config=dict(config or {}) or None,
     )
     try:

@@ -101,6 +101,7 @@ struct PyFitConfig {
     // `{name|id|key, metadata}`; fitting ignores it and persistence carries it.
     group_metadata: Option<BTreeMap<String, serde_json::Value>>,
     groups: Option<serde_json::Value>,
+    precision_hyperpriors: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
@@ -3989,6 +3990,8 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     };
     let mut fit_config = FitConfig::default();
     fit_config.group_metadata = parse_group_metadata(py_config.group_metadata, py_config.groups)?;
+    fit_config.penalty_block_gamma_priors =
+        parse_precision_hyperpriors(py_config.precision_hyperpriors)?;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
@@ -4134,6 +4137,89 @@ fn parse_group_metadata(
         (Some(_), Some(_)) => {
             Err("fit config accepts either group_metadata or groups metadata, not both".to_string())
         }
+    }
+}
+
+fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(String, f64, f64), String> {
+    match value {
+        serde_json::Value::Array(values) => {
+            if values.len() != 2 {
+                return Err(format!(
+                    "precision_hyperpriors['{label}'] must be [shape, rate]"
+                ));
+            }
+            let shape = values[0].as_f64().ok_or_else(|| {
+                format!("precision_hyperpriors['{label}'][0] must be numeric")
+            })?;
+            let rate = values[1].as_f64().ok_or_else(|| {
+                format!("precision_hyperpriors['{label}'][1] must be numeric")
+            })?;
+            Ok((label.to_string(), shape, rate))
+        }
+        serde_json::Value::Object(mut map) => {
+            let shape = map
+                .remove("shape")
+                .or_else(|| map.remove("a"))
+                .or_else(|| map.remove("a_p"))
+                .ok_or_else(|| {
+                    format!("precision_hyperpriors['{label}'] missing shape/a")
+                })?
+                .as_f64()
+                .ok_or_else(|| {
+                    format!("precision_hyperpriors['{label}'] shape/a must be numeric")
+                })?;
+            let rate = map
+                .remove("rate")
+                .or_else(|| map.remove("b"))
+                .or_else(|| map.remove("b_p"))
+                .ok_or_else(|| {
+                    format!("precision_hyperpriors['{label}'] missing rate/b")
+                })?
+                .as_f64()
+                .ok_or_else(|| {
+                    format!("precision_hyperpriors['{label}'] rate/b must be numeric")
+                })?;
+            Ok((label.to_string(), shape, rate))
+        }
+        _ => Err(format!(
+            "precision_hyperpriors['{label}'] must be [shape, rate] or an object"
+        )),
+    }
+}
+
+fn parse_precision_hyperpriors(
+    raw: Option<serde_json::Value>,
+) -> Result<Vec<(String, f64, f64)>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    match raw {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .map(|(label, value)| parse_gamma_pair_value(&label, value))
+            .collect(),
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .enumerate()
+            .map(|(idx, item)| {
+                let serde_json::Value::Object(mut obj) = item else {
+                    return Err(format!("precision_hyperpriors[{idx}] must be an object"));
+                };
+                let label = obj
+                    .remove("label")
+                    .or_else(|| obj.remove("name"))
+                    .or_else(|| obj.remove("group"))
+                    .ok_or_else(|| {
+                        format!("precision_hyperpriors[{idx}] needs label/name/group")
+                    })?;
+                let serde_json::Value::String(label) = label else {
+                    return Err(format!("precision_hyperpriors[{idx}] label must be a string"));
+                };
+                parse_gamma_pair_value(&label, serde_json::Value::Object(obj))
+            })
+            .collect(),
+        _ => Err("precision_hyperpriors must be a map or array".to_string()),
     }
 }
 
