@@ -15851,6 +15851,50 @@ fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, 
 }
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
+    fn persistent_warm_start_fingerprint(
+        &self,
+        _specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
+    ) -> Option<String> {
+        let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
+        hasher.write_str("survival-marginal-slope-family");
+        hasher.write_usize(self.n);
+        hasher.write_usize(self.event.len());
+        for &value in self.event.iter() {
+            hasher.write_f64(value);
+        }
+        hasher.write_usize(self.weights.len());
+        for &value in self.weights.iter() {
+            hasher.write_f64(value);
+        }
+        hasher.write_usize(self.z.nrows());
+        hasher.write_usize(self.z.ncols());
+        for &value in self.z.iter() {
+            hasher.write_f64(value);
+        }
+        match self.gaussian_frailty_sd {
+            Some(value) => {
+                hasher.write_bool(true);
+                hasher.write_f64(value);
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_f64(self.derivative_guard);
+        hasher.write_usize(self.offset_entry.len());
+        for &value in self.offset_entry.iter() {
+            hasher.write_f64(value);
+        }
+        hasher.write_usize(self.offset_exit.len());
+        for &value in self.offset_exit.iter() {
+            hasher.write_f64(value);
+        }
+        hasher.write_usize(self.derivative_offset_exit.len());
+        for &value in self.derivative_offset_exit.iter() {
+            hasher.write_f64(value);
+        }
+        Some(hasher.finish_hex())
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
@@ -17380,7 +17424,29 @@ pub fn fit_survival_marginal_slope_terms(
     };
 
     // ── Pilot fit: rigid (zero-penalty) to seed coefficients ────────────
-    {
+    //
+    // The pilot is only a cold-start coefficient initializer. If the workflow
+    // dispatcher already attached an exact or prefix warm-start entry, the
+    // outer optimizer will consume that ρ seed and the first real inner solve
+    // will immediately overwrite these hints at the cached smoothing point.
+    // Running the rigid pilot in that regime is pure latency at biobank scale
+    // (the log shows ~15s for n≈196k), and worse, it seeds β at ρ=0 while the
+    // cached outer seed may be far from ρ=0. Do a non-consuming peek so the
+    // optimizer still receives the cached entry via `try_load`.
+    let outer_cache_seed_available = options
+        .cache_session
+        .as_ref()
+        .and_then(|session| session.peek_load())
+        .is_some_and(|entry| {
+            entry.objective.is_none_or(|value| value.is_finite()) && !entry.payload.is_empty()
+        });
+    if outer_cache_seed_available {
+        log::info!(
+            "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
+            n,
+            setup.rho_dim(),
+        );
+    } else {
         let pilot_started = std::time::Instant::now();
         log::info!(
             "[survival-marginal-slope/pilot] start n={} time_p={} marginal_p={} logslope_p={}",
