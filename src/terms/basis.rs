@@ -18599,6 +18599,49 @@ fn periodic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     dx.min(period - dx).abs()
 }
 
+/// Drop centers that periodically identify with the leftmost anchor.
+///
+/// When the user describes a closed periodic lattice by including BOTH
+/// endpoints of ``[left, left+period]``, the right endpoint is the same
+/// circle point as ``left`` and produces an identical kernel column. We
+/// remove every such duplicate (tested under the periodic metric with a
+/// tolerance scaled to ``period``); the remaining centers correspond to
+/// geometrically distinct points on the circle.
+fn collapse_periodic_endpoint(
+    centers: Array2<f64>,
+    left: f64,
+    period: f64,
+) -> Array2<f64> {
+    if period <= 0.0 || !period.is_finite() {
+        return centers;
+    }
+    // Tolerance: relative to ``period``, well below any reasonable lattice
+    // spacing (mgcv's smallest practical periodic ``k`` is around 3, giving a
+    // spacing of ``period/3``).
+    let tol = period.max(1.0) * 1.0e-10;
+    let col = centers.column(0);
+    let n_rows = col.len();
+    let keep: Vec<usize> = (0..n_rows)
+        .filter(|&i| {
+            if i == 0 {
+                return true;
+            }
+            // Drop any center within ``tol`` of ``left`` modulo ``period``.
+            periodic_distance_1d(col[i], left, period) > tol
+        })
+        .collect();
+    if keep.len() == n_rows {
+        return centers;
+    }
+    let mut trimmed = Array2::<f64>::zeros((keep.len(), centers.ncols()));
+    for (out_row, &src_row) in keep.iter().enumerate() {
+        for c in 0..centers.ncols() {
+            trimmed[[out_row, c]] = centers[[src_row, c]];
+        }
+    }
+    trimmed
+}
+
 fn build_periodic_duchon_basis_1d(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -18622,6 +18665,21 @@ fn build_periodic_duchon_basis_1d(
         return Err(BasisError::InvalidRange(left, right));
     }
     let period = right - left;
+    // ``left + period`` is the same circle point as ``left``. If the user
+    // supplied centers spanning ``[left, left+period]`` (the natural way to
+    // describe a closed periodic lattice and what the position-API validator
+    // requires) the rightmost point is a duplicate of the leftmost under
+    // periodic identification. Two identical kernel columns make the design
+    // ``rank K−1`` instead of ``K``; ``X'X`` becomes singular (cond ~10¹⁷)
+    // and the REML whitening transform amplifies machine noise into a ~10⁻⁶
+    // negative eigenvalue, tripping the solver's PSD check.
+    //
+    // Drop the periodically duplicate center so the K kernel columns
+    // correspond to K geometrically distinct circle points. ``left`` and
+    // ``period`` stay valid (we drop the rightmost center, so ``left`` is
+    // unchanged and the circumference is still the user's declared
+    // ``period``).
+    let centers = collapse_periodic_endpoint(centers, left, period);
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power;
