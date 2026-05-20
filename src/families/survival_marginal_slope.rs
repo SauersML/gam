@@ -4091,7 +4091,12 @@ impl SurvivalMarginalSlopeFamily {
                     self.row_neglog_directional_with_scale_jet(
                         row,
                         block_states,
-                        &[Array1::zeros(primary_dim), da.clone(), db],
+                        &[
+                            Array1::zeros(primary_dim),
+                            Array1::zeros(primary_dim),
+                            da.clone(),
+                            db,
+                        ],
                         &scale,
                     )?
                 } else {
@@ -18950,9 +18955,8 @@ mod tests {
 
         assert_eq!(policy.predicted_hessian_work, row_kernel_work);
         assert!(
-            generic_dense_work
-                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "generic dense work should reproduce the historical false BFGS demotion"
+            row_kernel_work < generic_dense_work,
+            "rigid row-kernel work must be cheaper than generic dense Hessian work"
         );
         assert!(
             policy.predicted_hessian_work
