@@ -16126,13 +16126,24 @@ pub fn fit_survival_marginal_slope_terms(
                 hints.logslope_beta.clone(),
             ),
         ];
+        if let Some(prepared) = score_warp_prepared.as_ref() {
+            let rho_h = rho
+                .slice(s![cursor..cursor + prepared.block.penalties.len()])
+                .to_owned();
+            cursor += prepared.block.penalties.len();
+            blocks.push(build_per_z_score_warp_aux_blockspec(
+                prepared,
+                rho_h,
+                hints.score_warp_beta.clone(),
+            )?);
+        }
         push_deviation_aux_blockspecs(
             &mut blocks,
             rho,
             &mut cursor,
-            score_warp_prepared.as_ref(),
+            None,
             link_dev_prepared.as_ref(),
-            hints.score_warp_beta.clone(),
+            None,
             hints.link_dev_beta.clone(),
         )?;
         Ok(blocks)
