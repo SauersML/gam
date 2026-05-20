@@ -14,10 +14,11 @@ use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     MarginalSlopeCovariance, build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed, marginal_slope_covariance_from_scores,
-    marginal_slope_preserving_scale, padded_deviation_seed, project_monotone_feasible_beta,
-    push_deviation_aux_blockspecs, signed_probit_neglog_derivatives_up_to_fourth,
-    standardize_latent_z_with_policy, unary_derivatives_log, unary_derivatives_log_normal_pdf,
-    unary_derivatives_neglog_phi, unary_derivatives_sqrt,
+    marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
+    project_monotone_feasible_beta, push_deviation_aux_blockspecs,
+    signed_probit_neglog_derivatives_up_to_fourth, standardize_latent_z_with_policy,
+    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
+    unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
@@ -2686,20 +2687,8 @@ pub fn survival_marginal_slope_vector_eta(
     covariance: &MarginalSlopeCovariance,
     probit_scale: f64,
 ) -> Result<f64, String> {
-    if z.len() != slopes.len() {
-        return Err(format!(
-            "survival marginal-slope vector score/slope dimension mismatch: z={}, slopes={}",
-            z.len(),
-            slopes.len()
-        ));
-    }
-    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
-    let linear = z
-        .iter()
-        .zip(slopes.iter())
-        .map(|(&zi, &ri)| probit_scale * ri * zi)
-        .sum::<f64>();
-    Ok(q * c + linear)
+    marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)
+        .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
 pub fn survival_marginal_slope_vector_neglog(
@@ -2763,6 +2752,17 @@ fn standardize_latent_z_matrix_with_policy(
         out.column_mut(col).assign(&standardized);
     }
     Ok((out, first_norm))
+}
+
+fn score_warp_seed_from_score_matrix(z: &Array2<f64>) -> Array1<f64> {
+    debug_assert!(z.ncols() > 0);
+    if z.ncols() == 1 {
+        return z.column(0).to_owned();
+    }
+    Array1::from_iter(
+        z.axis_iter(Axis(0))
+            .map(|row| row.iter().map(|value| value * value).sum::<f64>().sqrt()),
+    )
 }
 
 /// Derivatives of c(g) = √(1 + (s_f g)^2) up to 4th order in the raw slope g.
@@ -15712,10 +15712,11 @@ pub fn fit_survival_marginal_slope_terms(
     let logslopespec_boot = joint_specs.remove(0);
 
     let time_penalties_len = spec.time_block.penalties.len();
+    let score_warp_seed = score_warp_seed_from_score_matrix(&spec.z);
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_score_warp_deviation_block_from_seed(&z_primary, cfg))
+        .map(|cfg| build_score_warp_deviation_block_from_seed(&score_warp_seed, cfg))
         .transpose()?;
     let link_dev_prepared = spec
         .link_dev
