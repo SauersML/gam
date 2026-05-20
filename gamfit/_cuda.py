@@ -9,13 +9,21 @@ from pathlib import Path
 from typing import Iterable
 
 
-_CUDA_LIBRARY_ORDER: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("cuda_runtime", ("libcudart.so.12", "libcudart.so")),
-    ("nvjitlink", ("libnvJitLink.so.12", "libnvJitLink.so")),
-    ("cublas", ("libcublasLt.so.12", "libcublasLt.so", "libcublas.so.12", "libcublas.so")),
-    ("cusparse", ("libcusparse.so.12", "libcusparse.so")),
-    ("cusolver", ("libcusolver.so.11", "libcusolver.so")),
+_CUDA_LIBRARY_GROUPS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
+    ("cuda_runtime", (("libcudart.so.12", "libcudart.so"),)),
+    ("nvjitlink", (("libnvJitLink.so.12", "libnvJitLink.so"),)),
+    (
+        "cublas",
+        (
+            ("libcublasLt.so.12", "libcublasLt.so"),
+            ("libcublas.so.12", "libcublas.so"),
+        ),
+    ),
+    ("cusparse", (("libcusparse.so.12", "libcusparse.so"),)),
+    ("cusolver", (("libcusolver.so.11", "libcusolver.so"),)),
 )
+
+_CUDA_LIBRARY_HANDLES: list[ctypes.CDLL] = []
 
 
 @lru_cache(maxsize=1)
@@ -29,33 +37,66 @@ def preload_cuda_libraries() -> tuple[str, ...]:
     loaded: list[str] = []
     for path in _cuda_library_candidates():
         try:
-            ctypes.CDLL(str(path), mode=mode)
+            handle = ctypes.CDLL(str(path), mode=mode)
         except OSError:
             continue
+        _CUDA_LIBRARY_HANDLES.append(handle)
         loaded.append(str(path))
     return tuple(loaded)
 
 
 def _cuda_library_candidates() -> tuple[Path, ...]:
-    roots = _nvidia_roots()
-    candidates: list[Path] = []
-    seen: set[Path] = set()
-    for component, names in _CUDA_LIBRARY_ORDER:
-        for root in roots:
-            lib_dir = root / component / "lib"
-            for name in names:
-                path = lib_dir / name
-                if path.exists() and path not in seen:
-                    candidates.append(path)
-                    seen.add(path)
+    for root in _nvidia_roots():
+        candidates = _complete_nvidia_stack(root)
+        if candidates:
+            return candidates
     for lib_dir in _system_cuda_lib_dirs():
-        for _, names in _CUDA_LIBRARY_ORDER:
-            for name in names:
-                path = lib_dir / name
-                if path.exists() and path not in seen:
-                    candidates.append(path)
-                    seen.add(path)
-    return tuple(candidates)
+        candidates = _complete_system_stack(lib_dir)
+        if candidates:
+            return candidates
+    return ()
+
+
+def _complete_nvidia_stack(root: Path) -> tuple[Path, ...]:
+    out: list[Path] = []
+    for component, library_groups in _CUDA_LIBRARY_GROUPS:
+        lib_dir = root / component / "lib"
+        for names in library_groups:
+            path = _first_existing(lib_dir, names)
+            if path is None:
+                return ()
+            out.append(path)
+    return tuple(_dedup_resolved(out))
+
+
+def _complete_system_stack(lib_dir: Path) -> tuple[Path, ...]:
+    out: list[Path] = []
+    for _, library_groups in _CUDA_LIBRARY_GROUPS:
+        for names in library_groups:
+            path = _first_existing(lib_dir, names)
+            if path is None:
+                return ()
+            out.append(path)
+    return tuple(_dedup_resolved(out))
+
+
+def _first_existing(lib_dir: Path, names: tuple[str, ...]) -> Path | None:
+    for name in names:
+        path = lib_dir / name
+        if path.exists():
+            return path
+    return None
+
+
+def _dedup_resolved(paths: Iterable[Path]) -> tuple[Path, ...]:
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            out.append(resolved)
+            seen.add(resolved)
+    return tuple(out)
 
 
 def _nvidia_roots() -> tuple[Path, ...]:
