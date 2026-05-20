@@ -1612,7 +1612,13 @@ fn fit_survival_location_scale_model(
                 .with_tolerance(1e-4)
                 .with_max_iter(240)
                 .with_bounds(lower, upper)
-                .with_heuristic_lambdas(init.to_vec());
+                .with_initial_rho(init.clone())
+                .with_seed_config(crate::seeding::SeedConfig {
+                    max_seeds: 1,
+                    seed_budget: 1,
+                    num_auxiliary_trailing: dim,
+                    ..Default::default()
+                });
             let context = format!("survival inverse-link optimization ({name}, dim={dim})");
             let mut obj = problem.build_objective(
                 objective,

@@ -8553,6 +8553,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 "exact spatial adaptive outer optimization failed: {e}"
             ))
         })?;
+    if !outer_result.converged {
+        return Err(EstimationError::InvalidInput(format!(
+            "exact spatial adaptive outer optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            outer_result.iterations,
+            outer_result.final_value,
+            outer_result
+                .final_grad_norm
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+        )));
+    }
     let outer_iterations = outer_result.iterations;
     let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(f64::NAN);
     let theta_star = outer_result.rho;
@@ -13119,6 +13129,16 @@ fn try_exact_joint_spatial_aniso_optimization(
             "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
         ))
     })?;
+    if !result.converged {
+        return Err(EstimationError::InvalidInput(format!(
+            "anisotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            result.iterations,
+            result.final_value,
+            result
+                .final_grad_norm
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+        )));
+    }
     log::trace!(
         "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
         result.iterations,
@@ -13420,6 +13440,16 @@ fn try_exact_joint_spatial_isotropic_optimization(
             "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
         ))
     })?;
+    if !result.converged {
+        return Err(EstimationError::InvalidInput(format!(
+            "isotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            result.iterations,
+            result.final_value,
+            result
+                .final_grad_norm
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+        )));
+    }
     log::trace!(
         "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
         result.iterations,
