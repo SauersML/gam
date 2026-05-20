@@ -4349,15 +4349,7 @@ impl SurvivalMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let JointPsiSecondOrderAcc {
-            objective_psi_psi,
-            score_t,
-            score_m,
-            score_g,
-            score_h,
-            score_w,
-            hessian,
-        } = chunked_row_reduction(
+        let acc = chunked_row_reduction(
             row_iter.as_slice(),
             || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
             |row, acc| -> Result<(), String> {
@@ -11811,7 +11803,15 @@ impl SurvivalMarginalSlopeFamily {
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Process fixed row chunks in parallel and merge local cross-block
         // accumulators in row-chunk order for deterministic timewiggle assembly.
-        let acc = chunked_row_reduction(
+        let JointPsiSecondOrderAcc {
+            objective_psi_psi,
+            score_t,
+            score_m,
+            score_g,
+            score_h,
+            score_w,
+            hessian,
+        } = chunked_row_reduction(
             row_iter.as_slice(),
             make_acc,
             |row, a| -> Result<(), String> {
