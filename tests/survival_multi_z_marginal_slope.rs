@@ -52,6 +52,16 @@ fn survival_multi_z_k2_full_covariance_preserves_identity() {
 }
 
 #[test]
+fn survival_multi_z_k4_diagonal_covariance_preserves_identity() {
+    let covariance = MarginalSlopeCovariance::Diagonal(array![0.8, 1.1, 0.6, 1.4]);
+    let z = [-0.3, 0.9, 1.2, -0.7];
+    let slopes = [0.12, -0.22, 0.31, -0.09];
+    let eta = survival_marginal_slope_vector_eta(0.58, &z, &slopes, &covariance, 0.95).unwrap();
+    assert!(eta.is_finite());
+    assert_survival_identity(0.58, &slopes, &covariance, 0.95);
+}
+
+#[test]
 fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
     let factor = array![[1.0, 0.0], [0.4, -0.2], [-0.3, 0.5], [0.2, 0.7]];
     let covariance = MarginalSlopeCovariance::LowRank(factor);
