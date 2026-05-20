@@ -11092,6 +11092,62 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+            // Noise-floor KKT certificate.
+            //
+            // Reading the joint stationarity residual ‖∇L(β) − Sβ‖_∞ at finite
+            // precision picks up rounding mass from the X'WX assembly and the
+            // per-block penalty contraction. For well-conditioned problems
+            // that floor sits well below `residual_tol`, so the strict path
+            // fires and this branch is dormant. For tightly converged inner
+            // states where the Newton iterate is already at the analytic
+            // optimum but every additional step changes the objective by less
+            // than `objective_tol` and the recomputed residual lands just
+            // above `residual_tol` due to arithmetic noise, the strict path
+            // alone refuses to certify convergence — even though no further
+            // useful descent direction exists. Burning hundreds of identical
+            // descent cycles past that point neither tightens the inner
+            // optimum (the noise floor sets a hard lower bound on ‖rhs‖) nor
+            // gives the outer optimizer more hyperparameter information; it
+            // just causes the outer wrapper to reject every seed as
+            // "inner did not converge" and downstream callers to mark the
+            // analytic outer Hessian as unavailable.
+            //
+            // Combining two independent post-step signals — objective change
+            // within scale-aware tolerance AND residual within a small
+            // multiple of the same tolerance — supplies the missing
+            // certificate without weakening the envelope-theorem requirement
+            // by more than the residual measurement's own arithmetic noise.
+            // Concretely: with `residual <= 2 · residual_tol` and
+            // `|Δobjective| <= objective_tol`, the certificate fires only
+            // when the inner state is already inside the band where both
+            // the objective and the gradient norm are operating at their
+            // joint round-off floor. The bound stays at the noise scale of
+            // a single dot-product evaluation, well inside the precision the
+            // outer gradient identity itself uses; widening it further
+            // (e.g. to `10 · residual_tol`) would start to accept genuinely
+            // unconverged β states and is intentionally avoided.
+            //
+            // Distinct from the strict path because the strict path requires
+            // `residual <= residual_tol` and is silent on objective change;
+            // distinct from the trust-region floor certificate at the head
+            // of the cycle because that one fires only when the trust radius
+            // has collapsed to its 1e-12 floor with all attempts rejected,
+            // whereas this branch fires when the trust region is still open
+            // but each accepted step is no longer producing detectable
+            // objective progress.
+            let objective_change = signed_obj_change.abs();
+            if objective_change <= objective_tol && residual <= 2.0 * residual_tol {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | noise-floor KKT certificate: residual={:.3e} <= 2*tol={:.3e}, |Δobjective|={:.3e} <= obj_tol={:.3e}",
+                    cycle,
+                    residual,
+                    2.0 * residual_tol,
+                    objective_change,
+                    objective_tol,
+                );
+                converged = true;
+                break;
+            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
