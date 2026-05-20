@@ -92,15 +92,40 @@ fn libcuda_loadable() -> bool {
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
-        if unsafe { cudarc::cublas::sys::is_culib_present() } {
+        // First pass: try cudarc's normal loader without any preload.
+        // `is_culib_present` dlopens its probe handles transiently
+        // (Drop → dlclose), so on success we *also* force-init the
+        // persistent `culib()` handle below — that way the mapping
+        // visible to `detect_cuda_library_conflicts` is exactly the
+        // one CudaBlas::new will use, not a transient probe.
+        if unsafe { cudarc::cublas::sys::is_culib_present() }
+            && force_init_culib_persistent()
+        {
             return verify_no_cuda_library_conflicts();
         }
+        // Fall back to the bundled-wheel preload only if the system
+        // stack is genuinely unreachable.
         preload_packaged_cuda_libraries();
-        if !unsafe { cudarc::cublas::sys::is_culib_present() } {
+        if !force_init_culib_persistent() {
             return false;
         }
         verify_no_cuda_library_conflicts()
     })
+}
+
+/// Force `cudarc::cublas::sys::culib()` to initialise its process-wide
+/// `OnceLock<Library>` so libcublas stays mapped for the rest of the
+/// process — guaranteeing that subsequent `/proc/self/maps` scans see
+/// the same file `CudaBlas::new` will dispatch through.
+///
+/// `culib()` panics with `panic_no_lib_found` when no candidate name
+/// is dlopen'able, so the call is wrapped in `catch_unwind` to convert
+/// that into a clean `false` instead of an unrecoverable abort.
+fn force_init_culib_persistent() -> bool {
+    let outcome = std::panic::catch_unwind(|| unsafe {
+        let _ = cudarc::cublas::sys::culib();
+    });
+    outcome.is_ok()
 }
 
 /// Linux-only defensive scan: refuse cuBLAS work if more than one
