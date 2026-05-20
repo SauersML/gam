@@ -647,7 +647,8 @@ pub struct OuterCapability {
     /// When present, EFS is still eligible at plan time, but the EFS iteration
     /// loop performs a quantitative check each step: if
     /// `barrier_curvature_is_significant(β, ref_diag, threshold)` fires, EFS
-    /// bails out early and the result is finalized at the current rho.
+    /// is abandoned and the fallback ladder routes to a first-order joint
+    /// optimizer.
     ///
     /// Previously this was a binary `barrier_active: bool` that unconditionally
     /// blocked EFS. The quantitative check allows EFS when constraints exist but
@@ -1060,12 +1061,11 @@ impl std::fmt::Display for OuterPlan {
 impl OuterPlan {
     /// Stable, grep-friendly routing token for biobank/log regression
     /// assertions. Emits `solver=<Solver>;hessian=<Source>;matrix-free=<bool>`.
-    /// `matrix-free=true` is reported when the plan keeps
-    /// `HessianSource::Analytic` (runtime may then use operator HVPs);
-    /// the BFGS/EFS variants report `matrix-free=false` because no Hessian
-    /// operator is supplied to the runner.
+    /// Planning alone does not prove the runtime Hessian representation;
+    /// matrix-free routing is decided after the seed evaluation returns an
+    /// operator Hessian, so the static plan token reports `false`.
     pub fn routing_log_line(&self) -> String {
-        let matrix_free = matches!(self.hessian_source, HessianSource::Analytic);
+        let matrix_free = false;
         format!(
             "solver={:?};hessian={:?};matrix-free={}",
             self.solver, self.hessian_source, matrix_free
@@ -1986,7 +1986,9 @@ struct OuterFirstOrderBridge<'a> {
     /// stable inner tolerance — Wolfe conditions assume constant cost
     /// noise within a bracket.
     outer_inner_cap: Option<InnerProgressFeedback>,
-    /// Counts accepted gradient evaluations (one per BFGS outer iter).
+    /// Counts gradient evaluations for logging only. Inner-PIRLS scheduling
+    /// uses `InnerProgressFeedback.accepted_iter` so rejected line-search
+    /// probes do not relax the inner work budget.
     iter_count: usize,
     /// First observed `‖g‖` from `eval_grad`. Used by the schedule to
     /// compute the gradient-ratio (`last / initial`) — when the ratio
@@ -2964,14 +2966,29 @@ struct OuterOperatorBridge<'a> {
     layout: OuterThetaLayout,
     /// Inner-PIRLS cap atomic, mirroring the BFGS / ARC bridges.
     outer_inner_cap: Option<InnerProgressFeedback>,
-    /// Counts gradient/Hessian evaluations for the inner-cap schedule
-    /// and progress logs.
+    /// Counts gradient/Hessian evaluations for progress logs. Inner-cap
+    /// scheduling uses accepted outer iterations from `outer_inner_cap`.
     eval_count: usize,
     /// First observed `‖g‖`. Used by the inner-cap schedule's
     /// gradient-ratio gate.
     g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval.
     last_g_norm: Option<f64>,
+}
+
+impl OuterOperatorBridge<'_> {
+    fn update_inner_cap_from_accepted_iter(&mut self) {
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let snapshot = feedback.snapshot();
+            let accepted_iter = feedback.accepted_iter.load(Ordering::Relaxed);
+            let cap = first_order_inner_cap_schedule(accepted_iter, g_ratio, snapshot);
+            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
+        }
+    }
 }
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
@@ -2989,6 +3006,7 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
 impl FirstOrderObjective for OuterOperatorBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
+        self.update_inner_cap_from_accepted_iter();
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
@@ -3021,21 +3039,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         x: &Array1<f64>,
     ) -> Result<OperatorSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        // Drive the outer-aware inner-PIRLS cap, mirroring
-        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each
-        // accepted outer iter calls eval_value_grad_op exactly once
-        // (the matrix-free TR's inner CG uses HVPs, not full
-        // evaluations), so we increment per call without the /2 the
-        // ARC bridge needs.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
-                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
-                _ => None,
-            };
-            let snapshot = feedback.snapshot();
-            let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
-        }
+        self.update_inner_cap_from_accepted_iter();
         let stage_start = std::time::Instant::now();
         log::info!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
@@ -3169,6 +3173,7 @@ struct OuterFixedPointBridge<'a> {
     obj: &'a mut dyn OuterObjective,
     layout: OuterThetaLayout,
     barrier_config: Option<BarrierConfig>,
+    fixed_point_tolerance: f64,
     /// Consecutive HybridEFS iterations whose ψ block was zeroed after
     /// exhausting backtracking. When this reaches
     /// [`MAX_CONSECUTIVE_PSI_STAGNATION`], the bridge surfaces the
@@ -6478,7 +6483,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_log_line_arc_analytic_advertises_matrix_free() {
+    fn routing_log_line_arc_analytic_does_not_advertise_matrix_free() {
         // Token pinned by tests/bench_biobank_scale_runner_test.py. Renaming
         // any of these substrings is a log-regression and breaks downstream
         // grep patterns.
@@ -6489,7 +6494,7 @@ mod tests {
         let line = p.routing_log_line();
         assert!(line.contains("solver=Arc"), "got {line}");
         assert!(line.contains("hessian=Analytic"), "got {line}");
-        assert!(line.contains("matrix-free=true"), "got {line}");
+        assert!(line.contains("matrix-free=false"), "got {line}");
     }
 
     #[test]

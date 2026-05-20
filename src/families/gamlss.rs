@@ -3653,6 +3653,16 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     let outer = problem
         .run(&mut obj, "binomial mean wiggle exact spatial hyper")
         .map_err(|e| e.to_string())?;
+    if !outer.converged {
+        return Err(format!(
+            "binomial mean wiggle exact spatial hyper did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            outer.iterations,
+            outer.final_value,
+            outer
+                .final_grad_norm
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+        ));
+    }
     let theta_star = outer.rho;
 
     let log_kappa =

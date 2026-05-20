@@ -453,9 +453,8 @@ fn build_per_z_score_warp_aux_blockspec(
             for penalty_idx in 0..penalties_per_coord {
                 let flat_idx = coord * penalties_per_coord + penalty_idx;
                 let label = format!("score_warp_dev[z{coord}].penalty{penalty_idx}");
-                spec.penalties[flat_idx] = spec.penalties[flat_idx]
-                    .clone()
-                    .with_precision_label(label);
+                spec.penalties[flat_idx] =
+                    spec.penalties[flat_idx].clone().with_precision_label(label);
             }
         }
     }
@@ -3254,11 +3253,6 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
-    #[inline]
-    fn z_scalar(&self, row: usize) -> f64 {
-        self.z[[row, 0]]
-    }
-
     fn z_subsample_key(&self) -> Array1<f64> {
         self.z.column(0).to_owned()
     }
@@ -3372,7 +3366,9 @@ impl SurvivalMarginalSlopeFamily {
         for coord in 0..self.score_dim() {
             let local_beta = score_warp_component_beta(runtime, beta_h, coord)?;
             let z_coord = self.z[[row, coord]];
-            value += runtime.local_cubic_at(&local_beta, z_coord)?.evaluate(z_coord);
+            value += runtime
+                .local_cubic_at(&local_beta, z_coord)?
+                .evaluate(z_coord);
         }
         Ok(value)
     }
@@ -3466,7 +3462,10 @@ impl SurvivalMarginalSlopeFamily {
                 3 + k
             ));
         }
-        Ok((self.z.row(row).sum(), self.shared_logslope_covariance_scale()?))
+        Ok((
+            self.z.row(row).sum(),
+            self.shared_logslope_covariance_scale()?,
+        ))
     }
 
     fn row_primary_closed_form_rigid(
@@ -3634,9 +3633,10 @@ impl SurvivalMarginalSlopeFamily {
                 );
             return total;
         }
-        // True fast path: closed-form scalar NLL for K=1; covariance-aware
-        // value-only vector path for K>1. Derivative paths still use the
-        // scalar closed form until their block Jacobians are expanded.
+        // True fast path: K=1 keeps the original scalar closed form; K>1
+        // uses the covariance-aware vector likelihood. Exact rigid
+        // gradient/Hessian paths below use the same c(a)=sqrt(1+r'Sigma r)
+        // algebra through `row_primary_closed_form_rigid`.
         let guard = self.derivative_guard;
         let probit_scale = self.probit_frailty_scale();
         let score_dim = self.score_dim();
@@ -6034,10 +6034,9 @@ impl SurvivalMarginalSlopeFamily {
         let mut chi_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let r_uv = self
-                    .observed_fixed_eta_second_partial(
-                        primary, &obs, row, u, v, z_obs, u_obs, a, b,
-                    )?;
+                let r_uv = self.observed_fixed_eta_second_partial(
+                    primary, &obs, row, u, v, z_obs, u_obs, a, b,
+                )?;
                 let chi_uv_fixed = self
                     .observed_fixed_chi_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
 
@@ -6448,7 +6447,8 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[[row, 0]];
+        let (z_sum, covariance_ones) =
+            self.exact_shared_score_summary(row, block_states, "row_neglog_directional_refs")?;
 
         // Primary scalar jets: q0, q1, qd1, g.
         // Stack-allocated fixed-capacity buffers (k ≤ 4 by precondition above)
@@ -6485,8 +6485,9 @@ impl SurvivalMarginalSlopeFamily {
         // The observed slope seen by the probit likelihood is the frailty-scaled
         // raw logslope coefficient.
         let observed_g_jet = g_jet.scale(self.probit_frailty_scale());
-        // c = sqrt(1 + observed_g^2)
-        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        // c = sqrt(1 + observed_g^2 * 1' Sigma 1) for a shared K-vector slope.
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0)
+            .add(&observed_g_jet.mul(&observed_g_jet).scale(covariance_ones));
         let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
 
         // a0 = q0 * c, a1 = q1 * c, ad1 = qd1 * c
@@ -6494,8 +6495,8 @@ impl SurvivalMarginalSlopeFamily {
         let a1_jet = q1_jet.mul(&c_jet);
         let ad1_jet = qd1_jet.mul(&c_jet);
 
-        // eta0 = a0 + observed_g * z, eta1 = a1 + observed_g * z
-        let z_jet = MultiDirJet::constant(k, zi);
+        // eta0 = a0 + observed_g * 1'z, eta1 = a1 + observed_g * 1'z.
+        let z_jet = MultiDirJet::constant(k, z_sum);
         let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
         let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
 
@@ -6592,7 +6593,11 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[[row, 0]];
+        let (z_sum, covariance_ones) = self.exact_shared_score_summary(
+            row,
+            block_states,
+            "row_neglog_directional_jet_batched",
+        )?;
 
         // Primary scalar jets: q0, q1, qd1, g. Fixed-capacity stack buffers
         // (k ≤ 8) avoid heap allocation in the per-row hot loop.
@@ -6625,15 +6630,16 @@ impl SurvivalMarginalSlopeFamily {
 
         // observed_g = frailty_scale * g
         let observed_g_jet = g_jet.scale(self.probit_frailty_scale());
-        // c = sqrt(1 + observed_g^2)
-        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        // c = sqrt(1 + observed_g^2 * 1' Sigma 1) for a shared K-vector slope.
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0)
+            .add(&observed_g_jet.mul(&observed_g_jet).scale(covariance_ones));
         let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
 
         let a0_jet = q0_jet.mul(&c_jet);
         let a1_jet = q1_jet.mul(&c_jet);
         let ad1_jet = qd1_jet.mul(&c_jet);
 
-        let z_jet = MultiDirJet::constant(k, zi);
+        let z_jet = MultiDirJet::constant(k, z_sum);
         let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
         let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
 
@@ -9955,6 +9961,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_third_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir.len() != p {
@@ -10121,6 +10128,7 @@ impl SurvivalMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_fourth_contracted_exact")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir_u.len() != p || dir_v.len() != p {
@@ -17387,6 +17395,80 @@ mod tests {
             .zip(rhs.iter())
             .map(|(left, right)| (left - right).abs())
             .fold(0.0_f64, f64::max)
+    }
+
+    #[test]
+    fn rigid_shared_multi_z_row_kernel_matches_vector_value_and_finite_differences() {
+        let covariance = MarginalSlopeCovariance::Full(array![[1.3, 0.4], [0.4, 0.7]]);
+        let z = [0.6, -1.1];
+        let params = [0.15, 0.55, 0.9, -0.22];
+        let weight = 1.3;
+        let event = 1.0;
+        let derivative_guard = 1e-6;
+        let probit_scale = 0.85;
+        let covariance_ones = covariance.quadratic_form(&[1.0, 1.0]).expect("1'Sigma1");
+        let z_sum = z.iter().sum::<f64>();
+
+        let eval = |p: [f64; 4]| {
+            row_primary_closed_form_shared_score(
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                z_sum,
+                covariance_ones,
+                weight,
+                event,
+                derivative_guard,
+                probit_scale,
+            )
+            .expect("shared-score row kernel")
+        };
+
+        let (nll, grad, hess) = eval(params);
+        let vector_nll = survival_marginal_slope_vector_neglog(
+            params[0],
+            params[1],
+            params[2],
+            &[params[3], params[3]],
+            &z,
+            &covariance,
+            weight,
+            event,
+            derivative_guard,
+            probit_scale,
+        )
+        .expect("vector row value");
+        assert!(
+            (nll - vector_nll).abs() <= 1e-14,
+            "shared row nll={nll:.17e} vector nll={vector_nll:.17e}"
+        );
+
+        let step = 1e-5;
+        for axis in 0..4 {
+            let mut plus = params;
+            let mut minus = params;
+            plus[axis] += step;
+            minus[axis] -= step;
+            let (nll_plus, grad_plus, _) = eval(plus);
+            let (nll_minus, grad_minus, _) = eval(minus);
+            let fd_grad = (nll_plus - nll_minus) / (2.0 * step);
+            assert!(
+                (grad[axis] - fd_grad).abs() <= 2e-6,
+                "grad[{axis}] analytic={:.12e} fd={:.12e}",
+                grad[axis],
+                fd_grad
+            );
+            for row in 0..4 {
+                let fd_hess = (grad_plus[row] - grad_minus[row]) / (2.0 * step);
+                assert!(
+                    (hess[row][axis] - fd_hess).abs() <= 3e-5,
+                    "hess[{row},{axis}] analytic={:.12e} fd={:.12e}",
+                    hess[row][axis],
+                    fd_hess
+                );
+            }
+        }
     }
 
     fn assert_blockwise_matches_joint_principal_blocks(

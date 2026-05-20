@@ -549,7 +549,13 @@ where
         .with_tolerance(1e-4)
         .with_max_iter(60)
         .with_bounds(lower, upper)
-        .with_heuristic_lambdas(seed.to_vec());
+        .with_initial_rho(seed.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            num_auxiliary_trailing: dim,
+            ..Default::default()
+        });
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
@@ -585,6 +591,12 @@ where
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
+    if !result.converged {
+        return Err(format!(
+            "{context} did not converge after {} iterations (final_objective={:.6e})",
+            result.iterations, result.final_value
+        ));
+    }
     survival_baseline_config_from_theta(target, &result.rho)
 }
 
@@ -623,7 +635,13 @@ where
         .with_tolerance(1e-4)
         .with_max_iter(240)
         .with_bounds(lower, upper)
-        .with_heuristic_lambdas(seed.to_vec());
+        .with_initial_rho(seed.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            num_auxiliary_trailing: dim,
+            ..Default::default()
+        });
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
     let cost_objective = std::rc::Rc::clone(&objective);
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
@@ -673,6 +691,12 @@ where
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
+    if !result.converged {
+        return Err(format!(
+            "{context} did not converge after {} iterations (final_objective={:.6e})",
+            result.iterations, result.final_value
+        ));
+    }
     survival_baseline_config_from_theta(target, &result.rho)
 }
 
@@ -701,7 +725,13 @@ where
         .with_tolerance(1e-4)
         .with_max_iter(240)
         .with_bounds(lower, upper)
-        .with_heuristic_lambdas(seed.to_vec());
+        .with_initial_rho(seed.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            num_auxiliary_trailing: dim,
+            ..Default::default()
+        });
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
     let cost_objective = std::rc::Rc::clone(&objective);
     let cost_fn = move |_: &mut (), theta: &ndarray::Array1<f64>| {
@@ -765,6 +795,12 @@ where
     let result = problem
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
+    if !result.converged {
+        return Err(format!(
+            "{context} did not converge after {} iterations (final_objective={:.6e})",
+            result.iterations, result.final_value
+        ));
+    }
     survival_baseline_config_from_theta(target, &result.rho)
 }
 
