@@ -8475,49 +8475,49 @@ mod tests {
                 "cached rho (idx {c}) must precede initial_rho (idx {i})",
             );
         }
+    }
 
-        #[test]
-        fn exact_final_cache_hit_skips_outer_validation() {
-            let (_d, session) = tmp_cache_session("final-skip");
-            let payload = encode_iterate(&array![2.5], 0.25, 7).expect("encode");
-            session.finalize(&payload, Some(0.25), Some(7));
+    #[test]
+    fn exact_final_cache_hit_skips_outer_validation() {
+        let (_d, session) = tmp_cache_session("final-skip");
+        let payload = encode_iterate(&array![2.5], 0.25, 7).expect("encode");
+        session.finalize(&payload, Some(0.25), Some(7));
 
-            let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
-            let problem = OuterProblem::new(1)
-                .with_solver_class(SolverClass::AuxiliaryGradientFree)
-                .with_bounds(array![-5.0], array![5.0])
-                .with_initial_rho(array![-3.0])
-                .with_max_iter(8)
-                .with_cache_session(Arc::clone(&session));
-            let mut obj = problem.build_objective(
-                seen.clone(),
-                |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
-                    seen.lock().unwrap().push(theta.clone());
-                    Ok((theta[0] - 2.5).powi(2))
-                },
-                |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
-                    Err(EstimationError::InvalidInput("eval not used".into()))
-                },
-                None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
-                None::<
-                    fn(
-                        &mut Arc<Mutex<Vec<Array1<f64>>>>,
-                        &Array1<f64>,
-                    ) -> Result<EfsEval, EstimationError>,
-                >,
-            );
+        let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let problem = OuterProblem::new(1)
+            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_bounds(array![-5.0], array![5.0])
+            .with_initial_rho(array![-3.0])
+            .with_max_iter(8)
+            .with_cache_session(Arc::clone(&session));
+        let mut obj = problem.build_objective(
+            seen.clone(),
+            |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                seen.lock().unwrap().push(theta.clone());
+                Ok((theta[0] - 2.5).powi(2))
+            },
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput("eval not used".into()))
+            },
+            None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
+            None::<
+                fn(
+                    &mut Arc<Mutex<Vec<Array1<f64>>>>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        );
 
-            let result = problem
-                .run(&mut obj, "final-skip")
-                .expect("final exact hit should return cached outer result");
-            assert_eq!(result.rho, array![2.5]);
-            assert_eq!(result.final_value, 0.25);
-            assert_eq!(result.iterations, 7);
-            assert!(result.converged);
-            assert!(
-                seen.lock().unwrap().is_empty(),
-                "exact final hit should not evaluate the outer objective"
-            );
-        }
+        let result = problem
+            .run(&mut obj, "final-skip")
+            .expect("final exact hit should return cached outer result");
+        assert_eq!(result.rho, array![2.5]);
+        assert_eq!(result.final_value, 0.25);
+        assert_eq!(result.iterations, 7);
+        assert!(result.converged);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "exact final hit should not evaluate the outer objective"
+        );
     }
 }
