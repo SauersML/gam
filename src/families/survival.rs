@@ -152,6 +152,207 @@ impl PenaltyBlocks {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CauseSpecificSurvivalExpanded {
+    pub cause_count: usize,
+    pub base_coefficient_dim: usize,
+    pub age_entry: Array1<f64>,
+    pub age_exit: Array1<f64>,
+    pub event_target: Array1<u8>,
+    pub event_competing: Array1<u8>,
+    pub sampleweight: Array1<f64>,
+    pub x_entry: Array2<f64>,
+    pub x_exit: Array2<f64>,
+    pub x_derivative: Array2<f64>,
+    pub offset_eta_entry: Array1<f64>,
+    pub offset_eta_exit: Array1<f64>,
+    pub offset_derivative_exit: Array1<f64>,
+}
+
+pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8, String> {
+    const INTEGER_TOL: f64 = 1e-8;
+    const MAX_AUTO_CAUSES: u8 = 32;
+    if !value.is_finite() {
+        return Err(format!(
+            "survival event value at row {} is non-finite",
+            row_index + 1
+        ));
+    }
+    if value < 0.0 {
+        return Err(format!(
+            "survival event value at row {} is negative: {value}",
+            row_index + 1
+        ));
+    }
+    let rounded = value.round();
+    if (value - rounded).abs() > INTEGER_TOL {
+        return Err(format!(
+            "survival event value at row {} must be an integer code with 0=censored, got {value}",
+            row_index + 1
+        ));
+    }
+    if rounded > f64::from(MAX_AUTO_CAUSES) {
+        return Err(format!(
+            "survival event value at row {} has code {rounded}; automatic competing-risks detection supports codes 0..={MAX_AUTO_CAUSES}",
+            row_index + 1
+        ));
+    }
+    Ok(rounded as u8)
+}
+
+pub fn cause_count_from_event_codes(event_codes: ArrayView1<'_, u8>) -> usize {
+    event_codes
+        .iter()
+        .copied()
+        .max()
+        .map(usize::from)
+        .unwrap_or(0)
+        .max(1)
+}
+
+pub fn expand_cause_specific_penalty_blocks(
+    penalties: &PenaltyBlocks,
+    cause_count: usize,
+    base_coefficient_dim: usize,
+) -> Result<PenaltyBlocks, SurvivalError> {
+    if cause_count <= 1 {
+        return Ok(penalties.clone());
+    }
+    if base_coefficient_dim == 0 {
+        return Err(SurvivalError::DimensionMismatch);
+    }
+    let joint_dim = cause_count * base_coefficient_dim;
+    let mut expanded = Vec::with_capacity(penalties.blocks.len());
+    for block in &penalties.blocks {
+        if block.range.start > block.range.end || block.range.end > base_coefficient_dim {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        let block_dim = block.range.end - block.range.start;
+        if block.matrix.nrows() != block_dim || block.matrix.ncols() != block_dim {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        let mut matrix = Array2::<f64>::zeros((joint_dim, joint_dim));
+        for cause in 0..cause_count {
+            let dst_start = cause * base_coefficient_dim + block.range.start;
+            let dst_end = dst_start + block_dim;
+            matrix
+                .slice_mut(ndarray::s![dst_start..dst_end, dst_start..dst_end])
+                .assign(&block.matrix);
+        }
+        expanded.push(PenaltyBlock {
+            matrix,
+            lambda: block.lambda,
+            range: 0..joint_dim,
+            nullspace_dim: block.nullspace_dim * cause_count,
+        });
+    }
+    Ok(PenaltyBlocks::new(expanded))
+}
+
+pub fn expand_cause_specific_survival_flat_inputs(
+    age_entry: ArrayView1<'_, f64>,
+    age_exit: ArrayView1<'_, f64>,
+    event_codes: ArrayView1<'_, u8>,
+    sampleweight: ArrayView1<'_, f64>,
+    x_entry: ArrayView2<'_, f64>,
+    x_exit: ArrayView2<'_, f64>,
+    x_derivative: ArrayView2<'_, f64>,
+    offsets: Option<SurvivalBaselineOffsets<'_>>,
+) -> Result<CauseSpecificSurvivalExpanded, SurvivalError> {
+    let n = event_codes.len();
+    let p = x_exit.ncols();
+    if age_entry.len() != n
+        || age_exit.len() != n
+        || sampleweight.len() != n
+        || x_entry.nrows() != n
+        || x_exit.nrows() != n
+        || x_derivative.nrows() != n
+        || x_entry.ncols() != p
+        || x_derivative.ncols() != p
+    {
+        return Err(SurvivalError::DimensionMismatch);
+    }
+    let cause_count = cause_count_from_event_codes(event_codes);
+    let joint_n = n * cause_count;
+    let joint_p = p * cause_count;
+    let mut joint_age_entry = Array1::<f64>::zeros(joint_n);
+    let mut joint_age_exit = Array1::<f64>::zeros(joint_n);
+    let mut joint_event_target = Array1::<u8>::zeros(joint_n);
+    let mut joint_event_competing = Array1::<u8>::zeros(joint_n);
+    let mut joint_weights = Array1::<f64>::zeros(joint_n);
+    let mut joint_x_entry = Array2::<f64>::zeros((joint_n, joint_p));
+    let mut joint_x_exit = Array2::<f64>::zeros((joint_n, joint_p));
+    let mut joint_x_derivative = Array2::<f64>::zeros((joint_n, joint_p));
+    let mut joint_offset_entry = Array1::<f64>::zeros(joint_n);
+    let mut joint_offset_exit = Array1::<f64>::zeros(joint_n);
+    let mut joint_offset_derivative = Array1::<f64>::zeros(joint_n);
+    let (offset_entry, offset_exit, offset_derivative) = if let Some(offsets) = offsets {
+        if offsets.eta_entry.len() != n
+            || offsets.eta_exit.len() != n
+            || offsets.derivative_exit.len() != n
+        {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        (
+            Some(offsets.eta_entry),
+            Some(offsets.eta_exit),
+            Some(offsets.derivative_exit),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    for cause in 0..cause_count {
+        let row_start = cause * n;
+        let col_start = cause * p;
+        let col_end = col_start + p;
+        let cause_code = (cause + 1) as u8;
+        for i in 0..n {
+            let dst = row_start + i;
+            joint_age_entry[dst] = age_entry[i];
+            joint_age_exit[dst] = age_exit[i];
+            joint_weights[dst] = sampleweight[i];
+            let observed = event_codes[i];
+            joint_event_target[dst] = u8::from(observed == cause_code);
+            joint_event_competing[dst] = u8::from(observed != 0 && observed != cause_code);
+            joint_x_entry
+                .slice_mut(ndarray::s![dst, col_start..col_end])
+                .assign(&x_entry.row(i));
+            joint_x_exit
+                .slice_mut(ndarray::s![dst, col_start..col_end])
+                .assign(&x_exit.row(i));
+            joint_x_derivative
+                .slice_mut(ndarray::s![dst, col_start..col_end])
+                .assign(&x_derivative.row(i));
+            if let Some(offset) = offset_entry.as_ref() {
+                joint_offset_entry[dst] = offset[i];
+            }
+            if let Some(offset) = offset_exit.as_ref() {
+                joint_offset_exit[dst] = offset[i];
+            }
+            if let Some(offset) = offset_derivative.as_ref() {
+                joint_offset_derivative[dst] = offset[i];
+            }
+        }
+    }
+
+    Ok(CauseSpecificSurvivalExpanded {
+        cause_count,
+        base_coefficient_dim: p,
+        age_entry: joint_age_entry,
+        age_exit: joint_age_exit,
+        event_target: joint_event_target,
+        event_competing: joint_event_competing,
+        sampleweight: joint_weights,
+        x_entry: joint_x_entry,
+        x_exit: joint_x_exit,
+        x_derivative: joint_x_derivative,
+        offset_eta_entry: joint_offset_entry,
+        offset_eta_exit: joint_offset_exit,
+        offset_derivative_exit: joint_offset_derivative,
+    })
+}
+
 fn compress_positive_collinear_constraints(
     a: &Array2<f64>,
     b: &Array1<f64>,

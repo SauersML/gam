@@ -202,7 +202,23 @@ impl InverseLink {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RhoPrior {
     Flat,
-    Normal { mean: f64, sd: f64 },
+    Normal {
+        mean: f64,
+        sd: f64,
+    },
+    /// Gamma(shape, rate) conjugate prior on the precision λ = exp(ρ).
+    ///
+    /// The REML/LAML objective is minimized, so this contributes
+    /// `rate * exp(ρ) - shape * ρ` up to an additive constant. With the
+    /// Gaussian penalty normalization this yields the conjugate precision
+    /// update `(shape + rank/2, rate + β'Sβ/2)`.
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
+    /// Coordinate-specific priors for models whose smoothing parameters do
+    /// not share one prior family, such as nested coefficient groups.
+    Independent(Vec<RhoPrior>),
 }
 
 impl Default for RhoPrior {

@@ -11073,9 +11073,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|x: &f64| x.abs())
                 .fold(0.0_f64, f64::max);
             let pen_inf = {
-                let mut beta_joint = Array1::<f64>::zeros(
-                    states.iter().map(|s| s.beta.len()).sum::<usize>(),
-                );
+                let mut beta_joint =
+                    Array1::<f64>::zeros(states.iter().map(|s| s.beta.len()).sum::<usize>());
                 let mut offset = 0usize;
                 for state in &states {
                     let len = state.beta.len();
@@ -11097,7 +11096,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 };
                 let pen_vec =
                     apply_joint_block_penalty(&block_ranges, &s_lambdas, &beta_joint, 0.0);
-                pen_vec.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max)
+                pen_vec
+                    .iter()
+                    .map(|x: &f64| x.abs())
+                    .fold(0.0_f64, f64::max)
             };
             let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
 

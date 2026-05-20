@@ -927,6 +927,16 @@ impl TermCollectionDesign {
         self.penalties.len()
     }
 
+    /// Resolve coefficient groups against this design's global coefficient
+    /// layout and append their penalties after the existing term penalties.
+    pub fn realize_coefficient_groups(
+        &self,
+        groups: &[CoefficientGroupSpec],
+        base_prior: &crate::types::RhoPrior,
+    ) -> Result<RealizedCoefficientGroups, BasisError> {
+        realize_coefficient_groups(self, groups, base_prior)
+    }
+
     /// Extract a `KroneckerPenaltySystem` if exactly one smooth term has
     /// Kronecker structure and it accounts for all penalties.
     ///
@@ -961,6 +971,260 @@ impl TermCollectionDesign {
         )
         .ok()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CoefficientSelector {
+    /// Explicit global coefficient indices in the realized design matrix.
+    GlobalColumns(Vec<usize>),
+    /// A half-open global coefficient range.
+    GlobalRange(Range<usize>),
+    LinearTerm(String),
+    RandomEffectTerm(String),
+    SmoothTerm(String),
+    /// Selected basis columns within one smooth term.
+    SmoothTermColumns {
+        term: String,
+        columns: Vec<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CoefficientGroupPrior {
+    Flat,
+    NormalLogPrecision { mean: f64, sd: f64 },
+    GammaPrecision { shape: f64, rate: f64 },
+}
+
+impl CoefficientGroupPrior {
+    fn to_rho_prior(&self) -> crate::types::RhoPrior {
+        match *self {
+            Self::Flat => crate::types::RhoPrior::Flat,
+            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
+            Self::GammaPrecision { shape, rate } => {
+                crate::types::RhoPrior::GammaPrecision { shape, rate }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoefficientGroupSpec {
+    pub name: String,
+    pub selectors: Vec<CoefficientSelector>,
+    pub parent: Option<String>,
+    pub prior: Option<CoefficientGroupPrior>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RealizedCoefficientGroups {
+    pub penalty_specs: Vec<PenaltySpec>,
+    pub nullspace_dims: Vec<usize>,
+    pub rho_prior: crate::types::RhoPrior,
+    pub group_column_indices: Vec<(String, Vec<usize>)>,
+}
+
+fn combine_group_rho_prior(
+    base_prior: &crate::types::RhoPrior,
+    base_count: usize,
+    groups: &[CoefficientGroupSpec],
+) -> crate::types::RhoPrior {
+    let mut priors = Vec::with_capacity(base_count + groups.len());
+    priors.extend((0..base_count).map(|_| base_prior.clone()));
+    priors.extend(groups.iter().map(|group| {
+        group
+            .prior
+            .as_ref()
+            .map(CoefficientGroupPrior::to_rho_prior)
+            .unwrap_or_else(|| base_prior.clone())
+    }));
+    crate::types::RhoPrior::Independent(priors)
+}
+
+fn insert_range(
+    cols: &mut BTreeSet<usize>,
+    range: Range<usize>,
+    p: usize,
+    context: &str,
+) -> Result<(), BasisError> {
+    if range.end > p {
+        return Err(BasisError::DimensionMismatch(format!(
+            "{context} coefficient range {}..{} exceeds design width {p}",
+            range.start, range.end
+        )));
+    }
+    cols.extend(range);
+    Ok(())
+}
+
+fn resolve_group_columns(
+    design: &TermCollectionDesign,
+    group: &CoefficientGroupSpec,
+) -> Result<BTreeSet<usize>, BasisError> {
+    let p = design.design.ncols();
+    let mut cols = BTreeSet::<usize>::new();
+    for selector in &group.selectors {
+        match selector {
+            CoefficientSelector::GlobalColumns(indices) => {
+                for &idx in indices {
+                    if idx >= p {
+                        return Err(BasisError::DimensionMismatch(format!(
+                            "coefficient group '{}' references global column {idx}, but design width is {p}",
+                            group.name
+                        )));
+                    }
+                    cols.insert(idx);
+                }
+            }
+            CoefficientSelector::GlobalRange(range) => insert_range(
+                &mut cols,
+                range.clone(),
+                p,
+                &format!("coefficient group '{}'", group.name),
+            )?,
+            CoefficientSelector::LinearTerm(name) => {
+                let (_, range) = design
+                    .linear_ranges
+                    .iter()
+                    .find(|(term, _)| term == name)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "coefficient group '{}' references unknown linear term '{name}'",
+                            group.name
+                        ))
+                    })?;
+                insert_range(&mut cols, range.clone(), p, &group.name)?;
+            }
+            CoefficientSelector::RandomEffectTerm(name) => {
+                let (_, range) = design
+                    .random_effect_ranges
+                    .iter()
+                    .find(|(term, _)| term == name)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "coefficient group '{}' references unknown random-effect term '{name}'",
+                            group.name
+                        ))
+                    })?;
+                insert_range(&mut cols, range.clone(), p, &group.name)?;
+            }
+            CoefficientSelector::SmoothTerm(name) => {
+                let term = design
+                    .smooth
+                    .terms
+                    .iter()
+                    .find(|term| &term.name == name)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "coefficient group '{}' references unknown smooth term '{name}'",
+                            group.name
+                        ))
+                    })?;
+                let start = p - design.smooth.total_smooth_cols() + term.coeff_range.start;
+                insert_range(
+                    &mut cols,
+                    start..(start + term.coeff_range.len()),
+                    p,
+                    &group.name,
+                )?;
+            }
+            CoefficientSelector::SmoothTermColumns { term, columns } => {
+                let smooth_term = design
+                    .smooth
+                    .terms
+                    .iter()
+                    .find(|smooth_term| &smooth_term.name == term)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "coefficient group '{}' references unknown smooth term '{term}'",
+                            group.name
+                        ))
+                    })?;
+                let smooth_start = p - design.smooth.total_smooth_cols();
+                for &local_col in columns {
+                    if local_col >= smooth_term.coeff_range.len() {
+                        return Err(BasisError::DimensionMismatch(format!(
+                            "coefficient group '{}' references smooth term '{term}' local column {local_col}, but the term has {} columns",
+                            group.name,
+                            smooth_term.coeff_range.len()
+                        )));
+                    }
+                    cols.insert(smooth_start + smooth_term.coeff_range.start + local_col);
+                }
+            }
+        }
+    }
+    if cols.is_empty() {
+        return Err(BasisError::InvalidInput(format!(
+            "coefficient group '{}' contains no coefficients",
+            group.name
+        )));
+    }
+    Ok(cols)
+}
+
+fn realize_coefficient_groups(
+    design: &TermCollectionDesign,
+    groups: &[CoefficientGroupSpec],
+    base_prior: &crate::types::RhoPrior,
+) -> Result<RealizedCoefficientGroups, BasisError> {
+    let p = design.design.ncols();
+    let mut names = BTreeSet::<String>::new();
+    for group in groups {
+        if !names.insert(group.name.clone()) {
+            return Err(BasisError::InvalidInput(format!(
+                "duplicate coefficient group '{}'",
+                group.name
+            )));
+        }
+    }
+
+    let mut resolved = BTreeMap::<String, BTreeSet<usize>>::new();
+    for group in groups {
+        resolved.insert(group.name.clone(), resolve_group_columns(design, group)?);
+    }
+    for group in groups {
+        if let Some(parent) = group.parent.as_ref() {
+            let parent_cols = resolved.get(parent).ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "coefficient group '{}' references unknown parent group '{parent}'",
+                    group.name
+                ))
+            })?;
+            let child_cols = resolved.get(&group.name).expect("group was resolved above");
+            if !child_cols.is_subset(parent_cols) {
+                return Err(BasisError::InvalidInput(format!(
+                    "coefficient group '{}' is not a subset of parent group '{parent}'",
+                    group.name
+                )));
+            }
+        }
+    }
+
+    let mut penalty_specs: Vec<PenaltySpec> = design
+        .penalties
+        .iter()
+        .map(PenaltySpec::from_blockwise_ref)
+        .collect();
+    let mut nullspace_dims = design.nullspace_dims.clone();
+    let mut group_column_indices = Vec::<(String, Vec<usize>)>::with_capacity(groups.len());
+    for group in groups {
+        let cols = resolved.get(&group.name).expect("group was resolved above");
+        let mut penalty = Array2::<f64>::zeros((p, p));
+        for &col in cols {
+            penalty[[col, col]] = 1.0;
+        }
+        penalty_specs.push(PenaltySpec::Dense(penalty));
+        nullspace_dims.push(p.saturating_sub(cols.len()));
+        group_column_indices.push((group.name.clone(), cols.iter().copied().collect()));
+    }
+
+    Ok(RealizedCoefficientGroups {
+        penalty_specs,
+        nullspace_dims,
+        rho_prior: combine_group_rho_prior(base_prior, design.penalties.len(), groups),
+        group_column_indices,
+    })
 }
 
 #[derive(Clone)]
@@ -6019,6 +6283,44 @@ pub fn fit_term_collection_forspec(
     fit_term_collection_forspecwith_heuristic_lambdas(
         data, y, weights, offset, spec, None, family, options,
     )
+}
+
+pub fn fit_term_collection_with_coefficient_groups(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    groups: &[CoefficientGroupSpec],
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    if groups.is_empty() {
+        return fit_term_collection_forspec(data, y, weights, offset, spec, family, options);
+    }
+    let design = build_term_collection_design(data, spec)?;
+    let base_fit_opts = adaptive_fit_options_base(options, &design);
+    let realized = design
+        .realize_coefficient_groups(groups, &base_fit_opts.rho_prior)
+        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let mut grouped_options = base_fit_opts.clone();
+    grouped_options.rho_prior = realized.rho_prior;
+    let fitted = FittedTermCollection {
+        fit: crate::estimate::fit_gam_with_penalty_specs(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            realized.penalty_specs,
+            realized.nullspace_dims,
+            family,
+            &grouped_options,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
 }
 
 fn fit_term_collection_forspecwith_heuristic_lambdas(
