@@ -708,8 +708,34 @@ fn dense_transpose_weighted_response(
     y: &Array1<f64>,
     row_scale: Option<&Array1<f64>>,
 ) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(matrix.ncols());
-    for i in 0..matrix.nrows() {
+    let p = matrix.ncols();
+    let n = matrix.nrows();
+    let mut out = Array1::<f64>::zeros(p);
+    if matrix.is_standard_layout() {
+        if let (Some(x), Some(w), Some(yslice)) =
+            (matrix.as_slice(), weights.as_slice(), y.as_slice())
+        {
+            let scale_slice = row_scale.and_then(|s| s.as_slice());
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in 0..n {
+                let mut scaled = yslice[i] * w[i].max(0.0);
+                if let Some(s) = scale_slice {
+                    scaled *= s[i];
+                } else if let Some(scale) = row_scale {
+                    scaled *= scale[i];
+                }
+                if scaled == 0.0 {
+                    continue;
+                }
+                let row = &x[i * p..i * p + p];
+                for j in 0..p {
+                    out_slice[j] += row[j] * scaled;
+                }
+            }
+            return out;
+        }
+    }
+    for i in 0..n {
         let mut scaled = y[i] * weights[i].max(0.0);
         if let Some(scale) = row_scale {
             scaled *= scale[i];
@@ -717,7 +743,7 @@ fn dense_transpose_weighted_response(
         if scaled == 0.0 {
             continue;
         }
-        for j in 0..matrix.ncols() {
+        for j in 0..p {
             out[j] += matrix[[i, j]] * scaled;
         }
     }

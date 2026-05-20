@@ -9081,21 +9081,6 @@ pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> 
     (w, c, d)
 }
 
-/// Fisher-information weights for Gaussian-inverse (no residual correction).
-///
-/// ```text
-/// w_F = ω / (φ η⁴),  c_F = −4ω / (φ η⁵),  d_F = 20ω / (φ η⁶)
-/// ```
-#[inline]
-pub fn fisher_weight_gaussian_inverse(eta: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
-    let eta2 = eta * eta;
-    let eta4 = eta2 * eta2;
-    let eta5 = eta4 * eta;
-    let eta6 = eta4 * eta2;
-    let inv_phi = pw / phi;
-    (inv_phi / eta4, -4.0 * inv_phi / eta5, 20.0 * inv_phi / eta6)
-}
-
 #[inline]
 fn observed_weight_binomial_logit_from_jet(
     n_trials: f64,
