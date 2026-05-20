@@ -121,9 +121,9 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
             ) from exc
     shape_f = float(shape)
     rate_f = float(rate)
-    if shape_f < 0.0 or rate_f < 0.0:
+    if shape_f <= 0.0 or rate_f < 0.0:
         raise ValueError(
-            f"precision_hyperpriors[{label!r}] needs shape >= 0 and rate >= 0"
+            f"precision_hyperpriors[{label!r}] needs shape > 0 and rate >= 0"
         )
     return [shape_f, rate_f]
 

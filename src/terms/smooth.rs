@@ -1104,9 +1104,9 @@ fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMeta
 }
 
 fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<(), BasisError> {
-    if !shape.is_finite() || shape < 0.0 {
+    if !shape.is_finite() || shape <= 0.0 {
         return Err(BasisError::InvalidInput(format!(
-            "Gamma precision hyperprior for penalty block '{label}' requires shape >= 0, got {shape}"
+            "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
         )));
     }
     if !rate.is_finite() || rate < 0.0 {
