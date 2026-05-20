@@ -14854,7 +14854,16 @@ impl SurvivalMarginalSlopeFamily {
         let beta_time = &block_states[0].beta;
         let beta_logslope = &block_states[2].beta;
         let probit_scale = self.probit_frailty_scale();
-        let (ll, grad_t, grad_m, grad_g, hess_t, hess_m, hess_g) = (0..self.n)
+        type PerZBlockAcc = (
+            f64,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array2<f64>,
+            Array2<f64>,
+            Array2<f64>,
+        );
+        let (ll, grad_t, grad_m, grad_g, hess_t, hess_m, hess_g): PerZBlockAcc = (0..self.n)
             .into_par_iter()
             .try_fold(
                 || {
