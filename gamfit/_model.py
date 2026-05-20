@@ -1551,6 +1551,14 @@ class Model:
         value = self.summary().get("group_metadata")
         return dict(value) if isinstance(value, dict) else None
 
+    @property
+    def deployment_extensions(self) -> tuple[dict[str, Any], ...]:
+        """No-refit group extensions applied after fitting."""
+        value = self.summary().get("deployment_extensions")
+        if not isinstance(value, list):
+            return ()
+        return tuple(dict(item) for item in value if isinstance(item, dict))
+
     def _model_class_from_summary(self) -> str:
         value = self.summary().get("model_class")
         if value is None:
