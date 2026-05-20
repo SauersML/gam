@@ -440,10 +440,16 @@ fn entry_better(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
 }
 
 fn entry_newer(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
-    let candidate_stamp =
-        (candidate.written_unix_secs, candidate.written_nanos, candidate_kind_rank(candidate.kind));
-    let current_stamp =
-        (current.written_unix_secs, current.written_nanos, candidate_kind_rank(current.kind));
+    let candidate_stamp = (
+        candidate.written_unix_secs,
+        candidate.written_nanos,
+        candidate_kind_rank(candidate.kind),
+    );
+    let current_stamp = (
+        current.written_unix_secs,
+        current.written_nanos,
+        candidate_kind_rank(current.kind),
+    );
     candidate_stamp > current_stamp
 }
 
@@ -547,6 +553,32 @@ mod tests {
         let got = store.lookup(&key).unwrap().unwrap();
         assert_eq!(got.payload, b"better");
         assert_eq!(got.objective, Some(1.0));
+    }
+
+    #[test]
+    fn lookup_latest_ignores_objective_ordering() {
+        let (_d, store) = temp_store();
+        let key = key_for("latest-vs-best");
+        store
+            .save(&key, b"low-objective", Some(1.0), Some(1), EntryKind::Final)
+            .unwrap();
+        thread::sleep(Duration::from_millis(2));
+        store
+            .save(
+                &key,
+                b"newer-higher-objective",
+                Some(10.0),
+                Some(2),
+                EntryKind::Checkpoint,
+            )
+            .unwrap();
+
+        let best = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(best.payload, b"low-objective");
+
+        let latest = store.lookup_latest(&key).unwrap().unwrap();
+        assert_eq!(latest.payload, b"newer-higher-objective");
+        assert_eq!(latest.iteration, Some(2));
     }
 
     #[test]

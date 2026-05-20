@@ -13,7 +13,7 @@
 //! falls back to BFGS or an EFS variant instead of synthesizing second-order
 //! curvature numerically.
 
-use crate::cache::Session as CacheSession;
+use crate::cache::{LoadSource, Session as CacheSession};
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
 use ::opt::{
@@ -4275,7 +4275,8 @@ impl OuterProblem {
         let key_hex = session.key().to_hex();
         let short_key = &key_hex[..8.min(key_hex.len())];
         let mut had_hit = false;
-        if let Some(entry) = session.try_load() {
+        if let Some(loaded) = session.try_load_with_source() {
+            let entry = loaded.entry;
             if let Some(payload) = decode_iterate(&entry.payload, self.n_params) {
                 let cached_rho = Array1::from_vec(payload.rho);
                 // Validation-on-load: reject payloads whose recorded
@@ -4294,6 +4295,35 @@ impl OuterProblem {
                         prior_obj_display,
                         rho_finite,
                     );
+                } else if loaded.source == LoadSource::Exact
+                    && entry.kind == crate::cache::EntryKind::Final
+                {
+                    let cap = primary_capability_for_config(obj.capability(), &config, context);
+                    let plan_used = plan_with_class(&cap, config.solver_class);
+                    let iterations = entry
+                        .iteration
+                        .unwrap_or(payload.eval_id)
+                        .min(usize::MAX as u64) as usize;
+                    log::info!(
+                        "[CACHE] final-hit key={}.. context={} rho_dim={} prior_obj={:.6e} iter={} action=skip-outer-validation",
+                        short_key,
+                        context,
+                        cached_rho.len(),
+                        prior_obj_display,
+                        iterations,
+                    );
+                    return Ok(OuterResult {
+                        rho: cached_rho,
+                        final_value: entry.objective.unwrap_or(payload.cost),
+                        iterations,
+                        final_grad_norm: None,
+                        final_gradient: None,
+                        final_hessian: None,
+                        converged: true,
+                        plan_used,
+                        operator_trust_radius: None,
+                        operator_stop_reason: None,
+                    });
                 } else if config
                     .initial_rho
                     .as_ref()
@@ -8314,7 +8344,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session));
+        let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
         // Initial: nothing on disk.
         assert!(session.try_load().is_none());
         // First eval persists.
@@ -8349,15 +8379,51 @@ mod tests {
     }
 
     #[test]
+    fn checkpointing_objective_mirrors_checkpoints() {
+        let (_primary_dir, primary) = tmp_cache_session("ckpt-primary");
+        let (_mirror_dir, mirror) = tmp_cache_session("ckpt-mirror");
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Unavailable);
+        let mut inner: ClosureObjective<_, _, _> = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+            |_: &mut (), _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput("eval not used".into()))
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut wrapped = CheckpointingObjective::new(
+            &mut inner,
+            Arc::clone(&primary),
+            vec![Arc::clone(&mirror)],
+        );
+
+        let value = wrapped.eval_cost(&array![4.0]).unwrap();
+        assert_eq!(value, 16.0);
+
+        let primary_payload =
+            decode_iterate(&primary.try_load().expect("primary checkpoint").payload, 1)
+                .expect("primary decode");
+        let mirror_payload =
+            decode_iterate(&mirror.try_load().expect("mirror checkpoint").payload, 1)
+                .expect("mirror decode");
+        assert_eq!(primary_payload.rho, vec![4.0]);
+        assert_eq!(mirror_payload.rho, vec![4.0]);
+        assert_eq!(primary_payload.cost, mirror_payload.cost);
+    }
+
+    #[test]
     fn cached_rho_is_prepended_as_first_seed() {
         // Whitebox: pre-seed the session with a known iterate, then run
         // an OuterProblem with a deliberately-different `initial_rho`.
         // The runner must visit the cached rho before the configured
         // `initial_rho` because `try_load` overrode it.
         let (_d, session) = tmp_cache_session("seed-prepend");
-        // Hand-write the cached entry: rho = [2.5], cost = 0.25.
+        // Hand-write the cached checkpoint: rho = [2.5], cost = 0.25.
+        // Final exact hits return immediately; checkpoints still exercise the
+        // regular seed-prepend path.
         let payload = encode_iterate(&array![2.5], 0.25, 0).expect("encode");
-        session.finalize(&payload, Some(0.25), Some(0));
+        session.checkpoint(&payload, Some(0.25), Some(0));
         assert!(
             session.try_load().is_some(),
             "precondition: cache populated"
@@ -8407,6 +8473,50 @@ mod tests {
             assert!(
                 c <= i,
                 "cached rho (idx {c}) must precede initial_rho (idx {i})",
+            );
+        }
+
+        #[test]
+        fn exact_final_cache_hit_skips_outer_validation() {
+            let (_d, session) = tmp_cache_session("final-skip");
+            let payload = encode_iterate(&array![2.5], 0.25, 7).expect("encode");
+            session.finalize(&payload, Some(0.25), Some(7));
+
+            let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+            let problem = OuterProblem::new(1)
+                .with_solver_class(SolverClass::AuxiliaryGradientFree)
+                .with_bounds(array![-5.0], array![5.0])
+                .with_initial_rho(array![-3.0])
+                .with_max_iter(8)
+                .with_cache_session(Arc::clone(&session));
+            let mut obj = problem.build_objective(
+                seen.clone(),
+                |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                    seen.lock().unwrap().push(theta.clone());
+                    Ok((theta[0] - 2.5).powi(2))
+                },
+                |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, _: &Array1<f64>| {
+                    Err(EstimationError::InvalidInput("eval not used".into()))
+                },
+                None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
+                None::<
+                    fn(
+                        &mut Arc<Mutex<Vec<Array1<f64>>>>,
+                        &Array1<f64>,
+                    ) -> Result<EfsEval, EstimationError>,
+                >,
+            );
+
+            let result = problem
+                .run(&mut obj, "final-skip")
+                .expect("final exact hit should return cached outer result");
+            assert_eq!(result.rho, array![2.5]);
+            assert_eq!(result.final_value, 0.25);
+            assert_eq!(result.iterations, 7);
+            assert!(result.converged);
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "exact final hit should not evaluate the outer objective"
             );
         }
     }
