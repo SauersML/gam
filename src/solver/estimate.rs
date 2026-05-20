@@ -3527,7 +3527,7 @@ where
     let finalgrad_norm = if finalgrad_norm_rho.is_finite() {
         finalgrad_norm_rho
     } else {
-        outer_result.final_grad_norm
+        outer_result.final_grad_norm.unwrap_or(f64::NAN)
     };
 
     if opts.compute_inference {

@@ -3118,6 +3118,117 @@ fn row_primary_closed_form(
     Ok((nll, grad, hess))
 }
 
+/// Shared-slope multi-z reduction for the rigid 4-primary row calculus.
+///
+/// When K observed scores share one raw log-slope value `g`, the probit
+/// gradient vector is `r(g) = s_f g 1_K` and the row index is
+///
+///     eta_j = q_j sqrt(1 + r(g)' Sigma r(g)) + r(g)' z_i
+///           = q_j sqrt(1 + g^2 s_f^2 1' Sigma 1) + g s_f (1'z_i).
+///
+/// The exact row kernel can therefore remain four-dimensional
+/// `(q0, q1, qd1, g)` if, and only if, the log-slope surface is shared across
+/// z coordinates.  The derivatives below are the scalar chain rule with
+/// `c(g) = sqrt(1 + g^2 s_f^2 1' Sigma 1)` and
+/// `d(r'z_i)/dg = s_f 1'z_i`.  K=1 with `1' Sigma 1 = 1` is exactly the
+/// existing scalar path handled by `row_primary_closed_form`.
+#[inline]
+fn row_primary_closed_form_shared_score(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z_sum: f64,
+    covariance_ones: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+    if !(covariance_ones.is_finite() && covariance_ones >= 0.0) {
+        return Err(format!(
+            "survival marginal-slope shared-score covariance scale must be finite and non-negative, got {covariance_ones}"
+        ));
+    }
+    let effective_scale = probit_scale * covariance_ones.sqrt();
+    let (c, c1, c2, ..) = c_derivatives(g, effective_scale);
+    let linear = rigid_observed_logslope(g, probit_scale) * z_sum;
+    let linear_dg = probit_scale * z_sum;
+
+    let eta0 = q0 * c + linear;
+    let eta1 = q1 * c + linear;
+    let ad1 = qd1 * c;
+
+    if survival_derivative_guard_violated(qd1, derivative_guard) {
+        return Err(format!(
+            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+        ));
+    }
+
+    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let log_ad1 = ad1.max(1e-300).ln();
+
+    let nll =
+        w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
+
+    let (e0_k1, e0_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta0, -w)?;
+    let (e1_k1, e1_k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-eta1, w * (1.0 - d))?;
+    let phi_u1 = w * d * eta1;
+    let phi_u2 = w * d;
+    let (nl_u1, nl_u2, _, _) = neglog_derivatives(ad1);
+    let td_u1 = w * d * nl_u1;
+    let td_u2 = w * d * nl_u2;
+
+    let deta0_dq0 = c;
+    let deta0_dg = q0 * c1 + linear_dg;
+    let deta1_dq1 = c;
+    let deta1_dg = q1 * c1 + linear_dg;
+    let dad1_dqd1 = c;
+    let dad1_dg = qd1 * c1;
+
+    let u1_eta0 = -e0_k1;
+    let u1_eta1 = -e1_k1 + phi_u1;
+    let u1_ad1 = td_u1;
+
+    let mut grad = [0.0_f64; N_PRIMARY];
+    grad[0] = u1_eta0 * deta0_dq0;
+    grad[1] = u1_eta1 * deta1_dq1;
+    grad[2] = u1_ad1 * dad1_dqd1;
+    grad[3] = u1_eta0 * deta0_dg + u1_eta1 * deta1_dg + u1_ad1 * dad1_dg;
+
+    let u2_eta0 = e0_k2;
+    let u2_eta1 = e1_k2 + phi_u2;
+    let u2_ad1 = td_u2;
+
+    let d2eta0_dq0dg = c1;
+    let d2eta1_dq1dg = c1;
+    let d2ad1_dqd1dg = c1;
+    let d2eta0_dg2 = q0 * c2;
+    let d2eta1_dg2 = q1 * c2;
+    let d2ad1_dg2 = qd1 * c2;
+
+    let mut hess = [[0.0_f64; N_PRIMARY]; N_PRIMARY];
+    hess[0][0] = u2_eta0 * deta0_dq0 * deta0_dq0;
+    hess[1][1] = u2_eta1 * deta1_dq1 * deta1_dq1;
+    hess[2][2] = u2_ad1 * dad1_dqd1 * dad1_dqd1;
+    hess[0][3] = u2_eta0 * deta0_dq0 * deta0_dg + u1_eta0 * d2eta0_dq0dg;
+    hess[3][0] = hess[0][3];
+    hess[1][3] = u2_eta1 * deta1_dq1 * deta1_dg + u1_eta1 * d2eta1_dq1dg;
+    hess[3][1] = hess[1][3];
+    hess[2][3] = u2_ad1 * dad1_dqd1 * dad1_dg + u1_ad1 * d2ad1_dqd1dg;
+    hess[3][2] = hess[2][3];
+    hess[3][3] = u2_eta0 * deta0_dg * deta0_dg
+        + u1_eta0 * d2eta0_dg2
+        + u2_eta1 * deta1_dg * deta1_dg
+        + u1_eta1 * d2eta1_dg2
+        + u2_ad1 * dad1_dg * dad1_dg
+        + u1_ad1 * d2ad1_dg2;
+
+    Ok((nll, grad, hess))
+}
+
 // ── Eval cache ────────────────────────────────────────────────────────
 //
 // Third and fourth order contracted derivatives for the outer REML path
@@ -3326,6 +3437,96 @@ impl SurvivalMarginalSlopeFamily {
         ))
     }
 
+    fn shared_logslope_covariance_scale(&self) -> Result<f64, String> {
+        let k = self.score_dim();
+        if k == 1 {
+            return Ok(1.0);
+        }
+        let ones = vec![1.0; k];
+        self.score_covariance.quadratic_form(&ones).map_err(|err| {
+            format!("survival marginal-slope shared log-slope covariance scale: {err}")
+        })
+    }
+
+    fn exact_shared_score_summary(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        context: &str,
+    ) -> Result<(f64, f64), String> {
+        let k = self.score_dim();
+        if k == 1 {
+            return Ok((self.z[[row, 0]], 1.0));
+        }
+        let logslope_eta_len = block_states[2].eta.len();
+        if logslope_eta_len != self.n {
+            return Err(format!(
+                "{context}: survival marginal-slope exact shared-slope calculus for K={k} requires one log-slope eta per row (n={}); got eta len {logslope_eta_len}. Per-z log-slope derivatives require a {}-primary row kernel.",
+                self.n,
+                3 + k
+            ));
+        }
+        Ok((self.z.row(row).sum(), self.shared_logslope_covariance_scale()?))
+    }
+
+    fn row_primary_closed_form_rigid(
+        &self,
+        row: usize,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        block_states: &[ParameterBlockState],
+        probit_scale: f64,
+    ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
+        let logslope_eta = &block_states[2].eta;
+        let k = self.score_dim();
+        if k == 1 {
+            return row_primary_closed_form(
+                q0,
+                q1,
+                qd1,
+                logslope_eta[row],
+                self.z[[row, 0]],
+                self.weights[row],
+                self.event[row],
+                self.derivative_guard,
+                probit_scale,
+            );
+        }
+        if logslope_eta.len() != self.n {
+            return Err(format!(
+                "survival marginal-slope exact rigid row calculus for K={k} requires one shared log-slope surface (eta len n={}); got eta len {}. Per-z log-slope derivatives require a {}-primary row kernel.",
+                self.n,
+                logslope_eta.len(),
+                3 + k
+            ));
+        }
+        let (z_sum, covariance_ones) =
+            self.exact_shared_score_summary(row, block_states, "row_primary_closed_form_rigid")?;
+        row_primary_closed_form_shared_score(
+            q0,
+            q1,
+            qd1,
+            logslope_eta[row],
+            z_sum,
+            covariance_ones,
+            self.weights[row],
+            self.event[row],
+            self.derivative_guard,
+            probit_scale,
+        )
+    }
+
+    fn ensure_scalar_flex_exact_score_geometry(&self, context: &str) -> Result<(), String> {
+        if self.score_dim() == 1 {
+            return Ok(());
+        }
+        Err(format!(
+            "{context}: survival marginal-slope exact flexible row calculus is scalar-z only; K={} must use the rigid shared-slope vector kernel or a widened per-z primary kernel",
+            self.score_dim()
+        ))
+    }
+
     fn row_neglog_rigid_vector_value(
         &self,
         row: usize,
@@ -3523,7 +3724,11 @@ impl SurvivalMarginalSlopeFamily {
         }
         let wi = self.weights[row];
         let di = self.event[row];
-        let zi = self.z[[row, 0]];
+        let (z_sum, covariance_ones) = self.exact_shared_score_summary(
+            row,
+            block_states,
+            "row_neglog_directional_with_scale_jet",
+        )?;
         let q_geom = self.row_dynamic_q_values(row, block_states)?;
 
         let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
@@ -3533,13 +3738,14 @@ impl SurvivalMarginalSlopeFamily {
         let g_jet = MultiDirJet::linear(k, block_states[2].eta[row], &first(3));
 
         let observed_g_jet = g_jet.mul(scale_jet);
-        let one_plus_b2 = MultiDirJet::constant(k, 1.0).add(&observed_g_jet.mul(&observed_g_jet));
+        let one_plus_b2 = MultiDirJet::constant(k, 1.0)
+            .add(&observed_g_jet.mul(&observed_g_jet).scale(covariance_ones));
         let c_jet = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.coeff(0)));
 
         let a0_jet = q0_jet.mul(&c_jet);
         let a1_jet = q1_jet.mul(&c_jet);
         let ad1_jet = qd1_jet.mul(&c_jet);
-        let z_jet = MultiDirJet::constant(k, zi);
+        let z_jet = MultiDirJet::constant(k, z_sum);
         let eta0_jet = a0_jet.add(&observed_g_jet.mul(&z_jet));
         let eta1_jet = a1_jet.add(&observed_g_jet.mul(&z_jet));
 
@@ -5980,6 +6186,9 @@ impl SurvivalMarginalSlopeFamily {
         q_geom: &SurvivalMarginalSlopeDynamicRow,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        self.ensure_scalar_flex_exact_score_geometry(
+            "compute_row_flex_primary_gradient_hessian_exact",
+        )?;
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
@@ -5995,6 +6204,7 @@ impl SurvivalMarginalSlopeFamily {
         q_geom: &SurvivalMarginalSlopeDynamicRowGradient,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>), String> {
+        self.ensure_scalar_flex_exact_score_geometry("compute_row_flex_primary_gradient_exact")?;
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
@@ -6564,16 +6774,12 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let q_geom = self.row_dynamic_q_values(row, block_states)?;
-        let g = block_states[2].eta[row];
-        let (nll, grad_arr, hess_arr) = row_primary_closed_form(
+        let (nll, grad_arr, hess_arr) = self.row_primary_closed_form_rigid(
+            row,
             q_geom.q0,
             q_geom.q1,
             q_geom.qd1,
-            g,
-            self.z[[row, 0]],
-            self.weights[row],
-            self.event[row],
-            self.derivative_guard,
+            block_states,
             self.probit_frailty_scale(),
         )?;
         // Convert stack arrays to ndarray types at the boundary.
@@ -12664,16 +12870,12 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
             + self.block_states[1].eta[row];
         let qd1 = self.family.design_derivative_exit.dot_row(row, beta_time)
             + self.family.derivative_offset_exit[row];
-        let g = self.block_states[2].eta[row];
-        row_primary_closed_form(
+        self.family.row_primary_closed_form_rigid(
+            row,
             q0,
             q1,
             qd1,
-            g,
-            self.family.z[row],
-            self.family.weights[row],
-            self.family.event[row],
-            self.family.derivative_guard,
+            &self.block_states,
             self.family.probit_frailty_scale(),
         )
     }
@@ -12921,15 +13123,12 @@ impl SurvivalMarginalSlopeFamily {
                         &primary,
                     )?
                 } else {
-                    let (nll, grad_arr, _) = row_primary_closed_form(
+                    let (nll, grad_arr, _) = self.row_primary_closed_form_rigid(
+                        row,
                         q_geom.q0,
                         q_geom.q1,
                         q_geom.qd1,
-                        block_states[2].eta[row],
-                        self.z[[row, 0]],
-                        self.weights[row],
-                        self.event[row],
-                        self.derivative_guard,
+                        block_states,
                         self.probit_frailty_scale(),
                     )?;
                     (nll, Array1::from_vec(grad_arr.to_vec()))
