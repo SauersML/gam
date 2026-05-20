@@ -1,4 +1,6 @@
-use crate::custom_family::BlockwiseFitOptions;
+use crate::custom_family::{
+    BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family,
+};
 use crate::estimate::{
     AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
 };
@@ -43,6 +45,7 @@ use crate::smooth::{
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
+use crate::survival::PenaltyBlock;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
     WigglePenaltyConfig,
@@ -157,9 +160,7 @@ where
             "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
             result.iterations,
             result.final_value,
-            result
-                .final_grad_norm
-                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}"))
+            result.final_grad_norm_report(),
         ));
     }
     recover(&result.rho).ok_or_else(|| {
@@ -963,6 +964,143 @@ fn survival_unified_fit_result(
     .map_err(|err| err.to_string())
 }
 
+fn fit_cause_specific_survival_transformation_custom(
+    spec: &SurvivalTransformationTermSpec,
+    resolvedspec: TermCollectionSpec,
+    baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
+    prepared: PreparedWorkflowSurvivalTimeStack,
+    dense_cov_design: &Array2<f64>,
+    penalty_blocks: Vec<PenaltyBlock>,
+    beta0_flat: Array1<f64>,
+    derivative_floor: f64,
+) -> Result<SurvivalTransformationFitResult, String> {
+    let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view());
+    if cause_count <= 1 {
+        return Err("cause-specific custom survival fit requires at least two causes".to_string());
+    }
+    let n = spec.event_target.len();
+    let p_time_total = prepared.time_design_exit.ncols();
+    let p_cov = dense_cov_design.ncols();
+    let p = p_time_total + p_cov;
+    if beta0_flat.len() != p * cause_count {
+        return Err(format!(
+            "cause-specific survival initial beta length mismatch: got {}, expected {}",
+            beta0_flat.len(),
+            p * cause_count
+        ));
+    }
+
+    let dense_time_entry = prepared.time_design_entry.to_dense();
+    let dense_time_exit = prepared.time_design_exit.to_dense();
+    let dense_time_derivative = prepared.time_design_derivative.to_dense();
+    let mut x_entry = Array2::<f64>::zeros((n, p));
+    let mut x_exit = Array2::<f64>::zeros((n, p));
+    let mut x_derivative = Array2::<f64>::zeros((n, p));
+    if p_time_total > 0 {
+        x_entry
+            .slice_mut(s![.., ..p_time_total])
+            .assign(&dense_time_entry);
+        x_exit
+            .slice_mut(s![.., ..p_time_total])
+            .assign(&dense_time_exit);
+        x_derivative
+            .slice_mut(s![.., ..p_time_total])
+            .assign(&dense_time_derivative);
+    }
+    if p_cov > 0 {
+        x_entry
+            .slice_mut(s![.., p_time_total..])
+            .assign(dense_cov_design);
+        x_exit
+            .slice_mut(s![.., p_time_total..])
+            .assign(dense_cov_design);
+    }
+
+    let mut family_blocks = Vec::with_capacity(cause_count);
+    let mut block_specs = Vec::with_capacity(cause_count);
+    for cause in 0..cause_count {
+        let cause_code = (cause + 1) as u8;
+        let event_target = spec
+            .event_target
+            .mapv(|observed| u8::from(observed == cause_code));
+        family_blocks.push(crate::survival::CauseSpecificRoystonParmarBlock {
+            age_entry: spec.age_entry.clone(),
+            age_exit: spec.age_exit.clone(),
+            event_target,
+            sampleweight: spec.weights.clone(),
+            x_entry: x_entry.clone(),
+            x_exit: x_exit.clone(),
+            x_derivative: x_derivative.clone(),
+            offset_eta_entry: prepared.eta_offset_entry.clone() + &spec.covariate_offset,
+            offset_eta_exit: prepared.eta_offset_exit.clone() + &spec.covariate_offset,
+            offset_derivative_exit: prepared.derivative_offset_exit.clone(),
+            derivative_floor,
+        });
+
+        let mut penalties = Vec::with_capacity(penalty_blocks.len());
+        let mut nullspace_dims = Vec::with_capacity(penalty_blocks.len());
+        let mut initial_log_lambdas = Array1::<f64>::zeros(penalty_blocks.len());
+        for (penalty_idx, block) in penalty_blocks.iter().enumerate() {
+            if block.range.end > p || block.range.start > block.range.end {
+                return Err("cause-specific survival penalty range is out of bounds".to_string());
+            }
+            let block_dim = block.range.end - block.range.start;
+            if block.matrix.nrows() != block_dim || block.matrix.ncols() != block_dim {
+                return Err(format!(
+                    "cause-specific survival penalty {penalty_idx} has shape {}x{} but range has width {block_dim}",
+                    block.matrix.nrows(),
+                    block.matrix.ncols()
+                ));
+            }
+            penalties.push(
+                PenaltyMatrix::Blockwise {
+                    local: block.matrix.clone(),
+                    col_range: block.range.clone(),
+                    total_dim: p,
+                }
+                .with_precision_label(format!("cause_specific_survival_penalty_{penalty_idx}")),
+            );
+            nullspace_dims.push(block.nullspace_dim);
+            initial_log_lambdas[penalty_idx] = block.lambda.max(1e-300).ln();
+        }
+        let beta_start = beta0_flat.slice(s![cause * p..(cause + 1) * p]).to_owned();
+        block_specs.push(ParameterBlockSpec {
+            name: format!("time_cause_{}", cause + 1),
+            design: crate::matrix::DesignMatrix::from(x_exit.clone()),
+            offset: prepared.eta_offset_exit.clone() + &spec.covariate_offset,
+            penalties,
+            nullspace_dims,
+            initial_log_lambdas,
+            initial_beta: Some(beta_start),
+        });
+    }
+
+    let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
+    let mut fit = fit_custom_family(
+        &family,
+        &block_specs,
+        &BlockwiseFitOptions {
+            compute_covariance: false,
+            ..Default::default()
+        },
+    )
+    .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
+    fit.likelihood_family = Some(LikelihoodFamily::RoystonParmar);
+    let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
+        &spec.time_build,
+        spec.time_anchor,
+    );
+    Ok(SurvivalTransformationFitResult {
+        fit,
+        resolvedspec,
+        baseline_cfg,
+        likelihood_mode: spec.likelihood_mode,
+        time_basis,
+        time_base_ncols: spec.time_build.x_exit_time.ncols(),
+        baseline_timewiggle: prepared.timewiggle_block,
+    })
+}
+
 fn hash_workflow_array_view(
     hasher: &mut crate::solver::persistent_warm_start::StableHasher,
     array: ArrayView1<'_, f64>,
@@ -1314,7 +1452,7 @@ fn fit_survival_transformation_model(
                 )
                 .map_err(|err| format!("failed to expand cause-specific survival model: {err}"))?;
                 let expanded_penalties = crate::survival::expand_cause_specific_penalty_blocks(
-                    &PenaltyBlocks::new(penalty_blocks),
+                    &PenaltyBlocks::new(penalty_blocks.clone()),
                     cause_count,
                     p,
                 )
@@ -1342,7 +1480,7 @@ fn fit_survival_transformation_model(
                 .map_err(|err| {
                     format!("failed to construct cause-specific survival model: {err}")
                 })?;
-                (model, expanded_penalties.blocks)
+                (model, penalty_blocks)
             };
             if cause_count <= 1 && spec.likelihood_mode != SurvivalLikelihoodMode::Weibull {
                 model
@@ -1425,6 +1563,18 @@ fn fit_survival_transformation_model(
 
     let (prepared, penalty_blocks, beta0, structural_lower_bounds, mut model) =
         build_working_model(&baseline_cfg)?;
+    if cause_count > 1 {
+        return fit_cause_specific_survival_transformation_custom(
+            &spec,
+            resolvedspec,
+            baseline_cfg,
+            prepared,
+            &dense_cov_design,
+            penalty_blocks,
+            beta0,
+            exact_derivative_guard,
+        );
+    }
     let opts = crate::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,

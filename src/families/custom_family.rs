@@ -3016,9 +3016,7 @@ fn custom_outer_nonconvergence_error(
         outer_result.plan_used,
         outer_result.iterations,
         outer_result.final_value,
-        outer_result
-            .final_grad_norm
-            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}")),
+        outer_result.final_grad_norm_report(),
         format_top_abs_array_entries(&outer_result.rho, "top_abs_log_lambda", 8),
         format_top_abs_array_entries(&lambdas, "top_abs_lambda", 8),
         gradient_detail,
@@ -18135,7 +18133,7 @@ fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'sta
     }
     let rho_star = outer_result.rho;
     let outer_iters = outer_result.iterations;
-    let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(f64::NAN);
+    let outer_grad_norm = outer_result.final_grad_norm_or_nan();
     screening_cap.store(0, Ordering::Relaxed);
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
