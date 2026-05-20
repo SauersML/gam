@@ -4852,11 +4852,6 @@ impl UnifiedFitResult {
         self.beta_covariance()
     }
 
-    /// Get the smoothing-parameter-corrected Bayesian covariance (`Vp`) if available.
-    pub fn beta_covariance_vp(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance_corrected()
-    }
-
     /// Get the frequentist sandwich covariance (`Ve`) if available.
     pub fn beta_covariance_ve(&self) -> Option<&Array2<f64>> {
         self.inference

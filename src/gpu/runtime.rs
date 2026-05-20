@@ -561,11 +561,6 @@ impl GpuRuntime {
         &self.devices
     }
 
-    #[inline]
-    pub fn device_by_ordinal(&self, ordinal: usize) -> Option<&GpuDeviceInfo> {
-        self.devices.iter().find(|device| device.ordinal == ordinal)
-    }
-
     /// Workload-size policy for the selected device.
     #[inline]
     pub fn policy(&self) -> &DispatchPolicy {
@@ -704,13 +699,6 @@ pub fn warm() {
 #[inline]
 pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
     GpuRuntime::global().selected_device().cloned()
-}
-
-/// Convenience: every CUDA device visible to this process, sorted by dispatch
-/// preference.
-#[inline]
-pub fn gpu_device_infos() -> Vec<GpuDeviceInfo> {
-    GpuRuntime::global().devices().to_vec()
 }
 
 /// Shared `Arc<CudaContext>` for `ordinal`, or `None` if no such device.

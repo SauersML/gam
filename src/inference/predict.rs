@@ -4273,34 +4273,6 @@ pub struct TrainingSupport {
     pub axis_max: Array1<f64>,
 }
 
-impl TrainingSupport {
-    /// Convenience constructor from raw training rows. Computes per-axis
-    /// min/max in a single pass.
-    pub fn from_training_rows(rows: ArrayView2<'_, f64>) -> Self {
-        let d = rows.ncols();
-        if rows.nrows() == 0 || d == 0 {
-            return Self {
-                axis_min: Array1::zeros(0),
-                axis_max: Array1::zeros(0),
-            };
-        }
-        let mut axis_min = Array1::from_elem(d, f64::INFINITY);
-        let mut axis_max = Array1::from_elem(d, f64::NEG_INFINITY);
-        for row in rows.outer_iter() {
-            for k in 0..d {
-                let v = row[k];
-                if v < axis_min[k] {
-                    axis_min[k] = v;
-                }
-                if v > axis_max[k] {
-                    axis_max[k] = v;
-                }
-            }
-        }
-        Self { axis_min, axis_max }
-    }
-}
-
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
