@@ -7616,11 +7616,7 @@ fn compute_outer_hessian(
     // Precompute a_k = ½ λₖ(β̂-μₖ)'Sₖ(β̂-μₖ) for profiled Gaussian correction.
     let rho_a_vals: Vec<f64> = (0..k)
         .map(|idx| {
-            0.5 * penalty_a_k_quadratic(
-                &solution.penalty_coords[idx],
-                &solution.beta,
-                lambdas[idx],
-            )
+            0.5 * penalty_a_k_quadratic(&solution.penalty_coords[idx], &solution.beta, lambdas[idx])
         })
         .collect();
 
