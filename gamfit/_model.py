@@ -1236,7 +1236,9 @@ class Model:
         if point.size != design.shape[0] or lower.size != point.size or upper.size != point.size:
             raise ValueError("prediction interval payload has inconsistent row count")
 
-        cov = cov_flat.reshape(cov_n, cov_n)
+        raw_cov = cov_flat.reshape(cov_n, cov_n)
+        covariance_symmetry_max_abs = float(np.max(np.abs(raw_cov - raw_cov.T))) if cov_n else 0.0
+        cov = 0.5 * (raw_cov + raw_cov.T)
         eta_variance = np.einsum("ij,jk,ik->i", design, cov, design)
         labels, label_info, label_indices = _coverage_provenance_groups(state, cov_n)
 
@@ -1250,6 +1252,10 @@ class Model:
         #               = sum_g x_g V_g,g x_g'
         #                 + 2 sum_{g<h} x_g V_g,h x_h'.
         #
+        # A covariance matrix is symmetric; if the serialized matrix carries
+        # tiny numerical skew, the quadratic form depends only on
+        # (V + V') / 2 because x (V - V') x' = 0 for any skew-symmetric part.
+        #
         # The per-group contribution reported below is the recognized diagonal
         # block term sigma_g^2(x) = x_g V_g,g x_g'.  Cross-block covariance is
         # exposed separately, so group terms plus cross terms reconstruct the
@@ -1258,6 +1264,12 @@ class Model:
             label: np.asarray(indices, dtype=int)
             for label, indices in label_indices.items()
         }
+        flat_indices = sorted(int(idx) for indices in label_arrays.values() for idx in indices)
+        if flat_indices != list(range(cov_n)):
+            raise ValueError(
+                "coefficient provenance must partition all covariance columns for "
+                "coverage decomposition"
+            )
         group_variance = {
             label: np.einsum(
                 "ij,jk,ik->i",
@@ -1332,6 +1344,7 @@ class Model:
             "metadata": {
                 "coverage": coverage,
                 "covariance_corrected": bool(state.get("covariance_corrected", False)),
+                "covariance_symmetry_max_abs": covariance_symmetry_max_abs,
             },
         }
 
