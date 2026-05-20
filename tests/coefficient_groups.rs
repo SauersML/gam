@@ -1,6 +1,4 @@
-use gam::estimate::{
-    CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs,
-};
+use gam::estimate::{CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
 use gam::smooth::{
     CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
     TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
@@ -70,6 +68,81 @@ fn synthetic_two_score_data() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<
 }
 
 #[test]
+fn overlapping_coefficient_groups_are_distinct_precision_coordinates() {
+    let (x, _, _, _) = synthetic_two_score_data();
+    let design = build_term_collection_design(x.view(), &two_linear_term_spec()).expect("design");
+    let realized = design
+        .realize_coefficient_groups(
+            &[
+                CoefficientGroupSpec {
+                    name: "both_scores".to_string(),
+                    selectors: vec![
+                        CoefficientSelector::LinearTerm("score_a".to_string()),
+                        CoefficientSelector::LinearTerm("score_b".to_string()),
+                    ],
+                    parent: None,
+                    prior: Some(CoefficientGroupPrior::GammaPrecision {
+                        shape: 2.0,
+                        rate: 1.0,
+                    }),
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+                CoefficientGroupSpec {
+                    name: "score_b_only".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_b".to_string())],
+                    parent: None,
+                    prior: Some(CoefficientGroupPrior::GammaPrecision {
+                        shape: 4.0,
+                        rate: 1.0,
+                    }),
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+            ],
+            &RhoPrior::Flat,
+        )
+        .expect("overlapping groups");
+
+    assert_eq!(realized.penalty_specs.len(), 2);
+    assert_eq!(realized.nullspace_dims, vec![1, 2]);
+    assert_eq!(
+        realized.group_column_indices,
+        vec![
+            ("both_scores".to_string(), vec![1, 2]),
+            ("score_b_only".to_string(), vec![2]),
+        ]
+    );
+}
+
+#[test]
+fn cyclic_coefficient_group_hierarchy_is_rejected() {
+    let (x, _, _, _) = synthetic_two_score_data();
+    let design = build_term_collection_design(x.view(), &two_linear_term_spec()).expect("design");
+    let err = design
+        .realize_coefficient_groups(
+            &[
+                CoefficientGroupSpec {
+                    name: "outer".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
+                    parent: Some("inner".to_string()),
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+                CoefficientGroupSpec {
+                    name: "inner".to_string(),
+                    selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
+                    parent: Some("outer".to_string()),
+                    prior: None,
+                    prior_mean: CoefficientPriorMean::Zero,
+                },
+            ],
+            &RhoPrior::Flat,
+        )
+        .expect_err("cyclic hierarchy must fail");
+
+    assert!(err.to_string().contains("cycle"));
+}
+
+#[test]
 fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
     let (x, y, weights, offset) = synthetic_two_score_data();
     let spec = two_linear_term_spec();
@@ -123,7 +196,10 @@ fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
     assert_eq!(grouped.fit.lambdas.len(), 1);
     assert!((grouped.fit.lambdas[0] - manual.lambdas[0]).abs() < 1e-8);
     for (a, b) in grouped.fit.beta.iter().zip(manual.beta.iter()) {
-        assert!((a - b).abs() < 1e-8, "beta mismatch: grouped={a} manual={b}");
+        assert!(
+            (a - b).abs() < 1e-8,
+            "beta mismatch: grouped={a} manual={b}"
+        );
     }
 }
 
@@ -343,7 +419,10 @@ fn coefficient_group_zero_prior_mean_matches_default_bits() {
     )
     .expect("explicit zero prior mean fit");
 
-    assert_eq!(default_fit.fit.lambdas.len(), explicit_zero_fit.fit.lambdas.len());
+    assert_eq!(
+        default_fit.fit.lambdas.len(),
+        explicit_zero_fit.fit.lambdas.len()
+    );
     for (a, b) in default_fit
         .fit
         .lambdas

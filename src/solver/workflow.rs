@@ -38,9 +38,8 @@ use crate::families::transformation_normal::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design,
+    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, SpatialLengthScaleOptimizationOptions,
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
