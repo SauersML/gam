@@ -497,7 +497,7 @@ impl<'a> RemlState<'a> {
                 total_k
             )));
         }
-        let x_y = x_dense.dot(&shared.y);
+        let x_y = crate::faer_ndarray::fast_av(x_dense, &shared.y);
 
         let mut diag_combined = Array1::<f64>::zeros(n);
         ndarray::Zip::from(&mut diag_combined)
@@ -606,7 +606,7 @@ impl<'a> RemlState<'a> {
             );
         p_total += &active_total;
 
-        let xp = x_dense.dot(&p_total);
+        let xp = crate::faer_ndarray::fast_ab(x_dense, &p_total);
         let mut lev_p = Array1::<f64>::zeros(n);
         ndarray::Zip::from(&mut lev_p)
             .and(xp.rows())
@@ -728,7 +728,7 @@ impl<'a> RemlState<'a> {
                 beta_dir.len()
             )));
         }
-        let deta = firth_op.x_dense.dot(beta_dir);
+        let deta = crate::faer_ndarray::fast_av(&firth_op.x_dense, beta_dir);
         let dir = firth_op.direction_from_deta(deta);
         let hphi = firth_op.hphi_direction(&dir);
         if hphi.raw_dim() != p_total.raw_dim() {
