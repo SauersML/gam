@@ -40,7 +40,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design, fit_term_collection_with_coefficient_groups,
+    build_term_collection_design,
+    fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
@@ -652,25 +653,22 @@ fn fixed_gaussian_shift_frailty_from_spec(
 }
 
 fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
-    if !request.coefficient_groups.is_empty() && !request.penalty_block_gamma_priors.is_empty() {
-        return Err(
-            "coefficient_groups and penalty_block_gamma_priors both define precision priors; use one coordinate system per fit"
-                .to_string(),
-        );
-    }
-    let fitted = if !request.coefficient_groups.is_empty() {
-        fit_term_collection_with_coefficient_groups(
+    let fitted = if !request.coefficient_groups.is_empty()
+        || !request.penalty_block_gamma_priors.is_empty()
+    {
+        fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
             request.data,
             request.y.view(),
             request.weights.view(),
             request.offset.view(),
             &request.spec,
             &request.coefficient_groups,
+            &request.penalty_block_gamma_priors,
             request.family,
             &request.options,
         )
         .map_err(|e| e.to_string())?
-    } else if request.penalty_block_gamma_priors.is_empty() {
+    } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
             request.data,
             request.y.clone(),
@@ -680,18 +678,6 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.family,
             &request.options,
             &request.kappa_options,
-        )
-        .map_err(|e| e.to_string())?
-    } else {
-        crate::smooth::fit_term_collection_with_penalty_block_gamma_priors(
-            request.data,
-            request.y.view(),
-            request.weights.view(),
-            request.offset.view(),
-            &request.spec,
-            &request.penalty_block_gamma_priors,
-            request.family,
-            &request.options,
         )
         .map_err(|e| e.to_string())?
     };

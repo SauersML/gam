@@ -137,12 +137,21 @@ def _resolve_precision_hyperpriors(
     formula: str,
     headers: list[str],
     rows: list[list[str]],
+    group_metadata: Any | None = None,
 ) -> Any | None:
     if value is None:
         return None
     if callable(value):
         out: dict[str, list[float]] = {}
+        metadata_by_label = group_metadata if isinstance(group_metadata, dict) else {}
+        labels: list[str] = []
         for label in _group_terms_from_formula(formula):
+            if label not in labels:
+                labels.append(label)
+        for label in metadata_by_label:
+            if str(label) not in labels:
+                labels.append(str(label))
+        for label in labels:
             levels: list[str] = []
             if label in headers:
                 col = headers.index(label)
@@ -154,6 +163,8 @@ def _resolve_precision_hyperpriors(
                     "column": label,
                     "levels": levels,
                     "n_coefficients": len(levels),
+                    "metadata": metadata_by_label.get(label),
+                    "group_metadata": metadata_by_label.get(label),
                 }
             )
             out[label] = _normalize_precision_pair(pair, label)
@@ -421,7 +432,7 @@ def fit(
     ):
         rust_config.pop(key, None)
     resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
-        precision_hyperpriors, formula, headers, rows
+        precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
     )
     payload = _build_fit_payload(
         family=family,
@@ -490,6 +501,10 @@ def fit_array(
     """
     X_arr = _numeric_matrix(X, "X")
     Y_arr = _numeric_matrix(Y, "Y")
+    rust_config = dict(config or {})
+    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
+        precision_hyperpriors, formula, [], [], rust_config.get("group_metadata")
+    )
     payload = _build_fit_payload(
         family=family,
         offset=offset,
@@ -510,8 +525,8 @@ def fit_array(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
-        precision_hyperpriors=precision_hyperpriors,
-        config=dict(config or {}) or None,
+        precision_hyperpriors=resolved_precision_hyperpriors,
+        config=rust_config or None,
     )
     try:
         model_bytes = bytes(
