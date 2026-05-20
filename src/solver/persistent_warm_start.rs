@@ -284,7 +284,12 @@ pub(crate) fn lookup_outer_iterate_payload(seed_key: &str) -> Option<crate::cach
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", seed_key);
-    store.lookup(&fp.finalize()).ok().flatten()
+    // Seed-prefix entries can represent related but non-identical fits
+    // (different folds, diseases, or row sets). Their objectives are not on a
+    // common scale, so "lowest objective" is the wrong selection rule here.
+    // Prefer the newest valid seed; exact-key resume still uses objective-
+    // ranked lookup through Session::try_load().
+    store.lookup_latest(&fp.finalize()).ok().flatten()
 }
 
 /// Open a [`crate::cache::Session`] for outer-iterate (rho-axis) checkpoints.

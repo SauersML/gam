@@ -425,9 +425,9 @@ impl<'a> FitRequest<'a> {
     /// the final-result `finalize` write. Used by the dispatcher to write
     /// the converged ρ to the data-independent seed prefix keyspace so a
     /// future fit with related-but-not-identical structure can warm-start
-    /// from this run. Per-checkpoint writes are NOT mirrored — only the
-    /// final result is, so the broadcast overhead is one extra write per
-    /// fit, not per outer iteration.
+    /// from this run. Checkpoints are mirrored through the same rate-limited
+    /// session path as the primary cache, so interrupted runs can still seed
+    /// later related fits instead of waiting for a successful final result.
     pub fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
         match self {
             FitRequest::Standard(_) => {}
@@ -2025,7 +2025,7 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     let exact_key = request.cache_key();
     let seed_key = request.cache_seed_key();
     if let Some(session) = crate::solver::persistent_warm_start::open_outer_session(&exact_key) {
-        let exact_present = session.try_load().is_some();
+        let exact_present = session.peek_load().is_some();
         if !exact_present
             && let Some(seed) =
                 crate::solver::persistent_warm_start::lookup_outer_iterate_payload(&seed_key)
@@ -2041,10 +2041,10 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
         }
         request.attach_cache_session(session);
     }
-    // Mirror finalize to the seed-prefix keyspace so the *next* fit with
-    // related-but-not-identical structure can pick this run's ρ up via
-    // the prefix lookup above. The mirror runs lazily on result —
-    // checkpoints during the run only write to the exact key.
+    // Mirror checkpoints and finalize to the seed-prefix keyspace so the
+    // *next* fit with related-but-not-identical structure can pick this run's
+    // ρ up via the prefix lookup above, even if the current process is killed
+    // before convergence.
     let mirror_session = crate::solver::persistent_warm_start::open_outer_session(&seed_key);
     if let Some(mirror) = mirror_session.as_ref() {
         request.attach_cache_mirror(Arc::clone(mirror));

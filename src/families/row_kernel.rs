@@ -799,6 +799,47 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             return Array2::<f64>::zeros((rank, rank));
         }
 
+        if !Self::use_blas3_projected_matrix(n_rows, rank) {
+            let op_factor = self.mul_mat(factor);
+            return factor.t().dot(&op_factor);
+        }
+
+        let jf = self.compute_jf(factor);
+        self.projected_matrix_with_jf(factor, jf.view())
+    }
+
+    fn projected_matrix_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
+        if rank == 0 || n_rows == 0 {
+            return Array2::<f64>::zeros((rank, rank));
+        }
+        if !Self::use_blas3_projected_matrix(n_rows, rank) {
+            let op_factor = self.mul_mat(factor);
+            return factor.t().dot(&op_factor);
+        }
+
+        let jf = self.cached_jf(factor, cache);
+        self.projected_matrix_with_jf(factor, jf.view())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        row_kernel_directional_derivative(&*self.kern, &self.rows, &self.direction)
+            .expect("row-kernel directional derivative dense materialization should succeed")
+    }
+
+    fn is_implicit(&self) -> bool {
+        true
+    }
+}
+
+impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, T> {
+    fn use_blas3_projected_matrix(n_rows: usize, rank: usize) -> bool {
         // BLAS-3 threshold gate.
         //
         // The override reorganises `Fᵀ B F` into K(K+1)/2 weighted
@@ -816,18 +857,18 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         // n=300, rank=81 (n·rank²≈2M) the per-column mul_mat path is
         // ~1 ms cheaper than the BLAS-3 setup; at n=1000 the BLAS-3
         // path overtakes; at n=20K it's 4× faster. The threshold
-        // matches that crossover. Below the threshold we fall through
-        // to the trait default which is implemented inline here to
-        // avoid a recursive call back into this method.
+        // matches that crossover.
         const BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD: usize = 2_500_000;
-        if n_rows.saturating_mul(rank).saturating_mul(rank) < BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD
-        {
-            let op_factor = self.mul_mat(factor);
-            return factor.t().dot(&op_factor);
-        }
+        n_rows.saturating_mul(rank).saturating_mul(rank) >= BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD
+    }
 
-        // Build J·F once (BLAS-3 fast path when the kernel exposes one).
-        let jf = self.compute_jf(factor);
+    fn projected_matrix_with_jf(
+        &self,
+        factor: &Array2<f64>,
+        jf: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let rank = factor.ncols();
+        let n_rows = self.kern.n_rows();
         debug_assert_eq!(jf.dim(), (n_rows, K * rank));
 
         // Per-row T_r tensor: T[r, a, b] = row_third_contracted(r,
@@ -937,18 +978,6 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         out.mapv_inplace(|v| 0.5 * v);
         out
     }
-
-    fn to_dense(&self) -> Array2<f64> {
-        row_kernel_directional_derivative(&*self.kern, &self.rows, &self.direction)
-            .expect("row-kernel directional derivative dense materialization should succeed")
-    }
-
-    fn is_implicit(&self) -> bool {
-        true
-    }
-}
-
-impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, T> {
     /// Build the jacobian-projected factor `J · F`: an `(n, K * rank)`
     /// row-major matrix with `jf[r, k * rank + col] = (J_r · F[:, col])[k]`.
     ///
