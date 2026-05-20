@@ -102,14 +102,16 @@ gamfit.fit(df, "y ~ te(space, time, k=10)")   # tensor product
 ### Geometric / manifold smooths
 
 When the predictor space is a circle, cylinder, torus, sphere, or
-Möbius strip, ordinary smooths produce visible seams and pole
-artefacts. gamfit's geometric smooths bake the wrap topology into
-both the basis and the penalty — `periodic=[axes]`, `period=[...]`
-margins for tensor products, an intrinsic `sphere(...)` kernel
-(Wahba's reproducing kernel or spherical harmonics), and
-boundary-conditioned 1-D B-splines.
+periodic tensor product, ordinary smooths produce visible seams and pole
+artefacts. gamfit's geometric smooths bake the wrap topology into both
+the basis and the penalty — `periodic=[axes]`, `period=[...]` margins
+for tensor products, an intrinsic `sphere(...)` kernel (Wahba's
+reproducing kernel or spherical harmonics), and boundary-conditioned
+1-D B-splines. The gallery's Möbius-looking example is a 4π-periodic
+double-cover parameterization of a Möbius embedding, not a twisted
+Möbius-strip predictor basis.
 
-![rotating recovery of six manifolds (trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, Möbius strip) from noisy 3-D point clouds](docs/images/geometric_shapes_demo.gif)
+![rotating recovery of six geometric examples (trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, Möbius double-cover) from noisy 3-D point clouds](docs/images/geometric_shapes_demo.gif)
 
 Each pair shows a noisy 3-D point cloud (left) and the smooth
 manifold the geometric smooths recover (right). The full gallery,
@@ -216,8 +218,8 @@ est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
   `report`, `diagnose`, `sample`, `generate`).
 - **Cookbook:** [docs/cookbook.md](docs/cookbook.md).
 - **Manifold smooths gallery:** [docs/manifold-smooths.md](docs/manifold-smooths.md)
-  — visual tour of the periodic / sphere / cylinder / torus / Möbius /
-  BC smooths, recovered from noisy 3-D point clouds.
+  — visual tour of the periodic / sphere / cylinder / torus /
+  Möbius-double-cover / BC smooths, recovered from noisy 3-D point clouds.
 
 ## Repository layout
 

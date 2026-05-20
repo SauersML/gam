@@ -6,7 +6,7 @@
 //! polynomial of degree l. The l-th term scales like l^{1 − 2m}, so the
 //! series converges absolutely for m ≥ 2 and is only conditionally
 //! convergent (and divergent at γ = 0) for m = 1: at γ = 0 the m = 1
-//! sum behaves like ½π · Σ 1/l, the harmonic series. For m = 1 we
+//! sum behaves like (1 / 2π) · Σ 1/l, the harmonic series. For m = 1 we
 //! therefore probe at γ > 0 only; for m ≥ 2 truncating at L = 200 gives
 //! the "truth" against which the closed-form polynomial in
 //! `wahba_sphere_kernel_from_cos` is exact (up to an additive constant

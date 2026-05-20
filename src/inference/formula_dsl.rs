@@ -437,10 +437,17 @@ pub struct SurvivalFormulaSpec {
 pub struct ParsedFormula {
     pub response: String,
     pub terms: Vec<ParsedTerm>,
+    pub logslope_surfaces: Vec<LogSlopeSurfaceSpec>,
     pub linkwiggle: Option<LinkWiggleFormulaSpec>,
     pub timewiggle: Option<LinkWiggleFormulaSpec>,
     pub linkspec: Option<LinkFormulaSpec>,
     pub survivalspec: Option<SurvivalFormulaSpec>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LogSlopeSurfaceSpec {
+    pub z_column: String,
+    pub terms: Vec<ParsedTerm>,
 }
 
 #[derive(Clone, Debug)]
@@ -478,6 +485,10 @@ pub enum ParsedTerm {
     SurvivalConfig {
         options: BTreeMap<String, String>,
     },
+    LogSlopeSurface {
+        z_column: String,
+        terms: Vec<ParsedTerm>,
+    },
 }
 
 pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) -> bool {
@@ -490,6 +501,9 @@ pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) ->
         | ParsedTerm::TimeWiggle { .. }
         | ParsedTerm::LinkConfig { .. }
         | ParsedTerm::SurvivalConfig { .. } => false,
+        ParsedTerm::LogSlopeSurface { z_column, terms } => {
+            z_column == column_name || parsed_terms_reference_column(terms, column_name)
+        }
     })
 }
 
@@ -500,15 +514,32 @@ pub fn validate_marginal_slope_z_column_exclusion(
     context: &str,
     logslope_label: &str,
 ) -> Result<(), String> {
-    if parsed_terms_reference_column(&main_formula.terms, z_column) {
-        return Err(format!(
-            "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
-        ));
+    let z_columns = logslope_formula
+        .logslope_surfaces
+        .iter()
+        .map(|surface| surface.z_column.as_str())
+        .chain(std::iter::once(z_column));
+    for z_column in z_columns {
+        if parsed_terms_reference_column(&main_formula.terms, z_column) {
+            return Err(format!(
+                "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
+            ));
+        }
     }
-    if parsed_terms_reference_column(&logslope_formula.terms, z_column) {
+    if logslope_formula.logslope_surfaces.is_empty()
+        && parsed_terms_reference_column(&logslope_formula.terms, z_column)
+    {
         return Err(format!(
             "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
         ));
+    }
+    for surface in &logslope_formula.logslope_surfaces {
+        if parsed_terms_reference_column(&surface.terms, &surface.z_column) {
+            return Err(format!(
+                "{context} reserves z column '{}' as the auxiliary latent score for its log-slope surface; it cannot also appear in {logslope_label}",
+                surface.z_column
+            ));
+        }
     }
     Ok(())
 }
@@ -1209,6 +1240,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     let mut timewiggle: Option<LinkWiggleFormulaSpec> = None;
     let mut linkspec: Option<LinkFormulaSpec> = None;
     let mut survivalspec: Option<SurvivalFormulaSpec> = None;
+    let mut logslope_surfaces = Vec::<LogSlopeSurfaceSpec>::new();
     // Track seen-term-keys so we can reject exact duplicates like
     // `y ~ smooth(x) + smooth(x)` upfront — without this the duplicate
     // produces a rank-deficient design and the user has no idea why their
@@ -1258,8 +1290,17 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
                 }
                 survivalspec = Some(parse_survival_formulaspec(&options, t)?);
             }
+            ParsedTerm::LogSlopeSurface { z_column, terms } => {
+                logslope_surfaces.push(LogSlopeSurfaceSpec { z_column, terms });
+            }
             other => terms.push(other),
         }
+    }
+    if !logslope_surfaces.is_empty() && !terms.is_empty() {
+        return Err(
+            "logslope(...) declarations must own the full log-slope formula; do not mix wrapped and unwrapped log-slope terms"
+                .to_string(),
+        );
     }
 
     // Reject self-referential formulas like `y ~ smooth(y)` or `y ~ y`: the
@@ -1280,6 +1321,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     Ok(ParsedFormula {
         response: lhs.to_string(),
         terms,
+        logslope_surfaces,
         linkwiggle,
         timewiggle,
         linkspec,
@@ -1554,6 +1596,32 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 return Ok(ParsedTerm::SurvivalConfig { options });
             }
+            "logslope" | "log_slope" | "log_slope_surface" => {
+                validate_known_term_options("logslope", &options, &[], raw)?;
+                if vars.len() < 2 {
+                    return Err(format!(
+                        "logslope() expects a z column followed by one or more RHS terms: {raw}"
+                    ));
+                }
+                let z_column = vars[0].trim();
+                if !is_exact_ident(z_column) {
+                    return Err(format!(
+                        "logslope() z column must be a bare column name, got `{z_column}` in {raw}"
+                    ));
+                }
+                let rhs = vars[1..].join(" + ");
+                let parsed = parse_formula(&format!("__logslope__ ~ {rhs}"))?;
+                if !parsed.logslope_surfaces.is_empty() {
+                    return Err(format!(
+                        "logslope() declarations cannot be nested inside another logslope(): {raw}"
+                    ));
+                }
+                validate_auxiliary_formula_controls(&parsed, "logslope()")?;
+                return Ok(ParsedTerm::LogSlopeSurface {
+                    z_column: z_column.to_string(),
+                    terms: parsed.terms,
+                });
+            }
             "linear" => {
                 if vars.len() != 1 {
                     return Err(format!("linear() expects exactly one variable: {raw}"));
@@ -1575,7 +1643,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
                 ));
             }
         }
