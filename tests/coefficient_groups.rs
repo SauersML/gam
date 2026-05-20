@@ -463,8 +463,18 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
             prior_mean: Default::default(),
         },
         CoefficientGroupSpec {
-            name: "per_score_level".to_string(),
+            name: "per_score_a_level".to_string(),
             selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
+            parent: Some("publication_level".to_string()),
+            prior: Some(CoefficientGroupPrior::GammaPrecision {
+                shape: 15.0,
+                rate: 1.0,
+            }),
+            prior_mean: Default::default(),
+        },
+        CoefficientGroupSpec {
+            name: "per_score_b_level".to_string(),
+            selectors: vec![CoefficientSelector::LinearTerm("score_b".to_string())],
             parent: Some("publication_level".to_string()),
             prior: Some(CoefficientGroupPrior::GammaPrecision {
                 shape: 15.0,
@@ -486,12 +496,13 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
     )
     .expect("nested grouped fit");
 
-    assert_eq!(fit.fit.lambdas.len(), 2);
+    assert_eq!(fit.fit.lambdas.len(), 3);
     let parent_lambda = fit.fit.lambdas[0];
-    let child_lambda = fit.fit.lambdas[1];
+    let child_a_lambda = fit.fit.lambdas[1];
+    let child_b_lambda = fit.fit.lambdas[2];
     assert!(
-        child_lambda > parent_lambda,
-        "child level should carry the stronger Gamma-prior precision: child={child_lambda} parent={parent_lambda}"
+        child_a_lambda > parent_lambda && child_b_lambda > parent_lambda,
+        "child levels should carry stronger Gamma-prior precision: child_a={child_a_lambda} child_b={child_b_lambda} parent={parent_lambda}"
     );
 
     let unpenalized = array![0.0_f64, 0.15, 1.25];
