@@ -643,6 +643,30 @@ pub trait HessianOperator: Send + Sync {
     }
 }
 
+/// Representative curvature scale for a Hessian operator.
+///
+/// Returns the geometric mean of the active Hessian eigenvalues,
+/// `exp(log|H|_+ / rank(H))`. This has the same physical units as a Hessian
+/// diagonal entry but is basis-invariant, cheap after the operator has computed
+/// its log-determinant, and well-defined for both dense spectral and
+/// matrix-free operator paths.
+pub fn hessian_operator_geometric_scale(op: &dyn HessianOperator) -> Option<f64> {
+    let rank = op.active_rank();
+    if rank == 0 {
+        return None;
+    }
+    let logdet = op.logdet();
+    if !logdet.is_finite() {
+        return None;
+    }
+    let scale = (logdet / rank as f64).exp();
+    if scale.is_finite() && scale > 0.0 {
+        Some(scale)
+    } else {
+        None
+    }
+}
+
 /// Provider of family-specific Hessian derivative information.
 ///
 /// The REML/LAML gradient requires ∂H/∂ρₖ. For Gaussian, this is just Aₖ = λₖSₖ.
@@ -11650,9 +11674,7 @@ impl HessianOperator for DenseSpectralOperator {
     }
 
     fn active_rank(&self) -> usize {
-        // With smooth regularization all eigenvalues are active (positive).
-        // Return the full dimension for consistency.
-        self.n_dim
+        self.active_mask.iter().filter(|&&active| active).count()
     }
 
     fn dim(&self) -> usize {
