@@ -5995,9 +5995,14 @@ pub fn reml_laml_evaluate(
             // produced `trace_logdet_i` — the projected/stochastic/exact-dense
             // batched paths short-circuit the per-coord match arm but still
             // need to surface the same `unprojected_tr` / `production_tr` pair
-            // and (for ext_idx == 0) the term-breakdown stash that
+            // and (for ext_idx == 0) the IFT-diagonal pair that
             // `iso_kappa_duchon_penalty_subspace_projection_pins_trace` and
             // `duchon_probit_per_row_dnu_dpsi_fd_vs_analytic` consume.
+            //
+            // The capture below runs inside this `into_par_iter` closure on a
+            // rayon worker, so `debug_stash::store_terms` writes through a
+            // process-wide `Mutex`, not a thread-local; otherwise the test
+            // thread would never see the stash.
             #[cfg(test)]
             if incl_logdet_h
                 && let Some(ds) = hop.as_exact_dense_spectral()
