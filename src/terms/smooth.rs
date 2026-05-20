@@ -5811,16 +5811,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
 }
 
 fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
-    match &term.basis {
-        SmoothBasisSpec::BSpline1D { .. } => 0,
-        SmoothBasisSpec::TensorBSpline { .. } => 1,
-        SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Sphere { .. } => 3,
-        SmoothBasisSpec::Matern { .. } => 4,
-        SmoothBasisSpec::Duchon { .. } => 5,
-        SmoothBasisSpec::FactorSmooth { .. } => 6,
-        SmoothBasisSpec::BySmooth { .. } => 7,
-    }
+    term.basis.family_rank()
 }
 
 fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
