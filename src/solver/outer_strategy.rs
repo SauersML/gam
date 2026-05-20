@@ -3334,6 +3334,27 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 //    still violated everywhere on the active set).
                 const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
                 const BARRIER_CURVATURE_SATURATION: f64 = 1.0;
+                const BARRIER_CURVATURE_RELATIVE_THRESHOLD: f64 = 0.05;
+                if let Some(ref_diag) = eval.inner_hessian_diag_scale
+                    && ref_diag.is_finite()
+                    && ref_diag > 0.0
+                    && barrier_cfg.barrier_curvature_is_significant(
+                        beta,
+                        ref_diag,
+                        BARRIER_CURVATURE_RELATIVE_THRESHOLD,
+                    )
+                {
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "{} EFS barrier curvature significant relative to inner Hessian \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e}, ref_diag={:.3e})",
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        eval.cost,
+                        ref_diag,
+                    )));
+                }
                 if barrier_cfg.barrier_curvature_locally_concentrated(
                     beta,
                     LOCAL_CONCENTRATION_RATIO,
@@ -6157,6 +6178,7 @@ mod tests {
                     beta: None,
                     psi_gradient: Some(array![1.0]),
                     psi_indices: Some(vec![11]),
+                    inner_hessian_diag_scale: None,
                 })
             }),
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
@@ -7835,6 +7857,7 @@ mod tests {
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
+                    inner_hessian_diag_scale: None,
                 })
             }),
         );
@@ -7886,6 +7909,7 @@ mod tests {
                             beta: None,
                             psi_gradient: None,
                             psi_indices: None,
+                            inner_hessian_diag_scale: None,
                         })
                     } else {
                         Err(EstimationError::RemlOptimizationFailed(
