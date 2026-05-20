@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
-from ._cuda import cuda_diagnostics, format_cuda_diagnostics
+from ._cuda import cuda_diagnostics as _cuda_diagnostics
+from ._cuda import format_cuda_diagnostics as _format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
@@ -35,6 +36,18 @@ def build_info() -> dict[str, Any]:
     True
     """
     return extension_status()
+
+
+def cuda_diagnostics() -> dict[str, object]:
+    """Return CUDA loader diagnostics without forcing Rust GPU dispatch."""
+
+    return _cuda_diagnostics()
+
+
+def format_cuda_diagnostics() -> str:
+    """Return CUDA loader diagnostics as stable, grep-friendly text."""
+
+    return _format_cuda_diagnostics()
 
 
 def _build_fit_payload(
