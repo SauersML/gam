@@ -209,9 +209,13 @@ pub enum RhoPrior {
     /// Gamma(shape, rate) conjugate hyperprior on the precision lambda = exp(rho).
     ///
     /// The REML/LAML objective is minimized, so this contributes
-    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant,
-    /// yielding the conjugate update `(shape + rank/2, rate + beta'S beta/2)`.
-    /// `Gamma(1, 0)` is the explicit flat/default precision prior.
+    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant. For a
+    /// block with effective dimension n_p and centered quadratic
+    /// `(beta - mu)'S_p(beta - mu)`, the conditional posterior is
+    /// `Gamma(shape + n_p/2, rate + quadratic/2)` and the closed-form MAP
+    /// precision is `(shape + n_p/2 - 1) / (rate + quadratic/2)`.
+    /// `Gamma(1, 0)` is the explicit flat/default case and reproduces the
+    /// current MacKay/Tipping fixed point.
     GammaPrecision {
         shape: f64,
         rate: f64,
