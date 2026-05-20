@@ -437,7 +437,10 @@ pub fn realize_coefficient_groups_for_custom_family(
             return Err("coefficient group label must not be empty".to_string());
         }
         if !seen.insert(group.label.clone()) {
-            return Err(format!("duplicate coefficient group label '{}'", group.label));
+            return Err(format!(
+                "duplicate coefficient group label '{}'",
+                group.label
+            ));
         }
         if group.coefficients.is_empty() {
             return Err(format!(
@@ -538,7 +541,8 @@ pub fn realize_coefficient_groups_for_custom_family(
                         .count(),
                 ),
             );
-            let mut rho = Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
+            let mut rho =
+                Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
             if !realized_specs[block_idx].initial_log_lambdas.is_empty() {
                 let old_len = realized_specs[block_idx].initial_log_lambdas.len();
                 rho.slice_mut(s![..old_len])
@@ -571,12 +575,9 @@ pub fn fit_custom_family_with_coefficient_groups<
     if groups.is_empty() {
         return fit_custom_family(family, specs, options);
     }
-    let realized = realize_coefficient_groups_for_custom_family(
-        specs,
-        groups,
-        crate::types::RhoPrior::Flat,
-    )
-    .map_err(CustomFamilyError::InvalidInput)?;
+    let realized =
+        realize_coefficient_groups_for_custom_family(specs, groups, crate::types::RhoPrior::Flat)
+            .map_err(CustomFamilyError::InvalidInput)?;
     fit_custom_family(family, &realized.specs, options)
 }
 
@@ -6109,6 +6110,129 @@ fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
     out
 }
 
+#[derive(Clone, Debug)]
+struct PenaltyLabelLayout {
+    penalty_counts: Vec<usize>,
+    physical_to_outer: Vec<usize>,
+    initial_rho: Array1<f64>,
+}
+
+impl PenaltyLabelLayout {
+    fn physical_count(&self) -> usize {
+        self.physical_to_outer.len()
+    }
+
+    fn has_tied_coordinates(&self) -> bool {
+        self.initial_rho.len() != self.physical_to_outer.len()
+    }
+}
+
+fn penalty_label_layout(
+    specs: &[ParameterBlockSpec],
+    penalty_counts: Vec<usize>,
+) -> Result<PenaltyLabelLayout, String> {
+    let mut label_to_outer = BTreeMap::<String, usize>::new();
+    let mut physical_to_outer = Vec::<usize>::new();
+    let mut initial = Vec::<f64>::new();
+
+    for (block_idx, spec) in specs.iter().enumerate() {
+        for penalty_idx in 0..spec.penalties.len() {
+            let label = spec.penalties[penalty_idx]
+                .precision_label()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+            let rho0 = spec.initial_log_lambdas[penalty_idx];
+            let outer = if let Some(&outer) = label_to_outer.get(&label) {
+                let first = initial[outer];
+                if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                    return Err(format!(
+                        "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
+                    ));
+                }
+                outer
+            } else {
+                let outer = initial.len();
+                label_to_outer.insert(label.clone(), outer);
+                initial.push(rho0);
+                outer
+            };
+            physical_to_outer.push(outer);
+        }
+    }
+
+    Ok(PenaltyLabelLayout {
+        penalty_counts,
+        physical_to_outer,
+        initial_rho: Array1::from_vec(initial),
+    })
+}
+
+fn expand_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if rho.len() != layout.initial_rho.len() {
+        return Err(format!(
+            "log-lambda label coordinate mismatch: got {}, expected {}",
+            rho.len(),
+            layout.initial_rho.len()
+        ));
+    }
+    let mut expanded = Array1::<f64>::zeros(layout.physical_count());
+    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
+        expanded[physical] = rho[outer];
+    }
+    Ok(expanded)
+}
+
+fn split_labeled_log_lambdas(
+    rho: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Vec<Array1<f64>>, String> {
+    let expanded = expand_labeled_log_lambdas(rho, layout)?;
+    split_log_lambdas(&expanded, &layout.penalty_counts)
+}
+
+fn aggregate_labeled_gradient(
+    gradient: &Array1<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array1<f64>, String> {
+    if gradient.len() != layout.physical_count() {
+        return Err(format!(
+            "physical gradient length mismatch: got {}, expected {}",
+            gradient.len(),
+            layout.physical_count()
+        ));
+    }
+    let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
+    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
+        out[outer] += gradient[physical];
+    }
+    Ok(out)
+}
+
+fn aggregate_labeled_hessian(
+    hessian: &Array2<f64>,
+    layout: &PenaltyLabelLayout,
+) -> Result<Array2<f64>, String> {
+    if hessian.nrows() != layout.physical_count() || hessian.ncols() != layout.physical_count() {
+        return Err(format!(
+            "physical Hessian shape mismatch: got {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            layout.physical_count(),
+            layout.physical_count()
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((layout.initial_rho.len(), layout.initial_rho.len()));
+    for (i, &oi) in layout.physical_to_outer.iter().enumerate() {
+        for (j, &oj) in layout.physical_to_outer.iter().enumerate() {
+            out[[oi, oj]] += hessian[[i, j]];
+        }
+    }
+    Ok(out)
+}
+
 fn split_log_lambdas(
     flat: &Array1<f64>,
     penalty_counts: &[usize],
@@ -6127,6 +6251,153 @@ fn split_log_lambdas(
         at += k;
     }
     Ok(out)
+}
+
+#[derive(Clone, Debug)]
+struct PenaltyCoordinateLayout {
+    penalty_counts: Vec<usize>,
+    penalty_to_outer: Vec<usize>,
+    outer_initial_rho: Array1<f64>,
+    has_shared_labels: bool,
+}
+
+impl PenaltyCoordinateLayout {
+    fn from_specs(
+        specs: &[ParameterBlockSpec],
+        penalty_counts: Vec<usize>,
+    ) -> Result<Self, String> {
+        let mut label_to_outer = BTreeMap::<String, usize>::new();
+        let mut outer_initial = Vec::<f64>::new();
+        let mut penalty_to_outer = Vec::<usize>::new();
+        let mut has_shared_labels = false;
+
+        for (block_idx, spec) in specs.iter().enumerate() {
+            for (penalty_idx, penalty) in spec.penalties.iter().enumerate() {
+                let rho0 = spec.initial_log_lambdas[penalty_idx];
+                let label = penalty
+                    .precision_label()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("__block_{block_idx}_penalty_{penalty_idx}"));
+                if let Some(&outer_idx) = label_to_outer.get(&label) {
+                    has_shared_labels = true;
+                    let first = outer_initial[outer_idx];
+                    if first.is_finite() && rho0.is_finite() && (first - rho0).abs() > 1e-10 {
+                        return Err(format!(
+                            "precision label '{label}' has inconsistent initial log-precisions: {first} and {rho0}"
+                        ));
+                    }
+                    penalty_to_outer.push(outer_idx);
+                } else {
+                    let outer_idx = outer_initial.len();
+                    label_to_outer.insert(label, outer_idx);
+                    outer_initial.push(rho0);
+                    penalty_to_outer.push(outer_idx);
+                }
+            }
+        }
+
+        Ok(Self {
+            penalty_counts,
+            penalty_to_outer,
+            outer_initial_rho: Array1::from_vec(outer_initial),
+            has_shared_labels,
+        })
+    }
+
+    fn expand_outer_rho(&self, outer_rho: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if outer_rho.len() != self.outer_initial_rho.len() {
+            return Err(format!(
+                "outer rho length mismatch: got {}, expected {}",
+                outer_rho.len(),
+                self.outer_initial_rho.len()
+            ));
+        }
+        let mut expanded = Array1::<f64>::zeros(self.penalty_to_outer.len());
+        for (penalty_idx, &outer_idx) in self.penalty_to_outer.iter().enumerate() {
+            expanded[penalty_idx] = outer_rho[outer_idx];
+        }
+        Ok(expanded)
+    }
+
+    fn split_outer_rho(&self, outer_rho: &Array1<f64>) -> Result<Vec<Array1<f64>>, String> {
+        let expanded = self.expand_outer_rho(outer_rho)?;
+        split_log_lambdas(&expanded, &self.penalty_counts)
+    }
+
+    fn compress_gradient(&self, gradient: Array1<f64>) -> Result<Array1<f64>, String> {
+        if gradient.len() != self.penalty_to_outer.len() {
+            return Err(format!(
+                "internal gradient length mismatch: got {}, expected {}",
+                gradient.len(),
+                self.penalty_to_outer.len()
+            ));
+        }
+        let mut compressed = Array1::<f64>::zeros(self.outer_initial_rho.len());
+        for (penalty_idx, &outer_idx) in self.penalty_to_outer.iter().enumerate() {
+            compressed[outer_idx] += gradient[penalty_idx];
+        }
+        Ok(compressed)
+    }
+
+    fn compress_hessian_matrix(&self, hessian: Array2<f64>) -> Result<Array2<f64>, String> {
+        let n_internal = self.penalty_to_outer.len();
+        if hessian.nrows() != n_internal || hessian.ncols() != n_internal {
+            return Err(format!(
+                "internal Hessian shape mismatch: got {}x{}, expected {n_internal}x{n_internal}",
+                hessian.nrows(),
+                hessian.ncols()
+            ));
+        }
+        let n_outer = self.outer_initial_rho.len();
+        let mut compressed = Array2::<f64>::zeros((n_outer, n_outer));
+        for (i_internal, &i_outer) in self.penalty_to_outer.iter().enumerate() {
+            for (j_internal, &j_outer) in self.penalty_to_outer.iter().enumerate() {
+                compressed[[i_outer, j_outer]] += hessian[[i_internal, j_internal]];
+            }
+        }
+        Ok(compressed)
+    }
+
+    fn compress_hessian_result(
+        &self,
+        hessian: crate::solver::outer_strategy::HessianResult,
+    ) -> Result<crate::solver::outer_strategy::HessianResult, String> {
+        if !self.has_shared_labels {
+            return Ok(hessian);
+        }
+        match hessian {
+            crate::solver::outer_strategy::HessianResult::Analytic(matrix) => {
+                Ok(crate::solver::outer_strategy::HessianResult::Analytic(
+                    self.compress_hessian_matrix(matrix)?,
+                ))
+            }
+            crate::solver::outer_strategy::HessianResult::Operator(operator) => {
+                let dense = operator.materialize_dense()?;
+                Ok(crate::solver::outer_strategy::HessianResult::Analytic(
+                    self.compress_hessian_matrix(dense)?,
+                ))
+            }
+            crate::solver::outer_strategy::HessianResult::Unavailable => {
+                Ok(crate::solver::outer_strategy::HessianResult::Unavailable)
+            }
+        }
+    }
+
+    fn compress_outer_eval(
+        &self,
+        result: OuterObjectiveEvalResult,
+    ) -> Result<OuterObjectiveEvalResult, String> {
+        if !self.has_shared_labels {
+            return Ok(result);
+        }
+        Ok(OuterObjectiveEvalResult {
+            objective: result.objective,
+            gradient: self.compress_gradient(result.gradient)?,
+            outer_hessian: self.compress_hessian_result(result.outer_hessian)?,
+            warm_start: result.warm_start,
+            inner_converged: result.inner_converged,
+        })
+    }
 }
 
 fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -13494,6 +13765,53 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
     .map_err(String::from)
 }
 
+fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    eval_mode: EvalMode,
+) -> Result<OuterObjectiveEvalResult, String> {
+    if !layout.has_tied_coordinates() {
+        return outerobjectivegradienthessian_internal(
+            family,
+            specs,
+            options,
+            &layout.penalty_counts,
+            rho,
+            warm_start,
+            eval_mode,
+        );
+    }
+
+    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+    let physical_warm_start = warm_start.map(|seed| {
+        let mut seed = seed.clone();
+        seed.rho = physical_rho.clone();
+        seed
+    });
+    let mut result = outerobjectivegradienthessian_internal(
+        family,
+        specs,
+        options,
+        &layout.penalty_counts,
+        &physical_rho,
+        physical_warm_start.as_ref(),
+        eval_mode,
+    )?;
+    result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
+    result.outer_hessian = match result.outer_hessian.materialize_dense()? {
+        Some(hessian) => crate::solver::outer_strategy::HessianResult::Analytic(
+            aggregate_labeled_hessian(&hessian, layout)?,
+        ),
+        None => crate::solver::outer_strategy::HessianResult::Unavailable,
+    };
+    result.warm_start.rho = rho.clone();
+    Ok(result)
+}
+
 #[cfg(test)]
 fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -17105,7 +17423,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     options: &BlockwiseFitOptions,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
-    let rho0 = flatten_log_lambdas(specs);
+    let label_layout = penalty_label_layout(specs, penalty_counts)?;
+    let rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(specs, options, rho0.len());
 
@@ -17174,7 +17493,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         log::info!(
             "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
         );
-        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+        let per_block = split_labeled_log_lambdas(&rho0, &label_layout)?;
         let mut inner = inner_blockwise_fit(
             family,
             specs,
@@ -17199,7 +17518,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             "custom-family explicit one-cycle inner probe",
         )
         .map_err(CustomFamilyError::Optimization)?;
-        let lambdas = rho0.mapv(f64::exp);
+        let rho0_physical = expand_labeled_log_lambdas(&rho0, &label_layout)?;
+        let lambdas = rho0_physical.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
         let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
         store_persistent_custom_family_warm_start(
@@ -17335,11 +17655,11 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
         let request_hessian =
             matches!(order, OuterEvalOrder::ValueGradientHessian) && need_outer_hessian;
-        let eval_result = match outerobjectivegradienthessian_internal(
+        let eval_result = match outerobjectivegradienthessian_labeled(
             family,
             specs,
             &outer_options,
-            &penalty_counts,
+            &label_layout,
             rho,
             warm_ref,
             if request_hessian {
@@ -17410,11 +17730,11 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
-            match outerobjectivegradienthessian_internal(
+            match outerobjectivegradienthessian_labeled(
                 family,
                 specs,
                 &outer_options,
-                &penalty_counts,
+                &label_layout,
                 rho,
                 warm_ref,
                 EvalMode::ValueOnly,
@@ -17465,12 +17785,18 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
             outer.warm_cache = None;
         }),
         Some(|outer: &mut CustomOuterState, rho: &Array1<f64>| {
+            if label_layout.has_tied_coordinates() {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "custom-family EFS is not available for tied coefficient-group precision labels"
+                        .to_string(),
+                ));
+            }
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
             match outerobjectiveefs(
                 family,
                 specs,
                 &outer_options,
-                &penalty_counts,
+                &label_layout.penalty_counts,
                 rho,
                 warm_ref,
             ) {
@@ -17529,7 +17855,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     let outer_grad_norm = outer_result.final_grad_norm;
     screening_cap.store(0, Ordering::Relaxed);
 
-    let per_block = split_log_lambdas(&rho_star, &penalty_counts)?;
+    let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
     let final_seed = obj.state.warm_cache.clone();
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
         .map_err(|e| {
@@ -17576,7 +17902,8 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         "custom-family fit final outer refit",
     )
     .map_err(CustomFamilyError::Optimization)?;
-    let lambdas_final = rho_star.mapv(f64::exp);
+    let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
+    let lambdas_final = rho_star_physical.mapv(f64::exp);
     let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
     blockwise_fit_from_parts(
         BlockwiseFitResultParts {
@@ -17596,19 +17923,6 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
         specs,
     )
     .map_err(CustomFamilyError::Optimization)
-}
-
-pub fn fit_custom_family_with_coefficient_groups<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    groups: &[CoefficientGroupSpec],
-    options: &BlockwiseFitOptions,
-) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
-    let realized = apply_coefficient_groups_to_block_specs(specs, groups)
-        .map_err(CustomFamilyError::InvalidInput)?;
-    fit_custom_family(family, &realized.specs, options)
 }
 
 pub(crate) fn fit_custom_family_fixed_log_lambdas<
@@ -17965,7 +18279,8 @@ mod tests {
                         col_range: col_range.clone(),
                         total_dim: wiggle_block.design.ncols(),
                     },
-                    crate::solver::estimate::PenaltySpec::Dense(m) => {
+                    crate::solver::estimate::PenaltySpec::Dense(m)
+                    | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                         PenaltyMatrix::Dense(m.clone())
                     }
                 })

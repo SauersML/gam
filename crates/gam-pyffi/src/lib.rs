@@ -102,6 +102,7 @@ struct PyFitConfig {
     group_metadata: Option<BTreeMap<String, serde_json::Value>>,
     groups: Option<serde_json::Value>,
     precision_hyperpriors: Option<serde_json::Value>,
+    penalty_block_gamma_priors: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
@@ -134,7 +135,10 @@ struct PyExtendGroupRequest {
     kind: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    term: String,
+    #[serde(default)]
+    term: Option<String>,
+    #[serde(default)]
+    column: Option<String>,
     #[serde(default)]
     level: Option<serde_json::Value>,
     #[serde(default)]
@@ -186,6 +190,8 @@ struct SummaryPayload {
     model_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     group_metadata: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deployment_extensions: Vec<SavedDeploymentExtension>,
     deviance: f64,
     reml_score: f64,
     iterations: usize,
@@ -314,6 +320,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "fit",
             "fit_array",
             "load",
+            "extend_with_group",
             "predict",
             "predict_array",
             "sample",
@@ -3444,8 +3451,17 @@ fn extend_model_with_group_impl(model_bytes: &[u8], request_json: &str) -> Resul
     }
     let request: PyExtendGroupRequest = serde_json::from_str(request_json)
         .map_err(|err| format!("failed to parse extend_with_group request: {err}"))?;
-    let kind = request
-        .kind
+    let PyExtendGroupRequest {
+        kind,
+        name,
+        term,
+        column,
+        level,
+        levels,
+        metadata,
+        prior,
+    } = request;
+    let kind = kind
         .as_deref()
         .unwrap_or("random-effect-level")
         .replace('_', "-");
@@ -3454,22 +3470,39 @@ fn extend_model_with_group_impl(model_bytes: &[u8], request_json: &str) -> Resul
             "extend_with_group supports kind='random-effect-level'; got '{kind}'"
         ));
     }
-    let mut levels = request.levels.unwrap_or_default();
-    if let Some(level) = request.level {
+    let mut levels = levels.unwrap_or_default();
+    if let Some(level) = level {
         levels.push(level);
     }
     if levels.is_empty() {
         return Err("extend_with_group requires level or levels".to_string());
     }
+    let term = match term.or(column) {
+        Some(term) => term,
+        None => {
+            let payload = model.payload();
+            let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
+                "extend_with_group requires saved resolved_termspec; refit".to_string()
+            })?;
+            if spec.random_effect_terms.len() == 1 {
+                spec.random_effect_terms[0].name.clone()
+            } else {
+                return Err(
+                    "extend_with_group requires term when the model has zero or multiple group terms"
+                        .to_string(),
+                );
+            }
+        }
+    };
 
     for level in levels {
         extend_model_with_random_effect_level(
             &mut model,
-            &request.term,
-            request.name.as_deref(),
+            term.as_str(),
+            name.as_deref(),
             level,
-            request.metadata.clone(),
-            request.prior.clone(),
+            metadata.clone(),
+            prior.clone(),
         )?;
     }
     model.validate_for_persistence()?;
@@ -3485,17 +3518,25 @@ fn extend_model_with_random_effect_level(
     metadata: Option<serde_json::Value>,
     prior: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    let spec = model
-        .resolved_termspec
-        .as_mut()
-        .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
-    let term_idx = spec
-        .random_effect_terms
-        .iter()
-        .position(|term| term.name == term_name)
-        .ok_or_else(|| format!("extend_with_group unknown random-effect term '{term_name}'"))?;
-    let feature_col = spec.random_effect_terms[term_idx].feature_col;
-    let schema = model
+    let payload: &mut FittedModelPayload = &mut *model;
+    let (term_idx, feature_col, coefficient_start, penalty_index) = {
+        let spec = payload
+            .resolved_termspec
+            .as_ref()
+            .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
+        let term_idx = spec
+            .random_effect_terms
+            .iter()
+            .position(|term| term.name == term_name)
+            .ok_or_else(|| format!("extend_with_group unknown random-effect term '{term_name}'"))?;
+        (
+            term_idx,
+            spec.random_effect_terms[term_idx].feature_col,
+            random_effect_coefficient_start(spec, term_idx)?,
+            random_effect_penalty_index(spec, term_idx),
+        )
+    };
+    let schema = payload
         .data_schema
         .as_mut()
         .ok_or_else(|| "extend_with_group requires saved data_schema; refit".to_string())?;
@@ -3505,6 +3546,44 @@ fn extend_model_with_random_effect_level(
         )
     })?;
     let (level_bits, encoded_value) = level_bits_for_extension(schema_col, &level)?;
+    let insert_pos = {
+        let spec = payload
+            .resolved_termspec
+            .as_ref()
+            .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
+        let levels = spec.random_effect_terms[term_idx]
+            .frozen_levels
+            .as_ref()
+            .ok_or_else(|| {
+                format!(
+                    "extend_with_group term '{term_name}' is not frozen; refit with persisted metadata"
+                )
+            })?;
+        match levels.binary_search(&level_bits) {
+            Ok(_) => {
+                return Err(format!(
+                    "extend_with_group level {} already exists for random-effect term '{term_name}'",
+                    compact_json(&level)
+                ));
+            }
+            Err(pos) => pos,
+        }
+    };
+    let coefficient_index = coefficient_start + insert_pos;
+    let (coefficient_mean, mut coefficient_variance) = extension_prior_parameters(prior.as_ref())?;
+    if coefficient_variance.is_none() {
+        coefficient_variance = payload
+            .fit_result
+            .as_ref()
+            .and_then(|fit| fit.lambdas.get(penalty_index).copied())
+            .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
+            .map(|lambda| 1.0 / lambda);
+    }
+
+    let spec = payload
+        .resolved_termspec
+        .as_mut()
+        .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
     let levels = spec.random_effect_terms[term_idx]
         .frozen_levels
         .as_mut()
@@ -3513,40 +3592,44 @@ fn extend_model_with_random_effect_level(
                 "extend_with_group term '{term_name}' is not frozen; refit with persisted metadata"
             )
         })?;
-    let insert_pos = match levels.binary_search(&level_bits) {
-        Ok(_) => {
-            return Err(format!(
-                "extend_with_group level {} already exists for random-effect term '{term_name}'",
-                compact_json(&level)
-            ));
-        }
-        Err(pos) => pos,
-    };
-    let coefficient_index = random_effect_coefficient_start(spec, term_idx)? + insert_pos;
-    let (coefficient_mean, coefficient_variance) = extension_prior_parameters(prior.as_ref())?;
-
     levels.insert(insert_pos, level_bits);
-    extend_training_feature_range(model, feature_col, encoded_value);
-    insert_coefficient_into_saved_fit(model.fit_result.as_mut(), coefficient_index, coefficient_mean, coefficient_variance)?;
-    insert_coefficient_into_saved_fit(model.unified.as_mut(), coefficient_index, coefficient_mean, coefficient_variance)?;
+    extend_training_feature_range(
+        payload.training_feature_ranges.as_mut(),
+        feature_col,
+        encoded_value,
+    );
+    insert_coefficient_into_saved_fit(
+        payload.fit_result.as_mut(),
+        coefficient_index,
+        coefficient_mean,
+        coefficient_variance,
+    )?;
+    insert_coefficient_into_saved_fit(
+        payload.unified.as_mut(),
+        coefficient_index,
+        coefficient_mean,
+        coefficient_variance,
+    )?;
 
     let extension_name = requested_name
         .map(str::to_string)
         .unwrap_or_else(|| format!("{term_name}:{}", compact_json(&level)));
     if let Some(metadata_value) = metadata.clone() {
-        let group_metadata = model.group_metadata.get_or_insert_with(BTreeMap::new);
+        let group_metadata = payload.group_metadata.get_or_insert_with(BTreeMap::new);
         group_metadata.insert(extension_name.clone(), metadata_value.clone());
     }
-    model.deployment_extensions.push(SavedDeploymentExtension {
-        name: extension_name,
-        kind: "random-effect-level".to_string(),
-        term: term_name.to_string(),
-        level,
-        coefficient_index,
-        coefficient_mean,
-        metadata,
-        prior,
-    });
+    payload
+        .deployment_extensions
+        .push(SavedDeploymentExtension {
+            name: extension_name,
+            kind: "random-effect-level".to_string(),
+            term: term_name.to_string(),
+            level,
+            coefficient_index,
+            coefficient_mean,
+            metadata,
+            prior,
+        });
     Ok(())
 }
 
@@ -3613,17 +3696,25 @@ fn random_effect_coefficient_start(
         if idx == term_idx {
             return Ok(col);
         }
-        let width = term.frozen_levels.as_ref().map(|levels| levels.len()).ok_or_else(|| {
-            format!(
-                "extend_with_group term '{}' is not frozen; refit with persisted metadata",
-                term.name
-            )
-        })?;
+        let width = term
+            .frozen_levels
+            .as_ref()
+            .map(|levels| levels.len())
+            .ok_or_else(|| {
+                format!(
+                    "extend_with_group term '{}' is not frozen; refit with persisted metadata",
+                    term.name
+                )
+            })?;
         col += width;
     }
     Err(format!(
         "extend_with_group internal error: random-effect term index {term_idx} is out of bounds"
     ))
+}
+
+fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
+    usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
 }
 
 fn extension_prior_parameters(
@@ -3665,13 +3756,17 @@ fn extension_prior_parameters(
     Ok((mean, variance))
 }
 
-fn extend_training_feature_range(model: &mut FittedModel, feature_col: usize, value: f64) {
-    if let Some(ranges) = model.training_feature_ranges.as_mut()
+fn extend_training_feature_range(
+    ranges: Option<&mut Vec<(f64, f64)>>,
+    feature_col: usize,
+    value: f64,
+) {
+    if let Some(ranges) = ranges
         && let Some((lo, hi)) = ranges.get_mut(feature_col)
     {
         if value.is_finite() {
-            *lo = lo.min(value);
-            *hi = hi.max(value);
+            *lo = (*lo).min(value);
+            *hi = (*hi).max(value);
         }
     }
 }
@@ -3713,9 +3808,46 @@ fn insert_coefficient_into_saved_fit(
     if let Some(cov) = fit.covariance_corrected.as_mut() {
         *cov = insert_symmetric_array2(cov, index, variance.unwrap_or(0.0))?;
     }
+    let variance_diag = variance.unwrap_or(0.0);
+    let precision_diag = if variance_diag > 0.0 {
+        1.0 / variance_diag
+    } else {
+        0.0
+    };
+    if let Some(inference) = fit.inference.as_mut() {
+        inference.penalized_hessian =
+            insert_symmetric_array2(&inference.penalized_hessian, index, precision_diag)?;
+        if let Some(cov) = inference.beta_covariance.as_mut() {
+            *cov = insert_symmetric_array2(cov, index, variance_diag)?;
+        }
+        if let Some(se) = inference.beta_standard_errors.as_mut() {
+            *se = insert_array1(se, index, variance_diag.sqrt());
+        }
+        if let Some(cov) = inference.beta_covariance_corrected.as_mut() {
+            *cov = insert_symmetric_array2(cov, index, variance_diag)?;
+        }
+        if let Some(se) = inference.beta_standard_errors_corrected.as_mut() {
+            *se = insert_array1(se, index, variance_diag.sqrt());
+        }
+        if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {
+            *cov = insert_symmetric_array2(cov, index, 0.0)?;
+        }
+        if let Some(influence) = inference.coefficient_influence.as_mut() {
+            *influence = insert_symmetric_array2(influence, index, 0.0)?;
+        }
+        if let Some(correction) = inference.smoothing_correction.as_mut() {
+            *correction = insert_symmetric_array2(correction, index, 0.0)?;
+        }
+        if let Some(qs) = inference.reparam_qs.as_mut() {
+            *qs = insert_symmetric_array2(qs, index, 1.0)?;
+        }
+        if let Some(bias) = inference.bias_correction_beta.as_mut() {
+            *bias = insert_array1(bias, index, 0.0);
+        }
+    }
     if let Some(geometry) = fit.geometry.as_mut() {
         geometry.penalized_hessian =
-            insert_symmetric_array2(&geometry.penalized_hessian, index, 0.0)?;
+            insert_symmetric_array2(&geometry.penalized_hessian, index, precision_diag)?;
     }
     Ok(())
 }
@@ -4303,12 +4435,9 @@ fn coefficient_provenance_for_state(
         let levels = term.frozen_levels.as_deref().unwrap_or(&[]);
         for (local, bits) in levels.iter().copied().enumerate() {
             let index = col + local;
-            let label = categorical_level_name_for_bits(
-                payload.data_schema.as_ref(),
-                &term.name,
-                bits,
-            )
-            .unwrap_or_else(|| f64::from_bits(bits).to_string());
+            let label =
+                categorical_level_name_for_bits(payload.data_schema.as_ref(), &term.name, bits)
+                    .unwrap_or_else(|| f64::from_bits(bits).to_string());
             if let Some(entry) = provenance.get_mut(index) {
                 entry.label = label.clone();
                 entry.source = "group".to_string();
@@ -4383,6 +4512,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         family_name: pretty_familyname(model.likelihood()).to_string(),
         model_class: prediction_model_class_label(&model),
         group_metadata: model.payload().group_metadata.clone(),
+        deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
@@ -4465,8 +4595,10 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     };
     let mut fit_config = FitConfig::default();
     fit_config.group_metadata = parse_group_metadata(py_config.group_metadata, py_config.groups)?;
-    fit_config.penalty_block_gamma_priors =
-        parse_precision_hyperpriors(py_config.precision_hyperpriors)?;
+    fit_config.penalty_block_gamma_priors = parse_precision_hyperpriors(
+        py_config.precision_hyperpriors,
+        py_config.penalty_block_gamma_priors,
+    )?;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
@@ -4615,7 +4747,10 @@ fn parse_group_metadata(
     }
 }
 
-fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(String, f64, f64), String> {
+fn parse_gamma_pair_value(
+    label: &str,
+    value: serde_json::Value,
+) -> Result<(String, f64, f64), String> {
     match value {
         serde_json::Value::Array(values) => {
             if values.len() != 2 {
@@ -4623,12 +4758,12 @@ fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(Stri
                     "precision_hyperpriors['{label}'] must be [shape, rate]"
                 ));
             }
-            let shape = values[0].as_f64().ok_or_else(|| {
-                format!("precision_hyperpriors['{label}'][0] must be numeric")
-            })?;
-            let rate = values[1].as_f64().ok_or_else(|| {
-                format!("precision_hyperpriors['{label}'][1] must be numeric")
-            })?;
+            let shape = values[0]
+                .as_f64()
+                .ok_or_else(|| format!("precision_hyperpriors['{label}'][0] must be numeric"))?;
+            let rate = values[1]
+                .as_f64()
+                .ok_or_else(|| format!("precision_hyperpriors['{label}'][1] must be numeric"))?;
             Ok((label.to_string(), shape, rate))
         }
         serde_json::Value::Object(mut map) => {
@@ -4636,9 +4771,7 @@ fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(Stri
                 .remove("shape")
                 .or_else(|| map.remove("a"))
                 .or_else(|| map.remove("a_p"))
-                .ok_or_else(|| {
-                    format!("precision_hyperpriors['{label}'] missing shape/a")
-                })?
+                .ok_or_else(|| format!("precision_hyperpriors['{label}'] missing shape/a"))?
                 .as_f64()
                 .ok_or_else(|| {
                     format!("precision_hyperpriors['{label}'] shape/a must be numeric")
@@ -4647,9 +4780,7 @@ fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(Stri
                 .remove("rate")
                 .or_else(|| map.remove("b"))
                 .or_else(|| map.remove("b_p"))
-                .ok_or_else(|| {
-                    format!("precision_hyperpriors['{label}'] missing rate/b")
-                })?
+                .ok_or_else(|| format!("precision_hyperpriors['{label}'] missing rate/b"))?
                 .as_f64()
                 .ok_or_else(|| {
                     format!("precision_hyperpriors['{label}'] rate/b must be numeric")
@@ -4663,13 +4794,29 @@ fn parse_gamma_pair_value(label: &str, value: serde_json::Value) -> Result<(Stri
 }
 
 fn parse_precision_hyperpriors(
-    raw: Option<serde_json::Value>,
+    precision_hyperpriors: Option<serde_json::Value>,
+    penalty_block_gamma_priors: Option<serde_json::Value>,
 ) -> Result<Vec<(String, f64, f64)>, String> {
-    let Some(raw) = raw else {
+    let raw = match (precision_hyperpriors, penalty_block_gamma_priors) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "fit config accepts either precision_hyperpriors or penalty_block_gamma_priors, not both"
+                    .to_string(),
+            );
+        }
+        (Some(raw), None) | (None, Some(raw)) => raw,
+        (None, None) => {
+            return Ok(Vec::new());
+        }
+    };
+    let raw_name = "precision_hyperpriors";
+    let Some(raw) = (match raw {
+        serde_json::Value::Null => None,
+        other => Some(other),
+    }) else {
         return Ok(Vec::new());
     };
     match raw {
-        serde_json::Value::Null => Ok(Vec::new()),
         serde_json::Value::Object(map) => map
             .into_iter()
             .map(|(label, value)| parse_gamma_pair_value(&label, value))
@@ -4678,23 +4825,42 @@ fn parse_precision_hyperpriors(
             .into_iter()
             .enumerate()
             .map(|(idx, item)| {
-                let serde_json::Value::Object(mut obj) = item else {
-                    return Err(format!("precision_hyperpriors[{idx}] must be an object"));
-                };
-                let label = obj
-                    .remove("label")
-                    .or_else(|| obj.remove("name"))
-                    .or_else(|| obj.remove("group"))
-                    .ok_or_else(|| {
-                        format!("precision_hyperpriors[{idx}] needs label/name/group")
-                    })?;
-                let serde_json::Value::String(label) = label else {
-                    return Err(format!("precision_hyperpriors[{idx}] label must be a string"));
-                };
-                parse_gamma_pair_value(&label, serde_json::Value::Object(obj))
+                match item {
+                    serde_json::Value::Object(mut obj) => {
+                        let label = obj
+                            .remove("label")
+                            .or_else(|| obj.remove("name"))
+                            .or_else(|| obj.remove("group"))
+                            .ok_or_else(|| {
+                                format!("{raw_name}[{idx}] needs label/name/group")
+                            })?;
+                        let serde_json::Value::String(label) = label else {
+                            return Err(format!("{raw_name}[{idx}] label must be a string"));
+                        };
+                        parse_gamma_pair_value(&label, serde_json::Value::Object(obj))
+                    }
+                    serde_json::Value::Array(mut values) => {
+                        if values.len() != 2 && values.len() != 3 {
+                            return Err(format!(
+                                "{raw_name}[{idx}] must be [label, shape, rate] or [label, [shape, rate]]"
+                            ));
+                        }
+                        let label = values.remove(0);
+                        let serde_json::Value::String(label) = label else {
+                            return Err(format!("{raw_name}[{idx}][0] must be a string label"));
+                        };
+                        let pair = if values.len() == 1 {
+                            values.remove(0)
+                        } else {
+                            serde_json::Value::Array(values)
+                        };
+                        parse_gamma_pair_value(&label, pair)
+                    }
+                    _ => Err(format!("{raw_name}[{idx}] must be an object or array")),
+                }
             })
             .collect(),
-        _ => Err("precision_hyperpriors must be a map or array".to_string()),
+        _ => Err(format!("{raw_name} must be a map or array")),
     }
 }
 
@@ -5211,6 +5377,10 @@ fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
             | ParsedTerm::SurvivalConfig { .. } => {}
+            | ParsedTerm::LogSlopeSurface { z_column, terms } => {
+                required.insert(z_column.clone());
+                add_formula_term_columns(required, terms);
+            }
         }
     }
 }

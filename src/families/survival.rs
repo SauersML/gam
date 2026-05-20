@@ -200,7 +200,9 @@ pub struct CauseSpecificRoystonParmarFamily {
 impl CauseSpecificRoystonParmarFamily {
     pub fn new(blocks: Vec<CauseSpecificRoystonParmarBlock>) -> Result<Self, String> {
         if blocks.is_empty() {
-            return Err("cause-specific survival family requires at least one endpoint".to_string());
+            return Err(
+                "cause-specific survival family requires at least one endpoint".to_string(),
+            );
         }
         for (idx, block) in blocks.iter().enumerate() {
             validate_cause_specific_block(block)
@@ -236,7 +238,10 @@ fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Res
     }
     if block.age_entry.iter().any(|v| !v.is_finite())
         || block.age_exit.iter().any(|v| !v.is_finite())
-        || block.sampleweight.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || block
+            .sampleweight
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.0)
         || block.event_target.iter().any(|&v| v > 1)
         || block.x_entry.iter().any(|v| !v.is_finite())
         || block.x_exit.iter().any(|v| !v.is_finite())

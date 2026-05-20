@@ -967,116 +967,6 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
 
-    def predict_with_coverage(
-        self,
-        data: Any,
-        *,
-        level: float = 0.95,
-    ) -> tuple[Any, Any, Any, dict[str, Any]]:
-        """Predict with covariance-backed intervals and group attribution.
-
-        Returns ``(point, lower, upper, coverage_breakdown)``.  The point and
-        interval arrays are response-scale mean predictions from the existing
-        posterior-covariance prediction path.  ``coverage_breakdown`` attributes
-        the rowwise interval width to saved group labels by pushing the same
-        coefficient covariance through the materialised deployment design.
-        """
-        import numpy as np
-
-        if not (0.0 < float(level) < 1.0):
-            raise ValueError("coverage level must be in (0, 1)")
-        if self.is_survival:
-            raise ValueError("predict_with_coverage currently supports non-survival models")
-
-        predicted = self.predict(data, interval=float(level), return_type="dict")
-        if not isinstance(predicted, dict):
-            raise ValueError("predict_with_coverage requires table-style predictions")
-        if "mean" not in predicted or "mean_lower" not in predicted or "mean_upper" not in predicted:
-            raise ValueError(
-                "predict_with_coverage requires a saved coefficient covariance; "
-                "prediction intervals were not produced"
-            )
-
-        point = np.asarray(predicted["mean"], dtype=float)
-        lower = np.asarray(predicted["mean_lower"], dtype=float)
-        upper = np.asarray(predicted["mean_upper"], dtype=float)
-        width = np.maximum(upper - lower, 0.0)
-
-        try:
-            state = json.loads(rust_module().coefficient_state_json(self._model_bytes))
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        beta = np.asarray(state.get("beta", []), dtype=float)
-        cov_n = int(state.get("covariance_n", 0))
-        cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
-        if cov_flat.size != cov_n * cov_n or beta.size != cov_n:
-            raise ValueError("coefficient covariance payload has inconsistent dimensions")
-        cov = cov_flat.reshape(cov_n, cov_n)
-
-        design = np.asarray(self.design_matrix(data), dtype=float)
-        if design.ndim != 2 or design.shape[1] != cov_n:
-            raise ValueError(
-                "design matrix and coefficient covariance have inconsistent dimensions"
-            )
-
-        groups = _coverage_groups_from_coefficient_state(state, cov_n)
-        covariance_pushforward = design @ cov
-        eta_variance = np.einsum("ij,ij->i", covariance_pushforward, design)
-        contributions: dict[str, Any] = {}
-        assigned = np.zeros(cov_n, dtype=bool)
-        for group in groups:
-            cols = np.asarray(group["columns"], dtype=int)
-            if cols.size == 0:
-                continue
-            assigned[cols] = True
-            variance_contribution = np.einsum(
-                "ij,ij->i",
-                design[:, cols],
-                covariance_pushforward[:, cols],
-            )
-            contributions[str(group["label"])] = {
-                "variance_contribution": variance_contribution,
-                "variance_share": _safe_share(variance_contribution, eta_variance),
-                "columns": cols.tolist(),
-                "metadata": group.get("metadata"),
-            }
-
-        other_cols = np.flatnonzero(~assigned)
-        other_variance = np.einsum(
-            "ij,ij->i",
-            design[:, other_cols],
-            covariance_pushforward[:, other_cols],
-        ) if other_cols.size else np.zeros(design.shape[0], dtype=float)
-        positive_total = np.maximum(other_variance, 0.0)
-        for payload in contributions.values():
-            positive_total = positive_total + np.maximum(
-                payload["variance_contribution"], 0.0
-            )
-        for payload in contributions.values():
-            share = _safe_share(
-                np.maximum(payload["variance_contribution"], 0.0),
-                positive_total,
-            )
-            payload["ci_width_share"] = share
-            payload["ci_width_contribution"] = width * share
-        other_width_share = _safe_share(np.maximum(other_variance, 0.0), positive_total)
-        coverage_breakdown = {
-            "level": float(level),
-            "scale": "mean",
-            "eta_variance": eta_variance,
-            "ci_width": width,
-            "groups": contributions,
-            "unattributed": {
-                "variance_contribution": other_variance,
-                "variance_share": _safe_share(other_variance, eta_variance),
-                "ci_width_contribution": width * other_width_share,
-                "ci_width_share": other_width_share,
-                "columns": other_cols.tolist(),
-            },
-            "covariance_corrected": bool(state.get("covariance_corrected", False)),
-        }
-        return point, lower, upper, coverage_breakdown
-
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score).
 
@@ -1319,6 +1209,8 @@ class Model:
         coverage = float(coverage)
         if not (0.0 < coverage < 1.0):
             raise ValueError("coverage must be in (0, 1)")
+        if self.is_survival:
+            raise ValueError("predict_with_coverage currently supports non-survival models")
 
         design = np.asarray(self.design_matrix(rows), dtype=float)
         try:
@@ -1553,6 +1445,41 @@ class Model:
         >>> loaded = gamfit.load("model.gam")
         """
         Path(path).write_bytes(self._model_bytes)
+
+    def extend_with_group(
+        self,
+        new_group_spec: dict[str, Any],
+        metadata: Any | None = None,
+        prior: Any | None = None,
+    ) -> "Model":
+        """Return a no-refit model extended with deployment-time group levels.
+
+        ``new_group_spec`` currently targets an existing random-effect term:
+        ``{"kind": "random-effect-level", "term": "group_term", "level": "new"}``
+        or ``{"term": "group_term", "levels": ["a", "b"]}``.  The returned
+        model reuses the fitted coefficients and inserts zero-initialized
+        coefficients, or ``prior["mean"]`` / ``prior["mu"]`` when supplied.
+        """
+        if not isinstance(new_group_spec, dict):
+            raise TypeError("new_group_spec must be a dict")
+        payload = dict(new_group_spec)
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if prior is not None:
+            payload["prior"] = prior
+        try:
+            model_bytes = bytes(
+                rust_module().extend_model_with_group(
+                    self._model_bytes,
+                    json.dumps(payload),
+                )
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return Model(
+            _model_bytes=model_bytes,
+            _training_table_kind=self._training_table_kind,
+        )
 
     def dumps(self) -> bytes:
         """Return the serialised model as raw bytes.
