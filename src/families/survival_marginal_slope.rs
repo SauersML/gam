@@ -2891,13 +2891,18 @@ pub fn survival_marginal_slope_vector_neglog(
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
     let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+    // Same survival row density as the scalar closed-form path, with only
+    // eta and d eta/dt changed by the vector marginal-preserving map:
+    //
+    //   ell = w[(1-d)(-log Phi(-eta1)) + log Phi(-eta0)
+    //           - d log phi(eta1) - d log(qd1 c)].
+    //
+    // There is no extra baseline -log phi(q1) or -log qd1 factor; adding
+    // either would make K=1 diverge from `row_primary_closed_form`.
     Ok(weight
         * ((1.0 - event) * (-logcdf_neg_eta1) + logcdf_neg_eta0
             - event * log_phi_eta1
-            - event * ad1.ln()
-            - event * log_phi_q1
-            - event * qd1.ln()))
+            - event * ad1.ln()))
 }
 
 fn standardize_latent_z_matrix_with_policy(
@@ -5114,16 +5119,15 @@ impl SurvivalMarginalSlopeFamily {
         coeff_abbu[primary.g] = [0.0; 4];
         coeff_bbbu[primary.g] = [0.0; 4];
 
-        if let (Some(h_range), Some(runtime)) = (primary.h.as_ref(), self.score_warp.as_ref()) {
+        if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
-                let basis_span = runtime.basis_cubic_at(local_idx, z_basis)?;
                 let idx = h_range.start + local_idx;
                 coeff_u[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, b),
+                    self.integration_score_basis_coefficients(local_idx, z_basis, b)?,
                     scale,
                 );
                 coeff_bu[idx] = scale_coeff4(
-                    exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                    self.integration_score_basis_coefficients(local_idx, z_basis, 1.0)?,
                     scale,
                 );
             }
@@ -5177,6 +5181,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         primary: &FlexPrimarySlices,
         obs: &ObservedDenestedCellPartials,
+        row: usize,
         u: usize,
         v: usize,
         z_obs: f64,
@@ -5192,14 +5197,9 @@ impl SurvivalMarginalSlopeFamily {
             if let Some(h_range) = primary.h.as_ref() {
                 if v >= h_range.start && v < h_range.end {
                     let local_idx = v - h_range.start;
-                    let runtime = self
-                        .score_warp
-                        .as_ref()
-                        .ok_or_else(|| "missing survival score-warp runtime".to_string())?;
-                    let basis_span = runtime.basis_cubic_at(local_idx, z_obs)?;
                     return Ok(eval_coeff4_at(
                         &scale_coeff4(
-                            exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+                            self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
                             scale,
                         ),
                         z_obs,
@@ -5221,7 +5221,8 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         if v == primary.g {
-            return self.observed_fixed_eta_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
+            return self
+                .observed_fixed_eta_second_partial(primary, obs, row, v, u, z_obs, u_obs, a, b);
         }
         Ok(0.0)
     }
