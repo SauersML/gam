@@ -25,6 +25,8 @@ use crate::types::{
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use std::collections::BTreeMap;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -300,6 +302,13 @@ pub struct FittedModelPayload {
     /// the predict path falls through unchanged (no clipping).
     #[serde(default)]
     pub training_feature_ranges: Option<Vec<(f64, f64)>>,
+    /// User-supplied per-group metadata, keyed by stable group identifier.
+    ///
+    /// This is intentionally schema-free JSON so provenance maps can carry
+    /// mixed scalar/list/object values. Missing in older payloads means no
+    /// group metadata was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_metadata: Option<BTreeMap<String, JsonValue>>,
     /// Transformation-normal: B-spline knots for the response-direction basis.
     #[serde(default)]
     pub transformation_response_knots: Option<Vec<f64>>,
@@ -413,6 +422,7 @@ impl FittedModelPayload {
             survival_distribution: None,
             training_headers: None,
             training_feature_ranges: None,
+            group_metadata: None,
             transformation_response_knots: None,
             transformation_response_transform: None,
             transformation_response_degree: None,

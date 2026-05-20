@@ -5494,6 +5494,62 @@ where
     X: Into<DesignMatrix>,
 {
     let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
+    fit_gamwith_penalty_specs_andwarm_start(
+        x,
+        y,
+        weights,
+        offset,
+        specs,
+        opts.nullspace_dims.clone(),
+        heuristic_lambdas,
+        warm_start_beta,
+        family,
+        opts,
+    )
+}
+
+pub fn fit_gam_with_penalty_specs<X>(
+    x: X,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    penalty_specs: Vec<PenaltySpec>,
+    nullspace_dims: Vec<usize>,
+    family: crate::types::LikelihoodFamily,
+    opts: &FitOptions,
+) -> Result<UnifiedFitResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    fit_gamwith_penalty_specs_andwarm_start(
+        x,
+        y,
+        weights,
+        offset,
+        penalty_specs,
+        nullspace_dims,
+        None,
+        None,
+        family,
+        opts,
+    )
+}
+
+fn fit_gamwith_penalty_specs_andwarm_start<X>(
+    x: X,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    specs: Vec<PenaltySpec>,
+    nullspace_dims: Vec<usize>,
+    heuristic_lambdas: Option<&[f64]>,
+    warm_start_beta: Option<ArrayView1<'_, f64>>,
+    family: crate::types::LikelihoodFamily,
+    opts: &FitOptions,
+) -> Result<UnifiedFitResult, EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
     let x = x.into();
     if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
         && opts.mixture_link.is_none()
@@ -5563,7 +5619,7 @@ where
         compute_inference: opts.compute_inference,
         max_iter: opts.max_iter,
         tol: opts.tol,
-        nullspace_dims: opts.nullspace_dims.clone(),
+        nullspace_dims,
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: Some(opts.firth_bias_reduction),
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,

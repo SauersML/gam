@@ -4550,6 +4550,11 @@ pub struct InnerSolution<'dp> {
     /// H-dependent trace / solve parts of the outer calculus.
     pub rho_curvature_scale: f64,
 
+    /// Configured prior over rho coordinates. The evaluator receives the
+    /// realized cost/gradient tuple separately; this copy lets EFS use the
+    /// conjugate Gamma rate in its multiplicative denominator.
+    pub rho_prior: crate::types::RhoPrior,
+
     // === Model dimensions ===
     /// Number of observations.
     pub n_observations: usize,
@@ -4604,6 +4609,7 @@ pub struct InnerSolutionBuilder<'dp> {
     hessian_logdet_correction: f64,
     penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     rho_curvature_scale: f64,
+    rho_prior: crate::types::RhoPrior,
     nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     ext_coords: Vec<HyperCoord>,
@@ -4641,6 +4647,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -4682,6 +4689,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     pub fn rho_curvature_scale(mut self, scale: f64) -> Self {
         self.rho_curvature_scale = scale;
+        self
+    }
+
+    pub fn rho_prior(mut self, prior: crate::types::RhoPrior) -> Self {
+        self.rho_prior = prior;
         self
     }
 
@@ -4752,6 +4764,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             hessian_logdet_correction: self.hessian_logdet_correction,
             penalty_subspace_trace: self.penalty_subspace_trace,
             rho_curvature_scale: self.rho_curvature_scale,
+            rho_prior: self.rho_prior,
             n_observations: self.n_observations,
             nullspace_dim,
             dispersion: self.dispersion,

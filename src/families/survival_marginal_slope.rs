@@ -17246,15 +17246,11 @@ mod tests {
         let n = 7usize;
         let family = SurvivalMarginalSlopeFamily {
             n,
-            event: Arc::new(Array1::from_iter((0..n).map(|i| {
-                if i % 3 == 0 { 1.0 } else { 0.0 }
-            }))),
-            weights: Arc::new(Array1::from_iter(
-                (0..n).map(|i| 0.8 + 0.07 * i as f64),
+            event: Arc::new(Array1::from_iter(
+                (0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }),
             )),
-            z: Arc::new(Array1::from_iter(
-                (0..n).map(|i| -0.6 + 0.2 * i as f64),
-            )),
+            weights: Arc::new(Array1::from_iter((0..n).map(|i| 0.8 + 0.07 * i as f64))),
+            z: Arc::new(Array1::from_iter((0..n).map(|i| -0.6 + 0.2 * i as f64))),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
@@ -17266,12 +17262,8 @@ mod tests {
             design_derivative_exit: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
                 0.10 + 0.02 * i as f64 + 0.03 * j as f64
             })),
-            offset_entry: Arc::new(Array1::from_iter(
-                (0..n).map(|i| -0.35 + 0.03 * i as f64),
-            )),
-            offset_exit: Arc::new(Array1::from_iter(
-                (0..n).map(|i| 0.15 + 0.04 * i as f64),
-            )),
+            offset_entry: Arc::new(Array1::from_iter((0..n).map(|i| -0.35 + 0.03 * i as f64))),
+            offset_exit: Arc::new(Array1::from_iter((0..n).map(|i| 0.15 + 0.04 * i as f64))),
             derivative_offset_exit: Arc::new(Array1::from_elem(n, 0.75)),
             marginal_design: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
                 0.20 + 0.05 * ((i + 2 * j) % 5) as f64
