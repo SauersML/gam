@@ -31,7 +31,7 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
 use gam::inference::model::{
-    ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload,
+    ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
     MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
     SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
 };
@@ -99,7 +99,7 @@ struct PyFitConfig {
     // Integration seam for task 04's group abstraction. The proposed group
     // type can pass either `group_metadata` directly or `groups` entries with
     // `{name|id|key, metadata}`; fitting ignores it and persistence carries it.
-    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
+    group_metadata: Option<GroupMetadata>,
     groups: Option<serde_json::Value>,
     precision_hyperpriors: Option<serde_json::Value>,
     penalty_block_gamma_priors: Option<serde_json::Value>,
@@ -189,7 +189,7 @@ struct SummaryPayload {
     family_name: String,
     model_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
+    group_metadata: Option<GroupMetadata>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deployment_extensions: Vec<SavedDeploymentExtension>,
     deviance: f64,
@@ -4354,7 +4354,7 @@ struct CoefficientStatePayload {
     random_column_ranges: Vec<(usize, usize)>,
     coefficient_provenance: Vec<CoefficientProvenancePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
+    group_metadata: Option<GroupMetadata>,
 }
 
 #[derive(Serialize)]
@@ -4732,9 +4732,9 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
 }
 
 fn parse_group_metadata(
-    direct: Option<BTreeMap<String, serde_json::Value>>,
+    direct: Option<GroupMetadata>,
     groups: Option<serde_json::Value>,
-) -> Result<Option<BTreeMap<String, serde_json::Value>>, String> {
+) -> Result<Option<GroupMetadata>, String> {
     match (direct, groups) {
         (Some(metadata), None) => Ok(nonempty_group_metadata(metadata)),
         (None, Some(groups)) => group_metadata_from_groups(groups),
@@ -4863,8 +4863,8 @@ fn parse_precision_hyperpriors(
 }
 
 fn nonempty_group_metadata(
-    metadata: BTreeMap<String, serde_json::Value>,
-) -> Option<BTreeMap<String, serde_json::Value>> {
+    metadata: GroupMetadata,
+) -> Option<GroupMetadata> {
     if metadata.is_empty() {
         None
     } else {
@@ -4874,7 +4874,7 @@ fn nonempty_group_metadata(
 
 fn group_metadata_from_groups(
     groups: serde_json::Value,
-) -> Result<Option<BTreeMap<String, serde_json::Value>>, String> {
+) -> Result<Option<GroupMetadata>, String> {
     match groups {
         serde_json::Value::Null => Ok(None),
         serde_json::Value::Object(map) => {
