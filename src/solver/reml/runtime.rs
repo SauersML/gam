@@ -3756,17 +3756,6 @@ impl<'a> RemlState<'a> {
             && rho.iter().all(|&r| r.is_finite())
     }
 
-    fn canonical_penalty_full_matrices(&self) -> Vec<Array2<f64>> {
-        self.canonical_penalties
-            .iter()
-            .map(|cp| {
-                let mut dense = Array2::<f64>::zeros((self.p, self.p));
-                cp.accumulate_weighted(&mut dense, 1.0);
-                dense
-            })
-            .collect()
-    }
-
     /// Evaluate Gaussian identity-link REML directly from sufficient statistics.
     ///
     /// When the Gaussian fixed-cache preconditions hold, the inner mode has the
@@ -3825,28 +3814,16 @@ impl<'a> RemlState<'a> {
         .max(0.0);
         let penalty_quadratic = beta.dot(&s_lambda.dot(&beta));
 
-        let penalty_matrices = self.canonical_penalty_full_matrices();
-        let penalty_logdet = if penalty_matrices.is_empty() {
-            super::unified::PenaltyLogdetDerivs {
-                value: 0.0,
-                first: Array1::zeros(0),
-                second: Some(Array2::zeros((0, 0))),
-            }
-        } else {
-            let per_block_rho = vec![rho.clone()];
-            let per_block_penalties = vec![penalty_matrices.as_slice()];
-            let per_block_nullspace_dims = vec![self.nullspace_dims.as_slice()];
-            super::unified::compute_block_penalty_logdet_derivs(
-                &per_block_rho,
-                &per_block_penalties,
-                &per_block_nullspace_dims,
-                0.0,
-            )
-            .map_err(EstimationError::InvalidInput)?
-        };
-
-        let penalty_rank = if self.canonical_penalties.is_empty() {
-            0
+        // Penalty logdet derivatives go through the canonical block-local
+        // path so unpenalized global columns (intercept, etc.) are not
+        // misclassified as positive eigenvalues.  Expanding canonical
+        // penalties to full p×p matrices and feeding `exact_intersection_nullity`
+        // the per-block nullity hints reports global nullity 0 for any
+        // block-local penalty (its local rank covers its block), so the
+        // PenaltyPseudologdet builder treats those structural zeros as
+        // positive eigenvalues and `1/√0` poisons the W-factor with NaN.
+        let (penalty_rank, log_det_s) = if self.canonical_penalties.is_empty() {
+            (0usize, 0.0)
         } else {
             use crate::faer_ndarray::FaerEigh;
             let (evals, _) = s_lambda.eigh(faer::Side::Lower).map_err(|e| {
@@ -3854,9 +3831,39 @@ impl<'a> RemlState<'a> {
                     "Gaussian closed-form penalty eigendecomposition failed: {e}"
                 ))
             })?;
-            let threshold =
-                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-            evals.iter().filter(|&&value| value > threshold).count()
+            // Match `fixed_subspace_penalty_rank_and_logdet`: take the
+            // structural rank from the canonical-penalty decomposition and
+            // sum the top eigenvalues of S_λ for log|S|+ so the Gaussian
+            // closed-form and PIRLS dense paths agree on which eigenvalues
+            // count as "active".
+            let structural_rank = self
+                .canonical_penalties
+                .iter()
+                .map(crate::construction::CanonicalPenalty::rank)
+                .sum::<usize>()
+                .min(self.p);
+            let evals_slice = evals.as_slice().unwrap();
+            let log_det: f64 = evals_slice
+                .iter()
+                .skip(self.p.saturating_sub(structural_rank))
+                .filter_map(|&ev| if ev > 0.0 { Some(ev.ln()) } else { None })
+                .sum();
+            (structural_rank, log_det)
+        };
+        let penalty_logdet = if self.canonical_penalties.is_empty() {
+            super::unified::PenaltyLogdetDerivs {
+                value: 0.0,
+                first: Array1::zeros(0),
+                second: Some(Array2::zeros((0, 0))),
+            }
+        } else {
+            let (det1, det2) =
+                self.structural_penalty_logdet_derivatives_block_local(&lambdas, 0.0)?;
+            super::unified::PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: Some(det2),
+            }
         };
         let nullspace_dim = self.p.saturating_sub(penalty_rank) as f64;
 
