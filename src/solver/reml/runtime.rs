@@ -990,7 +990,7 @@ impl<'a> RemlState<'a> {
             let rhs = a.dot(beta);
             let vi = h_inv_solve(&rhs)?;
             let bi = vi.mapv(|value| -value);
-            let ei = x_dense.dot(&bi);
+            let ei = crate::faer_ndarray::fast_av(x_dense, &bi);
             a_mats.push(a);
             v.push(vi);
             eta_i.push(ei);
@@ -1028,7 +1028,7 @@ impl<'a> RemlState<'a> {
         }
         for i in 0..k {
             for j in 0..=i {
-                let eta_ij = x_dense.dot(&beta_ij[i][j]);
+                let eta_ij = crate::faer_ndarray::fast_av(x_dense, &beta_ij[i][j]);
                 let diag = c_array * &eta_ij + &(d_array * &(&eta_i[i] * &eta_i[j]));
                 let mut h = Self::tk_xt_diag_x(x_dense, &diag);
                 if i == j {
@@ -1259,7 +1259,7 @@ impl<'a> RemlState<'a> {
             }
             let a_k_beta = &s_k_beta * lambdas[idx];
             let v_k = h_inv_solve(&a_k_beta)?;
-            x_vks.push(x_dense.dot(&v_k));
+            x_vks.push(crate::faer_ndarray::fast_av(x_dense, &v_k));
             beta_dirs.push(v_k.mapv(|value| -value));
         }
         let mut ext_drifts = Vec::with_capacity(ext_coords.len());
@@ -1284,7 +1284,7 @@ impl<'a> RemlState<'a> {
                 )));
             }
             let beta_theta = h_inv_solve(&coord.g)?;
-            x_vks.push(x_dense.dot(&beta_theta));
+            x_vks.push(crate::faer_ndarray::fast_av(x_dense, &beta_theta));
             beta_dirs.push(beta_theta.mapv(|value| -value));
             ext_drifts.push(drift);
             ext_eta_fixed.push(coord.tk_eta_fixed.clone());
