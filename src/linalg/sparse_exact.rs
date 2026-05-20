@@ -1525,12 +1525,14 @@ mod tests {
             positive_eigenvalues: Vec<f64>,
             total_dim: usize,
         ) -> crate::construction::CanonicalPenalty {
+            let block_dim = col_range.len();
             crate::construction::CanonicalPenalty {
-                root: Array2::<f64>::zeros((0, col_range.len())),
+                root: Array2::<f64>::zeros((0, block_dim)),
                 col_range,
                 total_dim,
                 nullity: 0,
                 local,
+                prior_mean: Array1::zeros(block_dim),
                 positive_eigenvalues,
                 op: None,
             }

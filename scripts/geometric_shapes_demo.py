@@ -133,6 +133,10 @@ def gen_mob(
     tuple[np.ndarray, np.ndarray, np.ndarray],
     float,
 ]:
+    # Standard Möbius embedding. Note: F(u+2π, v) = F(u, −v) and
+    # F(u+4π, v) = F(u, v). The smoother is given only the 4π periodicity
+    # (an orientable cylinder); the Möbius look comes from the embedding,
+    # not from a twisted basis identification.
     u = RNG.uniform(0, 2 * TAU, n)
     v = RNG.uniform(-0.8, 0.8, n)
     rim = 1 + 0.5 * v * np.cos(u / 2)

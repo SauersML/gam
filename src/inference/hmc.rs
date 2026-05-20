@@ -1031,9 +1031,10 @@ mod tests {
     use super::{
         FamilyNutsInputs, GlmFlatInputs, JointBetaRhoInputs, JointBetaRhoPosterior,
         LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior,
-        SharedData, firth_jeffreys_logp_and_grad, joint_family_logp_and_grad,
-        laplace_directional_cubic_diagnostic, run_joint_beta_rho_sampling,
-        run_logit_polya_gamma_gibbs, run_nuts_sampling_flattened_family,
+        SharedData, cloglog_bernoulli_logp_and_residual, firth_jeffreys_logp_and_grad,
+        joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
+        run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
+        run_nuts_sampling_flattened_family,
     };
     use crate::construction::CanonicalPenalty;
     use crate::estimate::{
@@ -1229,6 +1230,26 @@ mod tests {
         let lo = NutsPosterior::sigmoid_stable(-1000.0);
         assert!(hi <= 1.0 && hi >= 1.0 - 1e-12);
         assert!(lo >= 0.0 && lo <= 1e-12);
+    }
+
+    #[test]
+    fn cloglog_log_mu_uses_complementary_loglog_inverse_link() {
+        let eta = -1.0_f64;
+        let (ll_y1, residual_y1) = cloglog_bernoulli_logp_and_residual(eta, 1.0);
+        let expected = (1.0 - (-eta.exp()).exp()).ln();
+        let wrong_log_one_minus_exp_eta = (1.0 - eta.exp()).ln();
+
+        assert!((ll_y1 - expected).abs() < 1e-14);
+        assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
+
+        let eps = 1e-6;
+        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0);
+        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0);
+        let fd = (lp - lm) / (2.0 * eps);
+        assert!(
+            (residual_y1 - fd).abs() < 1e-9,
+            "cloglog residual is not the derivative of log μ: analytic={residual_y1}, fd={fd}"
+        );
     }
 
     #[test]
@@ -3532,20 +3553,10 @@ impl LinkWigglePosterior {
             NutsFamily::BinomialCLogLog => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
-                    let eta_i = eta[i];
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    // μ = 1 − exp(−exp(η));  1−μ = exp(−exp(η))
-                    // ⇒ log(1−μ) = −exp(η);   log μ = log1p(−exp(−exp(η))).
-                    let neg_s = (-eta_i.exp()).max(-700.0); // −exp(η), clamped
-                    let log_1m_mu = neg_s.min(0.0).max(-700.0);
-                    let one_m_mu_raw = neg_s.exp().clamp(0.0, 1.0); // exp(−exp(η))
-                    let log_mu = (-one_m_mu_raw).ln_1p().min(0.0).max(-700.0);
-                    ll_acc += w_i * (y_i * log_mu + (1.0 - y_i) * log_1m_mu);
-                    let exp_eta = eta_i.exp().min(1e300);
-                    let exp_neg_exp_eta = one_m_mu_raw;
-                    let mu = (1.0 - exp_neg_exp_eta).clamp(1e-15, 1.0 - 1e-15);
-                    let dmudeta = exp_eta * exp_neg_exp_eta;
-                    residual[i] = w_i * (y_i - mu) * dmudeta / (mu * (1.0 - mu)).max(1e-30);
+                    let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i);
+                    ll_acc += w_i * ll_i;
+                    residual[i] = w_i * residual_i;
                 }
                 ll = ll_acc;
             }

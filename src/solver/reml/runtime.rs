@@ -8170,6 +8170,7 @@ mod ift_warm_start_tests {
             total_dim: p,
             nullity,
             local,
+            prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,
         }
