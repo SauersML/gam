@@ -329,18 +329,65 @@ fn dense_transpose_matvec(matrix: &Array2<f64>, vector: &Array1<f64>) -> Array1<
 fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>) -> Array1<f64> {
     let n = matrix.nrows();
     let p = matrix.ncols();
+    let row_major_slices = if matrix.is_standard_layout() {
+        match (matrix.as_slice(), vector.as_slice()) {
+            (Some(x), Some(v)) => Some((x, v)),
+            _ => None,
+        }
+    } else {
+        None
+    };
     if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
         let mut out = Array1::<f64>::zeros(p);
-        for i in 0..n {
-            let vi = vector[i];
-            if vi == 0.0 {
-                continue;
+        if let Some((x, v)) = row_major_slices {
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in 0..n {
+                let vi = v[i];
+                if vi == 0.0 {
+                    continue;
+                }
+                let row = &x[i * p..i * p + p];
+                for j in 0..p {
+                    out_slice[j] += row[j] * vi;
+                }
             }
-            for j in 0..p {
-                out[j] += matrix[[i, j]] * vi;
+        } else {
+            for i in 0..n {
+                let vi = vector[i];
+                if vi == 0.0 {
+                    continue;
+                }
+                for j in 0..p {
+                    out[j] += matrix[[i, j]] * vi;
+                }
             }
         }
         return out;
+    }
+    if let Some((x, v)) = row_major_slices {
+        return (0..n)
+            .into_par_iter()
+            .fold(
+                || Array1::<f64>::zeros(p),
+                |mut acc, i| {
+                    let vi = v[i];
+                    if vi != 0.0 {
+                        let row = &x[i * p..i * p + p];
+                        let acc_slice = acc.as_slice_mut().expect("zeros are contiguous");
+                        for j in 0..p {
+                            acc_slice[j] += row[j] * vi;
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || Array1::<f64>::zeros(p),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            );
     }
     (0..n)
         .into_par_iter()
@@ -624,13 +671,33 @@ fn dense_transpose_weighted_response_view(
     weights: ArrayView1<'_, f64>,
     y: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(matrix.ncols());
-    for i in 0..matrix.nrows() {
+    let p = matrix.ncols();
+    let n = matrix.nrows();
+    let mut out = Array1::<f64>::zeros(p);
+    if matrix.is_standard_layout() {
+        if let (Some(x), Some(w), Some(yslice)) =
+            (matrix.as_slice(), weights.as_slice(), y.as_slice())
+        {
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in 0..n {
+                let scaled = yslice[i] * w[i].max(0.0);
+                if scaled == 0.0 {
+                    continue;
+                }
+                let row = &x[i * p..i * p + p];
+                for j in 0..p {
+                    out_slice[j] += row[j] * scaled;
+                }
+            }
+            return out;
+        }
+    }
+    for i in 0..n {
         let scaled = y[i] * weights[i].max(0.0);
         if scaled == 0.0 {
             continue;
         }
-        for j in 0..matrix.ncols() {
+        for j in 0..p {
             out[j] += matrix[[i, j]] * scaled;
         }
     }
