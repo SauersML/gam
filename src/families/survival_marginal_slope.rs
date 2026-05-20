@@ -96,6 +96,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub time_block: TimeBlockInput,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub logslopespec: TermCollectionSpec,
+    pub logslopespecs: Option<Vec<TermCollectionSpec>>,
     pub logslope_offset: Array1<f64>,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
@@ -165,6 +166,7 @@ struct SurvivalMarginalSlopeFamily {
     marginal_design: DesignMatrix,
     /// Log-slope block: standard single design.
     logslope_design: DesignMatrix,
+    logslope_surface_ranges: Vec<std::ops::Range<usize>>,
     score_warp: Option<DeviationRuntime>,
     link_dev: Option<DeviationRuntime>,
     time_linear_constraints: Option<LinearInequalityConstraints>,

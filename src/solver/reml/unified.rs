@@ -1188,11 +1188,7 @@ impl BarrierConfig {
     ///
     /// `ratio` of 0.1 means "the tightest slack is at least 10× tighter than
     /// the typical slack." Returns `true` on infeasible β.
-    pub fn barrier_curvature_locally_concentrated(
-        &self,
-        beta: &Array1<f64>,
-        ratio: f64,
-    ) -> bool {
+    pub fn barrier_curvature_locally_concentrated(&self, beta: &Array1<f64>, ratio: f64) -> bool {
         let mut slacks = match self.slacks(beta) {
             Some(s) => s,
             None => return true, // infeasible → conservatively unreliable
@@ -2333,6 +2329,123 @@ fn trace_projected_operator_terms_batched(
     out
 }
 
+fn dense_projected_matrix(matrix: &Array2<f64>, factor: &Array2<f64>) -> Array2<f64> {
+    factor.t().dot(&matrix.dot(factor))
+}
+
+fn collect_projected_matrix_terms<'a>(
+    out_idx: usize,
+    weight: f64,
+    op: &'a dyn HyperOperator,
+    factor: &Array2<f64>,
+    dense_acc: &mut [Array2<f64>],
+    terms: &mut Vec<(usize, f64, &'a dyn HyperOperator)>,
+) {
+    if weight == 0.0 {
+        return;
+    }
+    if let Some(composite) = op.as_composite() {
+        if let Some(dense) = composite.dense.as_ref() {
+            dense_acc[out_idx].scaled_add(weight, &dense_projected_matrix(dense, factor));
+        }
+        for inner in &composite.operators {
+            collect_projected_matrix_terms(
+                out_idx,
+                weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else if let Some(weighted) = op.as_weighted() {
+        for (term_weight, inner) in &weighted.terms {
+            collect_projected_matrix_terms(
+                out_idx,
+                weight * *term_weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else {
+        terms.push((out_idx, weight, op));
+    }
+}
+
+fn projected_operator_terms_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<Array2<f64>> {
+    let rank = factor.ncols();
+    let mut out = (0..n_out)
+        .map(|_| Array2::<f64>::zeros((rank, rank)))
+        .collect::<Vec<_>>();
+    let mut handled = vec![false; terms.len()];
+
+    for i in 0..terms.len() {
+        if handled[i] {
+            continue;
+        }
+        let Some(impl_i) = terms[i].2.as_implicit() else {
+            continue;
+        };
+        let mut group = vec![i];
+        handled[i] = true;
+        for j in (i + 1)..terms.len() {
+            if handled[j] {
+                continue;
+            }
+            if let Some(impl_j) = terms[j].2.as_implicit() {
+                if Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+                    && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                    && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                    && impl_i.p == impl_j.p
+                {
+                    group.push(j);
+                    handled[j] = true;
+                }
+            }
+        }
+
+        let lead = terms[group[0]].2.as_implicit().unwrap();
+        let xf = lead.cached_xf(factor, cache);
+        let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
+            .iter()
+            .map(|&term_idx| {
+                let op = terms[term_idx].2.as_implicit().unwrap();
+                (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
+            })
+            .collect();
+        let values = lead.projected_matrix_all_axes_with_xf(factor, xf.view(), &axes);
+        for (&term_idx, value) in group.iter().zip(values.iter()) {
+            let (out_idx, weight, _) = terms[term_idx];
+            out[out_idx].scaled_add(weight, value);
+        }
+    }
+
+    for (i, (out_idx, weight, op)) in terms.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        out[*out_idx].scaled_add(*weight, &op.projected_matrix_cached(factor, cache));
+    }
+
+    out
+}
+
+fn project_hyper_operators_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<Array2<f64>> {
+    projected_operator_terms_batched(n_out, terms, factor, cache)
+}
+
 fn trace_logdet_drifts_projected_factor_batched(
     drifts: &[DriftDerivResult],
     factor: &Array2<f64>,
@@ -3318,6 +3431,82 @@ impl ImplicitHyperOperator {
         projected += &projected_t;
         projected.mapv_inplace(|value| 0.5 * value);
         projected
+    }
+
+    /// Batched-axis sibling of [`Self::projected_matrix_with_xf`].
+    /// Shares `X · F`, raw radial row chunks, and chunk traversal across all
+    /// axes in the group; each axis still gets its exact own penalty and
+    /// optional third-derivative correction.
+    fn projected_matrix_all_axes_with_xf<'a>(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+        axes: &[(usize, &'a Array2<f64>, Option<&'a Array1<f64>>)],
+    ) -> Vec<Array2<f64>> {
+        let n_axes = axes.len();
+        if n_axes == 0 {
+            return Vec::new();
+        }
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        debug_assert_eq!(xf.dim(), (n_obs, rank));
+
+        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
+        const TARGET_BYTES: usize = 8 * 1024 * 1024;
+        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+            .max(512)
+            .min(n_obs);
+
+        let w = self.w_diag.as_ref();
+        let mut out = (0..n_axes)
+            .map(|_| Array2::<f64>::zeros((rank, rank)))
+            .collect::<Vec<_>>();
+
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+            let kd_all = self
+                .implicit_deriv
+                .row_chunk_first_raw_all_axes(start..end)
+                .expect("radial scalar evaluation failed during implicit hyper batched projected_matrix");
+
+            for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
+                let kd_chunk = &kd_all[*axis];
+                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
+                let mut weighted_dxf = dxf_chunk.clone();
+                for i_local in 0..(end - start) {
+                    let w_i = w[start + i_local];
+                    for col in 0..rank {
+                        weighted_dxf[[i_local, col]] *= w_i;
+                    }
+                }
+                out[slot] += &crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+                out[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_dxf);
+
+                if let Some(c) = c_opt {
+                    let mut weighted_xf = xf_chunk.to_owned();
+                    for i_local in 0..(end - start) {
+                        let c_i = c[start + i_local];
+                        for col in 0..rank {
+                            weighted_xf[[i_local, col]] *= c_i;
+                        }
+                    }
+                    out[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
+                }
+            }
+            start = end;
+        }
+
+        for (slot, (_, s_psi, _)) in axes.iter().enumerate() {
+            let s_f = s_psi.dot(factor);
+            out[slot] += &factor.t().dot(&s_f);
+            let out_t = out[slot].t().to_owned();
+            out[slot] += &out_t;
+            out[slot].mapv_inplace(|value| 0.5 * value);
+        }
+
+        out
     }
 
     /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
@@ -9127,20 +9316,37 @@ fn build_outer_hessian_operator(
             // rotated into the eigenbasis and contracted with that same
             // kernel.  The dense Hessian assembly path already does this;
             // the matrix-free outer-Hv path must match it exactly.
-            let rotated: Vec<Array2<f64>> = coords
-                .iter()
-                .map(|coord| {
-                    let mut projected =
+            let mut rotated: Vec<Array2<f64>> =
+                coords
+                    .iter()
+                    .map(|coord| {
                         coord.total_drift.dense_rotated.clone().unwrap_or_else(|| {
                             Array2::<f64>::zeros((dense_hop.n_dim, dense_hop.n_dim))
-                        });
-                    for op in &coord.total_drift.operators {
-                        projected +=
-                            &dense_hop.projected_operator(&dense_hop.eigenvectors, op.as_ref());
-                    }
-                    projected
-                })
-                .collect();
+                        })
+                    })
+                    .collect();
+            let mut terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+            for (idx, coord) in coords.iter().enumerate() {
+                for op in &coord.total_drift.operators {
+                    collect_projected_matrix_terms(
+                        idx,
+                        1.0,
+                        op.as_ref(),
+                        &dense_hop.eigenvectors,
+                        &mut rotated,
+                        &mut terms,
+                    );
+                }
+            }
+            let projected_ops = project_hyper_operators_batched(
+                total,
+                &terms,
+                &dense_hop.eigenvectors,
+                &dense_hop.projected_factor_cache,
+            );
+            for (dst, projected) in rotated.iter_mut().zip(projected_ops.iter()) {
+                *dst += projected;
+            }
 
             let mut ct = Array2::<f64>::zeros((total, total));
             for ii in 0..total {

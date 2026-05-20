@@ -3309,11 +3309,29 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         }
         if let Some(ref barrier_cfg) = self.barrier_config {
             if let Some(ref beta) = eval.beta {
-                let ref_diag = 1.0;
-                let threshold = 0.01;
-                if barrier_cfg.barrier_curvature_is_significant(beta, ref_diag, threshold) {
+                // Scale-free precondition check for EFS. Wood–Fasiolo's
+                // multiplicative log-λ update is derived under the
+                // assumption that the inner Hessian is ≈ X'WX + S. A log
+                // barrier adds τ/(β_j−l_j)² to the Hessian diagonal at the
+                // constrained coords; when the tightest slack is much
+                // smaller than the typical slack, that diagonal becomes
+                // locally dominant and the EFS direction is no longer
+                // guaranteed-ascent. Comparing slack *ratios* is
+                // dimensionless — independent of τ, β scale, and the
+                // inner-Hessian magnitude — which is exactly the regime
+                // change EFS cannot represent. The earlier criterion
+                // `barrier_curvature_is_significant(β, ref_diag=1.0, 0.01)`
+                // was dimensionful and depended on three quantities the
+                // bridge has no way to set correctly.
+                //
+                // `ratio = 0.1` ⇒ trigger fallback when the worst slack is
+                // ≥10× tighter than the median slack.
+                const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
+                if barrier_cfg
+                    .barrier_curvature_locally_concentrated(beta, LOCAL_CONCENTRATION_RATIO)
+                {
                     return Err(ObjectiveEvalError::recoverable(format!(
-                        "{} EFS barrier curvature significant \
+                        "{} EFS barrier curvature locally concentrated \
                          (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
                         EFS_FIRST_ORDER_FALLBACK_MARKER,
                         self.layout.rho_dim(),
@@ -5950,6 +5968,32 @@ mod tests {
         // β far from bound → curvature is negligible
         let beta_far = Array1::from_vec(vec![10.0]);
         assert!(!barrier.barrier_curvature_is_significant(&beta_far, 1.0, 0.01));
+    }
+
+    #[test]
+    fn barrier_curvature_locally_concentrated_is_scale_free() {
+        // Two constrained coords with comparable slacks → barrier is
+        // *not* locally concentrated; the dimensionless check is false
+        // regardless of the absolute slack scale.
+        let barrier = BarrierConfig {
+            tau: 1e-6,
+            constrained_indices: vec![0, 1],
+            lower_bounds: vec![0.0, 0.0],
+        };
+        let small_uniform = Array1::from_vec(vec![1.0e-3, 1.0e-3]);
+        assert!(!barrier.barrier_curvature_locally_concentrated(&small_uniform, 0.1));
+        let large_uniform = Array1::from_vec(vec![10.0, 10.0]);
+        assert!(!barrier.barrier_curvature_locally_concentrated(&large_uniform, 0.1));
+
+        // One slack 100× tighter than the other → locally concentrated,
+        // ratio 0.1 trips, ratio 0.001 does not.
+        let imbalanced = Array1::from_vec(vec![1.0e-4, 1.0e-2]);
+        assert!(barrier.barrier_curvature_locally_concentrated(&imbalanced, 0.1));
+        assert!(!barrier.barrier_curvature_locally_concentrated(&imbalanced, 1.0e-3));
+
+        // Infeasible (β ≤ l) → conservatively concentrated.
+        let infeasible = Array1::from_vec(vec![-0.5, 1.0]);
+        assert!(barrier.barrier_curvature_locally_concentrated(&infeasible, 0.1));
     }
 
     #[test]
