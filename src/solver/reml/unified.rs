@@ -1810,9 +1810,25 @@ pub trait HyperOperator: Send + Sync {
 
     /// Full dense materialization (fallback for exact trace computation).
     ///
-    /// Panics or returns a zero matrix if the operator was designed to avoid
-    /// materialization. Callers should check `is_implicit()` first.
-    fn to_dense(&self) -> Array2<f64>;
+    /// Callers should check `is_implicit()` first: the default implementation
+    /// recovers the dense form by `dim()` calls to `mul_vec` against successive
+    /// canonical basis vectors, which is the right shape for materialized
+    /// operators but O(dim²) work and is not the right path for genuinely
+    /// implicit ones. Implicit operators should either override `to_dense`
+    /// with their structure-aware materialization or return `is_implicit() =
+    /// true` so callers route around dense paths entirely.
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.dim();
+        let mut out = Array2::<f64>::zeros((p, p));
+        let mut basis = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            basis[j] = 1.0;
+            let col = self.mul_vec(&basis);
+            out.column_mut(j).assign(&col);
+            basis[j] = 0.0;
+        }
+        out
+    }
 
     /// Whether this operator uses implicit (non-materialized) storage.
     fn is_implicit(&self) -> bool;
