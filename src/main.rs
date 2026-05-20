@@ -112,7 +112,8 @@ use gam::{
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
     LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    TransformationNormalFitRequest, fit_model, resolve_offset_column, resolve_weight_column,
+    SurvivalTransformationFitRequest, TransformationNormalFitRequest, fit_model,
+    resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};
