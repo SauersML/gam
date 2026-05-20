@@ -5281,6 +5281,125 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     }
     let covariate_offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
     let dense_cov_design = cov_design.design.to_dense();
+    if cause_count > 1 {
+        let weibull_seed = if likelihood_mode == SurvivalLikelihoodMode::Weibull
+            && !learn_timewiggle
+        {
+            let scale = effective_args
+                .baseline_scale
+                .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
+            let shape = effective_args.baseline_shape.unwrap_or(1.0);
+            if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
+                return Err(
+                    "weibull survival fit requires finite positive baseline_scale and baseline_shape"
+                        .to_string(),
+                );
+            }
+            Some((scale, shape))
+        } else {
+            None
+        };
+        progress.set_stage("fit", "running cause-specific survival optimization");
+        let fit = match fit_model(FitRequest::SurvivalTransformation(
+            SurvivalTransformationFitRequest {
+                data: ds.values.view(),
+                spec: gam::solver::workflow::SurvivalTransformationTermSpec {
+                    age_entry: age_entry.clone(),
+                    age_exit: age_exit.clone(),
+                    event_target: event_target.clone(),
+                    weights: weights.clone(),
+                    covariate_spec: termspec.clone(),
+                    covariate_offset: covariate_offset.clone(),
+                    baseline_cfg: baseline_cfg.clone(),
+                    likelihood_mode,
+                    time_anchor,
+                    time_build: time_build.clone(),
+                    timewiggle: effective_timewiggle.clone(),
+                    weibull_seed,
+                    ridge_lambda: effective_args.ridge_lambda,
+                },
+                cache_session: None,
+            },
+        )) {
+            Ok(FitResult::SurvivalTransformation(result)) => result,
+            Ok(_) => {
+                return Err(
+                    "internal cause-specific survival workflow returned the wrong result variant"
+                        .to_string(),
+                );
+            }
+            Err(e) => return Err(format!("cause-specific survival fit failed: {e}")),
+        };
+        println!();
+        println!(
+            "cause-specific survival fit | causes={} | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            cause_count,
+            fit.fit.outer_converged,
+            fit.fit.outer_iterations,
+            fit.fit.log_likelihood,
+            fit.fit.reml_score
+        );
+        progress.advance_workflow(3);
+        if let Some(out) = args.out {
+            progress.set_stage("fit", "writing cause-specific survival model");
+            let mut payload = FittedModelPayload::new(
+                MODEL_VERSION,
+                formula,
+                ModelKind::Survival,
+                FittedFamily::Survival {
+                    likelihood: LikelihoodFamily::RoystonParmar,
+                    survival_likelihood: Some(
+                        survival_likelihood_modename(likelihood_mode).to_string(),
+                    ),
+                    survival_distribution: None,
+                    frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+                },
+                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+            );
+            payload.unified = Some(fit.fit.clone());
+            payload.fit_result = Some(fit.fit.clone());
+            payload.data_schema = Some(ds.schema.clone());
+            payload.survival_entry = Some(args.entry);
+            payload.survival_exit = Some(args.exit);
+            payload.survival_event = Some(args.event);
+            payload.survivalspec = Some(effectivespec);
+            payload.survival_baseline_target =
+                Some(survival_baseline_targetname(fit.baseline_cfg.target).to_string());
+            payload.survival_baseline_scale = fit.baseline_cfg.scale;
+            payload.survival_baseline_shape = fit.baseline_cfg.shape;
+            payload.survival_baseline_rate = fit.baseline_cfg.rate;
+            payload.survival_baseline_makeham = fit.baseline_cfg.makeham;
+            payload.apply_survival_time_basis(&fit.time_basis);
+            if let Some(timewiggle) = fit.baseline_timewiggle.as_ref() {
+                payload.baseline_timewiggle_degree = Some(timewiggle.degree);
+                payload.baseline_timewiggle_knots = Some(timewiggle.knots.to_vec());
+                payload.baseline_timewiggle_penalty_orders = effective_timewiggle
+                    .as_ref()
+                    .map(|cfg| cfg.penalty_orders.clone());
+                payload.baseline_timewiggle_double_penalty =
+                    effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty);
+                payload.beta_baseline_timewiggle = fit.fit.blocks.first().map(|block| {
+                    block
+                        .beta
+                        .slice(s![
+                            fit.time_base_ncols..fit.time_base_ncols + timewiggle.ncols
+                        ])
+                        .to_vec()
+                });
+            }
+            payload.survivalridge_lambda = Some(effective_args.ridge_lambda);
+            payload.survival_likelihood =
+                Some(survival_likelihood_modename(likelihood_mode).to_string());
+            payload.survival_beta_time = Some(fit.fit.beta.to_vec());
+            set_saved_offset_columns(&mut payload, args.offset_column.clone(), None);
+            set_training_feature_metadata_from_dataset(&mut payload, &ds);
+            payload.resolved_termspec = Some(fit.resolvedspec.clone());
+            write_payload_json(&out, payload)?;
+            progress.advance_workflow(survival_total_steps);
+        }
+        progress.finish_progress("cause-specific survival fit complete");
+        return Ok(());
+    }
     let build_working_model = |candidate: &SurvivalBaselineConfig| {
         let prepared = prepare_survival_time_stack(
             &age_entry,
