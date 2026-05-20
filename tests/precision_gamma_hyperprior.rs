@@ -1,7 +1,8 @@
 use gam::estimate::FitOptions;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, TermCollectionSpec,
-    fit_term_collection_forspec, fit_term_collection_with_penalty_block_gamma_priors,
+    fit_term_collection_forspec, fit_term_collection_with_penalty_block_gamma_prior_callback,
+    fit_term_collection_with_penalty_block_gamma_priors,
 };
 use gam::types::{LikelihoodFamily, RhoPrior};
 use ndarray::{Array1, Array2};
@@ -119,4 +120,44 @@ fn informative_gamma_precision_prior_shrinks_by_map_update() {
         ((observed_beta - expected_beta) / expected_beta).abs() < 0.08,
         "beta={observed_beta}, expected shrinkage near {expected_beta}"
     );
+}
+
+#[test]
+fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
+    let (data, y, weights, offset, spec) = linear_fixture();
+    let opts = fit_options();
+    let mut seen = Vec::new();
+    let callback_fit = fit_term_collection_with_penalty_block_gamma_prior_callback(
+        data.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec,
+        |metadata| {
+            seen.push((
+                metadata.label.clone(),
+                metadata.global_index,
+                metadata.effective_rank,
+            ));
+            Some((13.0, 0.25))
+        },
+        LikelihoodFamily::GaussianIdentity,
+        &opts,
+    )
+    .expect("callback gamma fit");
+    let keyed_fit = fit_term_collection_with_penalty_block_gamma_priors(
+        data.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec,
+        &[("linear".to_string(), 13.0, 0.25)],
+        LikelihoodFamily::GaussianIdentity,
+        &opts,
+    )
+    .expect("keyed gamma fit");
+
+    assert_eq!(seen, vec![("linear".to_string(), 0, 1)]);
+    assert_eq!(callback_fit.fit.lambdas.as_slice(), keyed_fit.fit.lambdas.as_slice());
+    assert_eq!(callback_fit.fit.beta.as_slice(), keyed_fit.fit.beta.as_slice());
 }
