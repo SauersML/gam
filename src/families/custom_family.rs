@@ -2638,8 +2638,8 @@ pub struct BlockwiseFitOptions {
     /// finalize() write. Used by the workflow dispatcher to broadcast a
     /// converged ρ to additional keyspace(s) — notably the data-
     /// independent seed prefix — so future fits with related structure
-    /// can warm-start from this run. Per-checkpoint writes only go to
-    /// the primary `cache_session`; only the final result is mirrored.
+    /// can warm-start from this run. Writes still pass through the session
+    /// rate limiter, so mirroring checkpoints does not add unbounded I/O.
     pub cache_mirror_sessions: Vec<Arc<crate::cache::Session>>,
 }
 
