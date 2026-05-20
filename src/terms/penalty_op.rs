@@ -232,16 +232,6 @@ impl PenaltyForm {
         }
     }
 
-    /// Borrow as a `&dyn PenaltyOp` for matvec / diag / trace consumers.
-    /// Requires holding a temporary `Array2<f64>` for the `Dense` case so the
-    /// trait reference can outlive the borrow; callers that need just the
-    /// matvec without that allocation should match on the variant directly.
-    pub fn as_op_arc(&self) -> Arc<dyn PenaltyOp> {
-        match self {
-            PenaltyForm::Dense(m) => Arc::new(m.clone()),
-            PenaltyForm::Operator(op) => op.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for PenaltyForm {

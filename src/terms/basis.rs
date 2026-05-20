@@ -5587,42 +5587,6 @@ impl ImplicitDesignPsiDerivative {
         Ok(())
     }
 
-    /// Apply the first derivative forward map to a row block: computes
-    /// `result[i - rows.start] = Σ_j (∂X/∂ψ_axis)[i, j] * u[j]` for each
-    /// `i ∈ rows`.
-    ///
-    /// The argument `u` is expressed in the final (`p_out`) basis. The returned
-    /// vector has length `rows.end - rows.start`.
-    pub fn forward_mul_rows(
-        &self,
-        axis: usize,
-        rows: std::ops::Range<usize>,
-        u: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert_eq!(u.len(), self.p_out());
-        assert!(rows.end <= self.n);
-        let chunk = self.row_chunk_first(axis, rows)?;
-        Ok(chunk.dot(&u))
-    }
-
-    /// Apply the first derivative adjoint to a row block: computes
-    /// `result[j] = Σ_{i ∈ rows} (∂X/∂ψ_axis)[i, j] * v[i - rows.start]`
-    /// expressed in the final `p_out` basis (the `row_chunk_first` output is
-    /// already projected through the identifiability transforms).
-    pub fn transpose_mul_rows(
-        &self,
-        axis: usize,
-        rows: std::ops::Range<usize>,
-        v: ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert!(rows.end <= self.n);
-        assert_eq!(v.len(), rows.end - rows.start);
-        let chunk = self.row_chunk_first(axis, rows)?;
-        Ok(chunk.t().dot(&v))
-    }
-
     fn transformed_axis_combination(&self, axis: usize) -> &[(usize, f64)] {
         self.axis_combinations
             .as_ref()
