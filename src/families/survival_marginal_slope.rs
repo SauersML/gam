@@ -14431,6 +14431,64 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         }
     }
 
+    fn outer_derivative_policy(
+        &self,
+        specs: &[ParameterBlockSpec],
+        psi_dim: usize,
+        options: &BlockwiseFitOptions,
+    ) -> crate::custom_family::OuterDerivativePolicy {
+        use crate::custom_family::OuterDerivativePolicy;
+
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let rho_dim = specs
+            .iter()
+            .map(|spec| spec.penalties.len() as u128)
+            .sum::<u128>();
+        let k = rho_dim.saturating_add(psi_dim as u128).max(1);
+
+        let predicted_hessian_work = if !self.flex_active() && !self.flex_timewiggle_active() {
+            // Rigid survival marginal-slope evaluates outer rho/psi
+            // coordinate corrections through the row-kernel/HVP path, not
+            // dense n·p_total² coefficient Hessian assembly. The biobank
+            // failure path is rho-only (psi_dim=0), so using the generic
+            // n·p_total²·K policy falsely demotes exact ARC curvature to
+            // first-order BFGS. Model the work that actually executes:
+            // one row-kernel pass per outer coordinate and coefficient axis,
+            // plus the fixed four primary survival channels.
+            let p_total = specs
+                .iter()
+                .map(|spec| spec.design.ncols() as u128)
+                .sum::<u128>();
+            (self.n as u128)
+                .saturating_mul(k)
+                .saturating_mul(p_total.saturating_add(N_PRIMARY as u128))
+        } else {
+            // Flex/time-wiggle survival paths have higher-order dynamic-q
+            // row geometry. Keep the generic dense policy there until those
+            // paths have their own measured row-work model.
+            let (gradient_work, hessian_work) =
+                crate::custom_family::default_outer_derivative_policy_costs(
+                    specs,
+                    psi_dim,
+                    self.coefficient_gradient_cost(specs),
+                    self.coefficient_hessian_cost(specs),
+                );
+            return OuterDerivativePolicy {
+                capability,
+                predicted_gradient_work: gradient_work,
+                predicted_hessian_work: hessian_work,
+                subsample_capable: true,
+            };
+        };
+
+        OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work: predicted_hessian_work / 2,
+            predicted_hessian_work,
+            subsample_capable: true,
+        }
+    }
+
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {
         true
     }
@@ -17118,6 +17176,61 @@ mod tests {
         assert!(
             crate::solver::estimate::reml::unified::prefer_outer_hessian_operator(50_001, 2, 32,)
         );
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
+    }
+
+    #[test]
+    fn survival_marginal_slope_rigid_biobank_rho_policy_uses_row_kernel_work() {
+        let n = 39_722usize;
+        let family = make_block_psi_test_family(n);
+        let specs = vec![
+            dummy_penalized_blockspec(11, 2),
+            dummy_penalized_blockspec(11, 3),
+            dummy_penalized_blockspec(11, 3),
+        ];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let policy = family.outer_derivative_policy(&specs, 0, &options);
+        let p_total = specs
+            .iter()
+            .map(|spec| spec.design.ncols() as u128)
+            .sum::<u128>();
+        let rho_dim = specs
+            .iter()
+            .map(|spec| spec.penalties.len() as u128)
+            .sum::<u128>();
+        let generic_dense_work = (n as u128)
+            .saturating_mul(rho_dim)
+            .saturating_mul(p_total)
+            .saturating_mul(p_total);
+        let row_kernel_work = (n as u128)
+            .saturating_mul(rho_dim)
+            .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
+
+        assert_eq!(policy.predicted_hessian_work, row_kernel_work);
+        assert!(
+            generic_dense_work
+                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "generic dense work should reproduce the historical false BFGS demotion"
+        );
+        assert!(
+            policy.predicted_hessian_work
+                <= crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "rigid row-kernel work should keep exact outer Hessian enabled"
+        );
+
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
         assert_eq!(
             gradient,
             crate::solver::outer_strategy::Derivative::Analytic
