@@ -108,6 +108,61 @@ def _build_fit_payload(
     return payload
 
 
+def _normalize_precision_pair(value: Any, label: str) -> list[float]:
+    if isinstance(value, dict):
+        shape = value.get("shape", value.get("a", value.get("a_p")))
+        rate = value.get("rate", value.get("b", value.get("b_p")))
+    else:
+        try:
+            shape, rate = value
+        except Exception as exc:  # pragma: no cover - defensive shape guard
+            raise ValueError(
+                f"precision_hyperpriors[{label!r}] must be (shape, rate)"
+            ) from exc
+    shape_f = float(shape)
+    rate_f = float(rate)
+    if shape_f <= 0.0 or rate_f < 0.0:
+        raise ValueError(
+            f"precision_hyperpriors[{label!r}] needs shape > 0 and rate >= 0"
+        )
+    return [shape_f, rate_f]
+
+
+def _group_terms_from_formula(formula: str) -> list[str]:
+    return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
+
+
+def _resolve_precision_hyperpriors(
+    value: Any | None,
+    formula: str,
+    headers: list[str],
+    rows: list[list[str]],
+) -> Any | None:
+    if value is None:
+        return None
+    if callable(value):
+        out: dict[str, list[float]] = {}
+        for label in _group_terms_from_formula(formula):
+            levels: list[str] = []
+            if label in headers:
+                col = headers.index(label)
+                levels = sorted({row[col] for row in rows})
+            pair = value(
+                {
+                    "label": label,
+                    "term": label,
+                    "column": label,
+                    "levels": levels,
+                    "n_coefficients": len(levels),
+                }
+            )
+            out[label] = _normalize_precision_pair(pair, label)
+        return out
+    if isinstance(value, dict):
+        return {str(k): _normalize_precision_pair(v, str(k)) for k, v in value.items()}
+    return value
+
+
 @overload
 def fit(
     data: Any,
@@ -132,6 +187,7 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
+    precision_hyperpriors: Any | None = ...,
     response_geometry: None = ...,
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
@@ -164,6 +220,7 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
+    precision_hyperpriors: Any | None = ...,
     response_geometry: str,
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
@@ -349,6 +406,7 @@ def fit(
                 "scale_dimensions": scale_dimensions,
                 "adaptive_regularization": adaptive_regularization,
                 "firth": firth,
+                "precision_hyperpriors": precision_hyperpriors,
                 "config": nested_config or None,
             },
         )
@@ -583,6 +641,7 @@ def validate_formula(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        precision_hyperpriors=None,
         config=rust_config or None,
     )
     try:

@@ -309,6 +309,14 @@ pub struct FittedModelPayload {
     /// group metadata was persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_metadata: Option<BTreeMap<String, JsonValue>>,
+    /// Deployment-time no-refit group extensions applied after fitting.
+    ///
+    /// Each entry records the requested group coordinate, caller metadata, and
+    /// prior used to initialize the inserted coefficient. The active
+    /// prediction contract lives in `data_schema` + `resolved_termspec`; this
+    /// ledger preserves provenance without requiring a refit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployment_extensions: Vec<SavedDeploymentExtension>,
     /// Transformation-normal: B-spline knots for the response-direction basis.
     #[serde(default)]
     pub transformation_response_knots: Option<Vec<f64>>,
@@ -334,6 +342,20 @@ pub struct FittedModelPayload {
     pub resolved_termspec_logslope: Option<TermCollectionSpec>,
     #[serde(default)]
     pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedDeploymentExtension {
+    pub name: String,
+    pub kind: String,
+    pub term: String,
+    pub level: JsonValue,
+    pub coefficient_index: usize,
+    pub coefficient_mean: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -423,6 +445,7 @@ impl FittedModelPayload {
             training_headers: None,
             training_feature_ranges: None,
             group_metadata: None,
+            deployment_extensions: Vec::new(),
             transformation_response_knots: None,
             transformation_response_transform: None,
             transformation_response_degree: None,

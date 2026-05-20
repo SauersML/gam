@@ -2,18 +2,19 @@
 
 `gamfit` ships a family of smooths whose **predictor space is a manifold
 other than flat Euclidean ℝᵈ**: a circle, a cylinder, a torus, a sphere,
-or a one-sided strip. Each one is exposed through the formula DSL with no
-new arguments to `fit()` — you describe the manifold in the formula and
-the engine picks the right basis and penalty automatically.
+or a tensor product with periodic margins. The visual demo also includes
+a 4π-periodic double-cover parameterization whose embedding traces a
+Möbius strip; the smoother sees an orientable cylinder, not a true
+Möbius predictor manifold.
 
 This page is the visual tour. The full reference for the underlying
 formula options lives in the [Formula DSL reference](formulas.md).
 
-## Recovering six manifolds from noisy point clouds
+## Recovering six geometric examples from noisy point clouds
 
 The image below is the output of
 [`scripts/geometric_shapes_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/geometric_shapes_demo.py).
-For each of six manifolds, we sample noisy 3-D points
+For each of six geometric examples, we sample noisy 3-D points
 `(x, y, z)` along the manifold and fit **one geometric smooth per
 output coordinate**:
 
@@ -56,7 +57,7 @@ below to get it locally. Source browsers can also open
 | **Wobbly cylinder** (one periodic axis, one open axis) | `θ` ∈ [0, 2π), `h` ∈ [0, 1] | `x ~ te(theta, h, periodic=[0], period=[2*pi, None], k=[26,12])` |
 | **Lumpy sphere** (intrinsic S² with multiple bulges + a deep crater) | `lat`, `lon` (radians) | `x ~ sphere(lat, lon, radians=true, k=100)` |
 | **Bumpy torus** (two periodic axes, period 2π in each) | `u`, `v` ∈ [0, 2π) | `x ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi], k=[20,16])` |
-| **Möbius embedding (4π double-cover)** — the smoother sees an orientable cylinder `S¹ × [−v,v]` with period **4π** in `u`; the embedding in ℝ³ happens to trace out a Möbius strip because `F(u+2π,v) = F(u,−v)` in the data. The smoother does *not* enforce the twisted identification `(u,v) ∼ (u+2π,−v)`. | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
+| **Möbius embedding (4π double-cover)** — the smoother sees an orientable cylinder `S¹ × [−v,v]` with period **4π** in `u`; the embedding in ℝ³ traces a Möbius strip because `F(u+2π,v) = F(u,−v)` in the data. The smoother does *not* enforce the twisted identification `(u,v) ∼ (u+2π,−v)`. | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
 
 The three coordinate fits per shape are independent — there is no shared
 parameter and no joint loss. The fact that the reassembled surfaces are

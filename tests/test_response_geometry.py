@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from gamfit._response_geometry import (
     ResponseGeometryModel,
@@ -61,6 +62,22 @@ def test_sphere_frechet_mean_is_intrinsic_and_log_exp_roundtrip() -> None:
     tangent = sphere_log_map(y, mean)
     np.testing.assert_allclose(sphere_exp_map(tangent, mean), y, rtol=1e-12, atol=1e-12)
     np.testing.assert_allclose(tangent @ mean, np.zeros(y.shape[0]), atol=1e-12)
+
+
+def test_sphere_antipodal_log_is_undefined_and_mean_is_not_endpoint() -> None:
+    y = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
+
+    with pytest.raises(ValueError, match="antipodal"):
+        sphere_log_map(y[1:], y[0])
+
+    mean = sphere_frechet_mean(y)
+    assert np.isclose(np.linalg.norm(mean), 1.0)
+    assert abs(float(mean @ y[0])) < 1e-8
+
+    endpoint_obj = 0.5 * np.pi**2
+    mean_obj = float(np.mean(np.arccos(np.clip(y @ mean, -1.0, 1.0)) ** 2))
+    assert mean_obj < endpoint_obj
+    assert np.isclose(mean_obj, 0.25 * np.pi**2)
 
 
 def test_geometry_log_map_resolves_simplex_aliases() -> None:

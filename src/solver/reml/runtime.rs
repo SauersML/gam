@@ -3022,7 +3022,8 @@ impl<'a> RemlState<'a> {
                         .map(|cp| {
                             let r = &cp.col_range;
                             let beta_block = beta_original.slice(s![r.start..r.end]);
-                            cp.local.dot(&beta_block)
+                            let centered = &beta_block - &cp.prior_mean;
+                            cp.local.dot(&centered)
                         })
                         .collect();
                     if blocks.is_empty() {
@@ -3915,6 +3916,13 @@ impl<'a> RemlState<'a> {
         for (k, cp) in self.canonical_penalties.iter().enumerate() {
             cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
         }
+        let mut penalty_linear_shift = Array1::<f64>::zeros(self.p);
+        let mut penalty_constant_shift = 0.0;
+        for (k, cp) in self.canonical_penalties.iter().enumerate() {
+            let lambda = lambdas[k];
+            penalty_linear_shift += &cp.prior_linear_shift(lambda);
+            penalty_constant_shift += cp.prior_constant_shift(lambda);
+        }
 
         let mut h = cache.xtwx_orig.clone();
         h += &s_lambda;
@@ -3925,7 +3933,9 @@ impl<'a> RemlState<'a> {
                 return Ok(None);
             }
         };
-        let beta = super::unified::HessianOperator::solve(hessian_op.as_ref(), &cache.xtwy_orig);
+        let mut rhs = cache.xtwy_orig.clone();
+        rhs += &penalty_linear_shift;
+        let beta = super::unified::HessianOperator::solve(hessian_op.as_ref(), &rhs);
         if beta.iter().any(|&value| !value.is_finite()) {
             return Ok(None);
         }
@@ -3934,7 +3944,9 @@ impl<'a> RemlState<'a> {
         let rss = (cache.centered_weighted_y_sq - 2.0 * beta.dot(&cache.xtwy_orig)
             + beta.dot(&xtwx_beta))
         .max(0.0);
-        let penalty_quadratic = beta.dot(&s_lambda.dot(&beta));
+        let s_beta = s_lambda.dot(&beta);
+        let penalty_quadratic =
+            beta.dot(&s_beta) - 2.0 * beta.dot(&penalty_linear_shift) + penalty_constant_shift;
 
         // Penalty logdet derivatives go through the canonical block-local
         // path so unpenalized global columns (intercept, etc.) are not
@@ -5180,7 +5192,8 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
             }
         }
         let beta_block = beta_cur.slice(s![r.start..r.end]);
-        let sb_block = cp.local.dot(&beta_block);
+        let centered = &beta_block - &cp.prior_mean;
+        let sb_block = cp.local.dot(&centered);
         for (target, src) in rhs_slice.iter_mut().zip(sb_block.iter()) {
             *target += scale * *src;
         }
@@ -6084,6 +6097,20 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
+    fn build_penalty_means(&self, beta_dim: usize) -> Vec<Array1<f64>> {
+        self.canonical_penalties
+            .iter()
+            .map(|cp| {
+                let mean = cp.full_width_prior_mean();
+                if mean.len() == beta_dim {
+                    mean
+                } else {
+                    Array1::<f64>::zeros(beta_dim)
+                }
+            })
+            .collect()
+    }
+
     /// Pack a `DerivativeContext` plus backend-specific pieces into an
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
@@ -6099,6 +6126,7 @@ impl<'a> RemlState<'a> {
         hessian_logdet_correction: f64,
         penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
     ) -> super::assembly::InnerAssembly<'static> {
+        let penalty_prior_means = self.build_penalty_means(beta.len());
         super::assembly::InnerAssembly {
             log_likelihood: ctx.log_likelihood,
             penalty_quadratic: pirls_result.stable_penalty_term,
@@ -6106,6 +6134,7 @@ impl<'a> RemlState<'a> {
             n_observations: self.y.len(),
             hessian_op,
             penalty_coords: self.build_penalty_coords(),
+            penalty_prior_means,
             penalty_logdet,
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,

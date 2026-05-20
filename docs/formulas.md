@@ -233,9 +233,9 @@ the truth is reasonable, but they take different paths to get there:
 
 ### Periodic / cyclic smooths
 
-For a visual tour of the periodic, sphere, cylinder, torus, Möbius, and
-boundary-conditioned smooths recovered from noisy 3-D point clouds, see
-the [manifold smooths gallery](manifold-smooths.md).
+For a visual tour of the periodic, sphere, cylinder, torus,
+Möbius-double-cover, and boundary-conditioned smooths recovered from
+noisy 3-D point clouds, see the [manifold smooths gallery](manifold-smooths.md).
 
 ```
 y ~ s(theta, periodic=true, period=6.283)             # cyclic 1D B-spline

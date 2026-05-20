@@ -316,163 +316,6 @@ pub struct ParameterBlockSpec {
     pub initial_beta: Option<Array1<f64>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct CoefficientGroupMember {
-    pub block: String,
-    pub coefficient: usize,
-}
-
-#[derive(Clone, Debug)]
-pub enum CoefficientGroupHyperprior {
-    Flat,
-    NormalLogPrecision { mean: f64, sd: f64 },
-    GammaPrecision { shape: f64, rate: f64 },
-}
-
-impl CoefficientGroupHyperprior {
-    pub fn to_rho_prior(&self) -> crate::types::RhoPrior {
-        match *self {
-            Self::Flat => crate::types::RhoPrior::Flat,
-            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
-            Self::GammaPrecision { shape, rate } => {
-                crate::types::RhoPrior::GammaPrecision { shape, rate }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CoefficientGroupSpec {
-    pub label: String,
-    pub members: Vec<CoefficientGroupMember>,
-    pub parent_label: Option<String>,
-    pub initial_log_lambda: f64,
-    pub hyperprior: Option<CoefficientGroupHyperprior>,
-}
-
-#[derive(Clone, Debug)]
-pub struct RealizedCoefficientGroupLayout {
-    pub specs: Vec<ParameterBlockSpec>,
-    pub label_priors: Vec<(String, crate::types::RhoPrior)>,
-}
-
-pub fn coefficient_member(block: impl Into<String>, coefficient: usize) -> CoefficientGroupMember {
-    CoefficientGroupMember {
-        block: block.into(),
-        coefficient,
-    }
-}
-
-pub fn apply_coefficient_groups_to_block_specs(
-    specs: &[ParameterBlockSpec],
-    groups: &[CoefficientGroupSpec],
-) -> Result<RealizedCoefficientGroupLayout, String> {
-    let mut out = specs.to_vec();
-    let block_by_name: BTreeMap<String, usize> = specs
-        .iter()
-        .enumerate()
-        .map(|(idx, spec)| (spec.name.clone(), idx))
-        .collect();
-    if block_by_name.len() != specs.len() {
-        return Err("coefficient group DSL requires unique parameter block names".to_string());
-    }
-
-    let mut labels = BTreeSet::<String>::new();
-    for group in groups {
-        if group.label.trim().is_empty() {
-            return Err("coefficient group label must not be empty".to_string());
-        }
-        if !labels.insert(group.label.clone()) {
-            return Err(format!("duplicate coefficient group label '{}'", group.label));
-        }
-        if group.members.is_empty() {
-            return Err(format!(
-                "coefficient group '{}' must contain at least one coefficient",
-                group.label
-            ));
-        }
-    }
-
-    let mut resolved = BTreeMap::<String, BTreeSet<(usize, usize)>>::new();
-    for group in groups {
-        let mut members = BTreeSet::<(usize, usize)>::new();
-        for member in &group.members {
-            let block_idx = *block_by_name.get(&member.block).ok_or_else(|| {
-                format!(
-                    "coefficient group '{}' references unknown block '{}'",
-                    group.label, member.block
-                )
-            })?;
-            let p = specs[block_idx].design.ncols();
-            if member.coefficient >= p {
-                return Err(format!(
-                    "coefficient group '{}' references coefficient {} in block '{}' with width {p}",
-                    group.label, member.coefficient, member.block
-                ));
-            }
-            members.insert((block_idx, member.coefficient));
-        }
-        resolved.insert(group.label.clone(), members);
-    }
-    for group in groups {
-        if let Some(parent) = group.parent_label.as_ref() {
-            let parent_members = resolved.get(parent).ok_or_else(|| {
-                format!(
-                    "coefficient group '{}' references unknown parent label '{parent}'",
-                    group.label
-                )
-            })?;
-            let child_members = resolved
-                .get(&group.label)
-                .expect("coefficient group should have been resolved");
-            if !child_members.is_subset(parent_members) {
-                return Err(format!(
-                    "coefficient group '{}' is not a subset of parent group '{parent}'",
-                    group.label
-                ));
-            }
-        }
-    }
-
-    let mut label_priors = Vec::with_capacity(groups.len());
-    for group in groups {
-        let members = resolved
-            .get(&group.label)
-            .expect("coefficient group should have been resolved");
-        let mut by_block: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for &(block_idx, coefficient) in members {
-            by_block.entry(block_idx).or_default().push(coefficient);
-        }
-        for (block_idx, coefficients) in by_block {
-            let p = specs[block_idx].design.ncols();
-            let mut local = Array2::<f64>::zeros((p, p));
-            for coefficient in coefficients {
-                local[[coefficient, coefficient]] = 1.0;
-            }
-            out[block_idx]
-                .penalties
-                .push(PenaltyMatrix::Dense(local).with_precision_label(group.label.clone()));
-            out[block_idx].nullspace_dims.push(p.saturating_sub(
-                members
-                    .iter()
-                    .filter(|(idx, _)| *idx == block_idx)
-                    .count(),
-            ));
-            let mut rho = out[block_idx].initial_log_lambdas.to_vec();
-            rho.push(group.initial_log_lambda);
-            out[block_idx].initial_log_lambdas = Array1::from_vec(rho);
-        }
-        if let Some(prior) = group.hyperprior.as_ref() {
-            label_priors.push((group.label.clone(), prior.to_rho_prior()));
-        }
-    }
-
-    Ok(RealizedCoefficientGroupLayout {
-        specs: out,
-        label_priors,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoefficientBlockSelector {
     Name(String),
@@ -499,6 +342,14 @@ impl CoefficientLabel {
             column,
         }
     }
+}
+
+pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
+    CoefficientLabel::by_block_name(block, column)
+}
+
+pub fn coefficient_label_by_block_index(block: usize, column: usize) -> CoefficientLabel {
+    CoefficientLabel::by_block_index(block, column)
 }
 
 #[derive(Debug, Clone, PartialEq)]
