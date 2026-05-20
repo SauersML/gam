@@ -204,7 +204,11 @@ def sphere_frechet_mean(
     tol: float = 1e-12,
     max_iter: int = 256,
 ) -> Any:
-    """Intrinsic Fréchet/Karcher mean on the unit sphere."""
+    """Intrinsic Fréchet/Karcher mean on the unit sphere.
+
+    If the minimizer is not unique, as for an exactly antipodal pair, this
+    returns one deterministic minimizer rather than an endpoint surrogate.
+    """
     import numpy as np
 
     y = _normalize_sphere(values)
@@ -233,7 +237,11 @@ def sphere_frechet_mean(
 
 
 def sphere_log_map(values: Any, base: Any) -> Any:
-    """Log map from the unit sphere to the ambient tangent space at ``base``."""
+    """Log map from the unit sphere to the tangent space at ``base``.
+
+    The log map is non-unique at antipodal points, so those inputs are
+    rejected instead of being mapped to a false zero tangent.
+    """
     import numpy as np
 
     y = _normalize_sphere(values)
