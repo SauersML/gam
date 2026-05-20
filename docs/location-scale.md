@@ -75,9 +75,9 @@ se_S = pred.survival_se_at([1, 5, 10])  # populated for location-scale
 
 ## Posterior sampling
 
-Location-scale models fall back to the Gaussian Laplace approximation
-rather than NUTS, because the predictive linear predictor is non-linear in
-the joint coefficient vector. The returned `PosteriorSamples` object has
+Location-scale models use the Gaussian Laplace approximation rather than
+NUTS because the predictive linear predictor is non-linear in the joint
+coefficient vector. The returned `PosteriorSamples` object has
 `posterior.method == "laplace"`, `rhat == 1.0`, and predictive
 bands flow through the same `.predict(...)` interface. See
 [posterior-sampling.md](posterior-sampling.md).

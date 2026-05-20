@@ -24,13 +24,15 @@ uv pip install gamfit
 uv add "gamfit[pandas]"     # pandas + pyarrow input/output
 uv add "gamfit[plot]"       # matplotlib-based plotting
 uv add "gamfit[sklearn]"    # scikit-learn integration
+uv add "gamfit[torch]"      # PyTorch bridge
 uv add "gamfit[all]"        # everything
 ```
 
 Plain `gamfit` works without any of these. Adding `pandas`/`pyarrow` only
 changes what `predict()` returns (and accepts); the engine does not depend
 on them. Without `matplotlib`, `Model.plot()` and posterior trace plots
-raise. Without `scikit-learn`, `gamfit.sklearn` imports fail.
+raise. Without `scikit-learn`, `gamfit.sklearn` imports fail. Without
+`torch`, `gamfit.torch` imports fail.
 
 ### Verifying the install
 
@@ -131,10 +133,10 @@ Defaults for `samples`, `warmup`, and `chains` are derived from the
 coefficient count — see [posterior-sampling.md](posterior-sampling.md) for
 the exact rule and how to override.
 
-NUTS is used where possible. A Gaussian Laplace fallback is used for model
-classes without exact NUTS support (location-scale survival, latent
-survival, location-scale GLMs, transformation-normal, Bernoulli
-marginal-slope). See [posterior-sampling.md](posterior-sampling.md).
+NUTS is used where possible. Gaussian Laplace is used for model classes
+without exact NUTS support (location-scale survival, latent survival,
+location-scale GLMs, transformation-normal, Bernoulli marginal-slope). See
+[posterior-sampling.md](posterior-sampling.md).
 
 ## Where to go next
 

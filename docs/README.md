@@ -4,8 +4,8 @@
 
 <p class="gamfit-tagline" markdown>
 Formula-first generalized additive models for Python, backed by a Rust
-engine. REML/LAML smoothing, NUTS posteriors, survival, location-scale,
-and flexible links in one API.
+engine. REML/LAML smoothing, NUTS or Gaussian Laplace posteriors, survival,
+location-scale, and flexible links in one API.
 </p>
 
 <div class="gamfit-cta" markdown>
@@ -19,7 +19,8 @@ and flexible links in one API.
 `gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
 random effects, bounded/constrained coefficients, location-scale extensions,
 survival likelihoods, and flexible/learnable links. Smoothing parameters are
-selected by REML or LAML. Posterior sampling uses NUTS.
+selected by REML or LAML. Posterior sampling uses NUTS where supported, and
+Gaussian Laplace for model classes without an exact NUTS path.
 
 This site is the Python documentation. For a short overview, see the
 [PyPI page](https://pypi.org/project/gamfit/).
@@ -37,6 +38,8 @@ This site is the Python documentation. For a short overview, see the
 
 - [Formula DSL reference](formulas.md) — every term type, every option, every
   link, every family.
+- [Difference smooths](difference-smooths.md) — pointwise and simultaneous
+  contrasts between smooths.
 - [Manifold smooths gallery](manifold-smooths.md) — visual tour of the
   periodic, cylinder, torus, sphere, Möbius, and boundary-conditioned
   smooths recovered from noisy 3-D point clouds.
@@ -62,6 +65,8 @@ This site is the Python documentation. For a short overview, see the
   `diagnose()`, `check()`, `plot()`, `report()`.
 - [scikit-learn integration](sklearn.md) — `GAMRegressor`, `GAMClassifier`,
   pipelines, cross-validation.
+- [PyTorch integration](torch.md) — differentiable REML primitives,
+  response-geometry transforms, and frozen fitted-model modules.
 - [Save and load](persistence.md) — `.gam` model files and `.npz` posteriors.
 
 **Reference**
