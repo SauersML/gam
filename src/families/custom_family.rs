@@ -10713,6 +10713,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
                     match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => {
+                            let lm_ridge = marquardt_ridge;
                             crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     // h_joint * v -> out (faer-backed, no alloc)
@@ -10730,6 +10731,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &mut pen,
                                     );
                                     *out += &*pen;
+                                    // Marquardt damping: adds μ·v to the
+                                    // Newton matvec without touching the
+                                    // penalty or REML/LAML cost surface.
+                                    if lm_ridge > 0.0 {
+                                        out.scaled_add(lm_ridge, v);
+                                    }
                                 },
                                 &rhs,
                                 &preconditioner_diag,
@@ -10749,6 +10756,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                         JointHessianSource::Operator { apply_into, .. } => {
                             let apply_h_into = Arc::clone(apply_into);
+                            let lm_ridge = marquardt_ridge;
                             crate::linalg::utils::solve_spd_pcg_with_info_into(
                                 |v, out| {
                                     if let Err(error) = apply_h_into(v, out) {
@@ -10766,6 +10774,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                         &mut pen,
                                     );
                                     *out += &*pen;
+                                    if lm_ridge > 0.0 {
+                                        out.scaled_add(lm_ridge, v);
+                                    }
                                 },
                                 &rhs,
                                 &preconditioner_diag,
