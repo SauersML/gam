@@ -1556,15 +1556,15 @@ pub struct EfsEval {
     /// coordinates. Used by the backtracking logic to selectively scale
     /// only the ψ portion of the step.
     pub psi_indices: Option<Vec<usize>>,
-    /// Representative scale of the inner Hessian's diagonal,
+    /// Representative curvature scale of the inner Hessian
     /// `H = X'W_HX + S_λ` (+ any barrier perturbation), at β̂.
-    /// Typically `median(diag(H))` or `tr(H) / p`. Inner solvers that
-    /// already materialize `H` during the EFS step computation should
-    /// fill this in so the outer barrier-curvature precondition check
-    /// can use the dimensionally correct comparison
-    /// `max_j τ/Δ_j² > threshold · ref_diag`. When `None`, the EFS
-    /// bridge falls back to a scale-free heuristic.
-    pub inner_hessian_diag_scale: Option<f64>,
+    ///
+    /// Production REML/LAML paths provide the geometric mean of the active
+    /// Hessian spectrum, `exp(log|H|_+ / rank(H))`, which is basis-invariant,
+    /// has curvature units, and is already available from the Hessian operator
+    /// used to evaluate the objective. The EFS barrier check uses it for the
+    /// dimensionally correct comparison `max_j τ/Δ_j² > threshold · scale`.
+    pub inner_hessian_scale: Option<f64>,
 }
 
 /// Common interface for outer smoothing-parameter objectives.
@@ -3335,12 +3335,12 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
                 const BARRIER_CURVATURE_SATURATION: f64 = 1.0;
                 const BARRIER_CURVATURE_RELATIVE_THRESHOLD: f64 = 0.05;
-                if let Some(ref_diag) = eval.inner_hessian_diag_scale
-                    && ref_diag.is_finite()
-                    && ref_diag > 0.0
+                if let Some(hessian_scale) = eval.inner_hessian_scale
+                    && hessian_scale.is_finite()
+                    && hessian_scale > 0.0
                     && barrier_cfg.barrier_curvature_is_significant(
                         beta,
-                        ref_diag,
+                        hessian_scale,
                         BARRIER_CURVATURE_RELATIVE_THRESHOLD,
                     )
                 {
@@ -3352,7 +3352,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                         self.layout.psi_dim,
                         self.layout.n_params,
                         eval.cost,
-                        ref_diag,
+                        hessian_scale,
                     )));
                 }
                 if barrier_cfg.barrier_curvature_locally_concentrated(
