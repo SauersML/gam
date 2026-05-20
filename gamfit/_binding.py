@@ -4,7 +4,7 @@ import importlib
 from functools import lru_cache
 from types import ModuleType
 
-from ._cuda import preload_cuda_libraries
+from ._cuda import assert_no_cuda_library_conflicts, cuda_diagnostics, prepare_cuda_libraries
 
 
 class RustExtensionUnavailableError(ImportError):
@@ -29,13 +29,16 @@ class RustExtensionUnavailableError(ImportError):
 
 @lru_cache(maxsize=1)
 def rust_module() -> ModuleType:
-    preload_cuda_libraries()
+    prepare_cuda_libraries()
+    assert_no_cuda_library_conflicts("importing gamfit._rust")
     try:
-        return importlib.import_module("gamfit._rust")
+        module = importlib.import_module("gamfit._rust")
     except ImportError as exc:  # pragma: no cover - import environment specific
         raise RustExtensionUnavailableError(
             "gamfit._rust is not available. Build or install the package with maturin first."
         ) from exc
+    assert_no_cuda_library_conflicts("using gamfit._rust")
+    return module
 
 
 def extension_status() -> dict[str, object]:
@@ -51,5 +54,6 @@ def extension_status() -> dict[str, object]:
     return {
         "available": True,
         "module": "gamfit._rust",
+        "cuda_diagnostics": cuda_diagnostics(),
         **dict(build_info),
     }
