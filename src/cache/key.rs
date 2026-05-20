@@ -14,10 +14,6 @@ use std::fmt;
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
-    pub fn from_bytes(b: [u8; 32]) -> Self {
-        Self(b)
-    }
-
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -99,14 +95,6 @@ impl Fingerprinter {
 
     pub fn absorb_u64(&mut self, tag: &[u8], v: u64) {
         self.absorb_bytes(tag, &v.to_le_bytes());
-    }
-
-    pub fn absorb_usize(&mut self, tag: &[u8], v: usize) {
-        self.absorb_u64(tag, v as u64);
-    }
-
-    pub fn absorb_bool(&mut self, tag: &[u8], v: bool) {
-        self.absorb_bytes(tag, &[v as u8]);
     }
 
     pub fn absorb_f64(&mut self, tag: &[u8], v: f64) {

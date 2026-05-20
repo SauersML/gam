@@ -1739,7 +1739,7 @@ pub trait HyperOperator: Send + Sync {
     /// by dense spectral logdet-Hessian contractions.
     fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
         let op_factor = self.mul_mat(factor);
-        factor.t().dot(&op_factor)
+        crate::faer_ndarray::fast_atb(factor, &op_factor)
     }
 
     /// Compute the exact projected matrix `F^T B F`, reusing caller-owned
@@ -11552,7 +11552,8 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn projected_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
-        self.w_factor.t().dot(matrix).dot(&self.w_factor)
+        let left = crate::faer_ndarray::fast_atb(&self.w_factor, matrix);
+        crate::faer_ndarray::fast_ab(&left, &self.w_factor)
     }
 
     #[inline]

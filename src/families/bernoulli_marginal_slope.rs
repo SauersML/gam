@@ -127,35 +127,6 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub latent_z_policy: LatentZPolicy,
 }
 
-impl BernoulliMarginalSlopeTermSpec {
-    pub fn calibrated_probit(
-        y: Array1<f64>,
-        weights: Array1<f64>,
-        z: Array1<f64>,
-        marginalspec: TermCollectionSpec,
-        logslopespec: TermCollectionSpec,
-        marginal_offset: Array1<f64>,
-        logslope_offset: Array1<f64>,
-        frailty: FrailtySpec,
-        protocol: crate::solver::protocol::MarginalSlopeCalibrationProtocol,
-    ) -> Self {
-        Self {
-            y,
-            weights,
-            z,
-            base_link: protocol.base_link,
-            marginalspec,
-            logslopespec,
-            marginal_offset,
-            logslope_offset,
-            frailty,
-            score_warp: protocol.score_warp,
-            link_dev: protocol.link_deviation,
-            latent_z_policy: protocol.latent_score.into_policy(),
-        }
-    }
-}
-
 pub struct BernoulliMarginalSlopeFitResult {
     pub fit: UnifiedFitResult,
     pub marginalspec_resolved: TermCollectionSpec,
@@ -514,12 +485,6 @@ impl LatentZPolicy {
         }
     }
 
-    pub fn empirical_fit_weighted() -> Self {
-        Self {
-            latent_measure: LatentMeasureSpec::global_empirical_default(),
-            ..Self::exploratory_fit_weighted()
-        }
-    }
 }
 
 impl Default for LatentZPolicy {
@@ -3157,29 +3122,6 @@ pub fn marginal_slope_probit_eta(
         .map(|(&score, &slope)| probit_scale * slope * score)
         .sum::<f64>();
     Ok(q * scale + linear)
-}
-
-pub fn marginal_slope_probit_neglog(
-    q: f64,
-    z: &[f64],
-    slopes: &[f64],
-    y: f64,
-    weight: f64,
-    covariance: &MarginalSlopeCovariance,
-    probit_scale: f64,
-) -> Result<f64, String> {
-    if !(weight.is_finite() && weight >= 0.0) || !y.is_finite() {
-        return Err(format!(
-            "marginal-slope probit neglog requires finite non-negative weight and finite y, got weight={weight}, y={y}"
-        ));
-    }
-    let eta = marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)?;
-    let signed = (2.0 * y - 1.0) * eta;
-    let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-    if !logcdf.is_finite() {
-        return Err("marginal-slope probit neglog produced non-finite log-CDF".to_string());
-    }
-    Ok(-weight * logcdf)
 }
 
 /// Log-space residual evaluator for the empirical-frailty intercept calibration.

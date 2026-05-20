@@ -95,14 +95,6 @@ impl WarmStartStore {
         Ok(Self { root, opts })
     }
 
-    /// Open the default store at `dirs::cache_dir()/gam/warm/v1/`. Returns
-    /// `None` if no cache dir is discoverable on the host.
-    pub fn open_default() -> Option<Self> {
-        let base = dirs::cache_dir()?;
-        let root = base.join("gam").join("warm").join("v1");
-        Self::open(root, StoreOptions::default()).ok()
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
     }
