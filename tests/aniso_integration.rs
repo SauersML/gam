@@ -115,6 +115,8 @@ fn aniso_matern_recovers_signal_axis() {
         kappa_options,
         wiggle: None,
         wiggle_options: None,
+        coefficient_groups: Vec::new(),
+        penalty_block_gamma_priors: Vec::new(),
     }))
     .expect("anisotropic Matérn fit should converge");
 

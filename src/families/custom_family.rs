@@ -31,7 +31,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 use std::any::{Any, type_name};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -65,6 +65,12 @@ pub enum PenaltyMatrix {
         col_range: std::ops::Range<usize>,
         total_dim: usize,
     },
+    /// Wrapper assigning this penalty component to a user-visible precision
+    /// label. Components with the same label share one smoothing parameter.
+    Labeled {
+        label: String,
+        inner: Box<PenaltyMatrix>,
+    },
 }
 
 impl PenaltyMatrix {
@@ -74,6 +80,7 @@ impl PenaltyMatrix {
             Self::Dense(m) => m.nrows(),
             Self::KroneckerFactored { left, right } => left.nrows() * right.nrows(),
             Self::Blockwise { total_dim, .. } => *total_dim,
+            Self::Labeled { inner, .. } => inner.dim(),
         }
     }
 
@@ -103,6 +110,7 @@ impl PenaltyMatrix {
                 .assign(local);
                 g
             }
+            Self::Labeled { inner, .. } => inner.to_dense(),
         }
     }
 
@@ -110,7 +118,7 @@ impl PenaltyMatrix {
     pub fn as_dense_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
         match self {
             Self::Dense(m) => std::borrow::Cow::Borrowed(m),
-            Self::KroneckerFactored { .. } | Self::Blockwise { .. } => {
+            Self::KroneckerFactored { .. } | Self::Blockwise { .. } | Self::Labeled { .. } => {
                 std::borrow::Cow::Owned(self.to_dense())
             }
         }
@@ -129,7 +137,21 @@ impl PenaltyMatrix {
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
             Self::Dense(m) => Some(m),
-            Self::KroneckerFactored { .. } | Self::Blockwise { .. } => None,
+            Self::KroneckerFactored { .. } | Self::Blockwise { .. } | Self::Labeled { .. } => None,
+        }
+    }
+
+    pub fn with_precision_label(self, label: impl Into<String>) -> Self {
+        Self::Labeled {
+            label: label.into(),
+            inner: Box::new(self),
+        }
+    }
+
+    pub fn precision_label(&self) -> Option<&str> {
+        match self {
+            Self::Labeled { label, .. } => Some(label.as_str()),
+            _ => None,
         }
     }
 
@@ -163,6 +185,7 @@ impl PenaltyMatrix {
                     .assign(&result_block);
                 out
             }
+            Self::Labeled { inner, .. } => inner.dot(v),
         }
     }
 
@@ -199,6 +222,7 @@ impl PenaltyMatrix {
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda, local);
             }
+            Self::Labeled { inner, .. } => inner.add_scaled_to(lambda, target),
         }
     }
 
@@ -235,6 +259,7 @@ impl PenaltyMatrix {
                     target[col_range.start + local_idx] += lambda * local[[local_idx, local_idx]];
                 }
             }
+            Self::Labeled { inner, .. } => inner.add_scaled_diag_to(lambda, target),
         }
     }
 
@@ -253,6 +278,7 @@ impl PenaltyMatrix {
                 let sv = local.dot(&beta_block);
                 beta_block.dot(&sv)
             }
+            Self::Labeled { inner, .. } => inner.quadratic_form(beta),
         }
     }
 
@@ -288,6 +314,262 @@ pub struct ParameterBlockSpec {
     pub initial_log_lambdas: Array1<f64>,
     /// Optional initial coefficients (defaults to zeros if omitted).
     pub initial_beta: Option<Array1<f64>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoefficientBlockSelector {
+    Name(String),
+    Index(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoefficientLabel {
+    pub block: CoefficientBlockSelector,
+    pub column: usize,
+}
+
+impl CoefficientLabel {
+    pub fn by_block_name(block: impl Into<String>, column: usize) -> Self {
+        Self {
+            block: CoefficientBlockSelector::Name(block.into()),
+            column,
+        }
+    }
+
+    pub fn by_block_index(block: usize, column: usize) -> Self {
+        Self {
+            block: CoefficientBlockSelector::Index(block),
+            column,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoefficientGroupPrior {
+    Flat,
+    NormalLogPrecision { mean: f64, sd: f64 },
+    GammaPrecision { shape: f64, rate: f64 },
+}
+
+impl CoefficientGroupPrior {
+    pub fn to_rho_prior(&self) -> crate::types::RhoPrior {
+        match *self {
+            Self::Flat => crate::types::RhoPrior::Flat,
+            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
+            Self::GammaPrecision { shape, rate } => {
+                crate::types::RhoPrior::GammaPrecision { shape, rate }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoefficientGroupSpec {
+    pub label: String,
+    pub coefficients: Vec<CoefficientLabel>,
+    pub parent: Option<String>,
+    pub prior: Option<CoefficientGroupPrior>,
+    pub initial_log_precision: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RealizedCoefficientGroup {
+    pub label: String,
+    pub parent: Option<String>,
+    pub coefficients: Vec<(usize, usize)>,
+    pub prior: Option<CoefficientGroupPrior>,
+    pub initial_log_precision: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RealizedCoefficientGroupSpecs {
+    pub specs: Vec<ParameterBlockSpec>,
+    pub groups: Vec<RealizedCoefficientGroup>,
+    /// One entry per realized penalty in flattened block order. Built-in
+    /// penalties receive unique internal labels; user groups carry their
+    /// declared labels. Consumers that optimize one coordinate per label can
+    /// use this to tie cross-block penalty pieces to a shared precision.
+    pub penalty_labels: Vec<String>,
+    /// Per-coordinate priors in `outer_labels` order.
+    pub rho_prior: crate::types::RhoPrior,
+    pub outer_labels: Vec<String>,
+}
+
+fn coefficient_group_block_index(
+    specs: &[ParameterBlockSpec],
+    selector: &CoefficientBlockSelector,
+) -> Result<usize, String> {
+    match selector {
+        CoefficientBlockSelector::Index(index) => {
+            if *index >= specs.len() {
+                Err(format!(
+                    "coefficient group references block index {index}, but only {} blocks exist",
+                    specs.len()
+                ))
+            } else {
+                Ok(*index)
+            }
+        }
+        CoefficientBlockSelector::Name(name) => specs
+            .iter()
+            .position(|spec| spec.name == *name)
+            .ok_or_else(|| format!("coefficient group references unknown block '{name}'")),
+    }
+}
+
+pub fn realize_coefficient_groups_for_custom_family(
+    specs: &[ParameterBlockSpec],
+    groups: &[CoefficientGroupSpec],
+    base_prior: crate::types::RhoPrior,
+) -> Result<RealizedCoefficientGroupSpecs, String> {
+    validate_blockspecs(specs)?;
+    let mut seen = BTreeSet::<String>::new();
+    for group in groups {
+        if group.label.trim().is_empty() {
+            return Err("coefficient group label must not be empty".to_string());
+        }
+        if !seen.insert(group.label.clone()) {
+            return Err(format!("duplicate coefficient group label '{}'", group.label));
+        }
+        if group.coefficients.is_empty() {
+            return Err(format!(
+                "coefficient group '{}' contains no coefficients",
+                group.label
+            ));
+        }
+    }
+
+    let mut realized_groups = Vec::<RealizedCoefficientGroup>::with_capacity(groups.len());
+    let mut group_sets = BTreeMap::<String, BTreeSet<(usize, usize)>>::new();
+    for group in groups {
+        let mut coeffs = BTreeSet::<(usize, usize)>::new();
+        for label in &group.coefficients {
+            let block_idx = coefficient_group_block_index(specs, &label.block)?;
+            let p = specs[block_idx].design.ncols();
+            if label.column >= p {
+                return Err(format!(
+                    "coefficient group '{}' references column {} in block '{}' (index {block_idx}), but the block has {p} columns",
+                    group.label, label.column, specs[block_idx].name
+                ));
+            }
+            coeffs.insert((block_idx, label.column));
+        }
+        group_sets.insert(group.label.clone(), coeffs.clone());
+        realized_groups.push(RealizedCoefficientGroup {
+            label: group.label.clone(),
+            parent: group.parent.clone(),
+            coefficients: coeffs.iter().copied().collect(),
+            prior: group.prior.clone(),
+            initial_log_precision: group.initial_log_precision.unwrap_or(0.0),
+        });
+    }
+
+    for group in &realized_groups {
+        if let Some(parent) = group.parent.as_ref() {
+            let parent_set = group_sets.get(parent).ok_or_else(|| {
+                format!(
+                    "coefficient group '{}' references unknown parent group '{parent}'",
+                    group.label
+                )
+            })?;
+            let child_set = group_sets
+                .get(&group.label)
+                .expect("realized group set should exist");
+            if !child_set.is_subset(parent_set) {
+                return Err(format!(
+                    "coefficient group '{}' is not a subset of parent group '{parent}'",
+                    group.label
+                ));
+            }
+        }
+    }
+
+    let mut realized_specs = specs.to_vec();
+    let mut penalty_labels = Vec::<String>::new();
+    let mut outer_labels = Vec::<String>::new();
+    let mut priors = Vec::<crate::types::RhoPrior>::new();
+
+    for (block_idx, spec) in specs.iter().enumerate() {
+        for penalty_idx in 0..spec.penalties.len() {
+            let label = format!("__block_{block_idx}_penalty_{penalty_idx}");
+            penalty_labels.push(label.clone());
+            outer_labels.push(label);
+            priors.push(base_prior.clone());
+        }
+    }
+
+    for group in &realized_groups {
+        outer_labels.push(group.label.clone());
+        priors.push(
+            group
+                .prior
+                .as_ref()
+                .map(CoefficientGroupPrior::to_rho_prior)
+                .unwrap_or_else(|| base_prior.clone()),
+        );
+
+        let mut by_block = BTreeMap::<usize, Vec<usize>>::new();
+        for &(block_idx, column) in &group.coefficients {
+            by_block.entry(block_idx).or_default().push(column);
+        }
+        for (block_idx, columns) in by_block {
+            let p = realized_specs[block_idx].design.ncols();
+            let mut matrix = Array2::<f64>::zeros((p, p));
+            for column in columns {
+                matrix[[column, column]] = 1.0;
+            }
+            realized_specs[block_idx]
+                .penalties
+                .push(PenaltyMatrix::Dense(matrix));
+            realized_specs[block_idx].nullspace_dims.push(
+                p.saturating_sub(
+                    group
+                        .coefficients
+                        .iter()
+                        .filter(|(b, _)| *b == block_idx)
+                        .count(),
+                ),
+            );
+            let mut rho = Array1::<f64>::zeros(realized_specs[block_idx].initial_log_lambdas.len() + 1);
+            if !realized_specs[block_idx].initial_log_lambdas.is_empty() {
+                let old_len = realized_specs[block_idx].initial_log_lambdas.len();
+                rho.slice_mut(s![..old_len])
+                    .assign(&realized_specs[block_idx].initial_log_lambdas);
+            }
+            let last = rho.len() - 1;
+            rho[last] = group.initial_log_precision;
+            realized_specs[block_idx].initial_log_lambdas = rho;
+            penalty_labels.push(group.label.clone());
+        }
+    }
+
+    Ok(RealizedCoefficientGroupSpecs {
+        specs: realized_specs,
+        groups: realized_groups,
+        penalty_labels,
+        rho_prior: crate::types::RhoPrior::Independent(priors),
+        outer_labels,
+    })
+}
+
+pub fn fit_custom_family_with_coefficient_groups<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    groups: &[CoefficientGroupSpec],
+    options: &BlockwiseFitOptions,
+) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
+    if groups.is_empty() {
+        return fit_custom_family(family, specs, options);
+    }
+    let realized = realize_coefficient_groups_for_custom_family(
+        specs,
+        groups,
+        crate::types::RhoPrior::Flat,
+    )
+    .map_err(CustomFamilyError::InvalidInput)?;
+    fit_custom_family(family, &realized.specs, options)
 }
 
 fn custom_family_block_role(
@@ -2235,6 +2517,11 @@ fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
             hasher.write_usize(col_range.end);
             hasher.write_usize(*total_dim);
             hash_cf_array2(hasher, local);
+        }
+        PenaltyMatrix::Labeled { label, inner } => {
+            hasher.write_str("labeled");
+            hasher.write_str(label);
+            hash_cf_penalty(hasher, inner);
         }
     }
 }

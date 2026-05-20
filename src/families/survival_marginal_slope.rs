@@ -2702,6 +2702,46 @@ pub fn survival_marginal_slope_vector_eta(
     Ok(q * c + linear)
 }
 
+pub fn survival_marginal_slope_vector_neglog(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    slopes: &[f64],
+    z: &[f64],
+    covariance: &MarginalSlopeCovariance,
+    weight: f64,
+    event: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<f64, String> {
+    if survival_derivative_guard_violated(qd1, derivative_guard) {
+        return Err(format!(
+            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+        ));
+    }
+    let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
+    let eta0 = survival_marginal_slope_vector_eta(q0, z, slopes, covariance, probit_scale)?;
+    let eta1 = survival_marginal_slope_vector_eta(q1, z, slopes, covariance, probit_scale)?;
+    let ad1 = qd1 * c;
+    if !(ad1.is_finite() && ad1 > 0.0) {
+        return Err(format!(
+            "survival marginal-slope transformed derivative must be positive, got {ad1}"
+        ));
+    }
+
+    let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
+    let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
+    let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
+    let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
+    Ok(weight
+        * ((1.0 - event) * (-logcdf_neg_eta1)
+            + logcdf_neg_eta0
+            - event * log_phi_eta1
+            - event * ad1.ln()
+            - event * log_phi_q1
+            - event * qd1.ln()))
+}
+
 fn standardize_latent_z_matrix_with_policy(
     z: &Array2<f64>,
     weights: &Array1<f64>,
@@ -2914,6 +2954,64 @@ impl SurvivalMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
+    #[inline]
+    fn z_scalar(&self, row: usize) -> f64 {
+        self.z[[row, 0]]
+    }
+
+    fn z_subsample_key(&self) -> Array1<f64> {
+        self.z.column(0).to_owned()
+    }
+
+    #[inline]
+    fn score_dim(&self) -> usize {
+        debug_assert_eq!(self.score_covariance.dim(), self.z.ncols());
+        self.z.ncols()
+    }
+
+    fn logslope_vector_for_row(
+        &self,
+        row: usize,
+        logslope_eta: &Array1<f64>,
+    ) -> Result<Vec<f64>, String> {
+        let k = self.score_dim();
+        if logslope_eta.len() == self.n {
+            return Ok(vec![logslope_eta[row]; k]);
+        }
+        if logslope_eta.len() == self.n * k {
+            let start = row * k;
+            return Ok(logslope_eta.slice(s![start..start + k]).to_vec());
+        }
+        Err(format!(
+            "survival marginal-slope logslope eta length {} is incompatible with n={} and score dim K={k}",
+            logslope_eta.len(),
+            self.n
+        ))
+    }
+
+    fn row_neglog_rigid_vector_value(
+        &self,
+        row: usize,
+        q_geom: DynamicQValues,
+        block_states: &[ParameterBlockState],
+        probit_scale: f64,
+    ) -> Result<f64, String> {
+        let slopes = self.logslope_vector_for_row(row, &block_states[2].eta)?;
+        let z = self.z.row(row).to_vec();
+        survival_marginal_slope_vector_neglog(
+            q_geom.q0,
+            q_geom.q1,
+            q_geom.qd1,
+            &slopes,
+            &z,
+            &self.score_covariance,
+            self.weights[row],
+            self.event[row],
+            self.derivative_guard,
+            probit_scale,
+        )
+    }
+
     /// Two-phase auto-subsample entry: when `options.auto_outer_subsample` is
     /// enabled and Phase 1 still has budget, this
     /// returns a cloned `BlockwiseFitOptions` carrying a freshly built
@@ -2953,9 +3051,10 @@ impl SurvivalMarginalSlopeFamily {
             .iter()
             .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
             .collect();
+        let z_key = self.z_subsample_key();
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
-            self.z.column(0).as_slice().expect("z column must be contiguous"),
+            z_key.as_slice().expect("z key must be contiguous"),
             Some(&event_secondary),
             &beta_proxy,
             &self.auto_subsample_phase_counter,
@@ -3000,6 +3099,7 @@ impl SurvivalMarginalSlopeFamily {
         // True fast path: closed-form scalar NLL, no jets, no Vecs, no gradients.
         let guard = self.derivative_guard;
         let probit_scale = self.probit_frailty_scale();
+        let _score_dim = self.score_dim();
         let total: Result<f64, String> = row_iter
             .into_par_iter()
             .try_fold(
@@ -15236,16 +15336,18 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         || spec.event_target.len() != n
         || spec.weights.len() != n
         || spec.z.nrows() != n
+        || spec.z.ncols() == 0
         || spec.marginal_offset.len() != n
         || spec.logslope_offset.len() != n
     {
         return Err(format!(
-            "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
+            "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}x{}, marginal_offset={}, logslope_offset={}",
             n,
             spec.age_exit.len(),
             spec.event_target.len(),
             spec.weights.len(),
             spec.z.nrows(),
+            spec.z.ncols(),
             spec.marginal_offset.len(),
             spec.logslope_offset.len()
         ));
@@ -15551,13 +15653,15 @@ pub fn fit_survival_marginal_slope_terms(
             spec.base_link
         ));
     }
-    let (z_standardized, z_normalization) = standardize_latent_z_with_policy(
+    let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
         "survival-marginal-slope",
         &spec.latent_z_policy,
     )?;
     spec.z = z_standardized;
+    let score_covariance = marginal_slope_covariance_from_scores(spec.z.view(), &spec.weights)?;
+    let z_primary = spec.z.column(0).to_owned();
     let n = spec.age_entry.len();
     let initial_sigma = match &spec.frailty {
         FrailtySpec::GaussianShift {
@@ -15573,7 +15677,7 @@ pub fn fit_survival_marginal_slope_terms(
     let baseline_slope = pooled_survival_baseline(
         &spec.event_target,
         &spec.weights,
-        &spec.z,
+        &z_primary,
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
@@ -15599,7 +15703,7 @@ pub fn fit_survival_marginal_slope_terms(
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
-        .map(|cfg| build_score_warp_deviation_block_from_seed(&spec.z, cfg))
+        .map(|cfg| build_score_warp_deviation_block_from_seed(&z_primary, cfg))
         .transpose()?;
     let link_dev_prepared = spec
         .link_dev
@@ -15608,7 +15712,7 @@ pub fn fit_survival_marginal_slope_terms(
             let q0_seed = Array1::from_iter((0..n).map(|row| {
                 let q_exit = spec.time_block.offset_exit[row] + spec.marginal_offset[row];
                 let slope = baseline_slope + spec.logslope_offset[row];
-                rigid_observed_eta(q_exit, slope, spec.z[row], probit_scale)
+                rigid_observed_eta(q_exit, slope, z_primary[row], probit_scale)
             }));
             let padded_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
             build_link_deviation_block_from_knots_design_seed_and_weights(
@@ -15705,6 +15809,7 @@ pub fn fit_survival_marginal_slope_terms(
             event: Arc::clone(&event),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),
+            score_covariance: score_covariance.clone(),
             gaussian_frailty_sd: sigma,
             derivative_guard,
             design_entry: design_entry.clone(),
