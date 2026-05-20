@@ -80,6 +80,11 @@ pub enum CoefficientPriorMean {
         metadata: Array1<f64>,
         evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
     },
+    /// Covariate-functional mean `mu(a) = amplitude * K(a)` for a coefficient block.
+    ///
+    /// Formula-level coefficient groups pass their row/covariate metadata as
+    /// `covariates`; the user-supplied kernel returns the block-sized basis
+    /// vector `K(a)` and the scalar amplitude supplies `alpha`.
     KernelBasis {
         covariates: Array1<f64>,
         amplitude: f64,
