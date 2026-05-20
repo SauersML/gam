@@ -494,7 +494,7 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
         "child level should carry the stronger Gamma-prior precision: child={child_lambda} parent={parent_lambda}"
     );
 
-    let unpenalized = array![0.0, 0.15, 1.25];
+    let unpenalized = array![0.0_f64, 0.15, 1.25];
     assert!(fit.fit.beta[1].abs() < unpenalized[1].abs());
     assert!(fit.fit.beta[2].abs() > fit.fit.beta[1].abs() * 3.0);
 }
