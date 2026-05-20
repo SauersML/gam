@@ -34,6 +34,7 @@ use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
     MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchoredDeviationRuntime,
     SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
+    append_deployment_extension_columns,
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
@@ -3519,7 +3520,7 @@ fn extend_model_with_random_effect_level(
     prior: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let payload: &mut FittedModelPayload = &mut *model;
-    let (term_idx, feature_col, coefficient_start, penalty_index) = {
+    let (term_idx, feature_col, penalty_index) = {
         let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
             "extend_with_group requires saved resolved_termspec; refit".to_string()
         })?;
@@ -3531,7 +3532,6 @@ fn extend_model_with_random_effect_level(
         (
             term_idx,
             spec.random_effect_terms[term_idx].feature_col,
-            random_effect_coefficient_start(spec, term_idx)?,
             random_effect_penalty_index(spec, term_idx),
         )
     };
@@ -3545,7 +3545,7 @@ fn extend_model_with_random_effect_level(
         )
     })?;
     let (level_bits, encoded_value) = level_bits_for_extension(schema_col, &level)?;
-    let insert_pos = {
+    {
         let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
             "extend_with_group requires saved resolved_termspec; refit".to_string()
         })?;
@@ -3557,40 +3557,46 @@ fn extend_model_with_random_effect_level(
                     "extend_with_group term '{term_name}' is not frozen; refit with persisted metadata"
                 )
             })?;
-        match levels.binary_search(&level_bits) {
-            Ok(_) => {
-                return Err(format!(
-                    "extend_with_group level {} already exists for random-effect term '{term_name}'",
-                    compact_json(&level)
-                ));
-            }
-            Err(pos) => pos,
+        if levels.contains(&level_bits) {
+            return Err(format!(
+                "extend_with_group level {} already exists for random-effect term '{term_name}'",
+                compact_json(&level)
+            ));
+        }
+    }
+    if payload.deployment_extensions.iter().any(|extension| {
+        extension.kind == "random-effect-level"
+            && extension.term == term_name
+            && extension.level_bits == level_bits
+    }) {
+        return Err(format!(
+            "extend_with_group level {} is already deployed for random-effect term '{term_name}'",
+            compact_json(&level)
+        ));
+    }
+    let coefficient_index = payload
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?
+        .beta
+        .len();
+    let (coefficient_mean, supplied_variance) = extension_prior_parameters(prior.as_ref())?;
+    let coefficient_variance = match supplied_variance {
+        Some(variance) => variance,
+        None => {
+            let lambda = payload
+                .fit_result
+                .as_ref()
+                .and_then(|fit| fit.lambdas.get(penalty_index).copied())
+                .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
+                .ok_or_else(|| {
+                    format!(
+                        "extend_with_group term '{term_name}' has no finite positive prior lambda"
+                    )
+                })?;
+            1.0 / lambda
         }
     };
-    let coefficient_index = coefficient_start + insert_pos;
-    let (coefficient_mean, mut coefficient_variance) = extension_prior_parameters(prior.as_ref())?;
-    if coefficient_variance.is_none() {
-        coefficient_variance = payload
-            .fit_result
-            .as_ref()
-            .and_then(|fit| fit.lambdas.get(penalty_index).copied())
-            .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
-            .map(|lambda| 1.0 / lambda);
-    }
-
-    let spec = payload
-        .resolved_termspec
-        .as_mut()
-        .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
-    let levels = spec.random_effect_terms[term_idx]
-        .frozen_levels
-        .as_mut()
-        .ok_or_else(|| {
-            format!(
-                "extend_with_group term '{term_name}' is not frozen; refit with persisted metadata"
-            )
-        })?;
-    levels.insert(insert_pos, level_bits);
     extend_training_feature_range(
         payload.training_feature_ranges.as_mut(),
         feature_col,
@@ -3623,8 +3629,10 @@ fn extend_model_with_random_effect_level(
             kind: "random-effect-level".to_string(),
             term: term_name.to_string(),
             level,
+            level_bits,
             coefficient_index,
             coefficient_mean,
+            coefficient_variance,
             metadata,
             prior,
         });
@@ -3734,9 +3742,9 @@ fn extension_prior_parameters(
     }
     let variance = match (parsed.variance, parsed.precision) {
         (Some(variance), _) => {
-            if !(variance.is_finite() && variance >= 0.0) {
+            if !(variance.is_finite() && variance > 0.0) {
                 return Err(format!(
-                    "extend_with_group prior variance must be finite and non-negative; got {variance}"
+                    "extend_with_group prior variance must be finite and positive; got {variance}"
                 ));
             }
             Some(variance)
