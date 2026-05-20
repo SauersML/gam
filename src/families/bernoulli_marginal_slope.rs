@@ -195,12 +195,6 @@ pub enum LatentMeasureSpec {
 }
 
 impl LatentMeasureSpec {
-    pub fn global_empirical_default() -> Self {
-        Self::GlobalEmpirical {
-            grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
-        }
-    }
-
     pub fn auto_default() -> Self {
         Self::Auto {
             grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,

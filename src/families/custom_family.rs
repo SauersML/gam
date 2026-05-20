@@ -336,12 +336,6 @@ impl CoefficientLabel {
         }
     }
 
-    pub fn by_block_index(block: usize, column: usize) -> Self {
-        Self {
-            block: CoefficientBlockSelector::Index(block),
-            column,
-        }
-    }
 }
 
 pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
