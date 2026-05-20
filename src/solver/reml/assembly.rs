@@ -221,7 +221,6 @@ pub struct InnerAssembly<'dp> {
     pub n_observations: usize,
     pub hessian_op: std::sync::Arc<dyn HessianOperator>,
     pub penalty_coords: Vec<PenaltyCoordinate>,
-    pub penalty_prior_means: Vec<Array1<f64>>,
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,
     pub rho_curvature_scale: f64,
@@ -257,7 +256,6 @@ impl<'dp> InnerAssembly<'dp> {
             self.penalty_logdet,
             self.dispersion,
         );
-        builder = builder.penalty_means(self.penalty_prior_means);
         builder = builder.rho_curvature_scale(self.rho_curvature_scale);
         builder = builder.rho_prior(self.rho_prior);
         builder = builder.hessian_logdet_correction(self.hessian_logdet_correction);

@@ -571,7 +571,8 @@ impl ParameterBlockInput {
                         ));
                     }
                 }
-                crate::solver::estimate::PenaltySpec::Dense(m) => {
+                crate::solver::estimate::PenaltySpec::Dense(m)
+                | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                     let (r, c) = m.dim();
                     if r != p || c != p {
                         return Err(format!(
@@ -606,7 +607,10 @@ impl ParameterBlockInput {
                             col_range,
                             total_dim: p,
                         },
-                        crate::solver::estimate::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m),
+                        crate::solver::estimate::PenaltySpec::Dense(m)
+                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            matrix: m, ..
+                        } => PenaltyMatrix::Dense(m),
                     })
                     .collect()
             },
@@ -2539,9 +2543,11 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
                             },
-                            crate::solver::estimate::PenaltySpec::Dense(m) => {
-                                PenaltyMatrix::Dense(m.clone())
-                            }
+                            crate::solver::estimate::PenaltySpec::Dense(m)
+                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                                matrix: m,
+                                ..
+                            } => PenaltyMatrix::Dense(m.clone()),
                         })
                         .collect()
                 },
@@ -2891,9 +2897,11 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
                             },
-                            crate::solver::estimate::PenaltySpec::Dense(m) => {
-                                PenaltyMatrix::Dense(m.clone())
-                            }
+                            crate::solver::estimate::PenaltySpec::Dense(m)
+                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                                matrix: m,
+                                ..
+                            } => PenaltyMatrix::Dense(m.clone()),
                         })
                         .collect()
                 },
@@ -3436,9 +3444,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
                             },
-                            crate::solver::estimate::PenaltySpec::Dense(m) => {
-                                PenaltyMatrix::Dense(m.clone())
-                            }
+                            crate::solver::estimate::PenaltySpec::Dense(m)
+                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                                matrix: m,
+                                ..
+                            } => PenaltyMatrix::Dense(m.clone()),
                         })
                         .collect()
                 },

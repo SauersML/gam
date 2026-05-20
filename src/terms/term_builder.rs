@@ -243,6 +243,12 @@ pub fn build_termspec(
             | ParsedTerm::SurvivalConfig { .. } => {
                 // Consumed at formula level, not design terms.
             }
+            ParsedTerm::LogSlopeSurface { .. } => {
+                return Err(
+                    "logslope(...) declarations must be resolved by the marginal-slope formula path before building a term spec"
+                        .to_string(),
+                );
+            }
         }
     }
 
