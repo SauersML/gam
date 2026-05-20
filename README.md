@@ -13,8 +13,8 @@ Fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
 random effects, bounded/constrained coefficients, location-scale
 extensions, survival likelihoods, and flexible/learnable link functions.
 Smoothing parameters are selected by REML or LAML. Posterior sampling
-uses NUTS where supported, with a Gaussian Laplace fallback for model
-classes that don't yet have an exact NUTS path.
+uses NUTS where supported, and Gaussian Laplace for model classes that
+do not have an exact NUTS path.
 
 **Docs:** <https://gamfit.readthedocs.io/> &middot; **PyPI:**
 <https://pypi.org/project/gamfit/>
@@ -52,7 +52,7 @@ pip install gamfit
 ```
 
 Optional extras: `gamfit[pandas]`, `gamfit[plot]`, `gamfit[sklearn]`,
-`gamfit[all]`.
+`gamfit[torch]`, `gamfit[all]`.
 
 **Rust CLI.** One-liner installer for macOS, Linux, and Windows Git Bash:
 

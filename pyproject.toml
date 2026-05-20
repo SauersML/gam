@@ -91,6 +91,7 @@ all = [
   "pyarrow>=14",
   "matplotlib>=3.8",
   "scikit-learn>=1.4",
+  "torch>=2.0",
 ]
 
 [tool.maturin]
