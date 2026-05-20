@@ -9036,51 +9036,6 @@ pub fn e_obs_from_jets(
 /// separate array because `InverseLinkJet` only stores up to h''' (d3).
 ///
 /// `var_jet_fn` maps μ → `VarianceJet`.
-pub fn compute_noncanonical_observed_weights(
-    eta: &Array1<f64>,
-    y: ArrayView1<f64>,
-    jets: &[MixtureInverseLinkJet],
-    h4: &[f64],
-    var_jet_fn: impl Fn(f64) -> VarianceJet + Sync,
-    phi: f64,
-    prior_weights: ArrayView1<f64>,
-) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let n = eta.len();
-    let mut w = Array1::<f64>::zeros(n);
-    let mut c = Array1::<f64>::zeros(n);
-    let mut d = Array1::<f64>::zeros(n);
-    // Per-row work: variance-jet evaluation plus the closed-form
-    // `observed_weight_noncanonical` algebra. Rows are fully independent
-    // (no carrier across iterations); used in noncanonical Bernoulli
-    // observed-Hessian paths where `n` is biobank-scale.
-    let w_s = w.as_slice_mut().expect("w must be contiguous");
-    let c_s = c.as_slice_mut().expect("c must be contiguous");
-    let d_s = d.as_slice_mut().expect("d must be contiguous");
-    w_s.par_iter_mut()
-        .zip(c_s.par_iter_mut())
-        .zip(d_s.par_iter_mut())
-        .enumerate()
-        .for_each(|(i, ((w_o, c_o), d_o))| {
-            let jet = &jets[i];
-            let vj = var_jet_fn(jet.mu);
-            let (wi, ci, di) = observed_weight_noncanonical(
-                y[i],
-                jet.mu,
-                jet.d1,
-                jet.d2,
-                jet.d3,
-                h4[i],
-                vj,
-                phi,
-                prior_weights[i],
-            );
-            *w_o = wi;
-            *c_o = ci;
-            *d_o = di;
-        });
-    (w, c, d)
-}
-
 // Direct (closed-form) observed-information weights for specific family-link
 // combinations.  These avoid the overhead of the generic noncanonical formula
 // when the algebra simplifies.
@@ -9101,18 +9056,6 @@ pub fn observed_weight_gaussian_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64,
     let c = inv_phi * mu * (4.0 * mu - y);
     let d = inv_phi * mu * (8.0 * mu - y);
     (w, c, d)
-}
-
-/// Fisher-information weights for Gaussian-log (no residual correction).
-///
-/// ```text
-/// w_F = ω μ² / φ,  c_F = ω 2μ² / φ,  d_F = ω 4μ² / φ
-/// ```
-#[inline]
-pub fn fisher_weight_gaussian_log(mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
-    let mu2 = mu * mu;
-    let inv_phi = pw / phi;
-    (inv_phi * mu2, inv_phi * 2.0 * mu2, inv_phi * 4.0 * mu2)
 }
 
 /// Gaussian family with inverse link: y ~ N(μ, φ), μ = 1/η.

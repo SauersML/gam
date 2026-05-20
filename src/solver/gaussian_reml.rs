@@ -240,26 +240,6 @@ pub fn gaussian_reml_closed_form_with_nullspace_dim(
     scalar_result_from_multi(result)
 }
 
-pub fn gaussian_reml_closed_form_warm_started_with_nullspace_dim(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    nullspace_dim: Option<usize>,
-    weights: Option<ArrayView1<'_, f64>>,
-    warm_start: Option<&GaussianRemlWarmStart>,
-) -> Result<GaussianRemlResult, EstimationError> {
-    let y2 = y.insert_axis(Axis(1));
-    let result = gaussian_reml_multi_closed_form_warm_started_with_nullspace_dim(
-        x,
-        y2,
-        penalty,
-        nullspace_dim,
-        weights,
-        warm_start,
-    )?;
-    scalar_result_from_multi(result)
-}
-
 fn scalar_result_from_multi(
     result: GaussianRemlMultiResult,
 ) -> Result<GaussianRemlResult, EstimationError> {
