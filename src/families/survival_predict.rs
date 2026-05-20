@@ -2014,18 +2014,6 @@ pub fn build_saved_survival_marginal_slope_predictor(
     Ok((predictor, pred_input, predictor_fit))
 }
 
-/// Extract the fixed Gaussian-shift sigma (if any) from a frailty spec. Used
-/// to compute the rigid-path probit frailty scale that mirrors the predictor's
-/// internal `probit_frailty_scale()`.
-pub fn gaussian_frailty_sigma_from_frailty(frailty: Option<&FrailtySpec>) -> Option<f64> {
-    match frailty {
-        Some(FrailtySpec::GaussianShift {
-            sigma_fixed: Some(sigma),
-        }) => Some(*sigma),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
