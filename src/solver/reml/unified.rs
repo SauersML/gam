@@ -11323,7 +11323,8 @@ impl DenseSpectralOperator {
 
     #[inline]
     fn rotate_to_eigenbasis(&self, matrix: &Array2<f64>) -> Array2<f64> {
-        self.eigenvectors.t().dot(matrix).dot(&self.eigenvectors)
+        let left = crate::faer_ndarray::fast_atb(&self.eigenvectors, matrix);
+        crate::faer_ndarray::fast_ab(&left, &self.eigenvectors)
     }
 
     /// Factor `F` satisfying `trace(G_epsilon(H) A) = trace(F^T A F)`.
