@@ -10164,6 +10164,7 @@ mod tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -10373,6 +10374,7 @@ mod tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -10446,6 +10448,7 @@ mod tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -11633,6 +11636,7 @@ mod root_cause_tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -11712,6 +11716,7 @@ mod root_cause_tests {
                     total_dim: r.ncols(),
                     nullity: 0,
                     local,
+                    prior_mean: Array1::zeros(r.ncols()),
                     positive_eigenvalues: Vec::new(),
                     op: None,
                 }
@@ -11811,6 +11816,7 @@ mod root_cause_tests {
                         total_dim: r.ncols(),
                         nullity: 0,
                         local,
+                        prior_mean: Array1::zeros(r.ncols()),
                         positive_eigenvalues: Vec::new(),
                         op: None,
                     }

@@ -179,6 +179,49 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert reloaded_prediction["mean"] == predicted["mean"]
 
 
+def test_group_metadata_roundtrips_through_saved_model(tmp_path: pathlib.Path) -> None:
+    rows = [
+        {"y": 1.0, "g": "alpha"},
+        {"y": 1.1, "g": "alpha"},
+        {"y": 2.0, "g": "beta"},
+        {"y": 2.2, "g": "beta"},
+        {"y": 3.0, "g": "gamma"},
+        {"y": 3.2, "g": "gamma"},
+    ]
+    metadata = {
+        "alpha": {
+            "source": "registry-a",
+            "batch": 7,
+            "scores": [0.25, 0.75],
+            "audited": True,
+        },
+        "beta": {
+            "source": "registry-b",
+            "batch": 8,
+            "tags": ["heldout", "priority"],
+            "audited": False,
+        },
+    }
+
+    model = gamfit.fit(
+        rows,
+        "y ~ group(g)",
+        config={
+            "groups": [
+                {"name": group_name, "metadata": group_metadata}
+                for group_name, group_metadata in metadata.items()
+            ]
+        },
+    )
+
+    path = tmp_path / "group_metadata.gam"
+    model.save(path)
+    loaded = gamfit.load(path)
+
+    assert model.group_metadata == metadata
+    assert loaded.group_metadata == metadata
+
+
 def test_pandas_diagnostics_and_plotting() -> None:
     model = gamfit.fit(training_frame(), "y ~ x")
 
