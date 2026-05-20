@@ -11058,15 +11058,48 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let step_tol = inner_tol * (1.0 + beta_inf);
             let objective_tol = inner_tol * (1.0 + lastobjective.abs());
             // KKT residual tolerance must scale with the natural magnitude of
-            // ‖Sβ − ∇L‖∞ (i.e. ‖∇L‖∞ ~ ‖Sβ‖∞ near stationarity), not the
-            // objective. At biobank scale with |β|∞ in the 10²–10³ range the
-            // gradient/penalty norms can sit orders of magnitude above |obj|
-            // and FP noise alone keeps the residual above any obj-scaled tol.
+            // ‖Sβ − ∇L‖∞ (i.e. max(‖∇L‖∞, ‖Sβ‖∞)), not the objective. At
+            // biobank scale with |β|∞ in the 10²–10³ range the gradient and
+            // penalty norms can sit orders of magnitude above |obj| and FP
+            // noise alone keeps the residual above any obj-scaled tol. The
+            // pre-line-search check at the head of the cycle already uses
+            // `inner_tol * (1 + max(grad_inf, pen_inf))`; using only grad_inf
+            // here created an asymmetry where the same convergence criterion
+            // would accept at one site and reject at the other, and on
+            // marginal-slope models where Sβ is the larger term it shrank
+            // the post-accept tolerance below the achievable FP floor.
             let grad_inf = gradient
                 .iter()
                 .map(|x: &f64| x.abs())
                 .fold(0.0_f64, f64::max);
-            let residual_tol = inner_tol * (1.0 + grad_inf);
+            let pen_inf = {
+                let mut beta_joint = Array1::<f64>::zeros(
+                    states.iter().map(|s| s.beta.len()).sum::<usize>(),
+                );
+                let mut offset = 0usize;
+                for state in &states {
+                    let len = state.beta.len();
+                    beta_joint
+                        .slice_mut(s![offset..offset + len])
+                        .assign(&state.beta);
+                    offset += len;
+                }
+                let block_ranges: Vec<(usize, usize)> = {
+                    let mut acc = 0usize;
+                    states
+                        .iter()
+                        .map(|s| {
+                            let start = acc;
+                            acc += s.beta.len();
+                            (start, acc)
+                        })
+                        .collect()
+                };
+                let pen_vec =
+                    apply_joint_block_penalty(&block_ranges, &s_lambdas, &beta_joint, 0.0);
+                pen_vec.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max)
+            };
+            let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
 
             // Per-cycle observability for the convergence test. Surfaces
             // WHICH criterion is binding (proposed step, accepted step,
