@@ -392,6 +392,192 @@ def test_periodic_duchon_rejects_centers_not_matching_period() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Periodic Duchon kernel — root-cause tests
+#
+# These tests pin down the exact mathematical property the periodic Duchon
+# kernel must satisfy on a uniform lattice. Each test fails hard if the
+# underlying kernel choice regresses to the triangle-wave construction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("K_effective", [4, 6, 8, 10, 12, 14])
+def test_periodic_duchon_design_full_rank_on_even_uniform_lattice(K_effective: int) -> None:
+    """Design matrix must be full column rank on every uniform K-lattice.
+
+    Root cause this guards against: the previous periodic kernel
+    ``phi(r) = r`` is the triangle wave on the circle and its Fourier series
+    carries only odd harmonics. On a uniform K-point lattice with EVEN K the
+    discrete DFT samples the zero (even-harmonic) modes and the kernel matrix
+    loses ``K/2 − 1`` singular values. A correct periodic Duchon ``m=2`` kernel
+    is the Green's function of ``(d²/dx²)²`` modulo constants — the Bernoulli
+    polynomial ``B_4(r/period)`` — whose Fourier series weights every nonzero
+    harmonic with ``1/n^4``.
+
+    HARD FAIL: if the design has rank < K_effective the kernel choice is wrong.
+    The test deliberately spans the failure region (even K from 4 to 14).
+    """
+    _require_ffi("duchon_function_norm_penalty")
+    period = 2 * math.pi
+    # Provide K_effective + 1 linspace points spanning [0, period]; the basis
+    # builder collapses the periodic wrap duplicate, leaving K_effective
+    # distinct circle points.
+    centers = torch.linspace(0.0, period, K_effective + 1, dtype=torch.float64)
+    n_data = 256
+    t_eval = torch.linspace(0.01, period - 0.01, n_data, dtype=torch.float64)
+    X = gt.duchon_basis_1d(t_eval, centers, m=2, periodic=True).numpy()
+    # Design must have K_effective columns (one for each distinct circle point).
+    assert X.shape[1] == K_effective, (
+        f"unexpected design width for K_effective={K_effective}: "
+        f"got {X.shape[1]} columns"
+    )
+    # Numerical rank: count singular values above a relative threshold scaled
+    # to the largest. With the Bernoulli kernel every column is independent.
+    sv = np.linalg.svd(X, compute_uv=False)
+    sv_rel = sv / sv[0]
+    rank = int((sv_rel > 1e-8).sum())
+    assert rank == K_effective, (
+        f"K_effective={K_effective}: design rank-deficient ({rank} of "
+        f"{K_effective}). singular values: {sv}"
+    )
+
+
+@pytest.mark.parametrize("K_effective", [4, 6, 8, 10, 12, 14])
+def test_periodic_duchon_center_kernel_has_K_minus_1_positive_eigenvalues(
+    K_effective: int,
+) -> None:
+    """Kernel matrix at the centers must have rank K − 1 (constant nullspace only).
+
+    The periodic Green's function ``B_{2m}(r/period)`` is PSD modulo
+    constants: every nonzero Fourier mode contributes ``∝ 1/n^{2m} > 0``, the
+    constant mode contributes zero. So a K-point center-kernel matrix should
+    have *exactly* one zero eigenvalue (the constant) and K − 1 strictly
+    positive eigenvalues. Anything else — extra zeros, negative eigenvalues —
+    means the kernel choice is wrong.
+    """
+    _require_ffi("duchon_function_norm_penalty")
+    period = 2 * math.pi
+    centers = np.linspace(0.0, period, K_effective + 1)[:-1]
+    # Kernel matrix at centers via the basis evaluator: K_ij = basis(c_i)_j
+    # is K_eff × K_eff with the wrap dedup already applied internally.
+    X = gt.duchon_basis_1d(
+        torch.tensor(centers, dtype=torch.float64),
+        torch.linspace(0.0, period, K_effective + 1, dtype=torch.float64),
+        m=2,
+        periodic=True,
+    ).numpy()
+    # X is K × K (square). Eigen-spectrum of (X+X')/2 reveals the rank
+    # structure. With the Bernoulli kernel: one near-zero (the constant
+    # mode the polynomial column captures) and K_effective − 1 strictly
+    # positive eigenvalues.
+    sym = 0.5 * (X + X.T)
+    eigs = np.linalg.eigvalsh(sym)
+    tol = 1.0e-8 * max(1.0, np.abs(eigs).max())
+    n_near_zero = int((np.abs(eigs) < tol).sum())
+    assert n_near_zero <= 1, (
+        f"K_effective={K_effective}: expected at most 1 near-zero eigenvalue "
+        f"(the constant nullspace), got {n_near_zero}. eigs={eigs}"
+    )
+
+
+@pytest.mark.parametrize("K_effective", [4, 6, 8, 10])
+def test_periodic_duchon_reml_fit_succeeds_on_even_uniform_lattice(
+    K_effective: int,
+) -> None:
+    """End-to-end REML fit must succeed on every K — including even uniform.
+
+    Before the Bernoulli-kernel fix this raised ``Gaussian REML penalty is
+    not positive semidefinite`` because the whitening transform
+    ``L⁻¹ S L⁻ᵀ`` amplified machine noise (from the rank-deficient ``X'X``)
+    into a real-valued ``~10⁻⁶`` negative eigenvalue. With the correct
+    kernel ``X'X`` is well conditioned and no spurious negative eigenvalues
+    appear.
+    """
+    _require_ffi("duchon_function_norm_penalty")
+    period = 2 * math.pi
+    t, y = _circular_sample(n=128, period=period, seed=K_effective)
+    centers = torch.linspace(0.0, period, K_effective + 1, dtype=torch.float64)
+    fit = gt.gaussian_reml_fit_positions(
+        t,
+        y,
+        basis="duchon",
+        knots_or_centers=centers,
+        periodic=True,
+        period=period,
+    )
+    assert torch.isfinite(fit.reml_score), "REML score is not finite"
+    assert float(fit.lam) > 0.0, "REML did not return a positive λ"
+
+
+def test_periodic_duchon_penalty_eigenspectrum_matches_n_to_the_minus_4() -> None:
+    """The penalty's eigenvalues must follow the Bernoulli ``1/n⁴`` law.
+
+    The periodic Duchon ``m=2`` kernel is the Green's function of
+    ``(d²/dx²)²`` modulo constants. Its Fourier coefficients are
+    ``c_n ∝ 1/n⁴``. The penalty matrix ``ω = z' K_centers z`` (where ``z``
+    spans the orthogonal complement of the constant direction) inherits
+    those K − 1 nonzero eigenvalues in pairs ``(λ_k, λ_{K-k})`` matching
+    the continuous coefficients to within discrete-sampling Riemann error.
+
+    On a K-point uniform lattice, the top eigenvalue pair corresponds to
+    Fourier mode ``k = 1``, the next pair to ``k = 2``, etc. Their ratios
+    must match ``1/k⁴`` to high precision. A regression to the
+    triangle-wave kernel ``r`` would show ratios like ``1/k²`` and zero
+    eigenvalues at even ``k``.
+    """
+    _require_ffi("duchon_function_norm_penalty")
+    period = 2 * math.pi
+    K = 33  # odd → 33 effective; clean DFT structure, no aliasing at Nyquist
+    centers = torch.linspace(0.0, period, K + 1, dtype=torch.float64)
+    # Fit on any data — the penalty depends only on centers + periodicity.
+    t, y = _circular_sample(n=256, period=period, seed=0)
+    fit = gt.gaussian_reml_fit_positions(
+        t, y, basis="duchon", knots_or_centers=centers, periodic=True, period=period
+    )
+    pen = fit.penalty.detach().numpy()
+    eigs = np.sort(np.linalg.eigvalsh(0.5 * (pen + pen.T)))[::-1]  # descending
+    # Drop near-zero eigenvalues (constant nullspace projection).
+    nonzero = eigs[np.abs(eigs) > 1.0e-8 * np.abs(eigs).max()]
+    # The K-1 = 32 effective modes come in pairs (real circulant).
+    # Distinct values are at positions 0, 2, 4, ... (one per pair).
+    pairs = nonzero[::2]
+    assert len(pairs) >= 5, f"expected ≥5 distinct eigenvalue pairs, got {len(pairs)}"
+    for i in range(1, 5):
+        observed = pairs[i] / pairs[0]
+        expected = 1.0 / (i + 1) ** 4
+        # Tight tolerance: the closed-form continuous Fourier coefficients
+        # of B_4 admit only Riemann-summation error at this K.
+        assert math.isclose(observed, expected, rel_tol=0.05), (
+            f"Fourier mode k={i+1}: ratio {observed:.6f} ≠ 1/{i+1}^4 = "
+            f"{expected:.6f}. Eigenvalues: {pairs[:6]}"
+        )
+
+
+def test_periodic_duchon_no_zero_modes_on_uniform_even_lattice() -> None:
+    """Hard negative test: ``r`` kernel has K/2 − 1 zero eigenvalues on even K.
+
+    This test would FAIL on the pre-fix code: the triangle-wave kernel
+    ``r`` has zero Fourier coefficients at every even-indexed harmonic, so
+    a uniform K-point lattice with K=10 (effective) produces exactly four
+    near-zero singular values in the design matrix. The Bernoulli B_4
+    kernel has nonzero coefficients at every harmonic with ``1/n⁴`` decay,
+    so the design is full rank.
+    """
+    _require_ffi("duchon_function_norm_penalty")
+    period = 2 * math.pi
+    centers = torch.linspace(0.0, period, 11, dtype=torch.float64)  # → 10 effective
+    t = torch.linspace(0.05, period - 0.05, 200, dtype=torch.float64)
+    X = gt.duchon_basis_1d(t, centers, m=2, periodic=True).numpy()
+    # Smallest singular value normalised by largest; if ≪ 1e-10 we have
+    # exact rank deficiency (the pre-fix failure mode).
+    sv = np.linalg.svd(X, compute_uv=False)
+    smallest = sv[-1] / sv[0]
+    assert smallest > 1.0e-8, (
+        f"design has effectively-zero singular value (sv[-1]/sv[0]={smallest:.3e}) "
+        f"— this is the triangle-wave regression. Full SVs: {sv}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Determinism + smoke
 # ---------------------------------------------------------------------------
 
