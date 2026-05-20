@@ -92,6 +92,21 @@ gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
     --scale-dimensions --out model.gam
 ```
 
+For vector-valued scores, keep the first coordinate in `--z-column` and add
+one `logslope(z_col, ...)` declaration per additional coordinate inside
+`--logslope-formula`:
+
+```bash
+gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
+    --z-column z1 \
+    --logslope-formula 'matern(pc1, pc2, pc3) + logslope(z2, s(age)) + logslope(z3, matern(pc1, pc2, pc3))' \
+    --scale-dimensions --out model.gam
+```
+
+The unwrapped RHS remains the first log-slope surface. Each extra
+`logslope(z_col, ...)` term declares another surface for that z coordinate,
+with its own coefficient and smoothing-parameter block.
+
 ## Stage 2b: Survival marginal-slope
 
 ```python
