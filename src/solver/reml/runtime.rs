@@ -6758,6 +6758,8 @@ impl<'a> RemlState<'a> {
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
         let inner_solution = assembly.build();
+        let inner_hessian_scale =
+            super::unified::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
 
         let prior = self.build_prior(rho, eval_mode);
         let cost_result = super::assembly::evaluate_solution(
@@ -6795,7 +6797,7 @@ impl<'a> RemlState<'a> {
                 beta: Some(beta_for_barrier),
                 psi_gradient,
                 psi_indices,
-                inner_hessian_diag_scale: None,
+                inner_hessian_scale,
             }
         } else {
             let steps = compute_efs_update(
@@ -6809,7 +6811,7 @@ impl<'a> RemlState<'a> {
                 beta: Some(beta_for_barrier),
                 psi_gradient: None,
                 psi_indices: None,
-                inner_hessian_diag_scale: None,
+                inner_hessian_scale,
             }
         };
 

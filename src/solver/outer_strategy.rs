@@ -6178,7 +6178,7 @@ mod tests {
                     beta: None,
                     psi_gradient: Some(array![1.0]),
                     psi_indices: Some(vec![11]),
-                    inner_hessian_diag_scale: None,
+                    inner_hessian_scale: None,
                 })
             }),
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
@@ -7857,7 +7857,7 @@ mod tests {
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
-                    inner_hessian_diag_scale: None,
+                    inner_hessian_scale: None,
                 })
             }),
         );
@@ -7909,7 +7909,7 @@ mod tests {
                             beta: None,
                             psi_gradient: None,
                             psi_indices: None,
-                            inner_hessian_diag_scale: None,
+                            inner_hessian_scale: None,
                         })
                     } else {
                         Err(EstimationError::RemlOptimizationFailed(
