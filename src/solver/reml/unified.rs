@@ -3386,15 +3386,17 @@ impl ImplicitHyperOperator {
 
             // Fused inner-product accumulation. Use slice access where
             // possible so the inner loops vectorize without bounds checks.
-            let dxf_std = dxf_chunk.is_standard_layout();
-            let xf_std = xf_chunk.is_standard_layout();
-            if dxf_std && xf_std {
-                let dxf_slice = dxf_chunk
-                    .as_slice()
-                    .expect("dxf chunk standard layout");
-                let xf_slice = xf_chunk
-                    .as_slice_memory_order()
-                    .expect("xf chunk row-major slice");
+            let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
+                dxf_chunk.as_slice()
+            } else {
+                None
+            };
+            let xf_slice_opt = if xf_chunk.is_standard_layout() {
+                xf_chunk.as_slice()
+            } else {
+                None
+            };
+            if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
                 for i_local in 0..chunk_n {
                     let i = start + i_local;
                     let w_i = w[i];
@@ -3493,28 +3495,21 @@ impl ImplicitHyperOperator {
             let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
             projected += &m;
             projected += &m.t();
-            start = end;
-        }
 
-        if c_opt.is_some() {
-            // The loop above already accumulated `D^T W X` and `X^T W D`.
-            // Add `X^T diag(c) X` in a second pass because `weighted_xf`
-            // is chunk-local.
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-                let c = c_opt.expect("checked Some");
+            // Fuse the c·X correction into the same chunk pass to avoid a
+            // second sweep over the xf slice.
+            if let Some(c) = c_opt {
                 let mut weighted_xf = xf_chunk.to_owned();
                 for i_local in 0..(end - start) {
                     let c_i = c[start + i_local];
+                    let mut row = weighted_xf.row_mut(i_local);
                     for col in 0..rank {
-                        weighted_xf[[i_local, col]] *= c_i;
+                        row[col] *= c_i;
                     }
                 }
                 projected += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
-                start = end;
             }
+            start = end;
         }
 
         let s_f = self.s_psi.dot(factor);
@@ -3645,24 +3640,62 @@ impl ImplicitHyperOperator {
                 .implicit_deriv
                 .row_chunk_first_raw_all_axes(start..end)
                 .expect("radial scalar evaluation failed during implicit hyper batched trace");
+            let xf_slice_opt = if xf_chunk.is_standard_layout() {
+                xf_chunk.as_slice()
+            } else {
+                None
+            };
             for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
                 let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
                 let mut design_total = design_totals[slot];
                 let mut correction_total = correction_totals[slot];
-                for i_local in 0..chunk_n {
-                    let i = start + i_local;
-                    let w_i = w[i];
-                    let dxf_row = dxf_chunk.row(i_local);
-                    let xf_row = xf_chunk.row(i_local);
-                    for k in 0..rank {
-                        design_total += dxf_row[k] * w_i * xf_row[k];
-                    }
-                    if let Some(c) = c_opt {
-                        let c_i = c[i];
+                let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
+                    dxf_chunk.as_slice()
+                } else {
+                    None
+                };
+                if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
+                    for i_local in 0..chunk_n {
+                        let i = start + i_local;
+                        let w_i = w[i];
+                        let off = i_local * rank;
+                        let drow = &dxf_slice[off..off + rank];
+                        let xrow = &xf_slice[off..off + rank];
+                        let mut acc = 0.0_f64;
                         for k in 0..rank {
-                            let v = xf_row[k];
-                            correction_total += c_i * v * v;
+                            acc += drow[k] * xrow[k];
+                        }
+                        design_total += w_i * acc;
+                        if let Some(c) = c_opt {
+                            let c_i = c[i];
+                            let mut acc2 = 0.0_f64;
+                            for k in 0..rank {
+                                let v = xrow[k];
+                                acc2 += v * v;
+                            }
+                            correction_total += c_i * acc2;
+                        }
+                    }
+                } else {
+                    for i_local in 0..chunk_n {
+                        let i = start + i_local;
+                        let w_i = w[i];
+                        let dxf_row = dxf_chunk.row(i_local);
+                        let xf_row = xf_chunk.row(i_local);
+                        let mut acc = 0.0_f64;
+                        for k in 0..rank {
+                            acc += dxf_row[k] * xf_row[k];
+                        }
+                        design_total += w_i * acc;
+                        if let Some(c) = c_opt {
+                            let c_i = c[i];
+                            let mut acc2 = 0.0_f64;
+                            for k in 0..rank {
+                                let v = xf_row[k];
+                                acc2 += v * v;
+                            }
+                            correction_total += c_i * acc2;
                         }
                     }
                 }
