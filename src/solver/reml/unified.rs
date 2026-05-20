@@ -3653,22 +3653,20 @@ impl ImplicitHyperOperator {
             .max(512)
             .min(n_obs);
 
-        let w = self.w_diag.as_ref();
-        let mut out = (0..n_axes)
-            .map(|_| Array2::<f64>::zeros((rank, rank)))
-            .collect::<Vec<_>>();
-
-        let mut start = 0usize;
-        while start < n_obs {
-            let end = (start + chunk_rows).min(n_obs);
+        let w_array = self.w_diag.as_ref();
+        let w = w_array
+            .as_slice()
+            .expect("w_diag must be contiguous for slice access");
+        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
+        let use_parallel = num_chunks >= 2
+            && rayon::current_thread_index().is_none()
+            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
+        let compute_chunk = |start: usize, end: usize| -> Vec<Array2<f64>> {
             let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
             let kd_all = self
                 .implicit_deriv
                 .row_chunk_first_raw_all_axes(start..end)
                 .expect("radial scalar evaluation failed during implicit hyper batched projected_matrix");
-
-            // Precompute W · xf_chunk once per chunk; reused across every
-            // axis as `Dᵀ (W X)` instead of building `Dᵀ W = W · D` per axis.
             let mut wxf_chunk = xf_chunk.to_owned();
             for i_local in 0..(end - start) {
                 let w_i = w[start + i_local];
@@ -3677,27 +3675,69 @@ impl ImplicitHyperOperator {
                     row[col] *= w_i;
                 }
             }
+            let mut local = (0..n_axes)
+                .map(|_| Array2::<f64>::zeros((rank, rank)))
+                .collect::<Vec<_>>();
             for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
                 let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
                 let m = crate::faer_ndarray::fast_atb(&dxf_chunk, &wxf_chunk);
-                out[slot] += &m;
-                out[slot] += &m.t();
-
+                local[slot] += &m;
+                local[slot] += &m.t();
                 if let Some(c) = c_opt {
+                    let c_slice = c
+                        .as_slice()
+                        .expect("c_x_psi_beta must be contiguous");
                     let mut weighted_xf = xf_chunk.to_owned();
                     for i_local in 0..(end - start) {
-                        let c_i = c[start + i_local];
+                        let c_i = c_slice[start + i_local];
                         let mut row = weighted_xf.row_mut(i_local);
                         for col in 0..rank {
                             row[col] *= c_i;
                         }
                     }
-                    out[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
+                    local[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
                 }
             }
-            start = end;
-        }
+            local
+        };
+        let mut out = if use_parallel {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunk_rows;
+                    let end = (start + chunk_rows).min(n_obs);
+                    compute_chunk(start, end)
+                })
+                .reduce(
+                    || {
+                        (0..n_axes)
+                            .map(|_| Array2::<f64>::zeros((rank, rank)))
+                            .collect::<Vec<_>>()
+                    },
+                    |mut acc, partial| {
+                        for (a, p) in acc.iter_mut().zip(partial) {
+                            *a += &p;
+                        }
+                        acc
+                    },
+                )
+        } else {
+            let mut out = (0..n_axes)
+                .map(|_| Array2::<f64>::zeros((rank, rank)))
+                .collect::<Vec<_>>();
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let local = compute_chunk(start, end);
+                for (a, l) in out.iter_mut().zip(local) {
+                    *a += &l;
+                }
+                start = end;
+            }
+            out
+        };
 
         for (slot, (_, s_psi, _)) in axes.iter().enumerate() {
             let s_f = s_psi.dot(factor);
@@ -3740,15 +3780,17 @@ impl ImplicitHyperOperator {
             .max(512)
             .min(n_obs);
 
-        let w = self.w_diag.as_ref();
-        let mut design_totals = vec![0.0_f64; n_axes];
-        let mut correction_totals = vec![0.0_f64; n_axes];
-        let mut start = 0usize;
-        while start < n_obs {
-            let end = (start + chunk_rows).min(n_obs);
+        let w_array = self.w_diag.as_ref();
+        let w = w_array
+            .as_slice()
+            .expect("w_diag must be contiguous for slice access");
+        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
+        let use_parallel = num_chunks >= 2
+            && rayon::current_thread_index().is_none()
+            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
+        let compute_chunk = |start: usize, end: usize| -> (Vec<f64>, Vec<f64>) {
             let chunk_n = end - start;
             let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-
             let kd_all = self
                 .implicit_deriv
                 .row_chunk_first_raw_all_axes(start..end)
@@ -3758,16 +3800,19 @@ impl ImplicitHyperOperator {
             } else {
                 None
             };
+            let mut design_local = vec![0.0_f64; n_axes];
+            let mut correction_local = vec![0.0_f64; n_axes];
             for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
                 let kd_chunk = &kd_all[*axis];
                 let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
-                let mut design_total = design_totals[slot];
-                let mut correction_total = correction_totals[slot];
+                let mut design_total = 0.0_f64;
+                let mut correction_total = 0.0_f64;
                 let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
                     dxf_chunk.as_slice()
                 } else {
                     None
                 };
+                let c_slice_opt = c_opt.and_then(|c| c.as_slice());
                 if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
                     for i_local in 0..chunk_n {
                         let i = start + i_local;
@@ -3780,7 +3825,7 @@ impl ImplicitHyperOperator {
                             acc += drow[k] * xrow[k];
                         }
                         design_total += w_i * acc;
-                        if let Some(c) = c_opt {
+                        if let Some(c) = c_slice_opt {
                             let c_i = c[i];
                             let mut acc2 = 0.0_f64;
                             for k in 0..rank {
@@ -3812,11 +3857,49 @@ impl ImplicitHyperOperator {
                         }
                     }
                 }
-                design_totals[slot] = design_total;
-                correction_totals[slot] = correction_total;
+                design_local[slot] = design_total;
+                correction_local[slot] = correction_total;
             }
-            start = end;
-        }
+            (design_local, correction_local)
+        };
+        let (design_totals, correction_totals) = if use_parallel {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunk_rows;
+                    let end = (start + chunk_rows).min(n_obs);
+                    compute_chunk(start, end)
+                })
+                .reduce(
+                    || (vec![0.0_f64; n_axes], vec![0.0_f64; n_axes]),
+                    |(mut da, mut ca), (db, cb)| {
+                        for (a, b) in da.iter_mut().zip(db) {
+                            *a += b;
+                        }
+                        for (a, b) in ca.iter_mut().zip(cb) {
+                            *a += b;
+                        }
+                        (da, ca)
+                    },
+                )
+        } else {
+            let mut design_totals = vec![0.0_f64; n_axes];
+            let mut correction_totals = vec![0.0_f64; n_axes];
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let (d_local, c_local) = compute_chunk(start, end);
+                for (a, b) in design_totals.iter_mut().zip(d_local) {
+                    *a += b;
+                }
+                for (a, b) in correction_totals.iter_mut().zip(c_local) {
+                    *a += b;
+                }
+                start = end;
+            }
+            (design_totals, correction_totals)
+        };
 
         let mut out = Vec::with_capacity(n_axes);
         for (slot, (_axis, s_psi, _)) in axes.iter().enumerate() {
