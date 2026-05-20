@@ -6,10 +6,9 @@ baseline risk surface and the score's effect live in separate formulas, so
 the baseline cannot absorb signal that belongs to the slope (or vice
 versa).
 
-![two-surface marginal-slope viz over a joint Duchon smooth](images/marginal_slope_3d.png)
-
-The vertical gap between the two surfaces is the score effect, and that
-gap is itself a smooth function of where you stand in covariate space.
+The vertical gap between the baseline and slope-adjusted surfaces is the
+score effect, and that gap is itself a smooth function of where you stand
+in covariate space.
 
 Two flavours:
 
