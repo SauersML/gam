@@ -547,7 +547,7 @@ fn expand_custom_group_base_prior(
     }
 }
 
-fn coefficient_group_leaf_penalty_components(
+fn coefficient_group_concatenated_penalty_components(
     label: &str,
     children_by_parent: &BTreeMap<String, Vec<String>>,
     group_sets: &BTreeMap<String, BTreeSet<(usize, usize)>>,
@@ -562,7 +562,7 @@ fn coefficient_group_leaf_penalty_components(
     };
     let mut components = Vec::new();
     for child in children {
-        components.extend(coefficient_group_leaf_penalty_components(
+        components.extend(coefficient_group_concatenated_penalty_components(
             child,
             children_by_parent,
             group_sets,
@@ -745,15 +745,17 @@ pub fn realize_coefficient_groups_for_custom_family(
         //
         //   lambda* = (a_g + |g|/2 - 1) / (b_g + q_g/2).
         //
-        // If a node has descendants, the parent precision is a single
-        // lambda multiplying the product of descendant Gaussian factors:
-        // replace |g| and q_g by sums over descendant leaf components.  We
-        // preserve that identity by emitting one physical penalty piece per
-        // descendant leaf and tying those pieces with the parent's precision
-        // label.  This is not a block-sum shortcut: overlapping leaves remain
-        // separate factors, so their log normalizers and quadratic
-        // contributions both add.
-        let penalty_components = coefficient_group_leaf_penalty_components(
+        // If a node has children, beta_g is the concatenation of the child
+        // coefficient vectors.  The parent density is therefore the product
+        // of those child Gaussian factors under one lambda_g: replace |g| and
+        // q_g by sums over the child components, expanding recursively when a
+        // child is itself an interior node.  We preserve that identity by
+        // emitting one physical penalty piece per concatenated child component
+        // and tying those pieces with the parent's precision label.  This is
+        // not a block-sum shortcut: overlapping children remain separate
+        // factors, so their log normalizers and quadratic contributions both
+        // add.
+        let penalty_components = coefficient_group_concatenated_penalty_components(
             &group.label,
             &children_by_parent,
             &group_sets,
@@ -6468,6 +6470,142 @@ fn aggregate_labeled_hessian(
         }
     }
     Ok(out)
+}
+
+fn rho_prior_cost_gradient_hessian(
+    prior: &crate::types::RhoPrior,
+    rho: &Array1<f64>,
+) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
+    fn scalar_terms(
+        prior: &crate::types::RhoPrior,
+        r: f64,
+        context: &str,
+    ) -> Result<(f64, f64, f64), String> {
+        match prior {
+            crate::types::RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
+            crate::types::RhoPrior::Normal { mean, sd } => {
+                if !mean.is_finite() || !sd.is_finite() || *sd <= 0.0 {
+                    return Err(format!(
+                        "{context} Normal log-precision prior requires finite mean and sd > 0"
+                    ));
+                }
+                let inv_var = 1.0 / (*sd * *sd);
+                let delta = r - *mean;
+                Ok((0.5 * delta * delta * inv_var, delta * inv_var, inv_var))
+            }
+            crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+                if !shape.is_finite() || *shape <= 0.0 || !rate.is_finite() || *rate < 0.0 {
+                    return Err(format!(
+                        "{context} Gamma precision prior requires shape > 0 and rate >= 0"
+                    ));
+                }
+                let lambda = r.exp();
+                Ok((
+                    *rate * lambda - (*shape - 1.0) * r,
+                    *rate * lambda - (*shape - 1.0),
+                    *rate * lambda,
+                ))
+            }
+            crate::types::RhoPrior::Independent(_) => Err(format!(
+                "{context} must be a scalar rho prior, not a nested Independent prior"
+            )),
+        }
+    }
+
+    match prior {
+        crate::types::RhoPrior::Flat => Ok((0.0, Array1::zeros(rho.len()), None)),
+        crate::types::RhoPrior::Normal { .. } | crate::types::RhoPrior::GammaPrecision { .. } => {
+            let mut cost = 0.0;
+            let mut gradient = Array1::<f64>::zeros(rho.len());
+            let mut hessian = Array2::<f64>::zeros((rho.len(), rho.len()));
+            let mut any_hessian = false;
+            for (idx, &r) in rho.iter().enumerate() {
+                let (c, g, h) = scalar_terms(prior, r, "rho prior")?;
+                cost += c;
+                gradient[idx] = g;
+                hessian[[idx, idx]] = h;
+                any_hessian |= h != 0.0;
+            }
+            Ok((cost, gradient, any_hessian.then_some(hessian)))
+        }
+        crate::types::RhoPrior::Independent(priors) => {
+            if priors.len() != rho.len() {
+                return Err(format!(
+                    "Independent rho prior length mismatch: got {}, expected {}",
+                    priors.len(),
+                    rho.len()
+                ));
+            }
+            let mut cost = 0.0;
+            let mut gradient = Array1::<f64>::zeros(rho.len());
+            let mut hessian = Array2::<f64>::zeros((rho.len(), rho.len()));
+            let mut any_hessian = false;
+            for (idx, (prior, &r)) in priors.iter().zip(rho.iter()).enumerate() {
+                let (c, g, h) = scalar_terms(prior, r, &format!("rho prior coordinate {idx}"))?;
+                cost += c;
+                gradient[idx] = g;
+                hessian[[idx, idx]] = h;
+                any_hessian |= h != 0.0;
+            }
+            Ok((cost, gradient, any_hessian.then_some(hessian)))
+        }
+    }
+}
+
+fn add_labeled_rho_prior_to_outer_eval(
+    mut result: OuterObjectiveEvalResult,
+    rho: &Array1<f64>,
+    rho_prior: &crate::types::RhoPrior,
+    eval_mode: EvalMode,
+) -> Result<OuterObjectiveEvalResult, String> {
+    // For tied physical penalties, the likelihood/LAML contribution is first
+    // evaluated in the expanded physical coordinates and then pulled back to
+    // the user-facing labeled coordinates.  The configured prior lives on the
+    // labeled precision itself, so it is added once after that pullback:
+    //
+    //   V_label(rho) = V_base(E rho) + pi(rho),
+    //   ∇V_label     = E' ∇V_base(E rho) + ∇pi(rho),
+    //   ∇²V_label    = E' ∇²V_base(E rho) E + ∇²pi(rho),
+    //
+    // where E maps each physical penalty piece to its outer label.  This is
+    // the same change-of-variables identity used for overlapping/nested group
+    // penalties; the prior is not repeated for each physical child component.
+    if matches!(rho_prior, crate::types::RhoPrior::Flat) {
+        return Ok(result);
+    }
+    let (cost, gradient, hessian) = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
+    result.objective += cost;
+    if eval_mode != EvalMode::ValueOnly {
+        if result.gradient.len() != gradient.len() {
+            return Err(format!(
+                "rho prior gradient length mismatch: got {}, expected {}",
+                gradient.len(),
+                result.gradient.len()
+            ));
+        }
+        result.gradient += &gradient;
+    }
+    if eval_mode == EvalMode::ValueGradientHessian {
+        if let Some(prior_hessian) = hessian {
+            result.outer_hessian = match result.outer_hessian.materialize_dense()? {
+                Some(mut base_hessian) => {
+                    if base_hessian.raw_dim() != prior_hessian.raw_dim() {
+                        return Err(format!(
+                            "rho prior Hessian shape mismatch: got {}x{}, expected {}x{}",
+                            prior_hessian.nrows(),
+                            prior_hessian.ncols(),
+                            base_hessian.nrows(),
+                            base_hessian.ncols()
+                        ));
+                    }
+                    base_hessian += &prior_hessian;
+                    crate::solver::outer_strategy::HessianResult::Analytic(base_hessian)
+                }
+                None => crate::solver::outer_strategy::HessianResult::Unavailable,
+            };
+        }
+    }
+    Ok(result)
 }
 
 fn split_log_lambdas(
@@ -13184,6 +13322,7 @@ fn build_custom_family_inner_assembly<'dp>(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<(crate::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
@@ -13266,7 +13405,7 @@ fn build_custom_family_inner_assembly<'dp>(
             include_logdet_s,
         },
         rho_curvature_scale,
-        rho_prior: crate::types::RhoPrior::Flat,
+        rho_prior,
         hessian_logdet_correction,
         penalty_subspace_trace: None,
         deriv_provider: Some(deriv_provider),
@@ -13303,6 +13442,7 @@ fn unified_joint_cost_gradient(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
@@ -13328,6 +13468,7 @@ fn unified_joint_cost_gradient(
         include_logdet_h,
         include_logdet_s,
         options,
+        rho_prior,
         deriv_provider,
         ext_bundle,
     )?;
@@ -13361,6 +13502,7 @@ fn unified_joint_efs_eval(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<crate::solver::outer_strategy::EfsEval, String> {
@@ -13378,6 +13520,7 @@ fn unified_joint_efs_eval(
         include_logdet_h,
         include_logdet_s,
         options,
+        rho_prior,
         deriv_provider,
         ext_bundle,
     )?;
@@ -13477,6 +13620,7 @@ fn joint_outer_evaluate(
     strict_spd: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_dh_many: Option<
@@ -13633,6 +13777,7 @@ fn joint_outer_evaluate(
         include_logdet_h,
         include_logdet_s,
         options,
+        rho_prior,
         provider_box,
         eval_mode,
         ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
@@ -13725,6 +13870,7 @@ fn joint_outer_evaluate_efs(
     include_logdet_s: bool,
     strict_spd: bool,
     options: &BlockwiseFitOptions,
+    rho_prior: crate::types::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
     compute_dh_many: Option<
@@ -13871,6 +14017,7 @@ fn joint_outer_evaluate_efs(
         include_logdet_h,
         include_logdet_s,
         options,
+        rho_prior,
         provider_box,
         ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
     )
@@ -15133,6 +15280,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
     rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: crate::types::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     evaluate_custom_family_hyper_internal_shared(
@@ -15143,6 +15291,7 @@ fn evaluate_custom_family_hyper_internal<F: CustomFamily + Clone + Send + Sync +
         rho_current,
         Arc::new(derivative_blocks.to_vec()),
         warm_start,
+        rho_prior,
         eval_mode,
     )
 }
@@ -15155,6 +15304,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     rho_current: &Array1<f64>,
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: crate::types::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
@@ -15577,8 +15727,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // `ValueGradientHessian` modes; in VGH the Hessian still flows through the
     // standard joint_outer_evaluate path below and only the gradient is
     // replaced. See `BatchedOuterGradientTerms`.
+    let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let mut batched_gradient_override: Option<Array1<f64>> = None;
-    if eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian {
+    if !has_configured_rho_prior
+        && (eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian)
+    {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
         let synced_states_for_batch = synchronized_states_from_flat_beta(
             family,

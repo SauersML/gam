@@ -1652,6 +1652,16 @@ pub trait HyperOperator: Send + Sync {
         factor.t().dot(&op_factor)
     }
 
+    /// Compute the exact projected matrix `F^T B F`, reusing caller-owned
+    /// projection caches when the operator has a shared row/design factor.
+    fn projected_matrix_cached(
+        &self,
+        factor: &Array2<f64>,
+        _cache: &ProjectedFactorCache,
+    ) -> Array2<f64> {
+        self.projected_matrix(factor)
+    }
+
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
     ///
     /// Sparse exact traces build `B E` in column batches. Operators with
@@ -2481,6 +2491,42 @@ impl HyperOperator for CompositeHyperOperator {
         trace
     }
 
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            return self.operators[0].projected_matrix(factor);
+        }
+
+        let rank = factor.ncols();
+        let mut projected = Array2::<f64>::zeros((rank, rank));
+        if let Some(dense) = self.dense.as_ref() {
+            projected += &factor.t().dot(&dense.dot(factor));
+        }
+        for op in &self.operators {
+            projected += &op.projected_matrix(factor);
+        }
+        projected
+    }
+
+    fn projected_matrix_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Array2<f64> {
+        if self.dense.is_none() && self.operators.len() == 1 {
+            return self.operators[0].projected_matrix_cached(factor, cache);
+        }
+
+        let rank = factor.ncols();
+        let mut projected = Array2::<f64>::zeros((rank, rank));
+        if let Some(dense) = self.dense.as_ref() {
+            projected += &factor.t().dot(&dense.dot(factor));
+        }
+        for op in &self.operators {
+            projected += &op.projected_matrix_cached(factor, cache);
+        }
+        projected
+    }
+
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let mut total = 0.0;
         if let Some(dense) = self.dense.as_ref() {
@@ -3018,6 +3064,32 @@ impl HyperOperator for ImplicitHyperOperator {
         let xf = self.cached_xf(factor, cache);
         self.trace_projected_factor_with_xf(factor, xf.view())
     }
+
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let n_obs = self.w_diag.len();
+        let rank = factor.ncols();
+        if rank == 0 || n_obs == 0 {
+            return Array2::<f64>::zeros((rank, rank));
+        }
+        let xf = self.compute_xf(factor);
+        self.projected_matrix_with_xf(factor, xf.view())
+    }
+
+    fn projected_matrix_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Array2<f64> {
+        debug_assert_eq!(factor.nrows(), self.p);
+        let n_obs = self.w_diag.len();
+        let rank = factor.ncols();
+        if rank == 0 || n_obs == 0 {
+            return Array2::<f64>::zeros((rank, rank));
+        }
+        let xf = self.cached_xf(factor, cache);
+        self.projected_matrix_with_xf(factor, xf.view())
+    }
 }
 
 impl ImplicitHyperOperator {
@@ -3130,6 +3202,80 @@ impl ImplicitHyperOperator {
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
 
         2.0 * design_total + correction_total + penalty
+    }
+
+    /// Exact `F^T B_d F` using the same cached `X · F` projection as the
+    /// scalar trace path. This avoids the default rank-many matrix-free
+    /// matvecs in dense-spectral outer-Hessian cross-trace assembly.
+    fn projected_matrix_with_xf(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        debug_assert_eq!(xf.dim(), (n_obs, rank));
+
+        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
+        const TARGET_BYTES: usize = 8 * 1024 * 1024;
+        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+            .max(512)
+            .min(n_obs);
+
+        let w = self.w_diag.as_ref();
+        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
+        let mut projected = Array2::<f64>::zeros((rank, rank));
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+            let kd_chunk = self
+                .implicit_deriv
+                .row_chunk_first_raw(self.axis, start..end)
+                .expect("radial scalar evaluation failed during implicit hyper projected_matrix");
+            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
+
+            let mut weighted_dxf = dxf_chunk.clone();
+            for i_local in 0..(end - start) {
+                let i = start + i_local;
+                let w_i = w[i];
+                for col in 0..rank {
+                    weighted_dxf[[i_local, col]] *= w_i;
+                }
+            }
+
+            projected += &crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
+            projected += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_dxf);
+            start = end;
+        }
+
+        if c_opt.is_some() {
+            // The loop above already accumulated `D^T W X` and `X^T W D`.
+            // Add `X^T diag(c) X` in a second pass because `weighted_xf`
+            // is chunk-local.
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+                let c = c_opt.expect("checked Some");
+                let mut weighted_xf = xf_chunk.to_owned();
+                for i_local in 0..(end - start) {
+                    let c_i = c[start + i_local];
+                    for col in 0..rank {
+                        weighted_xf[[i_local, col]] *= c_i;
+                    }
+                }
+                projected += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
+                start = end;
+            }
+        }
+
+        let s_f = self.s_psi.dot(factor);
+        projected += &factor.t().dot(&s_f);
+        let projected_t = projected.t().to_owned();
+        projected += &projected_t;
+        projected.mapv_inplace(|value| 0.5 * value);
+        projected
     }
 
     /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
@@ -8072,6 +8218,32 @@ impl HyperOperator for WeightedHyperOperator {
             .sum()
     }
 
+    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
+        let rank = factor.ncols();
+        let mut projected = Array2::<f64>::zeros((rank, rank));
+        for (weight, op) in &self.terms {
+            if *weight != 0.0 {
+                projected.scaled_add(*weight, &op.projected_matrix(factor));
+            }
+        }
+        projected
+    }
+
+    fn projected_matrix_cached(
+        &self,
+        factor: &Array2<f64>,
+        cache: &ProjectedFactorCache,
+    ) -> Array2<f64> {
+        let rank = factor.ncols();
+        let mut projected = Array2::<f64>::zeros((rank, rank));
+        for (weight, op) in &self.terms {
+            if *weight != 0.0 {
+                projected.scaled_add(*weight, &op.projected_matrix_cached(factor, cache));
+            }
+        }
+        projected
+    }
+
     fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.dim_hint, self.dim_hint));
         for (weight, op) in &self.terms {
@@ -10660,7 +10832,7 @@ impl DenseSpectralOperator {
     fn projected_operator(&self, factor: &Array2<f64>, op: &dyn HyperOperator) -> Array2<f64> {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
-            let result = op.projected_matrix(factor);
+            let result = op.projected_matrix_cached(factor, &self.projected_factor_cache);
             let signature = format!(
                 "DenseSpectralOperator::projected_operator dim={} rank={} implicit={}",
                 self.n_dim,
@@ -10670,7 +10842,7 @@ impl DenseSpectralOperator {
             dense_spectral_stage_log(&signature, start.elapsed().as_secs_f64());
             result
         } else {
-            op.projected_matrix(factor)
+            op.projected_matrix_cached(factor, &self.projected_factor_cache)
         }
     }
 
