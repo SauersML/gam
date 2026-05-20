@@ -306,7 +306,7 @@ fn coefficient_group_kernel_basis_prior_mean_recovers_known_amplitude() {
 fn coefficient_group_zero_prior_mean_matches_default_bits() {
     let (x, y, weights, offset) = synthetic_two_score_data();
     let spec = two_linear_term_spec();
-    let group = |prior_mean| CoefficientGroupSpec {
+    let group = |prior_mean: CoefficientPriorMean| CoefficientGroupSpec {
         name: "zero_equivalence".to_string(),
         selectors: vec![
             CoefficientSelector::LinearTerm("score_a".to_string()),
