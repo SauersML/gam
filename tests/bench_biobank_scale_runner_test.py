@@ -797,6 +797,12 @@ class MarkerPatternTests(unittest.TestCase):
                 "scale_prefers_operator=false",
                 "dense", "kernel_absent",
             ),
+            (
+                "[OUTER hessian-route] choice=operator reason=dense_memory_budget "
+                "n=10000 p=10000 k=2 callback_kernel=true subspace_trace=false "
+                "scale_prefers_operator=true dense_workspace_bytes=5600000000",
+                "operator", "dense_memory_budget",
+            ),
             # family-op branch — `scale_prefers_operator=irrelevant`
             (
                 "[OUTER hessian-route] choice=operator reason=family_op "
