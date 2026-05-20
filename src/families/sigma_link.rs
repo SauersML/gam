@@ -156,9 +156,12 @@ pub fn exp_sigma_derivs_up_to_fourth(
 ///
 ///   ℓ = −½ Σ (y−μ)²/σ² − Σ log σ
 ///
-/// is unbounded below as σ → 0 with μ → y on any single observation; with
-/// σ ≥ b > 0 the log term is bounded by −log b, so the joint penalized MLE is
-/// finite for any finite data and the working weight 1/σ² is bounded by 1/b².
+/// is unbounded *above* as σ → 0 with μ → y on any single observation
+/// (the −log σ term goes to +∞), so the *negative* log-likelihood is
+/// unbounded below and the unconstrained MLE does not exist. With
+/// σ ≥ b > 0 the −log σ term is bounded above by −log b, so the joint
+/// penalized objective stays finite for any finite data and the working
+/// weight 1/σ² is bounded by 1/b².
 ///
 /// # Scale invariance
 ///

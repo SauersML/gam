@@ -1321,10 +1321,14 @@ enum PirlsPenalty {
     Dense {
         s_transformed: Array2<f64>,
         e_transformed: Array2<f64>,
+        linear_shift: Array1<f64>,
+        constant_shift: f64,
     },
     Diagonal {
         diag: Array1<f64>,
         positive_indices: Vec<usize>,
+        linear_shift: Array1<f64>,
+        constant_shift: f64,
     },
 }
 
@@ -1363,6 +1367,31 @@ impl PirlsPenalty {
             Self::Dense { s_transformed, .. } => s_transformed.dot(beta),
             Self::Diagonal { diag, .. } => diag * beta,
         }
+    }
+
+    fn linear_shift(&self) -> &Array1<f64> {
+        match self {
+            Self::Dense { linear_shift, .. } | Self::Diagonal { linear_shift, .. } => linear_shift,
+        }
+    }
+
+    fn constant_shift(&self) -> f64 {
+        match self {
+            Self::Dense { constant_shift, .. } | Self::Diagonal { constant_shift, .. } => {
+                *constant_shift
+            }
+        }
+    }
+
+    fn shifted_gradient(&self, beta: &Array1<f64>) -> Array1<f64> {
+        let mut value = self.apply(beta);
+        value -= self.linear_shift();
+        value
+    }
+
+    fn shifted_quadratic(&self, beta: &Array1<f64>) -> f64 {
+        let s_beta = self.apply(beta);
+        beta.dot(&s_beta) - 2.0 * beta.dot(self.linear_shift()) + self.constant_shift()
     }
 }
 

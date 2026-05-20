@@ -38,8 +38,9 @@ use crate::families::transformation_normal::{
 };
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    AdaptiveRegularizationDiagnostics, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design,
+    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec,
+    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_design, fit_term_collection_with_coefficient_groups,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::types::{
@@ -77,6 +78,7 @@ pub struct StandardFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,
     pub wiggle_options: Option<BlockwiseFitOptions>,
+    pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
 }
 
 pub struct GaussianLocationScaleFitRequest<'a> {
@@ -649,17 +651,31 @@ fn fixed_gaussian_shift_frailty_from_spec(
 }
 
 fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
-    let fitted = fit_term_collectionwith_spatial_length_scale_optimization(
-        request.data,
-        request.y.clone(),
-        request.weights.clone(),
-        request.offset.clone(),
-        &request.spec,
-        request.family,
-        &request.options,
-        &request.kappa_options,
-    )
-    .map_err(|e| e.to_string())?;
+    let fitted = if request.penalty_block_gamma_priors.is_empty() {
+        fit_term_collectionwith_spatial_length_scale_optimization(
+            request.data,
+            request.y.clone(),
+            request.weights.clone(),
+            request.offset.clone(),
+            &request.spec,
+            request.family,
+            &request.options,
+            &request.kappa_options,
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        crate::smooth::fit_term_collection_with_penalty_block_gamma_priors(
+            request.data,
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
+            &request.spec,
+            &request.penalty_block_gamma_priors,
+            request.family,
+            &request.options,
+        )
+        .map_err(|e| e.to_string())?
+    };
 
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
@@ -2037,6 +2053,11 @@ pub struct FitConfig {
     /// field; saved-model builders pass it through so deployment consumers can
     /// recover group provenance.
     pub group_metadata: Option<BTreeMap<String, JsonValue>>,
+
+    /// Optional user-defined coefficient groups with separate precision
+    /// parameters. Group-local priors, including catalog-metadata-informed
+    /// Gamma precision hyperpriors, are resolved during design setup.
+    pub coefficient_groups: Vec<CoefficientGroupSpec>,
 }
 
 impl Default for FitConfig {
@@ -2074,6 +2095,7 @@ impl Default for FitConfig {
             firth: false,
             resource_policy: None,
             group_metadata: None,
+            coefficient_groups: Vec::new(),
         }
     }
 }
@@ -2596,6 +2618,7 @@ fn materialize_standard<'a>(
             kappa_options,
             wiggle,
             wiggle_options: None,
+            penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
         }),
         inference_notes,
     })
