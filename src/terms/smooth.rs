@@ -161,6 +161,24 @@ pub enum SmoothBasisSpec {
     },
 }
 
+impl SmoothBasisSpec {
+    /// Stable per-variant ordinal used when sorting smooth-related warnings:
+    /// each variant gets a fixed rank so callers can sort heterogeneous
+    /// smooth specs without matching on the variant themselves.
+    pub fn family_rank(&self) -> u8 {
+        match self {
+            Self::BSpline1D { .. } => 0,
+            Self::TensorBSpline { .. } => 1,
+            Self::ThinPlate { .. } => 2,
+            Self::Sphere { .. } => 3,
+            Self::Matern { .. } => 4,
+            Self::Duchon { .. } => 5,
+            Self::FactorSmooth { .. } => 6,
+            Self::BySmooth { .. } => 7,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TensorMarginalSpec {
     BSpline(BSplineBasisSpec),
