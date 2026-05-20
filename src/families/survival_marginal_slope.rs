@@ -4349,7 +4349,15 @@ impl SurvivalMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
-        let acc = chunked_row_reduction(
+        let JointPsiSecondOrderAcc {
+            objective_psi_psi,
+            score_t,
+            score_m,
+            score_g,
+            score_h,
+            score_w,
+            hessian,
+        } = chunked_row_reduction(
             row_iter.as_slice(),
             || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
             |row, acc| -> Result<(), String> {
@@ -12120,29 +12128,25 @@ impl SurvivalMarginalSlopeFamily {
         let mut score_psi_psi = Array1::zeros(slices.total);
         score_psi_psi
             .slice_mut(s![slices.time.clone()])
-            .assign(&acc.score_t);
+            .assign(&score_t);
         score_psi_psi
             .slice_mut(s![slices.marginal.clone()])
-            .assign(&acc.score_m);
+            .assign(&score_m);
         score_psi_psi
             .slice_mut(s![slices.logslope.clone()])
-            .assign(&acc.score_g);
+            .assign(&score_g);
         if let Some(range) = slices.score_warp.as_ref() {
-            score_psi_psi
-                .slice_mut(s![range.clone()])
-                .assign(&acc.score_h);
+            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_h);
         }
         if let Some(range) = slices.link_dev.as_ref() {
-            score_psi_psi
-                .slice_mut(s![range.clone()])
-                .assign(&acc.score_w);
+            score_psi_psi.slice_mut(s![range.clone()]).assign(&score_w);
         }
 
         Ok(Some(ExactNewtonJointPsiSecondOrderTerms {
-            objective_psi_psi: acc.objective_psi_psi,
+            objective_psi_psi,
             score_psi_psi,
             hessian_psi_psi: Array2::zeros((0, 0)),
-            hessian_psi_psi_operator: Some(Box::new(acc.hessian.into_operator(slices))),
+            hessian_psi_psi_operator: Some(Box::new(hessian.into_operator(slices))),
         }))
     }
 
@@ -15011,7 +15015,8 @@ impl SurvivalMarginalSlopeFamily {
         let beta_time = &block_states[0].beta;
         let beta_logslope = &block_states[2].beta;
         let probit_scale = self.probit_frailty_scale();
-        let (ll, grad, hess) = (0..self.n)
+        type PerZJointAcc = (f64, Array1<f64>, Array2<f64>);
+        let (ll, grad, hess): PerZJointAcc = (0..self.n)
             .into_par_iter()
             .try_fold(
                 || {
