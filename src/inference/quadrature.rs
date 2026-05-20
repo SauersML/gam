@@ -214,6 +214,21 @@ pub enum IntegratedExpectationMode {
     QuadratureFallback,
 }
 
+impl IntegratedExpectationMode {
+    /// Ordinal rank where higher = lower-fidelity / further from exact closed
+    /// form. Lets callers fold over a stream of modes and keep the *worst*
+    /// one with `a.rank().max(b.rank())`.
+    #[inline]
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::ExactClosedForm => 0,
+            Self::ExactSpecialFunction => 1,
+            Self::ControlledAsymptotic => 2,
+            Self::QuadratureFallback => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct IntegratedMeanDerivative {
     pub mean: f64,
@@ -2546,25 +2561,11 @@ fn beta_logistic_point_jet(x: f64, delta: f64, epsilon: f64) -> (f64, f64, f64, 
 }
 
 #[inline]
-fn integrated_expectation_mode_rank(mode: IntegratedExpectationMode) -> u8 {
-    match mode {
-        IntegratedExpectationMode::ExactClosedForm => 0,
-        IntegratedExpectationMode::ExactSpecialFunction => 1,
-        IntegratedExpectationMode::ControlledAsymptotic => 2,
-        IntegratedExpectationMode::QuadratureFallback => 3,
-    }
-}
-
-#[inline]
 fn worse_integrated_expectation_mode(
     lhs: IntegratedExpectationMode,
     rhs: IntegratedExpectationMode,
 ) -> IntegratedExpectationMode {
-    if integrated_expectation_mode_rank(lhs) >= integrated_expectation_mode_rank(rhs) {
-        lhs
-    } else {
-        rhs
-    }
+    if lhs.rank() >= rhs.rank() { lhs } else { rhs }
 }
 
 #[inline]
