@@ -1556,6 +1556,15 @@ pub struct EfsEval {
     /// coordinates. Used by the backtracking logic to selectively scale
     /// only the ψ portion of the step.
     pub psi_indices: Option<Vec<usize>>,
+    /// Representative scale of the inner Hessian's diagonal,
+    /// `H = X'W_HX + S_λ` (+ any barrier perturbation), at β̂.
+    /// Typically `median(diag(H))` or `tr(H) / p`. Inner solvers that
+    /// already materialize `H` during the EFS step computation should
+    /// fill this in so the outer barrier-curvature precondition check
+    /// can use the dimensionally correct comparison
+    /// `max_j τ/Δ_j² > threshold · ref_diag`. When `None`, the EFS
+    /// bridge falls back to a scale-free heuristic.
+    pub inner_hessian_diag_scale: Option<f64>,
 }
 
 /// Common interface for outer smoothing-parameter objectives.
