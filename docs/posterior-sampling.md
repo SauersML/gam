@@ -54,8 +54,8 @@ Total returned draws are `chains × samples`.
 | Bernoulli marginal-slope | Gaussian Laplace |
 | Transformation-normal | Gaussian Laplace |
 
-On Laplace fallback, `posterior.method == "laplace"`, `rhat == 1.0`,
-`ess == n_draws`, and `converged == True` — the draws are i.i.d. by
+With Gaussian Laplace, `posterior.method == "laplace"`, `rhat == 1.0`,
+`ess == n_draws`, and `converged == True` -- the draws are i.i.d. by
 construction. The `PosteriorSamples` API is identical either way.
 
 ## SamplingConfig

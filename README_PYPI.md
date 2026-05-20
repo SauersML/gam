@@ -12,7 +12,8 @@ engine.
 terms, random effects, bounded/constrained coefficients, location-scale
 extensions, survival likelihoods, and flexible/learnable links. Smoothing
 parameters are selected by REML or LAML. Posterior sampling uses NUTS
-where supported, with a Gaussian Laplace fallback elsewhere.
+where supported, and Gaussian Laplace for model classes without an exact
+NUTS path.
 
 Geometric / manifold smooths handle predictor spaces that wrap, including
 circles, cylinders, tori, the sphere (intrinsic Wahba / spherical
@@ -74,7 +75,8 @@ all work without conversion.
 - **Marginal-slope models.** Separate baseline risk from a calibrated
   score's effect, for both Bernoulli and survival outcomes.
 - **Posterior sampling.** `model.sample(...)` runs NUTS where supported,
-  with a Gaussian Laplace fallback elsewhere, behind one API.
+  and Gaussian Laplace for model classes without an exact NUTS path,
+  behind one API.
 
 ## Highlights from the API
 
@@ -127,6 +129,7 @@ Full reference at <https://gamfit.readthedocs.io/en/latest/api-reference/>.
 uv add "gamfit[pandas]"     # pandas + pyarrow input/output
 uv add "gamfit[plot]"       # matplotlib-based plotting
 uv add "gamfit[sklearn]"    # scikit-learn integration
+uv add "gamfit[torch]"      # PyTorch bridge
 uv add "gamfit[all]"        # everything
 ```
 
