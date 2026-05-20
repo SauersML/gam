@@ -6538,6 +6538,55 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     Ok(fitted)
 }
 
+pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    groups: &[CoefficientGroupSpec],
+    priors: &[(String, f64, f64)],
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    if groups.is_empty() {
+        return fit_term_collection_with_penalty_block_gamma_priors(
+            data, y, weights, offset, spec, priors, family, options,
+        );
+    }
+    if priors.is_empty() {
+        return fit_term_collection_with_coefficient_groups(
+            data, y, weights, offset, spec, groups, family, options,
+        );
+    }
+
+    let design = build_term_collection_design(data, spec)?;
+    let base_fit_opts = adaptive_fit_options_base(options, &design);
+    let base_rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
+        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let realized = design
+        .realize_coefficient_groups(groups, &base_rho_prior)
+        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let mut grouped_options = base_fit_opts.clone();
+    grouped_options.rho_prior = realized.rho_prior;
+    let fitted = FittedTermCollection {
+        fit: crate::estimate::fit_gam_with_penalty_specs(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            realized.penalty_specs,
+            realized.nullspace_dims,
+            family,
+            &grouped_options,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}
+
 fn fit_term_collection_forspecwith_heuristic_lambdas(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
