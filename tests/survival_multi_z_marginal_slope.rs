@@ -14,13 +14,12 @@ fn assert_marginal_preservation(
 ) {
     let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale).expect("scale");
     let observed: Vec<f64> = slopes.iter().map(|&r| probit_scale * r).collect();
-    let variance = covariance.quadratic_form(&observed).expect("quadratic form");
+    let variance = covariance
+        .quadratic_form(&observed)
+        .expect("quadratic form");
     let lhs = normal_cdf(-q * c / (1.0 + variance).sqrt());
     let rhs = normal_cdf(-q);
-    assert!(
-        (lhs - rhs).abs() <= 2e-15,
-        "lhs={lhs:.17e} rhs={rhs:.17e}"
-    );
+    assert!((lhs - rhs).abs() <= 2e-15, "lhs={lhs:.17e} rhs={rhs:.17e}");
 }
 
 #[test]
@@ -30,8 +29,8 @@ fn survival_multi_z_k1_diagonal_matches_scalar_eta_bitwise() {
     let slope = [0.27];
     let probit_scale = 0.8;
     let covariance = MarginalSlopeCovariance::Diagonal(array![1.0]);
-    let eta = survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale)
-        .expect("eta");
+    let eta =
+        survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale).expect("eta");
     let observed = probit_scale * slope[0];
     let scalar = q * (1.0 + observed * observed).sqrt() + observed * z[0];
     assert_eq!(eta.to_bits(), scalar.to_bits());
@@ -67,14 +66,8 @@ fn survival_multi_z_k4_low_rank_covariance_preserves_identity() {
 #[test]
 fn survival_multi_z_eta_rejects_score_slope_dimension_mismatch() {
     let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
-    let err = survival_marginal_slope_vector_eta(
-        0.2,
-        &[0.4, -0.8],
-        &[0.3],
-        &covariance,
-        1.0,
-    )
-    .expect_err("dimension mismatch must fail");
+    let err = survival_marginal_slope_vector_eta(0.2, &[0.4, -0.8], &[0.3], &covariance, 1.0)
+        .expect_err("dimension mismatch must fail");
     assert!(err.contains("dimension mismatch"));
 }
 
@@ -116,4 +109,23 @@ fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
         (actual - expected).abs() <= 1e-14,
         "actual={actual:.17e} expected={expected:.17e}"
     );
+}
+
+#[test]
+fn survival_multi_z_neglog_rejects_derivative_guard_violation() {
+    let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
+    let err = survival_marginal_slope_vector_neglog(
+        0.0,
+        0.2,
+        1e-7,
+        &[0.2, -0.1],
+        &[0.4, 0.5],
+        &covariance,
+        1.0,
+        1.0,
+        1e-6,
+        1.0,
+    )
+    .expect_err("derivative guard violation must fail");
+    assert!(err.contains("monotonicity violated"));
 }
