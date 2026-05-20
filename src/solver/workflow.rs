@@ -2138,7 +2138,8 @@ use crate::families::survival_location_scale::{
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,
-    parse_formula, parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
+    marginal_slope_logslope_surfaces, parse_formula, parse_link_choice,
+    parse_matching_auxiliary_formula, parse_surv_response,
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
 use crate::term_builder::{
@@ -3156,18 +3157,15 @@ fn materialize_survival<'a>(
         } else {
             None
         };
-    let marginal_z = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+    let (
+        marginal_z,
+        marginal_logslopespec,
+        marginal_logslopespecs,
+        marginal_slope_deviation_routing,
+    ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         let _base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
-        let z_col_name = marginal_z_column_name
-            .expect("marginal-slope z column should be validated before materialization");
-        let z_idx = resolve_role_col(col_map, z_col_name, "z")?;
-        Some(data.values.column(z_idx).to_owned())
-    } else {
-        None
-    };
-    let (marginal_logslopespec, marginal_slope_deviation_routing) = if survival_mode
-        == SurvivalLikelihoodMode::MarginalSlope
-    {
+        let default_z_column =
+            marginal_z_column_name.expect("marginal-slope z column should be available");
         if let Some(ls_formula) = config.logslope_formula.as_deref() {
             let (_, ls_parsed) =
                 parse_matching_auxiliary_formula(ls_formula, &parsed.response, "logslope_formula")?;
@@ -3192,21 +3190,30 @@ fn materialize_survival<'a>(
             validate_marginal_slope_z_column_exclusion(
                 parsed,
                 &ls_parsed,
-                marginal_z_column_name.expect("marginal-slope z column should be available"),
+                default_z_column,
                 "survival marginal-slope",
                 "logslope_formula",
             )?;
-            (
-                Some(build_termspec_with_geometry(
-                    &ls_parsed.terms,
+            let surfaces = marginal_slope_logslope_surfaces(&ls_parsed, default_z_column)?;
+            let mut z = Array2::<f64>::zeros((data.values.nrows(), surfaces.len()));
+            let mut specs = Vec::with_capacity(surfaces.len());
+            for (surface_idx, surface) in surfaces.iter().enumerate() {
+                let z_idx = resolve_role_col(col_map, &surface.z_column, "z")?;
+                z.column_mut(surface_idx).assign(&data.values.column(z_idx));
+                let aliased_col_map = column_map_with_alias(col_map, "z", &surface.z_column);
+                specs.push(build_termspec_with_geometry(
+                    &surface.terms,
                     data,
-                    marginal_slope_aliased_col_map
-                        .as_ref()
-                        .expect("marginal-slope column map should be available"),
+                    &aliased_col_map,
                     &mut inference_notes,
                     config.scale_dimensions,
                     &policy,
-                )?),
+                )?);
+            }
+            (
+                Some(z),
+                specs.first().cloned(),
+                Some(specs),
                 route_marginal_slope_deviation_blocks(
                     parsed.linkwiggle.as_ref(),
                     ls_parsed.linkwiggle.as_ref(),
@@ -3216,17 +3223,23 @@ fn materialize_survival<'a>(
             validate_marginal_slope_z_column_exclusion(
                 parsed,
                 parsed,
-                marginal_z_column_name.expect("marginal-slope z column should be available"),
+                default_z_column,
                 "survival marginal-slope",
                 "logslope_formula",
             )?;
+            let z_idx = resolve_role_col(col_map, default_z_column, "z")?;
+            let z = data.values.column(z_idx).to_owned().insert_axis(Axis(1));
             (
+                Some(z),
                 Some(termspec.clone()),
+                Some(vec![termspec.clone()]),
                 route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
             )
         }
     } else {
         (
+            None,
+            None,
             None,
             MarginalSlopeDeviationRouting {
                 score_warp: None,
@@ -3415,12 +3428,9 @@ fn materialize_survival<'a>(
                     age_exit: age_exit.clone(),
                     event_target: event.clone(),
                     weights: weights.clone(),
-                    z: marginal_z
-                        .clone()
-                        .ok_or_else(|| {
-                            "marginal-slope survival requires z_column in FitConfig".to_string()
-                        })?
-                        .insert_axis(Axis(1)),
+                    z: marginal_z.clone().ok_or_else(|| {
+                        "marginal-slope survival requires z_column in FitConfig".to_string()
+                    })?,
                     base_link: resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?,
                     marginalspec: termspec.clone(),
                     marginal_offset: threshold_offset.clone(),
@@ -3433,7 +3443,7 @@ fn materialize_survival<'a>(
                     logslopespec: marginal_logslopespec.clone().ok_or_else(|| {
                         "marginal-slope survival is missing logslope spec".to_string()
                     })?,
-                    logslopespecs: None,
+                    logslopespecs: marginal_logslopespecs.clone(),
                     logslope_offset: log_sigma_offset.clone(),
                     score_warp: marginal_slope_score_warp.clone(),
                     link_dev: marginal_slope_link_dev.clone(),

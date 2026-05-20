@@ -5120,6 +5120,7 @@ fn run_outer_with_plan(
                     gradient: seed_eval.gradient.clone(),
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
+                    .with_initial_sample(seed.clone(), initial_sample)
                     .with_bounds(bounds)
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter);
