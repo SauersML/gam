@@ -176,6 +176,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub formula_logslope: Option<String>,
     #[serde(default)]
+    pub formula_logslopes: Option<Vec<String>>,
+    #[serde(default)]
     pub offset_column: Option<String>,
     #[serde(default)]
     pub noise_offset_column: Option<String>,
@@ -215,6 +217,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub z_column: Option<String>,
     #[serde(default)]
+    pub z_columns: Option<Vec<String>>,
+    #[serde(default)]
     pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
     pub latent_score_contract: Option<SavedLatentScoreContract>,
@@ -232,6 +236,8 @@ pub struct FittedModelPayload {
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub logslope_baseline: Option<f64>,
+    #[serde(default)]
+    pub logslope_baselines: Option<Vec<f64>>,
     #[serde(default)]
     pub score_warp_runtime: Option<SavedAnchoredDeviationRuntime>,
     #[serde(default)]
@@ -341,6 +347,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub resolved_termspec_logslope: Option<TermCollectionSpec>,
     #[serde(default)]
+    pub resolved_termspec_logslopes: Option<Vec<TermCollectionSpec>>,
+    #[serde(default)]
     pub adaptive_regularization_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
@@ -390,6 +398,7 @@ impl FittedModelPayload {
             sas_param_covariance: None,
             formula_noise: None,
             formula_logslope: None,
+            formula_logslopes: None,
             offset_column: None,
             noise_offset_column: None,
             beta_noise: None,
@@ -408,12 +417,14 @@ impl FittedModelPayload {
             baseline_timewiggle_double_penalty: None,
             beta_baseline_timewiggle: None,
             z_column: None,
+            z_columns: None,
             latent_z_normalization: None,
             latent_score_contract: None,
             latent_measure: None,
             latent_z_rank_int_calibration: None,
             marginal_baseline: None,
             logslope_baseline: None,
+            logslope_baselines: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
             survival_entry: None,
@@ -454,6 +465,7 @@ impl FittedModelPayload {
             resolved_termspec: None,
             resolved_termspec_noise: None,
             resolved_termspec_logslope: None,
+            resolved_termspec_logslopes: None,
             adaptive_regularization_diagnostics: None,
         }
     }

@@ -747,7 +747,8 @@ fn sample_survival(
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {
                 crate::estimate::PenaltySpec::Block { local, .. } => local,
-                crate::estimate::PenaltySpec::Dense(m) => m,
+                crate::estimate::PenaltySpec::Dense(m)
+                | crate::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => m,
             };
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {

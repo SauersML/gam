@@ -3006,7 +3006,8 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
                     ));
                 }
             }
-            crate::solver::estimate::PenaltySpec::Dense(m) => {
+            crate::solver::estimate::PenaltySpec::Dense(m)
+            | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     return Err(format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}"));
@@ -3361,9 +3362,10 @@ fn prepare_cov_block_kind(bk: &CovariateBlockKind) -> Result<PreparedCovBlock, S
                             col_range: col_range.clone(),
                             total_dim: p,
                         },
-                        crate::solver::estimate::PenaltySpec::Dense(m) => {
-                            PenaltyMatrix::Dense(m.clone())
-                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m)
+                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            matrix: m, ..
+                        } => PenaltyMatrix::Dense(m.clone()),
                     })
                     .collect()
             },
@@ -4260,9 +4262,10 @@ fn prepare_survival_location_scale_model(
                             col_range: col_range.clone(),
                             total_dim: p_wiggle,
                         },
-                        crate::solver::estimate::PenaltySpec::Dense(m) => {
-                            PenaltyMatrix::Dense(m.clone())
-                        }
+                        crate::solver::estimate::PenaltySpec::Dense(m)
+                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            matrix: m, ..
+                        } => PenaltyMatrix::Dense(m.clone()),
                     })
                     .collect()
             },
@@ -4516,7 +4519,8 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), String
                     ));
                 }
             }
-            crate::solver::estimate::PenaltySpec::Dense(m) => {
+            crate::solver::estimate::PenaltySpec::Dense(m)
+            | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     return Err(format!(
