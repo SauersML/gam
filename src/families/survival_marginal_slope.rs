@@ -17242,6 +17242,133 @@ mod tests {
     }
 
     #[test]
+    fn survival_marginal_slope_rigid_row_kernel_matches_coefficient_finite_differences() {
+        let n = 7usize;
+        let family = SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(Array1::from_iter((0..n).map(|i| {
+                if i % 3 == 0 { 1.0 } else { 0.0 }
+            }))),
+            weights: Arc::new(Array1::from_iter(
+                (0..n).map(|i| 0.8 + 0.07 * i as f64),
+            )),
+            z: Arc::new(Array1::from_iter(
+                (0..n).map(|i| -0.6 + 0.2 * i as f64),
+            )),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.15 + 0.04 * i as f64 + 0.08 * j as f64
+            })),
+            design_exit: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.25 + 0.03 * i as f64 - 0.05 * j as f64
+            })),
+            design_derivative_exit: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.10 + 0.02 * i as f64 + 0.03 * j as f64
+            })),
+            offset_entry: Arc::new(Array1::from_iter(
+                (0..n).map(|i| -0.35 + 0.03 * i as f64),
+            )),
+            offset_exit: Arc::new(Array1::from_iter(
+                (0..n).map(|i| 0.15 + 0.04 * i as f64),
+            )),
+            derivative_offset_exit: Arc::new(Array1::from_elem(n, 0.75)),
+            marginal_design: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.20 + 0.05 * ((i + 2 * j) % 5) as f64
+            })),
+            logslope_design: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.12 + 0.04 * ((2 * i + j) % 4) as f64
+            })),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let beta0 = array![0.18, -0.11, 0.24, -0.09, 0.07, -0.13];
+        let states_from_beta = |beta: &Array1<f64>| -> Vec<ParameterBlockState> {
+            let beta_time = beta.slice(s![0..2]).to_owned();
+            let beta_marginal = beta.slice(s![2..4]).to_owned();
+            let beta_logslope = beta.slice(s![4..6]).to_owned();
+            let marginal_eta = family
+                .marginal_design
+                .to_dense()
+                .to_owned()
+                .dot(&beta_marginal);
+            let logslope_eta = family
+                .logslope_design
+                .to_dense()
+                .to_owned()
+                .dot(&beta_logslope);
+            vec![
+                ParameterBlockState {
+                    beta: beta_time,
+                    eta: Array1::zeros(n),
+                },
+                ParameterBlockState {
+                    beta: beta_marginal,
+                    eta: marginal_eta,
+                },
+                ParameterBlockState {
+                    beta: beta_logslope,
+                    eta: logslope_eta,
+                },
+            ]
+        };
+        let ll_at = |beta: &Array1<f64>| -> f64 {
+            let states = states_from_beta(beta);
+            let (ll, _, _) = family
+                .evaluate_exact_newton_joint_dense(&states)
+                .expect("rigid row-kernel evaluation");
+            ll
+        };
+
+        let states0 = states_from_beta(&beta0);
+        let (ll0, gradient, nll_hessian) = family
+            .evaluate_exact_newton_joint_dense(&states0)
+            .expect("base rigid row-kernel evaluation");
+        assert!(ll0.is_finite());
+
+        let step = 1e-5;
+        for axis in 0..beta0.len() {
+            let mut plus = beta0.clone();
+            let mut minus = beta0.clone();
+            plus[axis] += step;
+            minus[axis] -= step;
+            let fd_grad = (ll_at(&plus) - ll_at(&minus)) / (2.0 * step);
+            assert!(
+                (gradient[axis] - fd_grad).abs() <= 2e-6,
+                "coefficient gradient[{axis}] mismatch: analytic={:.12e}, fd={:.12e}",
+                gradient[axis],
+                fd_grad
+            );
+
+            let states_plus = states_from_beta(&plus);
+            let states_minus = states_from_beta(&minus);
+            let (_, grad_plus, _) = family
+                .evaluate_exact_newton_joint_dense(&states_plus)
+                .expect("plus rigid row-kernel evaluation");
+            let (_, grad_minus, _) = family
+                .evaluate_exact_newton_joint_dense(&states_minus)
+                .expect("minus rigid row-kernel evaluation");
+            let fd_ll_hessian_col = (&grad_plus - &grad_minus) / (2.0 * step);
+            for row in 0..beta0.len() {
+                let expected_nll = -fd_ll_hessian_col[row];
+                assert!(
+                    (nll_hessian[[row, axis]] - expected_nll).abs() <= 4e-5,
+                    "coefficient nll_hessian[{row},{axis}] mismatch: analytic={:.12e}, fd={:.12e}",
+                    nll_hessian[[row, axis]],
+                    expected_nll
+                );
+            }
+        }
+    }
+
+    #[test]
     fn survival_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
         // Rigid three-block shape: time p=12, marginal p=20, log-slope p=8.
         // The row kernel couples all three blocks, so the joint Hessian is
