@@ -3373,6 +3373,82 @@ impl ImplicitHyperOperator {
         cache.get_or_insert_with(key, || self.compute_xf(factor))
     }
 
+    fn trace_projected_chunk_reduction(
+        &self,
+        xf: ArrayView2<'_, f64>,
+        u_knot: &Array2<f64>,
+        w: &[f64],
+        c_opt: Option<&[f64]>,
+        rank: usize,
+        start: usize,
+        end: usize,
+    ) -> (f64, f64) {
+        let chunk_n = end - start;
+        let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+        let kd_chunk = self
+            .implicit_deriv
+            .row_chunk_first_raw(self.axis, start..end)
+            .expect("radial scalar evaluation failed during trace chunk reduction");
+        let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, u_knot);
+        let mut design_total = 0.0_f64;
+        let mut correction_total = 0.0_f64;
+        let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
+            dxf_chunk.as_slice()
+        } else {
+            None
+        };
+        let xf_slice_opt = if xf_chunk.is_standard_layout() {
+            xf_chunk.as_slice()
+        } else {
+            None
+        };
+        if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
+            for i_local in 0..chunk_n {
+                let i = start + i_local;
+                let w_i = w[i];
+                let off = i_local * rank;
+                let drow = &dxf_slice[off..off + rank];
+                let xrow = &xf_slice[off..off + rank];
+                let mut acc = 0.0_f64;
+                for k in 0..rank {
+                    acc += drow[k] * xrow[k];
+                }
+                design_total += w_i * acc;
+                if let Some(c) = c_opt {
+                    let c_i = c[i];
+                    let mut acc2 = 0.0_f64;
+                    for k in 0..rank {
+                        let v = xrow[k];
+                        acc2 += v * v;
+                    }
+                    correction_total += c_i * acc2;
+                }
+            }
+        } else {
+            for i_local in 0..chunk_n {
+                let i = start + i_local;
+                let w_i = w[i];
+                let dxf_row = dxf_chunk.row(i_local);
+                let xf_row = xf_chunk.row(i_local);
+                let mut acc = 0.0_f64;
+                for k in 0..rank {
+                    acc += dxf_row[k] * xf_row[k];
+                }
+                design_total += w_i * acc;
+                if let Some(c) = c_opt {
+                    let c_i = c[i];
+                    let mut acc2 = 0.0_f64;
+                    for k in 0..rank {
+                        let v = xf_row[k];
+                        acc2 += v * v;
+                    }
+                    correction_total += c_i * acc2;
+                }
+            }
+        }
+        (design_total, correction_total)
+    }
+
     /// Evaluate `tr(Fᵀ B_d F)` given a precomputed `X · F`. Pulls every
     /// per-axis-redundant `X · F` out of the inner loop so the cache (or
     /// caller-supplied matrix) covers every ψ-axis at once. The remaining
@@ -3394,83 +3470,45 @@ impl ImplicitHyperOperator {
             .max(512)
             .min(n_obs);
 
-        let w = self.w_diag.as_ref();
-        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
+        let w_array = self.w_diag.as_ref();
+        let w = w_array
+            .as_slice()
+            .expect("w_diag must be contiguous for slice access");
+        let c_opt = self
+            .c_x_psi_beta
+            .as_ref()
+            .map(|arc| arc.as_slice().expect("c_x_psi_beta must be contiguous"));
+        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
+        let use_parallel = num_chunks >= 2
+            && rayon::current_thread_index().is_none()
+            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
+        let chunk_totals: Vec<(f64, f64)> = if use_parallel {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunk_rows;
+                    let end = (start + chunk_rows).min(n_obs);
+                    self.trace_projected_chunk_reduction(xf, &u_knot, w, c_opt, rank, start, end)
+                })
+                .collect()
+        } else {
+            let mut totals = Vec::with_capacity(num_chunks);
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                totals.push(
+                    self.trace_projected_chunk_reduction(xf, &u_knot, w, c_opt, rank, start, end),
+                );
+                start = end;
+            }
+            totals
+        };
         let mut design_total = 0.0_f64;
         let mut correction_total = 0.0_f64;
-        let mut start = 0usize;
-        while start < n_obs {
-            let end = (start + chunk_rows).min(n_obs);
-            let chunk_n = end - start;
-
-            // Cached-or-precomputed X·F slice for this chunk.
-            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-
-            // Raw kernel scalars for axis d on this chunk, then a single
-            // (chunk × n_knots) · (n_knots × rank) GEMM gives DXF_chunk.
-            let kd_chunk = self
-                .implicit_deriv
-                .row_chunk_first_raw(self.axis, start..end)
-                .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
-            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
-
-            // Fused inner-product accumulation. Use slice access where
-            // possible so the inner loops vectorize without bounds checks.
-            let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
-                dxf_chunk.as_slice()
-            } else {
-                None
-            };
-            let xf_slice_opt = if xf_chunk.is_standard_layout() {
-                xf_chunk.as_slice()
-            } else {
-                None
-            };
-            if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
-                for i_local in 0..chunk_n {
-                    let i = start + i_local;
-                    let w_i = w[i];
-                    let off = i_local * rank;
-                    let drow = &dxf_slice[off..off + rank];
-                    let xrow = &xf_slice[off..off + rank];
-                    let mut acc = 0.0_f64;
-                    for k in 0..rank {
-                        acc += drow[k] * xrow[k];
-                    }
-                    design_total += w_i * acc;
-                    if let Some(c) = c_opt {
-                        let c_i = c[i];
-                        let mut acc2 = 0.0_f64;
-                        for k in 0..rank {
-                            let v = xrow[k];
-                            acc2 += v * v;
-                        }
-                        correction_total += c_i * acc2;
-                    }
-                }
-            } else {
-                for i_local in 0..chunk_n {
-                    let i = start + i_local;
-                    let w_i = w[i];
-                    let dxf_row = dxf_chunk.row(i_local);
-                    let xf_row = xf_chunk.row(i_local);
-                    let mut acc = 0.0_f64;
-                    for k in 0..rank {
-                        acc += dxf_row[k] * xf_row[k];
-                    }
-                    design_total += w_i * acc;
-                    if let Some(c) = c_opt {
-                        let c_i = c[i];
-                        let mut acc2 = 0.0_f64;
-                        for k in 0..rank {
-                            let v = xf_row[k];
-                            acc2 += v * v;
-                        }
-                        correction_total += c_i * acc2;
-                    }
-                }
-            }
-            start = end;
+        for (d, c) in chunk_totals {
+            design_total += d;
+            correction_total += c;
         }
 
         // Penalty trace: tr(F^T S_psi F) via dense BLAS3.
@@ -10247,11 +10285,13 @@ pub fn compute_hybrid_efs_update(
                     if let Some(op) = drift_ops[idx].as_ref() {
                         op_terms.push((idx, 1.0, op.as_ref()));
                     } else {
-                        projected_drifts[idx] = Some(dense_hop.projected_matrix(
-                            dense_drifts[idx]
-                                .as_ref()
-                                .expect("dense drift should be cached"),
-                        ));
+                        projected_drifts[idx] = Some(
+                            dense_hop.projected_matrix(
+                                dense_drifts[idx]
+                                    .as_ref()
+                                    .expect("dense drift should be cached"),
+                            ),
+                        );
                     }
                 }
                 if !op_terms.is_empty() {
