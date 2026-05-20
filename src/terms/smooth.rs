@@ -18409,7 +18409,7 @@ mod tests {
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
-                    inner_hessian_diag_scale: None,
+                    inner_hessian_scale: None,
                 })
             },
         )
@@ -20189,7 +20189,7 @@ mod tests {
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
-                    inner_hessian_diag_scale: None,
+                    inner_hessian_scale: None,
                 })
             },
         )
@@ -22153,7 +22153,7 @@ mod tests {
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
-                    inner_hessian_diag_scale: None,
+                    inner_hessian_scale: None,
                 })
             },
         )
