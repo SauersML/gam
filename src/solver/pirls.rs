@@ -10126,6 +10126,106 @@ mod tests {
         assert_eq!(decision.reason, "design_not_sparse");
     }
 
+    fn fixed_gaussian_beta(
+        x: Array2<f64>,
+        y: Array1<f64>,
+        penalties: Vec<crate::smooth::BlockwisePenalty>,
+        rho: Array1<f64>,
+    ) -> Array1<f64> {
+        let p = x.ncols();
+        let weights = Array1::<f64>::ones(y.len());
+        let offset = Array1::<f64>::zeros(y.len());
+        let specs: Vec<crate::estimate::PenaltySpec> = penalties
+            .iter()
+            .map(crate::estimate::PenaltySpec::from_blockwise_ref)
+            .collect();
+        let nulls = vec![0; specs.len()];
+        let (canonical, _) =
+            crate::construction::canonicalize_penalty_specs(&specs, &nulls, p, "prior mean test")
+                .expect("canonical penalties");
+        let config = PirlsConfig {
+            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            link_kind: InverseLink::Standard(LinkFunction::Identity),
+            max_iterations: 20,
+            convergence_tolerance: 1e-12,
+            firth_bias_reduction: false,
+            initial_lm_lambda: None,
+        };
+        let problem = PirlsProblem {
+            x,
+            offset: offset.view(),
+            y: y.view(),
+            priorweights: weights.view(),
+            covariate_se: None,
+            gaussian_fixed_cache: None,
+        };
+        let penalty = PenaltyConfig {
+            canonical_penalties: &canonical,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p,
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+            penalty_shrinkage_floor: None,
+            kronecker_factored: None,
+        };
+        let (fit, _) = fit_model_for_fixed_rho(LogSmoothingParamsView::new(rho.view()), problem, penalty, &config, None)
+            .expect("fixed rho fit");
+        fit.beta_transformed.as_ref().clone()
+    }
+
+    #[test]
+    fn constant_prior_mean_centers_penalty() {
+        let x = Array2::<f64>::zeros((4, 1));
+        let y = Array1::<f64>::zeros(4);
+        let penalty = crate::smooth::BlockwisePenalty::ridge(0..1, 1.0)
+            .with_prior_mean(crate::estimate::CoefficientPriorMean::scalar(2.5));
+        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
+        assert!((beta[0] - 2.5).abs() < 1e-10, "beta={beta:?}");
+    }
+
+    #[test]
+    fn functional_prior_mean_recovers_kernel_amplitude() {
+        let x = Array2::<f64>::zeros((5, 3));
+        let y = Array1::<f64>::zeros(5);
+        let metadata = array![2.0];
+        let alpha = 1.75;
+        let penalty = crate::smooth::BlockwisePenalty::ridge(0..3, 1.0).with_prior_mean(
+            crate::estimate::CoefficientPriorMean::functional(
+                metadata,
+                std::sync::Arc::new(move |a: &Array1<f64>| {
+                    let t = a[0];
+                    array![alpha, alpha * t, alpha * t * t]
+                }),
+            ),
+        );
+        let beta = fixed_gaussian_beta(x, y, vec![penalty], array![0.0]);
+        let recovered_alpha = beta[0];
+        assert!((recovered_alpha - alpha).abs() < 1e-10, "beta={beta:?}");
+        assert!((beta[1] / 2.0 - alpha).abs() < 1e-10, "beta={beta:?}");
+        assert!((beta[2] / 4.0 - alpha).abs() < 1e-10, "beta={beta:?}");
+    }
+
+    #[test]
+    fn zero_prior_mean_matches_default_fixed_fit_bitwise() {
+        let x = array![
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [1.0, 3.0],
+            [1.0, 4.0],
+        ];
+        let y = array![0.5, 1.0, 1.5, 2.0, 2.5];
+        let base_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0);
+        let zero_penalty = crate::smooth::BlockwisePenalty::ridge(0..2, 1.0)
+            .with_prior_mean(crate::estimate::CoefficientPriorMean::constant(Array1::zeros(2)));
+        let rho = array![0.25];
+        let beta_default =
+            fixed_gaussian_beta(x.clone(), y.clone(), vec![base_penalty], rho.clone());
+        let beta_zero = fixed_gaussian_beta(x, y, vec![zero_penalty], rho);
+        assert_eq!(beta_default.to_vec(), beta_zero.to_vec());
+    }
+
     #[test]
     fn pirls_decision_summary_logs_on_power_of_two_repetitions() {
         assert!(!should_log_pirls_decision_summary(1));

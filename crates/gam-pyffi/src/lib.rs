@@ -5,8 +5,8 @@ use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
 use gam::estimate::{
-    BlockRole, EstimationError, UnifiedFitResult, saved_latent_cloglog_state_from_fit,
-    saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    BlockRole, EstimationError, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
+    saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{array2_to_matmut, factorize_symmetricwith_fallback};
 use gam::families::family_meta::{
@@ -3520,10 +3520,9 @@ fn extend_model_with_random_effect_level(
 ) -> Result<(), String> {
     let payload: &mut FittedModelPayload = &mut *model;
     let (term_idx, feature_col, coefficient_start, penalty_index) = {
-        let spec = payload
-            .resolved_termspec
-            .as_ref()
-            .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
+        let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
+            "extend_with_group requires saved resolved_termspec; refit".to_string()
+        })?;
         let term_idx = spec
             .random_effect_terms
             .iter()
@@ -3547,10 +3546,9 @@ fn extend_model_with_random_effect_level(
     })?;
     let (level_bits, encoded_value) = level_bits_for_extension(schema_col, &level)?;
     let insert_pos = {
-        let spec = payload
-            .resolved_termspec
-            .as_ref()
-            .ok_or_else(|| "extend_with_group requires saved resolved_termspec; refit".to_string())?;
+        let spec = payload.resolved_termspec.as_ref().ok_or_else(|| {
+            "extend_with_group requires saved resolved_termspec; refit".to_string()
+        })?;
         let levels = spec.random_effect_terms[term_idx]
             .frozen_levels
             .as_ref()
