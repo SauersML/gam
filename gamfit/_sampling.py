@@ -702,7 +702,7 @@ class PosteriorSamples:
         }
         return Summary.from_dict(payload)
 
-    # ---- Posterior predictive -------------------------------------------
+    # ---- Posterior fitted means -----------------------------------------
 
     def predict(
         self,
