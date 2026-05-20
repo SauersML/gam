@@ -1,4 +1,10 @@
+use gam::custom_family::{
+    CoefficientGroupPrior as CustomCoefficientGroupPrior,
+    CoefficientGroupSpec as CustomCoefficientGroupSpec, ParameterBlockSpec, coefficient_label,
+    realize_coefficient_groups_for_custom_family,
+};
 use gam::estimate::{CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
+use gam::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::smooth::{
     CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
     TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
@@ -140,6 +146,60 @@ fn cyclic_coefficient_group_hierarchy_is_rejected() {
         .expect_err("cyclic hierarchy must fail");
 
     assert!(err.to_string().contains("cycle"));
+}
+
+#[test]
+fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
+    let block_spec = |name: &str| ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((4, 2)))),
+        offset: Array1::zeros(4),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: None,
+    };
+    let groups = vec![CustomCoefficientGroupSpec {
+        label: "shared_endpoint_group".to_string(),
+        coefficients: vec![
+            coefficient_label("risk_a", 0),
+            coefficient_label("risk_b", 1),
+        ],
+        parent: None,
+        prior: Some(CustomCoefficientGroupPrior::GammaPrecision {
+            shape: 3.0,
+            rate: 2.0,
+        }),
+        initial_log_precision: Some(0.7),
+    }];
+
+    let realized = realize_coefficient_groups_for_custom_family(
+        &[block_spec("risk_a"), block_spec("risk_b")],
+        &groups,
+        RhoPrior::Flat,
+    )
+    .expect("cross-block coefficient group");
+
+    assert_eq!(realized.outer_labels, vec!["shared_endpoint_group"]);
+    assert_eq!(
+        realized.penalty_labels,
+        vec!["shared_endpoint_group", "shared_endpoint_group"]
+    );
+    for spec in &realized.specs {
+        assert_eq!(spec.penalties.len(), 1);
+        assert_eq!(
+            spec.penalties[0].precision_label(),
+            Some("shared_endpoint_group")
+        );
+        assert_eq!(spec.initial_log_lambdas.as_slice().unwrap(), &[0.7]);
+    }
+    assert_eq!(
+        realized.rho_prior,
+        RhoPrior::Independent(vec![RhoPrior::GammaPrecision {
+            shape: 3.0,
+            rate: 2.0,
+        }])
+    );
 }
 
 #[test]
