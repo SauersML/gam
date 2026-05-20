@@ -2220,17 +2220,17 @@ fn optimize_rho(
     push_candidate(&mut candidates, RHO_LOWER);
     push_candidate(&mut candidates, RHO_UPPER);
     if let Some(rho0) = init_rho {
-        push_candidate(&mut candidates, rho0.clamp(RHO_LOWER, RHO_UPPER));
+        push_candidate(&mut candidates, rho0);
     }
 
+    // Evaluate each candidate exactly once. `min_by` over a comparator that
+    // re-evaluates would do O(n log n) extra `prepared.evaluate` calls during
+    // the sort.
     candidates
         .into_iter()
-        .min_by(|&a, &b| {
-            prepared
-                .evaluate(a)
-                .cost
-                .total_cmp(&prepared.evaluate(b).cost)
-        })
+        .map(|rho| (rho, prepared.evaluate(rho).cost))
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(rho, _)| rho)
         .ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Gaussian REML optimizer produced no candidates".to_string(),
