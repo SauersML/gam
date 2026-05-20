@@ -61,12 +61,150 @@ fn libcuda_loadable() -> bool {
 /// panic the first time `CudaBlas::new` runs. Delegating to cudarc's own
 /// presence check keeps the preflight name list in lockstep with the
 /// names cudarc will actually try.
+///
+/// Strategy: ask cudarc's bare-name probe FIRST. If a complete CUDA
+/// stack is reachable through the loader's normal search path (system
+/// `/usr/local/cuda*`, `ld.so.cache`, or an explicit `LD_LIBRARY_PATH`),
+/// we never touch the bundled wheel stack — keeping exactly one
+/// libcublas/libcudart/libcublasLt/… per family mapped in the process.
+///
+/// The old order was the reverse: preload bundled libs first, *then*
+/// ask cudarc. That order is catastrophic on hosts where both stacks
+/// are reachable. `preload_packaged_cuda_libraries` dlopens pip wheel
+/// libcublas by absolute path, mapping it under `…/site-packages/nvidia/cublas/lib/`.
+/// cudarc's first candidate name is the unversioned `libcublas.so`,
+/// which pip wheels do **not** ship (only `libcublas.so.12`), so the
+/// loader walks `LD_LIBRARY_PATH` → `RUNPATH` → `ld.so.cache` and
+/// finds `/usr/local/cuda*/lib64/libcublas.so` → resolves the symlink
+/// to system `libcublas.so.12`. glibc's `dlopen` deduplicates by
+/// `(device, inode)`, not by SONAME, so the two distinct files coexist
+/// in the process. cuBLAS handle state then splits across two cuBLAS
+/// implementations with different patch versions, different struct
+/// layouts, and different static initialisers — and the next
+/// `cublasDestroy_v2` frees a chunk one implementation never owned,
+/// aborting in glibc with "double free or corruption (!prev)".
+///
+/// Only fall back to the bundled-wheel preload when cudarc's normal
+/// search fails outright (a host with no CUDA on the loader path at
+/// all). And in every case, a defensive scan of `/proc/self/maps`
+/// (`detect_cuda_library_conflicts`) refuses cuBLAS work if a SONAME
+/// family ended up with more than one mapped file anyway.
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
+        if unsafe { cudarc::cublas::sys::is_culib_present() } {
+            return verify_no_cuda_library_conflicts();
+        }
         preload_packaged_cuda_libraries();
-        unsafe { cudarc::cublas::sys::is_culib_present() }
+        if !unsafe { cudarc::cublas::sys::is_culib_present() } {
+            return false;
+        }
+        verify_no_cuda_library_conflicts()
     })
+}
+
+/// Linux-only defensive scan: refuse cuBLAS work if more than one
+/// distinct file is mapped under any CUDA library SONAME family. Logs
+/// a multi-line, actionable error to the `log` crate naming every
+/// conflicting path. See [`detect_cuda_library_conflicts`] for the
+/// mechanism. CPU dispatch takes over from here.
+#[cfg(target_os = "linux")]
+fn verify_no_cuda_library_conflicts() -> bool {
+    match detect_cuda_library_conflicts() {
+        Ok(()) => true,
+        Err(report) => {
+            log::error!("[GPU] {report}");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_no_cuda_library_conflicts() -> bool {
+    true
+}
+
+/// Return the canonical CUDA library family for a file basename, or
+/// `None` if the basename isn't a CUDA library we care about.
+///
+/// Families are matched on the stem before the first `.so`, so
+/// `libcublas.so.12.3.4.1` and `libcublas.so.12` both resolve to
+/// `libcublas`. `libcublasLt.so.12` resolves to `libcublasLt` — a
+/// distinct family despite the shared prefix.
+#[cfg(target_os = "linux")]
+fn cuda_library_family(basename: &str) -> Option<&'static str> {
+    let stem = basename.split(".so").next()?;
+    match stem {
+        "libcuda" => Some("libcuda"),
+        "libcudart" => Some("libcudart"),
+        "libcublas" => Some("libcublas"),
+        "libcublasLt" => Some("libcublasLt"),
+        "libcusparse" => Some("libcusparse"),
+        "libcusolver" => Some("libcusolver"),
+        "libnvJitLink" => Some("libnvJitLink"),
+        "libnvrtc" => Some("libnvrtc"),
+        _ => None,
+    }
+}
+
+/// Detect whether more than one distinct file is mapped into the
+/// process for the same CUDA SONAME family.
+///
+/// On `Ok(())`, mappings are consistent. On `Err`, the string is a
+/// multi-line, actionable report naming every conflicting path —
+/// suitable for passing straight to `log::error!`.
+#[cfg(target_os = "linux")]
+fn detect_cuda_library_conflicts() -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(content) => content,
+        Err(_) => return Ok(()),
+    };
+    let mut by_family: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for line in maps.lines() {
+        let Some(path) = line.split_whitespace().last() else {
+            continue;
+        };
+        if !path.starts_with('/') {
+            continue;
+        }
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if let Some(family) = cuda_library_family(name) {
+            by_family.entry(family).or_default().insert(path.to_string());
+        }
+    }
+    let conflicts: Vec<(&'static str, Vec<String>)> = by_family
+        .into_iter()
+        .filter(|(_, paths)| paths.len() > 1)
+        .map(|(f, p)| (f, p.into_iter().collect()))
+        .collect();
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+    let mut msg = String::from(
+        "CUDA library conflict: multiple distinct files share a SONAME and \
+         coexist in this process. glibc dlopen deduplicates by \
+         (device, inode), not by SONAME, so all of the following are \
+         simultaneously mapped. cuBLAS handle state would split across \
+         them and the next cublasDestroy_v2 would abort with 'double \
+         free or corruption (!prev)'.",
+    );
+    for (family, paths) in &conflicts {
+        msg.push_str(&format!("\n  {family}:"));
+        for path in paths {
+            msg.push_str(&format!("\n    {path}"));
+        }
+    }
+    msg.push_str(
+        "\nKeep exactly one CUDA toolkit reachable to the loader: either \
+         the system toolkit (usually /usr/local/cuda*) or the pip \
+         nvidia-*-cu12 wheels, not both. Disabling CUDA dispatch.",
+    );
+    Err(msg)
 }
 
 #[cfg(target_os = "linux")]
