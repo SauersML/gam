@@ -5131,6 +5131,7 @@ impl SurvivalMarginalSlopeFamily {
             f_aa += exact_kernel::cell_second_derivative_from_moments(
                 neg_cell,
                 &dc_da,
+                &dc_da,
                 &dc_daa,
                 &state.moments,
             )?;
@@ -5186,6 +5187,7 @@ impl SurvivalMarginalSlopeFamily {
             "survival intercept",
             1e-12,
             64,
+            64,
         );
         // If the warm-started solve failed, retry once from the closed-form
         // seed. Cached `a` from a prior PIRLS iter can be far enough from the
@@ -5197,6 +5199,7 @@ impl SurvivalMarginalSlopeFamily {
                 a_closed_form,
                 "survival intercept",
                 1e-12,
+                64,
                 64,
             );
         }
@@ -6070,6 +6073,7 @@ impl SurvivalMarginalSlopeFamily {
                 let mut f_uv = vec![0.0; p * p];
                 let f_aa = exact_kernel::cell_second_derivative_from_moments(
                     neg_cell,
+                    &neg_dc_da,
                     &neg_dc_da,
                     &neg_dc_daa,
                     &state.moments,
@@ -8109,6 +8113,7 @@ impl SurvivalMarginalSlopeFamily {
                     let f_aa = exact_kernel::cell_second_derivative_from_moments(
                         neg_cell,
                         &neg_dc_da,
+                        &neg_dc_da,
                         &neg_dc_daa,
                         &state.moments,
                     )?;
@@ -8137,8 +8142,10 @@ impl SurvivalMarginalSlopeFamily {
                     let f_aa_dir = exact_kernel::cell_third_derivative_from_moments(
                         neg_cell,
                         &neg_dc_da,
+                        &neg_dc_da,
                         &neg_coeff_dir,
                         &neg_dc_daa,
+                        &neg_coeff_a_dir,
                         &neg_coeff_a_dir,
                         &neg_coeff_aa_dir,
                         &state.moments,
@@ -9019,8 +9026,13 @@ impl SurvivalMarginalSlopeFamily {
                 let daa = fx.dc_daa.map(|v| -v);
 
                 f_a += exact_kernel::cell_first_derivative_from_moments(&da, &st.moments)?;
-                f_aa +=
-                    exact_kernel::cell_second_derivative_from_moments(nc, &da, &daa, &st.moments)?;
+                f_aa += exact_kernel::cell_second_derivative_from_moments(
+                    nc,
+                    &da,
+                    &da,
+                    &daa,
+                    &st.moments,
+                )?;
 
                 let mut cd1 = [0.0; 4];
                 let mut ca1 = [0.0; 4];
@@ -9089,8 +9101,10 @@ impl SurvivalMarginalSlopeFamily {
                 f_aa_d1 += exact_kernel::cell_third_derivative_from_moments(
                     nc,
                     &da,
+                    &da,
                     &cd1,
                     &daa,
+                    &ca1,
                     &ca1,
                     &caa1,
                     &st.moments,
@@ -9098,14 +9112,17 @@ impl SurvivalMarginalSlopeFamily {
                 f_aa_d2 += exact_kernel::cell_third_derivative_from_moments(
                     nc,
                     &da,
+                    &da,
                     &cd2,
                     &daa,
+                    &ca2,
                     &ca2,
                     &caa2,
                     &st.moments,
                 )?;
                 f_aa_d12 += exact_kernel::cell_fourth_derivative_from_moments(
                     nc,
+                    &da,
                     &da,
                     &cd1,
                     &cd2,
@@ -9117,6 +9134,8 @@ impl SurvivalMarginalSlopeFamily {
                     &cd12,
                     &caa1,
                     &caa2,
+                    &ca12,
+                    &ca12,
                     &[0.0; 4],
                     &st.moments,
                 )?;
@@ -9184,6 +9203,10 @@ impl SurvivalMarginalSlopeFamily {
                         &cu1,
                         &cu2,
                         &cd12,
+                        &cau1,
+                        &cau2,
+                        &ca12,
+                        &[0.0; 4],
                         &[0.0; 4],
                         &st.moments,
                     )?;
@@ -9266,6 +9289,9 @@ impl SurvivalMarginalSlopeFamily {
                             &cv1,
                             &cv2,
                             &cd12,
+                            &[0.0; 4],
+                            &[0.0; 4],
+                            &[0.0; 4],
                             &[0.0; 4],
                             &st.moments,
                         )?;
@@ -14913,6 +14939,113 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
+    fn evaluate_exact_newton_joint_dense_per_z(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let slices = block_slices(self, block_states);
+        let total = slices.total;
+        let k = self.score_dim();
+        let dim = 3 + k;
+        let beta_time = &block_states[0].beta;
+        let beta_logslope = &block_states[2].beta;
+        let probit_scale = self.probit_frailty_scale();
+        let (ll, grad, hess) = (0..self.n)
+            .into_par_iter()
+            .try_fold(
+                || (0.0, Array1::<f64>::zeros(total), Array2::<f64>::zeros((total, total))),
+                |mut acc, row| -> Result<_, String> {
+                    let q0 = self.design_entry.dot_row(row, beta_time)
+                        + self.offset_entry[row]
+                        + block_states[1].eta[row];
+                    let q1 = self.design_exit.dot_row(row, beta_time)
+                        + self.offset_exit[row]
+                        + block_states[1].eta[row];
+                    let qd1 = self.design_derivative_exit.dot_row(row, beta_time)
+                        + self.derivative_offset_exit[row];
+                    let slopes = self.logslope_surface_values_for_row(row, beta_logslope)?;
+                    let z = self.z.row(row).to_vec();
+                    let (nll, f_pi, f_pipi) = row_primary_closed_form_vector(
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &z,
+                        &self.score_covariance,
+                        self.weights[row],
+                        self.event[row],
+                        self.derivative_guard,
+                        probit_scale,
+                    )?;
+                    acc.0 -= nll;
+                    let mut j = Array2::<f64>::zeros((dim, total));
+                    let entry = self.design_entry.try_row_chunk(row..row + 1).map_err(|e| {
+                        format!("evaluate_exact_newton_joint_dense_per_z entry row: {e}")
+                    })?;
+                    let exit = self.design_exit.try_row_chunk(row..row + 1).map_err(|e| {
+                        format!("evaluate_exact_newton_joint_dense_per_z exit row: {e}")
+                    })?;
+                    let deriv = self
+                        .design_derivative_exit
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| {
+                            format!("evaluate_exact_newton_joint_dense_per_z derivative row: {e}")
+                        })?;
+                    let marginal = self
+                        .marginal_design
+                        .try_row_chunk(row..row + 1)
+                        .map_err(|e| {
+                            format!("evaluate_exact_newton_joint_dense_per_z marginal row: {e}")
+                        })?;
+                    j.slice_mut(s![0, slices.time.clone()]).assign(&entry.row(0));
+                    j.slice_mut(s![1, slices.time.clone()]).assign(&exit.row(0));
+                    j.slice_mut(s![2, slices.time.clone()]).assign(&deriv.row(0));
+                    j.slice_mut(s![0, slices.marginal.clone()])
+                        .assign(&marginal.row(0));
+                    j.slice_mut(s![1, slices.marginal.clone()])
+                        .assign(&marginal.row(0));
+                    let g_row = self.logslope_surface_row(row)?;
+                    for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
+                        j.slice_mut(s![3 + coord, slices.logslope.start + range.start..slices.logslope.start + range.end])
+                            .assign(&g_row.slice(s![range.clone()]));
+                    }
+                    for a in 0..dim {
+                        for col in 0..total {
+                            acc.1[col] -= f_pi[a] * j[[a, col]];
+                        }
+                    }
+                    for a in 0..dim {
+                        for b in 0..dim {
+                            let alpha = f_pipi[[a, b]];
+                            if alpha == 0.0 {
+                                continue;
+                            }
+                            for ca in 0..total {
+                                let va = j[[a, ca]] * alpha;
+                                if va == 0.0 {
+                                    continue;
+                                }
+                                for cb in 0..total {
+                                    acc.2[[ca, cb]] += va * j[[b, cb]];
+                                }
+                            }
+                        }
+                    }
+                    Ok(acc)
+                },
+            )
+            .try_reduce(
+                || (0.0, Array1::<f64>::zeros(total), Array2::<f64>::zeros((total, total))),
+                |mut a, b| -> Result<_, String> {
+                    a.0 += b.0;
+                    a.1 += &b.1;
+                    a.2 += &b.2;
+                    Ok(a)
+                },
+            )?;
+        Ok((ll, grad, hess))
+    }
+
     /// Blockwise exact-Newton for the flexible (score-warp / link-deviation)
     /// model.
     ///
@@ -15716,6 +15849,11 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if total >= 512 {
             return Ok(None);
         }
+        if self.per_z_logslope_active() {
+            return Ok(Some(
+                self.evaluate_exact_newton_joint_dense_per_z(block_states)?.2,
+            ));
+        }
         Ok(Some(
             self.evaluate_exact_newton_joint_dense(block_states)?.2,
         ))
@@ -15726,6 +15864,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        if self.per_z_logslope_active() {
+            let (log_likelihood, gradient, _) =
+                self.evaluate_exact_newton_joint_dense_per_z(block_states)?;
+            return Ok(Some(ExactNewtonJointGradientEvaluation {
+                log_likelihood,
+                gradient,
+            }));
+        }
         if self.effective_flex_active(block_states)? || self.flex_timewiggle_active() {
             let (log_likelihood, gradient) =
                 self.evaluate_exact_newton_joint_gradient_dynamic_q(block_states)?;
@@ -15752,6 +15898,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        if self.per_z_logslope_active() {
+            return Ok(None);
+        }
         if !self.effective_flex_active(block_states)? && !self.flex_timewiggle_active() {
             let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
             return Ok(Some(Arc::new(RowKernelHessianWorkspace::new(kern)?)));
@@ -15771,6 +15920,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         _: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        if self.per_z_logslope_active() {
+            return Ok(None);
+        }
         if !self.effective_flex_active(block_states)? && !self.flex_timewiggle_active() {
             // Rigid path: RowKernel<4> operator wired through the supplied
             // `RowSet`. The cache and every assembly function honour the
@@ -15809,7 +15961,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
         // assembly.
-        true
+        !self.per_z_logslope_active()
     }
 
     fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
@@ -15820,7 +15972,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // `DriftDerivResult::Operator`. Advertising this capability lets the
         // outer planner keep ARC/Newton curvature at large n or large ψ_dim
         // while routing the representation through matrix-free HVPs.
-        true
+        !self.per_z_logslope_active()
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -15828,6 +15980,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.per_z_logslope_active() {
+            return Ok(None);
+        }
         if self.effective_flex_active(block_states)? {
             return if self.flex_timewiggle_active() {
                 self.exact_newton_joint_hessian_directional_derivative_timewiggle_flex(
@@ -15866,6 +16021,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.per_z_logslope_active() {
+            return Ok(None);
+        }
         if self.effective_flex_active(block_states)? {
             if self.flex_timewiggle_active() {
                 return self
@@ -15963,6 +16121,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if self.per_z_logslope_active() {
+            return Ok(None);
+        }
         Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -16603,7 +16764,7 @@ fn combine_logslope_surface_designs(
         let width = design.design.ncols();
         ranges.push(offset..offset + width);
         blocks.push(design.design.clone());
-        for (local_penalty_idx, penalty) in design.penalties.into_iter().enumerate() {
+        for (local_penalty_idx, penalty) in design.penalties.iter().cloned().enumerate() {
             let global_index = penalties.len();
             penalties.push(shift_penalty(penalty, offset));
             if let Some(info) = design.penaltyinfo.get(local_penalty_idx) {
@@ -16615,15 +16776,15 @@ fn combine_logslope_surface_designs(
                 penaltyinfo.push(info);
             }
         }
-        nullspace_dims.extend(design.nullspace_dims);
-        dropped_penaltyinfo.extend(design.dropped_penaltyinfo);
-        linear_ranges.extend(design.linear_ranges.into_iter().map(|(name, range)| {
+        nullspace_dims.extend(design.nullspace_dims.iter().copied());
+        dropped_penaltyinfo.extend(design.dropped_penaltyinfo.iter().cloned());
+        linear_ranges.extend(design.linear_ranges.iter().cloned().map(|(name, range)| {
             (
                 format!("logslope[z{surface_idx}]::{name}"),
                 (range.start + offset)..(range.end + offset),
             )
         }));
-        random_effect_ranges.extend(design.random_effect_ranges.into_iter().map(
+        random_effect_ranges.extend(design.random_effect_ranges.iter().cloned().map(
             |(name, range)| {
                 (
                     format!("logslope[z{surface_idx}]::{name}"),
@@ -16631,7 +16792,7 @@ fn combine_logslope_surface_designs(
                 )
             },
         ));
-        random_effect_levels.extend(design.random_effect_levels);
+        random_effect_levels.extend(design.random_effect_levels.iter().cloned());
         offset += width;
     }
     combined.design = DesignMatrix::hstack(blocks)
@@ -20422,11 +20583,13 @@ mod tests {
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             score_warp: None,
             link_dev: None,
             time_linear_constraints: None,
@@ -20482,11 +20645,13 @@ mod tests {
             offset_entry: Arc::new(Array1::zeros(2)),
             offset_exit: Arc::new(Array1::zeros(2)),
             derivative_offset_exit: Arc::new(array![0.25, 0.5]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((2, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((2, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             time_linear_constraints: structural_time_coefficient_constraints(
                 &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
                     [1.0, 2.0],
@@ -20567,11 +20732,13 @@ mod tests {
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             time_linear_constraints: Some(constraints),
             score_warp: None,
             link_dev: None,
@@ -20614,11 +20781,13 @@ mod tests {
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             time_linear_constraints: append_timewiggle_tail_nonnegative_constraints(
                 structural_time_coefficient_constraints(
                     &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20691,11 +20860,13 @@ mod tests {
             offset_exit: Arc::new(array![0.0]),
             // offset = derivative_guard exactly (the production setup).
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             score_warp: None,
             link_dev: None,
             time_linear_constraints: None,
@@ -20790,11 +20961,13 @@ mod tests {
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![1e-6]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             score_warp: None,
             link_dev: None,
             time_linear_constraints: None,
@@ -20853,11 +21026,13 @@ mod tests {
             offset_entry: Arc::new(array![0.0]),
             offset_exit: Arc::new(array![0.0]),
             derivative_offset_exit: Arc::new(array![0.2]),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from()),
-            logslope_surface_ranges: vec![0..0],
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((1, 0)),
+            )),
             logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((1, 0)),
             )),
+            logslope_surface_ranges: vec![0..0],
             score_warp: None,
             link_dev: None,
             time_linear_constraints: structural_time_coefficient_constraints(
@@ -21450,7 +21625,7 @@ mod tests {
             n,
             event: Arc::new(event),
             weights: Arc::new(weights),
-            z: Arc::new(z),
+            z: Arc::new(z.insert_axis(Axis(1))),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
@@ -22104,7 +22279,7 @@ mod tests {
             n,
             event: Arc::new(event),
             weights: Arc::new(weights),
-            z: Arc::new(z),
+            z: Arc::new(z.insert_axis(Axis(1))),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
