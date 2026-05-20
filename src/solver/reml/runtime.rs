@@ -334,7 +334,7 @@ impl<'a> RemlState<'a> {
             .collect::<Result<_, _>>()?;
         let h_diag = Array1::from(h_diag_vec);
         let m_vec = c_array * &h_diag;
-        let x_m = x_dense.t().dot(&m_vec);
+        let x_m = crate::faer_ndarray::fast_atv(x_dense, &m_vec);
         let y = h_inv_solve(&x_m)?;
         Ok(TkSharedIntermediates {
             h_diag,
@@ -801,7 +801,7 @@ impl<'a> RemlState<'a> {
         let has_design_deriv = x_fixed.is_some();
         if let Some(x_theta) = x_fixed {
             let ch = c_array * &shared.h_diag;
-            design_q_prime += &x_theta.t().dot(&ch);
+            design_q_prime += &crate::faer_ndarray::fast_atv(x_theta, &ch);
             ndarray::Zip::from(&mut h_prime)
                 .and(x_theta.rows())
                 .and(z.columns())
@@ -809,7 +809,7 @@ impl<'a> RemlState<'a> {
         }
 
         let q_weight_prime = &(&c_prime * &shared.h_diag) + &(c_array * &h_prime);
-        let q_prime = x_dense.t().dot(&q_weight_prime) + design_q_prime;
+        let q_prime = crate::faer_ndarray::fast_atv(x_dense, &q_weight_prime) + design_q_prime;
         let q_term_prime = 0.25 * q_prime.dot(&shared.y);
 
         let d_term_prime = -0.125
