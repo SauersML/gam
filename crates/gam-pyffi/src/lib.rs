@@ -3997,6 +3997,14 @@ fn predict_columns(
             "effective_se".to_string(),
             prediction.eta_standard_error.to_vec(),
         );
+        columns.insert(
+            "effective_variance".to_string(),
+            prediction
+                .eta_standard_error
+                .iter()
+                .map(|se| se * se)
+                .collect(),
+        );
         columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
         columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
     } else {
@@ -4027,7 +4035,14 @@ fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, 
 }
 
 fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
-    let preferred = ["eta", "mean", "effective_se", "mean_lower", "mean_upper"];
+    let preferred = [
+        "eta",
+        "mean",
+        "effective_se",
+        "effective_variance",
+        "mean_lower",
+        "mean_upper",
+    ];
     let mut out = Vec::<Vec<f64>>::new();
     let mut seen = BTreeSet::<&str>::new();
     for key in preferred {
