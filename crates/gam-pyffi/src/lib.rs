@@ -3849,6 +3849,8 @@ struct CoefficientStatePayload {
     schema: Option<DataSchema>,
     training_feature_ranges: Option<Vec<(f64, f64)>>,
     random_column_ranges: Vec<(usize, usize)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
@@ -3878,6 +3880,7 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         schema: payload.data_schema.clone(),
         training_feature_ranges: payload.training_feature_ranges.clone(),
         random_column_ranges: random_ranges,
+        group_metadata: payload.group_metadata.clone(),
     };
     serde_json::to_string(&out)
         .map_err(|err| format!("failed to serialize coefficient state: {err}"))
