@@ -1173,22 +1173,40 @@ impl BarrierConfig {
         Ok(-self.tau * slacks.iter().map(|&d| d.ln()).sum::<f64>())
     }
 
-    /// Scale-free detection of barrier-dominated geometry: returns `true` when
-    /// one (or a small handful of) β coordinates sit so much closer to the
-    /// boundary than the rest that the barrier diagonal `τ / (β_j − l_j)²` is
-    /// locally concentrated and EFS — which assumes Hessian ≈ X'WX + S and
-    /// ignores the barrier drift — becomes unreliable.
+    /// Detection of barrier-dominated geometry, where EFS — which assumes
+    /// inner Hessian ≈ X'WX + S and ignores the log-barrier drift
+    /// `τ / (β_j − l_j)²` on its diagonal — becomes unreliable. Returns
+    /// `true` whenever at least one of the following holds (each captures a
+    /// distinct failure mode of the EFS precondition):
     ///
-    /// Concretely, with slacks Δ_j = β_j − l_j, returns `true` iff
-    /// `min_j Δ_j  <  ratio · median_j Δ_j`. This depends only on the slack
-    /// *ratios*, so it is independent of the absolute scale of β, of τ, and
-    /// of the inner Hessian magnitude — the three quantities the old
-    /// `barrier_curvature_is_significant(_, ref_diag=1.0, _)` heuristic
-    /// conflated.
+    /// (a) **Asymmetric concentration.** With slacks Δ_j = β_j − l_j,
+    /// `min_j Δ_j < ratio · median_j Δ_j`. This is a *scale-free* check
+    /// using only slack ratios, so it is independent of the absolute scale
+    /// of β. It catches the common pathology where one constrained
+    /// coefficient runs to its bound while the rest stay healthy — that
+    /// one coord's `τ/Δ²` then dominates the inner Hessian diagonal at
+    /// that coord, and EFS's multiplicative update is no longer
+    /// guaranteed-ascent there.
     ///
-    /// `ratio` of 0.1 means "the tightest slack is at least 10× tighter than
-    /// the typical slack." Returns `true` on infeasible β.
-    pub fn barrier_curvature_locally_concentrated(&self, beta: &Array1<f64>, ratio: f64) -> bool {
+    /// (b) **Absolute saturation.** `τ / min_j Δ_j² ≥ saturation_threshold`.
+    /// This is a *dimensional* check that catches the case (a) misses:
+    /// when ALL slacks shrink together near the optimum, slack ratios stay
+    /// near 1 but the per-coord barrier curvature still saturates. With
+    /// the default `τ = 1e-6` and a `saturation_threshold` of 1.0 (the
+    /// natural unit penalty scale), this fires at `Δ_min ≲ 1e-3`.
+    ///
+    /// Returns `true` on infeasible β (Δ_j ≤ 0).
+    ///
+    /// Replaces the older `barrier_curvature_is_significant(_, ref_diag, _)`,
+    /// whose `ref_diag` was a representative diagonal of `X'W_HX + S` that
+    /// no call site could compute correctly without surfacing the inner
+    /// Hessian out to the EFS bridge.
+    pub fn barrier_curvature_locally_concentrated(
+        &self,
+        beta: &Array1<f64>,
+        ratio: f64,
+        saturation_threshold: f64,
+    ) -> bool {
         let mut slacks = match self.slacks(beta) {
             Some(s) => s,
             None => return true, // infeasible → conservatively unreliable
@@ -1197,7 +1215,17 @@ impl BarrierConfig {
             return false;
         }
         let min_slack = slacks.iter().copied().fold(f64::INFINITY, f64::min);
-        // Sort to find the median; len ≥ 1 so this is well-defined.
+
+        // (b) Absolute saturation: τ / Δ_min² ≥ threshold. Catches the
+        // symmetric near-boundary regime that ratio-only checks miss.
+        if min_slack > 0.0 && min_slack.is_finite() && saturation_threshold.is_finite() {
+            let max_barrier_curv = self.tau / (min_slack * min_slack);
+            if max_barrier_curv >= saturation_threshold {
+                return true;
+            }
+        }
+
+        // (a) Asymmetric concentration: min Δ ≪ median Δ.
         slacks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = if slacks.len() % 2 == 1 {
             slacks[slacks.len() / 2]

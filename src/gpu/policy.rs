@@ -12,7 +12,11 @@
 //!
 //! The crossover point for routing a kernel is "when GPU compute saving
 //! exceeds the host↔device transfer cost", computed from those three
-//! measured numbers. Nothing here knows or cares about product names.
+//! measured numbers. If a calibrated GPU's measured FP64 is weaker than
+//! the host CPU, the policy still leaves a finite bulk-work route open:
+//! large or batched kernels can use any available CUDA device instead of
+//! being permanently disabled. Nothing here knows or cares about product
+//! names.
 
 use super::calibration::measured_cpu_fp64_gflops;
 use super::device::GpuDeviceInfo;
@@ -27,6 +31,14 @@ const CPU_FP64_GFLOPS_FLOOR: f64 = 5.0;
 /// reports zero (e.g. all `cuMemcpy` calls returned errors after timing),
 /// fall back to a low Gen3-ish baseline rather than dividing by zero.
 const PCIE_GB_PER_S_FLOOR: f64 = 4.0;
+
+/// Minimum effective speedup used for dispatch-threshold math once a CUDA
+/// device has successfully calibrated. Some consumer/small GPUs expose weak
+/// FP64 relative to a many-core CPU; using raw measured FP64 there made the
+/// crossover infinite and disabled the device entirely. This keeps the
+/// policy finite while the existing workload thresholds still reject tiny
+/// kernels where launch + transfer overhead dominate.
+const AVAILABLE_GPU_EFFECTIVE_SPEEDUP_FLOOR: f64 = 1.05;
 
 /// Per-operation minimum workload sizes the cuBLAS / cuSPARSE / cuSOLVER
 /// backends need to clear before GPU dispatch beats the in-process CPU
@@ -100,7 +112,10 @@ impl DispatchPolicy {
     }
 
     fn from_measurements(peak_gpu_gflops: f64, cpu_gflops: f64, pcie_gb_per_s: f64) -> Self {
-        let speedup = (peak_gpu_gflops / cpu_gflops).max(1.0);
+        let effective_gpu_gflops =
+            peak_gpu_gflops.max(cpu_gflops * AVAILABLE_GPU_EFFECTIVE_SPEEDUP_FLOOR);
+        let speedup =
+            (effective_gpu_gflops / cpu_gflops).max(AVAILABLE_GPU_EFFECTIVE_SPEEDUP_FLOOR);
 
         // The payload constants below model the dispatch crossover as
         // "minimum FLOPs to amortize an HtoD/DtoH transfer of this many
@@ -111,19 +126,19 @@ impl DispatchPolicy {
         // from the calibrated values passed in.
         let gemm_min_flops = flops_threshold(
             /*payload_bytes=*/ 32.0 * 1024.0 * 1024.0,
-            peak_gpu_gflops,
+            effective_gpu_gflops,
             cpu_gflops,
             pcie_gb_per_s,
         );
         let gemv_min_flops = flops_threshold(
             /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
-            peak_gpu_gflops,
+            effective_gpu_gflops,
             cpu_gflops,
             pcie_gb_per_s,
         );
         let trsm_min_flops = flops_threshold(
             /*payload_bytes=*/ 16.0 * 1024.0 * 1024.0,
-            peak_gpu_gflops,
+            effective_gpu_gflops,
             cpu_gflops,
             pcie_gb_per_s,
         );
@@ -254,8 +269,9 @@ impl DispatchPolicy {
 /// Solves `F / gpu + bytes / pcie ≤ F / cpu` for `F`:
 ///   `F ≥ bytes · gpu · cpu / (pcie · (gpu − cpu))`
 ///
-/// Returns `f64::INFINITY` when the GPU is slower than the host (the
-/// runtime then unconditionally declines dispatch).
+/// Callers pass an effective GPU throughput that is at least slightly above
+/// the CPU baseline, so calibrated CUDA devices retain a finite bulk-work
+/// route even when raw measured FP64 is weaker than the host.
 fn crossover_flops(
     payload_bytes: f64,
     peak_gpu_gflops: f64,
@@ -374,6 +390,21 @@ mod tests {
         assert!(!p.route_chol_solve(1_000_000));
         assert!(!p.route_syevd(1_000_000));
         assert!(!p.route_trsm(1_000_000, 1_000_000));
+    }
+
+    #[test]
+    fn slow_available_gpu_still_routes_bulk_work() {
+        let p = DispatchPolicy::from_measurements(
+            /*peak_gpu_gflops=*/ 20.0, /*cpu_gflops=*/ 200.0,
+            /*pcie_gb_per_s=*/ 16.0,
+        );
+
+        assert!(p.gemm_min_flops < u64::MAX);
+        assert!(p.gemv_min_flops < u64::MAX);
+        assert!(p.trsm_min_flops < u64::MAX);
+        assert!(!p.route_gemm(128, 128, 128));
+        assert!(p.route_gemm(8_192, 8_192, 8_192));
+        assert!(p.route_xt_diag_y(1_000_000, 512, 512));
     }
 
     #[test]
