@@ -1028,6 +1028,8 @@ pub struct CoefficientGroupSpec {
     pub selectors: Vec<CoefficientSelector>,
     pub parent: Option<String>,
     pub prior: Option<CoefficientGroupPrior>,
+    #[serde(skip, default)]
+    pub prior_mean: crate::solver::estimate::CoefficientPriorMean,
 }
 
 #[derive(Debug, Clone)]
@@ -1067,9 +1069,9 @@ fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
 
 fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMetadata<'_> {
     PenaltyBlockGammaPriorMetadata {
-        label: penalty_block_label_candidates(info)
-            .into_iter()
-            .next()
+        label: info
+            .termname
+            .clone()
             .unwrap_or_else(|| format!("penalty:{}", info.global_index)),
         global_index: info.global_index,
         termname: info.termname.as_deref(),
@@ -1126,7 +1128,8 @@ fn realize_keyed_penalty_block_gamma_priors(
     let prior = realize_penalty_block_gamma_priors(design, |metadata| {
         let info = design
             .penaltyinfo
-            .get(metadata.global_index)
+            .iter()
+            .find(|info| info.global_index == metadata.global_index)
             .expect("metadata global index should match penaltyinfo");
         for label in penalty_block_label_candidates(info) {
             if let Some(value) = keyed.get(&label) {
@@ -1345,10 +1348,21 @@ fn realize_coefficient_groups(
     for group in groups {
         let cols = resolved.get(&group.name).expect("group was resolved above");
         let mut penalty = Array2::<f64>::zeros((p, p));
+        let local_mean = group
+            .prior_mean
+            .evaluate(cols.len(), &format!("coefficient group '{}'", group.name))
+            .map_err(|err| BasisError::InvalidInput(err.to_string()))?;
+        let mut prior_mean = Array1::<f64>::zeros(p);
         for &col in cols {
             penalty[[col, col]] = 1.0;
         }
-        penalty_specs.push(PenaltySpec::Dense(penalty));
+        for (mean_idx, &col) in cols.iter().enumerate() {
+            prior_mean[col] = local_mean[mean_idx];
+        }
+        penalty_specs.push(PenaltySpec::DenseWithMean {
+            matrix: penalty,
+            prior_mean: crate::solver::estimate::CoefficientPriorMean::constant(prior_mean),
+        });
         nullspace_dims.push(p.saturating_sub(cols.len()));
         group_column_indices.push((group.name.clone(), cols.iter().copied().collect()));
     }
