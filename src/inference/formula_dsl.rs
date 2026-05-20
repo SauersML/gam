@@ -1651,7 +1651,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options("logslope", &options, &[], raw)?;
                 if vars.len() < 2 {
                     return Err(format!(
-                        "logslope() expects a z column followed by one or more RHS terms: {raw}"
+                        "logslope() expects a z column followed by one or more RHS terms; add one logslope(z, ...) declaration per vector-z coordinate: {raw}"
                     ));
                 }
                 let z_column = vars[0].trim();
