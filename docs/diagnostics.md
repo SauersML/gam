@@ -108,7 +108,7 @@ plt.tight_layout()
 
 | `kind` | What it shows |
 | --- | --- |
-| `"prediction"` | Fitted curve with credible band, observed points overlaid. |
+| `"prediction"` | Fitted curve with pointwise Wald band, observed points overlaid. |
 | `"residuals"` | Residuals vs. predicted mean. |
 | `"observed_vs_predicted"` | Observed vs predicted with identity line. |
 

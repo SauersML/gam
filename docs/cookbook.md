@@ -297,7 +297,7 @@ preds = model.predict(
 # preds["patient_id"] is preserved verbatim.
 ```
 
-## Posterior predictive bands
+## Posterior mean bands
 
 ```python
 posterior = model.sample(train, seed=42)

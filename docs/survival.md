@@ -1,7 +1,7 @@
 # Survival models
 
-`gamfit` fits left-truncated, right-censored, interval-censored survival
-data with smooth covariate effects. The response is `Surv(entry, exit, event)`
+`gamfit` fits delayed-entry / left-truncated, right-censored survival data
+with smooth covariate effects. The response is `Surv(entry, exit, event)`
 and you choose a **likelihood mode** that controls how the baseline and
 covariate effects are parameterized.
 
@@ -53,7 +53,7 @@ location-scale, latent), pick the family with `baseline_target=`:
 
 | `baseline_target` | Extra parameters | Use when |
 | --- | --- | --- |
-| `"linear"` | — | Constant hazard. |
+| `"linear"` | — | Linear log-cumulative-hazard baseline; the constant-hazard model is the special Weibull case with shape 1. |
 | `"weibull"` | `baseline_scale`, `baseline_shape` (both > 0) | Monotone hazard. |
 | `"gompertz"` | `baseline_rate` (> 0) | Exponentially-rising hazard (e.g. mortality with age). |
 | `"gompertz-makeham"` | `baseline_rate`, `baseline_makeham` (both > 0) | Gompertz + an age-independent additive hazard floor. |
@@ -143,13 +143,14 @@ pred = model.predict(test_df, with_uncertainty=True)
 S = pred.survival_at([1, 5, 10])
 se_S = pred.survival_se_at([1, 5, 10])
 
-upper = S + 1.96 * se_S
+upper = (S + 1.96 * se_S).clip(0.0, 1.0)
 lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
 `with_uncertainty=True` is honored for location-scale survival models. For
-other survival modes, use `Model.sample(...)` and the posterior-predictive
-route — see [posterior-sampling.md](posterior-sampling.md).
+other survival modes, `Model.sample(...)` gives posterior coefficient draws;
+`PosteriorSamples.predict(...)` / `predict_draws(...)` are restricted to
+standard non-link-wiggle GAMs. See [posterior-sampling.md](posterior-sampling.md).
 
 ## Complete example
 
@@ -157,7 +158,7 @@ route — see [posterior-sampling.md](posterior-sampling.md).
 import gamfit
 import pandas as pd
 
-# Synthetic interval-censored data
+# Synthetic delayed-entry / right-censored data
 df = pd.DataFrame({
     "entry": [0, 0, 0, 5, 5, 0],
     "exit":  [12, 8, 30, 22, 14, 15],

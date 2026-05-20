@@ -114,7 +114,7 @@ posterior.to_numpy()          # (n_draws, n_coeffs)
 posterior.to_pandas()         # DataFrame with coefficient names as columns
 ```
 
-### Posterior predictive bands
+### Posterior mean bands
 
 ```python
 bands = posterior.predict(test_df, level=0.95)
@@ -128,7 +128,7 @@ roughly `n_draws × chunk_size × 8` bytes regardless of total prediction-set
 size. Set `chunk_size=None` to materialise the full matrix.
 
 Supports standard non-link-wiggle GAMs. Other model classes raise with a
-pointer to `Model.predict(interval=...)`.
+class-specific prediction error.
 
 ### Full draws
 
@@ -218,15 +218,17 @@ or_lo, or_hi = np.quantile(or_draws, [0.025, 0.975])
 print(f"OR = {or_mean:.2f} (95% CI {or_lo:.2f}–{or_hi:.2f})")
 ```
 
-### Posterior-predictive p-value
+### Posterior fitted-mean residual check
 
 ```python
 pp = posterior.predict_draws(train_df)
-# Replicate residual sum of squares from each posterior draw
+# Residual sum of squares against the conditional mean at each draw.
 import numpy as np
 y = train_df["y"].to_numpy()
-sse_rep = ((pp.mean - y[None, :]) ** 2).sum(axis=1)
-print("posterior-predictive p-value:", (sse_rep > sse_obs).mean())
+fitted_mean = pp.mean.mean(axis=0)
+sse_obs = ((y - fitted_mean) ** 2).sum()
+sse_draw = ((pp.mean - y[None, :]) ** 2).sum(axis=1)
+print("posterior fitted-mean SSE tail area:", (sse_draw > sse_obs).mean())
 ```
 
 ### Reproducibility

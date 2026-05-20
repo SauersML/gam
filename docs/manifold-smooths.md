@@ -67,9 +67,9 @@ seam-continuous and singularity-free is entirely a property of the basis
 
 - **Latent-free loop.** When the latent parameter is not observed, the
   demo estimates `t` from the noisy points via the angle of the first
-  two principal components — no special API, just preprocessing. Any
-  monotone reparametrisation of `t` is absorbed by the periodic smooth
-  because the fit only cares about the order around the loop.
+  two principal components — no special API, just preprocessing. The
+  cyclic boundary removes the seam, but the chosen parameterisation still
+  sets the metric used by the spline basis and penalty.
 - **Sphere.** The intrinsic `sphere(lat, lon)` smooth uses Wahba's
   reproducing kernel on S², which is rotation-invariant and free of
   pole artefacts. A spherical-harmonic alternative is also available
@@ -89,7 +89,8 @@ recovered surface will have a visible seam at `θ = 0`. Same for a torus
 geometric smooths bake the wrap topology into both the basis and the
 penalty so:
 
-- Predictions at `θ = ε` and `θ = 2π − ε` agree to machine precision.
+- Predictions at `θ = 0` and `θ = 2π` agree; values near the seam vary
+  continuously around the loop.
 - The penalty integrates the squared derivative *around* the loop, not
   just over the observed sample, so the wiggliness budget is spent
   honestly.

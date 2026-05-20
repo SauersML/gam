@@ -391,7 +391,7 @@ class SurvivalPrediction:
 
         Notes
         -----
-        Pair with :meth:`survival_at` for response-scale credible
+        Pair with :meth:`survival_at` for response-scale Wald-style
         bands: ``S +/- z * SE`` with the standard caveats around the
         Gaussian approximation near the ``[0, 1]`` boundaries.
 
@@ -1499,7 +1499,7 @@ class Model:
         Calls :meth:`predict` on the feature columns of ``data`` and
         compares the result against the observed response, packaging
         the prediction, residuals, observed values, and (when
-        requested) credible bands into a :class:`Diagnostics` object.
+        requested) Wald bands into a :class:`Diagnostics` object.
         Useful for ad-hoc held-out checks and for feeding the
         :meth:`plot` method.
 
@@ -1513,7 +1513,7 @@ class Model:
             :attr:`response_name`; required when that cannot be inferred
             (e.g. survival formulas).
         interval : float or None, optional
-            Credible-interval probability passed through to
+            Pointwise Wald-interval probability passed through to
             :meth:`predict`. Set to ``None`` to skip interval columns.
             Defaults to ``0.95``.
 
@@ -1594,12 +1594,12 @@ class Model:
         y : str, optional
             Response column name. Defaults to :attr:`response_name`.
         interval : float or None, optional
-            Credible-interval probability for the shaded band on
+            Pointwise Wald-interval probability for the shaded band on
             prediction plots. Ignored for ``residuals`` and
             ``observed_vs_predicted`` plots. Defaults to ``0.95``.
         kind : {"prediction", "residuals", "observed_vs_predicted"}, optional
             * ``"prediction"`` (default) — mean curve over ``x`` with a
-              credible band and observed scatter overlay.
+              pointwise Wald band and observed scatter overlay.
             * ``"residuals"`` — residuals vs predicted mean.
             * ``"observed_vs_predicted"`` — observed vs predicted with
               a reference ``y = x`` line.

@@ -54,8 +54,8 @@ marginal-slope models — see [marginal-slope.md](marginal-slope.md).
 
 ### Complementary log-log — `link(type=cloglog)`
 
-`g⁻¹(η) = 1 − e^{−e^η}`. Left-skewed. Use for interval-censored discrete-time
-survival or rare events.
+`g⁻¹(η) = 1 − e^{−e^η}`. Left-skewed. Use for grouped discrete-time
+hazards or rare events.
 
 ### Log — `link(type=log)`
 
@@ -122,7 +122,7 @@ See [formulas.md](formulas.md#linkwiggle-flexible-link-offset) for
 | --- | --- |
 | Binary outcome, no strong prior | `logit` (default). |
 | Binary outcome, Gaussian latent interpretation | `probit`. |
-| Rare events / interval-censored discrete-time survival | `cloglog`. |
+| Rare events / grouped discrete-time hazards | `cloglog`. |
 | Count / positive continuous | `log` (with `family="poisson"` or `"gamma"`). |
 | Base link approximately right, want a safety net | `flexible(base)` + `linkwiggle`. |
 | Two link shapes both plausible | `blended(a, b)`. |
