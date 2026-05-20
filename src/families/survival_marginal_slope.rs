@@ -3607,8 +3607,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Vec<f64>, String> {
         let k = self.score_dim();
         if self.logslope_surface_ranges.len() == k && k > 1 {
-            let beta = &logslope_eta; // unreachable for per-surface layouts; kept for error context.
-            if beta.len() == self.n {
+            if logslope_eta.len() == self.n {
                 return Err(
                     "survival marginal-slope internal logslope vector requested scalar eta for a per-z surface layout"
                         .to_string(),
@@ -15006,7 +15005,9 @@ impl SurvivalMarginalSlopeFamily {
                         .assign(&marginal.row(0));
                     let g_row = self.logslope_surface_row(row)?;
                     for (coord, range) in self.logslope_surface_ranges.iter().enumerate() {
-                        j.slice_mut(s![3 + coord, slices.logslope.start + range.start..slices.logslope.start + range.end])
+                        let global_range = (slices.logslope.start + range.start)
+                            ..(slices.logslope.start + range.end);
+                        j.slice_mut(s![3 + coord, global_range])
                             .assign(&g_row.slice(s![range.clone()]));
                     }
                     for a in 0..dim {
