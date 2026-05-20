@@ -99,6 +99,7 @@ fn fit_identity_penalized(
         total_dim: x.ncols(),
         nullity: 0,
         local,
+        prior_mean: Array1::zeros(x.ncols()),
         positive_eigenvalues: vec![1.0; x.ncols()],
         op: None,
     }];

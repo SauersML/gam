@@ -7623,7 +7623,7 @@ fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
             | ParsedTerm::TimeWiggle { .. }
             | ParsedTerm::LinkConfig { .. }
             | ParsedTerm::SurvivalConfig { .. } => {}
-            | ParsedTerm::LogSlopeSurface { z_column, terms } => {
+            ParsedTerm::LogSlopeSurface { z_column, terms } => {
                 out.insert(z_column.clone());
                 collect_term_column_names(terms, out);
             }

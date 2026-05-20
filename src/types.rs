@@ -206,11 +206,12 @@ pub enum RhoPrior {
         mean: f64,
         sd: f64,
     },
-    /// Gamma(shape, rate) conjugate prior on the precision λ = exp(ρ).
+    /// Gamma precision hyperprior contribution on the precision λ = exp(ρ).
     ///
     /// The REML/LAML objective is minimized, so this contributes
-    /// `rate * exp(ρ) - (shape - 1) * ρ` up to an additive constant.
-    /// `Gamma(1, 0)` is therefore the flat/default precision prior.
+    /// `rate * exp(ρ) - shape * ρ` up to an additive constant, yielding the
+    /// conjugate update `(shape + rank/2, rate + βᵀSβ/2)`. `(0, 0)` is the
+    /// explicit flat precision prior.
     GammaPrecision {
         shape: f64,
         rate: f64,

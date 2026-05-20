@@ -1,7 +1,7 @@
 use gam::estimate::FitOptions;
 use gam::smooth::{
-    LinearCoefficientGeometry, LinearTermSpec, TermCollectionSpec,
-    fit_term_collection_forspec, fit_term_collection_with_penalty_block_gamma_prior_callback,
+    LinearCoefficientGeometry, LinearTermSpec, TermCollectionSpec, fit_term_collection_forspec,
+    fit_term_collection_with_penalty_block_gamma_prior_callback,
     fit_term_collection_with_penalty_block_gamma_priors,
 };
 use gam::types::{LikelihoodFamily, RhoPrior};
@@ -28,7 +28,13 @@ fn fit_options() -> FitOptions {
     }
 }
 
-fn linear_fixture() -> (Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>, TermCollectionSpec) {
+fn linear_fixture() -> (
+    Array2<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+    TermCollectionSpec,
+) {
     let n = 41usize;
     let mut data = Array2::<f64>::zeros((n, 1));
     let mut y = Array1::<f64>::zeros(n);
@@ -158,6 +164,12 @@ fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
     .expect("keyed gamma fit");
 
     assert_eq!(seen, vec![("linear".to_string(), 0, 1)]);
-    assert_eq!(callback_fit.fit.lambdas.as_slice(), keyed_fit.fit.lambdas.as_slice());
-    assert_eq!(callback_fit.fit.beta.as_slice(), keyed_fit.fit.beta.as_slice());
+    assert_eq!(
+        callback_fit.fit.lambdas.as_slice(),
+        keyed_fit.fit.lambdas.as_slice()
+    );
+    assert_eq!(
+        callback_fit.fit.beta.as_slice(),
+        keyed_fit.fit.beta.as_slice()
+    );
 }
