@@ -15246,7 +15246,7 @@ impl SurvivalMarginalSlopeFamily {
             )
         };
 
-        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope) =
+        let (ll, grad_time, grad_marginal, grad_logslope, hess_time, hess_marginal, hess_logslope): MixedAcc =
             (0..self.n)
                 .into_par_iter()
                 .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
