@@ -2216,24 +2216,14 @@ fn optimize_rho(
         prev_eval = eval;
     }
 
-    // Pick a deterministic stationary point that varies smoothly with X. The
-    // smallest-rho refined stationary point is the canonical choice: stationary
-    // points move continuously with X under generic perturbations (no fold
-    // catastrophes), so the smallest-rho one stays the smallest-rho one and the
-    // returned value is smooth. Choosing by cost would re-introduce a kink at
-    // every level set where two stationary points trade ranks.
-    if let Some(&first) = stationary.first() {
-        return Ok(first);
+    let mut candidates = stationary;
+    push_candidate(&mut candidates, RHO_LOWER);
+    push_candidate(&mut candidates, RHO_UPPER);
+    if let Some(rho0) = init_rho {
+        push_candidate(&mut candidates, rho0);
     }
 
-    // No interior stationary point: fall back to the lowest-cost boundary.
-    let mut boundary = Vec::<f64>::new();
-    push_candidate(&mut boundary, RHO_LOWER);
-    push_candidate(&mut boundary, RHO_UPPER);
-    if let Some(rho0) = init_rho {
-        push_candidate(&mut boundary, rho0);
-    }
-    boundary
+    candidates
         .into_iter()
         .min_by(|&a, &b| {
             prepared
@@ -2377,12 +2367,9 @@ fn optimize_rho_no_alloc(
         RHO_LOWER,
     );
 
-    // Pass 1: scan grid for the FIRST sign change and refine that bracket. The
-    // smallest-rho stationary point is a smooth function of X under generic
-    // perturbations (no fold catastrophes), so the FD-vs-analytic comparison
-    // for the cost target converges at strict tolerance. Picking by cost would
-    // re-introduce a kink at every level set where two stationary points trade
-    // ranks under X perturbation.
+    let mut best_rho = RHO_LOWER;
+    let mut best_cost = lower_eval.cost;
+
     const GRID_INTERVALS: usize = 96;
     let mut prev_rho = RHO_LOWER;
     let mut prev_eval = lower_eval;
@@ -2397,7 +2384,7 @@ fn optimize_rho_no_alloc(
             rho,
         );
         if prev_eval.grad <= 0.0 && eval.grad >= 0.0 {
-            return Ok(refine_stationary_rho_no_alloc(
+            let stationary_rho = refine_stationary_rho_no_alloc(
                 cache,
                 ywy,
                 projected_rhs_squared,
@@ -2406,15 +2393,22 @@ fn optimize_rho_no_alloc(
                 prev_rho,
                 rho,
                 0.5 * (prev_rho + rho),
-            ));
+            );
+            consider_rho_no_alloc(
+                cache,
+                ywy,
+                projected_rhs_squared,
+                n_observations,
+                n_outputs,
+                stationary_rho,
+                &mut best_rho,
+                &mut best_cost,
+            );
         }
         prev_rho = rho;
         prev_eval = eval;
     }
 
-    // Fallback: no interior stationary point — evaluate boundaries and init.
-    let mut best_rho = RHO_LOWER;
-    let mut best_cost = lower_eval.cost;
     consider_rho_no_alloc(
         cache,
         ywy,
