@@ -3315,18 +3315,48 @@ impl ImplicitHyperOperator {
         let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
             .max(512)
             .min(n_obs);
-        let mut start = 0usize;
-        while start < n_obs {
-            let end = (start + chunk_rows).min(n_obs);
-            let rows = self
-                .x_design
-                .try_row_chunk(start..end)
-                .unwrap_or_else(|err| {
-                    panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
-                });
-            let block = crate::faer_ndarray::fast_ab(&rows, factor);
-            xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
-            start = end;
+        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
+        // Parallelize chunk traversal when we are not already inside a rayon
+        // worker (so we don't oversubscribe nested pools) and the work is
+        // large enough to amortize thread setup.
+        let use_parallel = num_chunks >= 2
+            && rayon::current_thread_index().is_none()
+            && (n_obs as u64) * (self.p as u64).max(1) >= 1_000_000;
+        if use_parallel {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let chunks: Vec<(usize, Array2<f64>)> = (0..num_chunks)
+                .into_par_iter()
+                .map(|ci| {
+                    let start = ci * chunk_rows;
+                    let end = (start + chunk_rows).min(n_obs);
+                    let rows = self
+                        .x_design
+                        .try_row_chunk(start..end)
+                        .unwrap_or_else(|err| {
+                            panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
+                        });
+                    let block = crate::faer_ndarray::fast_ab(&rows, factor);
+                    (start, block)
+                })
+                .collect();
+            for (start, block) in chunks {
+                let end = start + block.nrows();
+                xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
+            }
+        } else {
+            let mut start = 0usize;
+            while start < n_obs {
+                let end = (start + chunk_rows).min(n_obs);
+                let rows = self
+                    .x_design
+                    .try_row_chunk(start..end)
+                    .unwrap_or_else(|err| {
+                        panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
+                    });
+                let block = crate::faer_ndarray::fast_ab(&rows, factor);
+                xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
+                start = end;
+            }
         }
         xf
     }
