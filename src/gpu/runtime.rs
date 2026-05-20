@@ -106,60 +106,93 @@ fn load_packaged_cuda_libraries() -> Vec<Library> {
 
 #[cfg(target_os = "linux")]
 fn cuda_library_candidate_paths() -> Vec<PathBuf> {
-    let wheel_components: &[(&str, &[&str])] = &[
-        ("cuda_runtime", &["libcudart.so.12", "libcudart.so"]),
-        ("nvjitlink", &["libnvJitLink.so.12", "libnvJitLink.so"]),
-        (
-            "cublas",
-            &[
-                "libcublasLt.so.12",
-                "libcublasLt.so",
-                "libcublas.so.12",
-                "libcublas.so",
-            ],
-        ),
-        ("cusparse", &["libcusparse.so.12", "libcusparse.so"]),
-        (
-            "cusolver",
-            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
-        ),
-    ];
-    let mut out = Vec::new();
-    let mut push_if_exists = |path: PathBuf| {
-        if path.exists() && !out.iter().any(|seen| seen == &path) {
-            out.push(path);
-        }
-    };
-
     if let Some(image_dir) = current_image_dir() {
         for root in packaged_nvidia_roots(&image_dir) {
-            for (component, names) in wheel_components {
-                for name in *names {
-                    push_if_exists(root.join(component).join("lib").join(name));
-                }
+            if let Some(paths) = complete_packaged_cuda_stack(&root) {
+                return paths;
             }
         }
     }
 
     for lib_dir in system_library_dirs() {
-        for (_, names) in wheel_components {
-            for name in *names {
-                push_if_exists(lib_dir.join(name));
-            }
+        if let Some(paths) = complete_system_cuda_stack(&lib_dir) {
+            return paths;
         }
     }
 
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_library_groups() -> &'static [(&'static str, &'static [&'static [&'static str]])] {
+    &[
+        ("cuda_runtime", &[&["libcudart.so.12", "libcudart.so"]]),
+        ("nvjitlink", &[&["libnvJitLink.so.12", "libnvJitLink.so"]]),
+        (
+            "cublas",
+            &[
+                &["libcublasLt.so.12", "libcublasLt.so"],
+                &["libcublas.so.12", "libcublas.so"],
+            ],
+        ),
+        ("cusparse", &[&["libcusparse.so.12", "libcusparse.so"]]),
+        (
+            "cusolver",
+            &[&["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"]],
+        ),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn complete_packaged_cuda_stack(root: &Path) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for (component, library_groups) in cuda_library_groups() {
+        let lib_dir = root.join(component).join("lib");
+        for names in *library_groups {
+            out.push(first_existing_library(&lib_dir, names)?);
+        }
+    }
+    Some(dedup_canonical_paths(out))
+}
+
+#[cfg(target_os = "linux")]
+fn complete_system_cuda_stack(lib_dir: &Path) -> Option<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for (_, library_groups) in cuda_library_groups() {
+        for names in *library_groups {
+            out.push(first_existing_library(lib_dir, names)?);
+        }
+    }
+    Some(dedup_canonical_paths(out))
+}
+
+#[cfg(target_os = "linux")]
+fn first_existing_library(lib_dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    names
+        .iter()
+        .map(|name| lib_dir.join(name))
+        .find(|path| path.exists())
+}
+
+#[cfg(target_os = "linux")]
+fn dedup_canonical_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        let canonical = path.canonicalize().unwrap_or(path);
+        if !out.iter().any(|seen| seen == &canonical) {
+            out.push(canonical);
+        }
+    }
     out
 }
 
 /// CUDA toolkit shared libraries live in a handful of well-known places
 /// across cloud images, distro packages, and conda envs — but rarely all
 /// of them are on `LD_LIBRARY_PATH`, so `libloading::Library::new("libcublas.so.12")`
-/// fails on a host that nonetheless has a perfectly usable install. We
-/// walk every plausible directory and let the caller dlopen by absolute
-/// path; once the shared object is mapped, cudarc's own bare-name
-/// `dlopen("libcublas.so.12")` succeeds by SONAME match against the
-/// already-loaded mapping.
+/// fails on a host that nonetheless has a perfectly usable install. We choose
+/// one complete userspace stack and dlopen those absolute paths; once the
+/// shared objects are mapped, cudarc's own bare-name `dlopen("libcublas.so.12")`
+/// succeeds by SONAME match against the already-loaded mapping.
 #[cfg(target_os = "linux")]
 fn system_library_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
