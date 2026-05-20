@@ -6048,8 +6048,6 @@ pub fn reml_laml_evaluate(
             } else {
                 let correction = ext_corrections[ext_idx].as_ref();
                 let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
-                // Compute the production trace value first so any diagnostic
-                // logging can quote it alongside the unprojected variant.
                 let production_trace = match (&solution.penalty_subspace_trace, &drift) {
                     (Some(kernel), DriftDerivResult::Dense(matrix)) => {
                         kernel.trace_projected_logdet(matrix)
@@ -6062,105 +6060,115 @@ pub fn reml_laml_evaluate(
                         hop.trace_logdet_operator(op.as_ref())
                     }
                 };
-                // Test-only eigenmode diagnostic of the trace_logdet path.
-                //
-                // Production builds compile this block out entirely.  In test
-                // runs we log the unprojected `Σ φ'(σ_j)·(Uᵀ op_total U)_jj`
-                // alongside the production trace returned above, so the reader
-                // can never mistake one for the other.  For Duchon ψ axes the
-                // two values can disagree by orders of magnitude because the
-                // penalty-subspace projection eliminates a spurious null-space
-                // contribution that has no place in the cost identity.
-                #[cfg(test)]
-                if let Some(ds) = hop.as_exact_dense_spectral()
-                    && ds.dim() <= 12
-                {
-                    let mut op_dense = Array2::<f64>::zeros((ds.dim(), ds.dim()));
-                    let b_drift_again = hyper_coord_total_drift_result(&coord.drift, None, ds.dim());
-                    let b_dense = match b_drift_again {
-                        DriftDerivResult::Operator(o) => o.to_dense(),
-                        DriftDerivResult::Dense(m) => m,
-                    };
-                    op_dense += &b_dense;
-                    if let Some(c) = correction {
-                        match c {
-                            DriftDerivResult::Dense(m) => op_dense += m,
-                            DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
-                        }
-                    }
-                    // Rotate to eigenbasis: (U^T op U)_jj per eigenmode
-                    let p = ds.dim();
-                    let mut u_mat = Array2::<f64>::zeros((p, p));
-                    for col in 0..p {
-                        for row in 0..p {
-                            u_mat[[row, col]] = ds.eigenvector_entry(row, col);
-                        }
-                    }
-                    let ut_op = u_mat.t().dot(&op_dense);
-                    let proj = ut_op.dot(&u_mat);
-                    let eps_sq = {
-                        let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
-                        4.0 * eps_f * eps_f
-                    };
-                    let mut per_mode = Vec::with_capacity(p);
-                    let mut unprojected_tr = 0.0_f64;
-                    for j in 0..p {
-                        // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
-                        let r = ds.reg_eigenvalue(j);
-                        let sigma = r - eps_sq / (4.0 * r); // r = ½(σ + √(σ²+4ε²)) ⇒ σ = r − ε²/r
-                        let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
-                        let contrib = phi_prime * proj[[j, j]];
-                        per_mode.push((sigma, proj[[j, j]], contrib));
-                        unprojected_tr += contrib;
-                    }
-                    let projection_active = solution.penalty_subspace_trace.is_some();
-                    eprintln!(
-                        "[EIG-DECOMP ext_idx={}] unprojected_tr={:+.4e} \
-                         production_tr={:+.4e} (projection_active={}) per_mode={:?}",
-                        ext_idx, unprojected_tr, production_trace, projection_active, per_mode
-                    );
-                    if ext_idx == 0 {
-                        // Per-term breakdown of the operator portion (B), plus
-                        // the correction (D_β H[−v]) dense piece.
-                        let mut stash = debug_stash::TermStash::default();
-                        stash.op_total = Some(op_dense.clone());
-                        stash.u_mat = Some(u_mat.clone());
-                        stash.reg_eigenvalues = (0..ds.dim())
-                            .map(|j| ds.reg_eigenvalue(j))
-                            .collect();
-                        stash.unprojected_tr = Some(unprojected_tr);
-                        stash.production_tr = Some(production_trace);
-                        stash.projection_active = Some(projection_active);
-                        if let Some(op_arc) = coord.drift.operator.as_ref() {
-                            if let Some(sd) = op_arc.as_sparse_directional() {
-                                let bd = sd.term_breakdown_dense();
-                                stash.term1 = Some(bd.term1);
-                                stash.term2 = Some(bd.term2);
-                                stash.term3 = Some(bd.term3);
-                                stash.term4 = bd.term4;
-                                stash.firth_partial = bd.firth_partial;
-                                // Stash term4's diagonal `c · X_τβ̂` directly.
-                                stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
-                                // Also stash `X · v_ψ` per row, where
-                                // v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
-                                // The diagonal entering correction is `c · X · v_ψ`;
-                                // multiplying by the test's known c gives that diagonal.
-                                let v_i = &ext_v_is[ext_idx];
-                                stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
-                            }
-                        }
-                        if let Some(c) = correction {
-                            stash.correction = Some(match c {
-                                DriftDerivResult::Dense(m) => m.clone(),
-                                DriftDerivResult::Operator(o) => o.to_dense(),
-                            });
-                        }
-                        debug_stash::store_terms(stash);
-                    }
-                }
                 let _ = drift;
                 production_trace
             };
+
+            // Test-only eigenmode diagnostic of the trace_logdet path.
+            //
+            // Production builds compile this block out entirely. In test runs
+            // we log the unprojected `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` alongside
+            // the production trace `trace_logdet_i` returned above, so the
+            // reader can never mistake one for the other. For Duchon ψ axes
+            // the two values can disagree by orders of magnitude because the
+            // penalty-subspace projection eliminates a spurious null-space
+            // contribution that has no place in the cost identity.
+            //
+            // The diagnostic must fire regardless of which trace branch above
+            // produced `trace_logdet_i` — the projected/stochastic/exact-dense
+            // batched paths short-circuit the per-coord match arm but still
+            // need to surface the same `unprojected_tr` / `production_tr` pair
+            // and (for ext_idx == 0) the term-breakdown stash that
+            // `iso_kappa_duchon_penalty_subspace_projection_pins_trace` and
+            // `duchon_probit_per_row_dnu_dpsi_fd_vs_analytic` consume.
+            #[cfg(test)]
+            if incl_logdet_h
+                && let Some(ds) = hop.as_exact_dense_spectral()
+                && ds.dim() <= 12
+            {
+                let correction = ext_corrections[ext_idx].as_ref();
+                let mut op_dense = Array2::<f64>::zeros((ds.dim(), ds.dim()));
+                let b_drift_again = hyper_coord_total_drift_result(&coord.drift, None, ds.dim());
+                let b_dense = match b_drift_again {
+                    DriftDerivResult::Operator(o) => o.to_dense(),
+                    DriftDerivResult::Dense(m) => m,
+                };
+                op_dense += &b_dense;
+                if let Some(c) = correction {
+                    match c {
+                        DriftDerivResult::Dense(m) => op_dense += m,
+                        DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
+                    }
+                }
+                // Rotate to eigenbasis: (U^T op U)_jj per eigenmode
+                let p = ds.dim();
+                let mut u_mat = Array2::<f64>::zeros((p, p));
+                for col in 0..p {
+                    for row in 0..p {
+                        u_mat[[row, col]] = ds.eigenvector_entry(row, col);
+                    }
+                }
+                let ut_op = u_mat.t().dot(&op_dense);
+                let proj = ut_op.dot(&u_mat);
+                let eps_sq = {
+                    let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
+                    4.0 * eps_f * eps_f
+                };
+                let mut per_mode = Vec::with_capacity(p);
+                let mut unprojected_tr = 0.0_f64;
+                for j in 0..p {
+                    // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
+                    let r = ds.reg_eigenvalue(j);
+                    let sigma = r - eps_sq / (4.0 * r); // r = ½(σ + √(σ²+4ε²)) ⇒ σ = r − ε²/r
+                    let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
+                    let contrib = phi_prime * proj[[j, j]];
+                    per_mode.push((sigma, proj[[j, j]], contrib));
+                    unprojected_tr += contrib;
+                }
+                let projection_active = solution.penalty_subspace_trace.is_some();
+                eprintln!(
+                    "[EIG-DECOMP ext_idx={}] unprojected_tr={:+.4e} \
+                     production_tr={:+.4e} (projection_active={}) per_mode={:?}",
+                    ext_idx, unprojected_tr, trace_logdet_i, projection_active, per_mode
+                );
+                if ext_idx == 0 {
+                    // Per-term breakdown of the operator portion (B), plus
+                    // the correction (D_β H[−v]) dense piece.
+                    let mut stash = debug_stash::TermStash::default();
+                    stash.op_total = Some(op_dense.clone());
+                    stash.u_mat = Some(u_mat.clone());
+                    stash.reg_eigenvalues =
+                        (0..ds.dim()).map(|j| ds.reg_eigenvalue(j)).collect();
+                    stash.unprojected_tr = Some(unprojected_tr);
+                    stash.production_tr = Some(trace_logdet_i);
+                    stash.projection_active = Some(projection_active);
+                    if let Some(op_arc) = coord.drift.operator.as_ref() {
+                        if let Some(sd) = op_arc.as_sparse_directional() {
+                            let bd = sd.term_breakdown_dense();
+                            stash.term1 = Some(bd.term1);
+                            stash.term2 = Some(bd.term2);
+                            stash.term3 = Some(bd.term3);
+                            stash.term4 = bd.term4;
+                            stash.firth_partial = bd.firth_partial;
+                            // Stash term4's diagonal `c · X_τβ̂` directly.
+                            stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
+                            // Also stash `X · v_ψ` per row, where
+                            // v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
+                            // The diagonal entering correction is `c · X · v_ψ`;
+                            // multiplying by the test's known c gives that diagonal.
+                            let v_i = &ext_v_is[ext_idx];
+                            stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
+                        }
+                    }
+                    if let Some(c) = correction {
+                        stash.correction = Some(match c {
+                            DriftDerivResult::Dense(m) => m.clone(),
+                            DriftDerivResult::Operator(o) => o.to_dense(),
+                        });
+                    }
+                    debug_stash::store_terms(stash);
+                }
+            }
 
             let value = outer_gradient_entry(
                 coord.a,
