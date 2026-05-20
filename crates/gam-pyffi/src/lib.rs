@@ -3693,32 +3693,6 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
 }
 
-fn random_effect_coefficient_start(
-    spec: &TermCollectionSpec,
-    term_idx: usize,
-) -> Result<usize, String> {
-    let mut col = 1usize + spec.linear_terms.len();
-    for (idx, term) in spec.random_effect_terms.iter().enumerate() {
-        if idx == term_idx {
-            return Ok(col);
-        }
-        let width = term
-            .frozen_levels
-            .as_ref()
-            .map(|levels| levels.len())
-            .ok_or_else(|| {
-                format!(
-                    "extend_with_group term '{}' is not frozen; refit with persisted metadata",
-                    term.name
-                )
-            })?;
-        col += width;
-    }
-    Err(format!(
-        "extend_with_group internal error: random-effect term index {term_idx} is out of bounds"
-    ))
-}
-
 fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
     usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
 }
@@ -3781,11 +3755,16 @@ fn insert_coefficient_into_saved_fit(
     fit: Option<&mut gam::estimate::UnifiedFitResult>,
     index: usize,
     value: f64,
-    variance: Option<f64>,
+    variance: f64,
 ) -> Result<(), String> {
     let Some(fit) = fit else {
         return Ok(());
     };
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(format!(
+            "extend_with_group coefficient variance must be finite and positive; got {variance}"
+        ));
+    }
     if index > fit.beta.len() {
         return Err(format!(
             "extend_with_group coefficient index {index} exceeds fit coefficient length {}",
@@ -3808,18 +3787,28 @@ fn insert_coefficient_into_saved_fit(
         ));
     }
     fit.blocks[block_idx].beta = insert_array1(&fit.blocks[block_idx].beta, index, value);
+    // No-refit posterior algebra for a deployment-only block:
+    //
+    // The fitted posterior precision for the original coefficients is H_old.
+    // Extending with a new random-effect coefficient b and no likelihood
+    // refit contributes only its Gaussian prior,
+    //
+    //   -log p(b) = 1/2 (b - mu)' (lambda_new S_new) (b - mu) + const.
+    //
+    // Since no old likelihood rows or old penalties are recomputed, the joint
+    // precision is blockdiag(H_old, lambda_new S_new).  Therefore the
+    // conditional covariance is blockdiag(V_old, S_new^{-1}/lambda_new).  The
+    // current API extends one iid random-effect coordinate at a time, so
+    // S_new = [1] and `variance` is exactly 1/lambda_new, or the caller's
+    // supplied scalar prior covariance.
     if let Some(cov) = fit.covariance_conditional.as_mut() {
-        *cov = insert_symmetric_array2(cov, index, variance.unwrap_or(0.0))?;
+        *cov = insert_symmetric_array2(cov, index, variance)?;
     }
     if let Some(cov) = fit.covariance_corrected.as_mut() {
-        *cov = insert_symmetric_array2(cov, index, variance.unwrap_or(0.0))?;
+        *cov = insert_symmetric_array2(cov, index, variance)?;
     }
-    let variance_diag = variance.unwrap_or(0.0);
-    let precision_diag = if variance_diag > 0.0 {
-        1.0 / variance_diag
-    } else {
-        0.0
-    };
+    let variance_diag = variance;
+    let precision_diag = 1.0 / variance_diag;
     if let Some(inference) = fit.inference.as_mut() {
         inference.penalized_hessian =
             insert_symmetric_array2(&inference.penalized_hessian, index, precision_diag)?;
@@ -4160,7 +4149,13 @@ fn design_matrix_dense(
     )?;
     let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    Ok(design.design.to_dense())
+    append_deployment_extension_columns(
+        model.payload(),
+        dataset.values.view(),
+        &col_map,
+        training_headers,
+        design.design.to_dense(),
+    )
 }
 
 #[derive(Serialize)]
@@ -4220,7 +4215,13 @@ fn posterior_predict_table_impl(
     )?;
     let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    let dense = design.design.to_dense();
+    let dense = append_deployment_extension_columns(
+        model.payload(),
+        dataset.values.view(),
+        &col_map,
+        training_headers,
+        design.design.to_dense(),
+    )?;
     let n_rows = dense.nrows();
     if dense.ncols() != n_coeffs {
         return Err(format!(

@@ -392,8 +392,8 @@ pub struct RandomEffectTermSpec {
     /// If true, drop the lexicographically first group level to use treatment coding.
     /// If false, keep all levels (full one-hot block, still identifiable under ridge).
     pub drop_first_level: bool,
-    /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
-    /// When present, prediction uses exactly these columns to avoid design drift.
+    /// Optional fixed kept-level set captured at fit time.  When present,
+    /// prediction preserves this exact column order to avoid design drift.
     #[serde(default)]
     pub frozen_levels: Option<Vec<u64>>,
 }
@@ -4687,7 +4687,7 @@ fn build_random_effect_block(
         )));
     }
 
-    let mut kept_levels: Vec<u64> = if let Some(levels) = spec.frozen_levels.as_ref() {
+    let kept_levels: Vec<u64> = if let Some(levels) = spec.frozen_levels.as_ref() {
         if levels.is_empty() {
             return Err(BasisError::InvalidInput(format!(
                 "random-effect term '{}' has empty frozen_levels",
@@ -4714,8 +4714,6 @@ fn build_random_effect_block(
         };
         levels[start_idx..].to_vec()
     };
-    kept_levels.sort_unstable();
-    kept_levels.dedup();
 
     if kept_levels.is_empty() {
         return Err(BasisError::InvalidInput(format!(
@@ -4725,10 +4723,19 @@ fn build_random_effect_block(
     }
 
     let q = kept_levels.len();
+    let mut level_to_col = BTreeMap::<u64, usize>::new();
+    for (idx, &bits) in kept_levels.iter().enumerate() {
+        if level_to_col.insert(bits, idx).is_some() {
+            return Err(BasisError::InvalidInput(format!(
+                "random-effect term '{}' has duplicate frozen level bits {bits}",
+                spec.name
+            )));
+        }
+    }
     let mut group_ids = Vec::with_capacity(n);
     for &v in col {
         let bits = v.to_bits();
-        group_ids.push(kept_levels.binary_search(&bits).ok());
+        group_ids.push(level_to_col.get(&bits).copied());
     }
 
     Ok(RandomEffectBlock {
