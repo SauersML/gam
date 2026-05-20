@@ -9,7 +9,7 @@ use crate::custom_family::{
     joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::fast_av;
+use crate::faer_ndarray::{fast_ab, fast_av};
 use crate::families::bernoulli_marginal_slope::{
     DeviationBlockConfig, DeviationRuntime, LatentZNormalization, LatentZPolicy,
     MarginalSlopeCovariance, build_link_deviation_block_from_knots_design_seed_and_weights,
@@ -13105,6 +13105,47 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         ]
     }
 
+    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        if factor.nrows() != self.slices.total {
+            return None;
+        }
+        let n_rows = self.family.n;
+        let rank = factor.ncols();
+        if rank == 0 {
+            return Some(Array2::<f64>::zeros((n_rows, 0)));
+        }
+
+        let f_time = factor.slice(s![self.slices.time.clone(), ..]);
+        let f_marginal = factor.slice(s![self.slices.marginal.clone(), ..]);
+        let f_logslope = factor.slice(s![self.slices.logslope.clone(), ..]);
+
+        let jf_entry = survival_axis_jf_via_design(&self.family.design_entry, f_time, n_rows);
+        let jf_exit = survival_axis_jf_via_design(&self.family.design_exit, f_time, n_rows);
+        let jf_derivative =
+            survival_axis_jf_via_design(&self.family.design_derivative_exit, f_time, n_rows);
+        let jf_marginal =
+            survival_axis_jf_via_design(&self.family.marginal_design, f_marginal, n_rows);
+        let jf_logslope =
+            survival_axis_jf_via_design(&self.family.logslope_design, f_logslope, n_rows);
+
+        let mut jf = Array2::<f64>::zeros((n_rows, 4 * rank));
+        {
+            let mut axis0 = jf.slice_mut(s![.., 0..rank]);
+            axis0.assign(&jf_entry);
+            axis0 += &jf_marginal;
+        }
+        {
+            let mut axis1 = jf.slice_mut(s![.., rank..2 * rank]);
+            axis1.assign(&jf_exit);
+            axis1 += &jf_marginal;
+        }
+        jf.slice_mut(s![.., 2 * rank..3 * rank])
+            .assign(&jf_derivative);
+        jf.slice_mut(s![.., 3 * rank..4 * rank])
+            .assign(&jf_logslope);
+        Some(jf)
+    }
+
     fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
         {
             let mut time = ndarray::ArrayViewMut1::from(&mut out[self.slices.time.clone()]);
@@ -13209,6 +13250,29 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         let v_view = ndarray::aview1(&dir_v[..]);
         self.family
             .row_primary_fourth_contracted_batched(row, &self.block_states, u_view, v_view)
+    }
+}
+
+fn survival_axis_jf_via_design(
+    design: &DesignMatrix,
+    factor_block: ArrayView2<'_, f64>,
+    n_rows: usize,
+) -> Array2<f64> {
+    let rank = factor_block.ncols();
+    if rank == 0 {
+        return Array2::<f64>::zeros((n_rows, 0));
+    }
+    let factor = factor_block.as_standard_layout().into_owned();
+    match design.as_dense_ref() {
+        Some(dense) => fast_ab(dense, &factor),
+        None => {
+            let mut out = Array2::<f64>::zeros((n_rows, rank));
+            for c in 0..rank {
+                let result = design.dot(&factor.column(c).to_owned());
+                out.column_mut(c).assign(&result);
+            }
+            out
+        }
     }
 }
 
