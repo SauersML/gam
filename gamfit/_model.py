@@ -967,6 +967,116 @@ class Model:
         except Exception as exc:
             raise map_exception(exc) from exc
 
+    def predict_with_coverage(
+        self,
+        data: Any,
+        *,
+        level: float = 0.95,
+    ) -> tuple[Any, Any, Any, dict[str, Any]]:
+        """Predict with covariance-backed intervals and group attribution.
+
+        Returns ``(point, lower, upper, coverage_breakdown)``.  The point and
+        interval arrays are response-scale mean predictions from the existing
+        posterior-covariance prediction path.  ``coverage_breakdown`` attributes
+        the rowwise interval width to saved group labels by pushing the same
+        coefficient covariance through the materialised deployment design.
+        """
+        import numpy as np
+
+        if not (0.0 < float(level) < 1.0):
+            raise ValueError("coverage level must be in (0, 1)")
+        if self.is_survival:
+            raise ValueError("predict_with_coverage currently supports non-survival models")
+
+        predicted = self.predict(data, interval=float(level), return_type="dict")
+        if not isinstance(predicted, dict):
+            raise ValueError("predict_with_coverage requires table-style predictions")
+        if "mean" not in predicted or "mean_lower" not in predicted or "mean_upper" not in predicted:
+            raise ValueError(
+                "predict_with_coverage requires a saved coefficient covariance; "
+                "prediction intervals were not produced"
+            )
+
+        point = np.asarray(predicted["mean"], dtype=float)
+        lower = np.asarray(predicted["mean_lower"], dtype=float)
+        upper = np.asarray(predicted["mean_upper"], dtype=float)
+        width = np.maximum(upper - lower, 0.0)
+
+        try:
+            state = json.loads(rust_module().coefficient_state_json(self._model_bytes))
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        beta = np.asarray(state.get("beta", []), dtype=float)
+        cov_n = int(state.get("covariance_n", 0))
+        cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
+        if cov_flat.size != cov_n * cov_n or beta.size != cov_n:
+            raise ValueError("coefficient covariance payload has inconsistent dimensions")
+        cov = cov_flat.reshape(cov_n, cov_n)
+
+        design = np.asarray(self.design_matrix(data), dtype=float)
+        if design.ndim != 2 or design.shape[1] != cov_n:
+            raise ValueError(
+                "design matrix and coefficient covariance have inconsistent dimensions"
+            )
+
+        groups = _coverage_groups_from_coefficient_state(state, cov_n)
+        covariance_pushforward = design @ cov
+        eta_variance = np.einsum("ij,ij->i", covariance_pushforward, design)
+        contributions: dict[str, Any] = {}
+        assigned = np.zeros(cov_n, dtype=bool)
+        for group in groups:
+            cols = np.asarray(group["columns"], dtype=int)
+            if cols.size == 0:
+                continue
+            assigned[cols] = True
+            variance_contribution = np.einsum(
+                "ij,ij->i",
+                design[:, cols],
+                covariance_pushforward[:, cols],
+            )
+            contributions[str(group["label"])] = {
+                "variance_contribution": variance_contribution,
+                "variance_share": _safe_share(variance_contribution, eta_variance),
+                "columns": cols.tolist(),
+                "metadata": group.get("metadata"),
+            }
+
+        other_cols = np.flatnonzero(~assigned)
+        other_variance = np.einsum(
+            "ij,ij->i",
+            design[:, other_cols],
+            covariance_pushforward[:, other_cols],
+        ) if other_cols.size else np.zeros(design.shape[0], dtype=float)
+        positive_total = np.maximum(other_variance, 0.0)
+        for payload in contributions.values():
+            positive_total = positive_total + np.maximum(
+                payload["variance_contribution"], 0.0
+            )
+        for payload in contributions.values():
+            share = _safe_share(
+                np.maximum(payload["variance_contribution"], 0.0),
+                positive_total,
+            )
+            payload["ci_width_share"] = share
+            payload["ci_width_contribution"] = width * share
+        other_width_share = _safe_share(np.maximum(other_variance, 0.0), positive_total)
+        coverage_breakdown = {
+            "level": float(level),
+            "scale": "mean",
+            "eta_variance": eta_variance,
+            "ci_width": width,
+            "groups": contributions,
+            "unattributed": {
+                "variance_contribution": other_variance,
+                "variance_share": _safe_share(other_variance, eta_variance),
+                "ci_width_contribution": width * other_width_share,
+                "ci_width_share": other_width_share,
+                "columns": other_cols.tolist(),
+            },
+            "covariance_corrected": bool(state.get("covariance_corrected", False)),
+        }
+        return point, lower, upper, coverage_breakdown
+
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score).
 
@@ -1188,6 +1298,90 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
+
+    def predict_with_coverage(
+        self,
+        rows: Any,
+        *,
+        coverage: float = 0.95,
+    ) -> tuple[Any, Any, Any, list[dict[str, dict[str, Any]]]]:
+        """Predict with covariance-based confidence intervals and group attribution.
+
+        Returns ``(point, lower, upper, coverage_breakdown)``.  The first
+        three entries are numpy arrays on the response-mean scale.  The
+        breakdown is one dict per prediction row, keyed by group label; each
+        value includes the signed eta-variance contribution plus a normalized
+        nonnegative ``width_fraction`` / ``ci_width`` attribution for the
+        returned interval width.
+        """
+        import numpy as np
+
+        coverage = float(coverage)
+        if not (0.0 < coverage < 1.0):
+            raise ValueError("coverage must be in (0, 1)")
+
+        design = np.asarray(self.design_matrix(rows), dtype=float)
+        try:
+            state = json.loads(rust_module().coefficient_state_json(self._model_bytes))
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
+        beta = np.asarray(state.get("beta", []), dtype=float)
+        cov_n = int(state.get("covariance_n", 0))
+        cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
+        if cov_flat.size != cov_n * cov_n or beta.size != cov_n:
+            raise ValueError("coefficient covariance payload has inconsistent dimensions")
+        if design.shape[1] != cov_n:
+            raise ValueError(
+                "design matrix and coefficient covariance dimensions differ: "
+                f"design has {design.shape[1]} columns, covariance is {cov_n}x{cov_n}"
+            )
+
+        predicted = self.predict(rows, interval=coverage, return_type="dict")
+        columns = dict(predicted)
+        point = np.asarray(columns.get("mean", columns.get("eta", [])), dtype=float)
+        lower = np.asarray(columns.get("mean_lower", []), dtype=float)
+        upper = np.asarray(columns.get("mean_upper", []), dtype=float)
+        if point.size != design.shape[0] or lower.size != point.size or upper.size != point.size:
+            raise ValueError("prediction interval payload has inconsistent row count")
+
+        cov = cov_flat.reshape(cov_n, cov_n)
+        cov_design = design @ cov
+        signed_by_coefficient = design * cov_design
+        eta_variance = np.einsum("ij,jk,ik->i", design, cov, design)
+        labels, label_info, label_indices = _coverage_provenance_groups(state, cov_n)
+
+        breakdown: list[dict[str, dict[str, Any]]] = []
+        widths = np.maximum(upper - lower, 0.0)
+        for row_idx in range(design.shape[0]):
+            signed = {
+                label: float(signed_by_coefficient[row_idx, indices].sum())
+                for label, indices in label_indices.items()
+            }
+            positive = {label: max(value, 0.0) for label, value in signed.items()}
+            positive_total = sum(positive.values())
+            variance = float(max(eta_variance[row_idx], 0.0))
+            width = float(widths[row_idx])
+            row_breakdown: dict[str, dict[str, Any]] = {}
+            for label in labels:
+                signed_value = signed.get(label, 0.0)
+                width_fraction = (
+                    positive[label] / positive_total if positive_total > 0.0 else 0.0
+                )
+                variance_fraction = signed_value / variance if variance > 0.0 else 0.0
+                entry: dict[str, Any] = {
+                    "ci_width": float(width * width_fraction),
+                    "width_fraction": float(width_fraction),
+                    "variance": float(signed_value),
+                    "variance_fraction": float(variance_fraction),
+                }
+                info = label_info.get(label)
+                if info:
+                    entry.update(info)
+                row_breakdown[label] = entry
+            breakdown.append(row_breakdown)
+
+        return point, lower, upper, breakdown
 
     def difference_smooth(
         self,
@@ -1882,6 +2076,73 @@ def _interpolate_rows(
     if lo is not None or hi is not None:
         out = np.clip(out, lo if lo is not None else -np.inf, hi if hi is not None else np.inf)
     return out
+
+
+def _coverage_provenance_groups(
+    state: dict[str, Any],
+    n_coeffs: int,
+) -> tuple[list[str], dict[str, dict[str, Any]], dict[str, list[int]]]:
+    provenance = state.get("coefficient_provenance")
+    if not isinstance(provenance, list) or len(provenance) != n_coeffs:
+        provenance = [{"index": idx, "label": "__global__", "source": "global"} for idx in range(n_coeffs)]
+
+    group_metadata = state.get("group_metadata")
+    if not isinstance(group_metadata, dict):
+        group_metadata = {}
+
+    labels: list[str] = []
+    label_indices: dict[str, list[int]] = {}
+    raw_info: dict[str, dict[str, Any]] = {}
+    sources: dict[str, set[str]] = {}
+    terms: dict[str, set[str]] = {}
+    columns: dict[str, set[str]] = {}
+    levels: dict[str, set[str]] = {}
+
+    for fallback_index, item in enumerate(provenance):
+        if not isinstance(item, dict):
+            item = {}
+        index = int(item.get("index", fallback_index))
+        if index < 0 or index >= n_coeffs:
+            continue
+        label = str(item.get("label") or "__global__")
+        if label not in label_indices:
+            labels.append(label)
+            label_indices[label] = []
+            raw_info[label] = {"coefficient_indices": []}
+            sources[label] = set()
+            terms[label] = set()
+            columns[label] = set()
+            levels[label] = set()
+        label_indices[label].append(index)
+        raw_info[label]["coefficient_indices"].append(index)
+        if item.get("metadata") is not None:
+            raw_info[label]["metadata"] = item["metadata"]
+        elif label in group_metadata:
+            raw_info[label]["metadata"] = group_metadata[label]
+        for key, target in (
+            ("source", sources[label]),
+            ("term", terms[label]),
+            ("column", columns[label]),
+            ("level", levels[label]),
+        ):
+            value = item.get(key)
+            if value is not None:
+                target.add(str(value))
+
+    label_info: dict[str, dict[str, Any]] = {}
+    for label in labels:
+        info = dict(raw_info[label])
+        if sources[label]:
+            info["sources"] = sorted(sources[label])
+        if terms[label]:
+            info["terms"] = sorted(terms[label])
+        if columns[label]:
+            info["columns"] = sorted(columns[label])
+        if levels[label]:
+            info["levels"] = sorted(levels[label])
+        label_info[label] = info
+
+    return labels, label_info, label_indices
 
 
 __all__ = ["Model", "SurvivalPrediction"]

@@ -258,6 +258,13 @@ def test_geometry_parity_smoke() -> None:
         atol=1e-12,
     )
 
+    antipodal = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=float)
+    torch_mean = gt.sphere_frechet_mean(_tensor(antipodal)).detach().numpy()
+    assert abs(float(torch_mean @ antipodal[0])) < 1e-8
+    assert np.isclose(np.linalg.norm(torch_mean), 1.0)
+    with pytest.raises(ValueError, match="antipodal"):
+        gt.sphere_log_map(_tensor(antipodal[1:]), _tensor(antipodal[0]))
+
 
 def test_geometry_torch_inputs_keep_autograd() -> None:
     x = (torch.rand((6, 4), dtype=torch.float64) + 0.25).requires_grad_()

@@ -2,7 +2,8 @@
 """Geometric smooths demo — recover six shapes from noisy 3D point clouds.
 
 Generates a trefoil knot, a latent-free wiggly loop, a wobbly cylinder, a
-lumpy sphere, a bumpy torus, and a Möbius strip. Each shape is sampled with
+lumpy sphere, a bumpy torus, and a 4π-periodic double-cover of a Möbius
+embedding. Each shape is sampled with
 known (latent) parameters; we observe noisy (x, y, z) and fit one geometric
 smooth per coordinate using the `gam` CLI. The recovered surfaces / curves
 are rendered alongside the raw clouds in a single composite frame.
@@ -194,7 +195,7 @@ def write_csvs() -> None:
     np.savetxt(DATA / "tor.csv", np.column_stack([u, v, x, y, z]),
                delimiter=",", header="u,v,x,y,z", comments="", fmt="%.6f")
 
-    # Möbius (u, v)
+    # 4π-periodic Möbius double-cover (u, v)
     (u, v), coords, sig = gen_mob()
     x, y, z = add_noise(coords, sig)
     np.savetxt(DATA / "mob.csv", np.column_stack([u, v, x, y, z]),
@@ -314,7 +315,7 @@ def write_grids() -> None:
                np.column_stack([U.ravel(), V.ravel()]),
                delimiter=",", header="u,v", comments="", fmt="%.6f")
     np.save(DATA / "grid_tor_shape.npy", np.array([NU, NV]))
-    # Möbius grid
+    # 4π-periodic Möbius double-cover grid
     NMU, NMV = 240, 36
     UM, VM = np.meshgrid(np.linspace(0, 2 * TAU, NMU, endpoint=False),
                           np.linspace(-0.8, 0.8, NMV))
@@ -450,7 +451,7 @@ def build_shapes() -> dict[str, dict[str, Any]]:
                     color=PAL["torus"], cmap=cmap_for(PAL["torus"]),
                     elev=28, dist_mul=2.4))
 
-    # Möbius — periodic along u with period 4π; v is non-periodic (open edge)
+    # 4π-periodic Möbius double-cover: u wraps ordinarily; v is non-periodic.
     NMU, NMV = np.load(DATA / "grid_mob_shape.npy")
     shape = (NMV, NMU)
     cloud = np.loadtxt(DATA / "mob.csv", delimiter=",", skiprows=1)[:, 2:]
@@ -678,7 +679,7 @@ def quality_report() -> None:
     ])
     rows.append(("torus", "pointwise", *stats(tor_pred, tor_truth)))
 
-    # Möbius
+    # 4π-periodic Möbius double-cover
     g = np.loadtxt(DATA / "grid_mob.csv", delimiter=",", skiprows=1)
     u, v = g[:, 0], g[:, 1]
     rim = 1 + 0.5 * v * np.cos(u / 2)
@@ -688,7 +689,7 @@ def quality_report() -> None:
     mob_pred = np.column_stack([
         load_pred("mob_x"), load_pred("mob_y"), load_pred("mob_z"),
     ])
-    rows.append(("mobius", "pointwise", *stats(mob_pred, mob_truth)))
+    rows.append(("mobius-double-cover", "pointwise", *stats(mob_pred, mob_truth)))
 
     print("[quality] recovery error vs analytic truth")
     print("           shape        n_grid    metric         error         R²")
@@ -698,7 +699,7 @@ def quality_report() -> None:
         "cylinder": NTH * NH,
         "sphere":   len(sph_truth),
         "torus":    len(tor_truth),
-        "mobius":   len(mob_truth),
+        "mobius-double-cover": len(mob_truth),
     }
     for name, metric, err, r2 in rows:
         nrows = nrow_lookup[name]

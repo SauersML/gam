@@ -966,14 +966,15 @@ impl CanonicalPenalty {
     ) -> crate::solver::estimate::reml::unified::PenaltyCoordinate {
         use crate::solver::estimate::reml::unified::PenaltyCoordinate;
         if self.is_block_local() {
-            PenaltyCoordinate::BlockRoot {
-                root: self.root.clone(),
-                start: self.col_range.start,
-                end: self.col_range.end,
-                total_dim: self.total_dim,
-            }
+            PenaltyCoordinate::from_block_root_with_mean(
+                self.root.clone(),
+                self.col_range.start,
+                self.col_range.end,
+                self.total_dim,
+                self.prior_mean.clone(),
+            )
         } else {
-            PenaltyCoordinate::from_dense_root(self.root.clone())
+            PenaltyCoordinate::from_dense_root_with_mean(self.root.clone(), self.prior_mean.clone())
         }
     }
 }

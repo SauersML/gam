@@ -15713,6 +15713,7 @@ pub fn fit_survival_marginal_slope_terms(
 
     let time_penalties_len = spec.time_block.penalties.len();
     let score_warp_seed = score_warp_seed_from_score_matrix(&spec.z);
+    debug_assert_eq!(score_warp_seed.len(), n);
     let score_warp_prepared = spec
         .score_warp
         .as_ref()
