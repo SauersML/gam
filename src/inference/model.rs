@@ -52,6 +52,14 @@ use std::path::Path;
 /// forward-compatible.
 pub const MODEL_PAYLOAD_VERSION: u32 = 6;
 
+/// Schema-free saved-model metadata keyed by stable group id.
+///
+/// The values are JSON rather than a typed enum because group provenance is
+/// supplied by caller-owned catalogs. `FittedModelPayload::group_metadata`
+/// wraps this in `Option` with `#[serde(default)]`, so model files written
+/// before the field existed deserialize as `None`.
+pub type GroupMetadata = BTreeMap<String, JsonValue>;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DataSchema {
     pub columns: Vec<SchemaColumn>,
@@ -314,7 +322,7 @@ pub struct FittedModelPayload {
     /// mixed scalar/list/object values. Missing in older payloads means no
     /// group metadata was persisted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_metadata: Option<BTreeMap<String, JsonValue>>,
+    pub group_metadata: Option<GroupMetadata>,
     /// Deployment-time no-refit group extensions applied after fitting.
     ///
     /// Each entry records the requested group coordinate, caller metadata, and
