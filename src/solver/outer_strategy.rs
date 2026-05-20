@@ -3309,12 +3309,27 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 // was dimensionful and depended on three quantities the
                 // bridge has no way to set correctly.
                 //
-                // `ratio = 0.1` ⇒ trigger fallback when the worst slack is
-                // ≥10× tighter than the median slack.
+                // Two principled triggers, each catching a distinct
+                // failure mode of the EFS precondition:
+                //  • `ratio = 0.1`        — asymmetric concentration:
+                //    the worst slack is ≥10× tighter than the median.
+                //    Catches the common "one coefficient hits its bound
+                //    while others stay healthy" case.
+                //  • `saturation = 1.0`   — absolute saturation:
+                //    `max_j τ/Δ_j² ≥ 1`, i.e. at least one barrier-
+                //    diagonal entry has reached the natural unit penalty
+                //    scale. Catches the symmetric near-boundary regime
+                //    that ratio-only checks would let through (median Δ
+                //    also small, so min/median ratio stays near 1, but
+                //    EFS's "ignore the barrier diagonal" assumption is
+                //    still violated everywhere on the active set).
                 const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
-                if barrier_cfg
-                    .barrier_curvature_locally_concentrated(beta, LOCAL_CONCENTRATION_RATIO)
-                {
+                const BARRIER_CURVATURE_SATURATION: f64 = 1.0;
+                if barrier_cfg.barrier_curvature_locally_concentrated(
+                    beta,
+                    LOCAL_CONCENTRATION_RATIO,
+                    BARRIER_CURVATURE_SATURATION,
+                ) {
                     return Err(ObjectiveEvalError::recoverable(format!(
                         "{} EFS barrier curvature locally concentrated \
                          (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
@@ -5963,29 +5978,50 @@ mod tests {
     }
 
     #[test]
-    fn barrier_curvature_locally_concentrated_is_scale_free() {
-        // Two constrained coords with comparable slacks → barrier is
-        // *not* locally concentrated; the dimensionless check is false
-        // regardless of the absolute slack scale.
+    fn barrier_curvature_locally_concentrated_covers_both_failure_modes() {
+        // τ = 1e-6 (BarrierConfig default).
+        // For the dimensional check τ/Δ² ≥ saturation_threshold:
+        //   • Δ = 1e-3 ⇒ τ/Δ² = 1.0 (right at saturation = 1.0)
+        //   • Δ = 1e-2 ⇒ τ/Δ² = 1e-2 (well below)
+        //   • Δ = 1e-4 ⇒ τ/Δ² = 100 (well above)
         let barrier = BarrierConfig {
             tau: 1e-6,
             constrained_indices: vec![0, 1],
             lower_bounds: vec![0.0, 0.0],
         };
-        let small_uniform = Array1::from_vec(vec![1.0e-3, 1.0e-3]);
-        assert!(!barrier.barrier_curvature_locally_concentrated(&small_uniform, 0.1));
-        let large_uniform = Array1::from_vec(vec![10.0, 10.0]);
-        assert!(!barrier.barrier_curvature_locally_concentrated(&large_uniform, 0.1));
 
-        // One slack 100× tighter than the other → locally concentrated,
-        // ratio 0.1 trips, ratio 0.001 does not.
-        let imbalanced = Array1::from_vec(vec![1.0e-4, 1.0e-2]);
-        assert!(barrier.barrier_curvature_locally_concentrated(&imbalanced, 0.1));
-        assert!(!barrier.barrier_curvature_locally_concentrated(&imbalanced, 1.0e-3));
+        // Mode (b) symmetric near-boundary: slacks uniform & both small.
+        // With saturation = 1.0, Δ = 1e-2 stays under the saturation
+        // wall and ratio is healthy → not concentrated. Δ = 1e-4
+        // saturates absolutely → concentrated.
+        let mild_uniform = Array1::from_vec(vec![1.0e-2, 1.0e-2]);
+        assert!(!barrier.barrier_curvature_locally_concentrated(&mild_uniform, 0.1, 1.0));
+        let tight_uniform = Array1::from_vec(vec![1.0e-4, 1.0e-4]);
+        assert!(barrier.barrier_curvature_locally_concentrated(&tight_uniform, 0.1, 1.0));
+
+        // Mode (b) is gated by saturation_threshold: with a very large
+        // threshold (effectively disabling (b)), tight uniform stops
+        // tripping until you also relax (a) — the asymmetric ratio
+        // check — which on uniform slacks is necessarily false.
+        assert!(!barrier.barrier_curvature_locally_concentrated(&tight_uniform, 0.1, 1.0e9));
+
+        // Large uniform slacks: neither mode trips.
+        let large_uniform = Array1::from_vec(vec![10.0, 10.0]);
+        assert!(!barrier.barrier_curvature_locally_concentrated(&large_uniform, 0.1, 1.0));
+
+        // Mode (a) asymmetric concentration: one slack 100× tighter
+        // than the other, all in a regime where mode (b) DOESN'T fire.
+        // Δ_min = 1e-2 ⇒ τ/Δ² = 1e-2 ≪ 1.0 saturation. So only the
+        // ratio check is doing work here.
+        let imbalanced = Array1::from_vec(vec![1.0e-2, 1.0]);
+        assert!(barrier.barrier_curvature_locally_concentrated(&imbalanced, 0.1, 1.0));
+        // With a permissive ratio (1e-3) and mode (b) effectively off
+        // (huge threshold), neither check trips.
+        assert!(!barrier.barrier_curvature_locally_concentrated(&imbalanced, 1.0e-3, 1.0e9));
 
         // Infeasible (β ≤ l) → conservatively concentrated.
         let infeasible = Array1::from_vec(vec![-0.5, 1.0]);
-        assert!(barrier.barrier_curvature_locally_concentrated(&infeasible, 0.1));
+        assert!(barrier.barrier_curvature_locally_concentrated(&infeasible, 0.1, 1.0));
     }
 
     #[test]
@@ -8120,6 +8156,86 @@ mod tests {
             seen.lock().unwrap().first().cloned(),
             Some(array![1.0]),
             "aux direct-search must project the seed before evaluating its cost",
+        );
+    }
+
+    #[test]
+    fn run_arc_projects_seed_before_seed_validation_eval() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 1;
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Either)
+            .with_bounds(array![0.0], array![1.0])
+            .with_initial_rho(array![2.0])
+            .with_seed_config(seed_config)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok((theta[0] - 0.25).powi(2)),
+            {
+                let seen = Arc::clone(&seen);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    seen.lock().unwrap().push(theta.clone());
+                    Ok(OuterEval {
+                        cost: (theta[0] - 0.25).powi(2),
+                        gradient: array![2.0 * (theta[0] - 0.25)],
+                        hessian: HessianResult::Analytic(array![[2.0]]),
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let _ = problem
+            .run(&mut obj, "arc seed projection")
+            .expect("arc should evaluate the projected seed");
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some(array![1.0]),
+            "Arc must project the seed before validating the initial sample",
+        );
+    }
+
+    #[test]
+    fn run_bfgs_projects_seed_before_seed_validation_eval() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 1;
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_bounds(array![0.0], array![1.0])
+            .with_initial_rho(array![2.0])
+            .with_seed_config(seed_config)
+            .with_max_iter(1);
+        let mut obj = problem.build_objective(
+            (),
+            |_: &mut (), theta: &Array1<f64>| Ok((theta[0] - 0.25).powi(2)),
+            {
+                let seen = Arc::clone(&seen);
+                move |_: &mut (), theta: &Array1<f64>| {
+                    seen.lock().unwrap().push(theta.clone());
+                    Ok(OuterEval {
+                        cost: (theta[0] - 0.25).powi(2),
+                        gradient: array![2.0 * (theta[0] - 0.25)],
+                        hessian: HessianResult::Unavailable,
+                    })
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let _ = problem
+            .run(&mut obj, "bfgs seed projection")
+            .expect("BFGS should evaluate the projected seed");
+        assert_eq!(
+            seen.lock().unwrap().first().cloned(),
+            Some(array![1.0]),
+            "BFGS must project the seed before validating the initial sample",
         );
     }
 

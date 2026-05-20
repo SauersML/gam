@@ -17838,6 +17838,10 @@ mod tests {
         }
     }
 
+    fn unit_score_covariance() -> MarginalSlopeCovariance {
+        MarginalSlopeCovariance::Diagonal(array![1.0])
+    }
+
     fn base_time_block() -> TimeBlockInput {
         TimeBlockInput {
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -17901,6 +17905,7 @@ mod tests {
             event: Arc::new(event),
             weights: Arc::new(weights),
             z: Arc::new(z.insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             // Empty time/marginal/logslope designs: `n_rows × 0` so the
@@ -18262,6 +18267,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -18391,6 +18397,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.7]),
             z: Arc::new(array![0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -18438,7 +18445,7 @@ mod tests {
             q_geom.q1,
             q_geom.qd1,
             block_states[2].eta[0],
-            family.z[0],
+            family.z[[0, 0]],
             family.weights[0],
             family.event[0],
             family.derivative_guard,
@@ -18504,9 +18511,18 @@ mod tests {
         // Censored rows, q0 = q1 = η, at a wide range of saturations:
         // cancellation must be ULP-exact for every η.
         for &eta in &[0.5_f64, 1.0, 2.0, 5.0, 10.0, 40.0, 100.0, 500.0, 988.0] {
-            let (_nll, _grad, hess) =
-                row_primary_closed_form(eta, qd1, g, z, w, 0.0, derivative_guard, probit_scale)
-                    .expect("rigid censored row");
+            let (_nll, _grad, hess) = row_primary_closed_form(
+                eta,
+                eta,
+                qd1,
+                g,
+                z,
+                w,
+                0.0,
+                derivative_guard,
+                probit_scale,
+            )
+            .expect("rigid censored row");
             let sum = hess[0][0] + hess[1][1];
             assert!(
                 sum.abs() <= 1e-12 * (hess[0][0].abs() + hess[1][1].abs()).max(1.0),
@@ -18520,9 +18536,18 @@ mod tests {
         // Event rows, q0 = q1 = η, deep saturation: residual scales as
         // 1/η² by Mills asymptotic M(−η) = η + 1/η + O(1/η³).
         for &eta in &[40.0_f64, 100.0, 500.0, 988.0] {
-            let (_nll, _grad, hess) =
-                row_primary_closed_form(eta, qd1, g, z, w, 1.0, derivative_guard, probit_scale)
-                    .expect("rigid event row");
+            let (_nll, _grad, hess) = row_primary_closed_form(
+                eta,
+                eta,
+                qd1,
+                g,
+                z,
+                w,
+                1.0,
+                derivative_guard,
+                probit_scale,
+            )
+            .expect("rigid event row");
             let sum = hess[0][0] + hess[1][1];
             let bound = 2.0 / (eta * eta);
             assert!(
@@ -18635,6 +18660,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![0.9]),
             z: Arc::new(array![-0.35].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -18690,7 +18716,7 @@ mod tests {
             q_geom.q1,
             q_geom.qd1,
             block_states[2].eta[0],
-            family.z[0],
+            family.z[[0, 0]],
             family.weights[0],
             family.event[0],
             family.derivative_guard,
@@ -18720,6 +18746,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -18763,6 +18790,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 5))),
@@ -18894,7 +18922,10 @@ mod tests {
                 (0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }),
             )),
             weights: Arc::new(Array1::from_iter((0..n).map(|i| 0.8 + 0.07 * i as f64))),
-            z: Arc::new(Array1::from_iter((0..n).map(|i| -0.6 + 0.2 * i as f64))),
+            z: Arc::new(
+                Array1::from_iter((0..n).map(|i| -0.6 + 0.2 * i as f64)).insert_axis(Axis(1)),
+            ),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::from_shape_fn((n, 2), |(i, j)| {
@@ -19019,7 +19050,8 @@ mod tests {
             n,
             event: Arc::new(Array1::zeros(n)),
             weights: Arc::new(Array1::from_elem(n, 1.0)),
-            z: Arc::new(Array1::zeros(n)),
+            z: Arc::new(Array1::zeros(n).insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, p_time))),
@@ -19066,6 +19098,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 12))),
@@ -19110,6 +19143,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -19180,6 +19214,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -19256,6 +19291,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -19357,6 +19393,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
@@ -19418,6 +19455,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -19499,6 +19537,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -19587,6 +19626,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -19676,6 +19716,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -19753,6 +19794,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![
@@ -19820,6 +19862,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -19905,6 +19948,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![
@@ -20084,6 +20128,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![
@@ -20167,6 +20212,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -20252,6 +20298,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.0, 0.0, 0.0, 0.0, 0.0]]),
@@ -20335,6 +20382,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: Some(sigma),
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -20396,6 +20444,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -20505,6 +20554,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20558,6 +20608,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.2]),
             z: Arc::new(array![0.3].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: Some(0.65),
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20622,6 +20673,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.1]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: Some(0.4),
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![[0.2, 0.0, 0.0, 0.0]]),
@@ -20667,6 +20719,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20727,6 +20780,7 @@ mod tests {
             event: Arc::new(array![0.0, 1.0]),
             weights: Arc::new(array![1.0, 1.0]),
             z: Arc::new(array![0.0, 0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -20814,6 +20868,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20863,6 +20918,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -20942,6 +20998,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -21045,6 +21102,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -21108,6 +21166,7 @@ mod tests {
             event: Arc::new(array![0.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-4,
             design_entry: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[
@@ -21186,6 +21245,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.1, -0.2].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::Dense(DenseDesignMatrix::from(array![[1.0], [0.6]])),
@@ -21277,6 +21337,7 @@ mod tests {
             event: Arc::new(array![1.0]),
             weights: Arc::new(array![1.0]),
             z: Arc::new(array![0.15].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
@@ -21728,6 +21789,7 @@ mod tests {
             event: Arc::new(event),
             weights: Arc::new(weights),
             z: Arc::new(z.insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
@@ -22391,6 +22453,7 @@ mod tests {
             event: Arc::new(event),
             weights: Arc::new(weights),
             z: Arc::new(z.insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
@@ -22769,6 +22832,7 @@ mod tests {
             event: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 0.8]),
             z: Arc::new(array![0.15, -0.25].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(array![
