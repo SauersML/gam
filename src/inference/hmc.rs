@@ -4426,9 +4426,9 @@ impl JointBetaRhoPosterior {
         match &self.rho_prior {
             RhoPrior::Flat => {}
             RhoPrior::Normal { mean, sd } => {
-                let inv_var = 1.0 / (sd * sd);
+                let inv_var = 1.0 / (*sd * *sd);
                 for k in 0..n_rho {
-                    let d = rho[k] - mean;
+                    let d = rho[k] - *mean;
                     rho_prior -= 0.5 * inv_var * d * d;
                     grad_rho[k] -= inv_var * d;
                 }
@@ -4436,8 +4436,8 @@ impl JointBetaRhoPosterior {
             RhoPrior::GammaPrecision { shape, rate } => {
                 for k in 0..n_rho {
                     let lambda = rho[k].exp();
-                    rho_prior += (shape - 1.0) * rho[k] - rate * lambda;
-                    grad_rho[k] += (shape - 1.0) - rate * lambda;
+                    rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
+                    grad_rho[k] += (*shape - 1.0) - *rate * lambda;
                 }
             }
             RhoPrior::Independent(priors) => {
@@ -4448,15 +4448,15 @@ impl JointBetaRhoPosterior {
                     match &priors[k] {
                         RhoPrior::Flat => {}
                         RhoPrior::Normal { mean, sd } => {
-                            let inv_var = 1.0 / (sd * sd);
-                            let d = rho[k] - mean;
+                            let inv_var = 1.0 / (*sd * *sd);
+                            let d = rho[k] - *mean;
                             rho_prior -= 0.5 * inv_var * d * d;
                             grad_rho[k] -= inv_var * d;
                         }
                         RhoPrior::GammaPrecision { shape, rate } => {
                             let lambda = rho[k].exp();
-                            rho_prior += (shape - 1.0) * rho[k] - rate * lambda;
-                            grad_rho[k] += (shape - 1.0) - rate * lambda;
+                            rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
+                            grad_rho[k] += (*shape - 1.0) - *rate * lambda;
                         }
                         RhoPrior::Independent(_) => {
                             return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));

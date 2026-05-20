@@ -1038,6 +1038,126 @@ pub struct RealizedCoefficientGroups {
     pub group_column_indices: Vec<(String, Vec<usize>)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PenaltyBlockGammaPriorMetadata<'a> {
+    pub label: String,
+    pub global_index: usize,
+    pub termname: Option<&'a str>,
+    pub source: String,
+    pub effective_rank: usize,
+    pub nullspace_dim_hint: usize,
+}
+
+fn penalty_block_label_candidates(info: &PenaltyBlockInfo) -> Vec<String> {
+    let mut labels = Vec::<String>::new();
+    labels.push(format!("penalty:{}", info.global_index));
+    labels.push(info.global_index.to_string());
+    if let Some(termname) = info.termname.as_ref() {
+        labels.push(termname.clone());
+        labels.push(format!("{termname}:{}", info.penalty.original_index));
+    }
+    if let PenaltySource::Other(label) = &info.penalty.source {
+        labels.push(label.clone());
+    }
+    labels.push(format!("{:?}", info.penalty.source));
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
+fn penalty_block_metadata(info: &PenaltyBlockInfo) -> PenaltyBlockGammaPriorMetadata<'_> {
+    PenaltyBlockGammaPriorMetadata {
+        label: penalty_block_label_candidates(info)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| format!("penalty:{}", info.global_index)),
+        global_index: info.global_index,
+        termname: info.termname.as_deref(),
+        source: format!("{:?}", info.penalty.source),
+        effective_rank: info.penalty.effective_rank,
+        nullspace_dim_hint: info.penalty.nullspace_dim_hint,
+    }
+}
+
+fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<(), BasisError> {
+    if !shape.is_finite() || shape <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
+        )));
+    }
+    if !rate.is_finite() || rate < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
+        )));
+    }
+    Ok(())
+}
+
+fn realize_penalty_block_gamma_priors<F>(
+    design: &TermCollectionDesign,
+    mut callback: F,
+) -> Result<crate::types::RhoPrior, BasisError>
+where
+    F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
+{
+    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(design.penaltyinfo.len());
+    for info in &design.penaltyinfo {
+        let metadata = penalty_block_metadata(info);
+        let (shape, rate) = callback(&metadata).unwrap_or((1.0, 0.0));
+        validate_gamma_precision_prior(&metadata.label, shape, rate)?;
+        priors.push(crate::types::RhoPrior::GammaPrecision { shape, rate });
+    }
+    Ok(crate::types::RhoPrior::Independent(priors))
+}
+
+fn realize_keyed_penalty_block_gamma_priors(
+    design: &TermCollectionDesign,
+    priors: &[(String, f64, f64)],
+) -> Result<crate::types::RhoPrior, BasisError> {
+    let mut keyed = BTreeMap::<String, (f64, f64)>::new();
+    for (label, shape, rate) in priors {
+        if keyed.insert(label.clone(), (*shape, *rate)).is_some() {
+            return Err(BasisError::InvalidInput(format!(
+                "duplicate Gamma precision hyperprior for penalty block label '{label}'"
+            )));
+        }
+    }
+    let mut consumed = BTreeSet::<String>::new();
+    let prior = realize_penalty_block_gamma_priors(design, |metadata| {
+        let info = design
+            .penaltyinfo
+            .get(metadata.global_index)
+            .expect("metadata global index should match penaltyinfo");
+        for label in penalty_block_label_candidates(info) {
+            if let Some(value) = keyed.get(&label) {
+                consumed.insert(label);
+                return Some(*value);
+            }
+        }
+        None
+    })?;
+    let unknown: Vec<String> = keyed
+        .keys()
+        .filter(|label| !consumed.contains(*label))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        let available = design
+            .penaltyinfo
+            .iter()
+            .flat_map(penalty_block_label_candidates)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(BasisError::InvalidInput(format!(
+            "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
+            unknown.join(", ")
+        )));
+    }
+    Ok(prior)
+}
+
 fn combine_group_rho_prior(
     base_prior: &crate::types::RhoPrior,
     base_count: usize,
@@ -6329,6 +6449,281 @@ pub fn fit_term_collection_with_coefficient_groups(
             realized.nullspace_dims,
             family,
             &grouped_options,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}
+
+pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    callback: F,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError>
+where
+    F: FnMut(&PenaltyBlockGammaPriorMetadata<'_>) -> Option<(f64, f64)>,
+{
+    let design = build_term_collection_design(data, spec)?;
+    let mut fit_opts = adaptive_fit_options_base(options, &design);
+    fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
+        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let fitted = FittedTermCollection {
+        fit: fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            &design.penalties,
+            None,
+            family,
+            &fit_opts,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}
+
+pub fn fit_term_collection_with_penalty_block_gamma_priors(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    priors: &[(String, f64, f64)],
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    let design = build_term_collection_design(data, spec)?;
+    let mut fit_opts = adaptive_fit_options_base(options, &design);
+    fit_opts.rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
+        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let fitted = FittedTermCollection {
+        fit: fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            &design.penalties,
+            None,
+            family,
+            &fit_opts,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}
+
+fn penalty_block_labels(info: &PenaltyBlockInfo) -> Vec<String> {
+    let mut labels = vec![
+        info.global_index.to_string(),
+        format!("penalty:{}", info.global_index),
+    ];
+    if let Some(term) = info.termname.as_ref() {
+        labels.push(term.clone());
+        labels.push(format!("{term}:{}", info.penalty.original_index));
+        labels.push(format!("{term}[{}]", info.global_index));
+    }
+    labels
+}
+
+fn resolve_penalty_block_gamma_priors(
+    design: &TermCollectionDesign,
+    gamma_priors: &[(String, f64, f64)],
+    base_prior: &crate::types::RhoPrior,
+) -> Result<crate::types::RhoPrior, BasisError> {
+    let k = design.penalties.len();
+    let mut label_to_index = BTreeMap::<String, usize>::new();
+    for info in &design.penaltyinfo {
+        for label in penalty_block_labels(info) {
+            if label_to_index.insert(label.clone(), info.global_index).is_some() {
+                label_to_index.remove(&label);
+            }
+        }
+    }
+
+    let mut priors = vec![base_prior.clone(); k];
+    for (label, shape, rate) in gamma_priors {
+        if *shape <= 0.0 || !shape.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "Gamma precision hyperprior for penalty block '{label}' needs shape > 0, got {shape}"
+            )));
+        }
+        if *rate < 0.0 || !rate.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "Gamma precision hyperprior for penalty block '{label}' needs rate >= 0, got {rate}"
+            )));
+        }
+        let Some(&idx) = label_to_index.get(label) else {
+            let known = design
+                .penaltyinfo
+                .iter()
+                .flat_map(penalty_block_labels)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(BasisError::InvalidInput(format!(
+                "unknown penalty-block label '{label}' for Gamma precision hyperprior; known labels: {known}"
+            )));
+        };
+        priors[idx] = crate::types::RhoPrior::GammaPrecision {
+            shape: *shape,
+            rate: *rate,
+        };
+    }
+    Ok(crate::types::RhoPrior::Independent(priors))
+}
+
+pub fn fit_term_collection_with_penalty_block_gamma_priors(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    gamma_priors: &[(String, f64, f64)],
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    let design = build_term_collection_design(data, spec)?;
+    let mut fit_opts = adaptive_fit_options_base(options, &design);
+    fit_opts.rho_prior =
+        resolve_penalty_block_gamma_priors(&design, gamma_priors, &fit_opts.rho_prior)
+            .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let fitted = FittedTermCollection {
+        fit: fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            &design.penalties,
+            None,
+            family,
+            &fit_opts,
+        )?,
+        design,
+        adaptive_diagnostics: None,
+    };
+    enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
+    Ok(fitted)
+}
+
+fn penalty_block_label_candidates(info: &PenaltyBlockInfo, term_count: usize) -> Vec<String> {
+    let mut labels = Vec::new();
+    if let Some(term) = info.termname.as_ref() {
+        if term_count == 1 {
+            labels.push(term.clone());
+        }
+        labels.push(format!("{term}:{}", info.penalty.original_index));
+        labels.push(format!("{term}#{}", info.global_index));
+    }
+    labels.push(format!("#{}", info.global_index));
+    labels
+}
+
+fn resolve_penalty_block_gamma_priors(
+    design: &TermCollectionDesign,
+    gamma_priors: &[(String, f64, f64)],
+    base_prior: &crate::types::RhoPrior,
+) -> Result<crate::types::RhoPrior, BasisError> {
+    let mut term_counts = BTreeMap::<String, usize>::new();
+    for info in &design.penaltyinfo {
+        if let Some(term) = info.termname.as_ref() {
+            *term_counts.entry(term.clone()).or_insert(0) += 1;
+        }
+    }
+
+    let mut label_map = BTreeMap::<String, usize>::new();
+    for info in &design.penaltyinfo {
+        let term_count = info
+            .termname
+            .as_ref()
+            .and_then(|term| term_counts.get(term))
+            .copied()
+            .unwrap_or(0);
+        for label in penalty_block_label_candidates(info, term_count) {
+            if label_map.insert(label.clone(), info.global_index).is_some() {
+                return Err(BasisError::InvalidInput(format!(
+                    "internal duplicate penalty-block label '{label}'"
+                )));
+            }
+        }
+    }
+
+    let mut priors = match base_prior {
+        crate::types::RhoPrior::Independent(items) if items.len() == design.penaltyinfo.len() => {
+            items.clone()
+        }
+        _ => vec![base_prior.clone(); design.penaltyinfo.len()],
+    };
+    let mut seen = BTreeSet::<String>::new();
+    for (label, shape, rate) in gamma_priors {
+        if !seen.insert(label.clone()) {
+            return Err(BasisError::InvalidInput(format!(
+                "duplicate Gamma precision hyperprior for penalty block '{label}'"
+            )));
+        }
+        if !shape.is_finite() || *shape < 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "Gamma precision hyperprior for '{label}' has invalid shape {shape}; expected finite >= 0"
+            )));
+        }
+        if !rate.is_finite() || *rate < 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "Gamma precision hyperprior for '{label}' has invalid rate {rate}; expected finite >= 0"
+            )));
+        }
+        let Some(&idx) = label_map.get(label) else {
+            let available = label_map.keys().cloned().collect::<Vec<_>>().join(", ");
+            return Err(BasisError::InvalidInput(format!(
+                "unknown penalty-block Gamma precision hyperprior label '{label}'; available labels: {available}"
+            )));
+        };
+        priors[idx] = crate::types::RhoPrior::GammaPrecision {
+            shape: *shape,
+            rate: *rate,
+        };
+    }
+    Ok(crate::types::RhoPrior::Independent(priors))
+}
+
+pub fn fit_term_collection_with_penalty_block_gamma_priors(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    gamma_priors: &[(String, f64, f64)],
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollection, EstimationError> {
+    if gamma_priors.is_empty() {
+        return fit_term_collection_forspec(data, y, weights, offset, spec, family, options);
+    }
+    let design = build_term_collection_design(data, spec)?;
+    let base_fit_opts = adaptive_fit_options_base(options, &design);
+    let mut prior_options = base_fit_opts.clone();
+    prior_options.rho_prior =
+        resolve_penalty_block_gamma_priors(&design, gamma_priors, &base_fit_opts.rho_prior)
+            .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+    let fitted = FittedTermCollection {
+        fit: crate::estimate::fit_gamwith_heuristic_lambdas(
+            design.design.clone(),
+            y,
+            weights,
+            offset,
+            &design.penalties,
+            None,
+            family,
+            &prior_options,
         )?,
         design,
         adaptive_diagnostics: None,

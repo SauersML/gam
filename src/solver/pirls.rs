@@ -1949,8 +1949,7 @@ impl<'a> GamWorkingModel<'a> {
         let deviance = self
             .likelihood
             .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
-        let s_beta = self.penalty.apply(beta.as_ref());
-        let penalty_term = beta.as_ref().dot(&s_beta);
+        let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
         let penalized_objective = deviance + penalty_term;
         let arithmetic_finite = penalized_objective.is_finite()
             && self.workspace.eta_buf.iter().all(|v| v.is_finite())
@@ -2220,7 +2219,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // penalty contribution so the natural gradient scale can be assembled
         // for the scale-invariant convergence certificate.
         let score_norm = array1_l2_norm(&gradient);
-        let s_beta = self.penalty.apply(beta.as_ref());
+        let s_beta = self.penalty.shifted_gradient(beta.as_ref());
         let s_beta_norm = array1_l2_norm(&s_beta);
         gradient += &s_beta;
         let hessian_curvature = self.update_hessian_curvature_arrays(requested_curvature)?;
@@ -2282,7 +2281,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             self.priorweights,
         );
 
-        let mut penalty_term = beta.as_ref().dot(&s_beta);
+        let mut penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
         let mut ridge_grad_norm = 0.0;
         if ridge_used > 0.0 {
             let ridge_penalty = ridge_used * beta.as_ref().dot(beta.as_ref());
@@ -6354,7 +6353,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
                 .expect("dense Qs should exist for non-Kronecker transformed path"),
         )))
     };
-    let penalty_active = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
+    let mut penalty_active = if let Some((_, _, penalty_diag)) = kronecker_runtime.as_ref() {
         penalty_diag.clone()
     } else if use_sparse_native {
         // Build sparse-native penalty directly from canonical penalties.
@@ -6371,6 +6370,8 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         PirlsPenalty::Dense {
             s_transformed: s_lambda,
             e_transformed: e_root,
+            linear_shift: Array1::zeros(penalty.p),
+            constant_shift: 0.0,
         }
     } else {
         let dense = dense_reparam_result
@@ -6379,8 +6380,17 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         PirlsPenalty::Dense {
             s_transformed: dense.s_transformed.clone(),
             e_transformed: dense.e_transformed.clone(),
+            linear_shift: Array1::zeros(penalty.p),
+            constant_shift: 0.0,
         }
     };
+    let (shift_original, shift_constant) =
+        canonical_prior_shift(penalty.canonical_penalties, lambdas_slice, penalty.p);
+    let shift_active = transform_active
+        .as_ref()
+        .map(|transform| transform.apply_transpose(&shift_original))
+        .unwrap_or(shift_original);
+    attach_penalty_shift(&mut penalty_active, shift_active, shift_constant);
     // Build transformed constraints now that dense_reparam_result is available.
     let linear_constraints = if let Some(kc) = kronecker_constraints {
         kc
@@ -6501,11 +6511,11 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             .map(|transform| transform.apply_transpose(&xt_wr))
             .unwrap_or(xt_wr);
         let score_norm = array1_l2_norm(&gradient_data);
-        let s_beta = penalty_active.apply(beta_transformed.as_ref());
+        let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
         let s_beta_norm = array1_l2_norm(&s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
-        let mut penalty_term = beta_transformed.as_ref().dot(&s_beta);
+        let mut penalty_term = penalty_active.shifted_quadratic(beta_transformed.as_ref());
         let deviance = calculate_deviance(y, &finalmu, likelihood, priorweights);
         let ridge_used = baseridge;
         let stabilizedhessian = if ridge_used > 0.0 {
@@ -6974,7 +6984,8 @@ fn solve_penalized_least_squares_implicit(
             let mut wz = z.to_owned();
             wz -= &offset;
             wz *= &weights_owned;
-            let rhs = x_original.transpose_vector_multiply(&wz);
+            let mut rhs = x_original.transpose_vector_multiply(&wz);
+            rhs += penalty.linear_shift();
 
             // 3. Sparse Cholesky solve (factor reused from step 1)
             let betavec = solve_sparse_spd(&factor, &rhs)?;
@@ -7117,6 +7128,7 @@ fn solve_penalized_least_squares_implicit(
     } else {
         workspace.vec_buf_p.assign(&xtwy_orig);
     }
+    workspace.vec_buf_p += penalty.linear_shift();
 
     #[cfg(debug_assertions)]
     {

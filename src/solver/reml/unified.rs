@@ -4508,6 +4508,10 @@ pub struct InnerSolution<'dp> {
     /// through either a full-root or a block-local root.
     pub penalty_coords: Vec<PenaltyCoordinate>,
 
+    /// Prior centering vectors for each penalty coordinate, in the same basis
+    /// as `beta` and `penalty_coords`.
+    pub penalty_means: Vec<Array1<f64>>,
+
     /// Derivatives of log|S(ρ)|₊ — precomputed from penalty structure.
     pub penalty_logdet: PenaltyLogdetDerivs,
 
@@ -4598,6 +4602,7 @@ pub struct InnerSolutionBuilder<'dp> {
     hessian_op: Arc<dyn HessianOperator>,
     beta: Array1<f64>,
     penalty_coords: Vec<PenaltyCoordinate>,
+    penalty_means: Vec<Array1<f64>>,
     penalty_logdet: PenaltyLogdetDerivs,
     n_observations: usize,
     dispersion: DispersionHandling,
@@ -4637,6 +4642,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             hessian_op,
             beta,
             penalty_coords,
+            penalty_means: Vec::new(),
             penalty_logdet,
             n_observations,
             dispersion,
@@ -4712,6 +4718,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    pub fn penalty_means(mut self, means: Vec<Array1<f64>>) -> Self {
+        self.penalty_means = means;
+        self
+    }
+
     pub fn ext_coord_pair_fn(
         mut self,
         f: Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>,
@@ -4750,12 +4761,22 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             total_p.saturating_sub(penalty_rank) as f64
         });
 
+        let penalty_means = if self.penalty_means.is_empty() {
+            self.penalty_coords
+                .iter()
+                .map(|coord| Array1::<f64>::zeros(coord.dim()))
+                .collect()
+        } else {
+            self.penalty_means
+        };
+
         InnerSolution {
             log_likelihood: self.log_likelihood,
             penalty_quadratic: self.penalty_quadratic,
             hessian_op: self.hessian_op,
             beta: self.beta,
             penalty_coords: self.penalty_coords,
+            penalty_means,
             penalty_logdet: self.penalty_logdet,
             deriv_provider: self.deriv_provider,
             tk_correction: self.tk_correction,
