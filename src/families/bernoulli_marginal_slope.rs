@@ -1862,7 +1862,7 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     };
 
     // G_N = N^T W N (in sqrt-W frame: N_sqwᵀ N_sqw).
-    let g_n = n_train_sqw.t().dot(&n_train_sqw);
+    let g_n = crate::faer_ndarray::fast_atb(&n_train_sqw, &n_train_sqw);
     let (g_n_evals, g_n_evecs) = g_n
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("cross-block identifiability G_N eigh failed: {e}"))?;
@@ -1899,16 +1899,16 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
             rotation_r[[i, out_col]] = evec[i] * inv_sqrt;
         }
     }
-    let q_w_sqw = n_train_sqw.dot(&rotation_r); // n × r
+    let q_w_sqw = crate::faer_ndarray::fast_ab(&n_train_sqw, &rotation_r); // n × r
 
     // K_w = Q_wᵀ W C  =  q_w_sqwᵀ · c_sqw (r × p_c).
-    let k_w = q_w_sqw.t().dot(&c_sqw);
+    let k_w = crate::faer_ndarray::fast_atb(&q_w_sqw, &c_sqw);
 
     // C̃ in sqrt-W frame: c_sqw - q_w_sqw · k_w.
-    let c_tilde_sqw = &c_sqw - &q_w_sqw.dot(&k_w);
+    let c_tilde_sqw = &c_sqw - &crate::faer_ndarray::fast_ab(&q_w_sqw, &k_w);
 
     // G_C̃ = C̃ᵀ W C̃
-    let g_c_tilde = c_tilde_sqw.t().dot(&c_tilde_sqw);
+    let g_c_tilde = crate::faer_ndarray::fast_atb(&c_tilde_sqw, &c_tilde_sqw);
     let (gc_evals, gc_evecs) = g_c_tilde
         .eigh(faer::Side::Lower)
         .map_err(|e| format!("cross-block identifiability G_C̃ eigh failed: {e}"))?;
