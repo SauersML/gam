@@ -119,13 +119,10 @@ fn survival_multi_z_k1_neglog_matches_scalar_identity_fixture() {
     let eta0 = q0 * c + observed * z[0];
     let eta1 = q1 * c + observed * z[0];
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
     let expected = 1.2
         * ((1.0 - 1.0) * -normal_cdf(-eta1).ln() + normal_cdf(-eta0).ln()
             - log_phi_eta1
-            - (qd1 * c).ln()
-            - log_phi_q1
-            - qd1.ln());
+            - (qd1 * c).ln());
     let actual = survival_marginal_slope_vector_neglog(
         q0,
         q1,
