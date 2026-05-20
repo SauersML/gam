@@ -285,6 +285,39 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     mat_to_array(result.as_ref())
 }
 
+/// Compute A * B^T using faer's SIMD-optimized GEMM.
+/// For A of shape (m, k) and B of shape (n, k), this computes the (m, n) result.
+#[inline]
+pub fn fast_abt<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+) -> Array2<f64> {
+    use faer::linalg::matmul::matmul;
+    use faer::{Accum, Mat};
+
+    let (m, k_a) = a.dim();
+    let (n, k_b) = b.dim();
+    debug_assert_eq!(k_a, k_b, "A and B must have same number of columns for A·Bᵀ");
+
+    if !should_use_faer_matmul(m, n, k_a) {
+        return a.dot(&b.t());
+    }
+
+    let mut result = Mat::<f64>::zeros(m, n);
+    let aview = FaerArrayView::new(a);
+    let bview = FaerArrayView::new(b);
+    let par = matmul_parallelism(m, n, k_a);
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        aview.as_ref(),
+        bview.as_ref().transpose(),
+        1.0,
+        par,
+    );
+    mat_to_array(result.as_ref())
+}
+
 /// Compute A * B using faer's SIMD-optimized GEMM.
 /// For A of shape (n, p) and B of shape (p, q), this computes the (n, q) result.
 /// Uses zero-copy views when possible.

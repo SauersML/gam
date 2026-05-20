@@ -1823,8 +1823,7 @@ pub trait HyperOperator: Send + Sync {
         let mut basis = Array1::<f64>::zeros(p);
         for j in 0..p {
             basis[j] = 1.0;
-            let col = self.mul_vec(&basis);
-            out.column_mut(j).assign(&col);
+            self.mul_vec_into(basis.view(), out.column_mut(j));
             basis[j] = 0.0;
         }
         out
@@ -3194,19 +3193,6 @@ impl HyperOperator for ImplicitHyperOperator {
         let penalty = dense_bilinear(&self.s_psi, v, u);
 
         design + penalty
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        // Fallback: materialize column by column.
-        let p = self.p;
-        let mut out = Array2::<f64>::zeros((p, p));
-        let mut ei = Array1::<f64>::zeros(p);
-        for j in 0..p {
-            ei[j] = 1.0;
-            self.mul_vec_into(ei.view(), out.column_mut(j));
-            ei[j] = 0.0;
-        }
-        out
     }
 
     fn is_implicit(&self) -> bool {
