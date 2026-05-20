@@ -4008,6 +4008,7 @@ impl<'a> RemlState<'a> {
             self.y.len(),
             hessian_op,
             self.build_penalty_coords(),
+            self.build_penalty_means(beta.len()),
             penalty_logdet,
             super::unified::DispersionHandling::ProfiledGaussian,
         )
@@ -6097,20 +6098,6 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    fn build_penalty_means(&self, beta_dim: usize) -> Vec<Array1<f64>> {
-        self.canonical_penalties
-            .iter()
-            .map(|cp| {
-                let mean = cp.full_width_prior_mean();
-                if mean.len() == beta_dim {
-                    mean
-                } else {
-                    Array1::<f64>::zeros(beta_dim)
-                }
-            })
-            .collect()
-    }
-
     /// Pack a `DerivativeContext` plus backend-specific pieces into an
     /// `InnerAssembly`. All three assembly builders (`build_dense_assembly`,
     /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
@@ -6126,7 +6113,6 @@ impl<'a> RemlState<'a> {
         hessian_logdet_correction: f64,
         penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
     ) -> super::assembly::InnerAssembly<'static> {
-        let penalty_prior_means = self.build_penalty_means(beta.len());
         super::assembly::InnerAssembly {
             log_likelihood: ctx.log_likelihood,
             penalty_quadratic: pirls_result.stable_penalty_term,
@@ -6134,7 +6120,6 @@ impl<'a> RemlState<'a> {
             n_observations: self.y.len(),
             hessian_op,
             penalty_coords: self.build_penalty_coords(),
-            penalty_prior_means,
             penalty_logdet,
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,
