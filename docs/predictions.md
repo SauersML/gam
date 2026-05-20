@@ -54,7 +54,7 @@ For a multi-D smooth, calling `predict(interval=0.95)` gives you both the
 fitted mean and a pointwise SE for the fitted mean; the SE is largest where the
 covariates are sparse:
 
-![data → fitted mean → predictive SE](images/surface_fit_hero.png)
+![data → fitted mean → fitted-mean SE](images/surface_fit_hero.png)
 
 ## Passing through an identifier column
 

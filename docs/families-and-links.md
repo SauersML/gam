@@ -39,27 +39,27 @@ If both are set, the formula wins.
 
 ### Identity — `link(type=identity)`
 
-`g⁻¹(η) = η`. Default for continuous responses.
+Inverse link: `eta`. Default for continuous responses.
 
 ### Logit — `link(type=logit)`
 
-`g⁻¹(η) = 1 / (1 + e^{-η})`. Default for binary `{0, 1}` responses.
+Inverse link: `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
 Symmetric.
 
 ### Probit — `link(type=probit)`
 
-`g⁻¹(η) = Φ(η)` (standard normal CDF). Lighter tails than logit. Common when
+Inverse link: `Phi(eta)` (standard normal CDF). Lighter tails than logit. Common when
 a Gaussian latent-variable interpretation applies. Required by Bernoulli
 marginal-slope models — see [marginal-slope.md](marginal-slope.md).
 
 ### Complementary log-log — `link(type=cloglog)`
 
-`g⁻¹(η) = 1 − e^{−e^η}`. Left-skewed. Use for grouped discrete-time
+Inverse link: `1 - exp(-exp(eta))`. Left-skewed. Use for grouped discrete-time
 hazards or rare events.
 
 ### Log — `link(type=log)`
 
-`g⁻¹(η) = e^η`. For positive responses. Use with Poisson (counts) and Gamma
+Inverse link: `exp(eta)`. For positive responses. Use with Poisson (counts) and Gamma
 (positive continuous):
 
 ```python
