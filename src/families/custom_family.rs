@@ -50,7 +50,7 @@ const JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF: f64 = 20.0;
 ///
 /// Dense penalties are stored as-is.  Callers that need a raw `Array2<f64>` can
 /// call `as_dense()` (zero-cost for Dense, lazy-materialized for KroneckerFactored).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum PenaltyMatrix {
     Dense(Array2<f64>),
     KroneckerFactored {
