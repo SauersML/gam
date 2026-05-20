@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, overload
@@ -121,9 +122,14 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
             ) from exc
     shape_f = float(shape)
     rate_f = float(rate)
-    if shape_f <= 0.0 or rate_f < 0.0:
+    if (
+        not math.isfinite(shape_f)
+        or not math.isfinite(rate_f)
+        or shape_f <= 0.0
+        or rate_f < 0.0
+    ):
         raise ValueError(
-            f"precision_hyperpriors[{label!r}] needs shape > 0 and rate >= 0"
+            f"precision_hyperpriors[{label!r}] needs finite shape > 0 and finite rate >= 0"
         )
     return [shape_f, rate_f]
 

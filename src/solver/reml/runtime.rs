@@ -2044,9 +2044,10 @@ impl<'a> RemlState<'a> {
     // Gamma(a, b) precision hyperprior identity.
     //
     // For one penalty block, lambda = exp(rho) and
-    // p(lambda) proportional to lambda^(a-1) exp(-b lambda). The
-    // REML/LAML objective is a negative log posterior in rho, so the
-    // hyperprior contributes
+    // p(lambda) proportional to lambda^(a-1) exp(-b lambda). REML/LAML
+    // smoothing-parameter optimization targets the mode in lambda, expressed
+    // on the rho coordinate for numerical stability. Therefore no
+    // change-of-variables Jacobian is added here; the hyperprior contributes
     //
     //     -log p(exp(rho)) = b exp(rho) - (a - 1) rho + constant.
     //
