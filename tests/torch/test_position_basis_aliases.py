@@ -341,23 +341,13 @@ def test_periodic_duchon_end_to_end_and_seam_continuity() -> None:
     _require_ffi("duchon_function_norm_penalty")
     period = 2 * math.pi
     t, y = _circular_sample(n=128, period=period, seed=1)
-    # The position-API validator requires ``max(centers) − min(centers) ==
-    # period`` — the natural way to describe a closed periodic lattice. We
-    # supply ``K + 1`` linspace points across ``[0, period]``; the basis
-    # builder collapses the wrap duplicate at the right endpoint, leaving
-    # K distinct circle points.
-    #
-    # ``K`` is chosen *odd* on purpose. The periodic Duchon ``m=2`` kernel
-    # the engine currently uses is ``phi(r) = r`` (a triangle wave on the
-    # circle); its Fourier series has only odd harmonics. On a uniform
-    # K-point lattice with EVEN K, the discrete DFT lands exactly on the
-    # zero (even-harmonic) modes — ``K/2 − 1`` singular values of the
-    # design collapse to machine zero and ``X'X`` becomes singular. The
-    # right long-term fix is to swap the triangle-wave kernel for the
-    # periodic Green's function of ``(d²/dx²)²`` (Bernoulli ``B_4``),
-    # which has every harmonic with ``1/n^4`` decay; until then,
-    # odd-K uniform lattices avoid the degeneracy.
-    centers = torch.linspace(0.0, period, 16, dtype=torch.float64)  # → 15 effective
+    # Position-API validator requires ``max(centers) − min(centers) == period``
+    # — the natural way to describe a closed periodic lattice. The basis
+    # builder collapses the wrap duplicate at the right endpoint, leaving K
+    # distinct circle points. With the Bernoulli Green's function kernel,
+    # EVEN K is no longer pathological (was previously: ``phi(r) = r``
+    # triangle wave killed K/2 − 1 modes on even-K uniform lattices).
+    centers = torch.linspace(0.0, period, 17, dtype=torch.float64)  # → 16 effective (even, exercises the fixed kernel)
     fit = gt.gaussian_reml_fit_positions(
         t,
         y,
