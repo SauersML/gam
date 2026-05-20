@@ -152,6 +152,8 @@ struct SummaryPayload {
     formula: String,
     family_name: String,
     model_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    group_metadata: Option<BTreeMap<String, serde_json::Value>>,
     deviance: f64,
     reml_score: f64,
     iterations: usize,
@@ -3187,7 +3189,7 @@ fn fit_dataset_impl(
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
 
-    let payload = match request {
+    let mut payload = match request {
         FitRequest::Standard(standard_request) => {
             let family = standard_request.family;
             let fit_result = fit_model(FitRequest::Standard(standard_request))?;
@@ -3371,6 +3373,7 @@ fn fit_dataset_impl(
             build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
         }
     };
+    payload.group_metadata = fit_config.group_metadata.clone();
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec_pretty(&model).map_err(|err| format!("failed to serialize model: {err}"))
 }
@@ -3900,6 +3903,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         formula: model.payload().formula.clone(),
         family_name: pretty_familyname(model.likelihood()).to_string(),
         model_class: prediction_model_class_label(&model),
+        group_metadata: model.payload().group_metadata.clone(),
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
@@ -3981,6 +3985,8 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         _ => PyFitConfig::default(),
     };
     let mut fit_config = FitConfig::default();
+    fit_config.group_metadata =
+        parse_group_metadata(py_config.group_metadata, py_config.groups)?;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
@@ -4113,6 +4119,73 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         );
     }
     Ok(fit_config)
+}
+
+fn parse_group_metadata(
+    direct: Option<BTreeMap<String, serde_json::Value>>,
+    groups: Option<serde_json::Value>,
+) -> Result<Option<BTreeMap<String, serde_json::Value>>, String> {
+    match (direct, groups) {
+        (Some(metadata), None) => Ok(nonempty_group_metadata(metadata)),
+        (None, Some(groups)) => group_metadata_from_groups(groups),
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(
+            "fit config accepts either group_metadata or groups metadata, not both".to_string(),
+        ),
+    }
+}
+
+fn nonempty_group_metadata(
+    metadata: BTreeMap<String, serde_json::Value>,
+) -> Option<BTreeMap<String, serde_json::Value>> {
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata)
+    }
+}
+
+fn group_metadata_from_groups(
+    groups: serde_json::Value,
+) -> Result<Option<BTreeMap<String, serde_json::Value>>, String> {
+    match groups {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Object(map) => {
+            let out = map.into_iter().collect::<BTreeMap<_, _>>();
+            Ok(nonempty_group_metadata(out))
+        }
+        serde_json::Value::Array(items) => {
+            let mut out = BTreeMap::new();
+            for (idx, item) in items.into_iter().enumerate() {
+                let serde_json::Value::Object(mut group) = item else {
+                    return Err(format!("groups[{idx}] must be an object"));
+                };
+                let Some(metadata) = group.remove("metadata") else {
+                    continue;
+                };
+                let name = group
+                    .remove("name")
+                    .or_else(|| group.remove("id"))
+                    .or_else(|| group.remove("key"))
+                    .ok_or_else(|| {
+                        format!(
+                            "groups[{idx}] with metadata must include a string name, id, or key"
+                        )
+                    })?;
+                let serde_json::Value::String(name) = name else {
+                    return Err(format!("groups[{idx}] name/id/key must be a string"));
+                };
+                if name.is_empty() {
+                    return Err(format!("groups[{idx}] name/id/key must be non-empty"));
+                }
+                if out.insert(name.clone(), metadata).is_some() {
+                    return Err(format!("duplicate group metadata key '{name}'"));
+                }
+            }
+            Ok(nonempty_group_metadata(out))
+        }
+        _ => Err("groups must be an object map or an array of group objects".to_string()),
+    }
 }
 
 fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bool) {

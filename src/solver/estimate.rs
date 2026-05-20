@@ -65,6 +65,100 @@ use serde::{Deserialize, Serialize};
 // in the likelihood, rather than using ad-hoc weight adjustment.
 
 use std::ops::Range;
+use std::sync::Arc;
+
+/// Programmatic prior mean for a coefficient penalty block.
+///
+/// The mean is evaluated once during penalty canonicalization and then enters
+/// the solver as the centering vector in `(beta - mean)' S (beta - mean)`.
+#[derive(Clone)]
+pub enum CoefficientPriorMean {
+    Zero,
+    Scalar(f64),
+    Constant(Array1<f64>),
+    Functional {
+        metadata: Array1<f64>,
+        evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    },
+}
+
+impl std::fmt::Debug for CoefficientPriorMean {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => f.write_str("Zero"),
+            Self::Scalar(value) => f.debug_tuple("Scalar").field(value).finish(),
+            Self::Constant(values) => f
+                .debug_tuple("Constant")
+                .field(&format_args!("len={}", values.len()))
+                .finish(),
+            Self::Functional { metadata, .. } => f
+                .debug_struct("Functional")
+                .field("metadata_len", &metadata.len())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl Default for CoefficientPriorMean {
+    fn default() -> Self {
+        Self::Zero
+    }
+}
+
+impl CoefficientPriorMean {
+    pub fn scalar(value: f64) -> Self {
+        Self::Scalar(value)
+    }
+
+    pub fn constant(values: Array1<f64>) -> Self {
+        Self::Constant(values)
+    }
+
+    pub fn functional(
+        metadata: Array1<f64>,
+        evaluator: Arc<dyn Fn(&Array1<f64>) -> Array1<f64> + Send + Sync>,
+    ) -> Self {
+        Self::Functional {
+            metadata,
+            evaluator,
+        }
+    }
+
+    pub(crate) fn evaluate(
+        &self,
+        block_dim: usize,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let values = match self {
+            Self::Zero => Array1::zeros(block_dim),
+            Self::Scalar(value) => {
+                if !value.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "{context}: coefficient prior mean scalar must be finite, got {value}"
+                    )));
+                }
+                Array1::from_elem(block_dim, *value)
+            }
+            Self::Constant(values) => values.clone(),
+            Self::Functional {
+                metadata,
+                evaluator,
+            } => evaluator(metadata),
+        };
+        if values.len() != block_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "{context}: coefficient prior mean length must be {block_dim}, got {}",
+                values.len()
+            )));
+        }
+        if values.iter().any(|&value| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "{context}: coefficient prior mean contains non-finite values"
+            )));
+        }
+        Ok(values)
+    }
+}
 
 /// A penalty specification for the public estimate API.
 ///
@@ -79,6 +173,7 @@ pub enum PenaltySpec {
     Block {
         local: Array2<f64>,
         col_range: Range<usize>,
+        prior_mean: CoefficientPriorMean,
         /// Optional structural hint for fast-path spectral decomposition.
         structure_hint: Option<crate::terms::smooth::PenaltyStructureHint>,
         /// Optional operator-form handle bit-equivalent to `local`.
@@ -94,6 +189,7 @@ impl std::fmt::Debug for PenaltySpec {
             PenaltySpec::Block {
                 local,
                 col_range,
+                prior_mean,
                 structure_hint,
                 op,
             } => f
@@ -103,6 +199,7 @@ impl std::fmt::Debug for PenaltySpec {
                     &format_args!("{}×{}", local.nrows(), local.ncols()),
                 )
                 .field("col_range", col_range)
+                .field("prior_mean", prior_mean)
                 .field("structure_hint", structure_hint)
                 .field("op", &op.as_ref().map(|o| o.dim()))
                 .finish(),
@@ -140,6 +237,7 @@ impl PenaltySpec {
         PenaltySpec::Block {
             local: bp.local,
             col_range: bp.col_range,
+            prior_mean: bp.prior_mean,
             structure_hint: bp.structure_hint,
             op: bp.op,
         }
@@ -149,6 +247,7 @@ impl PenaltySpec {
         PenaltySpec::Block {
             local: bp.local.clone(),
             col_range: bp.col_range.clone(),
+            prior_mean: bp.prior_mean.clone(),
             structure_hint: bp.structure_hint.clone(),
             op: bp.op.clone(),
         }
