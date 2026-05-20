@@ -5122,8 +5122,7 @@ fn run_outer_with_plan(
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_gradient_tolerance(grad_tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 // Native per-axis L∞ trust budget (opt 0.5.10
                 // `Bfgs::with_axis_step_caps`). Rho axes (the first
                 // `rho_dim` parameters = log-λ) get the rho cap; psi axes
@@ -5253,8 +5252,8 @@ fn run_outer_with_plan(
                     fixed_point_tolerance: config.tolerance,
                     consecutive_psi_zero_iters: 0,
                 };
-                let initial_sample = match objective.eval_step(&seed) {
-                    Ok(sample) => sample,
+                match objective.eval_step(&seed) {
+                    Ok(_) => {}
                     Err(err) => {
                         let err = match err {
                             ObjectiveEvalError::Recoverable { message }
@@ -5283,8 +5282,7 @@ fn run_outer_with_plan(
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
@@ -5303,8 +5301,8 @@ fn run_outer_with_plan(
                     fixed_point_tolerance: config.tolerance,
                     consecutive_psi_zero_iters: 0,
                 };
-                let initial_sample = match objective.eval_step(&seed) {
-                    Ok(sample) => sample,
+                match objective.eval_step(&seed) {
+                    Ok(_) => {}
                     Err(err) => {
                         let err = match err {
                             ObjectiveEvalError::Recoverable { message }
@@ -5333,8 +5331,7 @@ fn run_outer_with_plan(
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {

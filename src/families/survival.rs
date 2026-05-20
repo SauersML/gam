@@ -495,14 +495,12 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
                 block_states.len()
             )
         })?;
-        Ok(Some(
-            cause_specific_hessian_second_directional_derivative(
-                block,
-                &state.beta,
-                d_beta_u,
-                d_beta_v,
-            )?,
-        ))
+        Ok(Some(cause_specific_hessian_second_directional_derivative(
+            block,
+            &state.beta,
+            d_beta_u,
+            d_beta_v,
+        )?))
     }
 }
 
@@ -594,8 +592,7 @@ fn cause_specific_hessian_second_directional_derivative(
                     "cause-specific survival derivative must be positive at row {i}, got {deriv}"
                 ));
             }
-            w_derivative[i] =
-                6.0 * weight * u_derivative[i] * v_derivative[i] / deriv.powi(4);
+            w_derivative[i] = 6.0 * weight * u_derivative[i] * v_derivative[i] / deriv.powi(4);
         }
     }
 
