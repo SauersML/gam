@@ -583,70 +583,12 @@ fn duchon_function_norm_penalty<'py>(
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
-    let mut penalty = built
+    let penalty = built
         .penalties
         .first()
         .ok_or_else(|| py_value_error("Duchon function-norm penalty was not built".to_string()))?
         .clone();
-    // Periodic Duchon penalties carry tiny negative eigenvalues (~1e-17)
-    // from floating-point rounding. After the REML whitening transform
-    // these get amplified above the solver's PSD tolerance (1e-10) and the
-    // fit rejects with "penalty is not positive semidefinite". Project to
-    // the PSD cone via eigendecomposition + floor at zero; the rebuilt
-    // matrix is bit-equivalent up to rounding for already-PSD inputs.
-    psd_project_in_place(&mut penalty);
     Ok(penalty.into_pyarray(py).unbind())
-}
-
-/// Project a symmetric matrix to the PSD cone (clamp negative eigenvalues
-/// to zero) and resymmetrise.
-fn psd_project_in_place(matrix: &mut Array2<f64>) {
-    use ndarray::linalg::Dot;
-    let n = matrix.nrows();
-    if n == 0 || matrix.ncols() != n {
-        return;
-    }
-    let symmetric: Array2<f64> = 0.5 * (&*matrix + &matrix.t());
-    let faer_view = gam::faer_ndarray::FaerArrayView::new(&symmetric);
-    let decomp = match faer::linalg::solvers::SelfAdjointEigen::new(faer_view.as_ref(), faer::Side::Lower) {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-    let eigvals_faer = decomp.S();
-    let eigvecs_faer = decomp.U();
-    let mut eigvals = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        eigvals[i] = eigvals_faer.column_vector().read(i).re;
-    }
-    let mut eigvecs = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..n {
-            eigvecs[[i, j]] = eigvecs_faer.read(i, j);
-        }
-    }
-    let max_abs = eigvals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let floor = 0.0_f64;
-    let mut clamped_any = false;
-    for v in eigvals.iter_mut() {
-        if *v < floor {
-            *v = 0.0;
-            clamped_any = true;
-        }
-    }
-    if !clamped_any && max_abs > 0.0 {
-        // Already PSD — just symmetrise and return.
-        *matrix = symmetric;
-        return;
-    }
-    let mut scaled = eigvecs.clone();
-    for j in 0..n {
-        let scale = eigvals[j];
-        for i in 0..n {
-            scaled[[i, j]] *= scale;
-        }
-    }
-    let rebuilt: Array2<f64> = scaled.dot(&eigvecs.t());
-    *matrix = 0.5 * (&rebuilt + &rebuilt.t());
 }
 
 #[pyfunction(signature = (centers, m = 2, length_scale = 1.0))]
