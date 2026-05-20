@@ -39,31 +39,6 @@ pub fn solve_monotone_root(
     Ok((solution.root, solution.abs_deriv, solution.residual))
 }
 
-/// Like [`solve_monotone_root`] but accepts an optional analytic bracket
-/// `[a_lo, a_hi]` known to straddle the root. When supplied, Phase 1 of the
-/// solver skips its expanding-step search and uses the analytic bracket
-/// directly.
-pub fn solve_monotone_root_with_bracket(
-    eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
-    a_init: f64,
-    label: &str,
-    convergence_tol: f64,
-    max_bracket_iters: usize,
-    max_refine_iters: usize,
-    analytic_bracket: Option<(f64, f64)>,
-) -> Result<(f64, f64, f64), String> {
-    let solution = solve_monotone_root_detailed_with_bracket(
-        eval,
-        a_init,
-        label,
-        convergence_tol,
-        max_bracket_iters,
-        max_refine_iters,
-        analytic_bracket,
-    )?;
-    Ok((solution.root, solution.abs_deriv, solution.residual))
-}
-
 pub fn solve_monotone_root_detailed(
     eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
     a_init: f64,

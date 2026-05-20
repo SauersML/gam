@@ -57,13 +57,6 @@ pub struct GaussianRemlWarmStart {
 }
 
 impl GaussianRemlWarmStart {
-    pub fn from_result(result: &GaussianRemlResult) -> Self {
-        Self {
-            lambda: Some(result.lambda),
-            eigen_cache: Some(result.cache.clone()),
-        }
-    }
-
     pub fn from_multi_result(result: &GaussianRemlMultiResult) -> Self {
         Self {
             lambda: Some(result.lambda),
@@ -102,17 +95,6 @@ pub struct GaussianRemlMultiResult {
     pub edf: f64,
     pub sigma2: Array1<f64>,
     pub cache: GaussianRemlEigenCache,
-}
-
-#[derive(Clone, Debug)]
-pub struct GaussianRemlScoreDerivatives {
-    pub reml_score: f64,
-    pub grad_lambda: f64,
-    pub hess_lambda: f64,
-    pub coefficients: Array2<f64>,
-    pub fitted: Array2<f64>,
-    pub sigma2: Array1<f64>,
-    pub edf: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -256,18 +238,6 @@ pub fn gaussian_reml_closed_form_with_nullspace_dim(
         init_rho,
     )?;
     scalar_result_from_multi(result)
-}
-
-pub fn gaussian_reml_closed_form_warm_started(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-    warm_start: Option<&GaussianRemlWarmStart>,
-) -> Result<GaussianRemlResult, EstimationError> {
-    gaussian_reml_closed_form_warm_started_with_nullspace_dim(
-        x, y, penalty, None, weights, warm_start,
-    )
 }
 
 pub fn gaussian_reml_closed_form_warm_started_with_nullspace_dim(
@@ -595,35 +565,6 @@ fn gaussian_reml_multi_closed_form_from_parts(
         edf: eval.edf,
         sigma2,
         cache: prepared.cache,
-    })
-}
-
-pub fn gaussian_reml_score_derivatives(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    lambda: f64,
-    penalty: ArrayView2<'_, f64>,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<GaussianRemlScoreDerivatives, EstimationError> {
-    if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML lambda must be finite and positive; got {lambda}"
-        )));
-    }
-    let prepared = prepare_gaussian_reml(x, y, penalty, None, weights, None)?;
-    let eval = prepared.evaluate(lambda.ln());
-    let coefficients = prepared.coefficients(lambda);
-    let fitted = dense_ab(x, coefficients.view());
-    let sigma2 = prepared.sigma2(lambda);
-    let (grad_lambda, hess_lambda) = rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
-    Ok(GaussianRemlScoreDerivatives {
-        reml_score: eval.cost,
-        grad_lambda,
-        hess_lambda,
-        coefficients,
-        fitted,
-        sigma2,
-        edf: eval.edf,
     })
 }
 

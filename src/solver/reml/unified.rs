@@ -3621,8 +3621,8 @@ impl ImplicitHyperOperator {
             projected
         };
 
-        let s_f = self.s_psi.dot(factor);
-        projected += &factor.t().dot(&s_f);
+        let s_f = crate::faer_ndarray::fast_ab(&self.s_psi, factor);
+        projected += &crate::faer_ndarray::fast_atb(factor, &s_f);
         let projected_t = projected.t().to_owned();
         projected += &projected_t;
         projected.mapv_inplace(|value| 0.5 * value);
@@ -3740,8 +3740,8 @@ impl ImplicitHyperOperator {
         };
 
         for (slot, (_, s_psi, _)) in axes.iter().enumerate() {
-            let s_f = s_psi.dot(factor);
-            out[slot] += &factor.t().dot(&s_f);
+            let s_f = crate::faer_ndarray::fast_ab(s_psi, factor);
+            out[slot] += &crate::faer_ndarray::fast_atb(factor, &s_f);
             let out_t = out[slot].t().to_owned();
             out[slot] += &out_t;
             out[slot].mapv_inplace(|value| 0.5 * value);

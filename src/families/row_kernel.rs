@@ -87,23 +87,6 @@ impl RowSet {
         }
     }
 
-    /// Materialize the row iterator as `(row_index, ht_weight)` pairs.
-    ///
-    /// * `All` yields every `0..n_total` with weight `1.0` (no rescaling
-    ///   — the full sum is its own unbiased estimator).
-    /// * `Subsample` yields each `WeightedOuterRow`'s `(index, weight)`.
-    ///
-    /// Kept as a fallback for non-hot-path callers that want a materialized
-    /// list. The row-kernel assembly hot loops use [`Self::par_for_each`]
-    /// and [`Self::par_reduce_fold`] directly so no `Vec` is allocated
-    /// per evaluation.
-    pub fn collect_indexed(&self, n_total: usize) -> Vec<(usize, f64)> {
-        match self {
-            Self::All => (0..n_total).map(|i| (i, 1.0)).collect(),
-            Self::Subsample { rows, .. } => rows.iter().map(|r| (r.index, r.weight)).collect(),
-        }
-    }
-
     /// Number of contributing rows. For `All` this is `n_total`; for
     /// `Subsample` this is the mask length. Used by callers that need to
     /// size workspaces without consulting `n_effective` (which returns
@@ -132,21 +115,6 @@ impl RowSet {
             }
             Self::Subsample { rows, .. } => {
                 rows.par_iter().for_each(|r| body(r.index, r.weight));
-            }
-        }
-    }
-
-    /// Parallel `try_for_each` variant — short-circuits on the first `Err`.
-    #[inline]
-    pub fn par_try_for_each<F, E>(&self, n_total: usize, body: F) -> Result<(), E>
-    where
-        F: Fn(usize, f64) -> Result<(), E> + Send + Sync,
-        E: Send,
-    {
-        match self {
-            Self::All => (0..n_total).into_par_iter().try_for_each(|i| body(i, 1.0)),
-            Self::Subsample { rows, .. } => {
-                rows.par_iter().try_for_each(|r| body(r.index, r.weight))
             }
         }
     }
