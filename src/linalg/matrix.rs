@@ -155,18 +155,46 @@ fn weighted_crossprod_dense_rows(
     right: &Array2<f64>,
     rows: Range<usize>,
 ) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
+    let p_left = left.ncols();
+    let p_right = right.ncols();
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+    if left.is_standard_layout() && right.is_standard_layout() {
+        if let (Some(lx), Some(rx), Some(w)) =
+            (left.as_slice(), right.as_slice(), weights.as_slice())
+        {
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in rows {
+                let wi = w[i].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                let l_row = &lx[i * p_left..i * p_left + p_left];
+                let r_row = &rx[i * p_right..i * p_right + p_right];
+                for a in 0..p_left {
+                    let scaled = wi * l_row[a];
+                    if scaled == 0.0 {
+                        continue;
+                    }
+                    let out_row = &mut out_slice[a * p_right..a * p_right + p_right];
+                    for b in 0..p_right {
+                        out_row[b] += scaled * r_row[b];
+                    }
+                }
+            }
+            return out;
+        }
+    }
     for i in rows {
         let wi = weights[i].max(0.0);
         if wi == 0.0 {
             continue;
         }
-        for a in 0..left.ncols() {
+        for a in 0..p_left {
             let scaled = wi * left[[i, a]];
             if scaled == 0.0 {
                 continue;
             }
-            for b in 0..right.ncols() {
+            for b in 0..p_right {
                 out[[a, b]] += scaled * right[[i, b]];
             }
         }
