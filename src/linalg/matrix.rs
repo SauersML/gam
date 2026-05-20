@@ -374,7 +374,27 @@ fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2
 fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
     let p = matrix.ncols();
     let mut diag = Array1::<f64>::zeros(p);
-    for i in 0..matrix.nrows() {
+    let n = matrix.nrows();
+    // Fast path: if the matrix is row-major contiguous, read each row as a
+    // slice and avoid n*p bounds-checked indexing.
+    if matrix.is_standard_layout() {
+        if let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice()) {
+            let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
+            for i in 0..n {
+                let wi = w[i].max(0.0);
+                if wi == 0.0 {
+                    continue;
+                }
+                let row = &x[i * p..i * p + p];
+                for j in 0..p {
+                    let xij = row[j];
+                    diag_slice[j] += wi * xij * xij;
+                }
+            }
+            return diag;
+        }
+    }
+    for i in 0..n {
         let wi = weights[i].max(0.0);
         if wi == 0.0 {
             continue;
