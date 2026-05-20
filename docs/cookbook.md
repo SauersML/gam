@@ -197,6 +197,7 @@ gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(age) + bmi + timewiggle(internal_knots=6)",
     survival_likelihood="transformation",
+    baseline_target="weibull",
 )
 ```
 
