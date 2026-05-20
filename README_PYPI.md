@@ -17,10 +17,12 @@ NUTS path.
 
 Geometric / manifold smooths handle predictor spaces that wrap, including
 circles, cylinders, tori, the sphere (intrinsic Wahba / spherical
-harmonic kernels), and one-sided strips, with no seams or pole
-artefacts:
+harmonic kernels), and periodic tensor products, with no seams or pole
+artefacts. The gallery's Möbius-looking example is a 4π-periodic
+double-cover parameterization of a Möbius embedding, not a twisted
+Möbius-strip predictor basis:
 
-![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius strip from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
+![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius double-cover from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
 
 **Docs:** <https://gamfit.readthedocs.io/>
 
@@ -65,7 +67,7 @@ all work without conversion.
   triple-operator regularization), and Matérn covariance, with automatic
   knot placement.
 - **Geometric / manifold smooths.** Cyclic 1-D, cylinder / torus tensor,
-  intrinsic sphere (Wahba + spherical harmonics), Möbius strip,
+  intrinsic sphere (Wahba + spherical harmonics), Möbius double-cover demo,
   boundary-conditioned B-splines. Predictor spaces that wrap or close
   are first-class — no seams, no pole artefacts.
 - **Adaptive anisotropy.** Per-axis spatial anisotropy shrinks or stretches
