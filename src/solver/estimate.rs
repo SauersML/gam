@@ -5181,9 +5181,9 @@ fn unscale_to_physical_lambdas(
 // If penalties were normalized before optimization:
 //   S_tilde_k = S_k / c_k
 // and the optimizer fits lambda_tilde_k, then
-//   lambda_tilde_k * beta' S_tilde_k beta
-// = lambda_tilde_k * beta' (S_k / c_k) beta
-// = (lambda_tilde_k / c_k) * beta' S_k beta.
+//   lambda_tilde_k * (beta-mu)' S_tilde_k (beta-mu)
+// = lambda_tilde_k * (beta-mu)' (S_k / c_k) (beta-mu)
+// = (lambda_tilde_k / c_k) * (beta-mu)' S_k (beta-mu).
 //
 // Therefore physical lambdas are:
 //   lambda_k = lambda_tilde_k / c_k,  k in {0,1,2}.
