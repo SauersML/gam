@@ -80,7 +80,7 @@ fn flat_gamma_precision_prior_matches_uninformed_fit_bitwise() {
         weights.view(),
         offset.view(),
         &spec,
-        &[("linear".to_string(), 1.0, 0.0)],
+        &[("linear".to_string(), 0.0, 0.0)],
         LikelihoodFamily::GaussianIdentity,
         &opts,
     )

@@ -10470,6 +10470,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
+
+        // Levenberg–Marquardt damping for the joint Newton system.
+        //
+        // The penalized Hessian (H + S_λ) goes near-singular when the
+        // outer ρ probes a region where the survival marginal-slope model
+        // has weakly-identified coefficients. PCG returns a Newton
+        // direction dominated by the small-eigenvalue subspace: |prop|∞
+        // blows up to 10³–10⁶ while the trust region clamps the accepted
+        // step in the same bad direction. Each clamped step shuffles β
+        // along the null mode without reducing the KKT residual — the
+        // exact 100-cycle oscillation pattern that triggers the outer
+        // first-order bridge with a 10⁷-magnitude stale-mode gradient.
+        //
+        // Marquardt damping solves (H + S_λ + μ·I) δ = rhs with μ grown
+        // when the previous cycle was rejected (or the unconstrained
+        // Newton overshot the trust radius by an order of magnitude) and
+        // shrunk when the previous cycle was a clean accept. Added as an
+        // extra `μ·v` term inside the PCG matvec — it does NOT route
+        // through the penalty path, so it touches only the inner Newton
+        // step direction. The penalized objective, the REML/LAML cost
+        // surface, and the envelope-theorem outer gradient are all
+        // evaluated against the original (H + S_λ), so the outer
+        // optimizer's contract is preserved.
+        const MARQUARDT_RIDGE_MIN: f64 = 1.0e-8;
+        const MARQUARDT_RIDGE_MAX: f64 = 1.0e8;
+        const MARQUARDT_RIDGE_GROW: f64 = 10.0;
+        const MARQUARDT_RIDGE_SHRINK: f64 = 0.1;
+        // Trigger threshold: when the unconstrained Newton |prop|∞ is at
+        // least this many times the trust radius, the direction is
+        // dominated by the small-eigenvalue subspace and LM damping is
+        // justified even before the TR explicitly rejects.
+        const MARQUARDT_NEWTON_OVERSHOOT_RATIO: f64 = 100.0;
+        let mut marquardt_ridge: f64 = 0.0;
+        let mut prev_cycle_rejected: bool = false;
+        let mut prev_cycle_newton_overshoot: bool = false;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
