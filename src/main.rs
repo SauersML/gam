@@ -5318,6 +5318,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     timewiggle: effective_timewiggle.clone(),
                     weibull_seed,
                     ridge_lambda: effective_args.ridge_lambda,
+                    penalty_block_gamma_priors: Vec::new(),
                 },
                 cache_session: None,
             },
