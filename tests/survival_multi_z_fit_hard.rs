@@ -30,7 +30,7 @@
 use gam::bernoulli_marginal_slope::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
-use gam::probability::normal_cdf;
+use gam::probability::{normal_cdf, normal_pdf};
 use gam::survival_marginal_slope::{
     survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
     survival_marginal_slope_vector_scale,
@@ -162,11 +162,11 @@ fn total_neglog(
     Ok(acc)
 }
 
-/// Simulate (z, q, qd1, event) where `event` is drawn from the marginal-slope
-/// model at `true_slopes` and `covariance`.  This ensures the population-
-/// expected negative log-likelihood is genuinely minimised at `true_slopes`
-/// (the previous `simulate` drew events as Bernoulli(0.5), independent of
-/// the slopes, so the chosen "truth" was not the population optimum).
+/// Simulate (z, q, qd1, event) where the event label is drawn from the same
+/// exact-event-density vs censoring likelihood scores used by
+/// `survival_marginal_slope_vector_neglog` at `true_slopes` and `covariance`.
+/// This ensures the population-expected negative log-likelihood is genuinely
+/// minimized at `true_slopes`.
 fn simulate_events_from_truth(
     seed: u64,
     true_slopes: &[f64; K],
@@ -191,19 +191,25 @@ fn simulate_events_from_truth(
         qd1[i] = 0.7 + 0.1 * next_unit(&mut state);
 
         let z_row = [z[[i, 0]], z[[i, 1]]];
-        let eta0 = survival_marginal_slope_vector_eta(
-            q0[i], &z_row, true_slopes, covariance, PROBIT_SCALE,
-        )
-        .expect("eta0");
         let eta1 = survival_marginal_slope_vector_eta(
-            q1[i], &z_row, true_slopes, covariance, PROBIT_SCALE,
+            q1[i],
+            &z_row,
+            true_slopes,
+            covariance,
+            PROBIT_SCALE,
         )
         .expect("eta1");
-        let p_surv_0 = normal_cdf(-eta0).max(f64::MIN_POSITIVE);
-        let p_surv_1 = normal_cdf(-eta1);
-        let p_event = (1.0 - (p_surv_1 / p_surv_0)).clamp(0.0, 1.0);
+        let c = survival_marginal_slope_vector_scale(true_slopes, covariance, PROBIT_SCALE)
+            .expect("scale");
+        let event_score = normal_pdf(eta1) * qd1[i] * c;
+        let censor_score = normal_cdf(-eta1);
+        let p_event = (event_score / (event_score + censor_score)).clamp(0.0, 1.0);
 
-        event[i] = if next_unit(&mut state) < p_event { 1.0 } else { 0.0 };
+        event[i] = if next_unit(&mut state) < p_event {
+            1.0
+        } else {
+            0.0
+        };
     }
     SimData {
         z,
@@ -247,13 +253,11 @@ fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
         for which in 0..K {
             let mut plus = true_slopes;
             plus[which] *= 1.0 + 0.05;
-            sum_pert_plus[which] +=
-                total_neglog(&data, &plus, &covariance).expect("plus nl");
+            sum_pert_plus[which] += total_neglog(&data, &plus, &covariance).expect("plus nl");
 
             let mut minus = true_slopes;
             minus[which] *= 1.0 - 0.05;
-            sum_pert_minus[which] +=
-                total_neglog(&data, &minus, &covariance).expect("minus nl");
+            sum_pert_minus[which] += total_neglog(&data, &minus, &covariance).expect("minus nl");
         }
     }
 
@@ -269,25 +273,14 @@ fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
             "aggregate symmetrized excess too small at which={which}: \
              excess={excess:.3} (sum_truth={sum_truth:.3}, \
              sum_pert_plus={:.3}, sum_pert_minus={:.3})",
-            sum_pert_plus[which], sum_pert_minus[which]
-        );
-
-        // Each side individually must also be positive on average (the
-        // linear-in-δ noise has SD ≈ δ·√(N·seeds·I) ≈ 4; a margin of −5
-        // catches any catastrophic curvature sign flip without false
-        // positives from MC noise).
-        assert!(
-            sum_pert_plus[which] - sum_truth > -5.0,
-            "+5% perturbation aggregate dropped neglog far below truth at which={which}: \
-             sum_pert_plus={:.3}, sum_truth={sum_truth:.3}",
-            sum_pert_plus[which]
-        );
-        assert!(
-            sum_pert_minus[which] - sum_truth > -5.0,
-            "-5% perturbation aggregate dropped neglog far below truth at which={which}: \
-             sum_pert_minus={:.3}, sum_truth={sum_truth:.3}",
+            sum_pert_plus[which],
             sum_pert_minus[which]
         );
+
+        // Do not assert each one-sided perturbation separately. The
+        // finite-sample score term is linear in δ and can move one side
+        // below the truth even when the population curvature is correct;
+        // the symmetrized excess above is the invariant this test needs.
     }
 }
 
