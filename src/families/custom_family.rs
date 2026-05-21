@@ -2610,7 +2610,23 @@ pub struct BlockwiseFitOptions {
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
-            inner_max_cycles: 100,
+            // Biobank-scale survival marginal-slope at n≈200k probit-survival
+            // converges monotonically (Δobj decreasing, |δ|∞ shrinking) but
+            // takes ~150-250 joint-Newton cycles to reach KKT residual
+            // tolerance: the joint Hessian over [β, log-slope] is genuinely
+            // ill-conditioned (cross-coupled near-singular directions in
+            // production data), so per-cycle progress is small relative to
+            // gradient norm even with perfect TR prediction ratios.
+            // `fit_survival_marginal_slope_terms` raises this to 300
+            // explicitly, but the bump only takes effect on options threaded
+            // through that function — direct callers of `inner_blockwise_fit`
+            // and code paths that construct fresh `BlockwiseFitOptions` see
+            // the default.  At biobank scale, 100 cycles is the difference
+            // between "fit converges" and "seed validation rejects every
+            // seed."  300 matches the survival bump; well-conditioned fits
+            // (Gaussian, logistic, small-n) exit on KKT well before 100
+            // cycles anyway, so the higher ceiling adds no work for them.
+            inner_max_cycles: 300,
             inner_tol: 1e-6,
             outer_max_iter: 60,
             outer_tol: 1e-5,
@@ -6122,9 +6138,7 @@ fn nonconverged_outer_efs_result(
     ))
 }
 
-fn custom_family_seed_screening_proxy_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
+fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
