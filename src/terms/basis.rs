@@ -1881,9 +1881,10 @@ pub struct BSplineBasisSpec {
 }
 
 /// Per-endpoint boundary condition for 1D B-spline smooths.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BSplineEndpointBoundaryCondition {
     /// No endpoint condition.
+    #[default]
     Free,
     /// Force the first derivative to be zero at the endpoint.
     Clamped,
@@ -1896,12 +1897,6 @@ pub enum BSplineEndpointBoundaryCondition {
     /// swing direction. Currently only `value == 0` is supported by the
     /// homogeneous coefficient reparameterization.
     Anchored { value: f64 },
-}
-
-impl Default for BSplineEndpointBoundaryCondition {
-    fn default() -> Self {
-        Self::Free
-    }
 }
 
 /// Boundary-condition policy for the left and right ends of a 1D B-spline.
@@ -2218,11 +2213,13 @@ pub fn fit_periodic_spline_curve(
 /// These constraints are applied directly in the builder via a reparameterization
 /// `B_constrained = B * Z`, and every penalty matrix is projected as
 /// `S_constrained = Z' S Z`, so solver geometry stays consistent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BSplineIdentifiability {
     /// Keep unconstrained basis columns.
     None,
     /// Enforce weighted sum-to-zero: `B' w = 0` (or unweighted when `weights=None`).
+    // Smooth terms are centered by default to avoid intercept confounding.
+    #[default]
     WeightedSumToZero { weights: Option<Array1<f64>> },
     /// Remove intercept + linear trend in coefficient space using Greville geometry.
     RemoveLinearTrend,
