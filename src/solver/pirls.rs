@@ -1043,13 +1043,16 @@ impl PirlsWorkspace {
         if use_parallel {
             // Parallel: each thread reuses one WX chunk buffer and one p×p
             // accumulator. We never form sqrt(W)·X so negative observed-Hessian
-            // weights survive the assembly exactly.
+            // weights survive the assembly exactly. Row-major chunk_buf and a
+            // serial inner scaling loop avoid (a) the F-order strided writes
+            // that fight cache lines and (b) nested rayon par_for_each that
+            // would compete for the same global pool as the outer fold.
             let combined = (0..num_chunks)
                 .into_par_iter()
                 .fold(
                     || {
                         (
-                            Array2::<f64>::zeros((chunkrows, p).f()),
+                            Array2::<f64>::zeros((chunkrows, p)),
                             Array2::<f64>::zeros((p, p).f()),
                         )
                     },
@@ -1057,15 +1060,35 @@ impl PirlsWorkspace {
                         let start = ci * chunkrows;
                         let rows = (n - start).min(chunkrows);
                         {
-                            let mut chunk = chunk_buf.slice_mut(s![0..rows, ..]);
+                            let chunk_full = chunk_buf
+                                .as_slice_mut()
+                                .expect("row-major chunk is contiguous");
                             let x_slice = x.slice(s![start..start + rows, ..]);
                             let w_slice = weights.slice(s![start..start + rows]);
-                            Zip::from(chunk.rows_mut())
-                                .and(x_slice.rows())
-                                .and(&w_slice)
-                                .par_for_each(|mut dst, src, &w| {
-                                    Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
-                                });
+                            if let (Some(x_all), Some(w_all)) =
+                                (x_slice.as_slice(), w_slice.as_slice())
+                            {
+                                for local in 0..rows {
+                                    let wi = w_all[local];
+                                    let src_off = local * p;
+                                    let src_row = &x_all[src_off..src_off + p];
+                                    let dst_off = local * p;
+                                    let dst_row = &mut chunk_full[dst_off..dst_off + p];
+                                    for col in 0..p {
+                                        dst_row[col] = src_row[col] * wi;
+                                    }
+                                }
+                            } else {
+                                for local in 0..rows {
+                                    let wi = w_slice[local];
+                                    let xrow = x_slice.row(local);
+                                    let dst_off = local * p;
+                                    let dst_row = &mut chunk_full[dst_off..dst_off + p];
+                                    for (col, xij) in xrow.iter().enumerate() {
+                                        dst_row[col] = xij * wi;
+                                    }
+                                }
+                            }
                         }
                         let x_slice = x.slice(s![start..start + rows, ..]);
                         let wx_slice = chunk_buf.slice(s![0..rows, ..]);
