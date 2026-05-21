@@ -4104,7 +4104,7 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
                 v.len()
             )));
         }
-        Ok(self.embed_vector(local.t().dot(v)))
+        Ok(self.embed_vector(crate::faer_ndarray::fast_atv(local, v)))
     }
 
     fn forward_mul_second_diag(
@@ -18823,12 +18823,17 @@ mod tests {
         );
     }
 
-    // Experimental scan: drive rho up to the biobank box ceiling (+10) and
-    // record the per-coord outer gradient for projected vs unprojected
-    // joint-Hessian-logdet routing. Reproduces the optimizer-visible blow-up
-    // documented in project_biobank_marginal_slope_failure.md.
+    // Experimental scan documenting that the joint_outer_evaluate path
+    // itself does *not* show divergence between project_hessian_logdet=true
+    // and =false at biobank-scale ρ: the dominant term ½ λ β'Sβ grows
+    // linearly in λ regardless of projection, and the trace pair cancels
+    // in both routes at this fixture's geometry.  The biobank failure on
+    // gamfit 0.1.92 lives in the custom survival-marginal-slope outer-
+    // gradient assembler (which has its own unprojected formula and has
+    // not been retrofitted to use joint_outer_evaluate's projected
+    // kernel) — see project_biobank_marginal_slope_failure.md.
     #[test]
-    fn biobank_scale_rho_scan_unprojected_gradient_blows_up() {
+    fn biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
         // Same fixture shape as the rank-deficient projected-trace test,
         // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
         let ranges = vec![(0, 3)];
@@ -18983,15 +18988,20 @@ mod tests {
             }
         }
 
-        // Claim: at rho = +10 the unprojected gradient is many orders of
-        // magnitude larger than the projected one — this is the
-        // optimizer-visible bug.
+        // Finding: at this fixture geometry the two routes agree to
+        // ~1e-6 relative precision at every ρ in [0, 10].  Both grow
+        // linearly in λ (≈ ½ λ β'Sβ + bounded trace contribution).
+        // The optimizer-visible blow-up in biobank therefore cannot be
+        // a missing projection in joint_outer_evaluate — it must live
+        // in the survival-marginal-slope custom gradient path.
+        let rel_diff = (g_un_at_10 - g_pr_at_10).abs() / g_pr_at_10.max(1e-30);
         assert!(
-            g_un_at_10 / g_pr_at_10.max(1e-30) > 1e3,
-            "unprojected/projected ratio at rho=10 should be >= 1e3; \
-             got g_un={:.3e}, g_pr={:.3e}",
+            rel_diff < 1e-4,
+            "projection should be near-invariant on this fixture at rho=10; \
+             got g_un={:.6e}, g_pr={:.6e}, rel_diff={:.3e}",
             g_un_at_10,
-            g_pr_at_10
+            g_pr_at_10,
+            rel_diff
         );
     }
 
