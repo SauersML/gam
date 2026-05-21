@@ -19349,8 +19349,6 @@ mod tests {
     //
     #[test]
     fn biobank_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
-        use crate::solver::reml::unified::DriftDerivResult;
-
         // Biobank-realistic dimensions for hypertension marginal-slope.
         // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
         // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
@@ -19420,7 +19418,7 @@ mod tests {
         // we can build Ḣ_k as the full-block S_k for the trace.
         let embed = |s: &Array2<f64>, range: (usize, usize)| -> Array2<f64> {
             let mut out = Array2::<f64>::zeros((p_total, p_total));
-            let (a, b) = range;
+            let (a, _b) = range;
             for i in 0..s.nrows() {
                 for j in 0..s.ncols() {
                     out[[a + i, a + j]] = s[[i, j]];
