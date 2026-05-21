@@ -5275,7 +5275,6 @@ pub struct InnerSolutionBuilder<'dp> {
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
     barrier_config: Option<BarrierConfig>,
-    kkt_residual: Option<Array1<f64>>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -5313,7 +5312,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         }
     }
 
@@ -14856,7 +14854,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -15185,7 +15182,6 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15403,7 +15399,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15543,7 +15538,6 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15634,7 +15628,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho = vec![0.0_f64; k];
         let result =
@@ -15808,7 +15801,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15907,7 +15899,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
         let rho = [lambda.ln()];
 
@@ -16069,7 +16060,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -16128,7 +16118,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
@@ -16230,7 +16219,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         };
 
         let result =
@@ -16307,7 +16295,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         }
     }
 
@@ -16479,7 +16466,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         }
     }
 
@@ -16531,7 +16517,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         }
     }
 
@@ -18252,7 +18237,6 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
-            kkt_residual: None,
         }
     }
 
