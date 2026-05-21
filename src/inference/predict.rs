@@ -1894,7 +1894,7 @@ impl BernoulliMarginalSlopePredictor {
             64,
             48,
         )
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
 
         if f_best.abs() > abs_tol {
             return Err(EstimationError::InvalidInput(format!(

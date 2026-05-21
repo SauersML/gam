@@ -56,37 +56,73 @@ pub enum MonotoneRootError {
     },
 }
 
+/// Internal: which exact textual shape a given error site emitted.
+/// These are folded into the enum variants above via Display so callers see
+/// byte-identical strings to the pre-refactor format!() output.
+impl MonotoneRootError {
+    fn exact_root_degenerate(label: &str, a: f64, fp: f64) -> Self {
+        // Tagged via `iters = usize::MAX` to select the "exact root" Display arm.
+        MonotoneRootError::RefinementDidNotConverge {
+            label: format!("__EXACT_ROOT__{label}"),
+            iters: usize::MAX,
+            last_residual: a,
+        }
+        // (fp is intentionally unused; we only need the label+a for the message)
+        .with_fp_hint(fp)
+    }
+
+    fn converged_root_degenerate(label: &str, a: f64) -> Self {
+        MonotoneRootError::RefinementDidNotConverge {
+            label: format!("__CONVERGED__{label}"),
+            iters: 0,
+            last_residual: a,
+        }
+    }
+
+    fn analytic_bracket_invalid(label: &str, lo: f64, hi: f64) -> Self {
+        MonotoneRootError::BracketingExhausted {
+            label: format!("__ANALYTIC_INVALID__{label}"),
+            iters: 0,
+            a_lo: lo,
+            a_hi: hi,
+        }
+    }
+
+    fn analytic_bracket_no_straddle(label: &str, f_lo: f64, f_hi: f64) -> Self {
+        MonotoneRootError::BracketingExhausted {
+            label: format!("__ANALYTIC_NOSTRADDLE__{label}"),
+            iters: 0,
+            a_lo: f_lo,
+            a_hi: f_hi,
+        }
+    }
+
+    fn search_exhausted(label: &str, step_sign: f64, a_init: f64) -> Self {
+        MonotoneRootError::BracketingExhausted {
+            label: format!("__SEARCH__{label}"),
+            iters: 0,
+            a_lo: a_init,
+            a_hi: step_sign,
+        }
+    }
+
+    fn with_fp_hint(self, _fp: f64) -> Self {
+        self
+    }
+}
+
 impl std::fmt::Display for MonotoneRootError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Pass through the inner eval error message verbatim so call-sites
-            // that previously did `eval(a)?` see the identical string.
             MonotoneRootError::EvalFailed { source, .. } => f.write_str(source),
             MonotoneRootError::NonFiniteEval { label, a, .. } => {
-                // Historical shape: closest match was inline; surface a clear
-                // diagnostic when an eval returned non-finite components.
+                write!(f, "{label}: non-finite evaluation at a={a:.6}")
+            }
+            MonotoneRootError::DegenerateDerivative { label, a, .. } => {
                 write!(
                     f,
-                    "{label}: non-finite evaluation at a={a:.6}",
-                    label = label,
-                    a = a
+                    "{label}: initial derivative is zero or non-finite at a={a:.6}"
                 )
-            }
-            MonotoneRootError::DegenerateDerivative { label, a, fp } => {
-                // Two original sites use very similar wording; choose the one
-                // matching the "initial" path, and the "exact root" / "converged
-                // root" paths emit their own variants below.
-                if fp.is_nan() {
-                    write!(
-                        f,
-                        "{label}: initial derivative is zero or non-finite at a={a:.6}"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "{label}: initial derivative is zero or non-finite at a={a:.6}"
-                    )
-                }
             }
             MonotoneRootError::BracketingExhausted {
                 label,
@@ -94,28 +130,29 @@ impl std::fmt::Display for MonotoneRootError {
                 a_hi,
                 ..
             } => {
-                // Original message used `step_sign` and `a_init`; recover the
-                // analytic-bracket shape vs search shape from which fields are
-                // meaningful. `a_lo == a_hi` means "invalid analytic bracket
-                // with single sentinel"; otherwise it's the bracketing search.
-                if a_lo == a_hi {
+                if let Some(real_label) = label.strip_prefix("__ANALYTIC_INVALID__") {
                     write!(
                         f,
-                        "{label}: invalid analytic bracket [{a_lo:.6}, {a_hi:.6}]"
+                        "{real_label}: invalid analytic bracket [{a_lo:.6}, {a_hi:.6}]"
                     )
-                } else if !a_lo.is_finite() && !a_hi.is_finite() {
+                } else if let Some(real_label) = label.strip_prefix("__ANALYTIC_NOSTRADDLE__") {
+                    let f_lo = a_lo;
+                    let f_hi = a_hi;
                     write!(
                         f,
-                        "{label}: invalid analytic bracket [{a_lo:.6}, {a_hi:.6}]"
+                        "{real_label}: analytic bracket does not straddle root (f_lo={f_lo:.3e}, f_hi={f_hi:.3e})"
+                    )
+                } else if let Some(real_label) = label.strip_prefix("__SEARCH__") {
+                    let step_sign = *a_hi;
+                    let a_init = *a_lo;
+                    write!(
+                        f,
+                        "{real_label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})"
                     )
                 } else {
-                    // Search-side exhaustion. `a_lo` carries the seed and
-                    // `a_hi` carries the signed step direction.
                     write!(
                         f,
-                        "{label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})",
-                        step_sign = a_hi,
-                        a_init = a_lo,
+                        "{label}: failed to bracket root (a_lo={a_lo:.6}, a_hi={a_hi:.6})"
                     )
                 }
             }
@@ -124,10 +161,24 @@ impl std::fmt::Display for MonotoneRootError {
                 last_residual,
                 ..
             } => {
-                write!(
-                    f,
-                    "{label}: zero or non-finite derivative at converged root a={last_residual:.6}"
-                )
+                if let Some(real_label) = label.strip_prefix("__EXACT_ROOT__") {
+                    let a = last_residual;
+                    write!(
+                        f,
+                        "{real_label}: zero or non-finite derivative at exact root a={a:.6}"
+                    )
+                } else if let Some(real_label) = label.strip_prefix("__CONVERGED__") {
+                    let a = last_residual;
+                    write!(
+                        f,
+                        "{real_label}: zero or non-finite derivative at converged root a={a:.6}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{label}: refinement did not converge (last residual={last_residual:.3e})"
+                    )
+                }
             }
         }
     }
@@ -171,7 +222,7 @@ pub fn solve_monotone_root_detailed(
     convergence_tol: f64,
     max_bracket_iters: usize,
     max_refine_iters: usize,
-) -> Result<MonotoneRootSolution, String> {
+) -> Result<MonotoneRootSolution, MonotoneRootError> {
     solve_monotone_root_detailed_with_bracket(
         eval,
         a_init,
@@ -191,15 +242,18 @@ pub fn solve_monotone_root_detailed_with_bracket(
     max_bracket_iters: usize,
     max_refine_iters: usize,
     analytic_bracket: Option<(f64, f64)>,
-) -> Result<MonotoneRootSolution, String> {
-    let (f_init, f_deriv_init, _) = eval(a_init)?;
+) -> Result<MonotoneRootSolution, MonotoneRootError> {
+    let (f_init, f_deriv_init, _) =
+        eval(a_init).map_err(|e| map_eval_err(label, a_init, e))?;
 
     // Exact root — rare but handle correctly.
     if f_init.abs() <= convergence_tol {
         let abs_d = f_deriv_init.abs();
         if !abs_d.is_finite() || abs_d == 0.0 {
-            return Err(format!(
-                "{label}: zero or non-finite derivative at exact root a={a_init:.6}"
+            return Err(MonotoneRootError::exact_root_degenerate(
+                label,
+                a_init,
+                f_deriv_init,
             ));
         }
         return Ok(MonotoneRootSolution {
@@ -211,9 +265,11 @@ pub fn solve_monotone_root_detailed_with_bracket(
     }
 
     if !f_deriv_init.is_finite() || f_deriv_init == 0.0 {
-        return Err(format!(
-            "{label}: initial derivative is zero or non-finite at a={a_init:.6}"
-        ));
+        return Err(MonotoneRootError::DegenerateDerivative {
+            label: label.to_string(),
+            a: a_init,
+            fp: f_deriv_init,
+        });
     }
 
     // With a good warm start, the root is often within one or two Newton
@@ -247,7 +303,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
         }
 
         let cand = a + step;
-        let (f_cand, fp_cand, _) = eval(cand)?;
+        let (f_cand, fp_cand, _) =
+            eval(cand).map_err(|e| map_eval_err(label, cand, e))?;
         if f_cand.abs() <= convergence_tol {
             let abs_d = fp_cand.abs();
             if !abs_d.is_finite() || abs_d == 0.0 {
@@ -269,19 +326,17 @@ pub fn solve_monotone_root_detailed_with_bracket(
     // --- Phase 1: bracket the root -------------------------------------------
     let (mut neg_pt, mut pos_pt) = if let Some((lo, hi)) = analytic_bracket {
         if !lo.is_finite() || !hi.is_finite() || lo == hi {
-            return Err(format!(
-                "{label}: invalid analytic bracket [{lo:.6}, {hi:.6}]"
-            ));
+            return Err(MonotoneRootError::analytic_bracket_invalid(label, lo, hi));
         }
-        let (f_lo, _, _) = eval(lo)?;
-        let (f_hi, _, _) = eval(hi)?;
+        let (f_lo, _, _) = eval(lo).map_err(|e| map_eval_err(label, lo, e))?;
+        let (f_hi, _, _) = eval(hi).map_err(|e| map_eval_err(label, hi, e))?;
         if f_lo <= 0.0 && f_hi >= 0.0 {
             (lo, hi)
         } else if f_hi <= 0.0 && f_lo >= 0.0 {
             (hi, lo)
         } else {
-            return Err(format!(
-                "{label}: analytic bracket does not straddle root (f_lo={f_lo:.3e}, f_hi={f_hi:.3e})"
+            return Err(MonotoneRootError::analytic_bracket_no_straddle(
+                label, f_lo, f_hi,
             ));
         }
     } else {
@@ -319,7 +374,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
         for _ in 0..max_bracket_iters {
             let probe = same_side + step_mag * step_sign;
-            let (f_probe, _, _) = eval(probe)?;
+            let (f_probe, _, _) =
+                eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
             let crossed = if f_init_negative {
                 f_probe >= 0.0
             } else {
@@ -337,8 +393,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
         }
 
         let Some((other, _)) = found_other else {
-            return Err(format!(
-                "{label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})"
+            return Err(MonotoneRootError::search_exhausted(
+                label, step_sign, a_init,
             ));
         };
 
@@ -380,7 +436,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
             (pos_pt, neg_pt)
         };
         let mid = 0.5 * (lo + hi);
-        let (f_mid, f_a_mid, f_aa_mid) = eval(mid)?;
+        let (f_mid, f_a_mid, f_aa_mid) =
+            eval(mid).map_err(|e| map_eval_err(label, mid, e))?;
         update_best(
             &mut best_a,
             &mut best_f,
@@ -427,7 +484,8 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
         // Evaluate probe if it differs from midpoint.
         let (bracket_pt, f_bracket) = if (probe - mid).abs() > 0.0 {
-            let (f_p, f_a_p, _) = eval(probe)?;
+            let (f_p, f_a_p, _) =
+                eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
             update_best(
                 &mut best_a,
                 &mut best_f,
@@ -459,13 +517,12 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
     // Final validation: re-evaluate at best_a if the derivative is suspect.
     if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
-        let (_, f_a_best, _) = eval(best_a)?;
+        let (_, f_a_best, _) =
+            eval(best_a).map_err(|e| map_eval_err(label, best_a, e))?;
         best_abs_deriv = f_a_best.abs();
     }
     if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
-        return Err(format!(
-            "{label}: zero or non-finite derivative at converged root a={best_a:.6}"
-        ));
+        return Err(MonotoneRootError::converged_root_degenerate(label, best_a));
     }
 
     Ok(MonotoneRootSolution {
