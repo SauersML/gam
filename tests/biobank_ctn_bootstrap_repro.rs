@@ -44,7 +44,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
                     num_centers: centers,
                 },
                 length_scale: Some(1.0),
-                power,
+                power: power as f64,
                 nullspace_order: DuchonNullspaceOrder::Zero,
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: Some(vec![0.0; d]),

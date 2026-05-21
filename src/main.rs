@@ -12190,7 +12190,7 @@ mod tests {
         match &spec.smooth_terms[0].basis {
             gam::smooth::SmoothBasisSpec::Duchon { spec: duchon, .. } => {
                 assert_eq!(
-                    duchon.power, 2,
+                    duchon.power, 2.0,
                     "explicit power=1 should escalate to power=2 (the minimum \
                      admissible for D2 collocation at d=4, p=2): got power={}",
                     duchon.power
