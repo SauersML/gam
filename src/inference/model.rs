@@ -10,7 +10,6 @@ use crate::families::survival_construction::{
 };
 use crate::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message,
-    saved_link_name_supports_joint_wiggle,
 };
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
@@ -2113,8 +2112,8 @@ impl FittedModel {
             .is_some_and(|link| !inverse_link_supports_joint_wiggle(link))
             || payload
                 .link
-                .as_deref()
-                .is_some_and(|link_name| !saved_link_name_supports_joint_wiggle(link_name));
+                .as_ref()
+                .is_some_and(|link| !inverse_link_supports_joint_wiggle(link));
         if saved_link_disallows_wiggle {
             return Err(joint_wiggle_unsupported_link_message("link wiggle"));
         }

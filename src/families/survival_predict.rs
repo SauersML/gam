@@ -1975,10 +1975,12 @@ pub fn apply_inverse_link_state_to_fit_result(
 /// Resolve the saved survival inverse-link from saved link metadata and fitted
 /// state.
 pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, String> {
+    if let Some(link) = model.link.as_ref() {
+        return Ok(link.clone());
+    }
     let raw = model
-        .link
+        .survival_distribution
         .as_deref()
-        .or(model.survival_distribution.as_deref())
         .ok_or_else(|| "saved survival model is missing link/distribution metadata".to_string())?;
     let name = raw.trim().to_ascii_lowercase();
     if name == "loglog" || name == "cauchit" {
