@@ -10508,6 +10508,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
+                Some(cached_active_sets.as_slice()),
             )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
@@ -10877,29 +10878,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const LINEARIZED_STALL_CYCLES: usize = 15;
         const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
         let mut linearized_stall_streak: usize = 0;
-
-        // Constrained-stationary convergence-kind flag. Set when the
-        // certificate at the bottom of the cycle body fires (`linearized_rel
-        // ≥ 0.5` AND `scalar_model_relerr ≤ 1e-3` AND objective exhausted).
-        // At a constrained-stationary KKT point ∇f = Aᵀμ where A indexes the
-        // active inequality/equality constraints and μ is the Lagrange
-        // multiplier; ∂β*/∂ρ_k lies in null(A) so the envelope chain-rule
-        // term (∇f)ᵀ(∂β*/∂ρ_k) = μᵀA(∂β*/∂ρ_k) = 0 in exact arithmetic. The
-        // IFT correction `−½ rᵀ H⁻¹ r` and `grad[k] −= rᵀ v_k` in
-        // `solver/reml/unified.rs` therefore vanish at the constrained
-        // optimum; computing them anyway via the full-H solve amplifies the
-        // multiplier-mass component of r (which is most of r in this regime)
-        // by `1/σ_min(H_active_normal)` (~10¹² on biobank survival
-        // marginal-slope), producing a gradient of magnitude ~10¹⁵–10¹⁷
-        // that the envelope-consistency tripwire then suppresses — leaving
-        // the outer optimizer with no usable gradient at all. The principled
-        // action is to mark the residual unavailable on this convergence
-        // kind so the outer IFT path is skipped entirely; the bare envelope
-        // gradient is the mathematically correct value at this β. Strict-KKT
-        // and noise-floor exits keep populating the residual (r is small in
-        // all directions there, so `rᵀ H⁻¹ r` is well-conditioned and the
-        // IFT correction is informative).
-        let mut inner_constrained_stationary: bool = false;
 
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
@@ -12418,10 +12396,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                          scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
                          at this β); |Δobjective|={:.3e}, geometric_tail_bound={:.3e}, obj_tol={:.3e}; further cycles cannot reduce the \
                          multiplier mass and would reproduce this plateau indefinitely; \
-                         IFT residual will be suppressed at the convergent return so the outer \
-                         envelope formula uses the bare ∂f/∂ρ_k (the chain-rule correction \
-                         gᵀ ∂β/∂ρ_k = μᵀ A ∂β/∂ρ_k = 0 at this KKT point in exact arithmetic; \
-                         computing it via full-H solve only injects 1/σ_min noise)",
+                         active-set multiplier mass will be projected out of the KKT residual \
+                         before the outer IFT correction is assembled",
                         cycle,
                         (1.0 - linearized_rel) * 100.0,
                         linearized_rel * 100.0,
@@ -12430,7 +12406,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         geometric_tail_bound.unwrap_or(objective_change),
                         objective_tol,
                     );
-                    inner_constrained_stationary = true;
                     converged = true;
                     break;
                 }
@@ -12610,23 +12585,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
-            let kkt_residual = if inner_constrained_stationary {
-                // See the `inner_constrained_stationary` declaration above.
-                // None signals the outer IFT path that the envelope identity
-                // is already valid at this β (the chain-rule correction
-                // term is exactly zero at a constrained KKT point); computing
-                // it through full-H amplifies multiplier mass by 1/σ_min.
-                None
-            } else {
-                exact_newton_joint_kkt_residual_for_ift(
-                    family,
-                    specs,
-                    &states,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                )?
-            };
+            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
+                family,
+                specs,
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                Some(cached_active_sets.as_slice()),
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -13503,23 +13470,26 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
-    let kkt_residual = if converged && !inner_constrained_stationary {
+    let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
-            Some(gradient) => exact_newton_joint_kkt_residual_for_ift_from_gradient(
-                &gradient,
-                specs,
-                &states,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-            )?,
+            Some(gradient) => {
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+                exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
+                    &gradient,
+                    specs,
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    &block_constraints,
+                    Some(cached_active_sets.as_slice()),
+                )?
+            }
             None => None,
         }
     } else {
-        // Either inner did not converge (no caller should trust an IFT
-        // correction at a non-KKT iterate) OR convergence was via the
-        // constrained-stationary certificate (see the comment on
-        // `inner_constrained_stationary` above).
+        // Inner did not converge; no caller should trust an IFT correction
+        // at a non-KKT iterate.
         None
     };
 
@@ -18494,6 +18464,73 @@ fn exact_newton_joint_stationarity_vector_from_gradient(
     Ok(residual)
 }
 
+fn exact_newton_joint_projected_stationarity_vector_from_gradient(
+    gradient: &Array1<f64>,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
+) -> Result<Array1<f64>, String> {
+    if states.len() != specs.len()
+        || states.len() != s_lambdas.len()
+        || states.len() != block_constraints.len()
+    {
+        return Err(
+            "exact-newton projected stationarity vector from gradient: block dimension mismatch"
+                .to_string(),
+        );
+    }
+    if let Some(sets) = block_active_sets
+        && sets.len() != states.len()
+    {
+        return Err(format!(
+            "exact-newton projected stationarity vector from gradient: active-set count mismatch, got {}, expected {}",
+            sets.len(),
+            states.len()
+        ));
+    }
+    let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    if gradient.len() != total_p {
+        return Err(format!(
+            "exact-newton projected stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
+            gradient.len(),
+            total_p
+        ));
+    }
+
+    let mut residual = Array1::<f64>::zeros(total_p);
+    let mut offset = 0usize;
+    for b in 0..states.len() {
+        let width = specs[b].design.ncols();
+        let start = offset;
+        let end = offset + width;
+        let mut block = s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
+        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            block += &states[b].beta.mapv(|v| ridge * v);
+        }
+        if let Some(constraints) = block_constraints[b].as_ref() {
+            let block_active_hint = block_active_sets
+                .and_then(|sets| sets.get(b))
+                .and_then(|opt| opt.as_deref());
+            block = projected_linear_constraint_stationarity_vector(
+                &block,
+                &states[b].beta,
+                constraints,
+                block_active_hint,
+            )
+            .ok_or_else(|| {
+                format!("exact-newton projected stationarity vector: failed to project block {b}")
+            })?;
+        }
+        residual.slice_mut(ndarray::s![start..end]).assign(&block);
+        offset = end;
+    }
+    Ok(residual)
+}
+
 fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -18501,36 +18538,44 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<Option<Array1<f64>>, String> {
     let eval = family.evaluate(states)?;
     let Some(gradient) = exact_newton_joint_gradient_from_eval(&eval, specs, states)? else {
         return Ok(None);
     };
-    exact_newton_joint_kkt_residual_for_ift_from_gradient(
+    let block_constraints = collect_block_linear_constraints(family, states, specs)?;
+    exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         &gradient,
         specs,
         states,
         s_lambdas,
         ridge,
         ridge_policy,
+        &block_constraints,
+        block_active_sets,
     )
 }
 
-fn exact_newton_joint_kkt_residual_for_ift_from_gradient(
+fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     gradient: &Array1<f64>,
     specs: &[ParameterBlockSpec],
     states: &[ParameterBlockState],
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<Option<Array1<f64>>, String> {
-    let residual = exact_newton_joint_stationarity_vector_from_gradient(
+    let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
         gradient,
         states,
         specs,
         s_lambdas,
         ridge,
         ridge_policy,
+        block_constraints,
+        block_active_sets,
     )?;
     if residual.iter().all(|v| v.is_finite()) {
         Ok(Some(residual))
@@ -25147,18 +25192,20 @@ mod tests {
         )
         .expect("stationarity projection should succeed");
         assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
-        let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_gradient(
+        let kkt_residual = exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
             &gradient,
             std::slice::from_ref(&spec),
             &[state.clone()],
             &s_lambdas,
             0.0,
             RidgePolicy::explicit_stabilization_full(),
+            &[Some(constraints.clone())],
+            None,
         )
         .expect("KKT residual assembly should succeed")
         .expect("exact-gradient path should produce residual");
-        assert_relative_eq!(kkt_residual[0], 3.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(kkt_residual[1], 3.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual[0], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual[1], 0.0_f64, epsilon = 1e-10);
 
         // Wrong-signed normal residual means the active constraint wants to
         // release. That is not convergence and must remain visible.
