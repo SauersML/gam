@@ -13011,6 +13011,19 @@ struct BorrowedJointDerivProvider<'a> {
     compute_dh_many:
         Option<&'a dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>>,
     compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    /// Optional batched second-derivative callback. The unified evaluator's
+    /// outer-Hessian ρ-ρ pair loop precomputes all K(K+1)/2 (v_k, v_l, u_kl)
+    /// triples and calls this once per outer Hessian assembly when set, so
+    /// families that fuse the per-row D²H walk across pairs (e.g. survival
+    /// marginal-slope which scans n rows once per outer eval) replace
+    /// K(K+1)/2 separate row-walks with one. The default `None` falls back
+    /// to the per-pair `compute_d2h` dispatch and preserves the historical
+    /// dispatch cost.
+    compute_d2h_many: Option<
+        &'a dyn Fn(
+            &[(Array1<f64>, Array1<f64>)],
+        ) -> Result<Vec<Option<DriftDerivResult>>, String>,
+    >,
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
@@ -13092,6 +13105,60 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
     }
 
+    fn hessian_second_derivative_corrections_result(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        // Fast path: family supplied a batched D²H callback that fuses the
+        // per-row scan across all K(K+1)/2 (v_k, v_l, u_kl) triples in one
+        // pass. Pair it with the (also potentially batched) `compute_dh`
+        // term1 walk over `u_kl` directions to keep the (term1, term2)
+        // CompositeHyperOperator semantics that the singular hook produces.
+        if let Some(compute_d2h_many) = self.compute_d2h_many {
+            let u_kls: Vec<Array1<f64>> = triples
+                .iter()
+                .map(|(_, _, u_kl)| u_kl.clone())
+                .collect();
+            let term1s = self.hessian_derivative_corrections_result(
+                &u_kls.iter().map(|u| -u).collect::<Vec<_>>(),
+            )?;
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> = triples
+                .iter()
+                .map(|(v_k, v_l, _)| (-v_l, -v_k))
+                .collect();
+            let term2s = compute_d2h_many(&pairs)?;
+            triples
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, _, u_kl))| match (&term1s[idx], &term2s[idx]) {
+                    (Some(t1), Some(t2)) => {
+                        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                            dense: None,
+                            operators: vec![
+                                t1.clone().into_operator(),
+                                t2.clone().into_operator(),
+                            ],
+                            dim_hint: u_kl.len(),
+                        };
+                        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+                    }
+                    _ => Ok(None),
+                })
+                .collect()
+        } else {
+            triples
+                .iter()
+                .map(|(v_k, v_l, u_kl)| {
+                    self.hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+                })
+                .collect()
+        }
+    }
+
+    fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
+        self.compute_d2h_many.is_some()
+    }
+
     fn has_corrections(&self) -> bool {
         true
     }
@@ -13112,6 +13179,17 @@ struct OwnedJointDerivProvider {
         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
             + Send
             + Sync,
+    >,
+    /// Optional batched second-derivative callback. See the matching field on
+    /// `BorrowedJointDerivProvider` for the dispatch contract.
+    compute_d2h_many: Option<
+        Arc<
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+                + Send
+                + Sync,
+        >,
     >,
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
@@ -13185,6 +13263,55 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
             dim_hint: u_kl.len(),
         };
         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+    }
+
+    fn hessian_second_derivative_corrections_result(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        if let Some(compute_d2h_many) = self.compute_d2h_many.as_ref() {
+            let u_kls: Vec<Array1<f64>> = triples
+                .iter()
+                .map(|(_, _, u_kl)| u_kl.clone())
+                .collect();
+            let term1s = self.hessian_derivative_corrections_result(
+                &u_kls.iter().map(|u| -u).collect::<Vec<_>>(),
+            )?;
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> = triples
+                .iter()
+                .map(|(v_k, v_l, _)| (-v_l, -v_k))
+                .collect();
+            let term2s = compute_d2h_many(&pairs)?;
+            triples
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, _, u_kl))| match (&term1s[idx], &term2s[idx]) {
+                    (Some(t1), Some(t2)) => {
+                        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                            dense: None,
+                            operators: vec![
+                                t1.clone().into_operator(),
+                                t2.clone().into_operator(),
+                            ],
+                            dim_hint: u_kl.len(),
+                        };
+                        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+                    }
+                    _ => Ok(None),
+                })
+                .collect()
+        } else {
+            triples
+                .iter()
+                .map(|(v_k, v_l, u_kl)| {
+                    self.hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+                })
+                .collect()
+        }
+    }
+
+    fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
+        self.compute_d2h_many.is_some()
     }
 
     fn has_corrections(&self) -> bool {

@@ -9991,6 +9991,37 @@ fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
     (matrix + &matrix.t().to_owned()) * 0.5
 }
 
+/// Centered design Gram: `(D − 1 μ')^T (D − 1 μ')` where `μ_j` is the
+/// column mean of `D` across rows. The constant direction (intercept basis
+/// = column of ones) sits in the exact null space because its centered
+/// column is identically zero. Used as the spring-measure mass penalty on
+/// the scale-free Duchon path so the magnitude term penalizes deviations
+/// from the function's row-mean rather than absolute level — the intercept
+/// is genuinely unpenalized regardless of what the row-mean is.
+fn centered_design_gram(d: &Array2<f64>) -> Array2<f64> {
+    let n_rows = d.nrows();
+    let n_cols = d.ncols();
+    if n_rows == 0 || n_cols == 0 {
+        return Array2::<f64>::zeros((n_cols, n_cols));
+    }
+    let inv_n = 1.0 / n_rows as f64;
+    let col_sum = d.sum_axis(Axis(0));
+    let g_raw = fast_ata(d);
+    // (D − 1μ')'(D − 1μ') = D'D − N μ μ'   where Σ = D'1 = col_sum,
+    // so the rank-1 correction is `col_sum col_sum' / N`.
+    let mut out = g_raw;
+    for i in 0..n_cols {
+        let ci = col_sum[i];
+        let row = out.row_mut(i);
+        // Subtract column i's contribution: out[i, j] -= (ci * col_sum[j]) / N.
+        let mut row = row;
+        for j in 0..n_cols {
+            row[j] -= ci * col_sum[j] * inv_n;
+        }
+    }
+    out
+}
+
 fn normalize_penalty(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
     let norm = matrix.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
     (matrix.mapv(|v| v / norm), norm)
@@ -11014,10 +11045,19 @@ pub fn operator_penalty_candidates_closed_form_pure(
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Vec<PenaltyCandidate> {
-    // q=0 mass always uses collocation Gram (closed-form pair block at q=0
-    // is the kernel itself, but the canonical operator-mass penalty is
-    // `D_0^T D_0` for symmetry with the hybrid path).
-    let s0_raw = symmetrize(&fast_ata(d0));
+    // q=0 mass is the *centered* collocation Gram — the data-density-weighted
+    // spring penalty on deviations from the function's mean over the
+    // collocation sites. Centering each design column by its mean across rows
+    // before forming the Gram puts the constant direction exactly into the
+    // penalty's null space (intercept genuinely unpenalized): for the
+    // constant basis column (all-ones), the column mean is one and the
+    // centered column is identically zero, so the resulting Gram row/column
+    // for that direction is zero. Algebraically this is
+    // `(D_0 - 1 μ')^T (D_0 - 1 μ')` where `μ_j = (1/N) Σ_i D_0[i, j]`. This
+    // expresses the "springs to a floating flat sheet" semantics — the level
+    // is free and only deviations get the spring force — while staying inside
+    // the standard quadratic-penalty machinery.
+    let s0_raw = symmetrize(&centered_design_gram(d0));
     let (s0, c0) = normalize_penalty(&s0_raw);
 
     let d = centers.ncols();
