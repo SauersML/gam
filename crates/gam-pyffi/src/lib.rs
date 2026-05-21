@@ -4608,12 +4608,15 @@ fn design_matrix_dense(
     )?;
     let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let dense = design
+        .design
+        .try_to_dense_by_chunks("design_matrix prediction design")?;
     append_deployment_extension_columns(
         model.payload(),
         dataset.values.view(),
         &col_map,
         training_headers,
-        design.design.to_dense(),
+        dense,
     )
 }
 
@@ -4674,12 +4677,15 @@ fn posterior_predict_table_impl(
     )?;
     let design = gam::smooth::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    let base_dense = design
+        .design
+        .try_to_dense_by_chunks("posterior_predict design")?;
     let dense = append_deployment_extension_columns(
         model.payload(),
         dataset.values.view(),
         &col_map,
         training_headers,
-        design.design.to_dense(),
+        base_dense,
     )?;
     let n_rows = dense.nrows();
     if dense.ncols() != n_coeffs {
@@ -7207,8 +7213,16 @@ fn build_binomial_location_scale_ffi_payload(
         .clone()
         .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
 
-    let dense_mean = ls_result.fit.mean_design.design.to_dense();
-    let dense_noise = ls_result.fit.noise_design.design.to_dense();
+    let dense_mean = ls_result
+        .fit
+        .mean_design
+        .design
+        .try_to_dense_by_chunks("binomial location-scale mean design")?;
+    let dense_noise = ls_result
+        .fit
+        .noise_design
+        .design
+        .try_to_dense_by_chunks("binomial location-scale noise design")?;
     let non_intercept_start = ls_result
         .fit
         .noise_design
@@ -7376,9 +7390,19 @@ fn build_survival_location_scale_ffi_payload(
     // CLI's build_scale_deviation_transform on the time + threshold + log_sigma
     // designs. Required for predict_survival_location_scale to recover the
     // saved scale-deviation transform.
-    let dense_threshold = ls_result.fit.threshold_design.design.to_dense();
-    let dense_log_sigma = ls_result.fit.log_sigma_design.design.to_dense();
-    let dense_time_exit = time_build.x_exit_time.to_dense();
+    let dense_threshold = ls_result
+        .fit
+        .threshold_design
+        .design
+        .try_to_dense_by_chunks("survival location-scale threshold design")?;
+    let dense_log_sigma = ls_result
+        .fit
+        .log_sigma_design
+        .design
+        .try_to_dense_by_chunks("survival location-scale log_sigma design")?;
+    let dense_time_exit = time_build
+        .x_exit_time
+        .try_to_dense_by_chunks("survival location-scale time-exit design")?;
     let mut survival_primary_design =
         Array2::<f64>::zeros((n, dense_time_exit.ncols() + dense_threshold.ncols()));
     survival_primary_design
