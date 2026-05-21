@@ -2397,7 +2397,8 @@ fn trace_projected_operator_terms_batched(
 }
 
 fn dense_projected_matrix(matrix: &Array2<f64>, factor: &Array2<f64>) -> Array2<f64> {
-    factor.t().dot(&matrix.dot(factor))
+    let mf = crate::faer_ndarray::fast_ab(matrix, factor);
+    crate::faer_ndarray::fast_atb(factor, &mf)
 }
 
 fn collect_projected_matrix_terms<'a>(
@@ -2721,7 +2722,8 @@ impl HyperOperator for CompositeHyperOperator {
         let rank = factor.ncols();
         let mut projected = Array2::<f64>::zeros((rank, rank));
         if let Some(dense) = self.dense.as_ref() {
-            projected += &factor.t().dot(&dense.dot(factor));
+            let mf = crate::faer_ndarray::fast_ab(dense, factor);
+            projected += &crate::faer_ndarray::fast_atb(factor, &mf);
         }
         for op in &self.operators {
             projected += &op.projected_matrix(factor);
@@ -2741,7 +2743,8 @@ impl HyperOperator for CompositeHyperOperator {
         let rank = factor.ncols();
         let mut projected = Array2::<f64>::zeros((rank, rank));
         if let Some(dense) = self.dense.as_ref() {
-            projected += &factor.t().dot(&dense.dot(factor));
+            let mf = crate::faer_ndarray::fast_ab(dense, factor);
+            projected += &crate::faer_ndarray::fast_atb(factor, &mf);
         }
         for op in &self.operators {
             projected += &op.projected_matrix_cached(factor, cache);
