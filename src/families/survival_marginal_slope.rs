@@ -15933,28 +15933,21 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let k = rho_dim.saturating_add(psi_dim as u128).max(1);
 
         let predicted_hessian_work = if !self.flex_active() && !self.flex_timewiggle_active() {
-            // Rigid survival marginal-slope evaluates coordinate corrections
-            // through the row-kernel/HVP path, but the analytic outer Hessian
-            // also differentiates the projected logdet-H trace.  With the
-            // rank-projected LAML kernel that trace is not an O(n·k·p) row
-            // correction; the cross-coordinate trace contractions scale like
-            // O(n·k·p²).  The AoU hypertension shape (n=195780, p=33, k=4)
-            // made this mismatch visible: the old row-kernel-only estimate
-            // was ≈29M, selected ARC, then spent ~20 minutes building a
-            // Hessian and still drove ARC into a boundary-gradient failure.
-            // Gate on the larger of the two honest costs so large projected
-            // trace Hessians route to gradient-only BFGS.
+            // Rigid survival marginal-slope evaluates outer rho/psi
+            // coordinate corrections and projected logdet traces through
+            // row-kernel/HVP paths.  The projected subspace trace reductions
+            // are batched in `reml::unified`, so the shared X·U_S work is
+            // paid once per derivative group rather than once per coordinate.
+            // Model the work that actually executes: one row-kernel pass per
+            // outer coordinate and coefficient axis, plus the fixed four
+            // primary survival channels.
             let p_total = specs
                 .iter()
                 .map(|spec| spec.design.ncols() as u128)
                 .sum::<u128>();
-            let row_kernel_work = (self.n as u128)
+            (self.n as u128)
                 .saturating_mul(k)
-                .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
-            let projected_trace_work = (self.n as u128)
-                .saturating_mul(k)
-                .saturating_mul(p_total.saturating_mul(p_total));
-            row_kernel_work.max(projected_trace_work)
+                .saturating_mul(p_total.saturating_add(N_PRIMARY as u128))
         } else {
             // Flex/time-wiggle survival paths have higher-order dynamic-q
             // row geometry. Keep the generic dense policy there until those
@@ -19026,7 +19019,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_small_projected_trace_keeps_exact_hessian() {
+    fn survival_marginal_slope_rigid_biobank_rho_policy_uses_batched_row_kernel_work() {
         let n = 39_722usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![
@@ -19055,14 +19048,7 @@ mod tests {
         let row_kernel_work = (n as u128)
             .saturating_mul(rho_dim)
             .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
-        let projected_trace_work = (n as u128)
-            .saturating_mul(rho_dim)
-            .saturating_mul(p_total.saturating_mul(p_total));
-
-        assert_eq!(
-            policy.predicted_hessian_work,
-            row_kernel_work.max(projected_trace_work)
-        );
+        assert_eq!(policy.predicted_hessian_work, row_kernel_work);
         assert!(
             row_kernel_work < generic_dense_work,
             "rigid row-kernel work must be cheaper than generic dense Hessian work"
@@ -19085,7 +19071,8 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_biobank_projected_trace_demotes_outer_hessian() {
+    fn survival_marginal_slope_rigid_biobank_keeps_analytic_hessian_after_batched_projected_trace()
+    {
         let n = 195_780usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![
@@ -19111,26 +19098,18 @@ mod tests {
         let row_kernel_work = (n as u128)
             .saturating_mul(rho_dim)
             .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
-        let projected_trace_work = (n as u128)
-            .saturating_mul(rho_dim)
-            .saturating_mul(p_total.saturating_mul(p_total));
 
         assert_eq!(p_total, 33);
         assert_eq!(rho_dim, 4);
         assert!(
             row_kernel_work
                 <= crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "the old row-kernel-only estimate would incorrectly select ARC"
+            "batched projected trace keeps the analytic Hessian route within budget"
         );
-        assert!(
-            projected_trace_work
-                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "projected logdet-H cross traces are the dominant biobank Hessian cost"
-        );
-        assert_eq!(policy.predicted_hessian_work, projected_trace_work);
+        assert_eq!(policy.predicted_hessian_work, row_kernel_work);
         assert_eq!(
             policy.declared_hessian_form(),
-            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
         );
 
         let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
@@ -19140,7 +19119,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
         );
     }
 

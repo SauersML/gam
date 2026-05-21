@@ -73,15 +73,26 @@ fn format_log_record(record: &Record<'_>) -> Vec<String> {
 }
 
 fn sanitize_log_message(message: &str) -> String {
-    message
-        .chars()
-        .filter_map(|ch| match ch {
-            '\r' => Some('\n'),
-            '\n' | '\t' => Some(ch),
-            ch if ch.is_control() => None,
-            ch => Some(ch),
-        })
-        .collect()
+    let mut sanitized = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => {
+                if chars.next_if_eq(&'[').is_some() {
+                    for seq_ch in chars.by_ref() {
+                        if ('@'..='~').contains(&seq_ch) {
+                            break;
+                        }
+                    }
+                }
+            }
+            '\r' => sanitized.push('\n'),
+            '\n' | '\t' => sanitized.push(ch),
+            ch if ch.is_control() => {}
+            ch => sanitized.push(ch),
+        }
+    }
+    sanitized
 }
 
 fn human_elapsed(elapsed: Duration) -> String {
@@ -1603,7 +1614,7 @@ mod tests {
     #[test]
     fn log_sanitizer_splits_carriage_returns_and_drops_controls() {
         let sanitized = sanitize_log_message("abc\rdef\u{1b}[2K\nghi\tjkl");
-        assert_eq!(sanitized, "abc\ndef[2K\nghi\tjkl");
+        assert_eq!(sanitized, "abc\ndef\nghi\tjkl");
     }
 
     #[test]
