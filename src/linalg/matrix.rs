@@ -1100,15 +1100,16 @@ impl DenseDesignMatrix {
             // strict-operator policy actually need). Strict callers must use
             // `try_to_dense_arc_with_policy(ctx, &analytic_operator_required())`
             // to get refusal semantics — they explicitly opted into operator-only math.
-            Self::Lazy(op) => dense_operator_to_dense_by_chunks(op.as_ref())
-                .unwrap_or_else(|err| {
+            Self::Lazy(op) => {
+                dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
                     panic!(
                         "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
                         op.nrows(),
                         op.ncols(),
                     )
-                }),
+                })
+            }
         }
     }
 
@@ -6381,16 +6382,16 @@ impl DesignMatrix {
                 } else {
                     // Bypass the size-capped policy guard: callers reaching
                     // `to_dense_cow` are committing to a dense consumer.
-                    Cow::Owned(dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(
-                        |err| {
+                    Cow::Owned(
+                        dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
                             panic!(
                                 "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
                                  operator-backed design via row chunks: {err}",
                                 op.nrows(),
                                 op.ncols(),
                             )
-                        },
-                    ))
+                        }),
+                    )
                 }
             }
             Self::Sparse(matrix) => Cow::Owned(

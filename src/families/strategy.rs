@@ -111,17 +111,20 @@ impl ResolvedFamilyStrategy {
     fn require_latent_cloglog_state(
         &self,
     ) -> Result<&crate::types::LatentCLogLogState, EstimationError> {
-        self.latent_cloglog_state().ok_or_else(|| missing_state(self.family, "latent cloglog"))
+        self.latent_cloglog_state()
+            .ok_or_else(|| missing_state(self.family, "latent cloglog"))
     }
 
     #[inline]
     fn require_sas_state(&self) -> Result<&crate::types::SasLinkState, EstimationError> {
-        self.sas_state().ok_or_else(|| missing_state(self.family, "SAS link"))
+        self.sas_state()
+            .ok_or_else(|| missing_state(self.family, "SAS link"))
     }
 
     #[inline]
     fn require_mixture_state(&self) -> Result<&crate::types::MixtureLinkState, EstimationError> {
-        self.mixture_state().ok_or_else(|| missing_state(self.family, "mixture link"))
+        self.mixture_state()
+            .ok_or_else(|| missing_state(self.family, "mixture link"))
     }
 }
 

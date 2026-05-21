@@ -10323,6 +10323,19 @@ fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'stati
     Ok((log_likelihood, gradient, Some(eval), workspace))
 }
 
+fn require_projected_kkt_residual(
+    residual: Option<ProjectedKktResidual>,
+    context: &str,
+) -> Result<Option<ProjectedKktResidual>, String> {
+    match residual {
+        Some(residual) => Ok(Some(residual)),
+        None => Err(format!(
+            "{context}: converged joint-Newton exact inner solve did not produce a projected KKT \
+             residual; refusing to assemble REML/LAML derivatives without the IFT correction input"
+        )),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct JointNewtonMathDiagnostic {
     old_kkt_inf: f64,
@@ -10450,6 +10463,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options.ridge_policy,
                 Some(cached_active_sets.as_slice()),
             )?;
+            let kkt_residual = if use_joint_newton {
+                require_projected_kkt_residual(kkt_residual, "same-rho warm-start inner reuse")?
+            } else {
+                kkt_residual
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -12592,6 +12610,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
                 cached_joint_gradient.as_ref(),
             )?;
+            let kkt_residual =
+                require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -25299,8 +25319,16 @@ mod tests {
         .expect("cached gradient path should not call family.evaluate()")
         .expect("cached gradient should produce a KKT residual");
 
-        assert_relative_eq!(residual.as_array()[0], expected_residual[0], epsilon = 1e-12);
-        assert_relative_eq!(residual.as_array()[1], expected_residual[1], epsilon = 1e-12);
+        assert_relative_eq!(
+            residual.as_array()[0],
+            expected_residual[0],
+            epsilon = 1e-12
+        );
+        assert_relative_eq!(
+            residual.as_array()[1],
+            expected_residual[1],
+            epsilon = 1e-12
+        );
     }
 
     #[test]
