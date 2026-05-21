@@ -3664,7 +3664,8 @@ impl RadialScalarKind {
                     // Collision: q, t diverge but s_a = 0 ⇒ q·s_a, t·s_a vanish.
                     return Ok((phi, 0.0, 0.0));
                 }
-                let (q, t, _, _) = duchon_polyharmonic_operator_block_jets(r, *block_order, *dim)?;
+                let (q, t, _, _) =
+                    duchon_polyharmonic_operator_block_jets(r, *block_order as f64, *dim)?;
                 Ok((phi, q, t))
             }
             RadialScalarKind::ThinPlate { length_scale, dim } => {
@@ -9165,8 +9166,11 @@ impl DuchonCrossPenaltyContext {
                     (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
                 } else {
                     let phi = polyharmonic_kernel(r, (self.pure_block_order) as f64, d);
-                    let (q, t, dt_dr, d2t_dr2) =
-                        duchon_polyharmonic_operator_block_jets(r, self.pure_block_order, d)?;
+                    let (q, t, dt_dr, d2t_dr2) = duchon_polyharmonic_operator_block_jets(
+                        r,
+                        self.pure_block_order as f64,
+                        d,
+                    )?;
                     (phi, q, t, dt_dr, d2t_dr2)
                 };
                 for col in 0..z_cols {
@@ -9462,7 +9466,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                             let phi = polyharmonic_kernel(r, (pure_block_order) as f64, d);
                             let (q, t, dt_dr, d2t_dr2) = duchon_polyharmonic_operator_block_jets(
                                 r,
-                                pure_block_order as usize,
+                                pure_block_order as f64,
                                 d,
                             )?;
                             (phi, q, t, dt_dr, d2t_dr2)
@@ -17213,7 +17217,7 @@ fn duchon_regularized_operator_core(
         if *coeff == 0.0 {
             continue;
         }
-        let (q, t, t_r, t_rr) = duchon_polyharmonic_operator_block_jets(r_eval, m, k_dim)?;
+        let (q, t, t_r, t_rr) = duchon_polyharmonic_operator_block_jets(r_eval, m as f64, k_dim)?;
         q_sum.add(coeff * q);
         t_sum.add(coeff * t);
         t_r_sum.add(coeff * t_r);
@@ -29241,7 +29245,7 @@ mod tests {
             "2D thin-plate phi_rr(0) should diverge to -inf, got {tps_phi_rr}"
         );
         let (q, _, _, _) =
-            duchon_polyharmonic_operator_block_jets(0.0, 2, 2).expect("thin-plate operator jet");
+            duchon_polyharmonic_operator_block_jets(0.0, 2.0, 2).expect("thin-plate operator jet");
         assert!(
             q.is_infinite() && q.is_sign_negative(),
             "2D thin-plate phi_r/r at collision should diverge to -inf, got {q}"
