@@ -169,6 +169,34 @@ other survival modes, `Model.sample(...)` gives posterior coefficient draws;
 `PosteriorSamples.predict(...)` / `predict_draws(...)` are restricted to
 standard non-link-wiggle GAMs. See [posterior-sampling.md](posterior-sampling.md).
 
+## Paired competing-risks posterior CIF
+
+For two cause-specific survival fits, use `sample_paired(...)` so posterior
+draw row `k` from the target-cause fit is paired with row `k` from the
+competing-cause fit. The CIF integration and equal-tailed intervals are
+computed in the Rust engine from those paired coefficient draws:
+
+```python
+disease_post = disease_model.sample_paired(
+    death_model,
+    train_df,
+    samples=1000,
+    chains=4,
+    seed=42,
+)
+
+times = [0, 1, 5, 10, 20]
+cif = disease_post.cumulative_incidence(test_df, times, level=0.95)
+
+cif.draws   # (n_draws, n_rows, n_times)
+cif.mean    # (n_rows, n_times)
+cif.lower   # lower credible band
+cif.upper   # upper credible band
+```
+
+Pass `competing_data=` to `sample_paired(...)` if the two fits need different
+training tables.
+
 ## Complete example
 
 ```python

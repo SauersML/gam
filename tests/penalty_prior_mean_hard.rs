@@ -15,13 +15,13 @@
 //!     `prior_linear_shift(1.0)` (= S·μ embedded into the global basis), and
 //!     `prior_constant_shift(1.0)` (= μ' S μ).
 //!
-//! `PenaltyCoordinate` lives in `pub(crate) mod unified` (src/solver/reml/mod.rs:23)
-//! and is **not** reachable from integration tests. We therefore drive the
-//! observable math via `CanonicalPenalty`, which is what feeds the runtime's
-//! shifted-quadratic call sites (src/solver/reml/runtime.rs:1252, 3048, 5049,
-//! 8144, 8553).
+//! `gam::estimate::PenaltyCoordinate` is the narrow public runtime surface for
+//! these centered penalty coordinates. Tests below exercise both that exact
+//! runtime coordinate and the public `CanonicalPenalty` construction layer that
+//! feeds it.
 
 use gam::construction::CanonicalPenalty;
+use gam::estimate::PenaltyCoordinate;
 use ndarray::{Array1, Array2};
 
 // ---------------------------------------------------------------------------
@@ -529,6 +529,142 @@ fn mismatched_prior_mean_length_panics() {
         assert!(
             result.is_err(),
             "mismatched prior_mean length must panic in debug builds"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. Runtime PenaltyCoordinate direct coverage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reml_centered_penalty_coordinate_invariance_under_joint_shift() {
+    for seed in 0..50u64 {
+        let mut local = Rng::new(0x5B_0000 ^ seed);
+        let dim = 3 + ((seed as usize) % 6);
+        let rank = dim.max(1);
+        let root = random_root(&mut local, rank, dim);
+        let mean = random_vector(&mut local, dim, 1.0);
+        let beta = random_vector(&mut local, dim, 1.0);
+        let delta = random_vector(&mut local, dim, 3.0);
+        let scale = 0.25 + (seed as f64 % 5.0);
+
+        let coord_base = PenaltyCoordinate::from_dense_root_with_mean(root.clone(), mean.clone());
+        let coord_shift =
+            PenaltyCoordinate::from_dense_root_with_mean(root, mean.clone() + &delta);
+
+        let q_base = coord_base.shifted_quadratic(&beta, scale);
+        let q_shift = coord_shift.shifted_quadratic(&(beta.clone() + &delta), scale);
+        let denom = 1.0 + q_base.abs() + q_shift.abs();
+        assert!(
+            (q_base - q_shift).abs() <= 1e-12 * denom,
+            "runtime coordinate joint shift invariant failed at seed={seed}: {q_base} vs {q_shift}"
+        );
+    }
+}
+
+#[test]
+fn penalty_coordinate_dense_root_centered_direct() {
+    for seed in 0..40u64 {
+        let mut rng = Rng::new(0x6C_0000 ^ seed);
+        let dim = 2 + ((seed as usize) % 7);
+        let rank = dim + 1;
+        let root = random_root(&mut rng, rank, dim);
+        let mean = random_vector(&mut rng, dim, 1.5);
+        let beta = random_vector(&mut rng, dim, 2.0);
+        let scale = 0.5 + (seed as f64 % 7.0);
+
+        let coord = PenaltyCoordinate::from_dense_root_with_mean(root.clone(), mean.clone());
+        let q = coord.shifted_quadratic(&beta, scale);
+        let q_ref = reference_shifted_quadratic(&root, &beta, &mean, scale);
+        let q_scale = 1.0 + q.abs() + q_ref.abs();
+        assert!(
+            (q - q_ref).abs() <= 1e-12 * q_scale,
+            "dense centered shifted quadratic mismatch seed={seed}: {q} vs {q_ref}"
+        );
+
+        let centered = &beta - &mean;
+        let mut apply_ref = root.t().dot(&root.dot(&centered));
+        apply_ref *= scale;
+        let applied = coord.apply_shifted_penalty(&beta, scale);
+        assert_eq!(applied.len(), dim);
+        for i in 0..dim {
+            let err = (applied[i] - apply_ref[i]).abs();
+            let denom = 1.0 + applied[i].abs() + apply_ref[i].abs();
+            assert!(
+                err <= 1e-12 * denom,
+                "dense centered apply mismatch seed={seed} i={i}: {} vs {}",
+                applied[i],
+                apply_ref[i]
+            );
+        }
+
+        assert_eq!(
+            coord.shifted_quadratic(&mean, scale).to_bits(),
+            0.0_f64.to_bits(),
+            "dense centered coordinate must be exactly zero at beta=mean"
+        );
+    }
+}
+
+#[test]
+fn penalty_coordinate_block_root_centered_direct() {
+    for seed in 0..40u64 {
+        let mut rng = Rng::new(0x7D_0000 ^ seed);
+        let total_dim = 9 + ((seed as usize) % 5);
+        let start = 1 + ((seed as usize) % 3);
+        let block_dim = 3 + ((seed as usize) % 4);
+        let end = start + block_dim;
+        let rank = block_dim + 2;
+        let root = random_root(&mut rng, rank, block_dim);
+        let mean = random_vector(&mut rng, block_dim, 1.25);
+        let beta = random_vector(&mut rng, total_dim, 2.0);
+        let beta_block = beta.slice(ndarray::s![start..end]).to_owned();
+        let scale = 0.75 + (seed as f64 % 6.0);
+
+        let coord = PenaltyCoordinate::from_block_root_with_mean(
+            root.clone(),
+            start,
+            end,
+            total_dim,
+            mean.clone(),
+        );
+        let q = coord.shifted_quadratic(&beta, scale);
+        let q_ref = reference_shifted_quadratic(&root, &beta_block, &mean, scale);
+        let q_scale = 1.0 + q.abs() + q_ref.abs();
+        assert!(
+            (q - q_ref).abs() <= 1e-12 * q_scale,
+            "block centered shifted quadratic mismatch seed={seed}: {q} vs {q_ref}"
+        );
+
+        let centered = &beta_block - &mean;
+        let mut block_ref = root.t().dot(&root.dot(&centered));
+        block_ref *= scale;
+        let applied = coord.apply_shifted_penalty(&beta, scale);
+        assert_eq!(applied.len(), total_dim);
+        for i in 0..total_dim {
+            let expected = if (start..end).contains(&i) {
+                block_ref[i - start]
+            } else {
+                0.0
+            };
+            let err = (applied[i] - expected).abs();
+            let denom = 1.0 + applied[i].abs() + expected.abs();
+            assert!(
+                err <= 1e-12 * denom,
+                "block centered apply mismatch seed={seed} i={i}: {} vs {expected}",
+                applied[i]
+            );
+        }
+
+        let mut beta_at_mean = beta.clone();
+        beta_at_mean
+            .slice_mut(ndarray::s![start..end])
+            .assign(&mean);
+        assert_eq!(
+            coord.shifted_quadratic(&beta_at_mean, scale).to_bits(),
+            0.0_f64.to_bits(),
+            "block centered coordinate must be exactly zero when beta_block=mean"
         );
     }
 }
