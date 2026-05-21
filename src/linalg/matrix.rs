@@ -5540,18 +5540,48 @@ fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Ar
     let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
 
     let par = faer::get_global_parallelism();
-    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    // Row-major (C-order) so per-row writes are stride-1 alongside the
+    // stride-1 reads from a row-major X. The previous F-order layout
+    // forced the inner write loop to skip by `chunk_rows` between
+    // columns, defeating cache + vectorization.
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
     let mut out_view = array2_to_matmut(out);
+
+    let x_is_row_major = x.is_standard_layout();
+    let weights_slice_opt = weights.as_slice();
 
     for start in (0..n).step_by(chunk_rows) {
         let rows = (n - start).min(chunk_rows);
         {
-            let mut chunk = wx_chunk.slice_mut(s![0..rows, ..]);
-            for local in 0..rows {
-                let src = start + local;
-                let wi = weights[src];
-                for col in 0..p {
-                    chunk[[local, col]] = x[[src, col]] * wi;
+            let chunk_slice = wx_chunk
+                .as_slice_mut()
+                .expect("row-major chunk is contiguous");
+            if x_is_row_major
+                && let Some(x_slice_all) = x.as_slice()
+                && let Some(w_slice) = weights_slice_opt
+            {
+                // Fast path: scale row-major X directly via raw slices.
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = w_slice[src];
+                    let src_off = src * p;
+                    let dst_off = local * p;
+                    let src_row = &x_slice_all[src_off..src_off + p];
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for col in 0..p {
+                        dst_row[col] = src_row[col] * wi;
+                    }
+                }
+            } else {
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = weights[src];
+                    let xrow = x.row(src);
+                    let dst_off = local * p;
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for (col, xij) in xrow.iter().enumerate() {
+                        dst_row[col] = xij * wi;
+                    }
                 }
             }
         }

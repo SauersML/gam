@@ -3791,20 +3791,7 @@ fn build_shape_linear_constraints_1d(
 fn linear_constraints_from_lower_bounds_global(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
-    let rows: Vec<usize> = (0..lower_bounds.len())
-        .filter(|&i| lower_bounds[i].is_finite())
-        .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let p = lower_bounds.len();
-    let mut a = Array2::<f64>::zeros((rows.len(), p));
-    let mut b = Array1::<f64>::zeros(rows.len());
-    for (r, &idx) in rows.iter().enumerate() {
-        a[[r, idx]] = 1.0;
-        b[r] = lower_bounds[idx];
-    }
-    Some(LinearInequalityConstraints { a, b })
+    LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
 fn merge_linear_constraints_global(
