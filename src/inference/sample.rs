@@ -697,7 +697,7 @@ fn sample_survival(
         }
     }
     if p_cov > 0 {
-        let cov_dense = cov_design.design.as_dense_cow();
+        let cov_dense = cov_design.design.to_dense();
         let cov_range = (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov);
         x_entry
             .slice_mut(s![.., cov_range.clone()])
