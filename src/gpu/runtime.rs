@@ -62,33 +62,18 @@ fn libcuda_loadable() -> bool {
 /// presence check keeps the preflight name list in lockstep with the
 /// names cudarc will actually try.
 ///
-/// Strategy: ask cudarc's bare-name probe FIRST. If a complete CUDA
+/// Strategy: ask cudarc's bare-name probe first. If a complete CUDA
 /// stack is reachable through the loader's normal search path (system
 /// `/usr/local/cuda*`, `ld.so.cache`, or an explicit `LD_LIBRARY_PATH`),
-/// we never touch the bundled wheel stack — keeping exactly one
-/// libcublas/libcudart/libcublasLt/… per family mapped in the process.
-///
-/// The old order was the reverse: preload bundled libs first, *then*
-/// ask cudarc. That order is catastrophic on hosts where both stacks
-/// are reachable. `preload_packaged_cuda_libraries` dlopens pip wheel
-/// libcublas by absolute path, mapping it under `…/site-packages/nvidia/cublas/lib/`.
-/// cudarc's first candidate name is the unversioned `libcublas.so`,
-/// which pip wheels do **not** ship (only `libcublas.so.12`), so the
-/// loader walks `LD_LIBRARY_PATH` → `RUNPATH` → `ld.so.cache` and
-/// finds `/usr/local/cuda*/lib64/libcublas.so` → resolves the symlink
-/// to system `libcublas.so.12`. glibc's `dlopen` deduplicates by
-/// `(device, inode)`, not by SONAME, so the two distinct files coexist
-/// in the process. cuBLAS handle state then splits across two cuBLAS
-/// implementations with different patch versions, different struct
-/// layouts, and different static initialisers — and the next
-/// `cublasDestroy_v2` frees a chunk one implementation never owned,
-/// aborting in glibc with "double free or corruption (!prev)".
+/// we do not preload any absolute-path bundled libraries. That avoids
+/// introducing a second CUDA stack from gamfit itself on hosts where both
+/// system CUDA and pip `nvidia-*-cu12` wheels are installed.
 ///
 /// Only fall back to the bundled-wheel preload when cudarc's normal
 /// search fails outright (a host with no CUDA on the loader path at
-/// all). And in every case, a diagnostic scan of `/proc/self/maps`
-/// (`detect_cuda_library_conflicts`) warns if a SONAME family ended up
-/// with more than one mapped file.
+/// all). If another framework has already mapped both CUDA stacks, gamfit
+/// warns with the paths and keeps CUDA enabled because cudarc resolves all
+/// gamfit cuBLAS symbols through one process-wide library handle.
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
