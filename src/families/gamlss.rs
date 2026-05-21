@@ -250,7 +250,6 @@ fn dense_locscale_block_designs_fromspecs<'a>(
 /// shape. Returns `(action, dense_matrix)` — at most one is `Some`, both
 /// are `None` for the `Zero` variant, and the `First` variant produces an
 /// error (`_psi_psi_map` should never return `First` here).
-#[allow(dead_code)] // WIP helper not yet wired into the locscale block methods.
 fn psi_psi_map_to_drift_slots(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     deriv_b: &crate::custom_family::CustomFamilyBlockPsiDerivative,
