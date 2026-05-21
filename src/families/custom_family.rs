@@ -6122,6 +6122,49 @@ fn nonconverged_outer_efs_result(
     ))
 }
 
+fn custom_family_seed_screening_proxy_labeled<
+    F: CustomFamily + Clone + Send + Sync + 'static,
+>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    layout: &PenaltyLabelLayout,
+    rho: &Array1<f64>,
+    warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: &crate::types::RhoPrior,
+) -> Result<(f64, ConstrainedWarmStart, bool), String> {
+    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
+    let physical_warm_start = if layout.has_tied_coordinates() {
+        warm_start.map(|seed| {
+            let mut seed = seed.clone();
+            seed.rho = physical_rho.clone();
+            seed
+        })
+    } else {
+        warm_start.cloned()
+    };
+    let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
+    let inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        physical_warm_start.as_ref(),
+    )?;
+    let mut score = inner_penalized_objective(
+        &inner,
+        false,
+        false,
+        "custom-family seed-screening partial inner objective",
+    )?;
+    if !matches!(rho_prior, crate::types::RhoPrior::Flat) {
+        score += rho_prior_cost_gradient_hessian(rho_prior, rho)?.0;
+    }
+    let mut warm_start = constrained_warm_start_from_inner(&physical_rho, &inner);
+    warm_start.rho = rho.clone();
+    Ok((score, warm_start, inner.converged))
+}
+
 fn outer_eval_result_to_joint_hyper_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperResult {
@@ -18378,6 +18421,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
+        .with_screen_initial_rho(true)
         // Tighten the per-coord ρ bound from the OuterConfig default of 30
         // to 10. λ = exp(10) ≈ 22k is already extremely strong shrinkage —
         // any smooth whose data prefers more aggressive shrinkage is
@@ -18492,7 +18536,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         })
     };
 
-    let mut obj = problem.build_objective_with_eval_order(
+    let mut obj = problem.build_objective_with_screening_proxy(
         CustomOuterState {
             warm_cache: persistent_warm_start.clone(),
             last_error: None,
@@ -18599,6 +18643,37 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 }
             }
         }),
+        |outer: &mut CustomOuterState, rho: &Array1<f64>| {
+            let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+            match custom_family_seed_screening_proxy_labeled(
+                family,
+                specs,
+                &outer_options,
+                &label_layout,
+                rho,
+                warm_ref,
+                &rho_prior,
+            ) {
+                Ok((score, warm_start, _inner_converged)) if score.is_finite() => {
+                    outer.warm_cache = Some(warm_start);
+                    outer.last_error = None;
+                    Ok(score)
+                }
+                Ok((score, warm_start, _inner_converged)) => {
+                    outer.warm_cache = Some(warm_start);
+                    outer.last_error = Some(format!(
+                        "custom-family seed-screening proxy produced non-finite score {score}"
+                    ));
+                    Err(EstimationError::RemlOptimizationFailed(
+                        "custom-family seed-screening proxy produced non-finite score".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    outer.last_error = Some(e.clone());
+                    Err(EstimationError::RemlOptimizationFailed(e))
+                }
+            }
+        },
     );
 
     let outer_result = problem.run(&mut obj, "custom family");
@@ -20364,6 +20439,39 @@ mod tests {
             result.outer_hessian,
             crate::solver::outer_strategy::HessianResult::Unavailable
         ));
+    }
+
+    #[test]
+    fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fit() {
+        let specs = vec![default_diagonal_exact_hook_spec()];
+        let penalty_counts = validate_blockspecs(&specs).expect("valid test spec");
+        let layout = penalty_label_layout(&specs, penalty_counts).expect("valid label layout");
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            compute_covariance: false,
+            inner_max_cycles: 1,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let (score, warm_start, inner_converged) = custom_family_seed_screening_proxy_labeled(
+            &DefaultDiagonalExactHookFamily,
+            &specs,
+            &options,
+            &layout,
+            &array![0.0],
+            None,
+            &crate::types::RhoPrior::Flat,
+        )
+        .expect("screening proxy should score a finite partial inner solve");
+
+        assert!(score.is_finite());
+        assert!(
+            !inner_converged,
+            "one-cycle screening is expected to be a partial inner fit"
+        );
+        assert_eq!(warm_start.rho, array![0.0]);
+        assert_eq!(warm_start.block_beta.len(), 1);
     }
 
     #[test]
