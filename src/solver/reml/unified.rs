@@ -15179,6 +15179,216 @@ mod tests {
         assert_relative_eq!(corr_proj, corr_full, max_relative = 1e-12);
     }
 
+    /// Direct ground-truth full-H inverse bilinear form `aᵀ H⁻¹ b` for an
+    /// arbitrary SPD `H`, computed via an explicit eigendecomposition.
+    /// Diagonal `full_h_inv_bilinear` cannot exhibit the cross-coupling
+    /// pathology described in `0dc469bd` (the off-diagonal entries are
+    /// what propagate `r`'s null-space noise into the `a_k ∈ range(S_+)`
+    /// solve).
+    fn dense_h_inv_bilinear_via_eig(
+        h_full: &Array2<f64>,
+        a: &Array1<f64>,
+        b: &Array1<f64>,
+    ) -> f64 {
+        use crate::faer_ndarray::FaerEigh;
+        let (evals, evecs) = h_full
+            .eigh(faer::Side::Lower)
+            .expect("eigendecomp of test fixture H");
+        // (Uᵀ a)_i · (1/λ_i) · (Uᵀ b)_i summed over i.
+        let ua = evecs.t().dot(a);
+        let ub = evecs.t().dot(b);
+        let mut acc = 0.0_f64;
+        for i in 0..evals.len() {
+            assert!(
+                evals[i].abs() > 0.0,
+                "fixture eigenvalue must be nonzero for direct solve"
+            );
+            acc += ua[i] * ub[i] / evals[i];
+        }
+        acc
+    }
+
+    /// **Mechanism test, line of evidence 5 (production geometry)**: an
+    /// SPD `H` with a small eigenvalue whose eigenvector MIXES
+    /// `range(S_+)` and `null(S_+)`. This is the geometry the biobank
+    /// survival marginal-slope hits at the failing iterate: the unpenalized
+    /// parametric columns (intercept, sex, prs_z) interact with the
+    /// penalized Duchon centers via `Xᵀ W X` off-diagonal coupling, so the
+    /// smallest eigendirection of `H` is NOT axis-aligned with the
+    /// `U_S = span(S_+)` block.
+    ///
+    /// In this regime:
+    ///   * `a_k = λ_k S_k β̂ ∈ range(S_+)` (by construction, exactly the
+    ///     production input shape — purely in-subspace, NO null
+    ///     contamination).
+    ///   * `r = r_clean + ε · e_null` has small but nonzero null-space
+    ///     contamination representative of floating-point KKT residual
+    ///     noise at the inner exit certificate.
+    ///   * The full-H inverse `H⁻¹ a_k` PICKS UP a null-direction
+    ///     component via the Schur complement / cross-block coupling: the
+    ///     small-eigenvalue eigenvector v_min has both a range(S_+) and
+    ///     a null(S_+) leg, so `H⁻¹ a_k ∝ (a_kᵀ v_min) · v_min / σ_min`
+    ///     has a null leg of magnitude `(a_k · v_min_S) · v_min_N /
+    ///     σ_min ≈ 1 · 1 / 1e-12 = 1e12`. Dotting with `r`'s tiny null
+    ///     noise `ε ≈ 1e-3` gives a `1e9` spurious contribution.
+    ///   * The projected helper `aᵀ U_S H_proj⁻¹ U_Sᵀ b`:
+    ///       - `U_Sᵀ a_k = a_k_S` (unchanged, since `a_k ∈ range(S_+)`)
+    ///       - `U_Sᵀ r = r_S` (drops the `ε · e_null` contamination)
+    ///       - `H_proj = U_Sᵀ H U_S` — the in-subspace block, which has
+    ///         the well-conditioned `O(1)` eigenvalues only (the small
+    ///         eigendirection's range(S_+) leg is `≪ 1`, so its
+    ///         contribution to `H_proj` is `O(σ_min · (v_min_S)²) ≪`
+    ///         the other eigenvalues; `H_proj⁻¹` stays `O(1)`).
+    ///       - Result: `r_S · H_proj⁻¹ · a_k_S` is `O(1)`.
+    ///
+    /// This test reproduces the FAILING-BIOBANK geometry (small eigenvalue
+    /// in a mixed direction, `a_k` purely in range(S_+), `r` with FP
+    /// null-noise) and shows the helper saves ~10⁹ in the corr while
+    /// remaining within `1e-9` of the mathematically correct value.
+    #[test]
+    fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_coupled_h() {
+        let small_eig = 1e-12_f64;
+        let p = 5usize;
+        let r_subspace = 4usize;
+
+        // U_S spans the first 4 standard basis vectors (range of S_+).
+        let mut u_s = Array2::<f64>::zeros((p, r_subspace));
+        for j in 0..r_subspace {
+            u_s[[j, j]] = 1.0;
+        }
+
+        // Build SPD H = Q diag(λ) Qᵀ with λ_min in a MIXED direction.
+        // v_min = (0, 0, 0, 0.1, sqrt(0.99)) — leg 0.1 inside range(S_+),
+        // leg ~0.995 outside. Other 4 eigenvectors orthonormalized via
+        // Gram-Schmidt.
+        let v_min = {
+            let leg_s = 0.1_f64;
+            let leg_n = (1.0 - leg_s * leg_s).sqrt();
+            array![0.0_f64, 0.0, 0.0, leg_s, leg_n]
+        };
+        // Orthonormalize four ambient basis vectors against v_min.
+        let mut q = Array2::<f64>::zeros((p, p));
+        q.column_mut(p - 1).assign(&v_min);
+        let mut col_idx = 0usize;
+        for ambient in 0..p {
+            if col_idx >= p - 1 {
+                break;
+            }
+            let mut v = Array1::<f64>::zeros(p);
+            v[ambient] = 1.0;
+            // Project out v_min.
+            let dot = v.dot(&v_min);
+            v.scaled_add(-dot, &v_min);
+            // Project out previously placed Q columns.
+            for prev in 0..col_idx {
+                let qprev = q.column(prev).to_owned();
+                let d = v.dot(&qprev);
+                v.scaled_add(-d, &qprev);
+            }
+            let norm = v.dot(&v).sqrt();
+            if norm < 1e-10 {
+                continue;
+            }
+            v /= norm;
+            q.column_mut(col_idx).assign(&v);
+            col_idx += 1;
+        }
+        assert_eq!(col_idx, p - 1, "Gram-Schmidt should fill p-1 orthonormal columns");
+
+        let eigvals = array![10.0_f64, 5.0, 2.0, 1.0, small_eig];
+        let mut h_full = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            let qi = q.column(i).to_owned();
+            for a in 0..p {
+                for b in 0..p {
+                    h_full[[a, b]] += eigvals[i] * qi[a] * qi[b];
+                }
+            }
+        }
+
+        // Confirm H is symmetric and has the intended cross-block coupling
+        // (off-diagonal entries are nonzero across the range/null boundary).
+        for a in 0..p {
+            for b in 0..p {
+                assert!(
+                    (h_full[[a, b]] - h_full[[b, a]]).abs() < 1e-14,
+                    "H must be symmetric"
+                );
+            }
+        }
+        // Cross-block coupling check: H[3,4] (a range(S_+) row crossing
+        // into null(S_+)) must be nonzero — that's the channel through
+        // which `H⁻¹ a_k` picks up a null leg.
+        assert!(
+            h_full[[3, 4]].abs() > 1e-6,
+            "fixture requires nonzero cross-block coupling, got {}",
+            h_full[[3, 4]]
+        );
+
+        let kernel = build_subspace_kernel(&h_full, &u_s);
+
+        // `a_k` purely in range(S_+) — matches production geometry exactly:
+        // `λ_k S_k β̂ ∈ col(S_k) ⊂ range(S_+)`. No null contamination.
+        let a_k = array![0.5_f64, 0.7, -0.3, 0.9, 0.0];
+        // `r = r_clean + ε · e_null`. r_clean is honest, ε models the
+        // floor-noise the inner KKT certificate accepts.
+        let eps_null = 1e-3_f64;
+        let r_clean = array![0.4_f64, -0.6, 1.1, 0.3, 0.0];
+        let r_total = &r_clean + &array![0.0_f64, 0.0, 0.0, 0.0, eps_null];
+
+        // Honest reference: what the correction SHOULD be — the projected
+        // pseudo-inverse on r_clean (no noise) and a_k.
+        let corr_honest = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_clean, &a_k);
+
+        // Production-shape inputs (with FP noise on r):
+        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_total, &a_k);
+        let corr_full = dense_h_inv_bilinear_via_eig(&h_full, &r_total, &a_k);
+
+        // The projected helper is INDIFFERENT to r's null contamination —
+        // `U_Sᵀ (r_clean + ε·e_null) = U_Sᵀ r_clean` exactly (e_null ⊥
+        // U_S). So `corr_proj == corr_honest` to machine precision.
+        assert_relative_eq!(corr_proj, corr_honest, max_relative = 1e-12);
+
+        // The full-H bilinear, in contrast, is corrupted by the noise via
+        // cross-block coupling. Quantify the predicted scale.
+        //
+        // Mathematically: corr_full - corr_honest_full = ε · (e_null)ᵀ
+        // H⁻¹ a_k. The eigendecomposition gives
+        //   H⁻¹ a_k = Σ_i (qᵢᵀ a_k) / λ_i · qᵢ
+        // The dominant term comes from the small-eigenvalue mode:
+        //   (q_minᵀ a_k) / σ_min · q_min[null] = (0.1 · 0.9) / 1e-12 · 0.995
+        //     = 0.0895 / 1e-12 ≈ 8.95e10
+        // Times eps_null = 1e-3 gives a `~1e8` noise contribution to
+        // corr_full, vastly exceeding the honest O(1) value.
+        let noise_contribution = corr_full - corr_honest;
+        assert!(
+            noise_contribution.abs() > 1e6,
+            "fixture must demonstrate the full-H amplification; \
+             got |corr_full - corr_honest| = {:.3e}, corr_full = {:.3e}, \
+             corr_honest = {:.3e}",
+            noise_contribution.abs(),
+            corr_full,
+            corr_honest
+        );
+
+        // Saved-orders-of-magnitude metric: ratio between the corrupted
+        // full-H bilinear and the projected helper.
+        let savings = corr_full.abs() / corr_proj.abs().max(1e-30);
+        assert!(
+            savings >= 1e5,
+            "projected helper should save ≥ 5 orders of magnitude on \
+             cross-coupled fixture; got savings = {savings:.3e} \
+             (full = {corr_full:.3e}, proj = {corr_proj:.3e})"
+        );
+
+        eprintln!(
+            "[ift-cross-coupled] corr_honest = {corr_honest:.6e}  \
+             corr_proj = {corr_proj:.6e}  corr_full = {corr_full:.6e}  \
+             noise_contribution = {noise_contribution:.6e}  \
+             savings = {savings:.3e}"
+        );
+    }
+
     fn make_factor_key(seed: u64) -> ProjectedFactorKey {
         // Build a unique-by-seed key without going through
         // `from_factor_view` so the test can inject fingerprints
