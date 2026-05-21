@@ -4882,7 +4882,7 @@ pub(crate) fn exact_intersection_nullity(
 
         // Intersect: M = N^T N_k (current_dim × mk).
         // SVD of M: singular values near 1 indicate shared directions.
-        let m_mat = n_basis.t().dot(&nk_basis);
+        let m_mat = crate::faer_ndarray::fast_atb(&n_basis, &nk_basis);
         let (u_opt, s, _) = match crate::faer_ndarray::FaerSvd::svd(&m_mat, true, false) {
             Ok(usv) => usv,
             Err(_) => return 0,
@@ -6769,8 +6769,8 @@ pub fn reml_laml_evaluate(
                             u_mat[[row, col]] = ds.eigenvector_entry(row, col);
                         }
                     }
-                    let ut_op = u_mat.t().dot(&op_dense);
-                    let proj = ut_op.dot(&u_mat);
+                    let ut_op = crate::faer_ndarray::fast_atb(&u_mat, &op_dense);
+                    let proj = crate::faer_ndarray::fast_ab(&ut_op, &u_mat);
                     let eps_sq = {
                         let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
                         4.0 * eps_f * eps_f
