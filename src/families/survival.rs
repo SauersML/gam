@@ -8,7 +8,7 @@ use crate::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use crate::types::{Coefficients, LinearPredictor};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -2383,7 +2383,29 @@ pub fn assemble_competing_risks_cif(
     cumulative_hazard: ArrayView3<'_, f64>,
 ) -> Result<CompetingRisksCifResult, SurvivalError> {
     let (n_endpoints, n_rows, n_times) = cumulative_hazard.dim();
-    if n_endpoints == 0 || n_rows == 0 || n_times == 0 || times.len() != n_times {
+    if n_endpoints == 0 {
+        return Err(SurvivalError::DimensionMismatch);
+    }
+    let endpoint_hazards = cumulative_hazard.axis_iter(Axis(0)).collect::<Vec<_>>();
+    assemble_competing_risks_cif_from_endpoints(times, &endpoint_hazards).and_then(|result| {
+        if result.overall_survival.dim() != (n_rows, n_times) {
+            Err(SurvivalError::DimensionMismatch)
+        } else {
+            Ok(result)
+        }
+    })
+}
+
+pub fn assemble_competing_risks_cif_from_endpoints(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazards: &[ArrayView2<'_, f64>],
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    let n_endpoints = cumulative_hazards.len();
+    if n_endpoints == 0 || times.is_empty() {
+        return Err(SurvivalError::DimensionMismatch);
+    }
+    let (n_rows, n_times) = cumulative_hazards[0].dim();
+    if n_rows == 0 || n_times == 0 || times.len() != n_times {
         return Err(SurvivalError::DimensionMismatch);
     }
     if times.iter().any(|time| !time.is_finite() || *time < 0.0) {
@@ -2396,12 +2418,18 @@ pub fn assemble_competing_risks_cif(
     {
         return Err(SurvivalError::InvalidTimeGrid);
     }
-    if cumulative_hazard.iter().any(|value| !value.is_finite()) {
-        return Err(SurvivalError::NonFiniteInput);
+    for endpoint_hazard in cumulative_hazards {
+        if endpoint_hazard.dim() != (n_rows, n_times) {
+            return Err(SurvivalError::DimensionMismatch);
+        }
+        if endpoint_hazard.iter().any(|value| !value.is_finite()) {
+            return Err(SurvivalError::NonFiniteInput);
+        }
     }
 
-    let max_abs_hazard = cumulative_hazard
+    let max_abs_hazard = cumulative_hazards
         .iter()
+        .flat_map(|endpoint_hazard| endpoint_hazard.iter())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     let monotone_tolerance = 1.0e-10_f64 * max_abs_hazard.max(1.0);
     let mut cif = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
@@ -2415,7 +2443,7 @@ pub fn assemble_competing_risks_cif(
         for time_idx in 0..n_times {
             let mut total_increment = 0.0_f64;
             for endpoint in 0..n_endpoints {
-                let current = cumulative_hazard[[endpoint, row, time_idx]];
+                let current = cumulative_hazards[endpoint][[row, time_idx]];
                 if current < -monotone_tolerance {
                     return Err(SurvivalError::NonMonotoneCumulativeHazard);
                 }
