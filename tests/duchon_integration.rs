@@ -141,7 +141,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                     length_scale: None,
-                    power: 2,
+                    power: 2.0,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -264,7 +264,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     // Hybrid Duchon (length_scale is Some) -- required for aniso.
                     length_scale: Some(1.0),
-                    power: 1,
+                    power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
@@ -406,7 +406,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     // Hybrid Duchon (length_scale is Some) -- required for aniso.
                     length_scale: Some(1.0),
-                    power: 1,
+                    power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     // Sentinel zeros: will be replaced by knot-cloud initialization.

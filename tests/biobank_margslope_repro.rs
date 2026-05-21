@@ -116,7 +116,7 @@ fn duchon_pc_smooth(name: &str) -> SmoothTermSpec {
             spec: DuchonBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                 length_scale: Some(1.0),
-                power: 8,
+                power: 8.0,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: Some(vec![0.0; 16]),
