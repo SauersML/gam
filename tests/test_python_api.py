@@ -693,9 +693,9 @@ def test_competing_risks_cif_validates_inputs() -> None:
         parameter_names=("log_hazard",),
     )
 
-    with pytest.raises(ValueError, match="strictly increasing"):
+    with pytest.raises(ValueError, match="time grid"):
         gamfit.competing_risks_cif([pred], times=[0.0, 1.0, 1.0])
-    with pytest.raises(ValueError, match="non-negative"):
+    with pytest.raises(ValueError, match="time grid"):
         gamfit.competing_risks_cif([pred], times=[-1.0, 1.0])
     with pytest.raises(ValueError, match="same \\(n_rows, n_times\\) shape"):
         gamfit.competing_risks_cif([pred, two_row_pred], times=[0.0, 1.0])

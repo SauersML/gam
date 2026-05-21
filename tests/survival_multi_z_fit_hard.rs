@@ -81,12 +81,12 @@ const N: usize = 2000;
 const K: usize = 2;
 
 struct SimData {
-    z: Array2<f64>,          // (N, 2) latent scores
-    weights: Array1<f64>,    // (N,) all ones
-    q0: Array1<f64>,         // (N,) baseline probit-q at entry
-    q1: Array1<f64>,         // (N,) baseline probit-q at exit
-    qd1: Array1<f64>,        // (N,) baseline d q / d t at exit
-    event: Array1<f64>,      // (N,) {0,1}
+    z: Array2<f64>,       // (N, 2) latent scores
+    weights: Array1<f64>, // (N,) all ones
+    q0: Array1<f64>,      // (N,) baseline probit-q at entry
+    q1: Array1<f64>,      // (N,) baseline probit-q at exit
+    qd1: Array1<f64>,     // (N,) baseline d q / d t at exit
+    event: Array1<f64>,   // (N,) {0,1}
 }
 
 /// Simulate N rows with K=2 latent z scores drawn from a configurable
@@ -116,7 +116,11 @@ fn simulate(seed: u64, corr: f64) -> SimData {
         qd1[i] = 0.7 + 0.1 * next_unit(&mut state);
 
         // event: probability of exit-event in [0,1].
-        event[i] = if next_unit(&mut state) < 0.5 { 1.0 } else { 0.0 };
+        event[i] = if next_unit(&mut state) < 0.5 {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     SimData {
@@ -335,8 +339,7 @@ fn survival_multi_z_fit_independent_columns_autoderive_to_diagonal() {
             data.z[[i, 1]] -= beta * z0;
         }
 
-        let cov =
-            marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("cov");
+        let cov = marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("cov");
         if cov.shape() == MarginalSlopeCovarianceShape::Diagonal {
             diag_count += 1;
         }

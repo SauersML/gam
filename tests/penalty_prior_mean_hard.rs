@@ -388,9 +388,7 @@ fn block_centered_penalties_sum_to_joint_quadratic() {
         // we manually inject zeros into a wide root and treat the blocks as
         // dense, then verify additivity at the quadratic level.
         let mut wide_a = Array2::<f64>::zeros((rank_a, total));
-        wide_a
-            .slice_mut(ndarray::s![.., 0..dim_a])
-            .assign(&root_a);
+        wide_a.slice_mut(ndarray::s![.., 0..dim_a]).assign(&root_a);
         let mut wide_b = Array2::<f64>::zeros((rank_b, total));
         wide_b
             .slice_mut(ndarray::s![.., dim_a..total])
@@ -445,16 +443,9 @@ fn joint_shift_of_mean_and_beta_leaves_quadratic_invariant() {
         let beta = random_vector(&mut local, dim, 1.0);
         let delta = random_vector(&mut local, dim, 3.0);
 
-        let cp_base = CanonicalPenalty::from_dense_root_with_mean(
-            root.clone(),
-            dim,
-            mean.clone(),
-        );
-        let cp_shift = CanonicalPenalty::from_dense_root_with_mean(
-            root.clone(),
-            dim,
-            mean.clone() + &delta,
-        );
+        let cp_base = CanonicalPenalty::from_dense_root_with_mean(root.clone(), dim, mean.clone());
+        let cp_shift =
+            CanonicalPenalty::from_dense_root_with_mean(root.clone(), dim, mean.clone() + &delta);
 
         let q_base = canonical_shifted_quadratic(&cp_base, &beta);
         let q_shift = canonical_shifted_quadratic(&cp_shift, &(beta.clone() + &delta));

@@ -25,6 +25,8 @@ pub enum SurvivalError {
     UnsupportedSpec(&'static str),
     #[error("crude risk integration setup is invalid")]
     InvalidIntegrationSetup,
+    #[error("survival time grid must be finite, non-negative, and strictly increasing")]
+    InvalidTimeGrid,
     #[error("cumulative hazard must be nondecreasing")]
     NonMonotoneCumulativeHazard,
     #[error("instantaneous hazard must stay strictly positive during integration")]
@@ -2385,14 +2387,14 @@ pub fn assemble_competing_risks_cif(
         return Err(SurvivalError::DimensionMismatch);
     }
     if times.iter().any(|time| !time.is_finite() || *time < 0.0) {
-        return Err(SurvivalError::NonFiniteInput);
+        return Err(SurvivalError::InvalidTimeGrid);
     }
     if times
         .iter()
         .zip(times.iter().skip(1))
         .any(|(previous, current)| current <= previous)
     {
-        return Err(SurvivalError::InvalidIntegrationSetup);
+        return Err(SurvivalError::InvalidTimeGrid);
     }
     if cumulative_hazard.iter().any(|value| !value.is_finite()) {
         return Err(SurvivalError::NonFiniteInput);
@@ -2686,8 +2688,7 @@ mod tests {
     #[test]
     fn competing_risks_cif_rejects_nonmonotone_hazards() {
         let times = array![0.0, 1.0, 2.0];
-        let cumulative = Array3::from_shape_vec((1, 1, 3), vec![0.0, 0.2, 0.1])
-            .expect("shape");
+        let cumulative = Array3::from_shape_vec((1, 1, 3), vec![0.0, 0.2, 0.1]).expect("shape");
         let err = assemble_competing_risks_cif(times.view(), cumulative.view())
             .expect_err("nonmonotone cumulative hazard should be rejected");
         assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));

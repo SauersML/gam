@@ -294,6 +294,22 @@ struct SurvivalPredictionPayload {
 }
 
 #[derive(Serialize)]
+struct CompetingRisksPredictionPayload {
+    class: &'static str,
+    model_class: String,
+    likelihood_mode: String,
+    endpoint_names: Vec<String>,
+    times: Vec<f64>,
+    hazard: Vec<Vec<Vec<f64>>>,
+    survival: Vec<Vec<Vec<f64>>>,
+    cumulative_hazard: Vec<Vec<Vec<f64>>>,
+    cif: Vec<Vec<Vec<f64>>>,
+    overall_survival: Vec<Vec<f64>>,
+    linear_predictor: Vec<Vec<f64>>,
+    columns: BTreeMap<String, Vec<f64>>,
+}
+
+#[derive(Serialize)]
 struct PairedSamplePayload {
     class: &'static str,
     n_draws: usize,
@@ -640,6 +656,58 @@ fn sample_table(
 ) -> PyResult<String> {
     py.detach(move || sample_table_impl(&model_bytes, headers, rows, options_json.as_deref()))
         .map_err(py_value_error)
+}
+
+#[pyfunction]
+fn paired_sample_table(
+    py: Python<'_>,
+    target_model_bytes: Vec<u8>,
+    competing_model_bytes: Vec<u8>,
+    target_headers: Vec<String>,
+    target_rows: Vec<Vec<String>>,
+    competing_headers: Vec<String>,
+    competing_rows: Vec<Vec<String>>,
+    options_json: Option<String>,
+) -> PyResult<String> {
+    py.detach(move || {
+        paired_sample_table_impl(
+            &target_model_bytes,
+            &competing_model_bytes,
+            target_headers,
+            target_rows,
+            competing_headers,
+            competing_rows,
+            options_json.as_deref(),
+        )
+    })
+    .map_err(py_value_error)
+}
+
+#[pyfunction]
+fn paired_cumulative_incidence_table(
+    py: Python<'_>,
+    target_model_bytes: Vec<u8>,
+    competing_model_bytes: Vec<u8>,
+    target_samples: PyReadonlyArray2<'_, f64>,
+    competing_samples: PyReadonlyArray2<'_, f64>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    options_json: Option<String>,
+) -> PyResult<String> {
+    let target_samples = target_samples.as_array().to_owned();
+    let competing_samples = competing_samples.as_array().to_owned();
+    py.detach(move || {
+        paired_cumulative_incidence_table_impl(
+            &target_model_bytes,
+            &competing_model_bytes,
+            target_samples.view(),
+            competing_samples.view(),
+            headers,
+            rows,
+            options_json.as_deref(),
+        )
+    })
+    .map_err(py_value_error)
 }
 
 #[pyfunction]
@@ -5142,12 +5210,20 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalLocationScale(_) => {
             ("Survival location-scale", "survival location-scale", true)
         }
-        FitRequest::SurvivalTransformation(request) => match request.spec.likelihood_mode {
-            gam::families::survival_construction::SurvivalLikelihoodMode::Weibull => {
-                ("Survival Weibull", "survival", true)
+        FitRequest::SurvivalTransformation(request) => {
+            let cause_count =
+                gam::survival::cause_count_from_event_codes(request.spec.event_target.view());
+            if cause_count > 1 {
+                ("Cause-specific survival", "competing risks survival", true)
+            } else {
+                match request.spec.likelihood_mode {
+                    gam::families::survival_construction::SurvivalLikelihoodMode::Weibull => {
+                        ("Survival Weibull", "survival", true)
+                    }
+                    _ => ("Survival", "survival", true),
+                }
             }
-            _ => ("Survival", "survival", true),
-        },
+        }
         FitRequest::BernoulliMarginalSlope(_) => {
             ("Bernoulli marginal-slope", "bernoulli marginal-slope", true)
         }
@@ -6559,7 +6635,18 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_entry = Some(entryname);
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
-    payload.survivalspec = Some("net".to_string());
+    let cause_count = rp_result.fit.blocks.len().max(1);
+    let is_joint_cause_specific = cause_count > 1;
+    payload.survivalspec = Some(if is_joint_cause_specific {
+        "cause-specific".to_string()
+    } else {
+        "net".to_string()
+    });
+    if is_joint_cause_specific {
+        payload.survival_cause_count = Some(cause_count);
+        payload.survival_endpoint_names =
+            Some((1..=cause_count).map(|idx| format!("cause_{idx}")).collect());
+    }
     payload.survival_baseline_target =
         Some(survival_baseline_targetname(baseline_cfg.target).to_string());
     payload.survival_baseline_scale = baseline_cfg.scale;
@@ -6652,16 +6739,31 @@ fn build_survival_transformation_ffi_payload(
             .map(|cfg| cfg.penalty_orders.clone());
         payload.baseline_timewiggle_double_penalty =
             parsed.timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-        let beta = &rp_result.fit.beta;
         let start = rp_result.time_base_ncols;
         let end = start + timewiggle.ncols;
-        if beta.len() < end {
-            return Err(format!(
-                "survival transformation timewiggle beta mismatch: beta has {}, needs {end}",
-                beta.len()
-            ));
+        if is_joint_cause_specific {
+            let mut by_cause = Vec::with_capacity(cause_count);
+            for (cause_idx, block) in rp_result.fit.blocks.iter().enumerate() {
+                if block.beta.len() < end {
+                    return Err(format!(
+                        "joint cause-specific survival timewiggle beta mismatch for cause {}: beta has {}, needs {end}",
+                        cause_idx + 1,
+                        block.beta.len()
+                    ));
+                }
+                by_cause.push(block.beta.slice(s![start..end]).to_vec());
+            }
+            payload.beta_baseline_timewiggle_by_cause = Some(by_cause);
+        } else {
+            let beta = &rp_result.fit.beta;
+            if beta.len() < end {
+                return Err(format!(
+                    "survival transformation timewiggle beta mismatch: beta has {}, needs {end}",
+                    beta.len()
+                ));
+            }
+            payload.beta_baseline_timewiggle = Some(beta.slice(s![start..end]).to_vec());
         }
-        payload.beta_baseline_timewiggle = Some(beta.slice(s![start..end]).to_vec());
     }
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(rp_result.resolvedspec);
