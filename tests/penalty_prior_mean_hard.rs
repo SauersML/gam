@@ -19,14 +19,7 @@
 //! and is **not** reachable from integration tests. We therefore drive the
 //! observable math via `CanonicalPenalty`, which is what feeds the runtime's
 //! shifted-quadratic call sites (src/solver/reml/runtime.rs:1252, 3048, 5049,
-//! 8144, 8553). Tests that need to call methods directly on `PenaltyCoordinate`
-//! (e.g. its own `shifted_quadratic`) document the gap with `#[ignore]` and
-//! `// MISSING:` notes.
-//!
-//! REML/MAP convergence assertions need a public REML driver. The library is
-//! currently build-red (WIP in src/terms/basis.rs); the corresponding tests are
-//! written against the public formula and `#[ignore]`-marked where they would
-//! require a full fit to be runnable. They will compile once the WIP resolves.
+//! 8144, 8553).
 
 use gam::construction::CanonicalPenalty;
 use ndarray::{Array1, Array2};
@@ -457,16 +450,6 @@ fn joint_shift_of_mean_and_beta_leaves_quadratic_invariant() {
     }
 }
 
-#[test]
-#[ignore = "MISSING: public REML driver path for end-to-end (μ_p, β-init) shift; \
-            unblock when fit_gam_with_penalty_specs is wired through a centered \
-            init API or when src/solver/reml/unified.rs PenaltyCoordinate is \
-            re-exported from src/solver/reml/mod.rs"]
-fn reml_full_fit_invariance_under_joint_shift() {
-    // Intentionally empty: documents the missing surface. The math version is
-    // covered by `joint_shift_of_mean_and_beta_leaves_quadratic_invariant`.
-}
-
 // ---------------------------------------------------------------------------
 // 9. Null-space component of μ is invisible to the penalty.
 // ---------------------------------------------------------------------------
@@ -548,29 +531,4 @@ fn mismatched_prior_mean_length_panics() {
             "mismatched prior_mean length must panic in debug builds"
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// PenaltyCoordinate-specific tests. The type lives in pub(crate) unified, so
-// these are documentation-of-gap stubs.
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "MISSING: PenaltyCoordinate is in `pub(crate) mod unified` \
-            (src/solver/reml/mod.rs:23). Re-export PenaltyCoordinate and its \
-            constructors (from_dense_root_with_mean, from_block_root_with_mean) \
-            plus the `shifted_quadratic`/`apply_shifted_penalty` methods to \
-            unblock a direct-on-runtime test."]
-fn penalty_coordinate_dense_root_centered_direct() {
-    // Would call:
-    //   let pc = PenaltyCoordinate::from_dense_root_with_mean(root, mean);
-    //   assert_eq!(pc.shifted_quadratic(&beta, 1.0).to_bits(), 0u64); // at β=μ
-}
-
-#[test]
-#[ignore = "MISSING: same gap — BlockRootCentered direct tests need a public \
-            constructor for PenaltyCoordinate::from_block_root_with_mean."]
-fn penalty_coordinate_block_root_centered_direct() {
-    // Would call PenaltyCoordinate::from_block_root_with_mean and assert
-    // shifted_quadratic / apply_shifted_penalty match the reference formula.
 }
