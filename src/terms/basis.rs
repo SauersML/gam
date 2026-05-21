@@ -3736,8 +3736,11 @@ struct StreamingRadialState {
     /// Lazily materialized radial-scalar cache. (phi, q, t) per (i, j) pair
     /// — independent of axis, identical across every per-axis chunk loop —
     /// so collapses (axes × calls × chunks × n × n_knots) streaming radial
-    /// evaluations into a single O(n × n_knots) sweep per operator.
-    triplet_cache: Arc<std::sync::OnceLock<StreamingTripletCache>>,
+    /// evaluations into a single O(n × n_knots) sweep per operator. The
+    /// inner `Option` is `None` when the parallel fill encountered a radial
+    /// evaluation error (e.g. a non-finite r); callers fall back to the
+    /// streaming path which propagates the error through `compute_pair`.
+    triplet_cache: Arc<std::sync::OnceLock<Option<StreamingTripletCache>>>,
 }
 
 #[derive(Debug)]
@@ -3769,47 +3772,86 @@ impl StreamingRadialState {
         if !self.cache_fits_budget() {
             return None;
         }
-        Some(self.triplet_cache.get_or_init(|| {
-            let n = self.data.nrows();
-            let n_knots = self.centers.nrows();
-            let total = n * n_knots;
-            let mut phi = vec![0.0_f64; total];
-            let mut q = vec![0.0_f64; total];
-            let mut t = vec![0.0_f64; total];
-            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-            let chunks: Vec<_> = phi
-                .par_chunks_mut(n_knots)
-                .zip(q.par_chunks_mut(n_knots))
-                .zip(t.par_chunks_mut(n_knots))
-                .enumerate()
-                .collect();
-            chunks
-                .into_par_iter()
-                .for_each(|(i, ((phi_row, q_row), t_row))| {
+        let n = self.data.nrows();
+        let n_knots = self.centers.nrows();
+        if n == 0 || n_knots == 0 {
+            return None;
+        }
+        // The OnceLock holds `Option<StreamingTripletCache>` so a fill that
+        // hits an invalid `eval_design_triplet` (e.g. a non-finite r) does
+        // not poison the cache silently — consumers see `None` and fall back
+        // to the streaming `compute_pair` path that propagates the error
+        // through `Result<…, BasisError>`.
+        self.triplet_cache
+            .get_or_init(|| self.materialize_triplet_cache())
+            .as_ref()
+    }
+
+    fn materialize_triplet_cache(&self) -> Option<StreamingTripletCache> {
+        let n = self.data.nrows();
+        let n_knots = self.centers.nrows();
+        let total = n * n_knots;
+        let mut phi = vec![0.0_f64; total];
+        let mut q = vec![0.0_f64; total];
+        let mut t = vec![0.0_f64; total];
+
+        let metric_weights: &[f64] = match &self.axis_mode {
+            StreamingAxisMode::PerAxis { metric_weights }
+            | StreamingAxisMode::ScalarTotal { metric_weights } => metric_weights,
+        };
+        let dim = metric_weights.len();
+        debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
+
+        // Pack ~1024 rows per parallel task so rayon scheduling overhead is
+        // amortized even at biobank shapes (n ≈ 2e5, n_knots ≈ 10 → ~200
+        // tasks).
+        const ROWS_PER_TASK: usize = 1024;
+        let stride = ROWS_PER_TASK.saturating_mul(n_knots).max(n_knots);
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let any_failed = AtomicBool::new(false);
+        use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+        phi.par_chunks_mut(stride)
+            .zip(q.par_chunks_mut(stride))
+            .zip(t.par_chunks_mut(stride))
+            .enumerate()
+            .for_each(|(task_idx, ((phi_blk, q_blk), t_blk))| {
+                if any_failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let rows_in_task = phi_blk.len() / n_knots;
+                let i_start = task_idx * (stride / n_knots);
+                for local_i in 0..rows_in_task {
+                    let i = i_start + local_i;
+                    debug_assert!(i < self.data.nrows());
+                    let row_off = local_i * n_knots;
                     for j in 0..n_knots {
-                        let r2 = match &self.axis_mode {
-                            StreamingAxisMode::PerAxis { metric_weights }
-                            | StreamingAxisMode::ScalarTotal { metric_weights } => {
-                                let dim = metric_weights.len();
-                                let mut acc = 0.0_f64;
-                                for a in 0..dim {
-                                    let h = unsafe {
-                                        self.data.uget((i, a)) - self.centers.uget((j, a))
-                                    };
-                                    acc += metric_weights[a] * h * h;
-                                }
-                                acc
+                        let mut r2 = 0.0_f64;
+                        for a in 0..dim {
+                            let h = unsafe {
+                                self.data.uget((i, a)) - self.centers.uget((j, a))
+                            };
+                            r2 += metric_weights[a] * h * h;
+                        }
+                        match self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                            Ok((pv, qv, tv)) => {
+                                phi_blk[row_off + j] = pv;
+                                q_blk[row_off + j] = qv;
+                                t_blk[row_off + j] = tv;
                             }
-                        };
-                        if let Ok((p_, qv, tv)) = self.radial_kind.eval_design_triplet(r2.sqrt()) {
-                            phi_row[j] = p_;
-                            q_row[j] = qv;
-                            t_row[j] = tv;
+                            Err(_) => {
+                                any_failed.store(true, Ordering::Relaxed);
+                                return;
+                            }
                         }
                     }
-                });
-            StreamingTripletCache { phi, q, t }
-        }))
+                }
+            });
+
+        if any_failed.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(StreamingTripletCache { phi, q, t })
+        }
     }
 
     #[inline]
