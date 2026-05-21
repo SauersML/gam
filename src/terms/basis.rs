@@ -12245,8 +12245,8 @@ impl PolyharmonicBlockCoeff {
     }
 }
 
-fn polyharmonic_kernel(r: f64, (m: f64) as f64, k_dim: usize) -> f64 {
-    PolyharmonicBlockCoeff::new((m) as f64, k_dim).eval(r)
+fn polyharmonic_kernel(r: f64, m: f64, k_dim: usize) -> f64 {
+    PolyharmonicBlockCoeff::new(m, k_dim).eval(r)
 }
 
 #[inline(always)]
@@ -12626,8 +12626,8 @@ fn duchon_matern_operator_block_jets(
 }
 
 #[inline(always)]
-fn pure_duchon_block_order(p_order: usize, s_order: usize) -> usize {
-    p_order + s_order
+fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
+    p_order as f64 + s_order
 }
 
 fn validate_duchon_kernel_orders(
