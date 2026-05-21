@@ -19071,8 +19071,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_hypertension_shape_routes_to_exact_gradient_bfgs()
-    {
+    fn survival_marginal_slope_rigid_hypertension_shape_routes_to_exact_gradient_bfgs() {
         let n = 195_780usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![

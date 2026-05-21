@@ -18180,7 +18180,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
 }
 
-fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
+pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,

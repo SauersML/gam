@@ -99,6 +99,7 @@ def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
         train,
         "Surv(entry, exit, event) ~ age",
         survival_likelihood="weibull",
+        precision_hyperpriors={"cause_specific_survival_penalty_0": [2.0, 1.0]},
     )
     pred = model.predict(prediction_rows()[["entry", "exit", "event", "age"]])
     assert isinstance(pred, gamfit.CompetingRisksPrediction)
