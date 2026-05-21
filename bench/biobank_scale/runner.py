@@ -32,6 +32,73 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 MAX_CAPTURE_CHARS = 200000
+_OUTPUT_LOCK = threading.Lock()
+
+
+class _TerminalOutputSanitizer:
+    def __init__(self) -> None:
+        self._state = "normal"
+
+    def feed(self, text: str) -> str:
+        out: list[str] = []
+        for ch in text:
+            state = self._state
+            if state == "normal":
+                if ch == "\x1b":
+                    self._state = "esc"
+                elif ch == "\r":
+                    out.append("\n")
+                elif ch in "\n\t" or (ord(ch) >= 0x20 and ch != "\x7f"):
+                    out.append(ch)
+            elif state == "esc":
+                if ch == "[":
+                    self._state = "csi"
+                elif ch == "]":
+                    self._state = "osc"
+                elif ch in "PX^_":
+                    self._state = "string"
+                else:
+                    self._state = "normal"
+            elif state == "csi":
+                if "@" <= ch <= "~":
+                    self._state = "normal"
+            elif state == "osc":
+                if ch == "\x07":
+                    self._state = "normal"
+                elif ch == "\x1b":
+                    self._state = "osc_esc"
+            elif state == "osc_esc":
+                self._state = "normal" if ch == "\\" else "osc"
+            elif state == "string":
+                if ch == "\x1b":
+                    self._state = "string_esc"
+            elif state == "string_esc":
+                self._state = "normal" if ch == "\\" else "string"
+        return _strip_terminal_indent("".join(out))
+
+    def flush(self) -> str:
+        self._state = "normal"
+        return ""
+
+
+def _strip_terminal_indent(text: str) -> str:
+    parts = []
+    for part in text.splitlines(keepends=True):
+        stripped = part.lstrip(" \t")
+        parts.append(stripped if stripped.startswith("[") else part)
+    return "".join(parts)
+
+
+def _write_stream(sink: Any, text: str) -> None:
+    if not text:
+        return
+    with _OUTPUT_LOCK:
+        sink.write(text)
+        sink.flush()
+
+
+def _print_stderr(message: str) -> None:
+    _write_stream(sys.stderr, f"{message}\n")
 
 
 def _env_int_optional(name: str) -> int | None:

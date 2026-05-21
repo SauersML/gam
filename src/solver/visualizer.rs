@@ -78,13 +78,7 @@ fn sanitize_log_message(message: &str) -> String {
     while let Some(ch) = chars.next() {
         match ch {
             '\x1b' => {
-                if chars.next_if_eq(&'[').is_some() {
-                    for seq_ch in chars.by_ref() {
-                        if ('@'..='~').contains(&seq_ch) {
-                            break;
-                        }
-                    }
-                }
+                strip_escape_sequence(&mut chars);
             }
             '\r' => sanitized.push('\n'),
             '\n' | '\t' => sanitized.push(ch),
@@ -93,6 +87,38 @@ fn sanitize_log_message(message: &str) -> String {
         }
     }
     sanitized
+}
+
+fn strip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.next() {
+        Some('[') => {
+            for seq_ch in chars.by_ref() {
+                if ('@'..='~').contains(&seq_ch) {
+                    break;
+                }
+            }
+        }
+        Some(']') => strip_string_escape(chars),
+        Some('P' | 'X' | '^' | '_') => strip_string_escape(chars),
+        Some(_) | None => {}
+    }
+}
+
+fn strip_string_escape<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(seq_ch) = chars.next() {
+        if seq_ch == '\x07' {
+            break;
+        }
+        if seq_ch == '\x1b' && chars.next_if_eq(&'\\').is_some() {
+            break;
+        }
+    }
 }
 
 fn human_elapsed(elapsed: Duration) -> String {
@@ -1613,8 +1639,10 @@ mod tests {
 
     #[test]
     fn log_sanitizer_splits_carriage_returns_and_drops_controls() {
-        let sanitized = sanitize_log_message("abc\rdef\u{1b}[2K\nghi\tjkl");
-        assert_eq!(sanitized, "abc\ndef\nghi\tjkl");
+        let sanitized = sanitize_log_message(
+            "abc\rdef\u{1b}[2K\nghi\tjkl\u{1b}]0;title\u{7}mno\u{1b}Pprivate\u{1b}\\pqr",
+        );
+        assert_eq!(sanitized, "abc\ndef\nghi\tjklmnopqr");
     }
 
     #[test]
