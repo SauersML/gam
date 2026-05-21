@@ -638,7 +638,7 @@ impl InteractiveVisualizer {
             let summary_panel = Paragraph::new(summary_lines)
                 .block(
                     Block::default()
-                        .title("Session")
+                        .title(" Session ")
                         .border_style(Style::default().fg(accent))
                         .borders(Borders::ALL),
                 )
@@ -696,7 +696,7 @@ impl InteractiveVisualizer {
             let model_panel = Paragraph::new(model_lines.join("\n"))
                 .block(
                     Block::default()
-                        .title("Effective Degrees of Freedom")
+                        .title(" Effective Degrees of Freedom ")
                         .border_style(Style::default().fg(Color::LightCyan))
                         .borders(Borders::ALL),
                 )
