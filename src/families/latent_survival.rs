@@ -2857,72 +2857,123 @@ impl LatentBinaryFamily {
     }
 }
 
-struct LatentSurvivalHessianWorkspace {
-    family: LatentSurvivalFamily,
-    block_states: Vec<ParameterBlockState>,
-    slices: LatentSurvivalJointSlices,
+/// Shared interface that both `LatentSurvivalFamily` and `LatentBinaryFamily`
+/// expose to the joint Hessian workspace.
+///
+/// The two families produce the same `ExactNewtonJointHessianWorkspace`
+/// shape — five of the six workspace methods are pure delegations to a
+/// matching family method (dense evaluation, directional derivatives, and the
+/// `slices` cache). The only family-specific piece is the per-row matvec body:
+/// the survival family iterates over real (entry, exit, ḋ) triples and may
+/// carry a log-σ block, while the binary family rewrites the same row kernel
+/// through `binary_from_log_survival(·)` to recover the per-row binary
+/// gradient/Hessian. That single difference is captured by `ws_matvec_into`;
+/// every other method is shared by the generic `LatentHessianWorkspace<F>`
+/// below.
+trait LatentJointHessianFamily {
+    fn ws_joint_slices(&self) -> LatentSurvivalJointSlices;
+
+    fn ws_evaluate_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String>;
+
+    fn ws_dh_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String>;
+
+    fn ws_dh_second_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String>;
+
+    /// Family-specific per-row Hessian matvec body, hoisted out of the
+    /// workspace impl. Writes `out := H · v` (with `out.fill(0.0)` already
+    /// performed by the caller) using the family's row kernel.
+    fn ws_matvec_into(
+        &self,
+        slices: &LatentSurvivalJointSlices,
+        block_states: &[ParameterBlockState],
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String>;
+
+    /// Family-name fragment used in the workspace's dimension-mismatch error
+    /// message, so callers still see "latent survival …" / "latent binary …"
+    /// after the workspace impl was unified.
+    fn ws_label() -> &'static str;
 }
 
-impl LatentSurvivalHessianWorkspace {
-    fn new(family: LatentSurvivalFamily, block_states: Vec<ParameterBlockState>) -> Self {
-        let slices = family.joint_slices();
-        Self {
-            family,
+impl LatentJointHessianFamily for LatentSurvivalFamily {
+    fn ws_joint_slices(&self) -> LatentSurvivalJointSlices {
+        self.joint_slices()
+    }
+
+    fn ws_evaluate_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        self.evaluate_exact_newton_joint_dense(block_states)
+    }
+
+    fn ws_dh_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_dense(block_states, d_beta_flat)
+    }
+
+    fn ws_dh_second_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative_dense(
             block_states,
-            slices,
-        }
-    }
-}
-
-impl ExactNewtonJointHessianWorkspace for LatentSurvivalHessianWorkspace {
-    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .evaluate_exact_newton_joint_dense(&self.block_states)
-            .map(|(_, _, hessian)| Some(hessian))
+            d_beta_u,
+            d_beta_v,
+        )
     }
 
-    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        let mut out = Array1::<f64>::zeros(self.slices.total);
-        self.hessian_matvec_into(v, &mut out)?;
-        Ok(Some(out))
-    }
-
-    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
-        if v.len() != self.slices.total || out.len() != self.slices.total {
-            return Err(format!(
-                "latent survival Hessian matvec dimension mismatch: v={} out={} expected={}",
-                v.len(),
-                out.len(),
-                self.slices.total
-            ));
-        }
-        out.fill(0.0);
-        let (q_entry, q_exit, qdot_exit, mu) = self.family.split_time_eta(&self.block_states)?;
-        let sigma = self.family.latent_sd(&self.block_states)?;
-        let include_log_sigma = self.slices.log_sigma.is_some();
-        for row_idx in 0..self.family.event_target.len() {
-            let wi = self.family.weights[row_idx];
+    fn ws_matvec_into(
+        &self,
+        slices: &LatentSurvivalJointSlices,
+        block_states: &[ParameterBlockState],
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String> {
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let include_log_sigma = slices.log_sigma.is_some();
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let event_type = if self.family.event_target[row_idx] >= 1 {
+            let event_type = if self.event_target[row_idx] >= 1 {
                 LatentSurvivalEventType::ExactEvent
             } else {
                 LatentSurvivalEventType::RightCensored
             };
             let row = build_latent_survival_row(
                 row_idx,
-                self.family.hazard_loading,
+                self.hazard_loading,
                 event_type,
                 q_entry[row_idx],
                 q_exit[row_idx],
                 qdot_exit[row_idx],
-                self.family.unloaded_mass_entry[row_idx],
-                self.family.unloaded_mass_exit[row_idx],
-                self.family.unloaded_hazard_exit[row_idx],
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                self.unloaded_hazard_exit[row_idx],
             )?;
             let (_, _, primary_hessian) = latent_survival_row_primary_gradient_hessian(
-                &self.family.quadctx,
+                &self.quadctx,
                 &row,
                 q_entry[row_idx],
                 q_exit[row_idx],
@@ -2931,60 +2982,118 @@ impl ExactNewtonJointHessianWorkspace for LatentSurvivalHessianWorkspace {
                 sigma,
                 include_log_sigma,
             )?;
-            let primary_dir = self
-                .family
-                .row_primary_direction_from_flat(row_idx, &self.slices, v);
+            let primary_dir = self.row_primary_direction_from_flat(row_idx, slices, v);
             let primary_hv = primary_hessian.dot(&primary_dir);
-            self.family
-                .add_pullback_primary_gradient(out, row_idx, &self.slices, &primary_hv, wi);
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
         }
         Ok(true)
     }
 
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        let dense = self
-            .family
-            .evaluate_exact_newton_joint_dense(&self.block_states)?
-            .2;
-        Ok(Some(dense.diag().to_owned()))
-    }
-
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_dense(
-                &self.block_states,
-                d_beta_flat,
-            )
-            .map(Some)
-    }
-
-    fn second_directional_derivative(
-        &self,
-        d_beta_u: &Array1<f64>,
-        d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessian_second_directional_derivative_dense(
-                &self.block_states,
-                d_beta_u,
-                d_beta_v,
-            )
-            .map(Some)
+    fn ws_label() -> &'static str {
+        "survival"
     }
 }
 
-struct LatentBinaryHessianWorkspace {
-    family: LatentBinaryFamily,
+impl LatentJointHessianFamily for LatentBinaryFamily {
+    fn ws_joint_slices(&self) -> LatentSurvivalJointSlices {
+        self.joint_slices()
+    }
+
+    fn ws_evaluate_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        self.evaluate_exact_newton_joint_dense(block_states)
+    }
+
+    fn ws_dh_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_dense(block_states, d_beta_flat)
+    }
+
+    fn ws_dh_second_directional(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_hessian_second_directional_derivative_dense(
+            block_states,
+            d_beta_u,
+            d_beta_v,
+        )
+    }
+
+    fn ws_matvec_into(
+        &self,
+        slices: &LatentSurvivalJointSlices,
+        block_states: &[ParameterBlockState],
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String> {
+        let (q_entry, q_exit, mu) = self.split_time_eta(block_states)?;
+        for row_idx in 0..self.event_target.len() {
+            let wi = self.weights[row_idx];
+            if wi <= MIN_WEIGHT {
+                continue;
+            }
+            let row = build_latent_survival_row(
+                row_idx,
+                self.hazard_loading,
+                LatentSurvivalEventType::RightCensored,
+                q_entry[row_idx],
+                q_exit[row_idx],
+                1.0,
+                self.unloaded_mass_entry[row_idx],
+                self.unloaded_mass_exit[row_idx],
+                0.0,
+            )?;
+            let (row_log_survival, survival_gradient, survival_hessian) =
+                latent_survival_row_primary_gradient_hessian(
+                    &self.quadctx,
+                    &row,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    1.0,
+                    mu[row_idx],
+                    self.latent_sd,
+                    false,
+                )?;
+            let binary = binary_from_log_survival(row_log_survival, self.event_target[row_idx])?;
+            let primary_dir = self.row_primary_direction_from_flat(row_idx, slices, v);
+            let mut primary_hv = binary.grad_scale * survival_hessian.dot(&primary_dir);
+            let outer_dot = survival_gradient.dot(&primary_dir);
+            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
+                primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
+            }
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
+        }
+        Ok(true)
+    }
+
+    fn ws_label() -> &'static str {
+        "binary"
+    }
+}
+
+/// Joint exact-Newton Hessian workspace shared by `LatentSurvivalFamily` and
+/// `LatentBinaryFamily`. The two families plug into the workspace via
+/// `LatentJointHessianFamily`; this struct holds the shared bookkeeping
+/// (block states + cached slices) and routes every trait method either through
+/// a thin family delegation or through the family's `ws_matvec_into` row
+/// kernel.
+struct LatentHessianWorkspace<F: LatentJointHessianFamily> {
+    family: F,
     block_states: Vec<ParameterBlockState>,
     slices: LatentSurvivalJointSlices,
 }
 
-impl LatentBinaryHessianWorkspace {
-    fn new(family: LatentBinaryFamily, block_states: Vec<ParameterBlockState>) -> Self {
-        let slices = family.joint_slices();
+impl<F: LatentJointHessianFamily> LatentHessianWorkspace<F> {
+    fn new(family: F, block_states: Vec<ParameterBlockState>) -> Self {
+        let slices = family.ws_joint_slices();
         Self {
             family,
             block_states,
@@ -2993,10 +3102,13 @@ impl LatentBinaryHessianWorkspace {
     }
 }
 
-impl ExactNewtonJointHessianWorkspace for LatentBinaryHessianWorkspace {
+impl<F> ExactNewtonJointHessianWorkspace for LatentHessianWorkspace<F>
+where
+    F: LatentJointHessianFamily + Send + Sync + 'static,
+{
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         self.family
-            .evaluate_exact_newton_joint_dense(&self.block_states)
+            .ws_evaluate_dense(&self.block_states)
             .map(|(_, _, hessian)| Some(hessian))
     }
 
@@ -3009,62 +3121,20 @@ impl ExactNewtonJointHessianWorkspace for LatentBinaryHessianWorkspace {
     fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         if v.len() != self.slices.total || out.len() != self.slices.total {
             return Err(format!(
-                "latent binary Hessian matvec dimension mismatch: v={} out={} expected={}",
+                "latent {} Hessian matvec dimension mismatch: v={} out={} expected={}",
+                F::ws_label(),
                 v.len(),
                 out.len(),
                 self.slices.total
             ));
         }
         out.fill(0.0);
-        let (q_entry, q_exit, mu) = self.family.split_time_eta(&self.block_states)?;
-        for row_idx in 0..self.family.event_target.len() {
-            let wi = self.family.weights[row_idx];
-            if wi <= MIN_WEIGHT {
-                continue;
-            }
-            let row = build_latent_survival_row(
-                row_idx,
-                self.family.hazard_loading,
-                LatentSurvivalEventType::RightCensored,
-                q_entry[row_idx],
-                q_exit[row_idx],
-                1.0,
-                self.family.unloaded_mass_entry[row_idx],
-                self.family.unloaded_mass_exit[row_idx],
-                0.0,
-            )?;
-            let (row_log_survival, survival_gradient, survival_hessian) =
-                latent_survival_row_primary_gradient_hessian(
-                    &self.family.quadctx,
-                    &row,
-                    q_entry[row_idx],
-                    q_exit[row_idx],
-                    1.0,
-                    mu[row_idx],
-                    self.family.latent_sd,
-                    false,
-                )?;
-            let binary =
-                binary_from_log_survival(row_log_survival, self.family.event_target[row_idx])?;
-            let primary_dir = self
-                .family
-                .row_primary_direction_from_flat(row_idx, &self.slices, v);
-            let mut primary_hv = binary.grad_scale * survival_hessian.dot(&primary_dir);
-            let outer_dot = survival_gradient.dot(&primary_dir);
-            for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
-                primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
-            }
-            self.family
-                .add_pullback_primary_gradient(out, row_idx, &self.slices, &primary_hv, wi);
-        }
-        Ok(true)
+        self.family
+            .ws_matvec_into(&self.slices, &self.block_states, v, out)
     }
 
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        let dense = self
-            .family
-            .evaluate_exact_newton_joint_dense(&self.block_states)?
-            .2;
+        let dense = self.family.ws_evaluate_dense(&self.block_states)?.2;
         Ok(Some(dense.diag().to_owned()))
     }
 
@@ -3073,10 +3143,7 @@ impl ExactNewtonJointHessianWorkspace for LatentBinaryHessianWorkspace {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         self.family
-            .exact_newton_joint_hessian_directional_derivative_dense(
-                &self.block_states,
-                d_beta_flat,
-            )
+            .ws_dh_directional(&self.block_states, d_beta_flat)
             .map(Some)
     }
 
@@ -3086,14 +3153,13 @@ impl ExactNewtonJointHessianWorkspace for LatentBinaryHessianWorkspace {
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         self.family
-            .exact_newton_joint_hessian_second_directional_derivative_dense(
-                &self.block_states,
-                d_beta_u,
-                d_beta_v,
-            )
+            .ws_dh_second_directional(&self.block_states, d_beta_u, d_beta_v)
             .map(Some)
     }
 }
+
+type LatentSurvivalHessianWorkspace = LatentHessianWorkspace<LatentSurvivalFamily>;
+type LatentBinaryHessianWorkspace = LatentHessianWorkspace<LatentBinaryFamily>;
 
 impl CustomFamily for LatentSurvivalFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
