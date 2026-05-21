@@ -7769,7 +7769,7 @@ fn extract_spatial_operator_runtime_caches(
                             centers.view(),
                             None,
                             *length_scale,
-                            *power as usize,
+                            *power,
                             *nullspace_order,
                             aniso_log_scales.as_deref(),
                             identifiability_transform.as_ref().map(|z| z.view()),

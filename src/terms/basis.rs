@@ -9080,8 +9080,8 @@ struct DuchonCrossPenaltyContext {
     centers: Array2<f64>,
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: usize,
-    pure_block_order: usize,
+    s_order: f64,
+    pure_block_order: f64,
     coeffs: Option<DuchonPartialFractionCoeffs>,
     aniso_log_scales: Vec<f64>,
     z_kernel: Array2<f64>,
@@ -9365,7 +9365,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     let coeffs = length_scale.map(|scale| {
         duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / scale.max(1e-300))
     });
-    let pure_block_order = pure_duchon_block_order(p_order, s_order) as usize;
+    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let z_cols = z_kernel.ncols();
@@ -9888,7 +9888,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         centers: centers.to_owned(),
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         pure_block_order: pure_block_order as usize,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
@@ -9946,7 +9946,7 @@ fn duchon_kernel_radial_triplet(
     // operator scalars (q, lap, t) in the penalty code.
     let triplet = match length_scale {
         None => {
-            let m = pure_duchon_block_order(p_order, s_order) as usize;
+            let m = pure_duchon_block_order(p_order, s_order as f64) as usize;
             polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
@@ -11819,7 +11819,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order as f64,
+        s_order,
         dim,
         max_operator_derivative_order,
     )?;
@@ -15547,7 +15547,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
-        s_order as f64,
+        s_order,
         centers.ncols(),
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
@@ -16850,7 +16850,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         dim,
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let block_order = pure_duchon_block_order(p_order, s_order) as usize;
+    let block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
         centers.view(),
@@ -16879,7 +16879,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let (per_axis, cross_terms, cross_provider) = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
         None,
-        spec.power_as_usize(),
+        spec.power,
         effective_nullspace_order,
         raw_eta,
         identifiability_transform.as_ref(),
@@ -16941,7 +16941,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
     let (per_axis, cross_pairs, cross_provider) = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
         Some(length_scale),
-        spec.power_as_usize(),
+        spec.power,
         effective_nullspace_order,
         eta,
         identifiability_transform.as_ref(),
@@ -19380,7 +19380,7 @@ pub fn build_duchon_basiswithworkspace(
         centers.view(),
         None,
         spec.length_scale,
-        spec.power_as_usize(),
+        spec.power,
         effective_nullspace_order,
         aniso.as_deref(),
         identifiability_transform.as_ref().map(|z| z.view()),
@@ -27960,7 +27960,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.0),
-            4,
+            4.0,
             DuchonNullspaceOrder::Linear,
         )
         .expect("primary Duchon case should build");
@@ -27984,7 +27984,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.0),
-            1,
+            1.0,
             DuchonNullspaceOrder::Linear,
         )
         .expect("general integer (p,s,k) Duchon kernel should build");
@@ -29146,7 +29146,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(0.9),
-            5,
+            5.0,
             DuchonNullspaceOrder::Linear, // order=1 => m=2
         )
         .expect("general Duchon basis should build");
@@ -29208,7 +29208,7 @@ mod tests {
             centers.view(),
             None,
             None,
-            1,
+            1.0,
             DuchonNullspaceOrder::Zero,
             None,
             None,
@@ -29234,7 +29234,7 @@ mod tests {
             centers.view(),
             None,
             None,
-            0,
+            0.0,
             DuchonNullspaceOrder::Linear,
             None,
             None,
@@ -29300,7 +29300,7 @@ mod tests {
             centers.view(),
             centers.view(),
             Some(1.0),
-            1,
+            1.0,
             DuchonNullspaceOrder::Zero,
         )
         .expect("hybrid Duchon basis");
@@ -29331,7 +29331,7 @@ mod tests {
             centers.view(),
             None,
             Some(1.0),
-            2,
+            2.0,
             DuchonNullspaceOrder::Linear,
             Some(&eta),
             None,
@@ -29760,7 +29760,7 @@ mod tests {
         use ndarray::array;
         let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
         let nullspace_order = DuchonNullspaceOrder::Linear;
-        let power = 1usize;
+        let power = 1.0;
         let length_scale = 1.0_f64;
         let mut workspace = BasisWorkspace::default();
         let eps: f64 = 1e-5;
@@ -29819,7 +29819,7 @@ mod tests {
         // Analytic d0_psi (kernel cols only): the same internals as
         // build_duchon_operator_penalty_psi_derivatives reach out for.
         let p_order = 2usize;
-        let s_order = power;
+        let s_order = duchon_power_to_usize(power);
         let d = 1usize;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let z_kernel =
@@ -29866,7 +29866,7 @@ mod tests {
         use ndarray::array;
         let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
         let nullspace_order = DuchonNullspaceOrder::Linear;
-        let power = 1usize;
+        let power = 1.0;
         let length_scale = 1.0_f64;
         let mut workspace = BasisWorkspace::default();
         let ops_base = build_duchon_collocation_operator_matriceswithworkspace(
@@ -31620,7 +31620,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.2),
-            4,
+            4.0,
             DuchonNullspaceOrder::Zero,
         )
         .expect("order=0 Duchon case should build");
@@ -31667,7 +31667,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.0),
-            1,
+            1.0,
             DuchonNullspaceOrder::Zero,
         ) {
             Ok(_) => panic!("16D rough Duchon case has an infinite diagonal"),
@@ -31772,7 +31772,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.0),
-            0,
+            0.0,
             DuchonNullspaceOrder::Linear,
         )
         .expect("order=1, s=0 Duchon case should build");
@@ -31789,7 +31789,7 @@ mod tests {
             data.view(),
             centers.view(),
             Some(1.0),
-            0,
+            0.0,
             DuchonNullspaceOrder::Zero,
         )
         .expect("order=0, s=0 Duchon case should build");
@@ -32164,7 +32164,7 @@ mod tests {
             centers.view(),
             None,
             Some(0.8),
-            3,
+            3.0,
             DuchonNullspaceOrder::Linear,
             None,
             None,
@@ -33212,7 +33212,7 @@ mod tests {
         centers: ArrayView2<'_, f64>,
         q: usize,
         length_scale: f64,
-        power: usize,
+        power: f64,
         nullspace_order: DuchonNullspaceOrder,
         aniso_log_scales: Option<&[f64]>,
     ) -> Array2<f64> {
@@ -33240,7 +33240,7 @@ mod tests {
         centers: ArrayView2<'_, f64>,
         q: usize,
         length_scale: f64,
-        power: usize,
+        power: f64,
         nullspace_order: DuchonNullspaceOrder,
         aniso_log_scales: Option<&[f64]>,
     ) -> Array2<f64> {
