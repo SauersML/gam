@@ -15025,15 +15025,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
         use crate::custom_family::ExactOuterDerivativeOrder;
 
-        // The realized cost gate now lives on
-        // `BernoulliMarginalSlopeFamily::outer_derivative_policy` —
-        // `predicted_hessian_work` is compared against
-        // `OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET` by the
-        // policy's `order_for_evaluation` helper. The capability query
-        // below names the highest analytic order the family advertises
-        // *in principle*; the policy clamps it at evaluation time. This
-        // keeps the cost decision a single source of truth (no
-        // duplicated thresholds, no per-call-site work-limit consts).
+        // The capability query names the highest analytic order the family
+        // advertises. Runtime work estimates belong to
+        // `outer_derivative_policy`: they inform routing and diagnostics, but
+        // they must not silently erase a mathematically available Hessian.
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -15052,14 +15047,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
 
     /// Realized outer-derivative policy for the BMS family.
     ///
-    /// Migrates the legacy in-source work-limit consts (formerly
-    /// `FLEX_DENSE_OUTER_HESSIAN_ROW_THIRD_WORK_LIMIT` and
-    /// `RIGID_DENSE_OUTER_HESSIAN_ROW_THIRD_WORK_LIMIT`, both `1e8`) into
-    /// the unified `OuterDerivativePolicy` carrying the family-specific
-    /// predicted per-evaluation work. The caller then consults
-    /// [`OuterDerivativePolicy::order_for_evaluation`], which gates
-    /// against [`OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`] —
-    /// the canonical universal ceiling, not a per-family duplicate.
+    /// Carries the family-specific predicted per-evaluation work into the
+    /// unified `OuterDerivativePolicy`. The caller can use those costs to
+    /// choose a dense, operator, or staged route, while the declared derivative
+    /// order remains a statement about available calculus.
     ///
     /// **Work model.** The dominant outer-Hessian cost is the per-row
     /// third/fourth-derivative tensor pullback, summed over n rows and
@@ -15080,10 +15071,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     /// fewer Hessian-row accumulation pass — matches the
     /// `default_coefficient_gradient_cost` convention).
     ///
-    /// All arithmetic uses `saturating_mul` so overflow rounds the
-    /// predicted work *up* to the budget ceiling (conservative-upper-
-    /// bound principle: prefer dropping one Hessian evaluation we could
-    /// have afforded over crashing on a 600 s eval).
+    /// All arithmetic uses `saturating_mul` so overflow preserves a
+    /// conservative upper-bound cost estimate for routing and diagnostics.
     fn outer_derivative_policy(
         &self,
         specs: &[ParameterBlockSpec],
@@ -21239,10 +21228,9 @@ mod tests {
             penalized_spec(flex_p, n_large, 12),
         ];
         // Capability is always Second when the family advertises analytic
-        // second-order calculus — cost gating is a *policy* decision, not a
-        // capability claim. The runtime-realized cost gate lives on
-        // `outer_derivative_policy(...).declared_hessian_form()` and below
-        // we assert the high-work branch trips it.
+        // second-order calculus. Large predicted work is a routing signal, not
+        // permission to downgrade the objective to a different derivative
+        // contract.
         assert_eq!(
             high_work_flex_family
                 .exact_outer_derivative_order(&high_work_specs, &BlockwiseFitOptions::default()),
@@ -21254,28 +21242,23 @@ mod tests {
             &BlockwiseFitOptions::default(),
         );
         assert!(
-            high_work_policy.predicted_hessian_work
-                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "high-work flex configuration must exceed the outer-Hessian work budget; \
-             got predicted={} budget={}",
+            high_work_policy.predicted_hessian_work > high_work_policy.predicted_gradient_work,
+            "high-work flex configuration should still record Hessian work above gradient work; \
+             got hessian={} gradient={}",
             high_work_policy.predicted_hessian_work,
-            crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            high_work_policy.predicted_gradient_work,
         );
-        assert!(
-            matches!(
-                high_work_policy.declared_hessian_form(),
-                crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
-            ),
-            "policy must declare the outer Hessian Unavailable when predicted work \
-             exceeds the budget; got {:?}",
+        assert_eq!(
             high_work_policy.declared_hessian_form(),
+            crate::solver::outer_strategy::DeclaredHessianForm::Either,
+            "high predicted work must not erase an analytic Hessian capability",
         );
         assert_eq!(
             high_work_policy.order_for_evaluation(
                 crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
             ),
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
-            "policy must clamp ValueGradientHessian to ValueAndGradient in the high-work regime",
+            crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+            "policy must preserve ValueGradientHessian when analytic Hessian calculus exists",
         );
 
         let mut large_rigid_family = large_flex_family.clone();

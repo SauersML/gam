@@ -123,12 +123,48 @@ def format_cuda_diagnostics() -> str:
     return "\n".join(lines)
 
 
+_CUDA_CONFLICT_WARNED: set[str] = set()
+
+
 def assert_no_cuda_library_conflicts(context: str) -> None:
-    """Raise before Rust/CUDA work starts if multiple CUDA stacks are mapped."""
+    """Warn (once per process) if multiple CUDA stacks are mapped, then proceed.
+
+    Two distinct files for the same SONAME (e.g. ``libcublas.so.12``) can
+    appear in ``/proc/self/maps`` when both a system CUDA install and the
+    pip ``nvidia-*-cu12`` wheels are reachable. The catastrophic case —
+    cuBLAS handle ownership splitting across implementations and crashing
+    on ``cublasDestroy_v2`` — only triggers if calling code does
+    ``dlopen(absolute_path)`` on BOTH files and crosses handles. Standard
+    library code uses ``dlopen(SONAME)``, which glibc resolves to exactly
+    one file via the loader's search path, so all CUDA calls route through
+    one handle even though both files are present in the address space.
+
+    This check used to ``raise RuntimeError``. That was overcautious — it
+    refused service on common Colab and cloud images where the dual mapping
+    is benign. The check now emits one warning per (process, conflict-set)
+    and returns. If a real double-free occurs later, the warning makes the
+    cause discoverable; if it doesn't (the typical case), gamfit just works.
+    """
 
     conflicts = cuda_diagnostics()["conflicts"]
     if not isinstance(conflicts, dict) or not conflicts:
         return
+    key = "|".join(f"{f}:{','.join(sorted(p))}" for f, p in sorted(conflicts.items()))
+    if key in _CUDA_CONFLICT_WARNED:
+        return
+    _CUDA_CONFLICT_WARNED.add(key)
+    details = format_cuda_diagnostics()
+    sys.stderr.write(
+        f"[gamfit] WARNING: dual CUDA stack detected before {context}. "
+        "Multiple files share the same SONAME in /proc/self/maps; this is "
+        "usually benign (dlopen-by-SONAME deterministically picks one) and "
+        "gamfit will proceed. If cublasDestroy_v2 later aborts with "
+        "'double free or corruption', keep exactly one CUDA toolkit "
+        "reachable: either the system install (typically /usr/local/cuda*) "
+        "or the pip nvidia-*-cu12 wheels, not both.\n"
+        f"{details}\n"
+    )
+    return
     details = format_cuda_diagnostics()
     raise RuntimeError(
         f"CUDA library conflict before {context}. Multiple distinct shared objects "

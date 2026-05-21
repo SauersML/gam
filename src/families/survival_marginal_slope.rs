@@ -19064,10 +19064,10 @@ mod tests {
             row_kernel_work < generic_dense_work,
             "rigid row-kernel work must be cheaper than generic dense Hessian work"
         );
-        assert!(
-            policy.predicted_hessian_work
-                <= crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "rigid row-kernel work should keep exact outer Hessian enabled"
+        assert_eq!(
+            policy.declared_hessian_form(),
+            crate::solver::outer_strategy::DeclaredHessianForm::Either,
+            "rigid row-kernel work should keep exact outer Hessian available"
         );
 
         let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
@@ -19082,7 +19082,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_hypertension_shape_routes_to_exact_gradient_bfgs() {
+    fn survival_marginal_slope_rigid_hypertension_shape_keeps_exact_hessian() {
         let n = 195_780usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![
@@ -19111,15 +19111,10 @@ mod tests {
 
         assert_eq!(p_total, 33);
         assert_eq!(rho_dim, 4);
-        assert!(
-            row_kernel_work
-                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "the hypertension biobank shape should exceed the ARC/Hessian stability budget"
-        );
         assert_eq!(policy.predicted_hessian_work, row_kernel_work);
         assert_eq!(
             policy.declared_hessian_form(),
-            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
         );
 
         let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
@@ -19129,7 +19124,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+            crate::solver::outer_strategy::DeclaredHessianForm::Either
         );
     }
 
