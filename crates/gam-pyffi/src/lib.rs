@@ -504,22 +504,25 @@ fn predict_array<'py>(
 fn competing_risks_cif<'py>(
     py: Python<'py>,
     times: PyReadonlyArray1<'py, f64>,
-    cumulative_hazard: PyReadonlyArray3<'py, f64>,
+    cumulative_hazards: Vec<PyReadonlyArray2<'py, f64>>,
 ) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
     let (cif, overall_survival) =
-        competing_risks_cif_impl(times.as_array(), cumulative_hazard.as_array())
-            .map_err(py_value_error)?;
+        competing_risks_cif_impl(times.as_array(), &cumulative_hazards).map_err(py_value_error)?;
     Ok((
         cif.into_pyarray(py).unbind(),
         overall_survival.into_pyarray(py).unbind(),
     ))
 }
 
-fn competing_risks_cif_impl(
+fn competing_risks_cif_impl<'py>(
     times: ArrayView1<'_, f64>,
-    cumulative_hazard: ArrayView3<'_, f64>,
+    cumulative_hazards: &[PyReadonlyArray2<'py, f64>],
 ) -> Result<(Array3<f64>, Array2<f64>), String> {
-    let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard)
+    let endpoint_views = cumulative_hazards
+        .iter()
+        .map(|hazard| hazard.as_array())
+        .collect::<Vec<_>>();
+    let result = gam::survival::assemble_competing_risks_cif_from_endpoints(times, &endpoint_views)
         .map_err(|err| err.to_string())?;
     Ok((result.cif, result.overall_survival))
 }

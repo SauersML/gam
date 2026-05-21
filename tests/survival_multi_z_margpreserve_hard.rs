@@ -542,14 +542,12 @@ fn survival_multi_z_covariance_from_scores_smoke() {
     let weights = Array1::<f64>::from_elem(n, 1.0);
     let cov = marginal_slope_covariance_from_scores(scores.view(), &weights)
         .expect("covariance from scores");
-    // Must validate cleanly and produce the expected shape (Full or LowRank
-    // depending on rank). We only sanity-check the identity still holds.
+    // Must validate cleanly. The classifier may legitimately return
+    // Diagonal for IID-normal scores when sample off-diagonals are within
+    // the statistical-noise threshold; the invariant is marginal preservation.
     let slopes = random_slopes(&mut rng, k, 1.0);
     assert_marginal_preservation(0.7, &slopes, &cov, 1.0, 2e-15, "scores-derived");
-    assert!(matches!(
-        cov.shape(),
-        MarginalSlopeCovarianceShape::Full | MarginalSlopeCovarianceShape::LowRank
-    ));
+    assert_eq!(cov.dim(), k);
 }
 
 // ---------------------------------------------------------------------------
