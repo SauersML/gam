@@ -15557,15 +15557,19 @@ fn build_duchon_operator_penalty_psi_derivatives(
     })?;
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power_as_usize();
+    let s_order: f64 = spec.power;
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
-        s_order as f64,
+        s_order,
         centers.ncols(),
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+    // Hybrid Matérn partial-fraction expansion requires integer s; the
+    // assertion fires here rather than at the spec layer so the
+    // scale-free path stays fractional-clean.
+    let coeffs =
+        duchon_partial_fraction_coeffs(p_order, duchon_power_to_usize(s_order), 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let p = centers.nrows();
@@ -19241,7 +19245,7 @@ pub fn build_duchon_basiswithworkspace(
     validate_duchon_collocation_orders(
         spec.length_scale,
         p_order,
-        spec.power_as_usize() as f64,
+        spec.power,
         data.ncols(),
         max_active_operator_order,
     )?;
@@ -19308,7 +19312,7 @@ pub fn build_duchon_basiswithworkspace(
                         r,
                         length_scale,
                         p_order,
-                        s_order as f64,
+                        s_order,
                         d,
                         coeffs.as_ref(),
                     )
@@ -28443,7 +28447,7 @@ mod tests {
             &d2,
             &DuchonOperatorPenaltySpec::default(),
             p_order,
-            s_order,
+            s_order as f64,
             None,
             None,
             0,
@@ -29424,7 +29428,7 @@ mod tests {
                         r,
                         Some(1.0),
                         p_order,
-                        s_order,
+                        s_order as f64,
                         dim,
                         Some(&coeffs),
                     )
@@ -31175,7 +31179,7 @@ mod tests {
             0.0,
             Some(length_scale),
             p_order,
-            s_order,
+            s_order as f64,
             k_dim,
             Some(&coeffs),
         )
@@ -32078,7 +32082,7 @@ mod tests {
             r,
             Some(length_scale),
             p_order,
-            s_order,
+            s_order as f64,
             dim,
             Some(&coeffs),
         )
@@ -32123,7 +32127,7 @@ mod tests {
             r,
             Some(length_scale),
             p_order,
-            s_order,
+            s_order as f64,
             dim,
             Some(&coeffs),
         )
@@ -32168,7 +32172,7 @@ mod tests {
             r,
             Some(length_scale),
             p_order,
-            s_order,
+            s_order as f64,
             dim,
             Some(&coeffs),
         )
