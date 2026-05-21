@@ -13825,7 +13825,7 @@ fn joint_outer_evaluate(
     } else {
         0.0
     };
-    let (projected_logdet_correction, penalty_subspace_trace) =
+    let (projected_logdet_correction, _penalty_subspace_trace) =
         if project_hessian_logdet
             && include_logdet_h
             && include_logdet_s
@@ -14104,7 +14104,7 @@ fn joint_outer_evaluate_efs(
     } else {
         0.0
     };
-    let (projected_logdet_correction, penalty_subspace_trace) =
+    let (projected_logdet_correction, _penalty_subspace_trace) =
         if project_hessian_logdet
             && include_logdet_h
             && include_logdet_s
