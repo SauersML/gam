@@ -137,7 +137,7 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
         };
         let tau_transpose = |term: &TauDesignTerm, y: &Array1<f64>| -> Array1<f64> {
             match term {
-                TauDesignTerm::Dense(dense) => dense.t().dot(y),
+                TauDesignTerm::Dense(dense) => crate::faer_ndarray::fast_atv(dense, y),
                 TauDesignTerm::Implicit(deriv) => match &self.basis {
                     TauPairBasis::Original => deriv
                         .transpose_mul_original(y)
@@ -167,7 +167,7 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
         };
         let tau_tau_transpose = |term: &TauTauDesignTerm, y: &Array1<f64>| -> Array1<f64> {
             match term {
-                TauTauDesignTerm::Dense(dense) => dense.t().dot(y),
+                TauTauDesignTerm::Dense(dense) => crate::faer_ndarray::fast_atv(dense, y),
                 TauTauDesignTerm::Implicit(deriv) => match &self.basis {
                     TauPairBasis::Original => deriv
                         .transpose_mul_original(y)
