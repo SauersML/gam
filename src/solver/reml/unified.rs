@@ -6300,8 +6300,8 @@ pub fn reml_laml_evaluate(
         .kkt_residual
         .as_ref()
         .filter(|r: &&Array1<f64>| r.len() == hop.dim());
-    let kkt_residual_correction_active =
-        kkt_residual_vec.is_some() && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
+    let kkt_residual_correction_active = kkt_residual_vec.is_some()
+        && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
     if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
@@ -6773,20 +6773,19 @@ pub fn reml_laml_evaluate(
     // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
     // the residual correction is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
-    let kkt_rho_corrections = if let Some(r) =
-        kkt_residual_vec.filter(|_| kkt_residual_correction_active && k > 0)
-    {
-        Some(compute_kkt_residual_rho_corrections(
-            solution,
-            hop,
-            &lambdas,
-            &rho_penalty_a_k_betas,
-            r,
-            mode == EvalMode::ValueGradientHessian,
-        )?)
-    } else {
-        None
-    };
+    let kkt_rho_corrections =
+        if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active && k > 0) {
+            Some(compute_kkt_residual_rho_corrections(
+                solution,
+                hop,
+                &lambdas,
+                &rho_penalty_a_k_betas,
+                r,
+                mode == EvalMode::ValueGradientHessian,
+            )?)
+        } else {
+            None
+        };
     if let Some(corrections) = kkt_rho_corrections.as_ref() {
         let mut sl = grad.slice_mut(ndarray::s![..k]);
         sl += &corrections.gradient;
@@ -8088,7 +8087,8 @@ fn compute_kkt_residual_rho_corrections(
         let entry = |i: usize, j: usize| -> f64 {
             let delta = if i == j { 1.0 } else { 0.0 };
             let cancel_exact_kkt_profile_term = penalty_a_k_betas[i].dot(&a_solutions[j]);
-            cancel_exact_kkt_profile_term - delta * a_i_dot_q[i]
+            cancel_exact_kkt_profile_term
+                - delta * a_i_dot_q[i]
                 - penalty_a_k_betas[i].dot(&q_derivs[j])
                 + q_derivs[j].dot(&a_i_qs[i])
                 + 0.5 * delta * q_a_i_q[i]
@@ -17618,8 +17618,7 @@ mod tests {
                     let mut mm = rho.to_vec();
                     mm[i] -= eps2;
                     mm[j] -= eps2;
-                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp)
-                        + log_det_s_at(&mm))
+                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp) + log_det_s_at(&mm))
                         / (4.0 * eps2 * eps2)
                 };
                 det2[[i, j]] = value;
@@ -19711,8 +19710,7 @@ mod tests {
                     let mut mm = rho.to_vec();
                     mm[i] -= eps2;
                     mm[j] -= eps2;
-                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp)
-                        + log_det_s_at(&mm))
+                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp) + log_det_s_at(&mm))
                         / (4.0 * eps2 * eps2)
                 };
                 det2[[i, j]] = value;
@@ -20041,16 +20039,16 @@ mod tests {
 
         let beta_star = solve_beta_star(&rho);
         let beta_hat = &beta_star + &Array1::from_vec(vec![0.02, -0.015, 0.025]);
-        let sol_envelope = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false));
-        let hessian_envelope = reml_laml_evaluate(
-            &sol_envelope,
+        let sol_envelope = to_fixed(build_gaussian_solution_at_beta(
             &rho,
-            EvalMode::ValueGradientHessian,
-            None,
-        )
-        .unwrap()
-        .hessian
-        .unwrap_analytic();
+            beta_hat.clone(),
+            false,
+        ));
+        let hessian_envelope =
+            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueGradientHessian, None)
+                .unwrap()
+                .hessian
+                .unwrap_analytic();
 
         let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat, true));
         let hessian_ift = reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
