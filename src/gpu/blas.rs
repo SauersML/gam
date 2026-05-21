@@ -502,48 +502,12 @@ pub fn try_solve_lower_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
     lower: &ArrayBase<S1, Ix2>,
     rhs: &ArrayBase<S2, Ix2>,
 ) -> Option<Array2<f64>> {
-    let p = lower.nrows();
-    if lower.ncols() != p || rhs.nrows() != p {
-        return None;
-    }
-    if !route_trsm(p, rhs.ncols()) {
-        diagnostics::log_policy_cpu(
-            "trsm_lower",
-            format!("p={p} rhs_cols={}", rhs.ncols()),
-            diagnostics::dispatch_decline_reason(format!(
-                "below cuBLAS policy threshold trsm_flops>={}",
-                GpuRuntime::global().policy().trsm_min_flops
-            )),
-        );
-        return None;
-    }
-    let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.trsm(lower, rhs, cublasFillMode_t::CUBLAS_FILL_MODE_LOWER))
-    {
-        Some((out, device)) => {
-            diagnostics::log_gpu_success(
-                "trsm_lower",
-                "cuBLAS",
-                &device,
-                format!("p={p} rhs_cols={}", rhs.ncols()),
-                (p as u64)
-                    .saturating_mul(p as u64)
-                    .saturating_mul(rhs.ncols() as u64),
-                diagnostics::bytes_for_f64(lower.len().saturating_add(rhs.len())),
-                diagnostics::bytes_for_f64(rhs.len()),
-                start.elapsed().as_secs_f64(),
-            );
-            Some(out)
-        }
-        None => {
-            diagnostics::log_runtime_cpu(
-                "trsm_lower",
-                "cuBLAS",
-                format!("p={p} rhs_cols={}", rhs.ncols()),
-            );
-            None
-        }
-    }
+    try_solve_triangular_matrix(
+        lower,
+        rhs,
+        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+        "trsm_lower",
+    )
 }
 
 #[inline]
@@ -551,13 +515,34 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
     upper: &ArrayBase<S1, Ix2>,
     rhs: &ArrayBase<S2, Ix2>,
 ) -> Option<Array2<f64>> {
-    let p = upper.nrows();
-    if upper.ncols() != p || rhs.nrows() != p {
+    try_solve_triangular_matrix(
+        upper,
+        rhs,
+        cublasFillMode_t::CUBLAS_FILL_MODE_UPPER,
+        "trsm_upper",
+    )
+}
+
+/// Shared dispatch for the lower/upper triangular solves: same
+/// shape-validate → policy gate → cuBLAS attempt → diagnostic logging
+/// pipeline that both `try_solve_{lower,upper}_triangular_matrix` walk.
+/// The fill-mode flag selects which triangle cuBLAS reads; the `op_label`
+/// (`"trsm_lower"` / `"trsm_upper"`) lands in every diagnostic and the
+/// CPU-fallback messages so the dispatch reason stays distinguishable.
+#[inline]
+fn try_solve_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    triangular: &ArrayBase<S1, Ix2>,
+    rhs: &ArrayBase<S2, Ix2>,
+    fill_mode: cublasFillMode_t,
+    op_label: &'static str,
+) -> Option<Array2<f64>> {
+    let p = triangular.nrows();
+    if triangular.ncols() != p || rhs.nrows() != p {
         return None;
     }
     if !route_trsm(p, rhs.ncols()) {
         diagnostics::log_policy_cpu(
-            "trsm_upper",
+            op_label,
             format!("p={p} rhs_cols={}", rhs.ncols()),
             diagnostics::dispatch_decline_reason(format!(
                 "below cuBLAS policy threshold trsm_flops>={}",
@@ -567,18 +552,17 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         return None;
     }
     let start = std::time::Instant::now();
-    match with_runtime(|runtime| runtime.trsm(upper, rhs, cublasFillMode_t::CUBLAS_FILL_MODE_UPPER))
-    {
+    match with_runtime(|runtime| runtime.trsm(triangular, rhs, fill_mode)) {
         Some((out, device)) => {
             diagnostics::log_gpu_success(
-                "trsm_upper",
+                op_label,
                 "cuBLAS",
                 &device,
                 format!("p={p} rhs_cols={}", rhs.ncols()),
                 (p as u64)
                     .saturating_mul(p as u64)
                     .saturating_mul(rhs.ncols() as u64),
-                diagnostics::bytes_for_f64(upper.len().saturating_add(rhs.len())),
+                diagnostics::bytes_for_f64(triangular.len().saturating_add(rhs.len())),
                 diagnostics::bytes_for_f64(rhs.len()),
                 start.elapsed().as_secs_f64(),
             );
@@ -586,7 +570,7 @@ pub fn try_solve_upper_triangular_matrix<S1: Data<Elem = f64>, S2: Data<Elem = f
         }
         None => {
             diagnostics::log_runtime_cpu(
-                "trsm_upper",
+                op_label,
                 "cuBLAS",
                 format!("p={p} rhs_cols={}", rhs.ncols()),
             );
