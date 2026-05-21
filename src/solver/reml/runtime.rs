@@ -234,7 +234,7 @@ impl<'a> RemlState<'a> {
             pirls::PirlsCoordinateFrame::TransformedQs => {
                 let qs = &pirls_result.reparam_result.qs;
                 let tmp = crate::faer_ndarray::fast_ab(qs, matrix);
-                tmp.dot(&qs.t())
+                crate::faer_ndarray::fast_abt(&tmp, qs)
             }
         }
     }
