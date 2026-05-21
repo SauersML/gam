@@ -993,7 +993,7 @@ impl OuterDerivativePolicy {
     /// quasi-Newton BFGS / L-BFGS picks up curvature from successive
     /// gradients. This is **convergent** to the exact MLE, not a feature
     /// drop — see the `OuterDerivativePolicy` doc-comment.
-    pub const OUTER_HESSIAN_WORK_BUDGET: u128 = 100_000_000;
+    pub const OUTER_HESSIAN_WORK_BUDGET: u128 = 25_000_000;
 
     /// Per-eval gradient work ceiling above which the κ schedule switches
     /// to the staged pilot/polish path. At biobank scale (n ≳ 100 k) even
