@@ -8695,13 +8695,20 @@ mod tests {
 
     #[test]
     fn cache_entry_classifier_rejects_only_structural_failures() {
-        // Only structural failures discard: wrong dimension, non-finite cost,
-        // non-finite ρ. Saturation, β presence, schema-1 mismatches are not
-        // "discards" — they're either honored or surfaced as decode failures.
-        let nonfinite_cost = encode_iterate(&array![0.5, 0.5], None, f64::NAN, 0).expect("encode");
+        // Only structural failures discard: payload shape (wrong rho_dim,
+        // non-finite payload internals → decode None → "payload-shape-mismatch")
+        // and non-finite cache metadata → "non-finite-payload". Saturation,
+        // β presence, and schema-1 mismatches are NOT discards here:
+        // saturation is honored under v2; schema-1 returns None from decode
+        // and surfaces as "payload-shape-mismatch" via the decode rejection.
+
+        // Non-finite metadata objective: decode succeeds (finite payload
+        // cost), but the entry-level objective is NaN — discard as
+        // non-finite-payload.
+        let payload = encode_iterate(&array![0.5, 0.5], None, 1.0, 0).expect("encode");
         let loaded = crate::cache::LoadedEntry {
             entry: crate::cache::CachedEntry {
-                payload: nonfinite_cost,
+                payload,
                 objective: Some(f64::NAN),
                 iteration: Some(0),
                 kind: crate::cache::EntryKind::Checkpoint,
@@ -8713,6 +8720,27 @@ mod tests {
             classify_cache_entry_for_outer(&loaded, 2, 10.0),
             CacheSeedDecision::Discard {
                 reason: "non-finite-payload",
+                ..
+            }
+        ));
+
+        // Dimension mismatch: 2-D payload viewed as a 3-D problem → decode
+        // rejects shape → "payload-shape-mismatch".
+        let payload = encode_iterate(&array![0.5, 0.5], None, 1.0, 0).expect("encode");
+        let loaded = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload,
+                objective: Some(1.0),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
+        };
+        assert!(matches!(
+            classify_cache_entry_for_outer(&loaded, 3, 10.0),
+            CacheSeedDecision::Discard {
+                reason: "payload-shape-mismatch",
                 ..
             }
         ));
