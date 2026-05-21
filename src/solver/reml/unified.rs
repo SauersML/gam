@@ -7046,17 +7046,25 @@ pub fn reml_laml_evaluate(
 
     // Sanity check: a finite-precision smooth function f : ℝᵏ → ℝ with
     // |f| ≈ |cost| cannot legitimately report an analytic gradient component
-    // whose magnitude exceeds what a step that the outer optimizer can
-    // *resolve* would predict.  The smallest distinguishable step in ρ-space
-    // is roughly √ε · max(1, |ρ_k|); along that step the gradient predicts a
-    // cost change of |g_k| · √ε.  If that predicted change vastly exceeds
-    // |cost|, the gradient is internally inconsistent with the function it
-    // claims to differentiate — almost always because the inner solver
-    // exited the noise-floor KKT certificate (custom_family.rs:12037) with
-    // a non-zero β-gradient residual on a coordinate where H is poorly
-    // conditioned, leaving an unmodeled IFT correction (-H⁻¹ · residual)
-    // baked into the envelope formula.  Log a single line so a later run
-    // can correlate the warning with TrustRegionRejectFloor downstream.
+    // whose magnitude exceeds what a step the outer optimizer can *resolve*
+    // would predict. The smallest meaningful step in ρ-space is roughly
+    // √ε · max(1, |ρ_k|) (below that, f(ρ+δ) − f(ρ) is buried in floating-
+    // point noise of cost itself). Along that step the gradient predicts a
+    // cost change of |g_k| · √ε. If that predicted change exceeds |cost|,
+    // the gradient is internally inconsistent with the function it claims to
+    // differentiate: the optimizer would step, the function would not move,
+    // every trust-region attempt would be rejected, and TR collapses to its
+    // floor — the exact failure mode observed on biobank-scale survival
+    // marginal-slope fits where the inner solver exited the noise-floor KKT
+    // certificate (custom_family.rs:12037) with a non-zero β-gradient
+    // residual on a coordinate whose H block was poorly conditioned, leaving
+    // an unmodeled IFT correction (-H⁻¹ · residual) baked into the envelope
+    // formula.  Log a single line so a later run correlates the warning with
+    // TrustRegionRejectFloor downstream.  Threshold is `ratio > 4` rather
+    // than `> 1` so a healthy near-stationary gradient (|g|∞ comparable to
+    // √ε · |cost|, ratio ≈ 1) does not trip it; only gradients overshooting
+    // by ≥ 4× the function magnitude — orders of magnitude past anything an
+    // honest IFT correction would explain — fire.
     let cost_scale = cost.abs().max(1.0);
     let resolve_step = f64::EPSILON.sqrt();
     if let Some((max_idx, max_abs)) = grad
@@ -7066,7 +7074,7 @@ pub fn reml_laml_evaluate(
         .reduce(|a, b| if a.1 >= b.1 { a } else { b })
     {
         let predicted_change = max_abs * resolve_step;
-        if max_abs.is_finite() && predicted_change > 1.0e6 * cost_scale {
+        if max_abs.is_finite() && predicted_change > 4.0 * cost_scale {
             log::warn!(
                 "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
                  |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
