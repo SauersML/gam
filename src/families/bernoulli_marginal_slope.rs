@@ -214,6 +214,40 @@ pub struct EmpiricalZGrid {
     pub weights: Vec<f64>,
 }
 
+impl EmpiricalZGrid {
+    /// Construct a grid whose node/weight invariants (equal length ≥ 2, finite
+    /// nodes, finite positive weights, weights summing to 1 within 1e-8) are
+    /// enforced up-front. Prefer this over building the struct literally;
+    /// every code path that goes through `new` is guaranteed to satisfy the
+    /// same contract that `validate_empirical_z_grid` checks on read.
+    pub fn new(nodes: Vec<f64>, weights: Vec<f64>, context: &str) -> Result<Self, String> {
+        validate_empirical_z_grid(&nodes, &weights, context)?;
+        Ok(Self { nodes, weights })
+    }
+
+    /// Number of (node, weight) pairs. Always agrees for both vectors by
+    /// invariant; the helper exists so call sites do not have to pick which
+    /// length to read.
+    #[inline]
+    pub fn len(&self) -> usize {
+        debug_assert_eq!(self.nodes.len(), self.weights.len());
+        self.nodes.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate over co-indexed `(node, weight)` pairs. Use this instead of
+    /// reading `.nodes`/`.weights` separately whenever a loop wants both
+    /// arrays in lockstep — eliminates the chance of mismatched indexing.
+    #[inline]
+    pub fn pairs(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.nodes.iter().copied().zip(self.weights.iter().copied())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum LatentMeasureKind {
@@ -413,7 +447,7 @@ fn combine_empirical_grids(
         let grid = grids.get(grid_idx).ok_or_else(|| {
             format!("local empirical latent mixture references missing grid {grid_idx}")
         })?;
-        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+        for (node, weight) in grid.pairs() {
             nodes.push(node);
             weights.push(grid_weight * weight);
         }
@@ -427,8 +461,7 @@ fn combine_empirical_grids(
     for weight in &mut weights {
         *weight /= total;
     }
-    validate_empirical_z_grid(&nodes, &weights, "local empirical latent combined grid")?;
-    Ok(EmpiricalZGrid { nodes, weights })
+    EmpiricalZGrid::new(nodes, weights, "local empirical latent combined grid")
 }
 
 #[derive(Clone, Debug)]
@@ -5555,7 +5588,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = directions.len();
         let mut f = mu_jet.scale(-1.0);
         let mut f_a = MultiDirJet::zero(n_dirs);
-        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+        for (node, weight) in grid.pairs() {
             let (eta, eta_a) = self.empirical_flex_eta_and_eta_a_jet_at_z(
                 primary, a_jet, b_jet, beta_h, beta_w, directions, node,
             )?;
@@ -7115,7 +7148,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut f = -marginal.mu;
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
-        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+        for (node, weight) in grid.pairs() {
             let obs = self.observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)?;
             let eta = eval_coeff4_at(&obs.coeff, node);
             let eta_a = eval_coeff4_at(&obs.dc_da, node);

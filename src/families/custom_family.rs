@@ -9316,63 +9316,14 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
 pub(crate) fn strict_logdet_spd_with_lm_continuation(
     matrix: &Array2<f64>,
 ) -> Result<(f64, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
-    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
-
-    if let Ok(logdet) = strict_logdet_spd(matrix) {
-        return Ok((logdet, StrictSpdLmStats::default()));
-    }
-
-    let p = matrix.nrows();
-    if p == 0 {
-        return Ok((0.0, StrictSpdLmStats::default()));
-    }
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
-    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
-
-    let mut delta = delta0;
-    for escalation in 1..=MAX_ESCALATIONS {
-        let mut ridged = sym.clone();
-        for i in 0..p {
-            ridged[[i, i]] += delta;
-        }
-        match ridged.cholesky(Side::Lower) {
-            Ok(chol) => {
-                let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
-                return Ok((
-                    logdet,
-                    StrictSpdLmStats {
-                        delta_used: delta,
-                        escalations: escalation,
-                    },
-                ));
-            }
-            Err(_) => {
-                delta *= RIDGE_GROWTH;
-            }
-        }
-    }
-    // δ-ridge schedule exhausted; eigen-floor fallback.
-    // `log|C̃| = Σ log Λ̃_i` with `Λ̃_i = max(Λ_i, ε λ_max)`.
-    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
-        format!(
-            "strict pseudo-laplace SPD logdet failed even with LM δ-ridge continuation \
-             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
-             eigen-floor fallback also failed: {e}"
-        )
-    })?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
-    let logdet: f64 = evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum();
-    Ok((
-        logdet,
-        StrictSpdLmStats {
-            delta_used: delta,
-            escalations: MAX_ESCALATIONS + 1,
-        },
-    ))
+    strict_spd_lm_engine(
+        matrix,
+        "strict pseudo-laplace SPD logdet",
+        0.0,
+        strict_logdet_spd,
+        |chol| 2.0 * chol.diag().mapv(f64::ln).sum(),
+        |evals, _evecs, eps_floor| evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum(),
+    )
 }
 
 fn strict_logdet_spd_with_semidefinite_option(

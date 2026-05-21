@@ -1236,7 +1236,7 @@ impl BernoulliMarginalSlopePredictor {
                     grid.weights.len()
                 )));
             }
-            for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+            for (node, weight) in grid.pairs() {
                 let combined_weight = grid_weight * weight;
                 if !(node.is_finite() && combined_weight.is_finite() && combined_weight >= 0.0) {
                     return Err(EstimationError::InvalidInput(
@@ -1594,7 +1594,7 @@ impl BernoulliMarginalSlopePredictor {
         let mut f = -marginal.mu;
         let mut f_a = 0.0;
         let mut f_aa = 0.0;
-        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+        for (node, weight) in grid.pairs() {
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
                 a,
@@ -2201,7 +2201,7 @@ impl BernoulliMarginalSlopePredictor {
                     let mut f_h_row = vec![0.0; score_warp_dim];
                     let mut f_w_row = vec![0.0; link_dev_dim];
                     if let Some(grid) = empirical_grid.as_ref() {
-                        for (&node, &weight) in grid.nodes.iter().zip(grid.weights.iter()) {
+                        for (node, weight) in grid.pairs() {
                             let obs = self.observed_denested_cell_partials_at_z(
                                 node,
                                 intercept,
