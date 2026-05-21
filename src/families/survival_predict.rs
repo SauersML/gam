@@ -9,11 +9,11 @@
 
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2, Array3, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView2, s};
 
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
-use crate::families::survival::assemble_competing_risks_cif;
+use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -694,16 +694,18 @@ pub fn predict_competing_risks_survival(
         }
     }
 
-    let cumulative_tensor = Array3::from_shape_fn((cause_count, n, t_cols), |(cause, row, col)| {
-        cumulative_hazard[cause][[row, col]]
-    });
     let assembly_times = if per_row_eval {
         Array1::from_elem(1, 0.0)
     } else {
         Array1::from_vec(eval_times.clone())
     };
-    let assembled = assemble_competing_risks_cif(assembly_times.view(), cumulative_tensor.view())
-        .map_err(|err| err.to_string())?;
+    let endpoint_hazards = cumulative_hazard
+        .iter()
+        .map(|hazard| hazard.view())
+        .collect::<Vec<_>>();
+    let assembled =
+        assemble_competing_risks_cif_from_endpoints(assembly_times.view(), &endpoint_hazards)
+            .map_err(|err| err.to_string())?;
     let cif = (0..cause_count)
         .map(|cause| assembled.cif.slice(s![cause, .., ..]).to_owned())
         .collect::<Vec<_>>();
