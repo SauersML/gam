@@ -15185,11 +15185,7 @@ mod tests {
     /// pathology described in `0dc469bd` (the off-diagonal entries are
     /// what propagate `r`'s null-space noise into the `a_k ∈ range(S_+)`
     /// solve).
-    fn dense_h_inv_bilinear_via_eig(
-        h_full: &Array2<f64>,
-        a: &Array1<f64>,
-        b: &Array1<f64>,
-    ) -> f64 {
+    fn dense_h_inv_bilinear_via_eig(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         use crate::faer_ndarray::FaerEigh;
         let (evals, evecs) = h_full
             .eigh(faer::Side::Lower)
@@ -15293,7 +15289,11 @@ mod tests {
             q.column_mut(col_idx).assign(&v);
             col_idx += 1;
         }
-        assert_eq!(col_idx, p - 1, "Gram-Schmidt should fill p-1 orthonormal columns");
+        assert_eq!(
+            col_idx,
+            p - 1,
+            "Gram-Schmidt should fill p-1 orthonormal columns"
+        );
 
         let eigvals = array![10.0_f64, 5.0, 2.0, 1.0, small_eig];
         let mut h_full = Array2::<f64>::zeros((p, p));

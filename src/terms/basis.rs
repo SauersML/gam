@@ -9357,7 +9357,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     )?;
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
-    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64);
+    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let z_cols = z_kernel.ncols();
@@ -9460,8 +9460,11 @@ fn build_duchon_operator_penalty_aniso_derivatives(
                             (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
                         } else {
                             let phi = polyharmonic_kernel(r, (pure_block_order) as f64, d);
-                            let (q, t, dt_dr, d2t_dr2) =
-                                duchon_polyharmonic_operator_block_jets(r, pure_block_order, d)?;
+                            let (q, t, dt_dr, d2t_dr2) = duchon_polyharmonic_operator_block_jets(
+                                r,
+                                pure_block_order as usize,
+                                d,
+                            )?;
                             (phi, q, t, dt_dr, d2t_dr2)
                         };
 
@@ -9878,7 +9881,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         length_scale,
         p_order,
         s_order,
-        pure_block_order,
+        pure_block_order: pure_block_order as usize,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
         z_kernel,
@@ -9935,7 +9938,7 @@ fn duchon_kernel_radial_triplet(
     // operator scalars (q, lap, t) in the penalty code.
     let triplet = match length_scale {
         None => {
-            let m = pure_duchon_block_order(p_order, s_order as f64);
+            let m = pure_duchon_block_order(p_order, s_order as f64) as usize;
             polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
@@ -12433,7 +12436,7 @@ fn log_power_family_value(
 #[inline(always)]
 fn duchon_polyharmonic_operator_block_jets(
     r: f64,
-    m: usize,
+    m: f64,
     k_dim: usize,
 ) -> Result<(f64, f64, f64, f64), BasisError> {
     if !r.is_finite() || r < 0.0 {
@@ -12441,25 +12444,36 @@ fn duchon_polyharmonic_operator_block_jets(
             "polyharmonic distance must be finite and non-negative".to_string(),
         ));
     }
+    assert!(
+        m.is_finite() && m > 0.0,
+        "duchon_polyharmonic_operator_block_jets: m must be finite and > 0, got {m}"
+    );
 
     let k_half = 0.5 * k_dim as f64;
-    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
-    let (c, phi_log_coeff, phi_pure_coeff) = if k_dim % 2 == 0 && m >= (k_dim / 2) {
+    let alpha = 2.0 * m - k_dim as f64;
+    // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
+    // (within ε). For fractional `m` this never fires; for integer `m` it
+    // matches the original `k_dim % 2 == 0 && m >= k_dim / 2` check.
+    const LOG_EPS: f64 = 1e-12;
+    let is_log_case = k_dim % 2 == 0 && {
+        let n_f = (alpha / 2.0).round();
+        n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
+    };
+    let (c, phi_log_coeff, phi_pure_coeff) = if is_log_case {
+        let m_int = m.round() as usize;
         (
-            polyharmonic_log_sign(m, k_dim)
-                / (2.0_f64.powi((2 * m - 1) as i32)
+            polyharmonic_log_sign(m_int, k_dim)
+                / (2.0_f64.powi((2 * m_int - 1) as i32)
                     * std::f64::consts::PI.powf(k_half)
-                    * gamma_lanczos(m as f64)
-                    * gamma_lanczos((m - k_dim / 2 + 1) as f64)),
+                    * gamma_lanczos(m)
+                    * gamma_lanczos((m_int - k_dim / 2 + 1) as f64)),
             1.0,
             0.0,
         )
     } else {
         (
-            gamma_lanczos(k_half - m as f64)
-                / (4.0_f64.powi(m as i32)
-                    * std::f64::consts::PI.powf(k_half)
-                    * gamma_lanczos(m as f64)),
+            gamma_lanczos(k_half - m)
+                / (4.0_f64.powf(m) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m)),
             0.0,
             1.0,
         )
@@ -12626,7 +12640,7 @@ fn duchon_matern_operator_block_jets(
 }
 
 #[inline(always)]
-fn pure_duchon_block_order(p_order: usize, s_order: f64 as f64) -> f64 {
+fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
     p_order as f64 + s_order
 }
 
@@ -12794,7 +12808,11 @@ fn duchon_matern_kernel_general_from_distance(
         ));
     }
     let Some(length_scale) = length_scale else {
-        return Ok(polyharmonic_kernel(r, (pure_duchon_block_order(p_order, s_order as f64)) as f64, k_dim, ));
+        return Ok(polyharmonic_kernel(
+            r,
+            pure_duchon_block_order(p_order, s_order as f64),
+            k_dim,
+        ));
     };
     if !length_scale.is_finite() || length_scale <= 0.0 {
         return Err(BasisError::InvalidInput(
@@ -16817,7 +16835,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         dim,
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let block_order = pure_duchon_block_order(p_order, s_order as f64);
+    let block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
         centers.view(),
@@ -16827,7 +16845,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         identifiability_transform.clone(),
         poly_cols,
         RadialScalarKind::PureDuchon {
-            block_order,
+            block_order: block_order as usize,
             p_order,
             s_order,
             dim,
@@ -18294,7 +18312,10 @@ pub fn create_duchon_spline_basiswithworkspace(
     };
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let pure_poly_coeff = if length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
+        Some(PolyharmonicBlockCoeff::new(
+            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+            d,
+        ))
     } else {
         None
     };
@@ -18568,7 +18589,10 @@ fn build_duchon_basis_designwithworkspace(
     // Pre-compute polyharmonic coefficient for the pure Duchon case (no length_scale).
     // This avoids 2 gamma_lanczos calls per kernel evaluation (n × k total).
     let pure_poly_coeff = if length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
+        Some(PolyharmonicBlockCoeff::new(
+            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+            d,
+        ))
     } else {
         None
     };
@@ -18706,7 +18730,8 @@ pub fn create_duchon_basis_1d_derivative_dense(
         polynomial_block_from_order(data.view(), effective_order).ncols()
     };
 
-    let pure_coeff = PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
+    let pure_coeff =
+        PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
     let kernel_amp = duchon_kernel_amplification(
         center_matrix.view(),
         None,
@@ -18991,7 +19016,10 @@ fn build_periodic_duchon_basis_1d(
         .length_scale
         .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
     let pure_poly_coeff = if spec.length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1, ))
+        Some(PolyharmonicBlockCoeff::new(
+            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+            1,
+        ))
     } else {
         None
     };
@@ -19213,7 +19241,10 @@ pub fn build_duchon_basiswithworkspace(
         let coeffs = length_scale
             .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
         let pure_poly_coeff = if length_scale.is_none() {
-            Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
+            Some(PolyharmonicBlockCoeff::new(
+                (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+                d,
+            ))
         } else {
             None
         };
@@ -31658,8 +31689,10 @@ mod tests {
     #[test]
     fn test_pure_duchon_default_counterexample_is_rejected() {
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-        let block_order =
-            pure_duchon_block_order(duchon_p_from_nullspace_order(DuchonNullspaceOrder::Zero), 2);
+        let block_order = pure_duchon_block_order(
+            duchon_p_from_nullspace_order(DuchonNullspaceOrder::Zero),
+            2.0,
+        );
         let k23 = polyharmonic_kernel(2.0_f64.sqrt(), (block_order) as f64, 2);
         let alpha = [-2.0, 1.0, 1.0];
         let qform = 2.0 * alpha[1] * alpha[2] * k23;
