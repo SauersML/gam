@@ -242,6 +242,48 @@ fn dense_locscale_block_designs_fromspecs<'a>(
     Ok((primary, log_sigma))
 }
 
+/// Per-block dispatch for the second-derivative ψ design map used by every
+/// location-scale family's `exact_newton_joint_psisecond_design_drifts`
+/// method. The two large `match psi_a.block_idx` arms in those methods
+/// (mu/threshold and log-σ) are identical bar the per-axis dimension `p`
+/// and the diagnostic `label`; this helper captures both bits in one
+/// shape. Returns `(action, dense_matrix)` — at most one is `Some`, both
+/// are `None` for the `Zero` variant, and the `First` variant produces an
+/// error (`_psi_psi_map` should never return `First` here).
+fn psi_psi_map_to_drift_slots(
+    deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+    deriv_b: &crate::custom_family::CustomFamilyBlockPsiDerivative,
+    local_idx_b: usize,
+    n: usize,
+    p: usize,
+    label: &'static str,
+    policy: &crate::resource::ResourcePolicy,
+) -> Result<
+    (
+        Option<crate::custom_family::CustomFamilyPsiSecondDesignAction>,
+        Option<Array2<f64>>,
+    ),
+    String,
+> {
+    match crate::custom_family::resolve_custom_family_x_psi_psi_map(
+        deriv,
+        deriv_b,
+        local_idx_b,
+        n,
+        p,
+        0..n,
+        label,
+        policy,
+    )? {
+        crate::custom_family::PsiDesignMap::Second { action } => Ok((Some(action), None)),
+        crate::custom_family::PsiDesignMap::Dense { matrix } => Ok((None, Some((*matrix).clone()))),
+        crate::custom_family::PsiDesignMap::Zero { .. } => Ok((None, None)),
+        crate::custom_family::PsiDesignMap::First { .. } => Err(format!(
+            "{label}: unexpected First variant from _psi_psi_map"
+        )),
+    }
+}
+
 fn dense_block_or_operator<'a>(
     design: &'a DesignMatrix,
     n: usize,
@@ -6605,48 +6647,30 @@ impl GaussianLocationScaleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_MU => {
-                    match resolve_custom_family_x_psi_psi_map(
+                    let (action, matrix) = psi_psi_map_to_drift_slots(
                         deriv,
                         deriv_b,
                         psi_b.local_idx,
                         n,
                         pmu,
-                        0..n,
                         "GaussianLocationScaleFamily mu",
                         &self.policy,
-                    )? {
-                        PsiDesignMap::Second { action } => xmu_ab_action = Some(action),
-                        PsiDesignMap::Dense { matrix } => xmu_ab = Some((*matrix).clone()),
-                        PsiDesignMap::Zero { .. } => {}
-                        PsiDesignMap::First { .. } => {
-                            return Err(
-                                "GaussianLocationScaleFamily mu: unexpected First variant from _psi_psi_map"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    )?;
+                    xmu_ab_action = action;
+                    xmu_ab = matrix;
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    match resolve_custom_family_x_psi_psi_map(
+                    let (action, matrix) = psi_psi_map_to_drift_slots(
                         deriv,
                         deriv_b,
                         psi_b.local_idx,
                         n,
                         p_ls,
-                        0..n,
                         "GaussianLocationScaleFamily log-sigma",
                         &self.policy,
-                    )? {
-                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
-                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
-                        PsiDesignMap::Zero { .. } => {}
-                        PsiDesignMap::First { .. } => {
-                            return Err(
-                                "GaussianLocationScaleFamily log-sigma: unexpected First variant from _psi_psi_map"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    )?;
+                    x_ls_ab_action = action;
+                    x_ls_ab = matrix;
                 }
                 _ => {}
             }
@@ -8895,48 +8919,30 @@ impl GaussianLocationScaleWiggleFamily {
             let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
             match psi_a.block_idx {
                 Self::BLOCK_MU => {
-                    match resolve_custom_family_x_psi_psi_map(
+                    let (action, matrix) = psi_psi_map_to_drift_slots(
                         deriv,
                         deriv_b,
                         psi_b.local_idx,
                         n,
                         pmu,
-                        0..n,
                         "GaussianLocationScaleWiggleFamily mu",
                         &self.policy,
-                    )? {
-                        PsiDesignMap::Second { action } => xmu_ab_action = Some(action),
-                        PsiDesignMap::Dense { matrix } => xmu_ab = Some((*matrix).clone()),
-                        PsiDesignMap::Zero { .. } => {}
-                        PsiDesignMap::First { .. } => {
-                            return Err(
-                                "GaussianLocationScaleWiggleFamily mu: unexpected First variant from _psi_psi_map"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    )?;
+                    xmu_ab_action = action;
+                    xmu_ab = matrix;
                 }
                 Self::BLOCK_LOG_SIGMA => {
-                    match resolve_custom_family_x_psi_psi_map(
+                    let (action, matrix) = psi_psi_map_to_drift_slots(
                         deriv,
                         deriv_b,
                         psi_b.local_idx,
                         n,
                         p_ls,
-                        0..n,
                         "GaussianLocationScaleWiggleFamily log-sigma",
                         &self.policy,
-                    )? {
-                        PsiDesignMap::Second { action } => x_ls_ab_action = Some(action),
-                        PsiDesignMap::Dense { matrix } => x_ls_ab = Some((*matrix).clone()),
-                        PsiDesignMap::Zero { .. } => {}
-                        PsiDesignMap::First { .. } => {
-                            return Err(
-                                "GaussianLocationScaleWiggleFamily log-sigma: unexpected First variant from _psi_psi_map"
-                                    .to_string(),
-                            );
-                        }
-                    }
+                    )?;
+                    x_ls_ab_action = action;
+                    x_ls_ab = matrix;
                 }
                 _ => {}
             }
