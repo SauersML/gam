@@ -12295,10 +12295,12 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             coeff_ww_db[row] = m2 * z_a;
         }
 
-        let score_w = geom.basis.t().dot(&score_w_b) + geom.basis_d1.t().dot(&score_w_d1);
+        let score_w = crate::faer_ndarray::fast_atv(&geom.basis, &score_w_b)
+            + crate::faer_ndarray::fast_atv(&geom.basis_d1, &score_w_d1);
 
         if let Some((action, _)) = implicit_dir {
-            let score_eta = action.transpose_mul(score_eta_xa.view()) + x_eta.t().dot(&score_eta_x);
+            let score_eta = action.transpose_mul(score_eta_xa.view())
+                + crate::faer_ndarray::fast_atv(x_eta.as_ref(), &score_eta_x);
             let score_psi = binomial_pack_mean_wiggle_joint_score(&score_eta, &score_w);
             let x_eta_arc = shared_dense_arc(x_eta.as_ref());
             let basis_arc = Arc::new(geom.basis.clone());
@@ -12402,7 +12404,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             .as_ref()
             .expect("dense eta psi design should exist when implicit direction is absent");
         let score_psi = binomial_pack_mean_wiggle_joint_score(
-            &(x_eta_psi.t().dot(&score_eta_xa) + x_eta.t().dot(&score_eta_x)),
+            &(crate::faer_ndarray::fast_atv(x_eta_psi, &score_eta_xa)
+                + crate::faer_ndarray::fast_atv(x_eta.as_ref(), &score_eta_x)),
             &score_w,
         );
         let a_eta_eta = xt_diag_y_dense(x_eta_psi, &coeff_eta_eta_xa_x, &x_eta)?;

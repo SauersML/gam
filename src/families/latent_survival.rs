@@ -3583,7 +3583,7 @@ mod tests {
             },
             ParameterBlockState {
                 beta: beta_mean.clone(),
-                eta: crate::faer_ndarray::fast_av(&family.x_mean, &beta_mean),
+                eta: family.x_mean.dot(&beta_mean),
             },
         ];
         if let Some(log_sigma) = slices.log_sigma {
@@ -3693,7 +3693,7 @@ mod tests {
             },
             ParameterBlockState {
                 beta: beta_mean.clone(),
-                eta: crate::faer_ndarray::fast_av(&family.x_mean, &beta_mean),
+                eta: family.x_mean.dot(&beta_mean),
             },
         ]
     }
