@@ -660,10 +660,14 @@ impl PredictableModel for StandardPredictor {
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
         let result = self.predict_plugin_response(input)?;
-        let eta_base = input.design.dot(&self.beta) + &input.offset;
         let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
             let se = if let Some(runtime) = self.link_wiggle.as_ref() {
+                // `eta_base` is the pre-wiggle linear predictor; it differs
+                // from `result.eta` only when a wiggle is active, so we
+                // recompute it here to avoid the double matvec on the
+                // common no-wiggle path.
+                let eta_base = input.design.dot(&self.beta) + &input.offset;
                 let p_main = self.beta.len();
                 let p_w = runtime.beta.len();
                 let p_total = p_main + p_w;
