@@ -12189,62 +12189,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            // Outer-scale soft-convergence certificate.  The strict KKT
-            // certificate above requires `residual ≤ 2·inner_tol·scale`;
-            // that is the right gold standard for the inner solver, but it
-            // is stricter than the outer REML/LAML optimizer actually
-            // needs.  The outer optimizer queries `V(ρ)` and ∇_ρV, both
-            // evaluated at the inner optimum; the IFT pullback through
-            // the projected pseudo-inverse (0dc469bd) keeps the
-            // null-space portion of any residual from contaminating ∇_ρV.
-            // Concretely, the outer needs the OBJECTIVE accurate to
-            // ~outer_tol·(1+|obj|); per-cycle objective movement that
-            // small means further inner cycles do not change `V(ρ)` to
-            // the outer's resolution, so the inner has done its job.
+            // INVESTIGATION NOTE — do NOT soft-accept here.
             //
-            // At biobank scale (n≈2·10⁵ probit survival, joint Hessian
-            // conditioned at ~10⁵–10⁸), Newton converges linearly with
-            // ratio ~0.95 — driving `residual` from 10⁷ at cycle 0 down
-            // to inner_tol·scale would take ~300+ cycles even with the
-            // analytic Hessian, because per-cycle progress is bounded by
-            // the smallest eigenvalue of H over the active subspace.
-            // The objective, however, plateaus to outer-scale within
-            // ~50–80 cycles. Soft-accepting at outer scale avoids
-            // running the inner past the point of diminishing returns
-            // for the outer optimizer.
-            //
-            // Safety guards (all required):
-            //   1. The objective is monotonically descending overall
-            //      (`lastobjective < initial_joint_objective`) so this is
-            //      not a stalled/oscillating run.
-            //   2. The accepted step is no longer driving meaningful
-            //      objective change at outer scale.
-            //   3. The accepted step itself is small at outer scale
-            //      (`step_inf ≤ outer_tol·(1+|β|∞)·10`).
-            //   4. At least `OUTER_SOFT_CONV_MIN_CYCLES` cycles have run,
-            //      so a transient single-cycle small Δobj near a saddle
-            //      cannot trip the early exit.
-            const OUTER_SOFT_CONV_MIN_CYCLES: usize = 20;
-            let outer_obj_tol = options.outer_tol * (1.0 + lastobjective.abs());
-            let outer_step_tol = options.outer_tol * (1.0 + beta_inf) * 10.0;
-            if cycle + 1 >= OUTER_SOFT_CONV_MIN_CYCLES
-                && lastobjective < initial_joint_objective
-                && objective_change <= outer_obj_tol
-                && accepted_step_inf <= outer_step_tol
-            {
-                log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | outer-scale soft certificate: |Δobjective|={:.3e} <= outer_obj_tol={:.3e}, accepted_|δ|∞={:.3e} <= outer_step_tol={:.3e}, residual={:.3e} (strict tol={:.3e}); outer REML/LAML resolution reached — strict inner KKT would only refine V(ρ) below outer_tol",
-                    cycle,
-                    objective_change,
-                    outer_obj_tol,
-                    accepted_step_inf,
-                    outer_step_tol,
-                    residual,
-                    residual_tol,
-                );
-                converged = true;
-                break;
-            }
+            // It is tempting to add a "the outer optimizer only needs
+            // V(ρ) accurate to outer_tol, so accept once Δobj plateaus
+            // at outer scale" certificate.  That is an ESCAPE HATCH:
+            // it hides whatever is preventing Newton from converging
+            // quadratically, and the IFT pullback to ∇_ρV assumes the
+            // inner is at KKT exactly.  The projected-pseudo-inverse
+            // (0dc469bd) only filters out the *null-space* portion of
+            // a nonzero residual; the range-space portion still
+            // contaminates ∇_ρV, so soft-acceptance silently feeds
+            // wrong outer gradients to ARC/BFGS.  At biobank scale we
+            // observe `|δ|∞ ≪ TR-radius` (TR not binding), TR ratio
+            // ≈ 1.00 every cycle (model is perfect), and objective
+            // descent that is *linear* (Δobj_{n+1}/Δobj_n ≈ 0.95)
+            // rather than quadratic.  For exact Newton on a smooth
+            // strongly-convex problem with an EXACT analytic Hessian,
+            // the next-iterate gradient should be O(|δ|²); with
+            // |δ| ≈ 0.14 that predicts |g_new| ≈ 0.02, but we observe
+            // |g_new|_∞ ≈ 4·10³.  That gap is the engine bug.  The
+            // diagnostic at budget exhaustion (below) surfaces which
+            // of the three plausible mechanisms is responsible.
 
             // Residual-stall early-exit. The strict and noise-floor
             // certificates above require the KKT residual to land within
@@ -12344,13 +12310,88 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         if cycles_done >= inner_max_cycles {
             if !converged {
+                // Engine-level diagnostic.  The same warning previously
+                // logged only the total objective drop, which does not
+                // distinguish the three modes that look identical in
+                // the outer error path:
+                //
+                //   (a) HESSIAN APPROXIMATION — `family.exact_newton_joint_hessian`
+                //       defaults to a BLOCK-DIAGONAL assembly when not
+                //       overridden (see custom_family.rs:1698, default
+                //       `exact_newton_joint_hessian_from_exact_blocks`),
+                //       which drops every cross-block second derivative.
+                //       For coupled families that means quasi-Newton
+                //       with linear convergence rate determined by the
+                //       off-diagonal mass.
+                //
+                //   (b) GRADIENT/HESSIAN INCONSISTENCY — the joint
+                //       gradient and joint Hessian assemblies use
+                //       different code paths.  If they evaluate
+                //       different formulae (e.g. observed-info Hessian
+                //       paired with Fisher-info gradient, or a missing
+                //       cross-block ∂g_a/∂β_b that is present in g but
+                //       absent from H), Newton iterates do not satisfy
+                //       g_{k+1} = O(|δ|²) and the residual stalls at
+                //       a rate proportional to the inconsistency.
+                //
+                //   (c) RANK DEFICIENCY — `H + λS` has a near-zero
+                //       eigenvalue with an eigenvector that the
+                //       residual lives partly in.  Newton steps along
+                //       that direction are unbounded in floating point
+                //       (or, with the safety ridge, truncated), so the
+                //       residual component in that direction never
+                //       decays.  The "residual-stall early-exit" branch
+                //       at line ~12240 fires on the *extreme* case of
+                //       this; a milder rank deficiency simply burns
+                //       the cycle budget without tripping that gate.
+                //
+                // Per-block gradient inf-norms tell (a) from (b)/(c):
+                // in (a) each block's component is reduced quadratically
+                // (∼O(|δ|²)), and the residual is dominated by the
+                // off-diagonal coupling term that the block-diagonal
+                // Hessian ignores; in (b)/(c) one block stays large
+                // while others converge.
+                let block_grad_norms: Vec<f64> = match cached_joint_gradient.as_ref() {
+                    Some(joint_grad) => {
+                        let mut acc = 0usize;
+                        states
+                            .iter()
+                            .map(|s| {
+                                let n = s.beta.len();
+                                let end = (acc + n).min(joint_grad.len());
+                                let nrm = if acc < end {
+                                    joint_grad
+                                        .slice(ndarray::s![acc..end])
+                                        .iter()
+                                        .map(|x: &f64| x.abs())
+                                        .fold(0.0_f64, f64::max)
+                                } else {
+                                    f64::NAN
+                                };
+                                acc += n;
+                                nrm
+                            })
+                            .collect()
+                    }
+                    None => vec![f64::NAN; states.len()],
+                };
+                let descent_total = initial_joint_objective - lastobjective;
+                let beta_inf_final = states
+                    .iter()
+                    .flat_map(|s| s.beta.iter().copied())
+                    .map(f64::abs)
+                    .fold(0.0_f64, f64::max);
+                let block_diag_default = !family.exact_newton_joint_hessian_beta_dependent()
+                    && specs.len() >= 2;
                 log::warn!(
-                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) over {} cycles; returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
+                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) |β|∞={:.3e} block_grad_inf={:?} block_diag_hessian_default={}; if descent total is large but per-block gradient infs are all comparable, the joint Hessian likely drops cross-block coupling (case (a)); if one block stays orders-of-magnitude larger than others, suspect gradient/Hessian inconsistency or rank deficiency (case (b)/(c)).  Returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
                     cycles_done,
                     initial_joint_objective,
                     lastobjective,
-                    initial_joint_objective - lastobjective,
-                    cycles_done,
+                    descent_total,
+                    beta_inf_final,
+                    block_grad_norms,
+                    block_diag_default,
                 );
             }
             let penalty_value =
