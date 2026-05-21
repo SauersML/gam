@@ -13914,9 +13914,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
-        let mut args = SurvivalArgs {
+    /// Default `SurvivalArgs` shape shared by the
+    /// `parse_survival_inverse_link_*` test set. Real fields are picked so
+    /// the inverse-link validator path is the only thing being tested:
+    /// `formula = "1"`, single-knot time basis, no frailty, no extra
+    /// columns. Tests override `link` / `sas_init` / `beta_logistic_init`
+    /// (and occasionally one more) to exercise the validation branches.
+    fn survival_args_for_inverse_link_test() -> SurvivalArgs {
+        SurvivalArgs {
             data: std::path::PathBuf::from("dummy.csv"),
             entry: "entry".to_string(),
             exit: "exit".to_string(),
@@ -13955,103 +13960,53 @@ mod tests {
             frailty_kind: None,
             frailty_sd: None,
             hazard_loading: None,
-        };
-        args.link = Some("sas".to_string());
-        args.beta_logistic_init = Some("0.1,0.2".to_string());
+        }
+    }
+
+    /// Shared test driver for the four "init-flag rejected when link does
+    /// not match" guards. Builds the default args, overrides
+    /// (`link`, `sas_init`, `beta_logistic_init`), runs the validator, and
+    /// pins the per-case expected error substring.
+    fn assert_inverse_link_init_rejected(
+        link: &str,
+        sas_init: Option<&str>,
+        beta_logistic_init: Option<&str>,
+        expected_error_substr: &str,
+    ) {
+        let mut args = survival_args_for_inverse_link_test();
+        args.link = Some(link.to_string());
+        args.sas_init = sas_init.map(String::from);
+        args.beta_logistic_init = beta_logistic_init.map(String::from);
         let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
-        assert!(err.contains("--beta-logistic-init requires --link beta-logistic"));
+        assert!(
+            err.contains(expected_error_substr),
+            "validation error '{err}' does not contain '{expected_error_substr}'"
+        );
+    }
+
+    #[test]
+    fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
+        assert_inverse_link_init_rejected(
+            "sas",
+            None,
+            Some("0.1,0.2"),
+            "--beta-logistic-init requires --link beta-logistic",
+        );
     }
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_logit() {
-        let mut args = SurvivalArgs {
-            data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: "1".to_string(),
-            predict_noise: None,
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: Some("logit".to_string()),
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            scale_dimensions: false,
-            pilot_subsample_threshold: 0,
-            out: None,
-            logslope_formula: None,
-            z_column: None,
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-        };
-        args.link = Some("logit".to_string());
-        args.sas_init = Some("0.1,0.2".to_string());
-        let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
-        assert!(err.contains("--sas-init requires --link sas"));
+        assert_inverse_link_init_rejected(
+            "logit",
+            Some("0.1,0.2"),
+            None,
+            "--sas-init requires --link sas",
+        );
     }
 
     #[test]
     fn parse_survival_inverse_link_accepts_beta_logistic_init() {
-        let mut args = SurvivalArgs {
-            data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: "1".to_string(),
-            predict_noise: None,
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: Some("logit".to_string()),
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            scale_dimensions: false,
-            pilot_subsample_threshold: 0,
-            out: None,
-            logslope_formula: None,
-            z_column: None,
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-        };
+        let mut args = survival_args_for_inverse_link_test();
         args.link = Some("beta-logistic".to_string());
         args.beta_logistic_init = Some("0.25,0.80".to_string());
         let link = parse_survival_inverse_link(&args).expect("beta-logistic survival link");
@@ -14066,98 +14021,22 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_beta_logistic() {
-        let mut args = SurvivalArgs {
-            data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: "1".to_string(),
-            predict_noise: None,
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: Some("logit".to_string()),
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            scale_dimensions: false,
-            pilot_subsample_threshold: 0,
-            out: None,
-            logslope_formula: None,
-            z_column: None,
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-        };
-        args.link = Some("beta-logistic".to_string());
-        args.sas_init = Some("0.1,0.2".to_string());
-        let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
-        assert!(err.contains("--sas-init requires --link sas"));
+        assert_inverse_link_init_rejected(
+            "beta-logistic",
+            Some("0.1,0.2"),
+            None,
+            "--sas-init requires --link sas",
+        );
     }
 
     #[test]
     fn parse_survival_inverse_link_rejects_beta_logistic_init_for_logit() {
-        let mut args = SurvivalArgs {
-            data: std::path::PathBuf::from("dummy.csv"),
-            entry: "entry".to_string(),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: "1".to_string(),
-            predict_noise: None,
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: Some("logit".to_string()),
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "linear".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 8,
-            time_smooth_lambda: 1e-2,
-            ridge_lambda: 1e-6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            scale_dimensions: false,
-            pilot_subsample_threshold: 0,
-            out: None,
-            logslope_formula: None,
-            z_column: None,
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-        };
-        args.link = Some("logit".to_string());
-        args.beta_logistic_init = Some("0.1,0.2".to_string());
-        let err = parse_survival_inverse_link(&args).expect_err("expected arg validation error");
-        assert!(err.contains("--beta-logistic-init requires --link beta-logistic"));
+        assert_inverse_link_init_rejected(
+            "logit",
+            None,
+            Some("0.1,0.2"),
+            "--beta-logistic-init requires --link beta-logistic",
+        );
     }
 
     #[test]
