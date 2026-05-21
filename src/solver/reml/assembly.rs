@@ -11,7 +11,8 @@ use super::FirthDenseOperator;
 use super::unified::{
     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
     HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
-    PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, RemlLamlResult,
+    PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, ProjectedKktResidual,
+    RemlLamlResult,
     penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::faer_ndarray::fast_xt_diag_y;
@@ -271,7 +272,10 @@ impl<'dp> InnerAssembly<'dp> {
             builder = builder.nullspace_dim_override(nd);
         }
         builder = builder.barrier_config(self.barrier_config);
-        builder = builder.kkt_residual(self.kkt_residual);
+        builder = builder.kkt_residual(
+            self.kkt_residual
+                .map(ProjectedKktResidual::from_projected),
+        );
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);

@@ -5106,6 +5106,44 @@ impl PenaltySubspaceTrace {
     }
 }
 
+/// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, already
+/// projected onto the *free subspace* — i.e. with the Lagrange-multiplier
+/// component along the active inequality-constraint normals stripped out.
+///
+/// The IFT correction `−½ rᵀ H⁻¹ r` in `reml_laml_evaluate` requires `r` to
+/// lie in `range(H_free)` so that `H⁻¹·r` is well-conditioned. At a
+/// constrained-stationary point the unprojected residual carries multiplier
+/// mass *outside* that range; feeding it through `H⁻¹` amplifies floating-
+/// point noise by `1/σ_min(H_active_normal)` (≈10¹² on rank-deficient inner
+/// Hessians) and the resulting gradient explodes to ~10¹⁵ — the envelope
+/// tripwire then suppresses the gradient and the outer optimizer can make no
+/// progress (the biobank survival marginal-slope failure mode).
+///
+/// This newtype lifts the projection contract into the type system: a value
+/// of this type can only be produced by the projection-aware constructors,
+/// so callers cannot accidentally hand an unprojected residual to the
+/// unified evaluator. The free-function helpers in `families::custom_family`
+/// (`exact_newton_joint_kkt_residual_for_ift`) take active-set information
+/// and emit values of this type; the unified evaluator consumes it via the
+/// borrowing accessor.
+#[derive(Clone, Debug)]
+pub struct ProjectedKktResidual(Array1<f64>);
+
+impl ProjectedKktResidual {
+    /// Construct from a vector that the caller guarantees has already been
+    /// projected onto the free subspace. Crate-private so the projection
+    /// invariant cannot be bypassed by downstream callers.
+    pub(crate) fn from_projected(residual: Array1<f64>) -> Self {
+        Self(residual)
+    }
+
+    /// Borrow the underlying free-space residual for the H⁻¹·r solve and
+    /// its ρ-derivatives.
+    pub fn as_array(&self) -> &Array1<f64> {
+        &self.0
+    }
+}
+
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
 /// fixed dispersion (non-Gaussian LAML).
 #[derive(Clone, Debug)]
@@ -5246,13 +5284,15 @@ pub struct InnerSolution<'dp> {
     /// outer REML/LAML objective.
     pub barrier_config: Option<BarrierConfig>,
 
-    /// Optional inner KKT residual r = ∇_β L_pen(β̂) at the converged β̂.
-    /// `Some` activates the implicit-function-theorem corrections in
-    /// `reml_laml_evaluate` (cost gets −½ rᵀ H⁻¹ r, ρ-gradient and ρρ Hessian
-    /// get the matching first and second derivatives of that same scalar
-    /// correction). `None` keeps the envelope-only behaviour for callers that
-    /// genuinely guarantee exact KKT.
-    pub kkt_residual: Option<Array1<f64>>,
+    /// Optional inner KKT residual `r = ∇_β L_pen(β̂)` at the converged β̂,
+    /// already projected onto the free subspace (see [`ProjectedKktResidual`]
+    /// for the invariant and why the type wraps this). `Some` activates the
+    /// implicit-function-theorem corrections in `reml_laml_evaluate` (cost
+    /// gets `−½ rᵀ H⁻¹ r`, ρ-gradient and ρρ Hessian get the matching first
+    /// and second derivatives of that same scalar correction). `None` keeps
+    /// the envelope-only behaviour for callers that genuinely guarantee
+    /// exact KKT.
+    pub kkt_residual: Option<ProjectedKktResidual>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -5283,7 +5323,7 @@ pub struct InnerSolutionBuilder<'dp> {
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
     barrier_config: Option<BarrierConfig>,
-    kkt_residual: Option<Array1<f64>>,
+    kkt_residual: Option<ProjectedKktResidual>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -5406,7 +5446,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn kkt_residual(mut self, residual: Option<Array1<f64>>) -> Self {
+    pub fn kkt_residual(mut self, residual: Option<ProjectedKktResidual>) -> Self {
         self.kkt_residual = residual;
         self
     }
@@ -6292,13 +6332,16 @@ pub fn reml_laml_evaluate(
     // same scalar Newton correction under fixed-dispersion LAML.
     //
     // Filter: callers populate `kkt_residual` only on convergent inner paths.
-    // Constrained callers must pass the free-space/projected residual: valid
-    // active-set multipliers are normal-cone terms, not errors to correct.
-    // `None` means the caller is presenting an exact-KKT mode and the envelope
-    // identities are already valid.
+    // The [`ProjectedKktResidual`] newtype lifts the projection invariant into
+    // the type system (callers cannot construct one without going through the
+    // active-set-aware projection helper), so the only thing left to validate
+    // here is the length match against the Hessian operator. `None` means the
+    // caller is presenting an exact-KKT mode and the envelope identities are
+    // already valid.
     let kkt_residual_vec: Option<&Array1<f64>> = solution
         .kkt_residual
         .as_ref()
+        .map(ProjectedKktResidual::as_array)
         .filter(|r: &&Array1<f64>| r.len() == hop.dim());
     let kkt_residual_correction_active = kkt_residual_vec.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
