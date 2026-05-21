@@ -853,133 +853,67 @@ impl StabilizationLedger {
         }
     }
 }
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct Coefficients(pub Array1<f64>);
+/// Generate a `#[repr(transparent)]` `Array1<f64>` newtype with the
+/// `new`/`Deref`/`DerefMut`/`AsRef`/`From` boilerplate every wrapper in this
+/// module needs. Keeping the three semantic types behind one macro both
+/// removes ~100 lines of duplication and guarantees they cannot drift apart.
+macro_rules! array1_f64_newtype {
+    ($name:ident $(, $extra:ident)*) => {
+        #[repr(transparent)]
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct $name(pub Array1<f64>);
 
-impl Coefficients {
-    pub fn new(values: Array1<f64>) -> Self {
-        Self(values)
-    }
+        impl $name {
+            #[inline]
+            pub fn new(values: Array1<f64>) -> Self {
+                Self(values)
+            }
 
-    pub fn zeros(len: usize) -> Self {
-        Self(Array1::zeros(len))
-    }
+            #[inline]
+            pub fn zeros(len: usize) -> Self {
+                Self(Array1::zeros(len))
+            }
+        }
+
+        impl Deref for $name {
+            type Target = Array1<f64>;
+            #[inline]
+            fn deref(&self) -> &Self::Target { &self.0 }
+        }
+
+        impl DerefMut for $name {
+            #[inline]
+            fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+        }
+
+        impl AsRef<Array1<f64>> for $name {
+            #[inline]
+            fn as_ref(&self) -> &Array1<f64> { &self.0 }
+        }
+
+        impl From<Array1<f64>> for $name {
+            #[inline]
+            fn from(values: Array1<f64>) -> Self { Self(values) }
+        }
+
+        impl From<$name> for Array1<f64> {
+            #[inline]
+            fn from(values: $name) -> Self { values.0 }
+        }
+
+        $( array1_f64_newtype!(@extra $name $extra); )*
+    };
+    (@extra $name:ident exp) => {
+        impl $name {
+            #[inline]
+            pub fn exp(&self) -> Array1<f64> { self.0.mapv(f64::exp) }
+        }
+    };
 }
 
-impl Deref for Coefficients {
-    type Target = Array1<f64>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for Coefficients {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl AsRef<Array1<f64>> for Coefficients {
-    fn as_ref(&self) -> &Array1<f64> {
-        &self.0
-    }
-}
-
-impl From<Array1<f64>> for Coefficients {
-    fn from(values: Array1<f64>) -> Self {
-        Self(values)
-    }
-}
-
-impl From<Coefficients> for Array1<f64> {
-    fn from(values: Coefficients) -> Self {
-        values.0
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct LinearPredictor(pub Array1<f64>);
-
-impl LinearPredictor {
-    pub fn new(values: Array1<f64>) -> Self {
-        Self(values)
-    }
-
-    pub fn zeros(len: usize) -> Self {
-        Self(Array1::zeros(len))
-    }
-}
-
-impl Deref for LinearPredictor {
-    type Target = Array1<f64>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for LinearPredictor {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl AsRef<Array1<f64>> for LinearPredictor {
-    fn as_ref(&self) -> &Array1<f64> {
-        &self.0
-    }
-}
-
-impl From<Array1<f64>> for LinearPredictor {
-    fn from(values: Array1<f64>) -> Self {
-        Self(values)
-    }
-}
-
-impl From<LinearPredictor> for Array1<f64> {
-    fn from(values: LinearPredictor) -> Self {
-        values.0
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct LogSmoothingParams(pub Array1<f64>);
-
-impl LogSmoothingParams {
-    pub fn new(values: Array1<f64>) -> Self {
-        Self(values)
-    }
-}
-
-impl Deref for LogSmoothingParams {
-    type Target = Array1<f64>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for LogSmoothingParams {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl From<Array1<f64>> for LogSmoothingParams {
-    fn from(values: Array1<f64>) -> Self {
-        Self(values)
-    }
-}
-
-impl From<LogSmoothingParams> for Array1<f64> {
-    fn from(values: LogSmoothingParams) -> Self {
-        values.0
-    }
-}
+array1_f64_newtype!(Coefficients);
+array1_f64_newtype!(LinearPredictor);
+array1_f64_newtype!(LogSmoothingParams, exp);
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
