@@ -7067,31 +7067,59 @@ pub fn reml_laml_evaluate(
     // honest IFT correction would explain — fire.
     let cost_scale = cost.abs().max(1.0);
     let resolve_step = f64::EPSILON.sqrt();
-    if let Some((max_idx, max_abs)) = grad
+    let envelope_inconsistent = grad
         .iter()
         .enumerate()
         .map(|(i, g)| (i, g.abs()))
         .reduce(|a, b| if a.1 >= b.1 { a } else { b })
-    {
-        let predicted_change = max_abs * resolve_step;
-        if max_abs.is_finite() && predicted_change > 4.0 * cost_scale {
-            log::warn!(
-                "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
-                 |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
-                 Envelope formula likely contaminated by inner KKT residual on ill-conditioned \
-                 H block; outer optimizer will reject every step and shrink TR to floor.",
-                max_abs,
-                max_idx,
-                predicted_change,
-                cost_scale,
-                predicted_change / cost_scale,
-            );
-        }
-    }
+        .and_then(|(max_idx, max_abs)| {
+            let predicted_change = max_abs * resolve_step;
+            if max_abs.is_finite() && predicted_change > 4.0 * cost_scale {
+                Some((max_idx, max_abs, predicted_change))
+            } else {
+                None
+            }
+        });
+
+    let gradient_out = if let Some((max_idx, max_abs, predicted_change)) = envelope_inconsistent {
+        // Mathematically impossible: a smooth function with |f| ≈ |cost|
+        // cannot have an analytic gradient component whose √ε step predicts
+        // a change far exceeding the function's own magnitude. The envelope
+        // gradient formula above assumes ∇_β L_pen(β̂) = 0; when the inner
+        // solver exits the noise-floor KKT certificate (custom_family.rs:12037)
+        // with a non-zero β-gradient residual on a coordinate where the
+        // inner Hessian block is poorly conditioned, the unmodeled IFT
+        // correction (-H⁻¹ · residual) inflates by ‖H⁻¹‖·‖residual‖ and
+        // overwhelms the legitimate envelope contribution. Surfacing this
+        // gradient to the outer optimizer triggers trust-region rejection
+        // on every step — for up to inner_max_cycles outer iterations at
+        // 144s each before TR collapses to its floor with no diagnostic.
+        // Mark the gradient unavailable so the outer wrapper either falls
+        // back to finite differences (when configured) or aborts with a
+        // clean error pointing here, instead of grinding wasted minutes on
+        // a wrong descent direction.
+        log::warn!(
+            "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
+             |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
+             Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \
+             marking analytic gradient unavailable so outer optimizer does not chase a \
+             mathematically impossible descent direction. Root remedy: tighten inner KKT \
+             convergence on this coordinate or implement the IFT correction term \
+             (-rᵀ · v_k) using the already-computed rho_v_ks.",
+            max_abs,
+            max_idx,
+            predicted_change,
+            cost_scale,
+            predicted_change / cost_scale,
+        );
+        None
+    } else {
+        Some(grad)
+    };
 
     Ok(RemlLamlResult {
         cost,
-        gradient: Some(grad),
+        gradient: gradient_out,
         hessian,
     })
 }
