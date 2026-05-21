@@ -3,7 +3,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use log::{Level, LevelFilter, Log, Metadata, Record};
+use log::{LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
@@ -18,6 +18,7 @@ const MAX_DIAGNOSTIC_LINES: usize = 10;
 
 static LOGGER: ProgressLogger = ProgressLogger;
 static ACTIVE_MULTIPROGRESS: OnceLock<Mutex<Option<MultiProgress>>> = OnceLock::new();
+static LOG_START: OnceLock<Instant> = OnceLock::new();
 
 fn active_multiprogress() -> &'static Mutex<Option<MultiProgress>> {
     ACTIVE_MULTIPROGRESS.get_or_init(|| Mutex::new(None))
@@ -48,17 +49,26 @@ impl Log for ProgressLogger {
 }
 
 fn format_log_record(record: &Record<'_>) -> String {
-    let tag = match record.level() {
-        Level::Error => "ERROR",
-        Level::Warn => "WARN",
-        Level::Info => "INFO",
-        Level::Debug => "DEBUG",
-        Level::Trace => "TRACE",
-    };
-    format!("[{tag}] {}", record.args())
+    let elapsed = LOG_START.get_or_init(Instant::now).elapsed();
+    format!("[{}] {}", human_elapsed(elapsed), record.args())
+}
+
+fn human_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs / 60) % 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 pub fn init_logging() {
+    LOG_START.get_or_init(Instant::now);
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(LevelFilter::Info);
     }
