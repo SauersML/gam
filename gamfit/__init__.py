@@ -55,7 +55,7 @@ from ._api import (
 from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
-from ._model import CompetingRisksCIF, Model, SurvivalPrediction, competing_risks_cif
+from ._model import CompetingRisksPrediction, Model, SurvivalPrediction
 from ._response_geometry import (
     ResponseGeometryModel,
     alr,
@@ -111,7 +111,7 @@ __all__ = [
     "FormulaError",
     "FormulaValidation",
     "GamError",
-    "CompetingRisksCIF",
+    "CompetingRisksPrediction",
     "Model",
     "CumulativeIncidenceDraws",
     "PairedPosteriorSamples",
@@ -133,7 +133,6 @@ __all__ = [
     "bspline_basis_derivative",
     "closure",
     "clr",
-    "competing_risks_cif",
     "cuda_diagnostics",
     "duchon_basis_1d",
     "duchon_basis_1d_derivative",

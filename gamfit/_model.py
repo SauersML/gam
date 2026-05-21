@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,6 +26,7 @@ DENSE_SURVIVAL_AUTO_CHUNK_CELLS = 1_000_000
 _SURVIVAL_MODEL_CLASSES = frozenset(
     {
         "survival",
+        "competing risks survival",
         "survival marginal-slope",
         "survival location-scale",
         "latent survival",
@@ -35,6 +35,7 @@ _SURVIVAL_MODEL_CLASSES = frozenset(
 _SURVIVAL_TIME_GRID_MODEL_CLASSES = frozenset(
     {
         "survival",
+        "competing risks survival",
         "survival marginal-slope",
         "survival location-scale",
     }
@@ -53,34 +54,20 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
 
 
 @dataclass(frozen=True)
-class CompetingRisksCIF:
-    """Aalen-Johansen cumulative incidence assembled from endpoint predictions.
+class CompetingRisksPrediction:
+    """Rust-computed joint cause-specific competing-risks prediction."""
 
-    Returned by :func:`competing_risks_cif`. The arrays are aligned on a
-    shared time grid and prediction-row axis.
-
-    Attributes
-    ----------
-    times : ndarray
-        Strictly increasing 1-D time grid used for assembly.
-    cif : ndarray
-        ``(n_endpoints, n_rows, n_times)`` cumulative incidence functions.
-        ``cif[k, i, j]`` is the probability that row ``i`` has failed from
-        endpoint ``k`` by ``times[j]`` before any competing endpoint.
-    overall_survival : ndarray
-        ``(n_rows, n_times)`` survival from all modeled endpoints combined.
-    cumulative_hazard : ndarray
-        ``(n_endpoints, n_rows, n_times)`` endpoint cumulative hazards used
-        for the assembly.
-    endpoint_names : tuple of str
-        Names aligned with the first axis of ``cif``.
-    """
-
+    model_class: str
+    likelihood_mode: str
+    endpoint_names: tuple[str, ...]
     times: Any
+    hazard: Any
+    survival: Any
+    cumulative_hazard: Any
     cif: Any
     overall_survival: Any
-    cumulative_hazard: Any
-    endpoint_names: tuple[str, ...]
+    linear_predictor: Any
+    columns: dict[str, list[float]]
 
 
 @dataclass
@@ -828,78 +815,6 @@ class SurvivalPrediction:
         return np.exp(-cumulative)
 
 
-def competing_risks_cif(
-    predictions: Sequence[SurvivalPrediction] | Mapping[str, SurvivalPrediction],
-    times: Any,
-    *,
-    endpoint_names: Sequence[str] | None = None,
-) -> CompetingRisksCIF:
-    """Assemble competing-risk cumulative incidence functions.
-
-    ``Model.predict(...)`` returns one :class:`SurvivalPrediction` per
-    cause-specific endpoint. This helper combines those endpoint survival
-    surfaces into Aalen-Johansen cumulative incidence functions on a shared
-    time grid. It uses each endpoint's cumulative-hazard increments and
-    assumes hazards are piecewise constant between adjacent requested times,
-    which keeps the endpoint CIFs probability-bounded and makes their sum
-    equal ``1 - overall_survival`` on the grid.
-
-    Parameters
-    ----------
-    predictions : sequence or mapping
-        Endpoint-specific :class:`SurvivalPrediction` objects. A mapping's
-        keys become ``endpoint_names``.
-    times : array_like
-        Strictly increasing finite non-negative time grid.
-    endpoint_names : sequence of str, optional
-        Names for sequence inputs. Must match the number of endpoint
-        predictions. Omit this when ``predictions`` is a mapping.
-
-    Returns
-    -------
-    CompetingRisksCIF
-        Result object with ``cif`` shaped ``(n_endpoints, n_rows, n_times)``,
-        plus the shared ``times`` and combined ``overall_survival``.
-
-    Examples
-    --------
-    >>> result = gamfit.competing_risks_cif(
-    ...     {"disease": disease_pred, "death": death_pred},
-    ...     times=[1.0, 5.0, 10.0],
-    ... )
-    >>> disease_cif = result.cif[0]      # (n_rows, 3)
-    >>> result.endpoint_names
-    ('disease', 'death')
-    """
-    import numpy as np
-
-    endpoint_predictions, names = _coerce_competing_risk_predictions(
-        predictions,
-        endpoint_names=endpoint_names,
-    )
-    times_arr = np.asarray(times, dtype=float).reshape(-1)
-    try:
-        cumulative_hazard = np.stack(
-            [
-                np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=float)
-                for prediction in endpoint_predictions
-            ],
-            axis=0,
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "all endpoint predictions must return the same (n_rows, n_times) shape"
-        ) from exc
-    out = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
-    return CompetingRisksCIF(
-        times=out["times"],
-        cif=out["cif"],
-        overall_survival=out["overall_survival"],
-        cumulative_hazard=out["cumulative_hazard"],
-        endpoint_names=names,
-    )
-
-
 class Model:
     def __init__(self, *, _model_bytes: bytes, _training_table_kind: str | None = None) -> None:
         self._model_bytes = _model_bytes
@@ -981,6 +896,8 @@ class Model:
                 id_column=id_column,
                 row_ids=row_ids,
             )
+        if parsed.get("class") == "competing_risks_prediction":
+            return _competing_risks_prediction_from_ffi_payload(parsed)
 
         columns = _ordered_prediction_columns(parsed["columns"])
         model_class = str(parsed.get("model_class") or self._model_class_from_summary())
@@ -2098,38 +2015,6 @@ def _validate_survival_chunk_size(value: int, name: str) -> int:
     return chunk
 
 
-def _coerce_competing_risk_predictions(
-    predictions: Sequence[SurvivalPrediction] | Mapping[str, SurvivalPrediction],
-    *,
-    endpoint_names: Sequence[str] | None,
-) -> tuple[tuple[SurvivalPrediction, ...], tuple[str, ...]]:
-    if isinstance(predictions, Mapping):
-        if endpoint_names is not None:
-            raise ValueError("endpoint_names must be omitted when predictions is a mapping")
-        items = list(predictions.items())
-        names = tuple(str(name) for name, _prediction in items)
-        endpoint_predictions = tuple(prediction for _name, prediction in items)
-    else:
-        endpoint_predictions = tuple(predictions)
-        if endpoint_names is None:
-            names = tuple(f"endpoint_{idx + 1}" for idx in range(len(endpoint_predictions)))
-        else:
-            names = tuple(str(name) for name in endpoint_names)
-            if len(names) != len(endpoint_predictions):
-                raise ValueError("endpoint_names must match the number of endpoint predictions")
-    if not endpoint_predictions:
-        raise ValueError("competing_risks_cif requires at least one endpoint prediction")
-    if len(set(names)) != len(names):
-        raise ValueError("endpoint_names must be unique")
-    for idx, prediction in enumerate(endpoint_predictions):
-        if not isinstance(prediction, SurvivalPrediction):
-            raise TypeError(
-                "competing_risks_cif expects SurvivalPrediction objects; "
-                f"endpoint {idx} has type {type(prediction).__name__}"
-            )
-    return endpoint_predictions, names
-
-
 def _extract_row_ids(
     headers: list[str],
     rows: list[list[str]],
@@ -2218,6 +2103,28 @@ def _survival_prediction_from_ffi_payload(
         row_ids=row_ids,
         survival_se=survival_se,
         eta_se=eta_se if eta_se is not None and eta_se.size else None,
+    )
+
+
+def _competing_risks_prediction_from_ffi_payload(
+    parsed: dict[str, Any],
+) -> CompetingRisksPrediction:
+    """Build a thin Python object from Rust's joint competing-risks payload."""
+    import numpy as np
+
+    columns = parsed.get("columns") or {}
+    return CompetingRisksPrediction(
+        model_class=str(parsed.get("model_class") or "competing risks survival"),
+        likelihood_mode=str(parsed.get("likelihood_mode") or "transformation"),
+        endpoint_names=tuple(str(name) for name in parsed.get("endpoint_names") or ()),
+        times=np.asarray(parsed.get("times") or [], dtype=float).reshape(-1),
+        hazard=np.asarray(parsed.get("hazard") or [], dtype=float),
+        survival=np.asarray(parsed.get("survival") or [], dtype=float),
+        cumulative_hazard=np.asarray(parsed.get("cumulative_hazard") or [], dtype=float),
+        cif=np.asarray(parsed.get("cif") or [], dtype=float),
+        overall_survival=np.asarray(parsed.get("overall_survival") or [], dtype=float),
+        linear_predictor=np.asarray(parsed.get("linear_predictor") or [], dtype=float),
+        columns={str(key): list(value) for key, value in columns.items()},
     )
 
 
@@ -2337,4 +2244,8 @@ def _coverage_provenance_groups(
     return labels, label_info, label_indices
 
 
-__all__ = ["CompetingRisksCIF", "Model", "SurvivalPrediction", "competing_risks_cif"]
+__all__ = [
+    "CompetingRisksPrediction",
+    "Model",
+    "SurvivalPrediction",
+]
