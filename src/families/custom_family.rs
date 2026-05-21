@@ -2656,20 +2656,6 @@ pub struct BlockwiseInnerResult {
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
     pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    /// Inner KKT residual r = S(λ)β̂ − ∇ℓ(β̂) at the converged β̂,
-    /// concatenated across blocks in the same layout as `block_states`.
-    ///
-    /// Populated only on the convergent unconstrained joint-Newton path.
-    /// The IFT correction in `reml_laml_evaluate` requires the unmasked
-    /// stationarity vector: active-set masking would discard Lagrange-
-    /// multiplier mass that is *not* a convergence defect but *is* part of
-    /// the unconstrained gradient the envelope formula assumes is zero,
-    /// and applying the correction with a masked residual would over-
-    /// correct the constrained gradient by exactly that mass. The
-    /// blockwise loop leaves this `None` whenever any block has a
-    /// nontrivial active set, preserving envelope-only behaviour for the
-    /// constrained path.
-    pub kkt_residual: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -10394,7 +10380,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s: cached.block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
-                kkt_residual: None,
             });
         }
         // Soft warm-start across rho changes.
@@ -13401,7 +13386,6 @@ fn build_custom_family_inner_assembly<'dp>(
         ext_coord_pair_fn,
         rho_ext_pair_fn,
         fixed_drift_deriv,
-        kkt_residual: None,
     };
 
     Ok((evaluator, ext_dim))
