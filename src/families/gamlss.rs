@@ -184,6 +184,64 @@ impl DenseOrOperator<'_> {
     }
 }
 
+/// Resolve a single dense block design from a `ParameterBlockSpec`, falling
+/// back to materializing the sparse representation through the policy when
+/// the dense form isn't already cached. Returns `Cow::Borrowed` whenever the
+/// spec already holds a dense array; `Cow::Owned` only after a forced
+/// materialization. The `materialization_label` string is woven into the
+/// materializer's error so callers can pin which block failed.
+fn dense_block_from_spec<'a>(
+    spec: &'a ParameterBlockSpec,
+    material_policy: &crate::resource::MaterialPolicy,
+    materialization_label: &str,
+) -> Result<Cow<'a, Array2<f64>>, String> {
+    match spec.design.as_dense_ref() {
+        Some(d) => Ok(Cow::Borrowed(d)),
+        None => Ok(Cow::Owned(
+            spec.design
+                .try_to_dense_with_policy(material_policy, materialization_label)
+                .map_err(|e| e.to_string())?
+                .as_ref()
+                .clone(),
+        )),
+    }
+}
+
+/// Resolve the (primary, log-σ) pair of dense block designs that every
+/// LocationScale family's spec-aware exact path needs. The primary block is
+/// the family-specific "mean" axis (μ for Gaussian, latent t for Binomial);
+/// the `short_family_name` ("GaussianLocationScale", "BinomialLocationScale",
+/// or their Wiggle siblings) and `primary_label` ("mu" / "threshold") are
+/// woven into the per-block materialization label for diagnostics.
+fn dense_locscale_block_designs_fromspecs<'a>(
+    specs: &'a [ParameterBlockSpec],
+    expected_count: usize,
+    family_name: &str,
+    short_family_name: &str,
+    primary_block_idx: usize,
+    log_sigma_block_idx: usize,
+    primary_label: &str,
+    material_policy: &crate::resource::MaterialPolicy,
+) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
+    if specs.len() != expected_count {
+        return Err(format!(
+            "{family_name} expects {expected_count} specs, got {}",
+            specs.len()
+        ));
+    }
+    let primary = dense_block_from_spec(
+        &specs[primary_block_idx],
+        material_policy,
+        &format!("{short_family_name} dense_block_designs_fromspecs {primary_label}"),
+    )?;
+    let log_sigma = dense_block_from_spec(
+        &specs[log_sigma_block_idx],
+        material_policy,
+        &format!("{short_family_name} dense_block_designs_fromspecs log_sigma"),
+    )?;
+    Ok((primary, log_sigma))
+}
+
 fn dense_block_or_operator<'a>(
     design: &'a DesignMatrix,
     n: usize,
