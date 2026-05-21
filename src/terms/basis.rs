@@ -9357,7 +9357,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     )?;
     let coeffs = length_scale
         .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
-    let pure_block_order = pure_duchon_block_order(p_order, s_order);
+    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64);
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let z_cols = z_kernel.ncols();
@@ -9935,7 +9935,7 @@ fn duchon_kernel_radial_triplet(
     // operator scalars (q, lap, t) in the penalty code.
     let triplet = match length_scale {
         None => {
-            let m = pure_duchon_block_order(p_order, s_order);
+            let m = pure_duchon_block_order(p_order, s_order as f64);
             polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
@@ -12626,7 +12626,7 @@ fn duchon_matern_operator_block_jets(
 }
 
 #[inline(always)]
-fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
+fn pure_duchon_block_order(p_order: usize, s_order: f64 as f64) -> f64 {
     p_order as f64 + s_order
 }
 
@@ -12794,7 +12794,7 @@ fn duchon_matern_kernel_general_from_distance(
         ));
     }
     let Some(length_scale) = length_scale else {
-        return Ok(polyharmonic_kernel(r, (pure_duchon_block_order(p_order, s_order)) as f64, k_dim, ));
+        return Ok(polyharmonic_kernel(r, (pure_duchon_block_order(p_order, s_order as f64)) as f64, k_dim, ));
     };
     if !length_scale.is_finite() || length_scale <= 0.0 {
         return Err(BasisError::InvalidInput(
@@ -16817,7 +16817,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         dim,
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let block_order = pure_duchon_block_order(p_order, s_order);
+    let block_order = pure_duchon_block_order(p_order, s_order as f64);
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
         centers.view(),
@@ -18294,7 +18294,7 @@ pub fn create_duchon_spline_basiswithworkspace(
     };
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let pure_poly_coeff = if length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order)) as f64, d, ))
+        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
     } else {
         None
     };
@@ -18568,7 +18568,7 @@ fn build_duchon_basis_designwithworkspace(
     // Pre-compute polyharmonic coefficient for the pure Duchon case (no length_scale).
     // This avoids 2 gamma_lanczos calls per kernel evaluation (n × k total).
     let pure_poly_coeff = if length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order)) as f64, d, ))
+        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
     } else {
         None
     };
@@ -18706,7 +18706,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
         polynomial_block_from_order(data.view(), effective_order).ncols()
     };
 
-    let pure_coeff = PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order)) as f64, 1);
+    let pure_coeff = PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
     let kernel_amp = duchon_kernel_amplification(
         center_matrix.view(),
         None,
@@ -18991,7 +18991,7 @@ fn build_periodic_duchon_basis_1d(
         .length_scale
         .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
     let pure_poly_coeff = if spec.length_scale.is_none() {
-        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order)) as f64, 1, ))
+        Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1, ))
     } else {
         None
     };
@@ -19213,7 +19213,7 @@ pub fn build_duchon_basiswithworkspace(
         let coeffs = length_scale
             .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
         let pure_poly_coeff = if length_scale.is_none() {
-            Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order)) as f64, d, ))
+            Some(PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, d, ))
         } else {
             None
         };
