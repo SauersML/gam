@@ -2410,9 +2410,9 @@ pub fn assemble_competing_risks_cif(
     for row in 0..n_rows {
         let mut previous_cif = vec![0.0_f64; n_endpoints];
         let mut previous_cumulative = vec![0.0_f64; n_endpoints];
+        let mut increments = vec![0.0_f64; n_endpoints];
         let mut previous_total_cumulative = 0.0_f64;
         for time_idx in 0..n_times {
-            let mut increments = vec![0.0_f64; n_endpoints];
             let mut total_increment = 0.0_f64;
             for endpoint in 0..n_endpoints {
                 let current = cumulative_hazard[[endpoint, row, time_idx]];
@@ -2426,7 +2426,7 @@ pub fn assemble_competing_risks_cif(
                 let increment = raw_increment.max(0.0);
                 increments[endpoint] = increment;
                 total_increment += increment;
-                previous_cumulative[endpoint] = current.max(0.0);
+                previous_cumulative[endpoint] += increment;
             }
 
             let survival_left = (-previous_total_cumulative).exp();

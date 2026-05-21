@@ -7263,3 +7263,5 @@ mod invert_regularized_rho_hessian_tests {
 
 #[path = "reml/mod.rs"]
 pub(crate) mod reml;
+
+pub use reml::unified::PenaltyCoordinate;
