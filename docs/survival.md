@@ -136,6 +136,19 @@ for row_slice, time_slice, block in pred.survival_at_chunks([1, 5, 10, 20]):
 pred.write_survival_at_csv("surv.csv", times=[1, 5, 10, 20])
 ```
 
+For competing risks, predict each cause-specific endpoint and assemble CIFs
+on the same grid:
+
+```python
+cif = gamfit.competing_risks_cif(
+    {"disease": disease_pred, "death": death_pred},
+    times=[1, 5, 10, 20],
+)
+
+disease_cif = cif.cif[0]               # (n, 4)
+overall_survival = cif.overall_survival
+```
+
 ## Uncertainty on the survival surface
 
 For location-scale survival, pass `with_uncertainty=True` to get

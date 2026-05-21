@@ -634,6 +634,75 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
     assert np.all(query_survival[1, :] > query_survival[0, :])
 
 
+def test_competing_risks_cif_matches_constant_hazard_closed_form() -> None:
+    disease_rates = np.array([0.12, 0.06], dtype=float)
+    death_rates = np.array([0.05, 0.02], dtype=float)
+    disease_pred = gamfit.SurvivalPrediction(
+        model_class="survival",
+        parameters=np.log(disease_rates).reshape(-1, 1),
+        parameter_names=("log_hazard",),
+    )
+    death_pred = gamfit.SurvivalPrediction(
+        model_class="survival",
+        parameters=np.log(death_rates).reshape(-1, 1),
+        parameter_names=("log_hazard",),
+    )
+    times = np.array([0.0, 2.0, 5.0, 10.0], dtype=float)
+
+    result = gamfit.competing_risks_cif(
+        {"disease": disease_pred, "death": death_pred},
+        times=times,
+    )
+
+    assert isinstance(result, gamfit.CompetingRisksCIF)
+    assert result.endpoint_names == ("disease", "death")
+    np.testing.assert_allclose(result.times, times)
+    assert result.cif.shape == (2, 2, times.size)
+    assert result.overall_survival.shape == (2, times.size)
+    total_rates = disease_rates + death_rates
+    expected_disease = (
+        disease_rates[:, None]
+        / total_rates[:, None]
+        * (1.0 - np.exp(-total_rates[:, None] * times.reshape(1, -1)))
+    )
+    expected_death = (
+        death_rates[:, None]
+        / total_rates[:, None]
+        * (1.0 - np.exp(-total_rates[:, None] * times.reshape(1, -1)))
+    )
+    np.testing.assert_allclose(result.cif[0], expected_disease, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(result.cif[1], expected_death, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(
+        result.cif.sum(axis=0),
+        1.0 - result.overall_survival,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+    assert np.all(np.diff(result.cif, axis=2) >= -1e-12)
+
+
+def test_competing_risks_cif_validates_inputs() -> None:
+    pred = gamfit.SurvivalPrediction(
+        model_class="survival",
+        parameters=np.array([[np.log(0.10)]], dtype=float),
+        parameter_names=("log_hazard",),
+    )
+    two_row_pred = gamfit.SurvivalPrediction(
+        model_class="survival",
+        parameters=np.array([[np.log(0.10)], [np.log(0.20)]], dtype=float),
+        parameter_names=("log_hazard",),
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        gamfit.competing_risks_cif([pred], times=[0.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="non-negative"):
+        gamfit.competing_risks_cif([pred], times=[-1.0, 1.0])
+    with pytest.raises(ValueError, match="same \\(n_rows, n_times\\) shape"):
+        gamfit.competing_risks_cif([pred, two_row_pred], times=[0.0, 1.0])
+    with pytest.raises(ValueError, match="endpoint_names must match"):
+        gamfit.competing_risks_cif([pred, two_row_pred], times=[0.0, 1.0], endpoint_names=["one"])
+
+
 def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> None:
     pred = gamfit.SurvivalPrediction(
         model_class="survival",
