@@ -15933,21 +15933,28 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         let k = rho_dim.saturating_add(psi_dim as u128).max(1);
 
         let predicted_hessian_work = if !self.flex_active() && !self.flex_timewiggle_active() {
-            // Rigid survival marginal-slope evaluates outer rho/psi
-            // coordinate corrections through the row-kernel/HVP path, not
-            // dense n·p_total² coefficient Hessian assembly. The biobank
-            // failure path is rho-only (psi_dim=0), so using the generic
-            // n·p_total²·K policy falsely demotes exact ARC curvature to
-            // first-order BFGS. Model the work that actually executes:
-            // one row-kernel pass per outer coordinate and coefficient axis,
-            // plus the fixed four primary survival channels.
+            // Rigid survival marginal-slope evaluates coordinate corrections
+            // through the row-kernel/HVP path, but the analytic outer Hessian
+            // also differentiates the projected logdet-H trace.  With the
+            // rank-projected LAML kernel that trace is not an O(n·k·p) row
+            // correction; the cross-coordinate trace contractions scale like
+            // O(n·k·p²).  The AoU hypertension shape (n=195780, p=33, k=4)
+            // made this mismatch visible: the old row-kernel-only estimate
+            // was ≈29M, selected ARC, then spent ~20 minutes building a
+            // Hessian and still drove ARC into a boundary-gradient failure.
+            // Gate on the larger of the two honest costs so large projected
+            // trace Hessians route to gradient-only BFGS.
             let p_total = specs
                 .iter()
                 .map(|spec| spec.design.ncols() as u128)
                 .sum::<u128>();
-            (self.n as u128)
+            let row_kernel_work = (self.n as u128)
                 .saturating_mul(k)
-                .saturating_mul(p_total.saturating_add(N_PRIMARY as u128))
+                .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
+            let projected_trace_work = (self.n as u128)
+                .saturating_mul(k)
+                .saturating_mul(p_total.saturating_mul(p_total));
+            row_kernel_work.max(projected_trace_work)
         } else {
             // Flex/time-wiggle survival paths have higher-order dynamic-q
             // row geometry. Keep the generic dense policy there until those
