@@ -9110,13 +9110,11 @@ fn evaluate_standard_familyobservations(
                 } else if let Some(state) = mixture_link_state {
                     Some(InverseLink::Mixture(state.clone()))
                 } else if let Some(state) = sas_link_state {
-                    Some(
-                        if family.is_binomial_beta_logistic() {
-                            InverseLink::BetaLogistic(*state)
-                        } else {
-                            InverseLink::Sas(*state)
-                        },
-                    )
+                    Some(if family.is_binomial_beta_logistic() {
+                        InverseLink::BetaLogistic(*state)
+                    } else {
+                        InverseLink::Sas(*state)
+                    })
                 } else {
                     None
                 };
