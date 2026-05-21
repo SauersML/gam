@@ -10408,6 +10408,28 @@ fn load_joint_gradient_evaluation<F: CustomFamily + Clone + Send + Sync + 'stati
     Ok((log_likelihood, gradient, Some(eval), workspace))
 }
 
+#[derive(Clone, Debug)]
+struct JointNewtonMathDiagnostic {
+    old_kkt_inf: f64,
+    linearized_next_kkt_inf: f64,
+    predicted_reduction: f64,
+    actual_reduction: f64,
+    trust_ratio: f64,
+    step_inf: f64,
+    proposal_inf: f64,
+}
+
+impl JointNewtonMathDiagnostic {
+    fn scalar_model_relative_error(&self) -> f64 {
+        (self.actual_reduction - self.predicted_reduction).abs()
+            / self.predicted_reduction.abs().max(1.0)
+    }
+
+    fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
+        new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
+    }
+}
+
 fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -10836,6 +10858,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
+        let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
 
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
@@ -11393,6 +11416,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut tr_log_sig: Option<String> = None;
             let mut tr_log_first: usize = 0;
             let mut tr_log_last: usize = 0;
+            let mut accepted_math_diag: Option<JointNewtonMathDiagnostic> = None;
             // Right-hand side for the TR subproblem, ∇L_pen = ∇ℓ − Sβ.
             // Constant across TR retries because β only mutates on accept,
             // and the gradient/penalty are reloaded outside the loop.
@@ -11654,6 +11678,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     "reject"
                 };
+                if floor_reached || secondary_ok {
+                    let old_kkt_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    let linearized_next_kkt_inf = hpen_delta
+                        .iter()
+                        .zip(rhs.iter())
+                        .map(|(h_delta_i, rhs_i)| (h_delta_i - rhs_i).abs())
+                        .fold(0.0_f64, f64::max);
+                    accepted_math_diag = Some(JointNewtonMathDiagnostic {
+                        old_kkt_inf,
+                        linearized_next_kkt_inf,
+                        predicted_reduction,
+                        actual_reduction,
+                        trust_ratio: trust_update.rho,
+                        step_inf: trial_step_inf,
+                        proposal_inf: step_inf,
+                    });
+                }
                 let radius_held =
                     (joint_trust_radius - old_radius).abs() <= 1e-12 * old_radius.abs().max(1.0);
                 let radius_field = if radius_held {
@@ -12078,6 +12119,55 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // defeating the throttle entirely.
             let near_convergence = residual <= 10.0 * residual_tol;
             let signed_obj_change = lastobjective - old_objective;
+            if let Some(math_diag) = accepted_math_diag.take() {
+                // Newton identities for the penalized negative objective
+                //
+                //   f(β) = -ℓ(β) + 1/2 βᵀ S_λ β + 1/2 r βᵀβ
+                //   g(β) = ∇f(β) = S_λβ + rβ - ∇ℓ(β) = -rhs
+                //   H(β) = ∇²f(β) = -∇²ℓ(β) + S_λ + rI.
+                //
+                // The exact Newton step solves Hδ = -g = rhs. Therefore the
+                // *linearized* next KKT residual is
+                //
+                //   ‖g(β) + Hδ‖∞ = ‖Hδ - rhs‖∞,
+                //
+                // which should sit at solver roundoff. The actual next
+                // residual obeys Taylor's theorem:
+                //
+                //   g(β+δ) = g(β) + Hδ
+                //          + ∫₀¹ [H(β+tδ) - H(β)] δ dt.
+                //
+                // Thus, once ‖Hδ-rhs‖∞ is tiny, a large post-step KKT
+                // residual can only come from (1) true nonlinear curvature
+                // along δ, (2) a Hessian/gradient assembly mismatch, or
+                // (3) constrained/rank-deficient geometry. The scalar trust
+                // ratio ρ = actual/predicted only checks the one-dimensional
+                // objective model; it cannot by itself prove the vector
+                // Newton equation.
+                let quadratic_defect = math_diag.quadratic_defect_ratio(residual);
+                let scalar_model_relerr = math_diag.scalar_model_relative_error();
+                let linearized_rel = math_diag.linearized_next_kkt_inf
+                    / (1.0 + math_diag.old_kkt_inf.max(math_diag.predicted_reduction.abs()));
+                last_joint_math = Some(math_diag.clone());
+                if verbose_cycle || residual > 100.0 * residual_tol || scalar_model_relerr > 1e-3 {
+                    log::info!(
+                        "[PIRLS/JN/math] cyc={:>3}/{} equations: old_kkt=‖g‖∞={:.3e}; linearized_next=‖g+Hδ‖∞=‖Hδ-rhs‖∞={:.3e} (rel={:.3e}); new_kkt=‖g(β+δ)‖∞={:.3e}; new_kkt/|δ|∞²={:.3e}; scalar_model actual={:+.3e} pred={:+.3e} ρ={:+.3e} relerr={:.3e}; |δ|∞={:.3e} |proposal|∞={:.3e}",
+                        cycle,
+                        inner_max_cycles,
+                        math_diag.old_kkt_inf,
+                        math_diag.linearized_next_kkt_inf,
+                        linearized_rel,
+                        residual,
+                        quadratic_defect,
+                        math_diag.actual_reduction,
+                        math_diag.predicted_reduction,
+                        math_diag.trust_ratio,
+                        scalar_model_relerr,
+                        math_diag.step_inf,
+                        math_diag.proposal_inf,
+                    );
+                }
+            }
             if verbose_cycle || near_convergence {
                 log::info!(
                     "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} -loglik={:.6e} pen={:.3e} Δobj={:+.3e} |δ|∞={:.3e} accepted_|δ|∞={:.3e} resid={:.3e} (tol={:.3e}) obj_tol={:.3e} step_tol={:.3e} |β|∞={:.3e} attempts={} t={:.3}s",
@@ -12191,26 +12281,36 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             // INVESTIGATION NOTE — do NOT soft-accept here.
             //
-            // It is tempting to add a "the outer optimizer only needs
-            // V(ρ) accurate to outer_tol, so accept once Δobj plateaus
-            // at outer scale" certificate.  That is an ESCAPE HATCH:
-            // it hides whatever is preventing Newton from converging
-            // quadratically, and the IFT pullback to ∇_ρV assumes the
-            // inner is at KKT exactly.  The projected-pseudo-inverse
-            // (0dc469bd) only filters out the *null-space* portion of
-            // a nonzero residual; the range-space portion still
-            // contaminates ∇_ρV, so soft-acceptance silently feeds
-            // wrong outer gradients to ARC/BFGS.  At biobank scale we
-            // observe `|δ|∞ ≪ TR-radius` (TR not binding), TR ratio
-            // ≈ 1.00 every cycle (model is perfect), and objective
-            // descent that is *linear* (Δobj_{n+1}/Δobj_n ≈ 0.95)
-            // rather than quadratic.  For exact Newton on a smooth
-            // strongly-convex problem with an EXACT analytic Hessian,
-            // the next-iterate gradient should be O(|δ|²); with
-            // |δ| ≈ 0.14 that predicts |g_new| ≈ 0.02, but we observe
-            // |g_new|_∞ ≈ 4·10³.  That gap is the engine bug.  The
-            // diagnostic at budget exhaustion (below) surfaces which
-            // of the three plausible mechanisms is responsible.
+            // The outer objective is V(ρ) = f(β*(ρ), ρ), where β*(ρ)
+            // satisfies g(β*,ρ)=∇_β f=0.  The envelope/IFT gradient used
+            // by the outer optimizer is
+            //
+            //   dV/dρ_j = ∂f/∂ρ_j
+            //
+            // only at g=0.  At a non-stationary β, the actual chain rule is
+            //
+            //   d f(β(ρ),ρ)/dρ_j = ∂f/∂ρ_j + gᵀ ∂β/∂ρ_j.
+            //
+            // A soft certificate based only on small Δf discards the second
+            // term without proving it is small.  The projected pseudo-inverse
+            // in the outer trace path removes null-space components of g, but
+            // any range-space component still contributes gᵀ∂β/∂ρ and gives
+            // ARC/BFGS a biased outer gradient.  The `[PIRLS/JN/math]` line
+            // above now prints the actual Newton identity:
+            //
+            //   old_kkt = ‖g‖∞,
+            //   linearized_next = ‖g + Hδ‖∞ = ‖Hδ-rhs‖∞,
+            //   new_kkt = ‖g(β+δ)‖∞,
+            //   scalar_model relerr = |actual-pred|/max(1,|pred|).
+            //
+            // That is the proof surface. If `linearized_next` is tiny but
+            // `new_kkt` remains large, the solve is accurate but the Newton
+            // model is not predictive of stationarity (true nonlinearity,
+            // Hessian/gradient mismatch, or rank/constraint geometry). If
+            // `linearized_next` is large, the linear solve/operator itself is
+            // the defect. If the scalar model is accurate while the vector
+            // identity is bad, objective-only soft convergence is exactly the
+            // wrong fix.
 
             // Residual-stall early-exit. The strict and noise-floor
             // certificates above require the KKT residual to land within
@@ -12383,8 +12483,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .fold(0.0_f64, f64::max);
                 let block_diag_default = !family.exact_newton_joint_hessian_beta_dependent()
                     && specs.len() >= 2;
+                let last_math_summary = last_joint_math
+                    .as_ref()
+                    .map(|math| {
+                        format!(
+                            "last_newton_math={{old_kkt={:.3e}, linearized_next={:.3e}, actual={:+.3e}, pred={:+.3e}, rho={:+.3e}, scalar_relerr={:.3e}, step_inf={:.3e}, proposal_inf={:.3e}}}",
+                            math.old_kkt_inf,
+                            math.linearized_next_kkt_inf,
+                            math.actual_reduction,
+                            math.predicted_reduction,
+                            math.trust_ratio,
+                            math.scalar_model_relative_error(),
+                            math.step_inf,
+                            math.proposal_inf,
+                        )
+                    })
+                    .unwrap_or_else(|| "last_newton_math=<none>".to_string());
                 log::warn!(
-                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) |β|∞={:.3e} block_grad_inf={:?} block_diag_hessian_default={}; if descent total is large but per-block gradient infs are all comparable, the joint Hessian likely drops cross-block coupling (case (a)); if one block stays orders-of-magnitude larger than others, suspect gradient/Hessian inconsistency or rank deficiency (case (b)/(c)).  Returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
+                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) |β|∞={:.3e} block_grad_inf={:?} block_diag_hessian_default={} {}; if descent total is large but per-block gradient infs are all comparable, the joint Hessian likely drops cross-block coupling (case (a)); if one block stays orders-of-magnitude larger than others, suspect gradient/Hessian inconsistency or rank deficiency (case (b)/(c)).  Returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
                     cycles_done,
                     initial_joint_objective,
                     lastobjective,
@@ -12392,6 +12508,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     beta_inf_final,
                     block_grad_norms,
                     block_diag_default,
+                    last_math_summary,
                 );
             }
             let penalty_value =
