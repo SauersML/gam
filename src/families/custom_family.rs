@@ -13566,6 +13566,92 @@ fn unified_joint_efs_eval(
     }
 }
 
+fn joint_penalty_subspace_trace_parts(
+    h_joint_unpen: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    total: usize,
+    hessian_diagonal_ridge: f64,
+    penalty_logdet_ridge: f64,
+) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
+    if total == 0 {
+        return Ok((0.0, None));
+    }
+
+    let mut s_lambda = Array2::<f64>::zeros((total, total));
+    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, penalty_logdet_ridge);
+    let (s_evals, s_evecs) = s_lambda
+        .eigh(Side::Lower)
+        .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?;
+    let s_threshold = positive_eigenvalue_threshold(s_evals.as_slice().unwrap());
+    let positive_cols: Vec<usize> = (0..total).filter(|&j| s_evals[j] > s_threshold).collect();
+    let rank = positive_cols.len();
+    if rank == 0 {
+        return Ok((0.0, None));
+    }
+
+    let mut u_s = Array2::<f64>::zeros((total, rank));
+    for (out_col, &src_col) in positive_cols.iter().enumerate() {
+        for row in 0..total {
+            u_s[[row, out_col]] = s_evecs[[row, src_col]];
+        }
+    }
+
+    let mut h_times_u = Array2::<f64>::zeros((total, rank));
+    for col in 0..rank {
+        let basis = u_s.column(col).to_owned();
+        let h_col = match h_joint_unpen {
+            JointHessianSource::Dense(h_joint) => {
+                let mut out = fast_av(h_joint, &basis);
+                let penalty =
+                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge);
+                out += &penalty;
+                out
+            }
+            JointHessianSource::Operator { apply, .. } => {
+                let mut out = apply(&basis)?;
+                let penalty =
+                    apply_joint_block_penalty(ranges, s_lambdas, &basis, hessian_diagonal_ridge);
+                out += &penalty;
+                out
+            }
+        };
+        h_times_u.column_mut(col).assign(&h_col);
+    }
+
+    let mut h_proj = fast_atb(&u_s, &h_times_u);
+    symmetrize_dense_in_place(&mut h_proj);
+    let (h_evals, h_evecs) = h_proj
+        .eigh(Side::Lower)
+        .map_err(|e| format!("joint projected Hessian eigendecomposition failed: {e}"))?;
+    let h_threshold = positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
+    let logdet = exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_threshold);
+
+    let mut h_proj_inverse = Array2::<f64>::zeros((rank, rank));
+    for eig_idx in 0..rank {
+        let sigma = h_evals[eig_idx];
+        if sigma <= h_threshold {
+            continue;
+        }
+        let inv = 1.0 / sigma;
+        for i in 0..rank {
+            for j in 0..rank {
+                h_proj_inverse[[i, j]] +=
+                    inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
+            }
+        }
+    }
+    symmetrize_dense_in_place(&mut h_proj_inverse);
+
+    Ok((
+        logdet,
+        Some(PenaltySubspaceTrace {
+            u_s,
+            h_proj_inverse,
+        }),
+    ))
+}
+
 /// Shared implementation for the joint exact-Newton and surrogate outer paths.
 ///
 /// Both paths differ only in:
@@ -13594,6 +13680,7 @@ fn joint_outer_evaluate(
     include_logdet_h: bool,
     include_logdet_s: bool,
     strict_spd: bool,
+    project_hessian_logdet: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
@@ -13660,9 +13747,9 @@ fn joint_outer_evaluate(
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
-            match h_joint_unpen {
+            match &h_joint_unpen {
                 JointHessianSource::Dense(h_joint) => {
-                    let h_joint = Arc::new(h_joint);
+                    let h_joint = Arc::new(h_joint.clone());
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
@@ -13731,6 +13818,38 @@ fn joint_outer_evaluate(
                 .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
         };
+
+    let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+        ridge
+    } else {
+        0.0
+    };
+    let (projected_logdet_correction, penalty_subspace_trace) =
+        if project_hessian_logdet
+            && include_logdet_h
+            && include_logdet_s
+            && pseudo_logdet_mode == PseudoLogdetMode::Smooth
+        {
+            let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
+                &h_joint_unpen,
+                ranges,
+                &scaled_s_lambdas,
+                total,
+                scaled_joint_trace_diagonal_ridge,
+                penalty_logdet_ridge,
+            )?;
+            let correction = projected_logdet - hessian_op.logdet();
+            if kernel.is_some() {
+                log::debug!(
+                    "[OUTER hessian-route] joint penalty subspace trace installed correction={:.6e}",
+                    correction
+                );
+            }
+            (correction, kernel.map(Arc::new))
+        } else {
+            (0.0, None)
+        };
+    let hessian_logdet_correction = hessian_logdet_correction + projected_logdet_correction;
 
     let expected_theta_dim = rho.len()
         + ext_bundle
@@ -13845,6 +13964,7 @@ fn joint_outer_evaluate_efs(
     include_logdet_h: bool,
     include_logdet_s: bool,
     strict_spd: bool,
+    project_hessian_logdet: bool,
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
@@ -13906,9 +14026,9 @@ fn joint_outer_evaluate_efs(
             let s_lambdas = Arc::new(scaled_s_lambdas.clone());
             let trace_diagonal_ridge = scaled_joint_trace_diagonal_ridge
                 + rho_curvature_scale * JOINT_TRACE_STABILITY_RIDGE;
-            match h_joint_unpen {
+            match &h_joint_unpen {
                 JointHessianSource::Dense(h_joint) => {
-                    let h_joint = Arc::new(h_joint);
+                    let h_joint = Arc::new(h_joint.clone());
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
@@ -13977,6 +14097,38 @@ fn joint_outer_evaluate_efs(
                 .map_err(|e| format!("BlockCoupledOperator from joint Hessian: {e}"))?,
             )
         };
+
+    let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
+        ridge
+    } else {
+        0.0
+    };
+    let (projected_logdet_correction, penalty_subspace_trace) =
+        if project_hessian_logdet
+            && include_logdet_h
+            && include_logdet_s
+            && pseudo_logdet_mode == PseudoLogdetMode::Smooth
+        {
+            let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
+                &h_joint_unpen,
+                ranges,
+                &scaled_s_lambdas,
+                total,
+                scaled_joint_trace_diagonal_ridge,
+                penalty_logdet_ridge,
+            )?;
+            let correction = projected_logdet - hessian_op.logdet();
+            if kernel.is_some() {
+                log::debug!(
+                    "[OUTER hessian-route] joint EFS penalty subspace trace installed correction={:.6e}",
+                    correction
+                );
+            }
+            (correction, kernel.map(Arc::new))
+        } else {
+            (0.0, None)
+        };
+    let hessian_logdet_correction = hessian_logdet_correction + projected_logdet_correction;
 
     unified_joint_efs_eval(
         inner,
@@ -14224,6 +14376,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 include_logdet_h,
                 include_logdet_s,
                 strict_spd,
+                family.exact_newton_joint_hessian_beta_dependent(),
                 options,
                 rho_prior.clone(),
                 family.pseudo_logdet_mode(),
@@ -14499,6 +14652,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 include_logdet_h,
                 include_logdet_s,
                 strict_spd,
+                family.exact_newton_joint_hessian_beta_dependent(),
                 options,
                 rho_prior.clone(),
                 family.pseudo_logdet_mode(),
@@ -15671,6 +15825,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             include_logdet_h,
             include_logdet_s,
             strict_spd,
+            !hessian_beta_independent,
             eval_mode,
             options,
             rho_prior.clone(),
@@ -15791,6 +15946,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             include_logdet_h,
                             include_logdet_s,
                             strict_spd,
+                            family.exact_newton_joint_hessian_beta_dependent(),
                             EvalMode::ValueOnly,
                             options,
                             crate::types::RhoPrior::Flat,
@@ -15899,6 +16055,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             include_logdet_h,
             include_logdet_s,
             strict_spd,
+            family.exact_newton_joint_hessian_beta_dependent(),
             eval_mode,
             options,
             rho_prior.clone(),
@@ -16199,6 +16356,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         include_logdet_h,
         include_logdet_s,
         strict_spd,
+        family.exact_newton_joint_hessian_beta_dependent(),
         eval_mode,
         options,
         rho_prior,
@@ -16690,6 +16848,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         include_logdet_h,
         include_logdet_s,
         strict_spd,
+        !hessian_beta_independent,
         options,
         crate::types::RhoPrior::Flat,
         family.pseudo_logdet_mode(),
