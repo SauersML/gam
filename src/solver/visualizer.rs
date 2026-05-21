@@ -56,12 +56,6 @@ impl Log for ProgressLogger {
                 model.log_tail.pop_front();
             }
         }
-        if let Ok(guard) = active_multiprogress().lock()
-            && let Some(mp) = guard.as_ref()
-        {
-            mp.println(line).ok();
-            return;
-        }
         writeln!(io::stderr(), "{line}").ok();
     }
 
@@ -894,15 +888,7 @@ impl DumbVisualizer {
             return;
         }
         self.last_lines = lines.clone();
-        if let Some(multi) = &self.multi {
-            for line in lines {
-                multi.println(line).ok();
-            }
-        } else {
-            for line in lines {
-                writeln!(io::stderr(), "{line}").ok();
-            }
-        }
+        let _ = lines;
     }
 
     fn teardown(&mut self, model: &VisualizerModel) {
@@ -1014,30 +1000,19 @@ impl VisualizerSession {
         if !enabled {
             return Self::default();
         }
-        // New activation rule: try /dev/tty first, fall back to Dumb on
-        // failure. We DON'T require stdout/stderr to be TTYs — when the
-        // user runs through `tee` (run.sh does this to capture the run
-        // file), stdout/stderr are pipes and the old rule disabled the
-        // chart entirely. Routing the chart to /dev/tty decouples it
-        // from the logging pipeline so both can run at once: chart on
-        // the real terminal, logs flowing through the tee to a file.
-        //
-        // When the process has no controlling terminal at all (cron,
-        // systemd, sandbox) /dev/tty open fails and we land in Dumb
-        // mode, which keeps emitting line-based progress on stderr —
-        // same behavior as before for headless runners. The notebook
-        // text-only flag is preserved for that fall-through so Jupyter
-        // notebook cells still get the compact text renderer.
-        // text_only is unconditionally true on the fall-through path:
-        // by definition we landed here because we have no usable
-        // /dev/tty, so the MultiProgress draw target (which writes
-        // ANSI to stderr) would garble whatever pipe is on the other
-        // end of stderr. The line-based renderer is safe through any
-        // pipe, including `tee`.
+        // Disable live progress rendering. The renderer's carriage/cursor
+        // control interacts badly with captured biobank logs and makes the
+        // canonical run file harder to read than plain records. Keep an
+        // active feed so solver internals can still publish progress samples,
+        // but route the session to a silent dumb renderer.
         let _ = should_use_text_only_progress();
-        let state_inner = match InteractiveVisualizer::new() {
-            Ok(v) => VisualizerState::Interactive(v),
-            Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
+        let state_inner = if live_visualization_enabled() {
+            match InteractiveVisualizer::new() {
+                Ok(v) => VisualizerState::Interactive(v),
+                Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
+            }
+        } else {
+            VisualizerState::Dumb(DumbVisualizer::new(true))
         };
         let session = Self {
             state: Arc::new(Mutex::new(state_inner)),
@@ -1690,6 +1665,10 @@ fn normalize_total(total: usize) -> usize {
 
 fn should_use_text_only_progress() -> bool {
     !io::stdout().is_terminal() || !io::stderr().is_terminal()
+}
+
+fn live_visualization_enabled() -> bool {
+    false
 }
 
 fn started_lane(label: &str, total: usize) -> LaneState {
