@@ -15053,8 +15053,8 @@ mod tests {
 
         // Honest reference: pseudo-inverse evaluated on the noise-free r
         // (gives the correction we'd see at exact inner KKT).
-        let corr_honest = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_honest, &a_k);
-        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_total, &a_k);
+        let corr_honest = kernel.bilinear_pseudo_inverse(&r_honest, &a_k);
+        let corr_proj = kernel.bilinear_pseudo_inverse(&r_total, &a_k);
         let corr_full = full_h_inv_bilinear(&h_full, &r_total, &a_k);
 
         // Projected pseudo-inverse: matches the honest reference exactly
@@ -15089,7 +15089,7 @@ mod tests {
         let r = array![0.0_f64, 0.0, 0.0, 0.0, eta];
         let a_k = array![0.0_f64, 0.0, 0.0, 0.0, xi];
 
-        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_proj = kernel.bilinear_pseudo_inverse(&r, &a_k);
         let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
 
         // Projection: U_Sᵀ kills both r and a_k entirely (they live in
@@ -15138,7 +15138,7 @@ mod tests {
         let r = array![eta, 0.0, 0.0, 0.0, 0.0]; // noise in e_0, which is in range(S_+)
         let a_k = array![xi, 0.0, 0.0, 0.0, 0.0];
 
-        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_proj = kernel.bilinear_pseudo_inverse(&r, &a_k);
         let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
 
         // Both methods give the same blow-up `ηξ/σ_min = 1e6` because
@@ -15173,7 +15173,7 @@ mod tests {
         let r = array![0.3_f64, -0.7, 1.2, 0.4, 0.0]; // honest in range(S_+)
         let a_k = array![0.5_f64, 0.1, -0.2, 0.8, 0.0]; // honest in range(S_+)
 
-        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_proj = kernel.bilinear_pseudo_inverse(&r, &a_k);
         let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
 
         assert_relative_eq!(corr_proj, corr_full, max_relative = 1e-12);
@@ -15338,10 +15338,10 @@ mod tests {
 
         // Honest reference: what the correction SHOULD be — the projected
         // pseudo-inverse on r_clean (no noise) and a_k.
-        let corr_honest = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_clean, &a_k);
+        let corr_honest = kernel.bilinear_pseudo_inverse(&r_clean, &a_k);
 
         // Production-shape inputs (with FP noise on r):
-        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_total, &a_k);
+        let corr_proj = kernel.bilinear_pseudo_inverse(&r_total, &a_k);
         let corr_full = dense_h_inv_bilinear_via_eig(&h_full, &r_total, &a_k);
 
         // The projected helper is INDIFFERENT to r's null contamination —
