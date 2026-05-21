@@ -525,11 +525,12 @@ pub fn build_smooth_basis(
     // the same diagnosis explicit and uniform across smooth families.
     for (var, &col) in vars.iter().zip(cols.iter()) {
         if unique_count_column(ds.values.column(col)) <= 1 {
-            return Err(format!(
+            return Err(TermBuilderError::degenerate_data(format!(
                 "smooth term over '{var}' has only one unique value in the training data \
                  — a smooth on a constant column is degenerate and would only fit the response mean. \
                  Remove `{var}` from the smooth, drop the term, or check the data."
-            ));
+            ))
+            .to_string());
         }
     }
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
@@ -576,21 +577,22 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if cols.len() != 2 {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "{} smooth currently expects exactly two variables: one continuous and one categorical/group variable",
                     type_opt
-                ));
+                ))
+                .to_string());
             }
             let k0 = ds
                 .column_kinds
                 .get(cols[0])
                 .copied()
-                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+                .ok_or_else(|| TermBuilderError::missing_column("column-kind lookup failed").to_string())?;
             let k1 = ds
                 .column_kinds
                 .get(cols[1])
                 .copied()
-                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+                .ok_or_else(|| TermBuilderError::missing_column("column-kind lookup failed").to_string())?;
             // Binary columns are 2-level discrete variables and are valid as
             // the grouping factor here. We require one column to be a discrete
             // grouping variable (Categorical or Binary) and the other to be
@@ -601,27 +603,30 @@ pub fn build_smooth_basis(
                 (ColumnKindTag::Binary, ColumnKindTag::Continuous) => (0usize, 1usize),
                 (ColumnKindTag::Continuous, ColumnKindTag::Binary) => (1usize, 0usize),
                 _ => {
-                    return Err(format!(
+                    return Err(TermBuilderError::incompatible_config(format!(
                         "{} smooth requires one categorical/binary grouping variable and one numeric variable, got kinds {:?} and {:?}",
                         type_opt, k0, k1
-                    ));
+                    ))
+                    .to_string());
                 }
             };
             let group_col = cols[group_idx];
             let cont_col = cols[cont_idx];
-            let levels = sorted_levels_for_column(ds.values.column(group_col))?;
+            let levels = sorted_levels_for_column(ds.values.column(group_col))
+                .map_err(|e| e.to_string())?;
             let degree = option_usize(options, "degree").unwrap_or(3);
             let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
             let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
             let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
             let n_knots = if let Some(k) = k {
                 if k < degree + 1 {
-                    return Err(format!(
+                    return Err(TermBuilderError::invalid_option(format!(
                         "factor smooth: k={} too small for degree {}; expected k >= {}",
                         k,
                         degree,
                         degree + 1
-                    ));
+                    ))
+                    .to_string());
                 }
                 k - degree - 1
             } else {
@@ -691,35 +696,41 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if cols.len() < 2 {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "tensor smooth requires >=2 variables: {}",
                     vars.join(", ")
-                ));
+                ))
+                .to_string());
             }
             let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             let degree = 3usize;
-            let knots_internal = option_usize_list_any(options, &["knots"])?
+            let knots_internal = option_usize_list_any(options, &["knots"])
+                .map_err(|e| e.to_string())?
                 .map(|v| expand_margin_usize_option("knots", v, cols.len()))
-                .transpose()?;
+                .transpose()
+                .map_err(|e| e.to_string())?;
             let basis_dim =
-                option_usize_list_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])?
+                option_usize_list_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                    .map_err(|e| e.to_string())?
                     .map(|v| expand_margin_usize_option("k", v, cols.len()))
-                    .transpose()?;
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
             if knots_internal.is_some() && basis_dim.is_some() {
-                return Err(
-                    "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
-                        .to_string(),
-                );
+                return Err(TermBuilderError::incompatible_config(
+                    "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)",
+                )
+                .to_string());
             }
             let inferred = knots_internal.is_none() && basis_dim.is_none();
             let mut internal_knots_by_dim = if let Some(k_values) = basis_dim {
                 let min_k = degree + 1;
                 for &k in &k_values {
                     if k < min_k {
-                        return Err(format!(
+                        return Err(TermBuilderError::invalid_option(format!(
                             "tensor smooth: k={} too small for degree {}; expected k >= {}",
                             k, degree, min_k
-                        ));
+                        ))
+                        .to_string());
                     }
                 }
                 k_values.into_iter().map(|k| k - min_k).collect()
@@ -750,10 +761,12 @@ pub fn build_smooth_basis(
                         .join(", ")
                 ));
             }
-            validate_tensor_bc_entries(options, cols.len())?;
-            let periodic_axes = parse_periodic_axes(options, cols.len())?;
-            let periods = parse_periods(options, &periodic_axes)?;
-            let origins = parse_period_origins(options, &periodic_axes)?;
+            validate_tensor_bc_entries(options, cols.len()).map_err(|e| e.to_string())?;
+            let periodic_axes =
+                parse_periodic_axes(options, cols.len()).map_err(|e| e.to_string())?;
+            let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
+            let origins =
+                parse_period_origins(options, &periodic_axes).map_err(|e| e.to_string())?;
             let specs = cols
                 .iter()
                 .enumerate()
@@ -762,10 +775,11 @@ pub fn build_smooth_basis(
                     let n_knots = internal_knots_by_dim[dim];
                     let knotspec = if periodic_axes[dim] {
                         let period = periods[dim].ok_or_else(|| {
-                            format!(
+                            TermBuilderError::incompatible_config(format!(
                                 "periodic tensor margin {} ('{}') requires period=[...] entry",
                                 dim, vars[dim]
-                            )
+                            ))
+                            .to_string()
                         })?;
                         let domain_start = origins[dim].unwrap_or(minv);
                         BSplineKnotSpec::PeriodicUniform {
@@ -793,7 +807,8 @@ pub fn build_smooth_basis(
                 spec: TensorBSplineSpec {
                     marginalspecs: specs,
                     double_penalty: tensor_double_penalty,
-                    identifiability: parse_tensor_identifiability(options)?,
+                    identifiability: parse_tensor_identifiability(options)
+                        .map_err(|e| e.to_string())?,
                 },
             })
         }
@@ -823,10 +838,11 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if cols.len() != 1 {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "periodic smooth expects one variable, got {}",
                     cols.len()
-                ));
+                ))
+                .to_string());
             }
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
@@ -839,14 +855,16 @@ pub fn build_smooth_basis(
             let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
                 .unwrap_or(default_basis);
             if num_basis < degree + 1 {
-                return Err(format!(
+                return Err(TermBuilderError::invalid_option(format!(
                     "periodic smooth: k={} too small for degree {}; expected k >= {}",
                     num_basis,
                     degree,
                     degree + 1
-                ));
+                ))
+                .to_string());
             }
-            let (domain_start, period) = parse_periodic_domain_1d(options, minv, maxv)?;
+            let (domain_start, period) =
+                parse_periodic_domain_1d(options, minv, maxv).map_err(|e| e.to_string())?;
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
@@ -902,10 +920,11 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if cols.len() != 1 {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "bspline smooth expects one variable, got {}",
                     cols.len()
-                ));
+                ))
+                .to_string());
             }
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
@@ -927,27 +946,28 @@ pub fn build_smooth_basis(
                     ceiling,
                 ));
             }
-            let periodic_axes = parse_periodic_axes(options, 1)?;
+            let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
             let boundary_conditions =
                 if periodic_axes[0] && bspline_bc_declares_periodic_axis(options) {
                     BSplineBoundaryConditions::default()
                 } else {
-                    parse_bspline_boundary_conditions(options)?
+                    parse_bspline_boundary_conditions(options).map_err(|e| e.to_string())?
                 };
-            let periods = parse_periods(options, &periodic_axes)?;
-            let origins = parse_period_origins(options, &periodic_axes)?;
+            let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
+            let origins =
+                parse_period_origins(options, &periodic_axes).map_err(|e| e.to_string())?;
             let knotspec = if periodic_axes[0] {
                 if !boundary_conditions.is_free() {
-                    return Err(
-                        "periodic B-splines cannot also declare endpoint boundary conditions"
-                            .to_string(),
-                    );
+                    return Err(TermBuilderError::incompatible_config(
+                        "periodic B-splines cannot also declare endpoint boundary conditions",
+                    )
+                    .to_string());
                 }
                 {
                     let (domain_start, p_value) = if periods[0].is_some() {
                         (origins[0].unwrap_or(minv), periods[0].unwrap())
                     } else {
-                        parse_periodic_domain_1d(options, minv, maxv)?
+                        parse_periodic_domain_1d(options, minv, maxv).map_err(|e| e.to_string())?
                     };
                     BSplineKnotSpec::PeriodicUniform {
                         data_range: (domain_start, domain_start + p_value),
@@ -1020,7 +1040,8 @@ pub fn build_smooth_basis(
                     // init sentinel.
                     length_scale: option_f64_strict(options, "length_scale")?.unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
-                    identifiability: parse_spatial_identifiability(options)?,
+                    identifiability: parse_spatial_identifiability(options)
+                        .map_err(|e| e.to_string())?,
                     radial_reparam: None,
                 },
                 input_scales: None,
@@ -1061,10 +1082,11 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if cols.len() != 2 {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "sphere smooth expects exactly two variables (latitude, longitude), got {}",
                     cols.len()
-                ));
+                ))
+                .to_string());
             }
             let plan = plan_spatial_basis(
                 ds.values.nrows(),
@@ -1084,9 +1106,10 @@ pub fn build_smooth_basis(
                 .or_else(|| option_usize(options, "penalty_order"))
                 .unwrap_or(2);
             if !(1..=4).contains(&penalty_order) {
-                return Err(format!(
+                return Err(TermBuilderError::invalid_option(format!(
                     "sphere smooth penalty order must be one of 1, 2, 3, 4; got {penalty_order}"
-                ));
+                ))
+                .to_string());
             }
             let radians = option_bool(options, "radians").unwrap_or_else(|| {
                 options
@@ -1130,10 +1153,11 @@ pub fn build_smooth_basis(
                 | Some("spherical-harmonics")
                 | Some("sh") => (crate::basis::SphereMethod::Harmonic, None),
                 Some(other) => {
-                    return Err(format!(
+                    return Err(TermBuilderError::unsupported_feature(format!(
                         "unsupported sphere method '{other}'; use one of: \
                          wahba | wahba_sobolev (default Wahba) | wahba_pseudo (mgcv `bs=\"sos\"` compatible) | harmonic"
-                    ));
+                    ))
+                    .to_string());
                 }
             };
             // Also accept an explicit `kernel=` option for users who set
