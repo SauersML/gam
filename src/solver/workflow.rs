@@ -3933,20 +3933,7 @@ fn materialize_transformation_normal<'a>(
             offset,
             covariate_spec,
             config: TransformationNormalConfig::default(),
-            options: BlockwiseFitOptions {
-                // The transformation-normal joint inner solve is jointly over
-                // (covariate β, monotone response basis ψ) with an h(y;ψ) that
-                // nonlinearly couples the two. Skewed-y datasets (Gamma,
-                // log-normal, heavy-tail) routinely need more than the
-                // 100-cycle default before the joint Newton settles; without
-                // the bigger budget the outer REML loop sees a stream of
-                // "inner solve did not converge after 100 cycle(s)" and
-                // refuses to use the inner state for derivatives, eventually
-                // killing the whole fit. Other families' inner solves don't
-                // share this coupling and can keep the smaller default.
-                inner_max_cycles: 300,
-                ..Default::default()
-            },
+            options: BlockwiseFitOptions::default(),
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
             warm_start: None,
         }),
