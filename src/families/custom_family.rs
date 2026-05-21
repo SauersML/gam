@@ -22345,7 +22345,7 @@ mod tests {
             inner_tol: 0.0,
             outer_max_iter: 1,
             outer_tol: 1e-8,
-            minweight: 1e-12,
+            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             ridge_floor: 1e-4,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: false,
@@ -22390,7 +22390,7 @@ mod tests {
             inner_tol: 1e-10,
             outer_max_iter: 1,
             outer_tol: 1e-8,
-            minweight: 1e-12,
+            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             ridge_floor: 0.0,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: false,
@@ -22438,7 +22438,7 @@ mod tests {
             inner_tol: 0.0,
             outer_max_iter: 1,
             outer_tol: 1e-8,
-            minweight: 1e-12,
+            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             ridge_floor: 1.0,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: false,
@@ -22600,7 +22600,7 @@ mod tests {
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
             inner_tol: 1e-10,
-            ridge_floor: 1e-12,
+            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
             ..BlockwiseFitOptions::default()
         };
         let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
@@ -22922,7 +22922,7 @@ mod tests {
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
-            ridge_floor: 1e-12,
+            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
             compute_covariance: false,
             ..BlockwiseFitOptions::default()
         };
@@ -24725,7 +24725,7 @@ mod tests {
         symmetrize_dense_in_place(&mut sym);
         let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
         let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+        let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
         let mut want = Array1::<f64>::zeros(p);
         for k in 0..p {
             let mut q_t_rhs = 0.0;
@@ -24770,7 +24770,7 @@ mod tests {
         symmetrize_dense_in_place(&mut sym);
         let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
         let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+        let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
         let want: f64 = evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum();
         let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
         assert!(
