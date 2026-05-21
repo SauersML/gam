@@ -5213,7 +5213,7 @@ impl SurvivalMarginalSlopeFamily {
                 64,
             );
         }
-        let solution = solve_result?;
+        let solution = solve_result.map_err(|e| e.to_string())?;
         let a = solution.root;
         // The solver already evaluated `eval` at `solution.root` during the
         // refine loop and returned the resulting `residual` (best_f) and

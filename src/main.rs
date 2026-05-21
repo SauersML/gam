@@ -1405,7 +1405,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         payload.unified = Some(saved_fit.clone());
         payload.fit_result = Some(saved_fit.clone());
         payload.data_schema = Some(ds.schema.clone());
-        payload.link = link_choice.as_ref().map(link_choice_to_string);
+        payload.link = inverse_link_from_fitted_link_state(&saved_fit.fitted_link);
         if let Some((wiggle_knots, wiggle_degree)) = standard_wiggle_meta {
             payload.linkwiggle_knots = Some(wiggle_knots);
             payload.linkwiggle_degree = Some(wiggle_degree);
@@ -2000,7 +2000,7 @@ fn run_fitwith_predict_noise(
             let mut model = build_location_scale_saved_model(
                 formula_text.to_string(),
                 FAMILY_GAUSSIAN_LOCATION_SCALE.to_string(),
-                link_choice.map(link_choice_to_string),
+                link_choice.map(|choice| InverseLink::Standard(choice.link)),
                 ds.schema.clone(),
                 noise_formula.clone(),
                 ds.headers.clone(),
@@ -2188,7 +2188,7 @@ fn run_fitwith_predict_noise(
         let mut model = build_location_scale_saved_model(
             formula_text.to_string(),
             FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
-            Some(location_scale_link_kind.saved_string()),
+            Some(location_scale_link_kind.clone()),
             ds.schema.clone(),
             noise_formula,
             ds.headers.clone(),
@@ -4532,7 +4532,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.unified = Some(fit_result.clone());
             payload.fit_result = Some(fit_result);
             payload.data_schema = Some(ds.schema.clone());
-            payload.link = Some(fitted_inverse_link.saved_string());
+            payload.link = Some(fitted_inverse_link.clone());
             payload.linkwiggle_degree = fit.wiggle_degree;
             payload.beta_link_wiggle = fit.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec());
             payload.linkwiggle_knots = fit.wiggle_knots.as_ref().map(|k| k.to_vec());
@@ -6606,7 +6606,7 @@ fn set_training_feature_metadata_from_dataset(payload: &mut FittedModelPayload, 
 fn build_location_scale_saved_model(
     formula: String,
     family: String,
-    link: Option<String>,
+    link: Option<InverseLink>,
     data_schema: DataSchema,
     noise_formula: String,
     training_headers: Vec<String>,
@@ -7019,7 +7019,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     payload.marginal_baseline = Some(baseline_marginal);
     payload.logslope_baseline = Some(baseline_logslope);
     payload.logslope_baselines = Some(vec![baseline_logslope]);
-    payload.link = Some(base_link.saved_string());
+    payload.link = Some(base_link.clone());
     payload.set_training_feature_metadata(training_headers, training_feature_ranges);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
@@ -7942,6 +7942,17 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
         out.push(parsed);
     }
     Ok(out)
+}
+
+fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Option<InverseLink> {
+    match state {
+        FittedLinkState::Standard(Some(link)) => Some(InverseLink::Standard(*link)),
+        FittedLinkState::Standard(None) => None,
+        FittedLinkState::LatentCLogLog { state } => Some(InverseLink::LatentCLogLog(*state)),
+        FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(*state)),
+        FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(*state)),
+        FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state.clone())),
+    }
 }
 
 fn link_choice_to_string(choice: &LinkChoice) -> String {
@@ -9402,7 +9413,8 @@ mod tests {
                 1e-12,
                 64,
                 64,
-            )?;
+            )
+            .map_err(|e| e.to_string())?;
             let target_survival = gam::probability::normal_cdf(-q);
             let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);
             let probability_tol = 1e-12_f64.max(1e-8 * tail_mass);
@@ -9768,7 +9780,10 @@ mod tests {
         .expect("location-scale fit should succeed");
 
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
-        assert_eq!(saved.link.as_deref(), Some("logit"));
+        assert_eq!(
+            saved.link.as_ref(),
+            Some(&InverseLink::Standard(LinkFunction::Logit))
+        );
         match &saved.family_state {
             FittedFamily::LocationScale {
                 likelihood,
@@ -9966,7 +9981,10 @@ mod tests {
         .expect("explicit probit location-scale fit should succeed");
 
         let saved = SavedModel::load_from_path(&model_path).expect("load fitted model");
-        assert_eq!(saved.link.as_deref(), Some("probit"));
+        assert_eq!(
+            saved.link.as_ref(),
+            Some(&InverseLink::Standard(LinkFunction::Probit))
+        );
         match &saved.family_state {
             FittedFamily::LocationScale {
                 likelihood,
@@ -10235,7 +10253,7 @@ mod tests {
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
         payload.marginal_baseline = Some(0.0);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload.score_warp_runtime = Some(saved_runtime());
         payload.link_deviation_runtime = Some(saved_runtime());
 
@@ -10638,7 +10656,7 @@ mod tests {
             "binomial-location-scale",
         );
         payload.fit_result = Some(fit_result);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload.formula_noise = Some("1".to_string());
         payload.beta_noise = Some(vec![beta_ls]);
         payload.linkwiggle_knots = wiggle_knots;
@@ -10699,7 +10717,7 @@ mod tests {
             family.name(),
         );
         payload.fit_result = Some(fit_result);
-        payload.link = Some(link.name().to_string());
+        payload.link = Some(InverseLink::Standard(link));
         payload.linkwiggle_knots = Some(wiggle_knots);
         payload.linkwiggle_degree = Some(wiggle_degree);
         payload.set_training_feature_metadata(vec![], vec![]);
@@ -11766,7 +11784,10 @@ mod tests {
         );
         assert_eq!(model.payload().marginal_baseline, Some(0.0));
         assert_eq!(model.payload().logslope_baseline, Some(0.0));
-        assert_eq!(model.payload().link.as_deref(), Some("probit"));
+        assert_eq!(
+            model.payload().link.as_ref(),
+            Some(&InverseLink::Standard(LinkFunction::Probit))
+        );
         assert_eq!(
             model
                 .resolved_inverse_link()
@@ -13033,7 +13054,7 @@ mod tests {
         // latent-z policy.
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         let model = SavedModel::from_payload(payload);
 
         let cov_design = nondensify_design(cov_dense.clone());
@@ -13213,7 +13234,7 @@ mod tests {
         // measure (the frozen default) is correct.
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         let model = SavedModel::from_payload(payload);
         model
             .validate_for_persistence()
@@ -15183,7 +15204,7 @@ mod tests {
             },
             "binomial-location-scale",
         );
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload.linkwiggle_knots = Some(knots);
         payload.linkwiggle_degree = Some(3);
         payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
@@ -15374,7 +15395,7 @@ mod tests {
             },
             "binomial-location-scale",
         );
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         let model = SavedModel::from_payload(payload);
         let design = test_saved_linkwiggle_design(&q0, &model).expect("wiggle design");
         assert!(design.is_none());
@@ -15391,7 +15412,7 @@ mod tests {
             },
             "binomial-location-scale",
         );
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload.linkwiggle_knots = Some(vec![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0]);
         payload.linkwiggle_degree = Some(2);
         let model = SavedModel::from_payload(payload);

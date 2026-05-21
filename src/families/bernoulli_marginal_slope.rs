@@ -3391,6 +3391,7 @@ pub(crate) fn empirical_intercept_from_marginal(
             64,
             48,
         )
+        .map_err(|e| e.to_string())
     };
     // A cached warm start can be poisoned across iterations: the per-row
     // `intercept_warm_starts` slot is shared by reference across line-search
@@ -7744,7 +7745,7 @@ impl BernoulliMarginalSlopeFamily {
                 48,
             );
         }
-        let solve_solution = solve_result?;
+        let solve_solution = solve_result.map_err(|e| e.to_string())?;
         if let Some(stats) = stats {
             stats.record_full_solver(solve_solution.refine_iters);
         }
