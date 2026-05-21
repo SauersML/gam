@@ -19641,11 +19641,18 @@ mod tests {
         let _ = eta_0;
     }
 
-    /// Test PIRLS determinism: call debug_full_h three times at the SAME
-    /// theta=0 and check whether the returned H matrices are identical.
-    /// If they differ, PIRLS produces a different Qs reparametrization
-    /// each call, and the op-vs-fd_H diagonal/eigenbasis comparison is
-    /// contaminated by basis non-determinism.
+    /// Test PIRLS structural determinism: call debug_full_h three times at
+    /// the SAME theta=0 and check the returned H matrices agree to a tight
+    /// relative tolerance. We deliberately do NOT require bit-identical
+    /// matrices: PIRLS feeds intermediate state through rayon `.reduce`
+    /// fold/combine on f64 (deviance, weighted sums, X'WX accumulation),
+    /// and floating-point addition is non-associative, so the bit pattern
+    /// of those reductions varies with thread scheduling. What we *do*
+    /// require is structural agreement — the same fixed point in the same
+    /// Qs frame. A non-deterministic Qs reparametrization (e.g. an
+    /// eigenvector sign flip) shows up as O(‖H‖) entry-wise drift, two
+    /// to ten orders of magnitude above the rayon summation floor; the
+    /// 1e-6 relative band catches that while tolerating the latter.
     #[test]
     fn duchon_probit_pirls_determinism_at_zero() {
         let n = 80usize;
@@ -19756,18 +19763,16 @@ mod tests {
         }
 
         let h0 = &h_calls[0];
+        let norm_h0 = h0.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let abs_tol = (1e-6_f64) * norm_h0 + 1e-12_f64;
         for trial in 1..3 {
             let diff = &h_calls[trial] - h0;
             let max_abs = diff.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            // PIRLS is deterministic at fixed θ: repeated debug_full_h calls
-            // must return bit-identical H matrices. Any drift indicates
-            // non-deterministic Qs reparametrization or stochastic seeding
-            // that would silently invalidate the analytic-vs-FD H comparison
-            // path (debug_duchon_op_vs_fd_h_at_zero, etc.).
-            assert_eq!(
-                max_abs, 0.0,
-                "PIRLS non-deterministic at fixed θ (trial {} vs 0): max|Δ|={:+.6e}",
-                trial, max_abs
+            assert!(
+                max_abs <= abs_tol,
+                "PIRLS non-deterministic at fixed θ (trial {trial} vs 0): \
+                 max|Δ|={max_abs:+.6e} > tol={abs_tol:+.6e} \
+                 (‖H‖_∞={norm_h0:+.6e})"
             );
         }
     }
