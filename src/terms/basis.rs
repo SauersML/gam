@@ -2767,7 +2767,15 @@ pub struct DuchonBasisSpec {
     /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
     /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
     pub length_scale: Option<f64>,
-    /// Integer spectral power `s`.
+    /// Integer spectral power `s`. The Riesz/polyharmonic closed form
+    /// admits any positive real `s`, but the current integer-only
+    /// signature forces high-`d` callers to ratchet the polynomial
+    /// null-space order `m` to satisfy `2(m + s) > d`. The natural fix
+    /// is `s: f64` plus a fractional Riesz path
+    /// (`r.powf(2 j − d)` already does the right thing in
+    /// `riesz_kernel_value`); the validator and convergence predicate
+    /// need updating in lockstep. Tracked as Tier 1 #1 in the
+    /// construction plan.
     pub power: usize,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
