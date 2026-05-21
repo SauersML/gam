@@ -28488,7 +28488,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
             length_scale: None,
-            power: 3.5,
+            power: 3.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,

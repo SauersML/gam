@@ -1663,16 +1663,38 @@ struct IteratePayload {
     /// Bump on incompatible payload changes; decode rejects mismatches.
     schema: u32,
     rho: Vec<f64>,
+    /// Inner-solver iterate (PIRLS β) captured alongside ρ. The (ρ, β)
+    /// pair lives on the implicit-function manifold β = β*(ρ); restoring
+    /// ρ alone forces the next inner solve to reconstruct β from scratch.
+    /// For saturated ρ (|ρ_i| near `rho_bound`) the inner Hessian
+    /// `X'WX + Σ λ_i S_i` has condition number `≈ e^{2·rho_bound}` — Newton
+    /// degrades to O(1/k) descent and the cycle budget exhausts before
+    /// KKT. Caching β lets the resume start in Newton's quadratic basin
+    /// regardless of where ρ lives. Empty when the family did not surface
+    /// an inner-β hint at write time (still useful as a ρ-only seed).
+    #[serde(default)]
+    beta: Vec<f64>,
     cost: f64,
     eval_id: u64,
 }
 
-const ITERATE_PAYLOAD_SCHEMA: u32 = 1;
+/// Bumped 1 → 2 (2026-05-21): schema 2 entries carry β alongside ρ.
+/// Pre-2 entries — produced by binaries that stored ρ-only — decode to
+/// `None` here. This orphans poisoned v1 checkpoints whose resume value
+/// at boundary ρ depended on cold β = 0 and could not be re-warmed,
+/// which manifested as inner-PIRLS budget exhaustion on subsequent runs.
+const ITERATE_PAYLOAD_SCHEMA: u32 = 2;
 
-fn encode_iterate(rho: &Array1<f64>, cost: f64, eval_id: u64) -> Option<Vec<u8>> {
+fn encode_iterate(
+    rho: &Array1<f64>,
+    beta: Option<&Array1<f64>>,
+    cost: f64,
+    eval_id: u64,
+) -> Option<Vec<u8>> {
     let p = IteratePayload {
         schema: ITERATE_PAYLOAD_SCHEMA,
         rho: rho.to_vec(),
+        beta: beta.map(|b| b.to_vec()).unwrap_or_default(),
         cost,
         eval_id,
     };
@@ -1688,6 +1710,9 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
         return None;
     }
     if !p.rho.iter().all(|x| x.is_finite()) || !p.cost.is_finite() {
+        return None;
+    }
+    if !p.beta.iter().all(|x| x.is_finite()) {
         return None;
     }
     Some(p)
@@ -1721,6 +1746,12 @@ struct CheckpointingObjective<'a> {
     session: Arc<CacheSession>,
     mirror_sessions: Vec<Arc<CacheSession>>,
     eval_counter: AtomicU64,
+    /// Most-recent inner β surfaced via [`OuterEval::inner_beta_hint`]. The
+    /// finalize path reads this so the `kind: Final` write encodes the
+    /// (ρ, β) pair that the BFGS optimum was actually fitted at — without
+    /// this the finalize would clobber per-eval checkpoint β state with a
+    /// ρ-only payload, reintroducing the cold-β resume failure.
+    last_inner_beta: std::sync::Mutex<Option<Array1<f64>>>,
 }
 
 impl<'a> CheckpointingObjective<'a> {
@@ -1734,15 +1765,33 @@ impl<'a> CheckpointingObjective<'a> {
             session,
             mirror_sessions,
             eval_counter: AtomicU64::new(0),
+            last_inner_beta: std::sync::Mutex::new(None),
         }
     }
 
-    fn note(&self, rho: &Array1<f64>, cost: f64) {
+    fn last_inner_beta(&self) -> Option<Array1<f64>> {
+        self.last_inner_beta
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    fn note(&self, rho: &Array1<f64>, beta: Option<&Array1<f64>>, cost: f64) {
         if !cost.is_finite() {
             return;
         }
+        // If β is provided, require it to be finite; non-finite β is a
+        // divergent inner state — persisting it would re-poison the cache.
+        if let Some(b) = beta {
+            if !b.iter().all(|v| v.is_finite()) {
+                return;
+            }
+            if let Ok(mut guard) = self.last_inner_beta.lock() {
+                *guard = Some(b.clone());
+            }
+        }
         let i = self.eval_counter.fetch_add(1, Ordering::Relaxed);
-        if let Some(bytes) = encode_iterate(rho, cost, i) {
+        if let Some(bytes) = encode_iterate(rho, beta, cost, i) {
             self.session.checkpoint(&bytes, Some(cost), Some(i));
             for mirror in &self.mirror_sessions {
                 mirror.checkpoint(&bytes, Some(cost), Some(i));
@@ -1758,7 +1807,8 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         let v = self.inner.eval_cost(rho)?;
-        self.note(rho, v);
+        // `eval_cost` carries no inner-β handle — persist ρ-only.
+        self.note(rho, None, v);
         Ok(v)
     }
 
@@ -1770,7 +1820,7 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let r = self.inner.eval(rho)?;
-        self.note(rho, r.cost);
+        self.note(rho, r.inner_beta_hint.as_ref(), r.cost);
         Ok(r)
     }
 
@@ -1780,13 +1830,14 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         order: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
         let r = self.inner.eval_with_order(rho, order)?;
-        self.note(rho, r.cost);
+        self.note(rho, r.inner_beta_hint.as_ref(), r.cost);
         Ok(r)
     }
 
     fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
         let r = self.inner.eval_efs(rho)?;
-        self.note(rho, r.cost);
+        // EfsEval has no inner-β hint surface yet — persist ρ-only.
+        self.note(rho, None, r.cost);
         Ok(r)
     }
 
@@ -4464,11 +4515,19 @@ impl OuterProblem {
             config.cache_mirror_sessions.clone(),
         );
         let result = run_outer(&mut checkpointing, &config, context);
+        // Pull the most-recent inner β surfaced by the inner solver so the
+        // finalize write encodes the (ρ, β) pair the BFGS optimum was
+        // actually fitted at, not a ρ-only seed that resumes at cold β.
+        let final_beta = checkpointing.last_inner_beta();
         if let Ok(result) = result.as_ref()
             && result.final_value.is_finite()
             && result.converged
-            && let Some(bytes) =
-                encode_iterate(&result.rho, result.final_value, result.iterations as u64)
+            && let Some(bytes) = encode_iterate(
+                &result.rho,
+                final_beta.as_ref(),
+                result.final_value,
+                result.iterations as u64,
+            )
         {
             let saved = session.finalize(
                 &bytes,
@@ -8491,15 +8550,15 @@ mod tests {
     #[test]
     fn checkpointing_objective_rejects_wrong_dim_on_decode() {
         // A payload from a 3-dim fit is invalid input for a 5-dim resume.
-        let bytes = encode_iterate(&array![1.0, 2.0, 3.0], 0.5, 0).expect("encode");
+        let bytes = encode_iterate(&array![1.0, 2.0, 3.0], None, 0.5, 0).expect("encode");
         assert!(decode_iterate(&bytes, 3).is_some());
         assert!(decode_iterate(&bytes, 5).is_none());
     }
 
     #[test]
     fn cache_entry_seed_validity_rejects_all_saturated_payload() {
-        let usable_payload = encode_iterate(&array![9.0, 0.0], 1.0, 0).expect("encode");
-        let poisoned_payload = encode_iterate(&array![10.0, -10.0], 1.0, 0).expect("encode");
+        let usable_payload = encode_iterate(&array![9.0, 0.0], None, 1.0, 0).expect("encode");
+        let poisoned_payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
         let usable = crate::cache::CachedEntry {
             payload: usable_payload,
             objective: Some(1.0),
@@ -8566,7 +8625,7 @@ mod tests {
         // Hand-write the cached checkpoint: rho = [2.5], cost = 0.25.
         // Final exact hits return immediately; checkpoints still exercise the
         // regular seed-prepend path.
-        let payload = encode_iterate(&array![2.5], 0.25, 0).expect("encode");
+        let payload = encode_iterate(&array![2.5], None, 0.25, 0).expect("encode");
         session.checkpoint(&payload, Some(0.25), Some(0));
         assert!(
             session.try_load().is_some(),
@@ -8624,7 +8683,7 @@ mod tests {
     #[test]
     fn all_saturated_cached_rho_is_discarded_before_seed_validation() {
         let (_d, session) = tmp_cache_session("all-saturated-discard");
-        let payload = encode_iterate(&array![10.0, -10.0], 1.0, 0).expect("encode");
+        let payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
         session.checkpoint(&payload, Some(1.0), Some(0));
         assert!(
             session.try_load().is_some(),
@@ -8682,7 +8741,7 @@ mod tests {
     #[test]
     fn exact_final_cache_hit_skips_outer_validation() {
         let (_d, session) = tmp_cache_session("final-skip");
-        let payload = encode_iterate(&array![2.5], 0.25, 7).expect("encode");
+        let payload = encode_iterate(&array![2.5], None, 0.25, 7).expect("encode");
         session.finalize(&payload, Some(0.25), Some(7));
 
         let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
