@@ -239,7 +239,8 @@ fn survival_multi_z_near_degenerate_rank1_lowrank() {
         let mut rng = SplitMix64::new(0xABCD_1234 ^ seed);
         let q = 4.0 * rng.next_signed();
         let probit_scale = 0.1 + 3.0 * rng.next_unit();
-        let slopes = random_slopes(&mut rng, k, 1.0 + 5.0 * rng.next_unit());
+        let amp = 1.0 + 5.0 * rng.next_unit();
+        let slopes = random_slopes(&mut rng, k, amp);
         assert_marginal_preservation(
             q,
             &slopes,
@@ -314,7 +315,8 @@ fn survival_multi_z_near_degenerate_full_one_tiny_eigenvalue() {
         let mut rng = SplitMix64::new(0x1357_2468 ^ seed);
         let q = 3.0 * rng.next_signed();
         let probit_scale = 0.5 + 1.5 * rng.next_unit();
-        let slopes = random_slopes(&mut rng, k, 0.5 + 2.0 * rng.next_unit());
+        let amp = 0.5 + 2.0 * rng.next_unit();
+        let slopes = random_slopes(&mut rng, k, amp);
         assert_marginal_preservation(
             q,
             &slopes,
@@ -405,7 +407,8 @@ fn survival_multi_z_permutation_invariance_full_and_lowrank() {
         }
         let cov_lr = MarginalSlopeCovariance::LowRank(lr_factor.clone());
 
-        let slopes = random_slopes(&mut rng, k, 1.0 + rng.next_unit());
+        let amp = 1.0 + rng.next_unit();
+        let slopes = random_slopes(&mut rng, k, amp);
         let z = random_z(&mut rng, k);
         let probit_scale = 0.2 + 1.5 * rng.next_unit();
         let q = 2.0 * rng.next_signed();
@@ -495,7 +498,8 @@ fn survival_multi_z_lowrank_vs_full_equivalence() {
         let cov_lr = MarginalSlopeCovariance::LowRank(factor.clone());
         let cov_full = MarginalSlopeCovariance::Full(factor.dot(&factor.t()));
 
-        let slopes = random_slopes(&mut rng, k, 0.5 + rng.next_unit());
+        let amp = 0.5 + rng.next_unit();
+        let slopes = random_slopes(&mut rng, k, amp);
         let z = random_z(&mut rng, k);
         let probit_scale = 0.2 + 1.5 * rng.next_unit();
         let q = 2.0 * rng.next_signed();
@@ -613,7 +617,10 @@ fn survival_multi_z_neglog_finite_under_random_shapes() {
         let cov = match seed % 3 {
             0 => random_diagonal(&mut rng, k),
             1 => random_full(&mut rng, k).0,
-            _ => random_low_rank(&mut rng, k, (rng.range(1, k + 1)).max(1)),
+            _ => {
+                let r = (rng.range(1, k + 1)).max(1);
+                random_low_rank(&mut rng, k, r)
+            }
         };
         let slopes = random_slopes(&mut rng, k, 0.5);
         let z = random_z(&mut rng, k);

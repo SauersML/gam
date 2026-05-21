@@ -26,9 +26,11 @@ from importlib import metadata as _metadata
 from pathlib import Path
 
 from ._api import (
+    SharedPrecisionGroup,
     bspline_basis,
     bspline_basis_derivative,
     build_info,
+    cross_fit_shared_precision_groups,
     cuda_diagnostics,
     duchon_basis_1d,
     duchon_basis_1d_derivative,
@@ -124,6 +126,7 @@ __all__ = [
     "SchemaCheck",
     "SchemaIssue",
     "SchemaMismatchError",
+    "SharedPrecisionGroup",
     "Summary",
     "SurvivalPrediction",
     "__version__",
@@ -133,6 +136,7 @@ __all__ = [
     "bspline_basis_derivative",
     "closure",
     "clr",
+    "cross_fit_shared_precision_groups",
     "cuda_diagnostics",
     "duchon_basis_1d",
     "duchon_basis_1d_derivative",
