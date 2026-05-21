@@ -28331,6 +28331,48 @@ mod tests {
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
+    /// Fractional spectral power `s = 1.5` in d=4, Degree-2 nullspace.
+    /// Integer power forces `s = 2` to clear D₂ collocation
+    /// (`2(p+s) > d+2` ⇒ `s > 1`), which inflates the polyharmonic
+    /// kernel block; fractional s=1.5 sits in the convergent regime at
+    /// `r²·log` style scaling without ratcheting the null space. Pins
+    /// that the fractional path lights up end-to-end: parser/spec accepts
+    /// it, the convergence predicate admits it, the Riesz kernel and
+    /// `isotropic_duchon_penalty` consume it, and the joint null space
+    /// remains exactly `span{1}`.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d_fractional_s() {
+        let data = array![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],
+            [0.25, 0.5, 0.75, 0.5],
+            [0.75, 0.25, 0.5, 0.5],
+            [0.5, 0.75, 0.25, 0.5]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+            length_scale: None,
+            power: 1.5,
+            nullspace_order: DuchonNullspaceOrder::Degree(2),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
     #[test]
     fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
         // The pure-Duchon `operator_penalty_candidates_closed_form_pure`

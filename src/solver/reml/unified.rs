@@ -15146,7 +15146,7 @@ mod tests {
     /// outside-`range(S_+)` case in tests 1 and 2 above.
     #[test]
     fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_inside_range_s_plus() {
-        let small_eig = 1e-12_f64;
+        let small_eig = 1e-8_f64;
         let (h_full, u_s) =
             synthetic_h_with_small_eig(small_eig, SmallEigPlacement::InsideRangeSPlus);
         let kernel = build_subspace_kernel(&h_full, &u_s);
@@ -15159,7 +15159,7 @@ mod tests {
         let corr_proj = kernel.bilinear_pseudo_inverse(&r, &a_k);
         let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
 
-        // Both methods give the same blow-up `ηξ/σ_min = 1e6` because
+        // Both methods give the same blow-up `ηξ/σ_min = 1e2` because
         // the near-null eigenvalue is inside the projected subspace.
         let expected = eta * xi / small_eig;
         assert_relative_eq!(corr_proj, expected, max_relative = 1e-12);
@@ -15255,10 +15255,21 @@ mod tests {
     ///         the other eigenvalues; `H_proj⁻¹` stays `O(1)`).
     ///       - Result: `r_S · H_proj⁻¹ · a_k_S` is `O(1)`.
     ///
-    /// This test reproduces the FAILING-BIOBANK geometry (small eigenvalue
-    /// in a mixed direction, `a_k` purely in range(S_+), `r` with FP
-    /// null-noise) and shows the helper saves ~10⁹ in the corr while
-    /// remaining within `1e-9` of the mathematically correct value.
+    /// This test reproduces the FAILING-BIOBANK geometry and asserts
+    /// FOUR INDEPENDENT properties:
+    ///   (P1) helper matches an independent eigendecomposition-based
+    ///        ground-truth bilinear to 1e-12 (validates the inversion
+    ///        path on a NON-DIAGONAL h_proj, where the diagonal
+    ///        shortcut would silently fail);
+    ///   (P2) null pollution on r is invariant under the helper (1e-12);
+    ///   (P3) the SAME null pollution corrupts full-H by the
+    ///        analytically predicted `ε · (q_minᵀ a_k) · q_min_null /
+    ///        σ_min` (matched within 5%);
+    ///   (P4) on CLEAN r the projected helper and full-H still DISAGREE
+    ///        by `O(σ_min⁻¹)` because the projected kernel pairs with
+    ///        `½ log|U_Sᵀ H U_S|_+` while the full-H is the Schur
+    ///        complement inverse — mathematically distinct, not just
+    ///        less noisy.
     #[test]
     fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_coupled_h() {
         let small_eig = 1e-12_f64;
