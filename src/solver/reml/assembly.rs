@@ -291,6 +291,7 @@ impl<'dp> InnerAssembly<'dp> {
         if let Some(f) = self.fixed_drift_deriv {
             builder = builder.fixed_drift_deriv(f);
         }
+        builder = builder.kkt_residual(self.kkt_residual);
 
         builder.build()
     }

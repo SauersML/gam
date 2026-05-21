@@ -5245,24 +5245,6 @@ pub struct InnerSolution<'dp> {
     /// When present, the barrier cost and Hessian corrections are added to the
     /// outer REML/LAML objective.
     pub barrier_config: Option<BarrierConfig>,
-
-    /// Optional inner KKT residual vector r = ∇_β L_pen(β̂) = -∇ℓ(β̂) + S(λ)β̂
-    /// at the inner-converged β̂, in the same block-concatenated layout as
-    /// `beta`.
-    ///
-    /// At an exact inner KKT point this vector is zero and the envelope-theorem
-    /// gradient formula
-    ///   dV/dρ_k = ½ λ_k β̂ᵀ S_k β̂ + ½ λ_k tr(H⁻¹ S_k) − ½ λ_k tr(S⁺ S_k)
-    /// is the total derivative.  When the inner solver exits the noise-floor
-    /// KKT certificate (`custom_family.rs:12037`) with `r ≠ 0` — common on
-    /// biobank-scale problems where one coordinate's H block is nearly
-    /// singular — the principled total derivative picks up an extra term
-    ///   dV/dρ_k = (envelope) − rᵀ · v_k,   v_k := λ_k H⁻¹ S_k β̂
-    /// and the cost picks up `cost := cost − ½ rᵀ H⁻¹ r`.
-    /// Setting this field activates both corrections in `reml_laml_evaluate`.
-    /// `None` keeps the envelope-only behavior unchanged for callers that
-    /// genuinely guarantee exact KKT.
-    pub kkt_residual: Option<Array1<f64>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -5421,6 +5403,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     /// to the LAML cost and gradient in `reml_laml_evaluate` that absorb
     /// the inner solver's residual KKT error (see
     /// `InnerSolution::kkt_residual`).
+    #[allow(dead_code)]
     pub fn kkt_residual(mut self, residual: Option<Array1<f64>>) -> Self {
         self.kkt_residual = residual;
         self
