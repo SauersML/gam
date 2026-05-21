@@ -3028,29 +3028,35 @@ pub fn marginal_slope_covariance_from_scores(
 
     // ── Shape classification ──
     //
-    // Order matters here.  Pick the CHEAPEST representation that does NOT
-    // lose information about the sample's rank structure:
+    // Pick the cheapest representation that preserves r'Σr for arbitrary r.
     //
-    //   1. Eigendecompose.  If the matrix is rank-deficient (some
-    //      eigenvalue ≈ 0 within `rank_tol`), return LowRank.  Reporting
-    //      Diagonal in this case would silently drop the off-diagonal
-    //      coupling that captures the rank deficiency (e.g. perfectly
-    //      collinear columns), making r'Σr wrong for any r outside
-    //      span(diagonal).
+    //   * K = 1: always Diagonal — the LowRank/Full distinction is
+    //     meaningless for a 1×1 matrix (and an eigendecomposition that
+    //     finds zero variance would mis-collapse to a rank-0 LowRank).
     //
-    //   2. Otherwise (full rank), test whether the off-diagonals are
-    //      indistinguishable from zero — either NUMERICALLY (off-diag at
-    //      machine precision, e.g. post-orthogonalised production input)
-    //      or STATISTICALLY under H0 = independent columns (off-diag has
-    //      asymptotic SE √(σ_aa σ_bb / N_eff)).  If so, return Diagonal.
+    //   * K ≥ 2: eigendecompose, then combine TWO signals:
     //
-    //   3. Otherwise return Full.
+    //       — RANK: positive.len() < k ⇒ matrix is rank-deficient.
+    //         Source of deficiency matters:
+    //           · collinear columns ⇒ off-diagonals are large; Diagonal
+    //             would drop the coupling and break r'Σr ⇒ LowRank.
+    //           · zero-variance columns (e.g. an unused dimension) ⇒
+    //             off-diagonals stay statistically zero; Diagonal
+    //             preserves r'Σr (the missing rank is on the axes) AND
+    //             is cheaper ⇒ Diagonal.
     //
-    // The 4σ statistical floor is Bonferroni-safe for K up to ~30 at
-    // α≈0.01 (K(K-1)/2 ≤ 435 pairs).  N_eff is Kish's effective sample
-    // size: (Σ wᵢ)² / Σ wᵢ².  When N_eff is huge (biobank scale) the
-    // statistical floor collapses below the numerical floor and behaviour
-    // is identical to a pure-numerical-tolerance classifier.
+    //       — OFFDIAG STAT-ZERO: combined numerical + 4σ statistical
+    //         floor on each pair.  Under H0 the asymptotic SE of an
+    //         off-diagonal sample covariance is √(σ_aa σ_bb / N_eff)
+    //         (Kish's effective sample size N_eff = (Σw)² / Σw²).  4σ
+    //         is Bonferroni-safe for K up to ~30 at α≈0.01.  At biobank
+    //         N_eff the statistical floor collapses below the numerical
+    //         floor and the classifier behaves like a pure-numerical
+    //         tolerance check — production paths are unaffected.
+    if k == 1 {
+        return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
+    }
+
     use crate::faer_ndarray::FaerEigh;
     let (evals, evecs) = cov
         .eigh(faer::Side::Lower)
@@ -3064,19 +3070,8 @@ pub fn marginal_slope_covariance_from_scores(
         .enumerate()
         .filter_map(|(idx, &value)| (value > rank_tol).then_some((idx, value)))
         .collect();
-    if positive.len() < k {
-        let mut factor = Array2::<f64>::zeros((k, positive.len()));
-        for (col, (idx, value)) in positive.iter().enumerate() {
-            let scale = value.sqrt();
-            for row in 0..k {
-                factor[[row, col]] = evecs[[row, *idx]] * scale;
-            }
-        }
-        return Ok(MarginalSlopeCovariance::LowRank(factor));
-    }
 
-    // Full rank.  Decide Diagonal vs Full via combined numerical/statistical
-    // off-diagonal tolerance.
+    // Combined numerical+statistical off-diagonal test.
     let sum_w_sq = weights.iter().map(|&w| w * w).sum::<f64>();
     let n_eff = if sum_w_sq > 0.0 {
         (total_weight * total_weight) / sum_w_sq
@@ -3087,7 +3082,7 @@ pub fn marginal_slope_covariance_from_scores(
     let diag_max = diag.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let numerical_floor = 1e-10 * (1.0 + diag_max);
     const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
-    let mut is_diagonal = true;
+    let mut is_offdiag_zero = true;
     'outer: for a in 0..k {
         for b in (a + 1)..k {
             let stat_se = (diag[a].max(0.0) * diag[b].max(0.0) / n_eff)
@@ -3095,12 +3090,30 @@ pub fn marginal_slope_covariance_from_scores(
                 .sqrt();
             let threshold = numerical_floor.max(OFFDIAG_Z_THRESHOLD * stat_se);
             if cov[[a, b]].abs() > threshold {
-                is_diagonal = false;
+                is_offdiag_zero = false;
                 break 'outer;
             }
         }
     }
-    if k == 1 || is_diagonal {
+
+    if positive.len() < k {
+        // Rank-deficient.  Pick Diagonal when the missing rank is on the
+        // diagonal (zero-variance axes); LowRank when it is from collinear
+        // columns (significant off-diagonals).
+        if is_offdiag_zero {
+            return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
+        }
+        let mut factor = Array2::<f64>::zeros((k, positive.len()));
+        for (col, (idx, value)) in positive.iter().enumerate() {
+            let scale = value.sqrt();
+            for row in 0..k {
+                factor[[row, col]] = evecs[[row, *idx]] * scale;
+            }
+        }
+        return Ok(MarginalSlopeCovariance::LowRank(factor));
+    }
+
+    if is_offdiag_zero {
         Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()))
     } else {
         Ok(MarginalSlopeCovariance::Full(cov))
