@@ -1972,7 +1972,9 @@ fn gaussian_reml_fit_formula_table_impl(
     }
     let design = gam::smooth::build_term_collection_design(standard.data, &standard.spec)
         .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
-    let x = design.design.to_dense();
+    let x = design
+        .design
+        .try_to_dense_by_chunks("closed_form_gaussian_reml_formula design")?;
     if y.nrows() != x.nrows() {
         return Err(format!(
             "closed-form Gaussian REML response row mismatch: formula design has {} rows but Y has {}",
@@ -2740,7 +2742,10 @@ fn validate_position_batched_reml_common(
             penalty.nrows()
         ));
     }
-    if y.iter().chain(penalty.iter()).any(|value| !value.is_finite()) {
+    if y.iter()
+        .chain(penalty.iter())
+        .any(|value| !value.is_finite())
+    {
         return Err("batched Gaussian REML inputs must be finite".to_string());
     }
     if let Some(weights) = weights {
@@ -2865,7 +2870,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 basis_order,
                 periodic,
                 period,
-                by.map(|values| values.slice(s![start..end])),
+                by.as_ref().map(|values| values.slice(s![start..end])),
                 by_start_col,
                 p,
                 b,
@@ -2915,7 +2920,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 basis_order,
                 periodic,
                 period,
-                by.map(|values| values.slice(s![start..end])),
+                by.as_ref().map(|values| values.slice(s![start..end])),
                 by_start_col,
                 p,
                 b,
@@ -2932,7 +2937,9 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
             ) {
                 Ok(result) => Ok((b, Some(result))),
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
-                Err(err) => Err(format!("batched position Gaussian REML fit {b} failed: {err}")),
+                Err(err) => Err(format!(
+                    "batched position Gaussian REML fit {b} failed: {err}"
+                )),
             }
         })
         .collect();
@@ -3131,7 +3138,7 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                     basis_derivative.ncols()
                 ));
             }
-            let by_slice = by.map(|values| values.slice(s![start..end]));
+            let by_slice = by.as_ref().map(|values| values.slice(s![start..end]));
             let gated_x;
             let x_slice = if let Some(by_values) = by_slice {
                 gated_x = apply_by_gate(x_base.view(), by_values, by_start_col)?;

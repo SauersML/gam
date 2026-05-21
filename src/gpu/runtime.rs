@@ -923,15 +923,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn verify_no_cuda_library_conflicts_returns_true_even_when_detector_reports() {
+    fn duplicate_cuda_library_mappings_are_warn_only() {
         // Whether the running host has duplicate mappings or not, the
-        // verifier must return true: cudarc's culib() is a process-wide
-        // OnceLock<Library>, so handle / destroy routing through that
-        // single Library handle cannot flip libraries between calls.
-        // Disabling CUDA on a duplicate-mapping report was a false
-        // positive that forced unnecessary CPU fallback on dual-stack
-        // Colab / AoU images.
-        assert!(verify_no_cuda_library_conflicts());
+        // warning path must not feed back into CUDA availability. cudarc's
+        // culib() is a process-wide OnceLock<Library>, so gamfit's cuBLAS
+        // symbols route through one Library handle after initialization.
+        warn_cuda_library_conflicts();
     }
 
     #[cfg(target_os = "linux")]
