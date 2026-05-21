@@ -4325,17 +4325,11 @@ impl OuterProblem {
                     // the durable seed for the next run, making the bad
                     // state sticky across restarts.
                     //
-                    // The fix is a small interior margin on the LOAD
-                    // side only. If the cached ρ has any coordinate at
-                    // (or within `MARGIN` of) the box bound, we pull it
-                    // strictly inside the box. The optimizer then probes
-                    // local geometry from an interior point with a
-                    // well-defined gradient. If the data truly prefers
-                    // ρ_i → +bound (or −bound), it walks back to the
-                    // boundary in one or two outer iterations at
-                    // negligible cost; if the saturated coordinate was
-                    // an artifact of a stale checkpoint, the optimizer
-                    // is no longer trapped.
+                    // The fix is on the LOAD side only: a partially
+                    // saturated checkpoint is pulled just inside the box,
+                    // while an all-saturated checkpoint is discarded as
+                    // poisoned. The optimizer then probes either local
+                    // interior geometry or the normal cold-start seed set.
                     //
                     // The `Final` entry-kind branch above is intentionally
                     // not clamped: that path short-circuits to return the
@@ -8544,6 +8538,65 @@ mod tests {
                 "cached rho (idx {c}) must precede initial_rho (idx {i})",
             );
         }
+    }
+
+    #[test]
+    fn all_saturated_cached_rho_is_discarded_before_seed_validation() {
+        let (_d, session) = tmp_cache_session("all-saturated-discard");
+        let payload = encode_iterate(&array![10.0, -10.0], 1.0, 0).expect("encode");
+        session.checkpoint(&payload, Some(1.0), Some(0));
+        assert!(
+            session.try_load().is_some(),
+            "precondition: cache populated"
+        );
+
+        let seen: Arc<Mutex<Vec<Array1<f64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut seed_config = crate::seeding::SeedConfig::default();
+        seed_config.max_seeds = 4;
+        seed_config.seed_budget = 1;
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_seed_config(seed_config)
+            .with_initial_rho(array![0.0, 0.0])
+            .with_rho_bound(10.0)
+            .with_max_iter(1)
+            .with_cache_session(Arc::clone(&session));
+
+        let mut obj = problem.build_objective(
+            seen.clone(),
+            |_: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| Ok(theta.dot(theta)),
+            |seen: &mut Arc<Mutex<Vec<Array1<f64>>>>, theta: &Array1<f64>| {
+                seen.lock().unwrap().push(theta.clone());
+                Ok(OuterEval {
+                    cost: theta.dot(theta),
+                    gradient: theta.clone(),
+                    hessian: HessianResult::Unavailable,
+                })
+            },
+            None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,
+            None::<
+                fn(
+                    &mut Arc<Mutex<Vec<Array1<f64>>>>,
+                    &Array1<f64>,
+                ) -> Result<EfsEval, EstimationError>,
+            >,
+        );
+
+        let _ = problem.run(&mut obj, "all-saturated-discard");
+        let evals = seen.lock().unwrap();
+        assert!(
+            !evals
+                .iter()
+                .any(|rho| rho.iter().all(|v| v.abs() >= 9.0)),
+            "all-saturated checkpoint must be discarded, not clamped and evaluated; saw {:?}",
+            *evals
+        );
+        assert!(
+            evals.iter().any(|rho| rho == &array![0.0, 0.0]),
+            "normal generated/initial seed should remain available after poisoned cache discard; saw {:?}",
+            *evals
+        );
     }
 
     #[test]
