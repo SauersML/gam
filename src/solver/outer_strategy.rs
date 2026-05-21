@@ -1391,7 +1391,6 @@ impl std::fmt::Debug for OuterEval {
             .field("hessian", &self.hessian)
             .finish()
     }
-    inner_beta_hint: None,
 }
 
 impl Clone for HessianResult {
