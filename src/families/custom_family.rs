@@ -10835,6 +10835,65 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
 
+        // Per-cycle |Δobjective| history for the geometric-tail trigger of
+        // the constrained-stationary certificate below. When the cycles
+        // settle into a linear-rate plateau (|Δobj_next| / |Δobj_prev|
+        // approaching 1 monotonically over the window), the total
+        // *remaining* objective descent is rigorously bounded above by the
+        // geometric series sum |Δobj_now| / (1 − max_ratio). When that
+        // bound is below `objective_tol` the cert can fire many cycles
+        // earlier than waiting for any single |Δobj| to individually
+        // cross obj_tol — the bound is mathematically the same precision
+        // contract, applied to the asymptotic tail rather than one step.
+        const GEOMETRIC_TAIL_WINDOW: usize = 5;
+        let mut geometric_tail_history: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
+
+        // Convergence-kind tracker used at the convergent return below to
+        // decide whether the IFT correction `−½ rᵀ H⁻¹ r` (and its ρ
+        // gradient/Hessian counterparts in `reml/unified.rs`) can be applied
+        // safely.
+        //
+        // * Strict-KKT and noise-floor exits: the residual `r` is genuinely
+        //   small in *all* directions (≤ residual_tol or ≤ 2·residual_tol),
+        //   so the full-H solve `H⁻¹ r` is well-conditioned and the IFT
+        //   correction is both informative and stable.
+        // * Constrained-stationary exit: the cert (linearized_rel ≥ 0.5,
+        //   scalar_model relerr ≤ 1e-3) *proves* that ≥ 50 % of `r` lies
+        //   outside `range(H_free)` — it is Lagrange-multiplier mass on the
+        //   active constraint set's normal direction. At a true constrained
+        //   stationary point the IFT correction term `gᵀ ∂β/∂ρ` vanishes
+        //   in exact arithmetic (g ⊥ ∂β/∂ρ by KKT), but computing it via
+        //   the full-H solve amplifies the multiplier-mass component by
+        //   `1/σ_min(H_active_normal)` (which is ~10¹² on biobank-scale
+        //   survival marginal-slope), yielding a gradient of magnitude
+        //   ~10¹⁵ that the envelope-consistency tripwire in
+        //   `reml/unified.rs` then correctly suppresses — leaving the
+        //   outer optimizer with no gradient at all and failing the run.
+        //
+        // When `penalty_subspace_trace` is available the outer envelope
+        // path already routes through `kernel.bilinear_pseudo_inverse`,
+        // which projects `r` onto `range(S_+)` before inversion and is the
+        // exact treatment. The cert-only case here has no kernel, so the
+        // principled action is to omit the IFT correction entirely on
+        // this path. Omitting it gives back the bare envelope gradient,
+        // which is the *mathematically correct* value at a constrained
+        // stationary point — the omitted term is zero in real arithmetic;
+        // skipping it just avoids the FP-noise amplification.
+        #[derive(Clone, Copy)]
+        enum JointNewtonConvergenceKind {
+            /// Strict residual ≤ residual_tol (real KKT).
+            StrictKkt,
+            /// |Δobj| ≤ obj_tol AND residual ≤ 2·residual_tol (round-off
+            /// floor; `r` small in all directions).
+            NoiseFloor,
+            /// `linearized_rel ≥ 0.5` AND `scalar_model relerr ≤ 1e-3`
+            /// AND objective exhausted: `r` dominated by multiplier mass
+            /// in a direction outside `range(H_free)`.
+            ConstrainedStationary,
+        }
+        let mut convergence_kind: Option<JointNewtonConvergenceKind> = None;
+
         // Linearized-rate stall early-exit. Companion to the
         // constrained-stationary certificate for the case where the
         // certificate cannot fire (e.g. the multiplier interpretation does
@@ -12234,6 +12293,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // unable to certify convergence on a problem that was
             // solved exactly in one Newton step.
             if joint_inner_kkt_converged(residual, residual_tol) {
+                convergence_kind = Some(JointNewtonConvergenceKind::StrictKkt);
                 converged = true;
                 break;
             }
@@ -12296,6 +12356,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     objective_change,
                     objective_tol,
                 );
+                convergence_kind = Some(JointNewtonConvergenceKind::NoiseFloor);
                 converged = true;
                 break;
             }
@@ -12394,6 +12455,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         geometric_tail_bound.unwrap_or(objective_change),
                         objective_tol,
                     );
+                    convergence_kind =
+                        Some(JointNewtonConvergenceKind::ConstrainedStationary);
                     converged = true;
                     break;
                 }
@@ -12576,14 +12639,38 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
-            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
-                family,
-                specs,
-                &states,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-            )?;
+            // IFT-residual policy by convergence kind. See the
+            // `JointNewtonConvergenceKind` doc-comment near the top of this
+            // function for the full mathematical rationale. In short:
+            //
+            // * StrictKkt / NoiseFloor: `r` is small in *all* directions, so
+            //   `−½ rᵀ H⁻¹ r` is a well-conditioned, informative cost
+            //   correction and its ρ-derivatives sharpen the outer
+            //   gradient/Hessian. Compute and attach `r`.
+            // * ConstrainedStationary: the cert proves `r` is dominantly
+            //   Lagrange-multiplier mass outside `range(H_free)`; the
+            //   correction term is mathematically zero (g ⊥ ∂β/∂ρ by KKT)
+            //   but the full-H solve amplifies the multiplier component
+            //   by `1/σ_min(H_active_normal) ≈ 10¹²`, producing a gradient
+            //   of magnitude ~10¹⁵ that the envelope tripwire suppresses,
+            //   blocking outer progress entirely. Returning `None` here
+            //   gives the outer the bare envelope gradient — the exact
+            //   answer in real arithmetic — without the FP-noise blowup.
+            // * Convergence path with no recorded kind (older flow): fall
+            //   back to the historical compute-and-attach behaviour.
+            let kkt_residual = match convergence_kind {
+                Some(JointNewtonConvergenceKind::ConstrainedStationary) => None,
+                Some(JointNewtonConvergenceKind::StrictKkt)
+                | Some(JointNewtonConvergenceKind::NoiseFloor)
+                | None => exact_newton_joint_kkt_residual_for_ift(
+                    family,
+                    specs,
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                )?,
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
