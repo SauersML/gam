@@ -14919,6 +14919,8 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None,
                 None,
                 None,
+                None,
+                None,
             )
         }
     }?;
@@ -16087,13 +16089,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             rho_prior.clone(),
             family.pseudo_logdet_mode(),
             &compute_dh,
-            compute_dh_many.as_deref(),
-            &compute_d2h,
-            Some(owned_compute_dh),
-            owned_compute_dh_many,
-            Some(owned_compute_d2h),
-            ext_bundle,
-            custom_family_batched_outer_hessian_operator(
+                compute_dh_many.as_deref(),
+                &compute_d2h,
+                None,
+                Some(owned_compute_dh),
+                owned_compute_dh_many,
+                Some(owned_compute_d2h),
+                None,
+                ext_bundle,
+                custom_family_batched_outer_hessian_operator(
                 family,
                 synced_joint_states.as_ref(),
                 specs,
@@ -16630,6 +16634,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         None,
         None,
         None,
+        None,
+        None,
         None, // no ext_coords for generic single-block fallback
         custom_family_batched_outer_hessian_operator(
             family,
@@ -17118,9 +17124,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         &compute_dh,
         compute_dh_many.as_deref(),
         &compute_d2h,
+        None,
         Some(owned_compute_dh),
         owned_compute_dh_many,
         Some(owned_compute_d2h),
+        None,
         Some(ext_bundle),
     )
     .map_err(CustomFamilyError::from)?;
