@@ -1092,20 +1092,39 @@ impl DenseDesignMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Materialized(matrix) => matrix.as_ref().clone(),
-            Self::Lazy(_) => self
-                .try_to_dense_arc("DenseDesignMatrix::to_dense")
-                .unwrap_or_else(|msg| panic!("{msg}"))
-                .as_ref()
-                .clone(),
+            // Infallible-by-contract dense materialization: callers that reach
+            // `to_dense` are committed to a dense `Array2<f64>` consumer and
+            // own the memory budget. Stream row chunks directly via the
+            // operator's `row_chunk_into`, bypassing the conservative
+            // single-materialization byte cap (which only callers with a
+            // strict-operator policy actually need). Strict callers must use
+            // `try_to_dense_arc_with_policy(ctx, &analytic_operator_required())`
+            // to get refusal semantics — they explicitly opted into operator-only math.
+            Self::Lazy(op) => dense_operator_to_dense_by_chunks(op.as_ref())
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
+                         operator-backed design via row chunks: {err}",
+                        op.nrows(),
+                        op.ncols(),
+                    )
+                }),
         }
     }
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Materialized(matrix) => Arc::clone(matrix),
-            Self::Lazy(_) => self
-                .try_to_dense_arc("DenseDesignMatrix::to_dense_arc")
-                .unwrap_or_else(|msg| panic!("{msg}")),
+            Self::Lazy(op) => Arc::new(
+                dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                    panic!(
+                        "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
+                         operator-backed design via row chunks: {err}",
+                        op.nrows(),
+                        op.ncols(),
+                    )
+                }),
+            ),
         }
     }
 
@@ -6360,12 +6379,18 @@ impl DesignMatrix {
                 if let Some(dense) = op.as_dense_ref() {
                     Cow::Borrowed(dense)
                 } else {
-                    Cow::Owned(
-                        self.try_to_dense_arc("DesignMatrix::to_dense_cow")
-                            .unwrap_or_else(|msg| panic!("{msg}"))
-                            .as_ref()
-                            .clone(),
-                    )
+                    // Bypass the size-capped policy guard: callers reaching
+                    // `to_dense_cow` are committing to a dense consumer.
+                    Cow::Owned(dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(
+                        |err| {
+                            panic!(
+                                "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
+                                 operator-backed design via row chunks: {err}",
+                                op.nrows(),
+                                op.ncols(),
+                            )
+                        },
+                    ))
                 }
             }
             Self::Sparse(matrix) => Cow::Owned(
@@ -6380,11 +6405,7 @@ impl DesignMatrix {
 
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
-            Self::Dense(matrix) => matrix
-                .try_to_dense_arc("DesignMatrix::to_dense")
-                .unwrap_or_else(|msg| panic!("{msg}"))
-                .as_ref()
-                .clone(),
+            Self::Dense(matrix) => matrix.to_dense(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
                 .unwrap_or_else(|msg| panic!("{msg}"))
@@ -6395,9 +6416,7 @@ impl DesignMatrix {
 
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
-            Self::Dense(matrix) => matrix
-                .try_to_dense_arc("DesignMatrix::to_dense_arc")
-                .unwrap_or_else(|msg| panic!("{msg}")),
+            Self::Dense(matrix) => matrix.to_dense_arc(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
                 .unwrap_or_else(|msg| panic!("{msg}")),
