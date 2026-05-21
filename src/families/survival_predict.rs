@@ -9,10 +9,11 @@
 
 use std::collections::HashMap;
 
-use ndarray::{Array1, Array2, ArrayView2, s};
+use ndarray::{Array1, Array2, Array3, ArrayView2, s};
 
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::scale_design::scale_transform_from_payload;
+use crate::families::survival::assemble_competing_risks_cif;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalLikelihoodMode, SurvivalTimeBuildOutput,
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -693,7 +694,20 @@ pub fn predict_competing_risks_survival(
         }
     }
 
-    let (cif, overall_survival) = assemble_competing_risks_cif(&cumulative_hazard)?;
+    let cumulative_tensor = Array3::from_shape_fn((cause_count, n, t_cols), |(cause, row, col)| {
+        cumulative_hazard[cause][[row, col]]
+    });
+    let assembly_times = if per_row_eval {
+        Array1::from_elem(1, 0.0)
+    } else {
+        Array1::from_vec(eval_times.clone())
+    };
+    let assembled = assemble_competing_risks_cif(assembly_times.view(), cumulative_tensor.view())
+        .map_err(|err| err.to_string())?;
+    let cif = (0..cause_count)
+        .map(|cause| assembled.cif.slice(s![cause, .., ..]).to_owned())
+        .collect::<Vec<_>>();
+    let overall_survival = assembled.overall_survival;
     let times_out = if per_row_eval {
         age_exit.to_vec()
     } else {
@@ -774,67 +788,6 @@ fn saved_cause_specific_timewiggles(
             })
         })
         .collect())
-}
-
-fn assemble_competing_risks_cif(
-    cumulative_hazard: &[Array2<f64>],
-) -> Result<(Vec<Array2<f64>>, Array2<f64>), String> {
-    if cumulative_hazard.is_empty() {
-        return Err("competing-risks CIF assembly requires at least one endpoint".to_string());
-    }
-    let n = cumulative_hazard[0].nrows();
-    let t = cumulative_hazard[0].ncols();
-    for (endpoint, matrix) in cumulative_hazard.iter().enumerate() {
-        if matrix.nrows() != n || matrix.ncols() != t {
-            return Err(format!(
-                "competing-risks endpoint {endpoint} cumulative hazard shape mismatch"
-            ));
-        }
-        if matrix
-            .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
-        {
-            return Err(format!(
-                "competing-risks endpoint {endpoint} cumulative hazards must be finite and non-negative"
-            ));
-        }
-    }
-
-    let k = cumulative_hazard.len();
-    let mut cif = (0..k)
-        .map(|_| Array2::<f64>::zeros((n, t)))
-        .collect::<Vec<_>>();
-    let mut overall_survival = Array2::<f64>::zeros((n, t));
-    for i in 0..n {
-        let mut prev_total: f64 = 0.0;
-        let mut running_cif = vec![0.0; k];
-        let mut prev_by_endpoint = vec![0.0; k];
-        for j in 0..t {
-            let mut increments = vec![0.0; k];
-            let mut total_increment = 0.0;
-            for endpoint in 0..k {
-                let current = cumulative_hazard[endpoint][[i, j]];
-                let increment = (current - prev_by_endpoint[endpoint]).max(0.0);
-                prev_by_endpoint[endpoint] = current;
-                increments[endpoint] = increment;
-                total_increment += increment;
-            }
-            let survival_left = (-prev_total).exp();
-            let interval_failure = -(-total_increment).exp_m1();
-            if total_increment > 0.0 {
-                for endpoint in 0..k {
-                    running_cif[endpoint] +=
-                        survival_left * interval_failure * increments[endpoint] / total_increment;
-                }
-            }
-            prev_total += total_increment;
-            overall_survival[[i, j]] = (-prev_total).exp().clamp(0.0, 1.0);
-            for endpoint in 0..k {
-                cif[endpoint][[i, j]] = running_cif[endpoint].clamp(0.0, 1.0);
-            }
-        }
-    }
-    Ok((cif, overall_survival))
 }
 
 // ---------------------------------------------------------------------------
