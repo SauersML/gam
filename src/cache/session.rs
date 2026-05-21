@@ -142,12 +142,28 @@ impl Session {
     /// expensive cold-start pilot) must not drain the preloaded seed that the
     /// outer optimizer is about to consume.
     pub fn peek_load(&self) -> Option<CachedEntry> {
+        self.peek_load_with_source().map(|loaded| loaded.entry)
+    }
+
+    /// Read the currently available warm-start entry with source metadata,
+    /// without consuming a preloaded near-match seed.
+    pub fn peek_load_with_source(&self) -> Option<LoadedEntry> {
         if let Ok(slot) = self.preloaded.lock()
             && let Some(entry) = slot.as_ref()
         {
-            return Some(entry.clone());
+            return Some(LoadedEntry {
+                entry: entry.clone(),
+                source: LoadSource::Preloaded,
+            });
         }
-        self.store.lookup(&self.key).ok().flatten()
+        self.store
+            .lookup(&self.key)
+            .ok()
+            .flatten()
+            .map(|entry| LoadedEntry {
+                entry,
+                source: LoadSource::Exact,
+            })
     }
 
     /// Persist a mid-fit checkpoint. Rate-limited; returns true if a write
