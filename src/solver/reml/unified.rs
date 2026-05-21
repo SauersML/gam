@@ -754,11 +754,14 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// evaluator only routes through this when a family actually fuses the
     /// per-row work.
     ///
-    /// API stub: no caller routes through this yet — the unified evaluator
-    /// still walks the singular hook per pair. The trait method is in place
-    /// so wiring a family's batched callback later only needs the
-    /// call-site refactor, not a trait extension.
-    #[allow(dead_code)]
+    /// Wired into `compute_outer_hessian`'s parallel ρ-ρ pair loop: when a
+    /// provider's `has_batched_hessian_second_derivative_corrections`
+    /// returns `true`, the loop precomputes all K(K+1)/2 triples (one
+    /// shared `hop.solve_multi` over the pair-stacked RHS), batch-calls
+    /// this hook once per outer Hessian assembly, then traces the
+    /// returned drifts through the projected subspace kernel before the
+    /// parallel pair sweep starts. Otherwise the loop falls back to
+    /// per-pair `hessian_second_derivative_correction_result`.
     fn hessian_second_derivative_corrections_result(
         &self,
         triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
@@ -771,7 +774,6 @@ pub trait HessianDerivativeProvider: Send + Sync {
             .collect()
     }
 
-    #[allow(dead_code)]
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         false
     }
