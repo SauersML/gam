@@ -1718,27 +1718,135 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
     Some(p)
 }
 
-pub(crate) fn cache_entry_can_seed_outer(
-    entry: &crate::cache::CachedEntry,
+const CACHE_BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
+
+#[derive(Debug)]
+pub(crate) enum CacheSeedDecision {
+    ExactFinal {
+        rho: Array1<f64>,
+        final_value: f64,
+        iterations: usize,
+        prior_obj_display: f64,
+    },
+    Seed {
+        rho: Array1<f64>,
+        prior_obj_display: f64,
+        iteration: u64,
+        saturated_coords: Vec<usize>,
+        clamped_to: Option<f64>,
+    },
+    Discard {
+        reason: &'static str,
+        prior_obj_display: f64,
+        all_rho_finite: Option<bool>,
+        saturated_coords: Vec<usize>,
+    },
+}
+
+pub(crate) fn classify_cache_entry_for_outer(
+    loaded: &crate::cache::LoadedEntry,
+    expected_rho_dim: usize,
+    rho_bound: f64,
+) -> CacheSeedDecision {
+    let entry = &loaded.entry;
+    let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
+        return CacheSeedDecision::Discard {
+            reason: "payload-shape-mismatch",
+            prior_obj_display: entry.objective.unwrap_or(f64::NAN),
+            all_rho_finite: None,
+            saturated_coords: Vec::new(),
+        };
+    };
+    let cached_rho = Array1::from_vec(payload.rho);
+    let prior_obj_display = entry.objective.unwrap_or(f64::NAN);
+    if matches!(entry.objective, Some(v) if !v.is_finite()) {
+        return CacheSeedDecision::Discard {
+            reason: "non-finite-payload",
+            prior_obj_display,
+            all_rho_finite: Some(cached_rho.iter().all(|v| v.is_finite())),
+            saturated_coords: Vec::new(),
+        };
+    }
+    if !cached_rho.iter().all(|v| v.is_finite()) {
+        return CacheSeedDecision::Discard {
+            reason: "non-finite-payload",
+            prior_obj_display,
+            all_rho_finite: Some(false),
+            saturated_coords: Vec::new(),
+        };
+    }
+    if loaded.source == LoadSource::Exact && entry.kind == crate::cache::EntryKind::Final {
+        return CacheSeedDecision::ExactFinal {
+            rho: cached_rho,
+            final_value: entry.objective.unwrap_or(payload.cost),
+            iterations: entry
+                .iteration
+                .unwrap_or(payload.eval_id)
+                .min(usize::MAX as u64) as usize,
+            prior_obj_display,
+        };
+    }
+
+    if !(rho_bound.is_finite() && rho_bound > CACHE_BOUNDARY_INTERIOR_MARGIN) {
+        return CacheSeedDecision::Seed {
+            rho: cached_rho,
+            prior_obj_display,
+            iteration: entry.iteration.unwrap_or(payload.eval_id),
+            saturated_coords: Vec::new(),
+            clamped_to: None,
+        };
+    }
+
+    let saturation_threshold = rho_bound - CACHE_BOUNDARY_INTERIOR_MARGIN;
+    let saturated_coords: Vec<usize> = cached_rho
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            if v.abs() >= saturation_threshold {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !saturated_coords.is_empty() && saturated_coords.len() == cached_rho.len() {
+        return CacheSeedDecision::Discard {
+            reason: "all-coords-saturated-poisoned-entry",
+            prior_obj_display,
+            all_rho_finite: Some(true),
+            saturated_coords,
+        };
+    }
+
+    if saturated_coords.is_empty() {
+        CacheSeedDecision::Seed {
+            rho: cached_rho,
+            prior_obj_display,
+            iteration: entry.iteration.unwrap_or(payload.eval_id),
+            saturated_coords,
+            clamped_to: None,
+        }
+    } else {
+        let interior = saturation_threshold.max(0.0);
+        CacheSeedDecision::Seed {
+            rho: cached_rho.mapv(|v| v.clamp(-interior, interior)),
+            prior_obj_display,
+            iteration: entry.iteration.unwrap_or(payload.eval_id),
+            saturated_coords,
+            clamped_to: Some(interior),
+        }
+    }
+}
+
+pub(crate) fn cache_entry_would_help_outer(
+    loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
     rho_bound: f64,
 ) -> bool {
-    let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
-        return false;
-    };
-    if matches!(entry.objective, Some(v) if !v.is_finite()) {
-        return false;
-    }
-    if !(rho_bound.is_finite() && rho_bound > 0.0) {
-        return true;
-    }
-
-    const BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
-    let all_coords_saturated = payload
-        .rho
-        .iter()
-        .all(|v| v.abs() >= rho_bound - BOUNDARY_INTERIOR_MARGIN);
-    !all_coords_saturated
+    matches!(
+        classify_cache_entry_for_outer(loaded, expected_rho_dim, rho_bound),
+        CacheSeedDecision::ExactFinal { .. } | CacheSeedDecision::Seed { .. }
+    )
 }
 
 struct CheckpointingObjective<'a> {
@@ -1770,10 +1878,7 @@ impl<'a> CheckpointingObjective<'a> {
     }
 
     fn last_inner_beta(&self) -> Option<Array1<f64>> {
-        self.last_inner_beta
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.last_inner_beta.lock().ok().and_then(|g| g.clone())
     }
 
     fn note(&self, rho: &Array1<f64>, beta: Option<&Array1<f64>>, cost: f64) {
@@ -4331,45 +4436,26 @@ impl OuterProblem {
         let short_key = &key_hex[..8.min(key_hex.len())];
         let mut had_hit = false;
         if let Some(loaded) = session.try_load_with_source() {
-            let entry = loaded.entry;
-            if let Some(payload) = decode_iterate(&entry.payload, self.n_params) {
-                let cached_rho = Array1::from_vec(payload.rho);
-                // Validation-on-load: reject payloads whose recorded
-                // objective is non-finite OR whose ρ vector contains
-                // non-finite entries. `entry.objective == None` is
-                // permissible (early checkpoint that didn't record the
-                // objective) — only `Some(non-finite)` triggers rejection.
-                let prior_obj_bad = matches!(entry.objective, Some(v) if !v.is_finite());
-                let rho_finite = cached_rho.iter().all(|v| v.is_finite());
-                let prior_obj_display = entry.objective.unwrap_or(f64::NAN);
-                if prior_obj_bad || !rho_finite {
-                    log::info!(
-                        "[CACHE] skip key={}.. context={} reason=non-finite-payload prior_obj={:.6e} all_rho_finite={}",
-                        short_key,
-                        context,
-                        prior_obj_display,
-                        rho_finite,
-                    );
-                } else if loaded.source == LoadSource::Exact
-                    && entry.kind == crate::cache::EntryKind::Final
-                {
+            match classify_cache_entry_for_outer(&loaded, self.n_params, config.rho_bound) {
+                CacheSeedDecision::ExactFinal {
+                    rho,
+                    final_value,
+                    iterations,
+                    prior_obj_display,
+                } => {
                     let cap = primary_capability_for_config(obj.capability(), &config, context);
                     let plan_used = plan_with_class(&cap, config.solver_class);
-                    let iterations = entry
-                        .iteration
-                        .unwrap_or(payload.eval_id)
-                        .min(usize::MAX as u64) as usize;
                     log::info!(
                         "[CACHE] final-hit key={}.. context={} rho_dim={} prior_obj={:.6e} iter={} action=skip-outer-validation",
                         short_key,
                         context,
-                        cached_rho.len(),
+                        rho.len(),
                         prior_obj_display,
                         iterations,
                     );
                     return Ok(OuterResult {
-                        rho: cached_rho,
-                        final_value: entry.objective.unwrap_or(payload.cost),
+                        rho,
+                        final_value,
                         iterations,
                         final_grad_norm: None,
                         final_gradient: None,
@@ -4379,127 +4465,95 @@ impl OuterProblem {
                         operator_trust_radius: None,
                         operator_stop_reason: None,
                     });
-                } else if config
-                    .initial_rho
-                    .as_ref()
-                    .is_none_or(|rho| rho != &cached_rho)
-                {
-                    // Boundary-interior margin on cache-loaded seeds.
-                    //
-                    // Some families (notably the survival marginal-slope
-                    // and other custom-family outer-gradient assemblers
-                    // that do not yet route through the projected-kernel
-                    // cancellation in `runtime.rs`) compute an outer
-                    // gradient that becomes numerically unreliable when
-                    // ρ_i saturates at the box bound — the
-                    // `tr(H⁻¹ Ḣ_k)` and `λ_k tr(S_λ⁺ S_k)` trace pair
-                    // fails to cancel and the analytic ∂L/∂ρ blows up by
-                    // many orders of magnitude. An optimizer reseeded
-                    // exactly on a saturated cached ρ then makes no
-                    // progress (the ARC trust-region rejects every
-                    // proposal at that geometry) and stalls into the
-                    // deterministic-replay detector.
-                    //
-                    // Worse, every accepted outer eval is persisted, so a
-                    // run that was interrupted mid-fit (Ctrl-C / OOM /
-                    // SIGKILL) writes its last-accepted intermediate ρ —
-                    // which may be at the bound for spurious reasons — as
-                    // the durable seed for the next run, making the bad
-                    // state sticky across restarts.
-                    //
-                    // The fix is on the LOAD side only: a partially
-                    // saturated checkpoint is pulled just inside the box,
-                    // while an all-saturated checkpoint is discarded as
-                    // poisoned. The optimizer then probes either local
-                    // interior geometry or the normal cold-start seed set.
-                    //
-                    // The `Final` entry-kind branch above is intentionally
-                    // not clamped: that path short-circuits to return the
-                    // cached ρ as the answer (the caller marked it final
-                    // and converged), so re-walking from interior would
-                    // defeat the optimization-skip purpose.
-                    const BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
-                    let bound = config.rho_bound;
-                    let interior = (bound - BOUNDARY_INTERIOR_MARGIN).max(0.0);
-                    let saturated_coords: Vec<usize> = cached_rho
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| {
-                            if v.abs() >= bound - BOUNDARY_INTERIOR_MARGIN {
-                                Some(i)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    // All-saturated cached ρ is the unique signature of a
-                    // divergent prior run (e.g. the pre-0dc469bd IFT bug
-                    // that pinned every coordinate at ±bound).  A healthy
-                    // fit cannot land every coordinate on the box; the
-                    // entry is poisoned.  Clamping to (bound - margin)
-                    // still leaves λ ∈ {e^-9, e^9}, which keeps the inner
-                    // PIRLS Hessian near-singular and starves the joint
-                    // Newton of useful progress within its cycle budget.
-                    // Discard the entry entirely so the optimizer falls
-                    // through to its normal cold-init seeding.
-                    if !saturated_coords.is_empty() && saturated_coords.len() == cached_rho.len() {
-                        log::info!(
-                            "[CACHE] discard key={}.. context={} rho_dim={} \
-                             saturated_coords={:?} bound=±{:.3} \
-                             reason=all-coords-saturated-poisoned-entry",
-                            short_key,
-                            context,
-                            cached_rho.len(),
-                            saturated_coords,
-                            bound,
-                        );
-                    } else {
-                        let seed_rho = if saturated_coords.is_empty() {
-                            cached_rho
-                        } else {
-                            let clamped = cached_rho.mapv(|v| v.clamp(-interior, interior));
+                }
+                CacheSeedDecision::Seed {
+                    rho,
+                    prior_obj_display,
+                    iteration,
+                    saturated_coords,
+                    clamped_to,
+                } => {
+                    if config
+                        .initial_rho
+                        .as_ref()
+                        .is_none_or(|initial| initial != &rho)
+                    {
+                        if let Some(interior) = clamped_to {
                             log::info!(
                                 "[CACHE] hit-clamp key={}.. context={} rho_dim={} \
                                  saturated_coords={:?} bound=±{:.3} clamped_to=±{:.3} \
                                  reason=stale-or-trapping-boundary-seed",
                                 short_key,
                                 context,
-                                clamped.len(),
+                                rho.len(),
                                 saturated_coords,
-                                bound,
+                                config.rho_bound,
                                 interior,
                             );
-                            clamped
-                        };
+                        }
                         log::info!(
                             "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
                             short_key,
                             context,
-                            seed_rho.len(),
+                            rho.len(),
                             prior_obj_display,
-                            entry.iteration.unwrap_or(0),
+                            iteration,
                         );
-                        config.initial_rho = Some(seed_rho);
+                        config.initial_rho = Some(rho);
                         config.screen_initial_rho = false;
                         had_hit = true;
+                    } else {
+                        log::info!(
+                            "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned prior_obj={:.6e}",
+                            short_key,
+                            context,
+                            rho.len(),
+                            prior_obj_display,
+                        );
+                        had_hit = true;
                     }
-                } else {
+                }
+                CacheSeedDecision::Discard {
+                    reason: "payload-shape-mismatch",
+                    ..
+                } => {
                     log::info!(
-                        "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned prior_obj={:.6e}",
+                        "[CACHE] skip key={}.. context={} reason=payload-shape-mismatch n_params={}",
                         short_key,
                         context,
-                        cached_rho.len(),
-                        prior_obj_display,
+                        self.n_params,
                     );
-                    had_hit = true;
                 }
-            } else {
-                log::info!(
-                    "[CACHE] skip key={}.. context={} reason=payload-shape-mismatch n_params={}",
-                    short_key,
-                    context,
-                    self.n_params,
-                );
+                CacheSeedDecision::Discard {
+                    reason: "non-finite-payload",
+                    prior_obj_display,
+                    all_rho_finite,
+                    ..
+                } => {
+                    log::info!(
+                        "[CACHE] skip key={}.. context={} reason=non-finite-payload prior_obj={:.6e} all_rho_finite={}",
+                        short_key,
+                        context,
+                        prior_obj_display,
+                        all_rho_finite.unwrap_or(false),
+                    );
+                }
+                CacheSeedDecision::Discard {
+                    reason,
+                    saturated_coords,
+                    ..
+                } => {
+                    log::info!(
+                        "[CACHE] discard key={}.. context={} rho_dim={} \
+                         saturated_coords={:?} bound=±{:.3} reason={}",
+                        short_key,
+                        context,
+                        saturated_coords.len(),
+                        saturated_coords,
+                        config.rho_bound,
+                        reason,
+                    );
+                }
             }
         } else {
             log::info!(
@@ -8556,29 +8610,73 @@ mod tests {
     }
 
     #[test]
-    fn cache_entry_seed_validity_rejects_all_saturated_payload() {
+    fn cache_entry_seed_policy_uses_helpful_cache_and_rejects_poisoned_checkpoints() {
         let usable_payload = encode_iterate(&array![9.0, 0.0], None, 1.0, 0).expect("encode");
         let poisoned_payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
-        let usable = crate::cache::CachedEntry {
-            payload: usable_payload,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: crate::cache::EntryKind::Checkpoint,
-            written_unix_secs: 0,
+        let usable = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload: usable_payload,
+                objective: Some(1.0),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
         };
-        let poisoned = crate::cache::CachedEntry {
-            payload: poisoned_payload,
-            objective: Some(1.0),
-            iteration: Some(0),
-            kind: crate::cache::EntryKind::Checkpoint,
-            written_unix_secs: 0,
+        let poisoned = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload: poisoned_payload,
+                objective: Some(1.0),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
         };
 
-        assert!(cache_entry_can_seed_outer(&usable, 2, 10.0));
+        assert!(cache_entry_would_help_outer(&usable, 2, 10.0));
+        let CacheSeedDecision::Seed {
+            saturated_coords,
+            clamped_to,
+            ..
+        } = classify_cache_entry_for_outer(&usable, 2, 10.0)
+        else {
+            panic!("partially saturated warm start should be repaired and used");
+        };
+        assert_eq!(saturated_coords, vec![0]);
+        assert_eq!(clamped_to, Some(9.0));
         assert!(
-            !cache_entry_can_seed_outer(&poisoned, 2, 10.0),
+            !cache_entry_would_help_outer(&poisoned, 2, 10.0),
             "all-boundary checkpoints must not suppress family cold-start pilots"
         );
+        assert!(matches!(
+            classify_cache_entry_for_outer(&poisoned, 2, 10.0),
+            CacheSeedDecision::Discard {
+                reason: "all-coords-saturated-poisoned-entry",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn exact_final_cache_hit_is_helpful_even_at_boundary() {
+        let payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 3).expect("encode");
+        let loaded = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload,
+                objective: Some(1.0),
+                iteration: Some(3),
+                kind: crate::cache::EntryKind::Final,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Exact,
+        };
+
+        assert!(cache_entry_would_help_outer(&loaded, 2, 10.0));
+        assert!(matches!(
+            classify_cache_entry_for_outer(&loaded, 2, 10.0),
+            CacheSeedDecision::ExactFinal { iterations: 3, .. }
+        ));
     }
 
     #[test]
