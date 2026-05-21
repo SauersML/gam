@@ -9889,7 +9889,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         centers: centers.to_owned(),
         length_scale,
         p_order,
-        s_order as f64,
+        s_order: duchon_power_to_usize(s_order),
         pure_block_order,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),

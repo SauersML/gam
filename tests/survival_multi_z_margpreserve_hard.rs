@@ -13,14 +13,14 @@
 //! the 2e-15 tolerance.
 
 use gam::bernoulli_marginal_slope::{
-    marginal_slope_covariance_from_scores, MarginalSlopeCovariance, MarginalSlopeCovarianceShape,
+    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
     survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,
     survival_marginal_slope_vector_scale,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 // ---------------------------------------------------------------------------
 // Tiny deterministic PRNG (splitmix64 -> f64 in [0,1)) so we do not pull in a
@@ -197,8 +197,22 @@ fn survival_multi_z_extreme_magnitudes_grid() {
                 let lr = random_low_rank(&mut rng, k, 2);
                 let slopes = random_slopes(&mut rng, k, sn);
                 let label = format!("extreme ps={ps:.0e} sn={sn:.0e} q={q}");
-                assert_marginal_preservation(q, &slopes, &diag, ps, 2e-15, &(label.clone() + " diag"));
-                assert_marginal_preservation(q, &slopes, &full, ps, 2e-15, &(label.clone() + " full"));
+                assert_marginal_preservation(
+                    q,
+                    &slopes,
+                    &diag,
+                    ps,
+                    2e-15,
+                    &(label.clone() + " diag"),
+                );
+                assert_marginal_preservation(
+                    q,
+                    &slopes,
+                    &full,
+                    ps,
+                    2e-15,
+                    &(label.clone() + " full"),
+                );
                 assert_marginal_preservation(q, &slopes, &lr, ps, 2e-15, &(label + " lr"));
             }
         }
@@ -400,8 +414,7 @@ fn survival_multi_z_permutation_invariance_full_and_lowrank() {
         let slopes_p = permute_vec(&slopes, &perm);
         let z_p = permute_vec(&z, &perm);
         let cov_full_p = MarginalSlopeCovariance::Full(permute_full(&dense, &perm));
-        let cov_lr_p =
-            MarginalSlopeCovariance::LowRank(permute_lowrank_rows(&lr_factor, &perm));
+        let cov_lr_p = MarginalSlopeCovariance::LowRank(permute_lowrank_rows(&lr_factor, &perm));
 
         for (label, cov, cov_p) in [
             ("Full", &cov_full, &cov_full_p),
@@ -409,9 +422,8 @@ fn survival_multi_z_permutation_invariance_full_and_lowrank() {
         ] {
             let scale_orig =
                 survival_marginal_slope_vector_scale(&slopes, cov, probit_scale).expect("scale");
-            let scale_perm =
-                survival_marginal_slope_vector_scale(&slopes_p, cov_p, probit_scale)
-                    .expect("scale perm");
+            let scale_perm = survival_marginal_slope_vector_scale(&slopes_p, cov_p, probit_scale)
+                .expect("scale perm");
             assert!(
                 (scale_orig - scale_perm).abs() <= 1e-14,
                 "{label} seed={seed}: scale not invariant; orig={scale_orig:.17e} perm={scale_perm:.17e}"
@@ -544,14 +556,9 @@ fn survival_multi_z_covariance_from_scores_smoke() {
 fn survival_multi_z_eta_rejects_z_slope_dimension_mismatch() {
     let covariance = MarginalSlopeCovariance::Diagonal(array![1.0, 1.0]);
     // z and covariance agree (len 2), but slopes is length 3.
-    let err = survival_marginal_slope_vector_eta(
-        0.2,
-        &[0.4, -0.8],
-        &[0.3, 0.1, -0.2],
-        &covariance,
-        1.0,
-    )
-    .expect_err("dimension mismatch must fail");
+    let err =
+        survival_marginal_slope_vector_eta(0.2, &[0.4, -0.8], &[0.3, 0.1, -0.2], &covariance, 1.0)
+            .expect_err("dimension mismatch must fail");
     assert!(
         err.to_lowercase().contains("dimension mismatch"),
         "unexpected error: {err}"

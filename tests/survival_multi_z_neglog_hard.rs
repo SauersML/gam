@@ -102,8 +102,7 @@ fn closed_form_neglog(
     let eta1 = q1 * c + linear;
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
     weight
-        * ((1.0 - event) * (-normal_cdf(-eta1).ln())
-            + normal_cdf(-eta0).ln()
+        * ((1.0 - event) * (-normal_cdf(-eta1).ln()) + normal_cdf(-eta0).ln()
             - event * log_phi_eta1
             - event * (qd1 * c).ln())
 }
@@ -141,11 +140,28 @@ fn closed_form_match_across_k_and_cov_shapes() {
                     let qd1 = rng.uniform(0.05, 2.0);
 
                     let actual = survival_marginal_slope_vector_neglog(
-                        q0, q1, qd1, &slopes, &z, &cov, weight, event, 1e-6, probit_scale,
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &z,
+                        &cov,
+                        weight,
+                        event,
+                        1e-6,
+                        probit_scale,
                     )
                     .expect("vector neglog");
                     let expected = closed_form_neglog(
-                        q0, q1, qd1, &slopes, &z, &cov, weight, event, probit_scale,
+                        q0,
+                        q1,
+                        qd1,
+                        &slopes,
+                        &z,
+                        &cov,
+                        weight,
+                        event,
+                        probit_scale,
                     );
                     let diff = (actual - expected).abs();
                     if diff > worst {
@@ -168,11 +184,9 @@ fn closed_form_match_across_k_and_cov_shapes() {
 
 #[test]
 fn event_zero_makes_qd1_irrelevant_bitwise() {
-    let cov = MarginalSlopeCovariance::Full(Array2::from_shape_vec(
-        (2, 2),
-        vec![1.4, 0.3, 0.3, 0.9],
-    )
-    .unwrap());
+    let cov = MarginalSlopeCovariance::Full(
+        Array2::from_shape_vec((2, 2), vec![1.4, 0.3, 0.3, 0.9]).unwrap(),
+    );
     let slopes = [0.31, -0.2];
     let z = [0.5, -0.4];
     let common = |qd1: f64| -> f64 {
@@ -269,13 +283,31 @@ fn weight_scaling_is_linear() {
         let event = if rng.next_u64() & 1 == 0 { 0.0 } else { 1.0 };
 
         let base = survival_marginal_slope_vector_neglog(
-            q0, q1, qd1, &slopes, &z, &cov, 1.0, event, 1e-6, probit_scale,
+            q0,
+            q1,
+            qd1,
+            &slopes,
+            &z,
+            &cov,
+            1.0,
+            event,
+            1e-6,
+            probit_scale,
         )
         .expect("base neglog");
 
         // The exact zero case.
         let zeroed = survival_marginal_slope_vector_neglog(
-            q0, q1, qd1, &slopes, &z, &cov, 0.0, event, 1e-6, probit_scale,
+            q0,
+            q1,
+            qd1,
+            &slopes,
+            &z,
+            &cov,
+            0.0,
+            event,
+            1e-6,
+            probit_scale,
         )
         .expect("w=0 neglog");
         assert_eq!(
@@ -455,7 +487,16 @@ fn probit_scale_slope_homogeneity() {
             let event = if rng.next_u64() & 1 == 0 { 0.0 } else { 1.0 };
 
             let base = survival_marginal_slope_vector_neglog(
-                q0, q1, qd1, &slopes, &z, &cov, weight, event, 1e-6, probit_scale,
+                q0,
+                q1,
+                qd1,
+                &slopes,
+                &z,
+                &cov,
+                weight,
+                event,
+                1e-6,
+                probit_scale,
             )
             .expect("base");
 
@@ -564,7 +605,16 @@ fn nan_inf_inputs_do_not_silently_return_finite() {
     // slopes containing Inf
     let inf_slopes = [f64::INFINITY, -0.1];
     let r2 = survival_marginal_slope_vector_neglog(
-        0.0, 0.3, 0.5, &inf_slopes, &z, &cov, 1.0, 1.0, 1e-6, 1.0,
+        0.0,
+        0.3,
+        0.5,
+        &inf_slopes,
+        &z,
+        &cov,
+        1.0,
+        1.0,
+        1e-6,
+        1.0,
     );
     match r2 {
         Err(_) => {}
