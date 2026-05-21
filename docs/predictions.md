@@ -135,6 +135,24 @@ pred.write_survival_at_csv("surv.csv", times=[1, 5, 10, 20])
 The CSV has columns `row, time, survival` (plus the id column if you set
 `id_column=` on `predict`).
 
+### Competing-risk CIF assembly
+
+Fit or predict one cause-specific survival endpoint per event type, then
+assemble Aalen-Johansen cumulative incidence functions on a shared grid:
+
+```python
+cif = gamfit.competing_risks_cif(
+    {"disease": disease_pred, "death": death_pred},
+    times=[1, 5, 10, 20],
+)
+
+disease_cif = cif.cif[0]              # (n_rows, 4)
+joint_survival = cif.overall_survival # (n_rows, 4)
+```
+
+`cif.cif` has shape `(n_endpoints, n_rows, n_times)`. Endpoint names are
+preserved from a mapping input or can be supplied with `endpoint_names=`.
+
 ### Survival uncertainty
 
 For location-scale survival models, pass `with_uncertainty=True` to compute

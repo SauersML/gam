@@ -27,6 +27,11 @@ For narrative explanations, see the topical guides in the sidebar.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.competing_risks_cif
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.validate_formula
     options:
       show_root_heading: true
@@ -55,6 +60,12 @@ For narrative explanations, see the topical guides in the sidebar.
         - "^__repr__$"
 
 ::: gamfit.SurvivalPrediction
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+::: gamfit.CompetingRisksCIF
     options:
       show_root_heading: true
       heading_level: 3
