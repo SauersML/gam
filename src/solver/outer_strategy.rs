@@ -1646,6 +1646,20 @@ pub trait OuterObjective {
 
     /// Restore to a clean baseline for the next multi-start candidate.
     fn reset(&mut self);
+
+    /// Seed the inner-solver iterate before the first eval, e.g. when the
+    /// outer-iterate cache restored a `(ρ, β)` pair from a prior run.
+    ///
+    /// The default is a no-op: families that don't expose an inner β slot
+    /// silently ignore the hint and the first `eval(ρ)` proceeds from
+    /// whatever inner state the family had — equivalent to a ρ-only resume.
+    /// Families that *do* expose β (PIRLS-based GAMs, custom-family marginal
+    /// slope, …) override this to install β as the warm-start iterate so the
+    /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
+    /// stops mattering.
+    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
+        Ok(())
+    }
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
@@ -1744,12 +1758,22 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
 pub(crate) enum CacheSeedDecision {
     ExactFinal {
         rho: Array1<f64>,
+        /// Optional inner β captured at the converged ρ. Empty when the
+        /// payload didn't carry one (legacy ρ-only writes or families
+        /// that don't surface β).
+        beta: Vec<f64>,
         final_value: f64,
         iterations: usize,
         prior_obj_display: f64,
     },
     Seed {
         rho: Array1<f64>,
+        /// Optional inner β to prime the next run's inner solver via
+        /// [`OuterObjective::seed_inner_state`]. When non-empty, the
+        /// dispatcher injects β before the first eval so the inner
+        /// PIRLS opens at zero-gradient regardless of where ρ sits in
+        /// the box.
+        beta: Vec<f64>,
         prior_obj_display: f64,
         iteration: u64,
     },
@@ -1792,6 +1816,7 @@ pub(crate) fn classify_cache_entry_for_outer(
     if loaded.source == LoadSource::Exact && entry.kind == crate::cache::EntryKind::Final {
         return CacheSeedDecision::ExactFinal {
             rho: cached_rho,
+            beta: payload.beta,
             final_value: entry.objective.unwrap_or(payload.cost),
             iterations: entry
                 .iteration
@@ -1802,6 +1827,7 @@ pub(crate) fn classify_cache_entry_for_outer(
     }
     CacheSeedDecision::Seed {
         rho: cached_rho,
+        beta: payload.beta,
         prior_obj_display,
         iteration: entry.iteration.unwrap_or(payload.eval_id),
     }
@@ -1913,6 +1939,19 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         // EfsEval has no inner-β hint surface yet — persist ρ-only.
         self.note(rho, None, r.cost);
         Ok(r)
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+        // Forward to the wrapped objective, then prime our last-inner-beta
+        // cache so a subsequent finalize-write encodes the seeded β if no
+        // eval surfaces a fresher β first.
+        let result = self.inner.seed_inner_state(beta);
+        if result.is_ok() && beta.iter().all(|v| v.is_finite()) {
+            if let Ok(mut guard) = self.last_inner_beta.lock() {
+                *guard = Some(beta.clone());
+            }
+        }
+        result
     }
 
     fn reset(&mut self) {
@@ -4404,10 +4443,12 @@ impl OuterProblem {
         let key_hex = session.key().to_hex();
         let short_key = &key_hex[..8.min(key_hex.len())];
         let mut had_hit = false;
+        let mut cached_inner_beta: Option<Array1<f64>> = None;
         if let Some(loaded) = session.try_load_with_source() {
             match classify_cache_entry_for_outer(&loaded, self.n_params, config.rho_bound) {
                 CacheSeedDecision::ExactFinal {
                     rho,
+                    beta: _beta_final,
                     final_value,
                     iterations,
                     prior_obj_display,
@@ -4437,19 +4478,27 @@ impl OuterProblem {
                 }
                 CacheSeedDecision::Seed {
                     rho,
+                    beta,
                     prior_obj_display,
                     iteration,
                 } => {
+                    let beta_len = beta.len();
+                    let beta_arr = if beta.is_empty() {
+                        None
+                    } else {
+                        Some(Array1::from_vec(beta))
+                    };
                     if config
                         .initial_rho
                         .as_ref()
                         .is_none_or(|initial| initial != &rho)
                     {
                         log::info!(
-                            "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
+                            "[CACHE] hit  key={}.. context={} rho_dim={} beta_dim={} prior_obj={:.6e} iter={}",
                             short_key,
                             context,
                             rho.len(),
+                            beta_len,
                             prior_obj_display,
                             iteration,
                         );
@@ -4458,14 +4507,16 @@ impl OuterProblem {
                         had_hit = true;
                     } else {
                         log::info!(
-                            "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned prior_obj={:.6e}",
+                            "[CACHE] hit  key={}.. context={} rho_dim={} beta_dim={} already-aligned prior_obj={:.6e}",
                             short_key,
                             context,
                             rho.len(),
+                            beta_len,
                             prior_obj_display,
                         );
                         had_hit = true;
                     }
+                    cached_inner_beta = beta_arr;
                 }
                 CacheSeedDecision::Discard {
                     reason: "payload-shape-mismatch",
@@ -4506,6 +4557,30 @@ impl OuterProblem {
             Arc::clone(&session),
             config.cache_mirror_sessions.clone(),
         );
+        // Inject the cached inner β (when present) so the family's PIRLS
+        // opens at the prior converged iterate. Families that don't expose
+        // a β slot inherit the trait's no-op default and silently ignore
+        // the hint — that's a ρ-only resume, identical to the pre-β-cache
+        // behavior, but never a regression. Families that DO expose β
+        // (PIRLS-based GAMs, custom-family marginal slope, …) override
+        // `seed_inner_state` to install β before the first eval.
+        if let Some(beta) = cached_inner_beta.as_ref() {
+            match checkpointing.seed_inner_state(beta) {
+                Ok(()) => log::info!(
+                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=installed",
+                    short_key,
+                    context,
+                    beta.len(),
+                ),
+                Err(err) => log::warn!(
+                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=skip err={}",
+                    short_key,
+                    context,
+                    beta.len(),
+                    err,
+                ),
+            }
+        }
         let result = run_outer(&mut checkpointing, &config, context);
         // Pull the most-recent inner β surfaced by the inner solver so the
         // finalize write encodes the (ρ, β) pair the BFGS optimum was
