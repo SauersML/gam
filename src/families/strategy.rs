@@ -134,6 +134,27 @@ fn missing_state(family: LikelihoodFamily, what: &str) -> EstimationError {
     ))
 }
 
+/// Compute `(mean, variance)` of a Bernoulli probability `p(η)` integrated
+/// against `η ~ N(eta, se_eta²)` via the joint `(p, p²)` adaptive Gauss-Hermite
+/// rule. Both SAS and beta-logistic posterior-mean-variance branches share
+/// this exact shape — only the probability kernel differs.
+#[inline]
+fn posterior_mv_from_prob_kernel<F>(
+    quadctx: &QuadratureContext,
+    eta: f64,
+    se_eta: f64,
+    prob: F,
+) -> (f64, f64)
+where
+    F: Fn(f64) -> f64,
+{
+    let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
+        let p = prob(x);
+        (p, p * p)
+    });
+    (m1, (m2 - m1 * m1).max(0.0))
+}
+
 impl FamilyStrategy for ResolvedFamilyStrategy {
     fn name(&self) -> &'static str {
         self.family.name()
@@ -255,29 +276,20 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             }
             LikelihoodFamily::BinomialSas => {
                 let state = self.require_sas_state()?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
-                    let p = crate::mixture_link::sas_inverse_link_jet(
-                        x,
-                        state.epsilon,
-                        state.log_delta,
-                    )
-                    .mu;
-                    (p, p * p)
-                });
-                Ok((m1, (m2 - m1 * m1).max(0.0)))
+                Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
+                    crate::mixture_link::sas_inverse_link_jet(x, state.epsilon, state.log_delta).mu
+                }))
             }
             LikelihoodFamily::BinomialBetaLogistic => {
                 let state = self.require_sas_state()?;
-                let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
-                    let p = crate::mixture_link::beta_logistic_inverse_link_jet(
+                Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
+                    crate::mixture_link::beta_logistic_inverse_link_jet(
                         x,
                         state.log_delta,
                         state.epsilon,
                     )
-                    .mu;
-                    (p, p * p)
-                });
-                Ok((m1, (m2 - m1 * m1).max(0.0)))
+                    .mu
+                }))
             }
             LikelihoodFamily::BinomialMixture => {
                 let state = self.require_mixture_state()?;
