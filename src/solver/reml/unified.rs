@@ -7701,6 +7701,27 @@ fn compute_base_h2_traces(
     if pairs.is_empty() {
         return Vec::new();
     }
+    if let Some(kernel) = subspace {
+        let factor = penalty_subspace_trace_factor(kernel);
+        let cache = ProjectedFactorCache::default();
+        let mut out = vec![0.0_f64; pairs.len()];
+        let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+        for (idx, pair) in pairs.iter().enumerate() {
+            if let Some(op) = pair.b_operator.as_deref() {
+                collect_projected_trace_terms(idx, 1.0, op, &factor, &mut out, &mut op_terms);
+            } else if pair.b_mat.nrows() > 0 {
+                out[idx] = dense_trace_projected_factor(&pair.b_mat, &factor);
+            }
+        }
+        if !op_terms.is_empty() {
+            let batched =
+                trace_projected_operator_terms_batched(pairs.len(), &op_terms, &factor, &cache);
+            for (idx, val) in batched.into_iter().enumerate() {
+                out[idx] += val;
+            }
+        }
+        return out;
+    }
     // Dense-spectral batched path: collect every operator-backed pair into a
     // single chunked sweep so the implicit design (compute_xf + per-axis
     // kernel scalars) is traversed once instead of `pairs.len()` times. At
