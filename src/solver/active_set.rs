@@ -57,9 +57,11 @@ pub struct ConstraintKktDiagnostics {
     pub active_tolerance: f64,
 }
 
+use crate::linalg::utils::array_is_finite;
+
 #[inline]
 fn array1_is_finite(values: &Array1<f64>) -> bool {
-    values.iter().all(|v| v.is_finite())
+    array_is_finite(values)
 }
 
 fn solve_newton_direction_dense(
