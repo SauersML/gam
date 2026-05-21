@@ -6411,6 +6411,19 @@ impl DesignMatrix {
         }
     }
 
+    /// Policy-aware densify: callers that own the consumer's dense budget can
+    /// override the conservative default cap used by [`Self::try_to_dense_arc`].
+    pub fn try_to_dense_arc_with_policy(
+        &self,
+        context: &str,
+        policy: &ResourcePolicy,
+    ) -> Result<Arc<Array2<f64>>, String> {
+        match self {
+            Self::Dense(matrix) => matrix.try_to_dense_arc_with_policy(context, policy),
+            Self::Sparse(matrix) => matrix.try_to_dense_arc(context),
+        }
+    }
+
     pub fn to_csr_cache(&self) -> Option<SparseRowMat<usize, f64>> {
         match self {
             Self::Dense(_) => None,

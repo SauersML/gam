@@ -126,20 +126,34 @@ fn force_init_culib_persistent() -> bool {
     outcome.is_ok()
 }
 
-/// Linux-only defensive scan: refuse cuBLAS work if more than one
-/// distinct file is mapped under any CUDA library SONAME family. Logs
-/// a multi-line, actionable error to the `log` crate naming every
-/// conflicting path. See [`detect_cuda_library_conflicts`] for the
-/// mechanism. CPU dispatch takes over from here.
+/// Linux-only diagnostic: report when more than one distinct file is
+/// mapped under any CUDA library SONAME family. This used to refuse
+/// cuBLAS work; it now only warns.
+///
+/// The crash scenario the refuse-path was guarding against —
+/// `cublasDestroy_v2` resolving to a *different* library than the one
+/// that produced the handle, freeing a chunk it never owned — requires
+/// per-call symbol resolution to flip libraries. cudarc's `culib()` is
+/// a process-wide `OnceLock<Library>` and every cuBLAS symbol is
+/// resolved through that single `Library` handle. Once initialized,
+/// `cublasCreate_v2` and `cublasDestroy_v2` necessarily route through
+/// the same physical file; the second mapping (typically pulled in by
+/// PyTorch or a sibling Python framework via its own DT_NEEDED chain)
+/// is dead weight that we never call into.
+///
+/// On dual-stack Colab / AoU images the strict-refuse policy was a
+/// false positive: the host happily runs PyTorch CUDA, our cudarc
+/// handle is consistent, and disabling GPU forced an n-times-slower
+/// CPU fallback. Downgrading to a warning surfaces the diagnostic
+/// without sacrificing throughput. If gam ever genuinely sees a
+/// destroy mismatch it surfaces as a SIGABRT from glibc anyway —
+/// observable, not silenced.
 #[cfg(target_os = "linux")]
 fn verify_no_cuda_library_conflicts() -> bool {
-    match detect_cuda_library_conflicts() {
-        Ok(()) => true,
-        Err(report) => {
-            log::error!("[GPU] {report}");
-            false
-        }
+    if let Err(report) = detect_cuda_library_conflicts() {
+        log::warn!("[GPU] {report}");
     }
+    true
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -212,12 +226,12 @@ fn detect_cuda_library_conflicts() -> Result<(), String> {
         return Ok(());
     }
     let mut msg = String::from(
-        "CUDA library conflict: multiple distinct files share a SONAME and \
-         coexist in this process. glibc dlopen deduplicates by \
-         (device, inode), not by SONAME, so all of the following are \
-         simultaneously mapped. cuBLAS handle state would split across \
-         them and the next cublasDestroy_v2 would abort with 'double \
-         free or corruption (!prev)'.",
+        "CUDA library duplicate mapping: more than one distinct file \
+         is mapped under the same SONAME. cudarc's `culib()` is a \
+         process-wide `OnceLock<Library>` so every cuBLAS symbol in \
+         gam resolves through one specific handle — the other mapping \
+         is dead weight (typically from PyTorch's DT_NEEDED chain) \
+         that gam does not call into. Continuing with CUDA enabled.",
     );
     for (family, paths) in &conflicts {
         msg.push_str(&format!("\n  {family}:"));
@@ -226,9 +240,9 @@ fn detect_cuda_library_conflicts() -> Result<(), String> {
         }
     }
     msg.push_str(
-        "\nKeep exactly one CUDA toolkit reachable to the loader: either \
-         the system toolkit (usually /usr/local/cuda*) or the pip \
-         nvidia-*-cu12 wheels, not both. Disabling CUDA dispatch.",
+        "\nTo silence this warning, ensure only one CUDA toolkit is \
+         reachable to the loader: either the system toolkit (usually \
+         /usr/local/cuda*) or the pip nvidia-*-cu12 wheels, not both.",
     );
     Err(msg)
 }

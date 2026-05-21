@@ -14806,7 +14806,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho, penalty_counts)?;
-    let inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
         log::warn!(
             "[OUTER] custom-family EFS inner solve did not converge after {} cycle(s); \
@@ -20633,7 +20633,10 @@ mod tests {
             EvalMode::ValueGradientHessian,
         );
 
-        let err = result.expect_err("non-converged inner solve must not expose derivatives");
+        let err = match result {
+            Ok(_) => panic!("non-converged inner solve must not expose derivatives"),
+            Err(e) => e,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("inner solve did not converge") && msg.contains("refusing to expose"),
