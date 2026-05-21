@@ -19309,6 +19309,381 @@ mod tests {
         );
     }
 
+    // ── Biobank-shape reproducer for the marginal-slope ρ-saturation
+    // failure ────────────────────────────────────────────────────────────
+    //
+    // Failure being investigated (see project_biobank_marginal_slope_failure.md):
+    //   outer iter=60, |g|=4.18e13, three of four ρ-coords pinned at the
+    //   box bound ±10 (`with_rho_bound(10.0)`). The dominant explicit term
+    //   ½λβ'Sβ at biobank scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is
+    //   only ~10⁸ — observed gradient is ~10¹³, FIVE orders of magnitude
+    //   beyond what the projected-trace kernel cancellation predicts.
+    //
+    // The existing `biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant`
+    // test uses single-block, p=3, nullspace_dims=1, and supplies
+    // `compute_dh = Ok(None)` — that path SKIPS the trace pair entirely and
+    // therefore cannot reproduce the failure. The biobank fit has:
+    //   - 3 blocks (time_surface, marginal_surface, logslope_surface)
+    //   - 4 penalty coords (time:1, marginal:2 [anisotropic], logslope:1)
+    //   - Duchon-shape penalties: large nullspace_dims (d+1=4 for d=3 PCs)
+    //     producing rank-deficient S with many zero eigenvalues
+    //   - n ~ 2e5 → H_unpen scale ~ n × diag-of-design-Gram
+    //   - Realistic `compute_dh(d)` returning the per-coord penalty drift
+    //     ∂H/∂ρ_k = λ_k S_k (chained through the direction d)
+    //
+    // This test reproduces the SHAPE: builds biobank-dimensioned blocks
+    // with rank-deficient Duchon-shape penalties, scales H to biobank
+    // magnitude, supplies a realistic penalty-drift `compute_dh`, evaluates
+    // `joint_outer_evaluate` at the actual failure ρ point
+    // [time=10, marg=10, marg=10, logslope=4.5], and asserts every gradient
+    // entry is BOUNDED by a physically reasonable multiple of the dominant
+    // ½λβ'Sβ term.
+    //
+    // If this test passes with reasonable bounds: the bug is NOT in
+    //   joint_outer_evaluate itself — it must live in the marginal-slope-
+    //   specific drift derivatives (`evaluate_exact_newton_joint_gradient_*`
+    //   in survival_marginal_slope.rs) that feed the closure.
+    // If this test fails: joint_outer_evaluate has a numerical defect that
+    //   surfaces at biobank scale + realistic Ḣ. We then bisect inside the
+    //   evaluator.
+    //
+    #[test]
+    fn biobank_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
+        use crate::solver::reml::unified::DriftDerivResult;
+
+        // Biobank-realistic dimensions for hypertension marginal-slope.
+        // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
+        // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
+        // The actual fit has time_surface with a different basis (B-spline
+        // along entry/exit age) — we approximate with p_time=10, null=2.
+        let p_time = 10usize;
+        let p_marg = 14usize;
+        let p_logs = 14usize;
+        let p_total = p_time + p_marg + p_logs;
+
+        // Block ranges in the joint coefficient vector.
+        let ranges = vec![
+            (0, p_time),
+            (p_time, p_time + p_marg),
+            (p_time + p_marg, p_total),
+        ];
+
+        // ── Build rank-deficient Duchon-shape penalty matrices.
+        // S = U diag(σ) Uᵀ where σ has `nullspace_dims` trailing zeros.
+        // We use deterministic orthonormal columns from a simple QR of a
+        // structured matrix to mimic the eigenstructure without random.
+        fn build_duchon_shape(p: usize, nullspace: usize, signal_scale: f64) -> Array2<f64> {
+            // Diagonal eigenvalue spectrum, geometric decay across the
+            // signal subspace then zeros on the nullspace.
+            let rank = p - nullspace;
+            let mut eigvals = vec![0.0_f64; p];
+            for i in 0..rank {
+                // 1.0, 0.5, 0.25, ... — physical Duchon penalty spectrum
+                // has spectrum decaying like 1/k for high-frequency modes;
+                // geometric decay is a faithful caricature.
+                eigvals[i] = signal_scale * 0.5_f64.powi(i as i32);
+            }
+            // Use a deterministic orthogonal basis: discrete cosine basis.
+            // U[i,j] = sqrt(2/p) cos(π (i+0.5) j / p) for j>0; U[i,0]=1/√p.
+            let mut u = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                u[[i, 0]] = 1.0 / (p as f64).sqrt();
+                for j in 1..p {
+                    u[[i, j]] = (2.0 / p as f64).sqrt()
+                        * (std::f64::consts::PI * (i as f64 + 0.5) * j as f64 / p as f64).cos();
+                }
+            }
+            // S = U diag(eigvals) Uᵀ.
+            let mut s = Array2::<f64>::zeros((p, p));
+            for k in 0..p {
+                if eigvals[k] == 0.0 {
+                    continue;
+                }
+                for i in 0..p {
+                    for j in 0..p {
+                        s[[i, j]] += eigvals[k] * u[[i, k]] * u[[j, k]];
+                    }
+                }
+            }
+            s
+        }
+
+        // time_surface: 1 penalty (nullspace=2: constant + linear in age).
+        let s_time = build_duchon_shape(p_time, 2, 1.0);
+        // marginal_surface: 2 penalties (nullspace=4 each, anisotropic).
+        let s_marg_0 = build_duchon_shape(p_marg, 4, 1.0);
+        let s_marg_1 = build_duchon_shape(p_marg, 4, 0.7);
+        // logslope_surface: 1 penalty (nullspace=4).
+        let s_logs = build_duchon_shape(p_logs, 4, 1.0);
+
+        // Embed each block's S into the joint p_total × p_total layout so
+        // we can build Ḣ_k as the full-block S_k for the trace.
+        let embed = |s: &Array2<f64>, range: (usize, usize)| -> Array2<f64> {
+            let mut out = Array2::<f64>::zeros((p_total, p_total));
+            let (a, b) = range;
+            for i in 0..s.nrows() {
+                for j in 0..s.ncols() {
+                    out[[a + i, a + j]] = s[[i, j]];
+                }
+            }
+            out
+        };
+        let s_time_full = embed(&s_time, ranges[0]);
+        let s_marg_0_full = embed(&s_marg_0, ranges[1]);
+        let s_marg_1_full = embed(&s_marg_1, ranges[1]);
+        let s_logs_full = embed(&s_logs, ranges[2]);
+
+        // ── Failure-point ρ = [10, 10, 10, 4.5]. λ = exp(ρ).
+        let rho = array![10.0_f64, 10.0, 10.0, 4.5];
+        let lams: Array1<f64> = rho.mapv(f64::exp);
+
+        // λ-scaled S matrices (per-block, in block-local indexing — this
+        // is what BlockwiseInnerResult.s_lambdas stores).
+        let s_lambdas_local: Vec<Array2<f64>> = vec![
+            s_time.mapv(|v| v * lams[0]),
+            // marginal block has TWO penalties — they are summed into one
+            // local s_lambda (this matches how BlockwiseInnerResult stores
+            // a per-block sum of all penalties in that block):
+            (&s_marg_0 * lams[1]) + &(&s_marg_1 * lams[2]),
+            s_logs.mapv(|v| v * lams[3]),
+        ];
+
+        // β at biobank scale: |β|∞ ~ 1, β'Sβ ~ trace(S) ~ O(p) ~ 10.
+        let beta_flat = Array1::<f64>::from_iter((0..p_total).map(|i| ((i as f64) * 0.13).sin()));
+
+        // ── Biobank-scale joint unpenalized Hessian.
+        // Real survival Hessian = Xᵀ W X with W diagonal and n=2e5. We
+        // mimic the SCALE by H = n * (I + small dense perturbation).
+        let n_scale = 2.0e5_f64;
+        let mut h = Array2::<f64>::eye(p_total) * n_scale;
+        // Add a small off-diagonal coupling to make it non-trivial but SPD.
+        for i in 0..p_total {
+            for j in 0..p_total {
+                if i != j {
+                    let v = 0.05_f64
+                        * n_scale
+                        * ((i as f64 - j as f64).abs() / p_total as f64).exp().recip();
+                    h[[i, j]] = v;
+                }
+            }
+        }
+
+        // ── Realistic penalty-drift closure.
+        // ∂H/∂ρ_k along direction d: H = H_unpen + Σ_k λ_k S_k (where each
+        // S_k is the embedded full-block matrix). ∂H/∂ρ_k = λ_k S_k. The
+        // closure takes a direction d in ρ-space and returns Σ_k d[k] λ_k
+        // S_k_full as a Dense DriftDerivResult.
+        let s_full_per_coord = vec![
+            s_time_full.clone(),
+            s_marg_0_full.clone(),
+            s_marg_1_full.clone(),
+            s_logs_full.clone(),
+        ];
+        let lams_for_closure = lams.clone();
+        let compute_dh = move |d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+            assert_eq!(d.len(), 4);
+            let mut out = Array2::<f64>::zeros((p_total, p_total));
+            for k in 0..4 {
+                let scale = d[k] * lams_for_closure[k];
+                if scale == 0.0 {
+                    continue;
+                }
+                out.scaled_add(scale, &s_full_per_coord[k]);
+            }
+            Ok(Some(DriftDerivResult::Dense(out)))
+        };
+        let no_d2h = |_u: &Array1<f64>,
+                      _v: &Array1<f64>|
+         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+
+        // ── ParameterBlockSpec for each block.
+        let mk_spec = |name: &str,
+                       p: usize,
+                       penalties: Vec<Array2<f64>>,
+                       null: usize,
+                       rho_block: Array1<f64>|
+         -> ParameterBlockSpec {
+            ParameterBlockSpec {
+                name: name.to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::<f64>::zeros((1, p)),
+                )),
+                offset: Array1::zeros(1),
+                penalties: penalties.into_iter().map(PenaltyMatrix::Dense).collect(),
+                nullspace_dims: vec![null],
+                initial_log_lambdas: rho_block,
+                initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
+            }
+        };
+        let specs = vec![
+            mk_spec(
+                "time_surface",
+                p_time,
+                vec![s_time.clone()],
+                2,
+                array![rho[0]],
+            ),
+            mk_spec(
+                "marginal_surface",
+                p_marg,
+                vec![s_marg_0.clone(), s_marg_1.clone()],
+                4,
+                array![rho[1], rho[2]],
+            ),
+            mk_spec(
+                "logslope_surface",
+                p_logs,
+                vec![s_logs.clone()],
+                4,
+                array![rho[3]],
+            ),
+        ];
+
+        let per_block = vec![array![rho[0]], array![rho[1], rho[2]], array![rho[3]]];
+
+        let inner = BlockwiseInnerResult {
+            block_states: vec![
+                ParameterBlockState {
+                    beta: beta_flat.slice(s![0..p_time]).to_owned(),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                    eta: Array1::zeros(1),
+                },
+                ParameterBlockState {
+                    beta: beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                    eta: Array1::zeros(1),
+                },
+            ],
+            active_sets: vec![None, None, None],
+            log_likelihood: 0.0,
+            penalty_value: 0.5
+                * (lams[0]
+                    * beta_flat.slice(s![0..p_time]).dot(&fast_av(
+                        &s_time,
+                        &beta_flat.slice(s![0..p_time]).to_owned(),
+                    ))
+                    + lams[1]
+                        * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                            &s_marg_0,
+                            &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                        ))
+                    + lams[2]
+                        * beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                            &s_marg_1,
+                            &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                        ))
+                    + lams[3]
+                        * beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+                            &s_logs,
+                            &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                        ))),
+            cycles: 1,
+            converged: true,
+            block_logdet_h: 0.0,
+            block_logdet_s: 0.0,
+            s_lambdas: s_lambdas_local,
+            joint_workspace: None,
+            kkt_residual: None,
+        };
+
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: false,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let projected = joint_outer_evaluate(
+            &inner,
+            &specs,
+            &per_block,
+            &rho,
+            &beta_flat,
+            JointHessianSource::Dense(h.clone()),
+            &ranges,
+            p_total,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            true,
+            false,
+            true,
+            EvalMode::ValueAndGradient,
+            &options,
+            crate::types::RhoPrior::Flat,
+            PseudoLogdetMode::Smooth,
+            &compute_dh,
+            None,
+            &no_d2h,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("biobank-shape projected eval");
+
+        eprintln!("\n=== biobank multi-block reproducer with realistic Ḣ ===");
+        eprintln!("ρ = {:?}", rho.as_slice().unwrap());
+        eprintln!("λ = {:?}", lams.as_slice().unwrap());
+        eprintln!(
+            "|β|∞ = {:.3}",
+            beta_flat.iter().fold(0.0_f64, |a, &b| a.max(b.abs()))
+        );
+        eprintln!("objective = {:.6e}", projected.objective);
+        eprintln!("gradient = {:?}", projected.gradient.as_slice().unwrap());
+
+        // Physical-bound check: ½λ_k β'_k S_k β_k is the dominant explicit
+        // term per coord. For biobank shape this is ~10⁸ at ρ=10 with
+        // β-scale O(1). The full gradient including the projected trace
+        // pair should be of THE SAME ORDER (or smaller after cancellation),
+        // never 10⁵× larger.
+        for (k, &g) in projected.gradient.iter().enumerate() {
+            let dominant_term = 0.5
+                * lams[k]
+                * match k {
+                    0 => beta_flat.slice(s![0..p_time]).dot(&fast_av(
+                        &s_time,
+                        &beta_flat.slice(s![0..p_time]).to_owned(),
+                    )),
+                    1 => beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                        &s_marg_0,
+                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                    )),
+                    2 => beta_flat.slice(s![p_time..p_time + p_marg]).dot(&fast_av(
+                        &s_marg_1,
+                        &beta_flat.slice(s![p_time..p_time + p_marg]).to_owned(),
+                    )),
+                    3 => beta_flat.slice(s![p_time + p_marg..p_total]).dot(&fast_av(
+                        &s_logs,
+                        &beta_flat.slice(s![p_time + p_marg..p_total]).to_owned(),
+                    )),
+                    _ => unreachable!(),
+                };
+            // Bound: trace pair adds ~p contributions, plus H⁻¹ Ḣ trace
+            // bounded by Σ |λ_k| / |H_diag| × p ~ λ_k p / n ~ tiny at
+            // biobank scale. Total gradient should be within 10× of the
+            // dominant term (allowing for projection-correction sign).
+            let bound = dominant_term.abs().max(1.0) * 100.0;
+            assert!(g.is_finite(), "gradient[{k}] is non-finite: {g}");
+            assert!(
+                g.abs() <= bound,
+                "gradient[{k}] = {:.6e} exceeds physical bound 100·|½λβ'Sβ| = {:.6e} \
+                 (dominant_term={:.6e}); this reproduces the biobank blowup \
+                 inside joint_outer_evaluate.",
+                g,
+                bound,
+                dominant_term
+            );
+        }
+    }
+
     #[test]
     fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
         let options = BlockwiseFitOptions {
