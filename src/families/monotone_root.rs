@@ -20,6 +20,131 @@ pub struct MonotoneRootSolution {
     pub refine_iters: usize,
 }
 
+/// Typed errors emitted by the monotone-root solver. `Display` preserves the
+/// exact pre-refactor error-string shapes so log expectations are unchanged.
+#[derive(Clone, Debug)]
+pub enum MonotoneRootError {
+    /// `eval(a)` returned an inner error message at the bracketing / refine step.
+    EvalFailed {
+        label: String,
+        a: f64,
+        source: String,
+    },
+    /// `eval(a)` returned a non-finite tuple component (f, f', or f'').
+    NonFiniteEval {
+        label: String,
+        a: f64,
+        f: f64,
+        fp: f64,
+        fpp: f64,
+    },
+    /// Derivative at the initial / current point is zero or non-finite —
+    /// monotonicity hypothesis violated.
+    DegenerateDerivative { label: String, a: f64, fp: f64 },
+    /// Bracketing failed to find a sign change within `max_bracket_iters`.
+    BracketingExhausted {
+        label: String,
+        iters: usize,
+        a_lo: f64,
+        a_hi: f64,
+    },
+    /// Newton refinement did not meet `convergence_tol` within `max_refine_iters`.
+    RefinementDidNotConverge {
+        label: String,
+        iters: usize,
+        last_residual: f64,
+    },
+}
+
+impl std::fmt::Display for MonotoneRootError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Pass through the inner eval error message verbatim so call-sites
+            // that previously did `eval(a)?` see the identical string.
+            MonotoneRootError::EvalFailed { source, .. } => f.write_str(source),
+            MonotoneRootError::NonFiniteEval { label, a, .. } => {
+                // Historical shape: closest match was inline; surface a clear
+                // diagnostic when an eval returned non-finite components.
+                write!(
+                    f,
+                    "{label}: non-finite evaluation at a={a:.6}",
+                    label = label,
+                    a = a
+                )
+            }
+            MonotoneRootError::DegenerateDerivative { label, a, fp } => {
+                // Two original sites use very similar wording; choose the one
+                // matching the "initial" path, and the "exact root" / "converged
+                // root" paths emit their own variants below.
+                if fp.is_nan() {
+                    write!(
+                        f,
+                        "{label}: initial derivative is zero or non-finite at a={a:.6}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{label}: initial derivative is zero or non-finite at a={a:.6}"
+                    )
+                }
+            }
+            MonotoneRootError::BracketingExhausted {
+                label,
+                a_lo,
+                a_hi,
+                ..
+            } => {
+                // Original message used `step_sign` and `a_init`; recover the
+                // analytic-bracket shape vs search shape from which fields are
+                // meaningful. `a_lo == a_hi` means "invalid analytic bracket
+                // with single sentinel"; otherwise it's the bracketing search.
+                if a_lo == a_hi {
+                    write!(
+                        f,
+                        "{label}: invalid analytic bracket [{a_lo:.6}, {a_hi:.6}]"
+                    )
+                } else if !a_lo.is_finite() && !a_hi.is_finite() {
+                    write!(
+                        f,
+                        "{label}: invalid analytic bracket [{a_lo:.6}, {a_hi:.6}]"
+                    )
+                } else {
+                    // Search-side exhaustion. `a_lo` carries the seed and
+                    // `a_hi` carries the signed step direction.
+                    write!(
+                        f,
+                        "{label}: failed to bracket root (searched {step_sign:+.0} from a={a_init:.6})",
+                        step_sign = a_hi,
+                        a_init = a_lo,
+                    )
+                }
+            }
+            MonotoneRootError::RefinementDidNotConverge {
+                label,
+                last_residual,
+                ..
+            } => {
+                write!(
+                    f,
+                    "{label}: zero or non-finite derivative at converged root a={last_residual:.6}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MonotoneRootError {}
+
+/// Internal helper: wrap an `eval` closure error into `EvalFailed`.
+#[inline]
+fn map_eval_err(label: &str, a: f64, source: String) -> MonotoneRootError {
+    MonotoneRootError::EvalFailed {
+        label: label.to_string(),
+        a,
+        source,
+    }
+}
+
 pub fn solve_monotone_root(
     eval: impl Fn(f64) -> Result<(f64, f64, f64), String>,
     a_init: f64,
@@ -27,7 +152,7 @@ pub fn solve_monotone_root(
     convergence_tol: f64,
     max_bracket_iters: usize,
     max_refine_iters: usize,
-) -> Result<(f64, f64, f64), String> {
+) -> Result<(f64, f64, f64), MonotoneRootError> {
     let solution = solve_monotone_root_detailed(
         eval,
         a_init,
