@@ -5600,6 +5600,12 @@ fn prediction_model_class_label(model: &FittedModel) -> String {
             .as_deref()
             .or(payload.survival_likelihood.as_deref())
         {
+            _ if payload
+                .survival_cause_count
+                .is_some_and(|cause_count| cause_count > 1) =>
+            {
+                "competing risks survival".to_string()
+            }
             Some("marginal-slope") => "survival marginal-slope".to_string(),
             Some("location-scale") => "survival location-scale".to_string(),
             _ => model.predict_model_class().name().to_string(),
@@ -7872,9 +7878,6 @@ fn refresh_baseline_timewiggle_beta(
     payload: &mut FittedModelPayload,
     draw: ArrayView1<'_, f64>,
 ) -> Result<(), String> {
-    let Some(saved_beta) = payload.beta_baseline_timewiggle.as_mut() else {
-        return Ok(());
-    };
     let tmp_model = FittedModel::from_payload(payload.clone());
     let time_cfg = gam::inference::model::load_survival_time_basis_config_from_model(&tmp_model)?;
     let anchor = payload
@@ -7882,6 +7885,9 @@ fn refresh_baseline_timewiggle_beta(
         .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
     let time_row =
         gam::families::survival_construction::evaluate_survival_time_basis_row(anchor, &time_cfg)?;
+    let Some(saved_beta) = payload.beta_baseline_timewiggle.as_mut() else {
+        return Ok(());
+    };
     let start = time_row.len();
     let end = start + saved_beta.len();
     if end > draw.len() {
