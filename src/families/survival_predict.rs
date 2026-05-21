@@ -426,10 +426,16 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                 row.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
-                    let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
-                    row.hazard[j] = haz_t;
-                    row.cumulative_hazard[j] = cum_t;
-                    row.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                    if t_query <= 0.0 {
+                        row.hazard[j] = 0.0;
+                        row.cumulative_hazard[j] = 0.0;
+                        row.survival[j] = 1.0;
+                    } else {
+                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        row.hazard[j] = haz_t;
+                        row.cumulative_hazard[j] = cum_t;
+                        row.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                    }
                 }
                 let (eta_t, _, _) = evaluate_at(age_exit[i])?;
                 row.linear_predictor = eta_t;
