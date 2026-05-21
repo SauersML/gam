@@ -12585,7 +12585,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
-            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
+            let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
                 family,
                 specs,
                 &states,
@@ -12593,6 +12593,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
                 Some(cached_active_sets.as_slice()),
+                cached_joint_gradient.as_ref(),
             )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
@@ -18553,6 +18554,40 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
         ridge,
         ridge_policy,
         &block_constraints,
+        block_active_sets,
+    )
+}
+
+fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    block_active_sets: Option<&[Option<Vec<usize>>]>,
+    cached_gradient: Option<&Array1<f64>>,
+) -> Result<Option<Array1<f64>>, String> {
+    if let Some(gradient) = cached_gradient {
+        let block_constraints = collect_block_linear_constraints(family, states, specs)?;
+        return exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
+            gradient,
+            specs,
+            states,
+            s_lambdas,
+            ridge,
+            ridge_policy,
+            &block_constraints,
+            block_active_sets,
+        );
+    }
+    exact_newton_joint_kkt_residual_for_ift(
+        family,
+        specs,
+        states,
+        s_lambdas,
+        ridge,
+        ridge_policy,
         block_active_sets,
     )
 }
