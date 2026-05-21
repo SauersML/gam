@@ -681,9 +681,33 @@ impl PredictableModel for StandardPredictor {
                     let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
                     let rows_in_chunk = q0_chunk.len();
                     let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                    for i in 0..rows_in_chunk {
-                        for j in 0..p_main {
-                            grad[[i, j]] = dq_dq0[i] * x_main[[i, j]];
+                    {
+                        let grad_slice = grad
+                            .as_slice_mut()
+                            .expect("row-major grad is contiguous");
+                        if let (Some(x_all), Some(dq_all)) =
+                            (x_main.as_slice(), dq_dq0.as_slice())
+                        {
+                            for i in 0..rows_in_chunk {
+                                let dqi = dq_all[i];
+                                let src_off = i * p_main;
+                                let src_row = &x_all[src_off..src_off + p_main];
+                                let dst_off = i * p_total;
+                                let dst_row = &mut grad_slice[dst_off..dst_off + p_main];
+                                for j in 0..p_main {
+                                    dst_row[j] = dqi * src_row[j];
+                                }
+                            }
+                        } else {
+                            for i in 0..rows_in_chunk {
+                                let dqi = dq_dq0[i];
+                                let xrow = x_main.row(i);
+                                let dst_off = i * p_total;
+                                let dst_row = &mut grad_slice[dst_off..dst_off + p_main];
+                                for (j, xij) in xrow.iter().enumerate() {
+                                    dst_row[j] = dqi * xij;
+                                }
+                            }
                         }
                     }
                     grad.slice_mut(ndarray::s![.., p_main..p_total])
