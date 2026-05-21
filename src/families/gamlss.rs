@@ -8120,15 +8120,6 @@ fn make_two_block_design_row_coeff_operator(
     })
 }
 
-struct GaussianLocationScaleJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
-    xmu_psi: PsiDesignMap,
-    x_ls_psi: PsiDesignMap,
-    zmu_psi: Array1<f64>,
-    z_ls_psi: Array1<f64>,
-}
-
 struct GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
     family: GaussianLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,
@@ -12905,24 +12896,6 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
             ),
         ))
     }
-}
-
-struct BinomialLocationScaleJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
-    x_t_psi: PsiDesignMap,
-    x_ls_psi: PsiDesignMap,
-    z_t_psi: Array1<f64>,
-    z_ls_psi: Array1<f64>,
-}
-
-struct BinomialLocationScaleJointPsiSecondDrifts {
-    x_t_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_t_ab: Option<Array2<f64>>,
-    x_ls_ab: Option<Array2<f64>>,
-    z_t_ab: Array1<f64>,
-    z_ls_ab: Array1<f64>,
 }
 
 struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
