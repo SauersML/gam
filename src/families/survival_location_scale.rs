@@ -543,6 +543,24 @@ pub fn residual_distribution_inverse_link(distribution: ResidualDistribution) ->
     InverseLink::Standard(residual_distribution_link(distribution))
 }
 
+/// Maps an `InverseLink` to its `ResidualDistribution` counterpart when the
+/// link is one of the three standard survival residual-distribution links
+/// (Probit/Logit/CLogLog). Returns `None` for stateful / mixture links (Sas,
+/// BetaLogistic, Mixture, LatentCLogLog) and for non-residual-distribution
+/// standard links — those carry their full state via `payload.link` and have
+/// no `ResidualDistribution` representation.
+#[inline]
+pub fn residual_distribution_from_inverse_link(
+    link: &InverseLink,
+) -> Option<ResidualDistribution> {
+    match link {
+        InverseLink::Standard(LinkFunction::Probit) => Some(ResidualDistribution::Gaussian),
+        InverseLink::Standard(LinkFunction::CLogLog) => Some(ResidualDistribution::Gumbel),
+        InverseLink::Standard(LinkFunction::Logit) => Some(ResidualDistribution::Logistic),
+        _ => None,
+    }
+}
+
 /// Fourth derivative of the inverse-link PDF (= 5th derivative of the CDF).
 ///
 /// This is the f'''' quantity used in the 4th derivative of log f(u), which
