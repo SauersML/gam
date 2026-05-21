@@ -2743,8 +2743,8 @@ impl<'a> RemlState<'a> {
     }
 
     pub(super) fn projectwith_basis(matrix: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
-        let zt_m = z.t().dot(matrix);
-        zt_m.dot(z)
+        let zt_m = crate::faer_ndarray::fast_atb(z, matrix);
+        crate::faer_ndarray::fast_ab(&zt_m, z)
     }
 
     /// Compute the structural penalty rank and exact pseudo-logdet log|S|₊.
@@ -2898,8 +2898,8 @@ impl<'a> RemlState<'a> {
         // arithmetic.  Force exact symmetry before eigh — faer rejects
         // visibly non-symmetric input, and the two halves should match
         // up to roundoff.
-        let h_times_u = h_total.dot(&u_s);
-        let mut h_proj = u_s.t().dot(&h_times_u);
+        let h_times_u = crate::faer_ndarray::fast_ab(&h_total, &u_s);
+        let mut h_proj = crate::faer_ndarray::fast_atb(&u_s, &h_times_u);
         enforce_symmetry(&mut h_proj);
 
         let (h_proj_evals, h_proj_evecs) = h_proj
@@ -6606,7 +6606,10 @@ impl<'a> RemlState<'a> {
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
                 let qs = &pirls_result.reparam_result.qs;
-                let h_transformed = qs.t().dot(&h_total_original).dot(qs);
+                let h_transformed = crate::faer_ndarray::fast_ab(
+                    &crate::faer_ndarray::fast_atb(qs, &h_total_original),
+                    qs,
+                );
                 let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
                     &h_transformed,
                     &e_for_logdet,
