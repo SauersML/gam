@@ -3601,9 +3601,7 @@ impl ImplicitHyperOperator {
                 .map(|ci| {
                     let start = ci * chunk_rows;
                     let end = (start + chunk_rows).min(n_obs);
-                    self.projected_chunk_contribution(
-                        xf, &u_knot, w, c_opt, rank, start, end,
-                    )
+                    self.projected_chunk_contribution(xf, &u_knot, w, c_opt, rank, start, end)
                 })
                 .reduce(
                     || Array2::<f64>::zeros((rank, rank)),
@@ -3617,9 +3615,8 @@ impl ImplicitHyperOperator {
             let mut start = 0usize;
             while start < n_obs {
                 let end = (start + chunk_rows).min(n_obs);
-                let partial = self.projected_chunk_contribution(
-                    xf, &u_knot, w, c_opt, rank, start, end,
-                );
+                let partial =
+                    self.projected_chunk_contribution(xf, &u_knot, w, c_opt, rank, start, end);
                 projected += &partial;
                 start = end;
             }
@@ -3690,9 +3687,7 @@ impl ImplicitHyperOperator {
                 local[slot] += &m;
                 local[slot] += &m.t();
                 if let Some(c) = c_opt {
-                    let c_slice = c
-                        .as_slice()
-                        .expect("c_x_psi_beta must be contiguous");
+                    let c_slice = c.as_slice().expect("c_x_psi_beta must be contiguous");
                     let mut weighted_xf = xf_chunk.to_owned();
                     for i_local in 0..(end - start) {
                         let c_i = c_slice[start + i_local];
@@ -4812,7 +4807,6 @@ impl PenaltyCoordinate {
             }
         }
     }
-
 }
 
 /// Compute the exact dimension of the intersection ∩_k N(S_k) for PSD penalties.
@@ -7049,6 +7043,43 @@ pub fn reml_laml_evaluate(
     } else {
         crate::solver::outer_strategy::HessianResult::Unavailable
     };
+
+    // Sanity check: a finite-precision smooth function f : ℝᵏ → ℝ with
+    // |f| ≈ |cost| cannot legitimately report an analytic gradient component
+    // whose magnitude exceeds what a step that the outer optimizer can
+    // *resolve* would predict.  The smallest distinguishable step in ρ-space
+    // is roughly √ε · max(1, |ρ_k|); along that step the gradient predicts a
+    // cost change of |g_k| · √ε.  If that predicted change vastly exceeds
+    // |cost|, the gradient is internally inconsistent with the function it
+    // claims to differentiate — almost always because the inner solver
+    // exited the noise-floor KKT certificate (custom_family.rs:12037) with
+    // a non-zero β-gradient residual on a coordinate where H is poorly
+    // conditioned, leaving an unmodeled IFT correction (-H⁻¹ · residual)
+    // baked into the envelope formula.  Log a single line so a later run
+    // can correlate the warning with TrustRegionRejectFloor downstream.
+    let cost_scale = cost.abs().max(1.0);
+    let resolve_step = f64::EPSILON.sqrt();
+    if let Some((max_idx, max_abs)) = grad
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (i, g.abs()))
+        .reduce(|a, b| if a.1 >= b.1 { a } else { b })
+    {
+        let predicted_change = max_abs * resolve_step;
+        if max_abs.is_finite() && predicted_change > 1.0e6 * cost_scale {
+            log::warn!(
+                "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
+                 |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
+                 Envelope formula likely contaminated by inner KKT residual on ill-conditioned \
+                 H block; outer optimizer will reject every step and shrink TR to floor.",
+                max_abs,
+                max_idx,
+                predicted_change,
+                cost_scale,
+                predicted_change / cost_scale,
+            );
+        }
+    }
 
     Ok(RemlLamlResult {
         cost,

@@ -239,7 +239,9 @@ pub enum TensorBSplineIdentifiability {
     None,
     #[default]
     SumToZero,
-    FrozenTransform { transform: Array2<f64> },
+    FrozenTransform {
+        transform: Array2<f64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,7 +354,10 @@ pub enum BoundedCoefficientPriorSpec {
     #[default]
     None,
     Uniform,
-    Beta { a: f64, b: f64 },
+    Beta {
+        a: f64,
+        b: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

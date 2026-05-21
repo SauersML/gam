@@ -2466,20 +2466,14 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
     })
 }
 
-#[derive(Clone)]
-struct LatentBinaryJointSlices {
-    time: std::ops::Range<usize>,
-    mean: std::ops::Range<usize>,
-    total: usize,
-}
-
 impl LatentBinaryFamily {
-    fn joint_slices(&self) -> LatentBinaryJointSlices {
+    fn joint_slices(&self) -> LatentSurvivalJointSlices {
         let p_time = self.x_time_exit.ncols();
         let p_mean = self.x_mean.ncols();
-        LatentBinaryJointSlices {
+        LatentSurvivalJointSlices {
             time: 0..p_time,
             mean: p_time..p_time + p_mean,
+            log_sigma: None,
             total: p_time + p_mean,
         }
     }
@@ -2487,7 +2481,7 @@ impl LatentBinaryFamily {
     fn row_primary_direction_from_flat(
         &self,
         row: usize,
-        slices: &LatentBinaryJointSlices,
+        slices: &LatentSurvivalJointSlices,
         d_beta_flat: &Array1<f64>,
     ) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
@@ -2504,7 +2498,7 @@ impl LatentBinaryFamily {
         &self,
         target: &mut Array1<f64>,
         row: usize,
-        slices: &LatentBinaryJointSlices,
+        slices: &LatentSurvivalJointSlices,
         primary_gradient: &Array1<f64>,
         weight: f64,
     ) {
@@ -2540,7 +2534,7 @@ impl LatentBinaryFamily {
         &self,
         target: &mut Array2<f64>,
         row: usize,
-        slices: &LatentBinaryJointSlices,
+        slices: &LatentSurvivalJointSlices,
         primary_hessian: &Array2<f64>,
     ) {
         {
@@ -2985,7 +2979,7 @@ impl ExactNewtonJointHessianWorkspace for LatentSurvivalHessianWorkspace {
 struct LatentBinaryHessianWorkspace {
     family: LatentBinaryFamily,
     block_states: Vec<ParameterBlockState>,
-    slices: LatentBinaryJointSlices,
+    slices: LatentSurvivalJointSlices,
 }
 
 impl LatentBinaryHessianWorkspace {
@@ -3565,10 +3559,16 @@ mod tests {
         let mut eta_time = Array1::<f64>::zeros(3 * n);
         eta_time
             .slice_mut(s![0..n])
-            .assign(&crate::faer_ndarray::fast_av(&family.x_time_entry, &beta_time));
+            .assign(&crate::faer_ndarray::fast_av(
+                &family.x_time_entry,
+                &beta_time,
+            ));
         eta_time
             .slice_mut(s![n..2 * n])
-            .assign(&crate::faer_ndarray::fast_av(&family.x_time_exit, &beta_time));
+            .assign(&crate::faer_ndarray::fast_av(
+                &family.x_time_exit,
+                &beta_time,
+            ));
         eta_time
             .slice_mut(s![2 * n..3 * n])
             .assign(&crate::faer_ndarray::fast_av(
@@ -3681,10 +3681,16 @@ mod tests {
         let mut eta_time = Array1::<f64>::zeros(3 * n);
         eta_time
             .slice_mut(s![0..n])
-            .assign(&crate::faer_ndarray::fast_av(&family.x_time_entry, &beta_time));
+            .assign(&crate::faer_ndarray::fast_av(
+                &family.x_time_entry,
+                &beta_time,
+            ));
         eta_time
             .slice_mut(s![n..2 * n])
-            .assign(&crate::faer_ndarray::fast_av(&family.x_time_exit, &beta_time));
+            .assign(&crate::faer_ndarray::fast_av(
+                &family.x_time_exit,
+                &beta_time,
+            ));
 
         vec![
             ParameterBlockState {

@@ -231,7 +231,6 @@ impl PenaltyForm {
             PenaltyForm::Operator(op) => op.as_dense(),
         }
     }
-
 }
 
 impl std::fmt::Debug for PenaltyForm {
