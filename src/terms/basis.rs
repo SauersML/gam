@@ -23546,7 +23546,14 @@ pub mod closed_form_penalty {
     /// isotropic Duchon kernel `f(R) = isotropic_duchon_penalty(0, d, m, s as f64, κ, R)`.
     ///
     /// Used by the radial-derivative anisotropic form.  Requires `R > 0`.
-    pub fn radial_derivatives_of_isotropic_duchon(d: usize, m: usize, (s: f64) as f64, kappa: f64, r: f64, max_order: usize, ) -> Vec<f64> {
+    pub fn radial_derivatives_of_isotropic_duchon(
+        d: usize,
+        m: usize,
+        s: f64,
+        kappa: f64,
+        r: f64,
+        max_order: usize,
+    ) -> Vec<f64> {
         assert!(
             r > 0.0,
             "radial_derivatives_of_isotropic_duchon: r must be > 0"
