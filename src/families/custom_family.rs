@@ -12520,6 +12520,64 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = false;
                 break;
             }
+
+            // Linearized-rate stall update + early-exit. See the
+            // `LINEARIZED_STALL_*` constants near the top of this function
+            // for the mathematical rationale. We use the same
+            // `last_joint_math` snapshot as the certificates above so the
+            // signal we react to is the *accepted* step's Newton identity,
+            // not an attempt-level intermediate that the trust-region loop
+            // may have rejected.
+            if let Some(math) = last_joint_math.as_ref() {
+                let linearized_rel_now =
+                    math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+                let residual_far_from_tol = residual.is_finite()
+                    && residual_tol.is_finite()
+                    && residual
+                        > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0);
+                if linearized_rel_now.is_finite()
+                    && linearized_rel_now >= LINEARIZED_STALL_REL_THRESHOLD
+                    && residual_far_from_tol
+                {
+                    linearized_stall_streak =
+                        linearized_stall_streak.saturating_add(1);
+                } else {
+                    linearized_stall_streak = 0;
+                }
+                if linearized_stall_streak >= LINEARIZED_STALL_CYCLES {
+                    // Projected cycles needed to reach residual_tol at the
+                    // observed geometric rate; logged so callers can verify
+                    // the bail-out is consistent with the budget.
+                    let projected_cycles_to_tol = if linearized_rel_now > 0.0
+                        && linearized_rel_now < 1.0
+                        && residual_tol > 0.0
+                        && residual > residual_tol
+                    {
+                        let ratio_log = linearized_rel_now.ln();
+                        let r_log = (residual / residual_tol).ln();
+                        if ratio_log < 0.0 && r_log.is_finite() {
+                            (r_log / -ratio_log).max(0.0)
+                        } else {
+                            f64::INFINITY
+                        }
+                    } else {
+                        f64::INFINITY
+                    };
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | linearized-rate stall early-exit: linearized_rel={:.3e} >= {:.3e} for {} consecutive cycles, residual={:.3e} (tol={:.3e}, factor>={:.3e}), projected_cycles_to_tol={:.1}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles burns the geometric tail.",
+                        cycle,
+                        linearized_rel_now,
+                        LINEARIZED_STALL_REL_THRESHOLD,
+                        linearized_stall_streak,
+                        residual,
+                        residual_tol,
+                        LINEARIZED_STALL_RESIDUAL_FACTOR,
+                        projected_cycles_to_tol,
+                    );
+                    converged = false;
+                    break;
+                }
+            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
@@ -12541,7 +12599,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
-                Some(cached_active_sets.as_slice()),
             )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
@@ -13422,7 +13479,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
             Some(gradient) => {
-                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 exact_newton_joint_kkt_residual_for_ift_from_gradient(
                     &gradient,
                     specs,
@@ -13430,8 +13486,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &s_lambdas,
                     ridge,
                     options.ridge_policy,
-                    &block_constraints,
-                    Some(cached_active_sets.as_slice()),
                 )?
             }
             None => None,
@@ -17955,24 +18009,6 @@ fn projected_stationarity_inf_norm(
     .unwrap_or(raw_inf)
 }
 
-fn projected_stationarity_vector(
-    residual: &Array1<f64>,
-    beta: &Array1<f64>,
-    constraints: Option<&LinearInequalityConstraints>,
-    known_active_rows: Option<&[usize]>,
-) -> Array1<f64> {
-    let Some(constraints) = constraints else {
-        return residual.clone();
-    };
-    projected_linear_constraint_stationarity_vector(
-        residual,
-        beta,
-        constraints,
-        known_active_rows,
-    )
-    .unwrap_or_else(|| residual.clone())
-}
-
 fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
@@ -18449,6 +18485,34 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
         ridge,
         ridge_policy,
     )
+    .map(|residual| {
+        residual.map(|raw_residual| {
+            let block_constraints =
+                collect_block_linear_constraints(family, states, specs).unwrap_or_default();
+            if block_constraints.len() != states.len() {
+                return raw_residual;
+            }
+            let mut projected_residual = Array1::<f64>::zeros(raw_residual.len());
+            let mut offset = 0usize;
+            for b in 0..states.len() {
+                let width = specs[b].design.ncols();
+                let start = offset;
+                let end = offset + width;
+                let raw_block = raw_residual.slice(ndarray::s![start..end]).to_owned();
+                let projected = projected_stationarity_vector(
+                    &raw_block,
+                    &states[b].beta,
+                    block_constraints[b].as_ref(),
+                    None,
+                );
+                projected_residual
+                    .slice_mut(ndarray::s![start..end])
+                    .assign(&projected);
+                offset = end;
+            }
+            projected_residual
+        })
+    })
 }
 
 fn exact_newton_joint_kkt_residual_for_ift_from_gradient(
@@ -24851,8 +24915,13 @@ mod tests {
         let inf_projected =
             projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
         assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
-        let vec_projected =
-            projected_stationarity_vector(&residual_active, &beta_active, Some(&single), None);
+        let vec_projected = projected_linear_constraint_stationarity_vector(
+            &residual_active,
+            &beta_active,
+            &single,
+            None,
+        )
+        .expect("active lower-bound projection should succeed");
         assert_relative_eq!(vec_projected[0], 0.0_f64, epsilon = 1e-10);
         assert_relative_eq!(vec_projected[1], -0.1_f64, epsilon = 1e-12);
 
@@ -25007,12 +25076,13 @@ mod tests {
             None,
         );
         assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
-        let vec_valid = projected_stationarity_vector(
+        let vec_valid = projected_linear_constraint_stationarity_vector(
             &residual_valid_multiplier,
             &beta_active,
-            Some(&constraints),
+            &constraints,
             None,
-        );
+        )
+        .expect("coupled active projection should succeed");
         assert_relative_eq!(vec_valid[0], 0.0_f64, epsilon = 1e-10);
         assert_relative_eq!(vec_valid[1], 0.0_f64, epsilon = 1e-10);
 
