@@ -6293,13 +6293,13 @@ pub fn reml_laml_evaluate(
     let kkt_residual_vec: Option<&Array1<f64>> = solution
         .kkt_residual
         .as_ref()
-        .filter(|r| r.len() == hop.dim());
+        .filter(|r: &&Array1<f64>| r.len() == hop.dim());
     if let Some(r) = kkt_residual_vec {
         let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
         rhs.column_mut(0).assign(r);
         let w_mat = hop.solve_multi(&rhs);
-        let w = w_mat.column(0);
-        let cost_correction = -0.5 * r.dot(&w);
+        let w: Array1<f64> = w_mat.column(0).to_owned();
+        let cost_correction: f64 = -0.5_f64 * r.view().dot(&w);
         if cost_correction.is_finite() {
             cost += cost_correction;
         }
@@ -6745,8 +6745,8 @@ pub fn reml_laml_evaluate(
             }
             let solved = hop.solve_multi(&rhs);
             for k_idx in 0..k {
-                let v_k = solved.column(k_idx);
-                let corr = r.dot(&v_k);
+                let v_k: Array1<f64> = solved.column(k_idx).to_owned();
+                let corr: f64 = r.view().dot(&v_k);
                 if corr.is_finite() {
                     grad[k_idx] -= corr;
                 }
@@ -14923,6 +14923,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -15251,6 +15252,7 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15468,6 +15470,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15607,6 +15610,7 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15697,6 +15701,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho = vec![0.0_f64; k];
         let result =
@@ -15870,6 +15875,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15968,6 +15974,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho = [lambda.ln()];
 
@@ -16129,6 +16136,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -16187,6 +16195,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
@@ -16288,6 +16297,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result =
