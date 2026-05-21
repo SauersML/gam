@@ -3733,9 +3733,107 @@ struct StreamingRadialState {
     axis_mode: StreamingAxisMode,
     /// Which radial kernel family to use for recomputation.
     radial_kind: RadialScalarKind,
+    /// Lazily materialized radial-scalar cache. (phi, q, t) per (i, j) pair
+    /// — independent of axis, identical across every per-axis chunk loop —
+    /// so collapses (axes × calls × chunks × n × n_knots) streaming radial
+    /// evaluations into a single O(n × n_knots) sweep per operator.
+    triplet_cache: Arc<std::sync::OnceLock<StreamingTripletCache>>,
 }
 
+#[derive(Debug)]
+struct StreamingTripletCache {
+    phi: Vec<f64>,
+    q: Vec<f64>,
+    t: Vec<f64>,
+}
+
+/// Memory cap (bytes) above which we keep streaming the radial scalars
+/// instead of materializing the (phi, q, t) triplet cache. Three `Vec<f64>`
+/// arrays of length `n × n_knots` consume `24 × n × n_knots` bytes; the cap
+/// keeps the resident footprint bounded for designs that would blow past a
+/// few hundred MiB.
+const STREAMING_TRIPLET_CACHE_BYTE_BUDGET: usize = 1 << 30;
+
 impl StreamingRadialState {
+    fn cache_fits_budget(&self) -> bool {
+        let total = self
+            .data
+            .nrows()
+            .saturating_mul(self.centers.nrows())
+            .saturating_mul(std::mem::size_of::<f64>())
+            .saturating_mul(3);
+        total <= STREAMING_TRIPLET_CACHE_BYTE_BUDGET
+    }
+
+    fn ensure_triplet_cache(&self) -> Option<&StreamingTripletCache> {
+        if !self.cache_fits_budget() {
+            return None;
+        }
+        Some(self.triplet_cache.get_or_init(|| {
+            let n = self.data.nrows();
+            let n_knots = self.centers.nrows();
+            let total = n * n_knots;
+            let mut phi = vec![0.0_f64; total];
+            let mut q = vec![0.0_f64; total];
+            let mut t = vec![0.0_f64; total];
+            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+            let chunks: Vec<_> = phi
+                .par_chunks_mut(n_knots)
+                .zip(q.par_chunks_mut(n_knots))
+                .zip(t.par_chunks_mut(n_knots))
+                .enumerate()
+                .collect();
+            chunks.into_par_iter().for_each(|(i, ((phi_row, q_row), t_row))| {
+                for j in 0..n_knots {
+                    let r2 = match &self.axis_mode {
+                        StreamingAxisMode::PerAxis { metric_weights }
+                        | StreamingAxisMode::ScalarTotal { metric_weights } => {
+                            let dim = metric_weights.len();
+                            let mut acc = 0.0_f64;
+                            for a in 0..dim {
+                                let h = unsafe {
+                                    self.data.uget((i, a)) - self.centers.uget((j, a))
+                                };
+                                acc += metric_weights[a] * h * h;
+                            }
+                            acc
+                        }
+                    };
+                    if let Ok((p_, qv, tv)) = self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                        phi_row[j] = p_;
+                        q_row[j] = qv;
+                        t_row[j] = tv;
+                    }
+                }
+            });
+            StreamingTripletCache { phi, q, t }
+        }))
+    }
+
+    #[inline]
+    fn fill_s_buf(&self, i: usize, j: usize, s_buf: &mut [f64]) {
+        match &self.axis_mode {
+            StreamingAxisMode::PerAxis { metric_weights } => {
+                let dim = metric_weights.len();
+                debug_assert_eq!(s_buf.len(), dim);
+                for a in 0..dim {
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    s_buf[a] = metric_weights[a] * h * h;
+                }
+            }
+            StreamingAxisMode::ScalarTotal { metric_weights } => {
+                debug_assert_eq!(s_buf.len(), 1);
+                let dim = metric_weights.len();
+                let mut r2 = 0.0;
+                for a in 0..dim {
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    r2 += metric_weights[a] * h * h;
+                }
+                s_buf[0] = r2;
+            }
+        }
+    }
+
     /// Compute `(phi, q, t, s_a[0..d])` for a single `(data_row i, center j)` pair.
     ///
     /// Returns `(phi, q, t)` and writes per-axis components into `s_buf` (length d).
@@ -3746,32 +3844,15 @@ impl StreamingRadialState {
         j: usize,
         s_buf: &mut [f64],
     ) -> Result<(f64, f64, f64), BasisError> {
+        debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
+        self.fill_s_buf(i, j, s_buf);
         match &self.axis_mode {
             StreamingAxisMode::PerAxis { metric_weights } => {
-                let dim = metric_weights.len();
-                debug_assert_eq!(s_buf.len(), dim);
-                debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
-                debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
-                let mut r2 = 0.0;
-                for a in 0..dim {
-                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
-                    let s_a = metric_weights[a] * h * h;
-                    s_buf[a] = s_a;
-                    r2 += s_a;
-                }
+                let r2: f64 = (0..metric_weights.len()).map(|a| s_buf[a]).sum();
                 self.radial_kind.eval_design_triplet(r2.sqrt())
             }
-            StreamingAxisMode::ScalarTotal { metric_weights } => {
-                debug_assert_eq!(s_buf.len(), 1);
-                let dim = metric_weights.len();
-                debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
-                debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
-                let mut r2 = 0.0;
-                for a in 0..dim {
-                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
-                    r2 += metric_weights[a] * h * h;
-                }
-                s_buf[0] = r2;
+            StreamingAxisMode::ScalarTotal { .. } => {
+                let r2 = s_buf[0];
                 self.radial_kind.eval_design_triplet(r2.sqrt())
             }
         }
@@ -3963,6 +4044,7 @@ impl ImplicitDesignPsiDerivative {
                 centers,
                 axis_mode: StreamingAxisMode::PerAxis { metric_weights },
                 radial_kind,
+                triplet_cache: Arc::new(std::sync::OnceLock::new()),
             }),
             ident_transform,
             full_ident_transform,
@@ -4002,6 +4084,7 @@ impl ImplicitDesignPsiDerivative {
                 centers,
                 axis_mode: StreamingAxisMode::ScalarTotal { metric_weights },
                 radial_kind,
+                triplet_cache: Arc::new(std::sync::OnceLock::new()),
             }),
             ident_transform,
             full_ident_transform,
@@ -5274,10 +5357,22 @@ impl ImplicitDesignPsiDerivative {
         let mut raw = Array2::<f64>::zeros((rows.end - rows.start, self.n_knots));
         if let Some(st) = self.streaming.as_ref() {
             let mut sb = vec![0.0; self.n_axes];
-            for (local, i) in rows.enumerate() {
-                for j in 0..self.n_knots {
-                    let (phi, q, t) = st.compute_pair(i, j, &mut sb)?;
-                    raw[[local, j]] = deriv_fn(phi, q, t, &sb, i * self.n_knots + j);
+            if let Some(cache) = st.ensure_triplet_cache() {
+                for (local, i) in rows.enumerate() {
+                    let base = i * self.n_knots;
+                    for j in 0..self.n_knots {
+                        let idx = base + j;
+                        st.fill_s_buf(i, j, &mut sb);
+                        raw[[local, j]] =
+                            deriv_fn(cache.phi[idx], cache.q[idx], cache.t[idx], &sb, idx);
+                    }
+                }
+            } else {
+                for (local, i) in rows.enumerate() {
+                    for j in 0..self.n_knots {
+                        let (phi, q, t) = st.compute_pair(i, j, &mut sb)?;
+                        raw[[local, j]] = deriv_fn(phi, q, t, &sb, i * self.n_knots + j);
+                    }
                 }
             }
         } else {
@@ -5394,12 +5489,28 @@ impl ImplicitDesignPsiDerivative {
             .collect();
         if let Some(st) = self.streaming.as_ref() {
             let mut sb = vec![0.0; self.n_axes];
-            for (local, i) in rows.clone().enumerate() {
-                for j in 0..self.n_knots {
-                    let (phi, q, _t) = st.compute_pair(i, j, &mut sb)?;
-                    let cphi = c * phi;
-                    for a in 0..n_axes {
-                        out[a][[local, j]] = q * sb[a] + cphi;
+            if let Some(cache) = st.ensure_triplet_cache() {
+                for (local, i) in rows.clone().enumerate() {
+                    let base = i * self.n_knots;
+                    for j in 0..self.n_knots {
+                        let idx = base + j;
+                        st.fill_s_buf(i, j, &mut sb);
+                        let phi = cache.phi[idx];
+                        let q = cache.q[idx];
+                        let cphi = c * phi;
+                        for a in 0..n_axes {
+                            out[a][[local, j]] = q * sb[a] + cphi;
+                        }
+                    }
+                }
+            } else {
+                for (local, i) in rows.clone().enumerate() {
+                    for j in 0..self.n_knots {
+                        let (phi, q, _t) = st.compute_pair(i, j, &mut sb)?;
+                        let cphi = c * phi;
+                        for a in 0..n_axes {
+                            out[a][[local, j]] = q * sb[a] + cphi;
+                        }
                     }
                 }
             }
