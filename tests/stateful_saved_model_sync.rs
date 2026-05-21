@@ -2,6 +2,7 @@ use gam::estimate::{
     BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
 };
 use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::survival_location_scale::ResidualDistribution;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass,
@@ -448,7 +449,7 @@ fn survival_marginal_slope_saved_models_require_special_predict_handling() {
         FittedFamily::Survival {
             likelihood: LikelihoodFamily::RoystonParmar,
             survival_likelihood: Some("marginal-slope".to_string()),
-            survival_distribution: Some("gaussian".to_string()),
+            survival_distribution: Some(ResidualDistribution::Gaussian),
             frailty: FrailtySpec::None,
         },
         "survival".to_string(),
