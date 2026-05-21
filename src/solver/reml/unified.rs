@@ -15408,6 +15408,79 @@ mod tests {
     }
 
     #[test]
+    fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
+        let h = array![[3.0, 0.1, 0.0], [0.1, 5.0, 0.2], [0.0, 0.2, 7.0]];
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+        let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
+        let kernel = PenaltySubspaceTrace {
+            u_s,
+            h_proj_inverse: array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]],
+        };
+
+        let dense_only = array![[0.4, 0.1, 0.0], [0.1, -0.2, 0.3], [0.0, 0.3, 0.6]];
+        let op_a = array![[0.2, -0.1, 0.4], [-0.1, 0.7, 0.0], [0.4, 0.0, -0.3]];
+        let op_b = array![[0.8, 0.2, -0.2], [0.2, 0.1, 0.5], [-0.2, 0.5, 0.9]];
+        let composite_dense = array![[0.05, 0.02, 0.0], [0.02, 0.03, 0.01], [0.0, 0.01, 0.04]];
+
+        let op_a_arc: Arc<dyn HyperOperator> = Arc::new(DenseMatrixHyperOperator {
+            matrix: op_a.clone(),
+        });
+        let op_b_arc: Arc<dyn HyperOperator> = Arc::new(DenseMatrixHyperOperator {
+            matrix: op_b.clone(),
+        });
+        let weighted: Arc<dyn HyperOperator> = Arc::new(WeightedHyperOperator {
+            terms: vec![(0.25, op_b_arc.clone()), (-0.5, op_a_arc.clone())],
+            dim_hint: 3,
+        });
+
+        let pairs = vec![
+            HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(3),
+                b_mat: dense_only,
+                b_operator: None,
+                ld_s: 0.0,
+            },
+            HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(3),
+                b_mat: Array2::zeros((0, 0)),
+                b_operator: Some(Box::new(DenseMatrixHyperOperator { matrix: op_a })),
+                ld_s: 0.0,
+            },
+            HyperCoordPair {
+                a: 0.0,
+                g: Array1::zeros(3),
+                b_mat: Array2::zeros((0, 0)),
+                b_operator: Some(Box::new(CompositeHyperOperator {
+                    dense: Some(composite_dense),
+                    operators: vec![weighted, op_b_arc],
+                    dim_hint: 3,
+                })),
+                ld_s: 0.0,
+            },
+        ];
+        let pair_refs: Vec<&HyperCoordPair> = pairs.iter().collect();
+
+        let batched = compute_base_h2_traces(&hop, &pair_refs, Some(&kernel));
+        let scalar: Vec<f64> = pair_refs
+            .iter()
+            .map(|pair| {
+                compute_base_h2_trace(&hop, &pair.b_mat, pair.b_operator.as_deref(), Some(&kernel))
+            })
+            .collect();
+
+        assert_eq!(batched.len(), scalar.len());
+        for (idx, (got, expected)) in batched.iter().zip(scalar.iter()).enumerate() {
+            assert!(
+                (*got - *expected).abs() <= 1e-12_f64.max(1e-12 * expected.abs()),
+                "projected base_h2 trace mismatch at pair {idx}: got={got}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
     fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha() {
         // p=4, K=2, r=2 fixture — exercises the full projection K = U_S H_proj⁻¹ U_Sᵀ
         // (the existing r=1 case at projected_operator_hessian_matches_dense_subspace_trace

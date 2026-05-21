@@ -18838,25 +18838,17 @@ mod tests {
         // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
         let ranges = vec![(0, 3)];
         let beta = array![1.0, -1.0, 3.0];
-        let s_unit: Array2<f64> =
-            array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let s_unit: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
         let n_scale = 2.0e5_f64;
-        let h: Array2<f64> = array![
-            [4.0, 0.2, 7.0],
-            [0.2, 9.0, -3.0],
-            [7.0, -3.0, 30.0]
-        ]
-        .mapv(|v| v * n_scale);
+        let h: Array2<f64> =
+            array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]].mapv(|v| v * n_scale);
 
         let no_dh = |_d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
-        let no_d2h =
-            |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-                Ok(None)
-            };
+        let no_d2h = |_u: &Array1<f64>,
+                      _v: &Array1<f64>|
+         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
-        eprintln!(
-            "\n=== biobank rho-scan: unprojected vs projected outer gradient ==="
-        );
+        eprintln!("\n=== biobank rho-scan: unprojected vs projected outer gradient ===");
         eprintln!(
             "{:>5}  {:>10}  {:>16}  {:>16}  {:>10}",
             "rho", "lambda", "g_unprojected", "g_projected", "ratio"
@@ -18872,9 +18864,9 @@ mod tests {
 
             let spec = ParameterBlockSpec {
                 name: "surface".to_string(),
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    Array2::zeros((1, 3)),
-                )),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+                    (1, 3),
+                ))),
                 offset: Array1::zeros(1),
                 penalties: vec![PenaltyMatrix::Dense(s_unit.clone())],
                 nullspace_dims: vec![1],
