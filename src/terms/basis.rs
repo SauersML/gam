@@ -2213,13 +2213,12 @@ pub fn fit_periodic_spline_curve(
 /// These constraints are applied directly in the builder via a reparameterization
 /// `B_constrained = B * Z`, and every penalty matrix is projected as
 /// `S_constrained = Z' S Z`, so solver geometry stays consistent.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineIdentifiability {
     /// Keep unconstrained basis columns.
     None,
     /// Enforce weighted sum-to-zero: `B' w = 0` (or unweighted when `weights=None`).
     // Smooth terms are centered by default to avoid intercept confounding.
-    #[default]
     WeightedSumToZero { weights: Option<Array1<f64>> },
     /// Remove intercept + linear trend in coefficient space using Greville geometry.
     RemoveLinearTrend,
@@ -2240,8 +2239,7 @@ pub enum BSplineIdentifiability {
 
 impl Default for BSplineIdentifiability {
     fn default() -> Self {
-        // Smooth terms should be centered by default to avoid intercept confounding.
-        Self::WeightedSumToZero { weights: None }
+        BSplineIdentifiability::WeightedSumToZero { weights: None }
     }
 }
 
@@ -2563,23 +2561,18 @@ pub struct ThinPlateBasisSpec {
 /// only an implicit intercept available, so it centers smooths against that
 /// intercept. The term-collection builder augments `C` with explicit linear
 /// terms when those terms are present in the formula.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum SpatialIdentifiability {
     /// Keep unconstrained basis columns.
     None,
     /// Orthogonalize the smooth against model-owned parametric columns.
+    // "Magic" default for modular GAMs with explicit parametric block:
+    // keep spatial smooth orthogonal to intercept/linear terms.
+    // ApproxKind: Exact (orthogonalization is an exact projection).
+    #[default]
     OrthogonalToParametric,
     /// Freeze a fit-time transform `Z`; prediction uses `B_new * Z` unchanged.
     FrozenTransform { transform: Array2<f64> },
-}
-
-impl Default for SpatialIdentifiability {
-    fn default() -> Self {
-        // "Magic" default for modular GAMs with explicit parametric block:
-        // keep spatial smooth orthogonal to intercept/linear terms.
-        // ApproxKind: Exact (orthogonalization is an exact projection).
-        Self::OrthogonalToParametric
-    }
 }
 
 /// Which intrinsic S² smooth construction to use.
@@ -2591,16 +2584,11 @@ impl Default for SpatialIdentifiability {
 /// - `Harmonic`: real spherical-harmonic truncation up to `max_degree` with
 ///   the Laplace-Beltrami eigenvalue penalty `[l(l+1)]^m`. Basis
 ///   dimension is `max_degree * (max_degree + 2)`; centers are ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SphereMethod {
+    #[default]
     Wahba,
     Harmonic,
-}
-
-impl Default for SphereMethod {
-    fn default() -> Self {
-        SphereMethod::Wahba
-    }
 }
 
 /// Which reproducing kernel to use for `SphereMethod::Wahba`.
@@ -2633,18 +2621,13 @@ impl Default for SphereMethod {
 /// Default is **Sobolev** because it matches the canonical "Wahba
 /// spline of order m on S²" interpretation. Use `Pseudo` for exact
 /// mgcv compatibility.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SphereWahbaKernel {
     /// True Sobolev `H^m(S²)` reproducing kernel.
+    #[default]
     Sobolev,
     /// Wahba 1981 closed-form pseudo-spline (mgcv `bs="sos"` compatible).
     Pseudo,
-}
-
-impl Default for SphereWahbaKernel {
-    fn default() -> Self {
-        SphereWahbaKernel::Sobolev
-    }
 }
 
 /// Intrinsic S² (sphere) smooth configuration.
@@ -2747,25 +2730,20 @@ pub struct MaternBasisSpec {
 ///
 /// These constraints are geometric (center-based), so they are stable across
 /// train/predict and do not depend on response weights.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum MaternIdentifiability {
     /// Keep the unconstrained kernel coefficient space.
     None,
     /// Enforce `1^T alpha = 0` at center locations (removes constant drift).
+    // Safe default with model intercepts: prevent kernel block from absorbing
+    // a global mean level.
+    #[default]
     CenterSumToZero,
     /// Enforce orthogonality to `[1, c_1, ..., c_d]` at centers.
     /// Use this when explicit linear terms should own global trends.
     CenterLinearOrthogonal,
     /// Freeze a fit-time transform `Z` so prediction cannot drift.
     FrozenTransform { transform: Array2<f64> },
-}
-
-impl Default for MaternIdentifiability {
-    fn default() -> Self {
-        // Safe default with model intercepts: prevent kernel block from absorbing
-        // a global mean level.
-        Self::CenterSumToZero
-    }
 }
 
 /// Duchon null-space polynomial degree.
