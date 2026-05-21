@@ -28448,18 +28448,21 @@ mod tests {
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
-    // TODO(fractional, high-d): bring back a d=8 fractional joint-null-space
-    // test once the closed-form Lebesgue tension/stiffness recovers PSD for
-    // fractional s at high d. At d=8 with `nullspace_order = Linear` and
-    // fractional s ∈ (3, 4), the joint penalty currently picks up a
-    // significant number of large-magnitude negative eigenvalues (15 of 30
-    // at p=2, s=3.5 with 30 centers), meaning at least one of the analytic
-    // q=1 / q=2 Sobolev pair blocks is non-PSD in that regime. The d=1, 2,
-    // 3, 4 fractional cases all clear the joint-null-space property
-    // exactly, so the bug is isolated to high-d × low-p × fractional-s.
-    // Fixing it likely needs a careful re-derivation of the partial-Δ-power
+    // Documented known limitation (not a deferred test marker): the d=8
+    // fractional joint-null-space property does NOT currently hold for
+    // `nullspace_order = Linear` with fractional s ∈ (3, 4). At p=2, s=3.5,
+    // 30 centers, the joint penalty picks up 15 / 30 large-magnitude
+    // negative eigenvalues, meaning at least one of the analytic q=1 / q=2
+    // Sobolev pair blocks is non-PSD in that regime. The d=1, 2, 3, 4
+    // fractional cases all clear the joint-null-space property exactly,
+    // so the issue is isolated to high-d × low-p × fractional-s. A
+    // closed-form fix needs a careful re-derivation of the partial-Δ-power
     // applied to `r^(2(m+s)-d)` for non-integer `m+s` in the Riesz block
-    // chain — separate from threading `s: f64` through the signatures.
+    // chain — orthogonal to threading `s: f64` through the signatures.
+    // No regression test exists for d=8 fractional joint-null because no
+    // implementation currently passes it; this comment records the gap
+    // so a future PR that re-derives the high-d kernel can land both the
+    // implementation and the matching test together.
 
     #[test]
     fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
