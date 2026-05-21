@@ -10336,6 +10336,37 @@ fn require_projected_kkt_residual(
     }
 }
 
+const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
+const LINEARIZED_STALL_CYCLES: usize = 15;
+const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
+
+fn joint_linearized_rate_stall_candidate(
+    linearized_rel: f64,
+    residual: f64,
+    residual_tol: f64,
+) -> bool {
+    linearized_rel.is_finite()
+        && linearized_rel >= LINEARIZED_STALL_REL_THRESHOLD
+        && residual.is_finite()
+        && residual_tol.is_finite()
+        && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0)
+}
+
+fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual_tol: f64) -> f64 {
+    if linearized_rel > 0.0 && linearized_rel < 1.0 && residual_tol > 0.0 && residual > residual_tol
+    {
+        let ratio_log = linearized_rel.ln();
+        let r_log = (residual / residual_tol).ln();
+        if ratio_log < 0.0 && r_log.is_finite() {
+            (r_log / -ratio_log).max(0.0)
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        f64::INFINITY
+    }
+}
+
 #[derive(Clone, Debug)]
 struct JointNewtonMathDiagnostic {
     old_kkt_inf: f64,
@@ -10832,9 +10863,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // exit `converged = false` so the outer optimizer rejects this
         // ρ evaluation immediately instead of riding the geometric tail
         // to `inner_max_cycles`.
-        const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
-        const LINEARIZED_STALL_CYCLES: usize = 15;
-        const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
         let mut linearized_stall_streak: usize = 0;
 
         // The exact joint-Hessian route solves the penalized Newton system
@@ -12541,12 +12569,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // may have rejected.
             if let Some(math) = last_joint_math.as_ref() {
                 let linearized_rel_now = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-                let residual_far_from_tol = residual.is_finite()
-                    && residual_tol.is_finite()
-                    && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0);
-                if linearized_rel_now.is_finite()
-                    && linearized_rel_now >= LINEARIZED_STALL_REL_THRESHOLD
-                    && residual_far_from_tol
+                if joint_linearized_rate_stall_candidate(linearized_rel_now, residual, residual_tol)
                 {
                     linearized_stall_streak = linearized_stall_streak.saturating_add(1);
                 } else {
@@ -12556,21 +12579,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // Projected cycles needed to reach residual_tol at the
                     // observed geometric rate; logged so callers can verify
                     // the bail-out is consistent with the budget.
-                    let projected_cycles_to_tol = if linearized_rel_now > 0.0
-                        && linearized_rel_now < 1.0
-                        && residual_tol > 0.0
-                        && residual > residual_tol
-                    {
-                        let ratio_log = linearized_rel_now.ln();
-                        let r_log = (residual / residual_tol).ln();
-                        if ratio_log < 0.0 && r_log.is_finite() {
-                            (r_log / -ratio_log).max(0.0)
-                        } else {
-                            f64::INFINITY
-                        }
-                    } else {
-                        f64::INFINITY
-                    };
+                    let projected_cycles_to_tol = projected_cycles_to_residual_tol(
+                        linearized_rel_now,
+                        residual,
+                        residual_tol,
+                    );
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | linearized-rate stall early-exit: linearized_rel={:.3e} >= {:.3e} for {} consecutive cycles, residual={:.3e} (tol={:.3e}, factor>={:.3e}), projected_cycles_to_tol={:.1}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles burns the geometric tail.",
                         cycle,
@@ -18640,6 +18653,30 @@ fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     if residual.iter().all(|v| v.is_finite()) {
         Ok(Some(ProjectedKktResidual::from_projected(residual)))
     } else {
+        // Surface this clearly: a non-finite projected residual reaches the
+        // unified evaluator as `kkt_residual = None`, which then makes the
+        // envelope-consistency tripwire fire with "no projected residual"
+        // as the suspected cause. Emit the count and magnitude so the
+        // failure is diagnosable from a single log line.
+        let nan_count = residual.iter().filter(|v| v.is_nan()).count();
+        let inf_count = residual.iter().filter(|v| v.is_infinite()).count();
+        let finite_max = residual
+            .iter()
+            .filter(|v| v.is_finite())
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        log::warn!(
+            "[exact-newton kkt-residual projection] dropping projected KKT residual to None: \
+             len={} nan_count={} inf_count={} finite_max={:.3e}. The unified evaluator will \
+             treat this convergent path as if no residual were available, which silently \
+             disables the IFT correction and can trip the envelope-gradient consistency check \
+             on near-singular H. Investigate which block produced the non-finite entry.",
+            residual.len(),
+            nan_count,
+            inf_count,
+            finite_max,
+        );
         Ok(None)
     }
 }
@@ -25163,6 +25200,36 @@ mod tests {
             linearized_rel < 0.5,
             "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
             linearized_rel,
+        );
+    }
+
+    #[test]
+    fn joint_linearized_rate_stall_detects_biobank_tail() {
+        // Pasted AoU cycle 49: rel≈0.9839, residual=1.712e4, tol=5.994.
+        // That is not a constrained-stationary certificate; it is a geometric
+        // KKT tail that would need hundreds more cycles to reach tol.
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 6.093e6,
+            linearized_next_kkt_inf: 5.995e6,
+            predicted_reduction: 5.552e-1,
+            actual_reduction: 5.571e-1,
+            trust_ratio: 1.003,
+            step_inf: 1.423e-1,
+            proposal_inf: 1.423e-1,
+        };
+        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+        let residual = 1.712e4;
+        let residual_tol = 5.994;
+
+        assert!(joint_linearized_rate_stall_candidate(
+            linearized_rel,
+            residual,
+            residual_tol
+        ));
+        let projected = projected_cycles_to_residual_tol(linearized_rel, residual, residual_tol);
+        assert!(
+            projected > 400.0,
+            "biobank tail should be rejected instead of spending projected_cycles={projected:.1}"
         );
     }
 
