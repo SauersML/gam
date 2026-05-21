@@ -41,11 +41,11 @@ use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{TermCollectionDesign, TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    BasisOptions, BasisWorkspace, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    build_duchon_basis, build_duchon_operator_penalty_matrices, build_thin_plate_penalty_matrix,
-    create_basis, create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense,
+    build_duchon_basis, build_duchon_basiswithworkspace, build_duchon_operator_penalty_matrices,
+    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
+    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
@@ -2688,6 +2688,134 @@ fn gaussian_reml_fit_positions_batched_impl(
     )
 }
 
+fn validate_position_batched_reml_common(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
+) -> Result<(usize, usize, usize), String> {
+    validate_vector("t", t)?;
+    validate_vector("knots_or_centers", knots_or_centers)?;
+    if row_offsets.len() < 2 {
+        return Err("row_offsets must contain at least [0, n]".to_string());
+    }
+    if row_offsets[0] != 0 || row_offsets[row_offsets.len() - 1] != t.len() {
+        return Err(format!(
+            "row_offsets must start at 0 and end at t.len(); got start={}, end={}, n={}",
+            row_offsets[0],
+            row_offsets[row_offsets.len() - 1],
+            t.len()
+        ));
+    }
+    for idx in 0..row_offsets.len() - 1 {
+        if row_offsets[idx] > row_offsets[idx + 1] {
+            return Err("row_offsets must be non-decreasing".to_string());
+        }
+    }
+    if y.nrows() != t.len() {
+        return Err(format!(
+            "position batched Gaussian REML row mismatch: t has {} rows but Y has {}",
+            t.len(),
+            y.nrows()
+        ));
+    }
+    if y.ncols() == 0 {
+        return Err("batched Gaussian REML requires non-empty Y columns".to_string());
+    }
+    if penalty.nrows() == 0 || penalty.ncols() != penalty.nrows() {
+        return Err(format!(
+            "penalty must be a non-empty square matrix; got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if by_start_col > penalty.nrows() {
+        return Err(format!(
+            "by_start_col must be <= number of columns; got {by_start_col} for {} columns",
+            penalty.nrows()
+        ));
+    }
+    if y.iter().chain(penalty.iter()).any(|value| !value.is_finite()) {
+        return Err("batched Gaussian REML inputs must be finite".to_string());
+    }
+    if let Some(weights) = weights {
+        if weights.len() != t.len() {
+            return Err(format!(
+                "weights length mismatch: expected {}, got {}",
+                t.len(),
+                weights.len()
+            ));
+        }
+        if weights
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(
+                "batched Gaussian REML weights must be finite non-negative values".to_string(),
+            );
+        }
+    }
+    if let Some(lambda) = init_lambda {
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return Err(format!(
+                "init_lambda must be finite and positive when provided; got {lambda}"
+            ));
+        }
+    }
+    if let Some(by) = by {
+        if by.len() != t.len() {
+            return Err(format!(
+                "by gate length mismatch: expected {}, got {}",
+                t.len(),
+                by.len()
+            ));
+        }
+        if by.iter().any(|value| !value.is_finite()) {
+            return Err("by gate must contain only finite values".to_string());
+        }
+    }
+    Ok((row_offsets.len() - 1, penalty.nrows(), y.ncols()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn position_fit_design_for_slice(
+    t: ArrayView1<'_, f64>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    period: Option<f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
+    expected_cols: usize,
+    batch_index: usize,
+) -> Result<Array2<f64>, String> {
+    let x = position_basis_design(
+        t,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+    )?;
+    if x.ncols() != expected_cols {
+        return Err(format!(
+            "position basis width mismatch in batch {batch_index}: penalty expects {expected_cols}, basis produced {}",
+            x.ncols()
+        ));
+    }
+    if let Some(by_values) = by {
+        apply_by_gate(x.view(), by_values, by_start_col)
+    } else {
+        Ok(x)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_positions_batched_streaming_impl(
     t: ArrayView1<'_, f64>,
@@ -2704,22 +2832,197 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
 ) -> Result<BatchedGaussianRemlResult, String> {
-    let x = position_basis_design(
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let (batch, p, d) = validate_position_batched_reml_common(
         t,
+        y,
+        row_offsets,
         knots_or_centers,
-        basis_kind,
-        basis_order,
-        periodic,
-        period,
+        penalty,
+        weights,
+        init_lambda,
+        by,
+        by_start_col,
     )?;
-    let gated_x;
-    let fit_x = if let Some(by_values) = by {
-        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
-        gated_x.view()
-    } else {
-        x.view()
-    };
-    gaussian_reml_fit_batched_impl(fit_x, y, row_offsets, penalty, weights, init_lambda)
+
+    // Build each ragged segment's basis independently. This makes it
+    // impossible for the position-batched API to materialize the concatenated
+    // n_total x p design, which is exactly the shape that becomes
+    // operator-backed for large Duchon batches.
+    let xtwx_phase: Vec<Result<Option<Array2<f64>>, String>> = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return Ok(None);
+            }
+            let x = position_fit_design_for_slice(
+                t.slice(s![start..end]),
+                knots_or_centers,
+                basis_kind,
+                basis_order,
+                periodic,
+                period,
+                by.map(|values| values.slice(s![start..end])),
+                by_start_col,
+                p,
+                b,
+            )?;
+            let owned_weight: Array1<f64> = match weights.as_ref() {
+                Some(w) => w.slice(s![start..end]).to_owned(),
+                None => Array1::ones(end - start),
+            };
+            Ok(Some(gam::faer_ndarray::fast_xt_diag_x(
+                &x.view(),
+                &owned_weight,
+            )))
+        })
+        .collect();
+
+    let mut live_indices: Vec<usize> = Vec::with_capacity(batch);
+    let mut live_xtwx: Vec<Array2<f64>> = Vec::with_capacity(batch);
+    for (b, slot) in xtwx_phase.into_iter().enumerate() {
+        if let Some(xtwx) = slot? {
+            live_indices.push(b);
+            live_xtwx.push(xtwx);
+        }
+    }
+    let batched_caches = build_gaussian_reml_eigen_cache_batched(live_xtwx, penalty, None);
+    let mut prebuilt_caches: Vec<Option<gam::gaussian_reml::GaussianRemlEigenCache>> =
+        (0..batch).map(|_| None).collect();
+    for (i, cache_result) in batched_caches.into_iter().enumerate() {
+        if let Ok(cache) = cache_result {
+            prebuilt_caches[live_indices[i]] = Some(cache);
+        }
+    }
+
+    let fit_results: Vec<
+        Result<(usize, Option<gam::gaussian_reml::GaussianRemlMultiResult>), String>,
+    > = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            if start == end {
+                return Ok((b, None));
+            }
+            let x = position_fit_design_for_slice(
+                t.slice(s![start..end]),
+                knots_or_centers,
+                basis_kind,
+                basis_order,
+                periodic,
+                period,
+                by.map(|values| values.slice(s![start..end])),
+                by_start_col,
+                p,
+                b,
+            )?;
+            let weight_slice = weights.as_ref().map(|w| w.slice(s![start..end]));
+            let cache_ref = prebuilt_caches[b].as_ref();
+            match gaussian_reml_multi_closed_form_with_cache(
+                x.view(),
+                y.slice(s![start..end, ..]),
+                penalty,
+                weight_slice,
+                init_lambda,
+                cache_ref,
+            ) {
+                Ok(result) => Ok((b, Some(result))),
+                Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
+                Err(err) => Err(format!("batched position Gaussian REML fit {b} failed: {err}")),
+            }
+        })
+        .collect();
+
+    let mut lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_scores = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_lambdas = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_grad_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut reml_hess_rhos = Array1::<f64>::from_elem(batch, f64::NAN);
+    let mut edf = Array1::<f64>::zeros(batch);
+    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
+    let mut fitted = Array2::<f64>::zeros((t.len(), d));
+    let mut sigma2 = Array2::<f64>::from_elem((batch, d), f64::NAN);
+    let mut statuses = vec!["degenerate".to_string(); batch];
+    let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
+    let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
+    let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
+    let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
+    let mut cache_logdet_penalty_positive = Array1::<f64>::zeros(batch);
+    let mut cache_penalty_ranks = Array1::<i64>::zeros(batch);
+    let mut cache_nullities = Array1::<i64>::zeros(batch);
+
+    for result in fit_results {
+        let (b, fit) = result?;
+        if let Some(fit) = fit {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            statuses[b] = if fit.lambda.is_finite() && fit.reml_score.is_finite() {
+                "ok".to_string()
+            } else {
+                "diverged".to_string()
+            };
+            lambdas[b] = fit.lambda;
+            rhos[b] = fit.rho;
+            reml_scores[b] = fit.reml_score;
+            reml_grad_lambdas[b] = fit.reml_grad_lambda;
+            reml_hess_lambdas[b] = fit.reml_hess_lambda;
+            reml_grad_rhos[b] = fit.reml_grad_rho;
+            reml_hess_rhos[b] = fit.reml_hess_rho;
+            edf[b] = fit.edf;
+            coefficients
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.coefficients);
+            fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
+            sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            cache_penalty_eigenvalues
+                .slice_mut(s![b, ..])
+                .assign(&fit.cache.penalty_eigenvalues);
+            cache_eigenvectors
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.cache.eigenvectors);
+            cache_coefficient_basis
+                .slice_mut(s![b, .., ..])
+                .assign(&fit.cache.coefficient_basis);
+            cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
+            cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
+            cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
+            cache_logdet_penalty_positive[b] = fit.cache.logdet_penalty_positive;
+            cache_penalty_ranks[b] = fit.cache.penalty_rank as i64;
+            cache_nullities[b] = fit.cache.nullity as i64;
+        }
+    }
+
+    Ok(BatchedGaussianRemlResult {
+        statuses,
+        lambdas,
+        rhos,
+        reml_scores,
+        reml_grad_lambdas,
+        reml_hess_lambdas,
+        reml_grad_rhos,
+        reml_hess_rhos,
+        edf,
+        coefficients,
+        fitted,
+        sigma2,
+        cache_penalty_eigenvalues,
+        cache_eigenvectors,
+        cache_coefficient_basis,
+        cache_xtwx_fingerprints,
+        cache_penalty_fingerprints,
+        cache_logdet_xtwx,
+        cache_logdet_penalty_positive,
+        cache_penalty_ranks,
+        cache_nullities,
+    })
 }
 
 fn gaussian_reml_fit_positions_batched_backward_impl(
@@ -2745,133 +3048,28 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
 ) -> Result<BatchedPositionGaussianRemlBackwardResult, String> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    if row_offsets.len() < 2 {
-        return Err("row_offsets must contain at least [0, n]".to_string());
-    }
-    if row_offsets[0] != 0 || row_offsets[row_offsets.len() - 1] != t.len() {
-        return Err(format!(
-            "row_offsets must start at 0 and end at t.len(); got start={}, end={}, n={}",
-            row_offsets[0],
-            row_offsets[row_offsets.len() - 1],
-            t.len()
-        ));
-    }
-    for idx in 0..row_offsets.len() - 1 {
-        if row_offsets[idx] > row_offsets[idx + 1] {
-            return Err("row_offsets must be non-decreasing".to_string());
-        }
-    }
-    if y.nrows() != t.len() {
-        return Err(format!(
-            "position batched Gaussian REML row mismatch: t has {} rows but Y has {}",
-            t.len(),
-            y.nrows()
-        ));
-    }
-    if let Some(weights) = weights {
-        if weights.len() != t.len() {
-            return Err(format!(
-                "weights length mismatch: expected {}, got {}",
-                t.len(),
-                weights.len()
-            ));
-        }
-    }
-
-    let x = position_basis_design(
+    let (batch, p, d) = validate_position_batched_reml_common(
         t,
+        y,
+        row_offsets,
         knots_or_centers,
-        basis_kind,
-        basis_order,
-        periodic,
-        period,
+        penalty,
+        weights,
+        init_lambda,
+        by,
+        by_start_col,
     )?;
-    let basis_derivative = position_basis_derivative(
-        t,
-        knots_or_centers,
-        basis_kind,
-        basis_order,
-        periodic,
-        period,
+    validate_batched_reml_upstreams(
+        batch,
+        p,
+        d,
+        t.len(),
+        grad_lambda,
+        grad_coefficients,
+        grad_fitted,
+        grad_reml_score,
+        grad_edf,
     )?;
-    let gated_x;
-    let fit_x = if let Some(by_values) = by {
-        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
-        gated_x.view()
-    } else {
-        x.view()
-    };
-    if penalty.dim() != (x.ncols(), x.ncols()) {
-        return Err(format!(
-            "penalty shape mismatch: expected {}x{}, got {}x{}",
-            x.ncols(),
-            x.ncols(),
-            penalty.nrows(),
-            penalty.ncols()
-        ));
-    }
-
-    let batch = row_offsets.len() - 1;
-    let p = x.ncols();
-    let d = y.ncols();
-    if let Some(grad_lambda) = grad_lambda {
-        if grad_lambda.len() != batch {
-            return Err(format!(
-                "grad_lambda length mismatch: expected {batch}, got {}",
-                grad_lambda.len()
-            ));
-        }
-        if grad_lambda.iter().any(|value| !value.is_finite()) {
-            return Err("grad_lambda must contain only finite values".to_string());
-        }
-    }
-    if let Some(grad_reml_score) = grad_reml_score {
-        if grad_reml_score.len() != batch {
-            return Err(format!(
-                "grad_reml_score length mismatch: expected {batch}, got {}",
-                grad_reml_score.len()
-            ));
-        }
-        if grad_reml_score.iter().any(|value| !value.is_finite()) {
-            return Err("grad_reml_score must contain only finite values".to_string());
-        }
-    }
-    if let Some(grad_edf) = grad_edf {
-        if grad_edf.len() != batch {
-            return Err(format!(
-                "grad_edf length mismatch: expected {batch}, got {}",
-                grad_edf.len()
-            ));
-        }
-        if grad_edf.iter().any(|value| !value.is_finite()) {
-            return Err("grad_edf must contain only finite values".to_string());
-        }
-    }
-    if let Some(grad_coefficients) = grad_coefficients {
-        if grad_coefficients.dim() != (batch, p, d) {
-            let (got_b, got_p, got_d) = grad_coefficients.dim();
-            return Err(format!(
-                "grad_coefficients shape mismatch: expected {batch}x{p}x{d}, got {got_b}x{got_p}x{got_d}"
-            ));
-        }
-        if grad_coefficients.iter().any(|value| !value.is_finite()) {
-            return Err("grad_coefficients must contain only finite values".to_string());
-        }
-    }
-    if let Some(grad_fitted) = grad_fitted {
-        if grad_fitted.dim() != y.dim() {
-            return Err(format!(
-                "grad_fitted shape mismatch: expected {}x{}, got {}x{}",
-                y.nrows(),
-                y.ncols(),
-                grad_fitted.nrows(),
-                grad_fitted.ncols()
-            ));
-        }
-        if grad_fitted.iter().any(|value| !value.is_finite()) {
-            return Err("grad_fitted must contain only finite values".to_string());
-        }
-    }
 
     if let Some(fits) = forward_fits {
         if fits.len() != batch {
@@ -2881,7 +3079,13 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             ));
         }
     }
-    type PositionBackwardParts = (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>);
+    type PositionBackwardParts = (
+        Array1<f64>,
+        Array2<f64>,
+        Array2<f64>,
+        Array1<f64>,
+        Option<Array1<f64>>,
+    );
     let results: Vec<Result<(usize, Option<PositionBackwardParts>), String>> = (0..batch)
         .into_par_iter()
         .map(|b| {
@@ -2896,7 +3100,45 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             let upstream_edf = grad_edf.as_ref().map_or(0.0, |g| g[b]);
             let upstream_coefficients = grad_coefficients.as_ref().map(|g| g.slice(s![b, .., ..]));
             let upstream_fitted = grad_fitted.as_ref().map(|g| g.slice(s![start..end, ..]));
-            let x_slice = fit_x.slice(s![start..end, ..]);
+            let x_base = position_basis_design(
+                t.slice(s![start..end]),
+                knots_or_centers,
+                basis_kind,
+                basis_order,
+                periodic,
+                period,
+            )?;
+            if x_base.ncols() != p {
+                return Err(format!(
+                    "position basis width mismatch in batch {b}: penalty expects {p}, basis produced {}",
+                    x_base.ncols()
+                ));
+            }
+            let basis_derivative = position_basis_derivative(
+                t.slice(s![start..end]),
+                knots_or_centers,
+                basis_kind,
+                basis_order,
+                periodic,
+                period,
+            )?;
+            if basis_derivative.dim() != x_base.dim() {
+                return Err(format!(
+                    "basis derivative shape mismatch in batch {b}: basis is {}x{} but dX/dt is {}x{}",
+                    x_base.nrows(),
+                    x_base.ncols(),
+                    basis_derivative.nrows(),
+                    basis_derivative.ncols()
+                ));
+            }
+            let by_slice = by.map(|values| values.slice(s![start..end]));
+            let gated_x;
+            let x_slice = if let Some(by_values) = by_slice {
+                gated_x = apply_by_gate(x_base.view(), by_values, by_start_col)?;
+                gated_x.view()
+            } else {
+                x_base.view()
+            };
             let y_slice = y.slice(s![start..end, ..]);
             let backward_result = if let Some(fits) = forward_fits {
                 match fits[b].as_ref() {
@@ -2929,15 +3171,30 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                 )
             };
             match backward_result {
-                Ok(backward) => Ok((
-                    b,
-                    Some((
-                        backward.grad_x,
-                        backward.grad_y,
-                        backward.grad_penalty,
-                        backward.grad_weights,
-                    )),
-                )),
+                Ok(backward) => {
+                    let (grad_x, grad_by) = if let Some(by_values) = by_slice {
+                        let (grad_x, grad_by) = apply_by_gate_backward(
+                            x_base.view(),
+                            by_values,
+                            by_start_col,
+                            backward.grad_x.view(),
+                        )?;
+                        (grad_x, Some(grad_by))
+                    } else {
+                        (backward.grad_x, None)
+                    };
+                    let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
+                    Ok((
+                        b,
+                        Some((
+                            grad_t,
+                            backward.grad_y,
+                            backward.grad_penalty,
+                            backward.grad_weights,
+                            grad_by,
+                        )),
+                    ))
+                }
                 Err(EstimationError::ModelIsIllConditioned { .. }) => Ok((b, None)),
                 Err(err) => Err(format!(
                     "batched position Gaussian REML backward {b} failed: {err}"
@@ -2947,35 +3204,35 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
         .collect();
 
     let mut statuses = vec!["degenerate".to_string(); batch];
-    let mut grad_fit_x = Array2::<f64>::zeros(x.dim());
+    let mut grad_t = Array1::<f64>::zeros(t.len());
     let mut grad_y = Array2::<f64>::zeros(y.dim());
     let mut grad_penalty = Array2::<f64>::zeros(penalty.dim());
     let mut grad_weights = Array1::<f64>::zeros(t.len());
+    let mut grad_by = by.map(|_| Array1::<f64>::zeros(t.len()));
     for result in results {
         let (b, backward) = result?;
-        if let Some((batch_grad_x, batch_grad_y, batch_grad_penalty, batch_grad_weights)) = backward
+        if let Some((
+            batch_grad_t,
+            batch_grad_y,
+            batch_grad_penalty,
+            batch_grad_weights,
+            batch_grad_by,
+        )) = backward
         {
             let start = row_offsets[b];
             let end = row_offsets[b + 1];
             statuses[b] = "ok".to_string();
-            grad_fit_x
-                .slice_mut(s![start..end, ..])
-                .assign(&batch_grad_x);
+            grad_t.slice_mut(s![start..end]).assign(&batch_grad_t);
             grad_y.slice_mut(s![start..end, ..]).assign(&batch_grad_y);
             grad_penalty += &batch_grad_penalty;
             grad_weights
                 .slice_mut(s![start..end])
                 .assign(&batch_grad_weights);
+            if let (Some(target), Some(source)) = (grad_by.as_mut(), batch_grad_by.as_ref()) {
+                target.slice_mut(s![start..end]).assign(source);
+            }
         }
     }
-    let (grad_x, grad_by) = if let Some(by_values) = by {
-        let (grad_x, grad_by) =
-            apply_by_gate_backward(x.view(), by_values, by_start_col, grad_fit_x.view())?;
-        (grad_x, Some(grad_by))
-    } else {
-        (grad_fit_x, None)
-    };
-    let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
 
     Ok(BatchedPositionGaussianRemlBackwardResult {
         statuses,
@@ -8261,6 +8518,61 @@ mod tests {
         }
         for (actual, expected) in actual.fitted.iter().zip(expected.fitted.iter()) {
             assert!((*actual - *expected).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn position_batched_duchon_forward_matches_prebuilt_design() {
+        let t = Array1::linspace(0.05, 0.95, 16);
+        let y = Array2::from_shape_fn((t.len(), 2), |(row, output)| {
+            let u = t[row];
+            let scale = output as f64 + 1.0;
+            0.2 + 0.35 * scale * u + 0.12 * (5.0 * u + scale).sin()
+        });
+        let offsets = array![0_usize, 6_usize, 16_usize];
+        let centers = Array1::linspace(0.0, 1.0, 6);
+        let x = position_basis_design(t.view(), centers.view(), "duchon", 2, false, None)
+            .expect("Duchon position basis");
+        let penalty = Array2::from_diag(&Array1::from_shape_fn(x.ncols(), |col| {
+            0.2 + 0.15 * col as f64
+        }));
+
+        let expected = gaussian_reml_fit_batched_impl(
+            x.view(),
+            y.view(),
+            offsets.view(),
+            penalty.view(),
+            None,
+            Some(0.8),
+        )
+        .expect("prebuilt Duchon batched fit");
+        let actual = gaussian_reml_fit_positions_batched_impl(
+            t.view(),
+            y.view(),
+            offsets.view(),
+            centers.view(),
+            "duchon",
+            2,
+            false,
+            None,
+            penalty.view(),
+            None,
+            Some(0.8),
+            None,
+            0,
+        )
+        .expect("streamed Duchon position batched fit");
+
+        assert_eq!(actual.statuses, expected.statuses);
+        for b in 0..2 {
+            assert!((actual.lambdas[b] - expected.lambdas[b]).abs() < 1.0e-11);
+            assert!((actual.reml_scores[b] - expected.reml_scores[b]).abs() < 1.0e-10);
+        }
+        for (actual, expected) in actual.coefficients.iter().zip(expected.coefficients.iter()) {
+            assert!((*actual - *expected).abs() < 1.0e-10);
+        }
+        for (actual, expected) in actual.fitted.iter().zip(expected.fitted.iter()) {
+            assert!((*actual - *expected).abs() < 1.0e-10);
         }
     }
 
