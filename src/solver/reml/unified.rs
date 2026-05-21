@@ -6993,8 +6993,7 @@ pub fn reml_laml_evaluate(
             }
         });
     let kkt_residual_was_applied = kkt_residual_vec.is_some();
-    let envelope_suppresses_outputs =
-        envelope_inconsistent.is_some() && !kkt_residual_was_applied;
+    let envelope_suppresses_outputs = envelope_inconsistent.is_some() && !kkt_residual_was_applied;
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
@@ -14969,6 +14968,65 @@ mod tests {
         };
         let dense = op.materialize_dense().expect("sentinel materialization");
         assert_eq!(dense, family_matrix);
+    }
+
+    #[test]
+    fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: array![[42.0]],
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0e20],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            kkt_residual: None,
+        };
+
+        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+            .expect("envelope tripwire evaluation");
+        assert!(
+            result.gradient.is_none(),
+            "inconsistent envelope gradient should be suppressed"
+        );
+        assert!(
+            matches!(
+                result.hessian,
+                crate::solver::outer_strategy::HessianResult::Unavailable
+            ),
+            "inconsistent envelope gradient should skip Hessian assembly"
+        );
     }
 
     #[test]
