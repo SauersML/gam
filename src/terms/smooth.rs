@@ -16431,7 +16431,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(0.9),
-                    power: 5,
+                    power: 5.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::OrthogonalToParametric,
                     aniso_log_scales: None,
@@ -17061,7 +17061,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: Some(1.0),
-                    power: 5,
+                    power: 5.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -17172,7 +17172,7 @@ mod tests {
                         spec: DuchonBasisSpec {
                             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                             length_scale: Some(1.0),
-                            power: 1,
+                            power: 1.0,
                             nullspace_order: DuchonNullspaceOrder::Linear,
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
@@ -17444,7 +17444,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: Some(1.4),
-                        power: 5,
+                        power: 5.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::OrthogonalToParametric,
                         aniso_log_scales: None,
@@ -17565,7 +17565,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(0.9),
-                    power: 5,
+                    power: 5.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -17602,7 +17602,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(1.0),
-                    power: 3,
+                    power: 3.0,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -17651,7 +17651,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 3,
+                        power: 3.0,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -17704,7 +17704,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 3,
+                        power: 3.0,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -17749,7 +17749,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(1.0),
-                        power: 3,
+                        power: 3.0,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -18660,7 +18660,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -18910,7 +18910,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(1.0),
-                    power: 1,
+                    power: 1.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -19216,7 +19216,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -19439,7 +19439,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -19680,7 +19680,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -19854,7 +19854,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                         length_scale: Some(1.0),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -21022,7 +21022,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
                         length_scale: Some(0.7),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -21357,7 +21357,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: Some(0.9),
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -21451,7 +21451,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                         length_scale: None,
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -21492,7 +21492,7 @@ mod tests {
                             [1.0, 1.0]
                         ]),
                         length_scale: None,
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0]),
@@ -21540,7 +21540,7 @@ mod tests {
                             [0.0, 0.0, 1.0],
                         ]),
                         length_scale: None,
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::None,
                         aniso_log_scales: Some(vec![0.7, 0.2, 0.1]),
@@ -21728,7 +21728,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
@@ -21923,7 +21923,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                         length_scale: None,
-                        power: 1,
+                        power: 1.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
@@ -22073,7 +22073,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(length_scale),
-                    power: 3,
+                    power: 3.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
@@ -22212,7 +22212,7 @@ mod tests {
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                     length_scale: None,
-                    power: 2,
+                    power: 2.0,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: Some(vec![0.0; d]),
@@ -22997,7 +22997,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 16 },
                         length_scale: None,
-                        power: 0,
+                        power: 0.0,
                         nullspace_order: DuchonNullspaceOrder::Degree(2),
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -23402,7 +23402,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 31 },
                         length_scale: Some(1.0),
-                        power: 2,
+                        power: 2.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -23581,7 +23581,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 120 },
                         length_scale: Some(1.0),
-                        power: 2,
+                        power: 2.0,
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
@@ -23832,7 +23832,7 @@ mod tests {
                     spec: DuchonBasisSpec {
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 11 },
                         length_scale: Some(0.8),
-                        power: 2,
+                        power: 2.0,
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
