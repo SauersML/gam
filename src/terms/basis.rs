@@ -9932,7 +9932,7 @@ fn duchon_kernel_radial_triplet(
     r: f64,
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     k_dim: usize,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
 ) -> Result<(f64, f64, f64), BasisError> {
@@ -9965,7 +9965,8 @@ fn duchon_kernel_radial_triplet(
                     &coeffs_local
                 }
             };
-            let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, coeffs_ref)?;
+            let jets =
+                duchon_radial_jets(r, length_scale, p_order, s_order as usize, k_dim, coeffs_ref)?;
             (jets.phi, jets.phi_r, jets.phi_rr)
         }
     };
@@ -11814,13 +11815,13 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = duchon_power_to_usize(power);
+    let s_order: f64 = power;
     let p_colloc = centers.nrows();
     let dim = centers.ncols();
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order as f64,
+        s_order,
         dim,
         max_operator_derivative_order,
     )?;
@@ -11832,8 +11833,12 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             )));
         }
     }
+    // Partial-fraction expansion only runs in the hybrid Matérn branch
+    // (`length_scale = Some`). The scale-free path (`length_scale = None`)
+    // skips it entirely and is fractional-clean down to the Riesz kernel.
     let coeffs = length_scale.map(|scale| {
-        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / scale.max(1e-300))
+        let s_int = duchon_power_to_usize(s_order);
+        duchon_partial_fraction_coeffs(p_order, s_int, 1.0 / scale.max(1e-300))
     });
     let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(centered_aniso_metric_weights);
     let row_scales = if let Some(w) = collocationweights {
@@ -11872,27 +11877,29 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             } else {
                 stable_euclidean_norm((0..dim).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
             };
-            let (phi, q, t) =
-                if let (Some(length_scale), Some(coeffs)) = (length_scale, coeffs.as_ref()) {
-                    let jets = duchon_radial_jets(r, length_scale, p_order, s_order, dim, coeffs)?;
-                    (jets.phi, jets.q, jets.t)
-                } else {
-                    let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
-                        r,
-                        length_scale,
-                        p_order,
+            let (phi, q, t) = if let (Some(length_scale), Some(coeffs)) =
+                (length_scale, coeffs.as_ref())
+            {
+                let jets =
+                    duchon_radial_jets(r, length_scale, p_order, s_order as usize, dim, coeffs)?;
+                (jets.phi, jets.q, jets.t)
+            } else {
+                let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
+                    r,
+                    length_scale,
+                    p_order,
                         s_order,
-                        dim,
-                        coeffs.as_ref(),
-                    )?;
-                    let q = if r > R_EPS { phi_r / r } else { phi_rr };
-                    let t = if r > R_EPS {
-                        (phi_rr - q) / (r * r)
-                    } else {
-                        0.0
-                    };
-                    (phi, q, t)
+                    dim,
+                    coeffs.as_ref(),
+                )?;
+                let q = if r > R_EPS { phi_r / r } else { phi_rr };
+                let t = if r > R_EPS {
+                    (phi_rr - q) / (r * r)
+                } else {
+                    0.0
                 };
+                (phi, q, t)
+            };
             if !phi.is_finite() || !q.is_finite() || !t.is_finite() {
                 return Err(BasisError::InvalidInput(format!(
                     "non-finite Duchon collocation operator derivative at rows ({k}, {j}), r={r}"
@@ -18797,7 +18804,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
                 0.0
             };
             let (phi, phi_r, phi_rr) =
-                duchon_kernel_radial_triplet(r, None, p_order, s_order, 1, None)?;
+                duchon_kernel_radial_triplet(r, None, p_order, s_order as f64, 1, None)?;
             raw_kernel[[i, j]] = match order {
                 0 => phi,
                 1 => phi_r * sign,
@@ -19295,7 +19302,7 @@ pub fn build_duchon_basiswithworkspace(
                         r,
                         length_scale,
                         p_order,
-                        s_order,
+                        s_order as f64,
                         d,
                         coeffs.as_ref(),
                     )
@@ -28637,7 +28644,7 @@ mod tests {
             centers.view(),
             1, // q = 1 (tension), maximal closed-form q for these orders
             p_order,
-            s_order,
+            s_order as f64,
             None,
         );
         // Q^T G_raw Q — the kernel sub-block.
@@ -29327,7 +29334,7 @@ mod tests {
             0.0,
             Some(length_scale),
             p_order,
-            s_order,
+            s_order as f64,
             dim,
             Some(&coeffs),
         )
@@ -30685,7 +30692,7 @@ mod tests {
             scaled_r,
             Some(length_scale_1),
             p_order,
-            s_order,
+            s_order as f64,
             k_dim,
             Some(&coeffs_1),
         )
@@ -30694,7 +30701,7 @@ mod tests {
             r,
             Some(length_scale_2),
             p_order,
-            s_order,
+            s_order as f64,
             k_dim,
             Some(&coeffs_2),
         )

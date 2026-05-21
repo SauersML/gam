@@ -15270,6 +15270,34 @@ mod tests {
     ///        `½ log|U_Sᵀ H U_S|_+` while the full-H is the Schur
     ///        complement inverse — mathematically distinct, not just
     ///        less noisy.
+    /// Independent ground-truth bilinear form `aᵀ U_S (U_Sᵀ H U_S)⁻¹
+    /// U_Sᵀ b`. Recomputes the projected inverse via a fresh
+    /// eigendecomposition of `U_Sᵀ H U_S` — a separate code path from
+    /// `PenaltySubspaceTrace::bilinear_pseudo_inverse` (which applies a
+    /// PRECOMPUTED `h_proj_inverse`). Match between the two is non-
+    /// trivial verification of the helper's inversion.
+    fn projected_pseudo_inverse_truth(
+        h_full: &Array2<f64>,
+        u_s: &Array2<f64>,
+        a: &Array1<f64>,
+        b: &Array1<f64>,
+    ) -> f64 {
+        use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
+        let proj_a = u_s.t().dot(a);
+        let proj_b = u_s.t().dot(b);
+        let h_proj = u_s.t().dot(h_full).dot(u_s);
+        let (evals, evecs) = h_proj.eigh(Side::Lower).expect("h_proj eigh");
+        let ua = evecs.t().dot(&proj_a);
+        let ub = evecs.t().dot(&proj_b);
+        let mut acc = 0.0_f64;
+        for i in 0..evals.len() {
+            assert!(evals[i].abs() > 1e-10, "h_proj eigenvalue must be nonzero");
+            acc += ua[i] * ub[i] / evals[i];
+        }
+        acc
+    }
+
     #[test]
     fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_coupled_h() {
         let small_eig = 1e-12_f64;
@@ -15282,47 +15310,48 @@ mod tests {
             u_s[[j, j]] = 1.0;
         }
 
-        // Build SPD H = Q diag(λ) Qᵀ with λ_min in a MIXED direction.
-        // v_min = (0, 0, 0, 0.1, sqrt(0.99)) — leg 0.1 inside range(S_+),
-        // leg ~0.995 outside. Other 4 eigenvectors orthonormalized via
-        // Gram-Schmidt.
+        // Build SPD H = Q diag(λ) Qᵀ where the smallest-eigenvalue
+        // eigenvector v_min has LEGS ON ALL FOUR range(S_+) coordinates
+        // (not just e_3 as in the earlier, weaker fixture). This forces
+        // `h_proj = U_Sᵀ H U_S` to be genuinely non-diagonal, so the
+        // helper's eigendecomposition-based inversion is actually
+        // exercised (a diagonal shortcut would silently fail here).
         let v_min = {
-            let leg_s = 0.1_f64;
-            let leg_n = (1.0 - leg_s * leg_s).sqrt();
-            array![0.0_f64, 0.0, 0.0, leg_s, leg_n]
+            let leg_s = 0.15_f64;
+            let leg_n = (1.0 - 4.0 * leg_s * leg_s).sqrt();
+            array![leg_s, leg_s, leg_s, leg_s, leg_n]
         };
-        // Orthonormalize four ambient basis vectors against v_min.
+        // Four ambient vectors with MIXED support (not the standard
+        // basis) so Gram-Schmidt against `v_min` produces dense Q
+        // columns and a dense `h_proj`.
+        let ambients = vec![
+            array![1.0_f64, 0.3, -0.2, 0.5, 0.0],
+            array![0.4_f64, 1.0, 0.6, -0.3, 0.0],
+            array![-0.5_f64, 0.2, 1.0, 0.7, 0.0],
+            array![0.6_f64, -0.4, 0.3, 1.0, 0.0],
+        ];
         let mut q = Array2::<f64>::zeros((p, p));
         q.column_mut(p - 1).assign(&v_min);
         let mut col_idx = 0usize;
-        for ambient in 0..p {
-            if col_idx >= p - 1 {
-                break;
-            }
-            let mut v = Array1::<f64>::zeros(p);
-            v[ambient] = 1.0;
-            // Project out v_min.
+        for ambient in ambients.iter() {
+            let mut v = ambient.clone();
             let dot = v.dot(&v_min);
             v.scaled_add(-dot, &v_min);
-            // Project out previously placed Q columns.
             for prev in 0..col_idx {
                 let qprev = q.column(prev).to_owned();
                 let d = v.dot(&qprev);
                 v.scaled_add(-d, &qprev);
             }
             let norm = v.dot(&v).sqrt();
-            if norm < 1e-10 {
-                continue;
-            }
+            assert!(
+                norm > 1e-10,
+                "Gram-Schmidt failed at col {col_idx}: norm = {norm}"
+            );
             v /= norm;
             q.column_mut(col_idx).assign(&v);
             col_idx += 1;
         }
-        assert_eq!(
-            col_idx,
-            p - 1,
-            "Gram-Schmidt should fill p-1 orthonormal columns"
-        );
+        assert_eq!(col_idx, p - 1);
 
         let eigvals = array![10.0_f64, 5.0, 2.0, 1.0, small_eig];
         let mut h_full = Array2::<f64>::zeros((p, p));
@@ -15334,87 +15363,107 @@ mod tests {
                 }
             }
         }
-
-        // Confirm H is symmetric and has the intended cross-block coupling
-        // (off-diagonal entries are nonzero across the range/null boundary).
+        // Symmetrize to suppress 1e-16-scale asymmetry from
+        // outer-product summation order.
         for a in 0..p {
-            for b in 0..p {
-                assert!(
-                    (h_full[[a, b]] - h_full[[b, a]]).abs() < 1e-14,
-                    "H must be symmetric"
-                );
+            for b in (a + 1)..p {
+                let avg = 0.5 * (h_full[[a, b]] + h_full[[b, a]]);
+                h_full[[a, b]] = avg;
+                h_full[[b, a]] = avg;
             }
         }
-        // Cross-block coupling check: H[3,4] (a range(S_+) row crossing
-        // into null(S_+)) must be nonzero — that's the channel through
-        // which `H⁻¹ a_k` picks up a null leg.
+
+        // Verify `h_proj` is genuinely non-diagonal (the WHOLE POINT of
+        // this fixture — earlier versions silently relied on it being
+        // diagonal).
+        let h_proj_check = u_s.t().dot(&h_full).dot(&u_s);
+        let mut max_offdiag = 0.0_f64;
+        let mut max_diag = 0.0_f64;
+        for i in 0..r_subspace {
+            max_diag = max_diag.max(h_proj_check[[i, i]].abs());
+            for j in 0..r_subspace {
+                if i != j {
+                    max_offdiag = max_offdiag.max(h_proj_check[[i, j]].abs());
+                }
+            }
+        }
         assert!(
-            h_full[[3, 4]].abs() > 1e-6,
-            "fixture requires nonzero cross-block coupling, got {}",
-            h_full[[3, 4]]
+            max_offdiag > 0.1 * max_diag,
+            "fixture must produce non-diagonal h_proj; max_offdiag = \
+             {max_offdiag:.3e}, max_diag = {max_diag:.3e}"
         );
 
         let kernel = build_subspace_kernel(&h_full, &u_s);
 
-        // `a_k` purely in range(S_+) — matches production geometry exactly:
-        // `λ_k S_k β̂ ∈ col(S_k) ⊂ range(S_+)`. No null contamination.
+        // `a_k` purely in range(S_+) — production geometry exactly:
+        // `λ_k S_k β̂ ∈ col(S_k) ⊂ range(S_+)`.
         let a_k = array![0.5_f64, 0.7, -0.3, 0.9, 0.0];
-        // `r = r_clean + ε · e_null`. r_clean is honest, ε models the
-        // floor-noise the inner KKT certificate accepts.
         let eps_null = 1e-3_f64;
         let r_clean = array![0.4_f64, -0.6, 1.1, 0.3, 0.0];
         let r_total = &r_clean + &array![0.0_f64, 0.0, 0.0, 0.0, eps_null];
 
-        // Honest reference: what the correction SHOULD be — the projected
-        // pseudo-inverse on r_clean (no noise) and a_k.
-        let corr_honest = kernel.bilinear_pseudo_inverse(&r_clean, &a_k);
+        // ── (P1) Helper matches independent ground-truth bilinear ──
+        let truth_clean = projected_pseudo_inverse_truth(&h_full, &u_s, &r_clean, &a_k);
+        let truth_total = projected_pseudo_inverse_truth(&h_full, &u_s, &r_total, &a_k);
+        let corr_proj_clean = kernel.bilinear_pseudo_inverse(&r_clean, &a_k);
+        let corr_proj_total = kernel.bilinear_pseudo_inverse(&r_total, &a_k);
+        assert_relative_eq!(corr_proj_clean, truth_clean, max_relative = 1e-10);
+        assert_relative_eq!(corr_proj_total, truth_total, max_relative = 1e-10);
 
-        // Production-shape inputs (with FP noise on r):
-        let corr_proj = kernel.bilinear_pseudo_inverse(&r_total, &a_k);
-        let corr_full = dense_h_inv_bilinear_via_eig(&h_full, &r_total, &a_k);
+        // ── (P2) Projection invariance under null pollution ──
+        // The two helper outputs agree because `U_Sᵀ ε e_null = 0`,
+        // AND this holds DESPITE the non-diagonal `h_proj` (i.e. the
+        // full inversion path is exercised).
+        assert_relative_eq!(corr_proj_total, corr_proj_clean, max_relative = 1e-12);
+        assert_relative_eq!(truth_total, truth_clean, max_relative = 1e-12);
 
-        // The projected helper is INDIFFERENT to r's null contamination —
-        // `U_Sᵀ (r_clean + ε·e_null) = U_Sᵀ r_clean` exactly (e_null ⊥
-        // U_S). So `corr_proj == corr_honest` to machine precision.
-        assert_relative_eq!(corr_proj, corr_honest, max_relative = 1e-12);
-
-        // The full-H bilinear, in contrast, is corrupted by the noise via
-        // cross-block coupling. Quantify the predicted scale.
-        //
-        // Mathematically: corr_full - corr_honest_full = ε · (e_null)ᵀ
-        // H⁻¹ a_k. The eigendecomposition gives
-        //   H⁻¹ a_k = Σ_i (qᵢᵀ a_k) / λ_i · qᵢ
-        // The dominant term comes from the small-eigenvalue mode:
-        //   (q_minᵀ a_k) / σ_min · q_min[null] = (0.1 · 0.9) / 1e-12 · 0.995
-        //     = 0.0895 / 1e-12 ≈ 8.95e10
-        // Times eps_null = 1e-3 gives a `~1e8` noise contribution to
-        // corr_full, vastly exceeding the honest O(1) value.
-        let noise_contribution = corr_full - corr_honest;
+        // ── (P3) Full-H IS corrupted by the same pollution ──
+        // Predicted scale: ε · (q_minᵀ a_k) · q_min[p-1] / σ_min.
+        let corr_full_clean = dense_h_inv_bilinear_via_eig(&h_full, &r_clean, &a_k);
+        let corr_full_total = dense_h_inv_bilinear_via_eig(&h_full, &r_total, &a_k);
+        let full_noise_contrib = corr_full_total - corr_full_clean;
+        let v_min_dot_a = v_min.dot(&a_k);
+        let v_min_null = v_min[p - 1];
+        let predicted_noise = eps_null * v_min_dot_a * v_min_null / small_eig;
         assert!(
-            noise_contribution.abs() > 1e6,
-            "fixture must demonstrate the full-H amplification; \
-             got |corr_full - corr_honest| = {:.3e}, corr_full = {:.3e}, \
-             corr_honest = {:.3e}",
-            noise_contribution.abs(),
-            corr_full,
-            corr_honest
+            full_noise_contrib.abs() > 1e6,
+            "full-H must show 10⁶+ noise amplification; got |Δ| = {:.3e}",
+            full_noise_contrib.abs()
+        );
+        let ratio = full_noise_contrib / predicted_noise;
+        assert!(
+            (ratio - 1.0).abs() < 0.05,
+            "full-H corruption must follow predicted scaling; \
+             ratio = {ratio:.6}, predicted = {predicted_noise:.3e}, \
+             actual = {full_noise_contrib:.3e}"
         );
 
-        // Saved-orders-of-magnitude metric: ratio between the corrupted
-        // full-H bilinear and the projected helper.
-        let savings = corr_full.abs() / corr_proj.abs().max(1e-30);
+        // ── (P4) Self-consistency: projected ≠ full-H even on CLEAN r ──
+        // The fix is the kernel that pairs with `½ log|U_Sᵀ H U_S|_+`;
+        // full-H pairs with `½ log|H|`. On a cross-coupled SPD H with a
+        // small-eigenvalue mixed direction, the two bilinear forms
+        // disagree by `O(σ_min⁻¹)`. NOT just a denoising effect.
+        let clean_disagreement = corr_full_clean - corr_proj_clean;
         assert!(
-            savings >= 1e5,
-            "projected helper should save ≥ 5 orders of magnitude on \
-             cross-coupled fixture; got savings = {savings:.3e} \
-             (full = {corr_full:.3e}, proj = {corr_proj:.3e})"
+            clean_disagreement.abs() > 1e5,
+            "fix is self-consistency, NOT denoising: on CLEAN input \
+             projected ({corr_proj_clean:.3e}) and full-H \
+             ({corr_full_clean:.3e}) must differ by O(1/σ_min); \
+             got disagreement = {clean_disagreement:.3e}"
         );
 
         eprintln!(
-            "[ift-cross-coupled] corr_honest = {corr_honest:.6e}  \
-             corr_proj = {corr_proj:.6e}  corr_full = {corr_full:.6e}  \
-             noise_contribution = {noise_contribution:.6e}  \
-             savings = {savings:.3e}"
+            "[ift-cross-coupled-airtight] h_proj non-diag ratio = \
+             {:.3} (max_off / max_diag), clean: projected = \
+             {corr_proj_clean:.6e}, full = {corr_full_clean:.6e}, \
+             disagreement = {clean_disagreement:.3e}",
+            max_offdiag / max_diag
+        );
+        eprintln!(
+            "[ift-cross-coupled-airtight] pollute(ε={eps_null:.0e}): \
+             projected = {corr_proj_total:.6e}, full = {corr_full_total:.6e}, \
+             predicted_noise = {predicted_noise:.6e}, actual_noise = \
+             {full_noise_contrib:.6e}, ratio = {ratio:.6}"
         );
     }
 
