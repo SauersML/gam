@@ -877,72 +877,17 @@ def competing_risks_cif(
         predictions,
         endpoint_names=endpoint_names,
     )
-    times_arr = _coerce_competing_risk_times(times)
-    cumulative = []
-    expected_shape: tuple[int, int] | None = None
-    for endpoint_index, prediction in enumerate(endpoint_predictions):
-        endpoint_cumulative = np.asarray(
-            prediction.cumulative_hazard_at(times_arr),
-            dtype=float,
-        )
-        if endpoint_cumulative.ndim != 2:
-            raise ValueError(
-                f"endpoint {endpoint_index} cumulative_hazard_at(times) must return a 2D array"
-            )
-        if endpoint_cumulative.shape[1] != times_arr.size:
-            raise ValueError(
-                f"endpoint {endpoint_index} cumulative_hazard_at(times) returned "
-                f"{endpoint_cumulative.shape[1]} time columns for {times_arr.size} query times"
-            )
-        if expected_shape is None:
-            expected_shape = endpoint_cumulative.shape
-        elif endpoint_cumulative.shape != expected_shape:
-            raise ValueError(
-                "all endpoint predictions must return the same "
-                f"(n_rows, n_times) shape; got {endpoint_cumulative.shape} "
-                f"for endpoint {endpoint_index}, expected {expected_shape}"
-            )
-        if not np.all(np.isfinite(endpoint_cumulative)):
-            raise ValueError(f"endpoint {endpoint_index} cumulative hazards must be finite")
-        cumulative.append(endpoint_cumulative)
-
-    cumulative_arr = np.stack(cumulative, axis=0)
-    previous_cumulative = np.concatenate(
-        [
-            np.zeros_like(cumulative_arr[:, :, :1]),
-            cumulative_arr[:, :, :-1],
-        ],
-        axis=2,
-    )
-    increments = cumulative_arr - previous_cumulative
-    min_increment = float(np.min(increments))
-    tolerance = 1e-10 * max(1.0, float(np.max(np.abs(cumulative_arr))))
-    if min_increment < -tolerance:
-        raise ValueError(
-            "endpoint cumulative hazards must be non-decreasing over the requested times"
-        )
-    increments = np.maximum(increments, 0.0)
-
-    total_previous_cumulative = np.sum(previous_cumulative, axis=0)
-    survival_left = np.exp(-total_previous_cumulative)
-    total_increment = np.sum(increments, axis=0)
-    interval_failure = -np.expm1(-total_increment)
-
-    weights = np.divide(
-        increments,
-        total_increment.reshape(1, *total_increment.shape),
-        out=np.zeros_like(increments),
-        where=total_increment.reshape(1, *total_increment.shape) > 0.0,
-    )
-    interval_incidence = weights * survival_left.reshape(1, *survival_left.shape)
-    interval_incidence *= interval_failure.reshape(1, *interval_failure.shape)
-    cif = np.cumsum(interval_incidence, axis=2)
-    overall_survival = np.exp(-np.sum(cumulative_arr, axis=0))
+    times_arr = np.asarray(times, dtype=np.float64).reshape(-1)
+    cumulative = [
+        np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=np.float64)
+        for prediction in endpoint_predictions
+    ]
+    cif, overall_survival = rust_module().competing_risks_cif(cumulative, times_arr)
     return CompetingRisksCIF(
         times=times_arr,
-        cif=np.clip(cif, 0.0, 1.0),
-        overall_survival=np.clip(overall_survival, 0.0, 1.0),
-        cumulative_hazard=cumulative_arr,
+        cif=cif,
+        overall_survival=overall_survival,
+        cumulative_hazard=np.stack(cumulative, axis=0),
         endpoint_names=names,
     )
 
@@ -2129,21 +2074,6 @@ def _coerce_competing_risk_predictions(
                 f"endpoint {idx} has type {type(prediction).__name__}"
             )
     return endpoint_predictions, names
-
-
-def _coerce_competing_risk_times(times: Any) -> Any:
-    import numpy as np
-
-    times_arr = np.asarray(times, dtype=float).reshape(-1)
-    if times_arr.size == 0:
-        raise ValueError("competing_risks_cif requires at least one time")
-    if not np.all(np.isfinite(times_arr)):
-        raise ValueError("competing_risks_cif times must be finite")
-    if np.any(times_arr < 0.0):
-        raise ValueError("competing_risks_cif times must be non-negative")
-    if times_arr.size > 1 and np.any(np.diff(times_arr) <= 0.0):
-        raise ValueError("competing_risks_cif times must be strictly increasing")
-    return times_arr
 
 
 def _extract_row_ids(

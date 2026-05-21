@@ -223,6 +223,8 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub beta_baseline_timewiggle: Option<Vec<f64>>,
     #[serde(default)]
+    pub beta_baseline_timewiggle_by_cause: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
     pub z_column: Option<String>,
     #[serde(default)]
     pub z_columns: Option<Vec<String>>,
@@ -258,6 +260,10 @@ pub struct FittedModelPayload {
     pub survival_event: Option<String>,
     #[serde(default)]
     pub survivalspec: Option<String>,
+    #[serde(default)]
+    pub survival_cause_count: Option<usize>,
+    #[serde(default)]
+    pub survival_endpoint_names: Option<Vec<String>>,
     #[serde(default)]
     pub survival_baseline_target: Option<String>,
     #[serde(default)]
@@ -519,6 +525,7 @@ impl FittedModelPayload {
             baseline_timewiggle_penalty_orders: None,
             baseline_timewiggle_double_penalty: None,
             beta_baseline_timewiggle: None,
+            beta_baseline_timewiggle_by_cause: None,
             z_column: None,
             z_columns: None,
             latent_z_normalization: None,
@@ -534,6 +541,8 @@ impl FittedModelPayload {
             survival_exit: None,
             survival_event: None,
             survivalspec: None,
+            survival_cause_count: None,
+            survival_endpoint_names: None,
             survival_baseline_target: None,
             survival_baseline_scale: None,
             survival_baseline_shape: None,
@@ -2153,6 +2162,17 @@ impl FittedModel {
         &self,
     ) -> Result<Option<SavedBaselineTimeWiggleRuntime>, String> {
         let payload = self.payload();
+        if payload
+            .survival_cause_count
+            .is_some_and(|cause_count| cause_count > 1)
+            && payload.beta_baseline_timewiggle.is_none()
+            && payload.beta_baseline_timewiggle_by_cause.is_some()
+        {
+            return Err(
+                "joint cause-specific survival stores baseline-timewiggle coefficients per cause"
+                    .to_string(),
+            );
+        }
         match (
             payload.baseline_timewiggle_knots.as_ref(),
             payload.baseline_timewiggle_degree,
@@ -2188,6 +2208,17 @@ impl FittedModel {
     /// Whether this model has a baseline-time wiggle component with complete metadata.
     #[inline]
     pub fn has_baseline_time_wiggle(&self) -> bool {
+        let payload = self.payload();
+        if payload
+            .survival_cause_count
+            .is_some_and(|cause_count| cause_count > 1)
+        {
+            return payload.baseline_timewiggle_knots.is_some()
+                && payload.baseline_timewiggle_degree.is_some()
+                && payload.baseline_timewiggle_penalty_orders.is_some()
+                && payload.baseline_timewiggle_double_penalty.is_some()
+                && payload.beta_baseline_timewiggle_by_cause.is_some();
+        }
         self.saved_baseline_time_wiggle()
             .map(|runtime| runtime.is_some())
             .unwrap_or(false)
@@ -3042,6 +3073,12 @@ impl FittedModel {
         }
         if let Some(v) = self.beta_baseline_timewiggle.as_ref() {
             validate_all_finite("beta_baseline_timewiggle", v.iter().copied())?;
+        }
+        if let Some(v) = self.beta_baseline_timewiggle_by_cause.as_ref() {
+            validate_all_finite(
+                "beta_baseline_timewiggle_by_cause",
+                v.iter().flatten().copied(),
+            )?;
         }
         if let Some(v) = self.latent_z_normalization {
             v.validate("latent_z_normalization")?;
