@@ -234,17 +234,12 @@ pub struct TensorBSplineSpec {
     pub identifiability: TensorBSplineIdentifiability,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum TensorBSplineIdentifiability {
     None,
+    #[default]
     SumToZero,
     FrozenTransform { transform: Array2<f64> },
-}
-
-impl Default for TensorBSplineIdentifiability {
-    fn default() -> Self {
-        Self::SumToZero
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,17 +347,12 @@ impl From<RawSmoothDesign> for SmoothDesign {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
+    #[default]
     None,
     Uniform,
     Beta { a: f64, b: f64 },
-}
-
-impl Default for BoundedCoefficientPriorSpec {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
