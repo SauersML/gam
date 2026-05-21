@@ -19327,13 +19327,18 @@ pub fn build_duchon_basiswithworkspace(
         )
     } else {
         // Scale-free path: data-density-weighted spring (centered mass) +
-        // gradient + curvature on the polyharmonic basis. The centering of
-        // the q=0 mass Gram inside `operator_penalty_candidates_closed_form_pure`
-        // puts the constant direction into the joint null space of all three
-        // candidates, so the intercept is the only unpenalized coordinate.
-        // No length scale enters the construction; the equivalent-kernel
-        // bandwidth emerges from `λ`-vs-data-density.
-        operator_penalty_candidates_closed_form_pure(
+        // gradient + curvature on the polyharmonic basis. The mass term is
+        // a *finite-rank gauge* anchored at the data sites — `(X − 1μ')'(X
+        // − 1μ')` with `X` evaluated at the actual rows of `data` — so it
+        // contributes nothing in sparse regions (no anchor → no spring) and
+        // vanishes on the constant direction by construction (centered
+        // intercept column ≡ 0). The polyharmonic basis stays scale-free;
+        // the bulk q=1 / q=2 candidates still come from
+        // `operator_penalty_candidates_closed_form_pure`, but the q=0 mass
+        // is overridden here with the data-point Gram so the magnitude
+        // spring lives at the data rather than at the (subset) collocation
+        // sites.
+        let mut candidates = operator_penalty_candidates_closed_form_pure(
             centers.view(),
             &ops.d0,
             &ops.d1,
@@ -19345,7 +19350,25 @@ pub fn build_duchon_basiswithworkspace(
             Some(&kernel_transform),
             poly_cols,
             identifiability_transform.as_ref(),
+        );
+        if matches!(
+            spec.operator_penalties.mass,
+            OperatorPenaltySpec::Active { .. }
         )
+            && let Ok(design_dense) =
+                design.try_to_dense_arc("Duchon scale-free magnitude gauge")
+        {
+            let data_centered = centered_design_gram(design_dense.as_ref());
+            let (matrix, normalization_scale) = normalize_penalty(&data_centered);
+            for cand in candidates.iter_mut() {
+                if matches!(cand.source, PenaltySource::OperatorMass) {
+                    cand.matrix = matrix;
+                    cand.normalization_scale = normalization_scale;
+                    break;
+                }
+            }
+        }
+        candidates
     };
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
