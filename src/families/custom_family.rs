@@ -19387,23 +19387,6 @@ mod tests {
         // logslope_surface: 1 penalty (nullspace=4).
         let s_logs = build_duchon_shape(p_logs, 4, 1.0);
 
-        // Embed each block's S into the joint p_total × p_total layout so
-        // we can build Ḣ_k as the full-block S_k for the trace.
-        let embed = |s: &Array2<f64>, range: (usize, usize)| -> Array2<f64> {
-            let mut out = Array2::<f64>::zeros((p_total, p_total));
-            let (a, _b) = range;
-            for i in 0..s.nrows() {
-                for j in 0..s.ncols() {
-                    out[[a + i, a + j]] = s[[i, j]];
-                }
-            }
-            out
-        };
-        let s_time_full = embed(&s_time, ranges[0]);
-        let s_marg_0_full = embed(&s_marg_0, ranges[1]);
-        let s_marg_1_full = embed(&s_marg_1, ranges[1]);
-        let s_logs_full = embed(&s_logs, ranges[2]);
-
         // ── Failure-point ρ = [10, 10, 10, 4.5]. λ = exp(ρ).
         let rho = array![10.0_f64, 10.0, 10.0, 4.5];
         let lams: Array1<f64> = rho.mapv(f64::exp);
@@ -19463,9 +19446,7 @@ mod tests {
         // `hessian_derivative_correction_result` β-chain — not in the
         // evaluator. If it FAILS, the evaluator itself has the defect at
         // biobank scale + Duchon-shape S.
-        let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-            Ok(None)
-        };
+        let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
         let compute_dh = no_dh;
         let no_d2h = |_u: &Array1<f64>,
                       _v: &Array1<f64>|

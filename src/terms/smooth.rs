@@ -8568,28 +8568,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             ))
         })?;
     if !outer_result.converged {
-        // Same graceful-degradation contract as the custom-family verdict
-        // in src/families/custom_family.rs: when ARC reports `converged =
-        // false` after the iteration cap, accept the best-effort iterate
-        // if it's admissible (finite cost, finite ρ, gradient passes the
-        // envelope-sanity tripwire). Surface a warning so the operator
-        // log still shows the non-convergence reason.
-        if outer_result.is_acceptable_best_effort() {
-            log::warn!(
-                "exact spatial adaptive outer optimization did not converge after {} iterations \
-                 (final_objective={:.6e}, final_grad_norm={}); proceeding with best-effort iterate",
-                outer_result.iterations,
-                outer_result.final_value,
-                outer_result.final_grad_norm_report(),
-            );
-        } else {
-            return Err(EstimationError::InvalidInput(format!(
-                "exact spatial adaptive outer optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-                outer_result.iterations,
-                outer_result.final_value,
-                outer_result.final_grad_norm_report(),
-            )));
-        }
+        return Err(EstimationError::InvalidInput(format!(
+            "exact spatial adaptive outer optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            outer_result.iterations,
+            outer_result.final_value,
+            outer_result.final_grad_norm_report(),
+        )));
     }
     let outer_iterations = outer_result.iterations;
     let outer_grad_norm = outer_result.final_grad_norm_or_nan();
