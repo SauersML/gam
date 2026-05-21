@@ -712,7 +712,7 @@ impl InteractiveVisualizer {
             //   2. Numerical health (dim, color value if anomalous)
             //   3. Pinned warnings/errors from push_diagnostic (yellow/red)
             //   4. Live log stream from log_tail (severity-colored)
-            let label = |s: &str| Span::styled(s, Style::default().fg(Color::DarkGray));
+            let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
             let value =
                 |s: String| Span::styled(s, Style::default().fg(Color::White).bold());
             let mut diag_lines: Vec<TextLine<'static>> = Vec::new();
