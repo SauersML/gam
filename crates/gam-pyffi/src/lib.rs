@@ -2671,6 +2671,39 @@ fn gaussian_reml_fit_positions_batched_impl(
     by: Option<ArrayView1<'_, f64>>,
     by_start_col: usize,
 ) -> Result<BatchedGaussianRemlResult, String> {
+    gaussian_reml_fit_positions_batched_streaming_impl(
+        t,
+        y,
+        row_offsets,
+        knots_or_centers,
+        basis_kind,
+        basis_order,
+        periodic,
+        period,
+        penalty,
+        weights,
+        init_lambda,
+        by,
+        by_start_col,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_positions_batched_streaming_impl(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    row_offsets: ArrayView1<'_, usize>,
+    knots_or_centers: ArrayView1<'_, f64>,
+    basis_kind: &str,
+    basis_order: usize,
+    periodic: bool,
+    period: Option<f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
+) -> Result<BatchedGaussianRemlResult, String> {
     let x = position_basis_design(
         t,
         knots_or_centers,
@@ -5828,7 +5861,10 @@ fn duchon_basis_1d_impl(
     };
     let built = build_duchon_basis(data.view(), &spec)
         .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
-    Ok(built.design.to_dense())
+    built
+        .design
+        .try_to_dense_by_chunks("duchon_basis_1d_impl")
+        .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))
 }
 
 fn duchon_basis_1d_derivative_impl(

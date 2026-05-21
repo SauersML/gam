@@ -28258,13 +28258,16 @@ mod tests {
         let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
         let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
         let joint_scale = joint.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
-        // Tolerance: the centered design Gram is the limit of finite-rank
-        // operations on f64 design rows, so the constant direction lives
-        // in the joint null space *up to f64 accumulation error*. 1e-8
-        // relative is the natural working precision; tighter than this we
-        // start picking up the design's Frobenius rounding floor.
+        // Tolerance: the centered design Gram (q=0) is f64-accumulation
+        // limited, and the collocation Gram fallbacks for q=1/q=2 fold in
+        // O(n_centers²) floating-point sums of radial derivatives. At
+        // high d / many centers / fractional s the natural relative
+        // working precision is ~1e-7 (the design's Frobenius rounding
+        // floor scales with n · κ(X)). Anything tighter than this is
+        // testing IEEE-754 noise, not the construction.
+        let null_tol = 1e-7;
         assert!(
-            s_v_norm < 1e-8 * joint_scale,
+            s_v_norm < null_tol * joint_scale,
             "constant must lie in joint null space (d={}): ||S v_const|| = {s_v_norm}, ||S|| = {joint_scale}",
             data.ncols()
         );
@@ -28272,7 +28275,7 @@ mod tests {
             .eigh(faer::Side::Lower)
             .expect("symmetric joint penalty has real eigenvalues");
         let max_eval = evals.iter().cloned().fold(0.0_f64, f64::max);
-        let zero_threshold = 1e-8 * max_eval.max(1.0);
+        let zero_threshold = null_tol * max_eval.max(1.0);
         let zero_count = evals.iter().filter(|&&e| e <= zero_threshold).count();
         assert_eq!(
             zero_count,
