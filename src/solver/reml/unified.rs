@@ -5130,6 +5130,138 @@ impl PenaltySubspaceTrace {
         let h_proj_inv_a = self.h_proj_inverse.dot(&proj_a);
         crate::faer_ndarray::fast_av(&self.u_s, &h_proj_inv_a)
     }
+
+    /// Build the **constrained pseudo-inverse kernel**
+    /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
+    /// from this penalty-projected kernel `K_S` and the *active* row block
+    /// `A_act` of the joint linear inequality constraint matrix.
+    ///
+    /// `K_T` is the **Moore-Penrose pseudo-inverse of `H` restricted to
+    /// `T = range(S₊) ∩ ker(A_act)`** — the smooth manifold the inner
+    /// solver actually moves on at a constrained-stationary point. It is
+    /// exactly the kernel that solves the per-coordinate saddle-point
+    /// IFT system
+    ///
+    /// ```text
+    ///   [ H   Aᵀ_act ] [ ∂β/∂ρ_k ]   [ −a_k ]
+    ///   [ A_act  0   ] [ ∂λ/∂ρ_k ] = [   0  ]
+    /// ```
+    ///
+    /// with `∂β/∂ρ_k = −K_T · a_k`. Using `K_T` for the per-coordinate
+    /// mode response `v_k` makes the outer gradient the *exact* derivative
+    /// of the projected Laplace cost `log|U_Tᵀ H U_T|`, where `U_T` is an
+    /// orthonormal basis of `T` — the marginal-likelihood determinant the
+    /// inner is actually drawing on.
+    ///
+    /// Returns a [`ConstrainedSubspaceKernel`] handle that caches the
+    /// small `k_active × k_active` Schur complement so subsequent
+    /// `apply_pseudo_inverse` calls for different RHS reuse it. When the
+    /// active set is empty the handle degrades to a pass-through over
+    /// `self` (no extra work).
+    ///
+    /// Total precompute cost: `k_active` calls to
+    /// [`Self::apply_pseudo_inverse`] (one per active row) plus a
+    /// `k_active × k_active` Cholesky/QR. Per-vector `apply` cost: one
+    /// `K_S` apply + one `k_active × p` matvec + one small triangular
+    /// solve + one `p × k_active` matvec.
+    pub fn with_active_constraints<'a>(
+        &'a self,
+        a_act: ndarray::ArrayView2<'a, f64>,
+    ) -> ConstrainedSubspaceKernel<'a> {
+        let k_active = a_act.nrows();
+        if k_active == 0 {
+            return ConstrainedSubspaceKernel {
+                kernel: self,
+                z: Array2::zeros((0, self.u_s.nrows())),
+                a_act,
+                m_inv: Array2::zeros((0, 0)),
+                k_active: 0,
+            };
+        }
+        // Z = K_S · Aᵀ_act,  shape (p × k_active).
+        let p = self.u_s.nrows();
+        let mut z = Array2::<f64>::zeros((p, k_active));
+        for j in 0..k_active {
+            let a_row = a_act.row(j).to_owned();
+            let k_s_a_row = self.apply_pseudo_inverse(&a_row);
+            z.column_mut(j).assign(&k_s_a_row);
+        }
+        // M = A_act · Z   (shape k_active × k_active, symmetric PSD on
+        // range(K_S) ∩ image(A_actᵀ); on a rank-deficient overlap we
+        // add a tiny diagonal regulariser so the inversion remains
+        // bounded — same noise-floor strategy as elsewhere in this
+        // module).
+        let mut m = a_act.dot(&z);
+        let diag_scale = m.diag().iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
+        let ridge = f64::EPSILON * diag_scale.max(1.0);
+        for i in 0..k_active {
+            m[[i, i]] += ridge;
+        }
+        // Symmetrise + invert.  k_active is small (#active inequality rows
+        // at the cert point) so the dense inverse is cheap and saves a
+        // factorisation pass on every per-coordinate apply.
+        for i in 0..k_active {
+            for j in 0..i {
+                let avg = 0.5 * (m[[i, j]] + m[[j, i]]);
+                m[[i, j]] = avg;
+                m[[j, i]] = avg;
+            }
+        }
+        let m_inv = match m.invh() {
+            Ok(inv) => inv,
+            Err(_) => Array2::zeros((k_active, k_active)),
+        };
+        ConstrainedSubspaceKernel {
+            kernel: self,
+            z,
+            a_act,
+            m_inv,
+            k_active,
+        }
+    }
+}
+
+/// Per-evaluation handle that combines a penalty-projected
+/// [`PenaltySubspaceTrace`] with an active inequality-constraint block,
+/// producing the constraint-aware pseudo-inverse
+/// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. See
+/// [`PenaltySubspaceTrace::with_active_constraints`] for the math.
+///
+/// Caches the small `k_active × k_active` Schur inverse so subsequent
+/// per-coordinate `apply` calls only do `O(p · k_active)` work each.
+pub struct ConstrainedSubspaceKernel<'a> {
+    kernel: &'a PenaltySubspaceTrace,
+    /// `Z = K_S · Aᵀ_act`, shape `(p × k_active)`.
+    z: Array2<f64>,
+    /// Active-row block of the joint constraint matrix.
+    a_act: ndarray::ArrayView2<'a, f64>,
+    /// `(A_act · K_S · Aᵀ_act)⁻¹`, shape `(k_active × k_active)`.
+    m_inv: Array2<f64>,
+    k_active: usize,
+}
+
+impl<'a> ConstrainedSubspaceKernel<'a> {
+    /// Apply `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` to `a`. The result
+    /// lies in `range(S₊) ∩ ker(A_act)` — the smooth manifold the inner
+    /// solver actually moves on at a constrained-stationary point.
+    pub fn apply_pseudo_inverse(&self, a: &Array1<f64>) -> Array1<f64> {
+        let v_s = self.kernel.apply_pseudo_inverse(a);
+        if self.k_active == 0 {
+            return v_s;
+        }
+        // mu = M_inv · (A_act · v_s)
+        let t = self.a_act.dot(&v_s);
+        let mu = self.m_inv.dot(&t);
+        // v = v_s - Z · mu
+        let correction = self.z.dot(&mu);
+        v_s - &correction
+    }
+
+    /// Whether any active constraints contribute (when false this kernel
+    /// is identical to the bare [`PenaltySubspaceTrace::apply_pseudo_inverse`]).
+    pub fn has_active_constraints(&self) -> bool {
+        self.k_active > 0
+    }
 }
 
 /// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, already
