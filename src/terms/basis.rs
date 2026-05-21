@@ -9313,7 +9313,7 @@ impl DuchonCrossPenaltyContext {
 fn build_duchon_operator_penalty_aniso_derivatives(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: &[f64],
     identifiability_transform: Option<&Array2<f64>>,
@@ -9355,7 +9355,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         d,
         duchon_max_active_operator_derivative_order(operator_penalties),
     )?;
@@ -11735,7 +11735,7 @@ pub fn build_duchon_collocation_operator_matrices(
     centers: ArrayView2<'_, f64>,
     collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -11759,7 +11759,7 @@ pub fn build_duchon_operator_penalty_matrices(
     centers: ArrayView2<'_, f64>,
     collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -11800,7 +11800,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     centers: ArrayView2<'_, f64>,
     collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<ArrayView2<'_, f64>>,
@@ -11815,7 +11815,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         dim,
         max_operator_derivative_order,
     )?;
@@ -12185,7 +12185,7 @@ fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, Bas
 #[derive(Clone, Copy)]
 struct PolyharmonicBlockCoeff {
     c: f64,
-    power: usize,
+    power: f64,
     is_log_case: bool,
 }
 
@@ -15542,7 +15542,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
-        s_order,
+        s_order as f64,
         centers.ncols(),
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
@@ -16022,7 +16022,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
-    validate_duchon_kernel_orders(Some(length_scale), p_order, s_order, 1)?;
+    validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
@@ -16051,7 +16051,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         centers.view(),
         Some(length_scale),
         p_order,
-        s_order,
+        s_order as f64,
         1,
         None,
         Some(&coeffs),
@@ -16840,7 +16840,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     validate_duchon_collocation_orders(
         None,
         p_order,
-        s_order,
+        s_order as f64,
         dim,
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
@@ -18271,7 +18271,7 @@ pub fn create_duchon_spline_basis(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<DuchonSplineBasis, BasisError> {
     let mut workspace = BasisWorkspace::default();
@@ -18289,7 +18289,7 @@ pub fn create_duchon_spline_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonSplineBasis, BasisError> {
@@ -18543,7 +18543,7 @@ fn build_duchon_basis_designwithworkspace(
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order = power;
-    validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
+    validate_duchon_kernel_orders(length_scale, p_order, s_order as f64, d)?;
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
@@ -18698,7 +18698,7 @@ pub fn build_duchon_basis(
 pub fn create_duchon_basis_1d_derivative_dense(
     t: ArrayView1<'_, f64>,
     centers: ArrayView1<'_, f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     periodic: bool,
     order: usize,
@@ -18729,7 +18729,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
     };
     let p_order = duchon_p_from_nullspace_order(effective_order);
     let s_order = power;
-    validate_duchon_kernel_orders(None, p_order, s_order, 1)?;
+    validate_duchon_kernel_orders(None, p_order, s_order as f64, 1)?;
     let z =
         kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
     let kernel_cols = z.ncols();
@@ -19013,7 +19013,7 @@ fn build_periodic_duchon_basis_1d(
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
-    validate_duchon_kernel_orders(spec.length_scale, p_order, s_order, 1)?;
+    validate_duchon_kernel_orders(spec.length_scale, p_order, s_order as f64, 1)?;
     let z = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -19221,7 +19221,7 @@ pub fn build_duchon_basiswithworkspace(
     validate_duchon_collocation_orders(
         spec.length_scale,
         p_order,
-        spec.power_as_usize(),
+        spec.power_as_usize() as f64,
         data.ncols(),
         max_active_operator_order,
     )?;
