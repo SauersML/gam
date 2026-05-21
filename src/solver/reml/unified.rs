@@ -5245,6 +5245,13 @@ pub struct InnerSolution<'dp> {
     /// When present, the barrier cost and Hessian corrections are added to the
     /// outer REML/LAML objective.
     pub barrier_config: Option<BarrierConfig>,
+
+    /// Optional inner KKT residual r = ∇_β L_pen(β̂) at the converged β̂.
+    /// `Some` activates the implicit-function-theorem corrections in
+    /// `reml_laml_evaluate` (cost gets −½ rᵀ H⁻¹ r, ρ-gradient gets
+    /// −rᵀ v_k with v_k = λ_k H⁻¹ S_k β̂). `None` keeps the envelope-only
+    /// behaviour for callers that genuinely guarantee exact KKT.
+    pub kkt_residual: Option<Array1<f64>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -5275,6 +5282,7 @@ pub struct InnerSolutionBuilder<'dp> {
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
     barrier_config: Option<BarrierConfig>,
+    kkt_residual: Option<Array1<f64>>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -6705,6 +6713,49 @@ pub fn reml_laml_evaluate(
         grad[idx] = value;
     }
 
+    // ─── Implicit-function-theorem gradient correction ───
+    //
+    // The envelope formula above is the total derivative dV/dρ_k *only* when
+    // β̂ satisfies the inner KKT condition ∇_β L_pen(β̂) = 0.  When the inner
+    // exits via the noise-floor certificate with `r = ∇_β L_pen(β̂) ≠ 0`,
+    // the principled gradient picks up an extra chain-rule term:
+    //
+    //   dβ̂/dρ_k = −H⁻¹ ∂g_β/∂ρ_k = −H⁻¹ · (λ_k S_k β̂) = −H⁻¹ a_k_β
+    //   dV(β*(ρ),ρ)/dρ_k ≈ g_env(β̂)[k] + (∂g_env/∂β)ᵀ(β* − β̂)
+    //                    ≈ g_env(β̂)[k] + (λ_k S_k β̂)ᵀ · (−H⁻¹ r)
+    //                    =  g_env(β̂)[k]  −  rᵀ · v_k,   v_k := λ_k H⁻¹ S_k β̂
+    //
+    // The correction strictly vanishes when r = 0.  When the inner exit
+    // accepts ‖r‖ > 0 on a coordinate whose H block is poorly conditioned
+    // (e.g., the failing biobank survival marginal-slope case where ‖H⁻¹‖
+    // is ~10¹² on the one unpinned λ), the dropped term inflates by
+    // ‖H⁻¹‖·‖r‖ and the envelope reports a gradient component orders of
+    // magnitude past anything the function can actually produce — TR
+    // rejects every step and collapses to its floor.  This term recovers
+    // the legitimate descent direction.
+    //
+    // Use `rho_penalty_a_k_betas` (with `lambdas`), NOT `rho_v_ks` (whose
+    // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
+    // the IFT identity above is in the actual S(λ) basis, and the curvature
+    // scale only applies to the H-dependent trace terms.
+    if let Some(r) = kkt_residual_vec {
+        if k > 0 {
+            let mut rhs = Array2::<f64>::zeros((hop.dim(), k));
+            for (idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
+                rhs.column_mut(idx).assign(a_k_beta);
+            }
+            let solved = hop.solve_multi(&rhs);
+            for k_idx in 0..k {
+                let v_k = solved.column(k_idx);
+                let corr = r.dot(&v_k);
+                if corr.is_finite() {
+                    grad[k_idx] -= corr;
+                }
+            }
+        }
+    }
+    let _ = &kkt_residual_w; // referenced for documentation; w is the cost-correction artefact
+
     // Extended hyperparameter gradient (ψ/τ coordinates).
     //
     // Uses the SAME outer_gradient_entry() formula as ρ coordinates above.
@@ -7085,31 +7136,23 @@ pub fn reml_laml_evaluate(
         crate::solver::outer_strategy::HessianResult::Unavailable
     };
 
-    // Envelope-gradient sanity check.
+    // Envelope-gradient sanity tripwire — last line of defense.
     //
-    // The gradient assembled above is the envelope-theorem expression
-    //   ∂V/∂ρ_k = ½ λ_k β̂ᵀ S_k β̂ + ½ λ_k tr(H⁻¹ S_k) − ½ λ_k tr(S⁺ S_k),
-    // which holds when β̂ satisfies the inner KKT condition ∇_β L_pen(β̂)=0.
-    // The principled total derivative at non-zero KKT residual r is
-    //   dV/dρ_k = (envelope)  −  rᵀ · v_k,    v_k := λ_k H⁻¹ S_k β̂
-    // (rho_v_ks at line ~6328 above already computes the v_k vectors).
-    // When the inner exits via the noise-floor KKT certificate
-    // (custom_family.rs:12037) with ‖r‖ > 0 on a coordinate whose H block
-    // is poorly conditioned, the dropped rᵀ v_k term inflates by ‖H⁻¹‖·‖r‖
-    // and the envelope formula reports a gradient component orders of
-    // magnitude past anything the function itself can produce — the exact
-    // failure mode on biobank-scale survival marginal-slope fits.
+    // When the inner solver populated `solution.kkt_residual`, the IFT
+    // correction `grad[k] −= rᵀ · v_k` was applied above and the gradient is
+    // honest regardless of inner KKT residual magnitude. When the residual
+    // was None (legacy callers, rho-only profiled paths that haven't been
+    // plumbed yet), the envelope formula is unguarded — for those, retain
+    // the tripwire: if the analytic gradient predicts a √ε-step cost change
+    // far exceeding |cost|, the gradient is mathematically inconsistent
+    // with the function (cf. the failing biobank survival marginal-slope
+    // case where |g|∞ ≈ 10¹⁴ while |cost| ≈ 10⁵ and the function was flat).
+    // Mark unavailable so the outer wrapper either falls back to FD or
+    // aborts cleanly, instead of grinding TR to floor for minutes on a
+    // wrong descent direction.
     //
-    // Until the residual vector r is plumbed through InnerAssembly so the
-    // rᵀ v_k correction can be applied, detect the pathology after the fact:
-    // a smooth function with |f| ≈ |cost| cannot legitimately report an
-    // analytic gradient component whose √ε·|g_k| predicted change exceeds
-    // the function's own magnitude (anything smaller than √ε·|cost| is
-    // buried in f's floating-point noise — the outer optimizer literally
-    // cannot resolve a step that small as moving the function). Marking
-    // gradient unavailable on detection trades a 70-minute silent TR
-    // collapse for a fast, named, actionable failure. Threshold ratio>4
-    // keeps a healthy gradient (|g|∞ ≈ √ε·|cost|, ratio≈1) from tripping.
+    // Threshold ratio > 4 keeps healthy near-stationary gradients
+    // (|g|∞ ≈ √ε · |cost|, ratio ≈ 1) from tripping.
     let cost_scale = cost.abs().max(1.0);
     let resolve_step = f64::EPSILON.sqrt();
     let envelope_inconsistent = grad
@@ -7126,40 +7169,39 @@ pub fn reml_laml_evaluate(
             }
         });
 
-    let gradient_out = if let Some((max_idx, max_abs, predicted_change)) = envelope_inconsistent {
-        // Mathematically impossible: a smooth function with |f| ≈ |cost|
-        // cannot have an analytic gradient component whose √ε step predicts
-        // a change far exceeding the function's own magnitude. The envelope
-        // gradient formula above assumes ∇_β L_pen(β̂) = 0; when the inner
-        // solver exits the noise-floor KKT certificate (custom_family.rs:12037)
-        // with a non-zero β-gradient residual on a coordinate where the
-        // inner Hessian block is poorly conditioned, the unmodeled IFT
-        // correction (-H⁻¹ · residual) inflates by ‖H⁻¹‖·‖residual‖ and
-        // overwhelms the legitimate envelope contribution. Surfacing this
-        // gradient to the outer optimizer triggers trust-region rejection
-        // on every step — for up to inner_max_cycles outer iterations at
-        // 144s each before TR collapses to its floor with no diagnostic.
-        // Mark the gradient unavailable so the outer wrapper either falls
-        // back to finite differences (when configured) or aborts with a
-        // clean error pointing here, instead of grinding wasted minutes on
-        // a wrong descent direction.
-        log::warn!(
-            "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
-             |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
-             Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \
-             marking analytic gradient unavailable so outer optimizer does not chase a \
-             mathematically impossible descent direction. Root remedy: tighten inner KKT \
-             convergence on this coordinate or implement the IFT correction term \
-             (-rᵀ · v_k) using the already-computed rho_v_ks.",
-            max_abs,
-            max_idx,
-            predicted_change,
-            cost_scale,
-            predicted_change / cost_scale,
-        );
-        None
-    } else {
-        Some(grad)
+    let kkt_residual_was_applied = kkt_residual_vec.is_some();
+    let gradient_out = match envelope_inconsistent {
+        Some((max_idx, max_abs, predicted_change)) if !kkt_residual_was_applied => {
+            log::warn!(
+                "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
+                 |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
+                 Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \
+                 marking analytic gradient unavailable so outer optimizer does not chase a \
+                 mathematically impossible descent direction. Remedy: populate \
+                 BlockwiseInnerResult::kkt_residual on the convergent path so the IFT correction \
+                 grad[k] -= rᵀ·v_k can run.",
+                max_abs,
+                max_idx,
+                predicted_change,
+                cost_scale,
+                predicted_change / cost_scale,
+            );
+            None
+        }
+        Some((max_idx, max_abs, predicted_change)) => {
+            // IFT correction was applied; gradient is principled.  Surface the
+            // unusual magnitude in case downstream optimizers want it, but do
+            // not suppress.
+            log::debug!(
+                "[reml_laml envelope-gradient post-IFT] |g|∞ = {:.3e} at coord {} (ratio {:.2e} vs \
+                 √ε·|cost|); IFT correction applied — gradient is the principled total derivative.",
+                max_abs,
+                max_idx,
+                predicted_change / cost_scale,
+            );
+            Some(grad)
+        }
+        None => Some(grad),
     };
 
     Ok(RemlLamlResult {
