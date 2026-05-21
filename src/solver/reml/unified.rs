@@ -5090,6 +5090,17 @@ impl PenaltySubspaceTrace {
     }
 }
 
+fn penalty_subspace_bilinear_pseudo_inverse(
+    kernel: &PenaltySubspaceTrace,
+    a: &Array1<f64>,
+    b: &Array1<f64>,
+) -> f64 {
+    let proj_a = crate::faer_ndarray::fast_atv(&kernel.u_s, a);
+    let proj_b = crate::faer_ndarray::fast_atv(&kernel.u_s, b);
+    let h_proj_inv_b = kernel.h_proj_inverse.dot(&proj_b);
+    proj_a.dot(&h_proj_inv_b)
+}
+
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
 /// fixed dispersion (non-Gaussian LAML).
 #[derive(Clone, Debug)]

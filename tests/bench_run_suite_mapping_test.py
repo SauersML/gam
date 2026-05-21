@@ -33,6 +33,15 @@ _REQUIRED_BENCHMARK_DATASETS = {
 
 
 class RunSuiteMappingTests(unittest.TestCase):
+    def test_terminal_output_sanitizer_removes_cursor_controls_across_chunks(self) -> None:
+        sanitizer = _RUN_SUITE._TerminalOutputSanitizer()
+        text = (
+            sanitizer.feed("progress\r        [1s] ok \x1b[")
+            + sanitizer.feed("2K next\x1b]0;title")
+            + sanitizer.feed("\x07 done\n")
+        )
+        self.assertEqual(text, "progress\n[1s] ok  next done\n")
+
     def test_finalize_cv_result_keeps_evaluation_from_fold_count(self) -> None:
         result = _RUN_SUITE._finalize_cv_result(
             contender="rust_gam",
