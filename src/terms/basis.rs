@@ -23771,7 +23771,7 @@ pub mod closed_form_penalty {
     pub fn anisotropic_duchon_penalty_radial(
         q: usize,
         m: usize,
-        s: usize,
+        s: f64,
         kappa: f64,
         eta: &[f64],
         r: &[f64],
