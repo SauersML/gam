@@ -12726,7 +12726,7 @@ impl CustomFamily for PoissonLogFamily {
             let e_raw = eta[i];
             let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
             let active_clamp = e != e_raw;
-            let m = safe_exp(e).max(1e-12);
+            let m = safe_exp(e).max(MIN_WEIGHT);
             mu[i] = m;
             // Drop log(y!) constant in objective.
             ll += self.weights[i] * (yi * e - m);
@@ -12757,7 +12757,9 @@ impl CustomFamilyGenerative for PoissonLogFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
-        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
+        let mean = gamlss_rowwise_map(eta.len(), |i| {
+            eta[i].clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP).exp().max(MIN_WEIGHT)
+        });
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Poisson,
@@ -12818,7 +12820,7 @@ impl CustomFamily for GammaLogFamily {
             let e_raw = eta[i];
             let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
             let active_clamp = e != e_raw;
-            let m = safe_exp(e).max(1e-12);
+            let m = safe_exp(e).max(MIN_WEIGHT);
             // Gamma(shape=k, scale=mu/k), dropping constants independent of eta.
             ll += self.weights[i] * (-self.shape * (yi / m + m.ln()));
             if self.weights[i] == 0.0 || active_clamp {
@@ -12881,7 +12883,7 @@ impl CustomFamily for GammaLogFamily {
                 dw[i] = 0.0;
                 continue;
             }
-            let m = safe_exp(e).max(1e-12);
+            let m = safe_exp(e).max(MIN_WEIGHT);
             let observed_weight = self.weights[i] * self.shape * yi / m;
             // d/dη [prior_weight * shape * y / exp(η)] = -W_obs.
             // If the positive floor is active, match the evaluated local piece.
@@ -12901,7 +12903,9 @@ impl CustomFamilyGenerative for GammaLogFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
-        let mean = gamlss_rowwise_map(eta.len(), |i| eta[i].clamp(-30.0, 30.0).exp().max(1e-12));
+        let mean = gamlss_rowwise_map(eta.len(), |i| {
+            eta[i].clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP).exp().max(MIN_WEIGHT)
+        });
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gamma { shape: self.shape },
