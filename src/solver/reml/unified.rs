@@ -6257,6 +6257,47 @@ pub fn reml_laml_evaluate(
         }
     }
 
+    // ─── Implicit-function-theorem cost correction ───
+    //
+    // Define β*(ρ) as the exact inner optimum (g_β(β*, ρ) = 0).  The outer
+    // objective we *want* is V(β*(ρ), ρ); what the envelope formula above
+    // computes is V(β̂, ρ) at the inner-returned β̂ ≠ β*.  First-order
+    // implicit-function theorem gives
+    //   β* − β̂ ≈ −H⁻¹ r,   r := ∇_β L_pen(β̂) = S(λ)β̂ − ∇ℓ(β̂)
+    //   V(β*) ≈ V(β̂) + (∂V/∂β)ᵀ(β* − β̂) = V(β̂) + rᵀ · (−H⁻¹ r)
+    //         = V(β̂) − ½ rᵀ H⁻¹ r            (using ∂V/∂β = r at β̂, second-
+    //                                          order expansion of V symmetric
+    //                                          in (β* − β̂)).
+    //
+    // The cost correction strictly vanishes when the inner reached exact
+    // KKT (r = 0).  When the inner exits via the noise-floor certificate
+    // with ‖r‖ > 0 it absorbs the leading error; combined with the matching
+    // gradient correction `grad[k] −= rᵀ · v_k` below, predicted-vs-actual
+    // remains consistent through trust-region steps.
+    //
+    // Filter: callers populate `kkt_residual` only on the convergent
+    // unconstrained joint-Newton path (`custom_family.rs`
+    // `exact_newton_joint_stationarity_vector_from_gradient`); `None`
+    // preserves the envelope-only behaviour for the rho-only profiled path
+    // and for legacy callers that never plumbed the residual.
+    let kkt_residual_vec: Option<&Array1<f64>> = solution
+        .kkt_residual
+        .as_ref()
+        .filter(|r| r.len() == hop.dim());
+    let kkt_residual_w: Option<Array1<f64>> = if let Some(r) = kkt_residual_vec {
+        let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
+        rhs.column_mut(0).assign(r);
+        let w_mat = hop.solve_multi(&rhs);
+        let w = w_mat.column(0).to_owned();
+        let cost_correction = -0.5 * r.dot(&w);
+        if cost_correction.is_finite() {
+            cost += cost_correction;
+        }
+        Some(w)
+    } else {
+        None
+    };
+
     if !cost.is_finite() {
         return Err(format!(
             "REML/LAML cost is non-finite ({cost}); check inner solver convergence"
