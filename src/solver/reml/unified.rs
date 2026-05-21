@@ -11129,16 +11129,11 @@ pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
 /// is that null-space directions drop out of both the cost and the
 /// gradient in a matched way; first-order perturbation theory applies only to
 /// directions that actually have curvature to perturb.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PseudoLogdetMode {
+    #[default]
     Smooth,
     HardPseudo,
-}
-
-impl Default for PseudoLogdetMode {
-    fn default() -> Self {
-        Self::Smooth
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

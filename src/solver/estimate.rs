@@ -71,8 +71,9 @@ use std::sync::Arc;
 ///
 /// The mean is evaluated once during penalty canonicalization and then enters
 /// the solver as the centering vector in `(beta - mean)' S (beta - mean)`.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum CoefficientPriorMean {
+    #[default]
     Zero,
     Scalar(f64),
     Constant(Array1<f64>),
@@ -115,12 +116,6 @@ impl std::fmt::Debug for CoefficientPriorMean {
                 .field("amplitude", amplitude)
                 .finish_non_exhaustive(),
         }
-    }
-}
-
-impl Default for CoefficientPriorMean {
-    fn default() -> Self {
-        Self::Zero
     }
 }
 
@@ -3898,6 +3893,12 @@ pub enum FittedLinkState {
     },
 }
 
+impl Default for FittedLinkState {
+    fn default() -> Self {
+        FittedLinkState::Standard(None)
+    }
+}
+
 pub fn saved_mixture_state_from_fit(fit: &UnifiedFitResult) -> Option<MixtureLinkState> {
     match &fit.fitted_link {
         FittedLinkState::Mixture { state, .. } => Some(state.clone()),
@@ -4139,12 +4140,6 @@ pub struct UnifiedFitResult {
     /// Inner cycle count (blockwise path).
     #[serde(default)]
     pub inner_cycles: usize,
-}
-
-impl Default for FittedLinkState {
-    fn default() -> Self {
-        FittedLinkState::Standard(None)
-    }
 }
 
 pub(crate) fn ensure_finite_scalar_estimation(
