@@ -150,7 +150,7 @@ fn bench_isotropic_kernel(c: &mut Criterion) {
                 /* q = */ 2,
                 D_TYPICAL,
                 M_TYPICAL,
-                S_TYPICAL,
+                S_TYPICAL as f64,
                 KAPPA_TYPICAL,
                 /* r = */ 0.4,
             );
@@ -163,7 +163,11 @@ fn bench_isotropic_kernel(c: &mut Criterion) {
     group.bench_function("small_r_regime", |b| {
         b.iter(|| {
             let v = isotropic_duchon_penalty(
-                /* q = */ 2, D_TYPICAL, M_TYPICAL, S_TYPICAL, /* kappa = */ 0.05,
+                /* q = */ 2,
+                D_TYPICAL,
+                M_TYPICAL,
+                S_TYPICAL as f64,
+                /* kappa = */ 0.05,
                 /* r = */ 1e-4,
             );
             black_box(v)
@@ -179,7 +183,7 @@ fn bench_isotropic_kernel(c: &mut Criterion) {
             let v = anisotropic_duchon_penalty_radial(
                 /* q = */ 2,
                 M_TYPICAL,
-                S_TYPICAL,
+                S_TYPICAL as f64,
                 KAPPA_TYPICAL,
                 &eta,
                 &r,
