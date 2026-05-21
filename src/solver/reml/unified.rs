@@ -18620,7 +18620,7 @@ mod tests {
     /// Attaching `Some(zeros)` must not perturb the envelope cost/gradient.
     #[test]
     fn ift_correction_vanishes_at_exact_kkt() {
-        let rho = vec![1.0, -0.5];
+        let rho: Vec<f64> = vec![1.0, -0.5];
         // Recompute exact β* = H⁻¹X'y at this ρ.
         let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
         let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
@@ -18681,7 +18681,7 @@ mod tests {
     /// uncorrected envelope formula evaluated at the perturbed β̂.
     #[test]
     fn ift_correction_recovers_fd_at_perturbed_beta() {
-        let rho = vec![0.5, 0.3];
+        let rho: Vec<f64> = vec![0.5, 0.3];
 
         // Re-solve for exact β* at ρ.
         let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
