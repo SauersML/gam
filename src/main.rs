@@ -1752,16 +1752,7 @@ fn run_fit_transformation_normal(
     emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
 
-    let mut options = blockwise_options_from_fit_args(args)?;
-    // TN's joint inner solve is over (covariate β, monotone response basis ψ)
-    // with an h(y;ψ) that nonlinearly couples the two. Skewed-y datasets
-    // (Gamma, log-normal, heavy-tail) often need more than the 100-cycle
-    // default before the joint Newton settles; without the bigger budget the
-    // outer REML loop sees a stream of "inner solve did not converge after
-    // 100 cycle(s)" and the whole fit aborts.
-    if options.inner_max_cycles < 300 {
-        options.inner_max_cycles = 300;
-    }
+    let options = blockwise_options_from_fit_args(args)?;
     let config = TransformationNormalConfig::default();
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
