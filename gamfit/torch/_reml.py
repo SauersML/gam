@@ -697,9 +697,19 @@ def gaussian_reml_fit(
     init_lambda:
         Optional initial smoothing parameter passed through to the engine.
     by:
-        Optional ``by`` vector of shape ``(N,)``.
+        Optional ``by`` vector of shape ``(N,)``. Acts as a per-row
+        multiplier on the design's contribution: the model becomes
+        ``y_i ≈ by_i * (phi_i @ B)`` for rows ``i`` where the ``by``
+        modulation is active (see ``by_start_col``). Equivalently,
+        ``fitted = by * (Phi @ B)``, NOT ``Phi @ B``. When ``by_i = 0``
+        the corresponding ``fitted_i`` is exactly zero; the REML fit
+        is also weighted by ``by`` so zero-``by`` rows do not influence
+        ``B``. Common SAE use: ``by`` = per-token feature amplitude;
+        ``fitted`` is already amplitude-weighted so callers must NOT
+        multiply the prediction by ``by`` a second time downstream.
     by_start_col:
-        First design column the ``by`` modulation applies to.
+        First design column the ``by`` modulation applies to. Columns
+        before this index are NOT multiplied by ``by``.
 
     Returns
     -------
@@ -960,8 +970,16 @@ def gaussian_reml_fit_positions(
         Optional override for the basis order; defaults from ``basis_kind``.
     periodic, period:
         Periodic-basis toggle and period length.
-    weights, by, init_lambda, by_start_col:
+    weights, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
+    by:
+        Optional per-row design multiplier. Importantly the returned
+        ``fitted`` is already ``by * (phi @ B)`` — callers wanting
+        ``by * smooth(t)`` (e.g. amplitude-weighted curves in SAEs)
+        should use ``fitted`` directly and NOT multiply by ``by`` a
+        second time downstream. Rows with ``by = 0`` produce
+        ``fitted = 0`` exactly and do not contribute to the REML fit.
+        See :func:`gaussian_reml_fit` for the full semantic.
     """
     from ._basis import _resolve_basis_locations_tensor
 
@@ -1125,8 +1143,16 @@ def gaussian_reml_fit_positions_batched(
         :func:`gaussian_reml_fit_positions`. ``knots_or_centers`` and
         ``penalty`` accept the same auto-derived defaults — basis
         locations are inferred from the concatenated ``t``.
-    weights, by, init_lambda, by_start_col:
+    weights, init_lambda, by_start_col:
         See :func:`gaussian_reml_fit`.
+    by:
+        Optional per-row design multiplier. Importantly the returned
+        ``fitted`` is already ``by * (phi @ B)`` — callers wanting
+        ``by * smooth(t)`` (e.g. amplitude-weighted curves in SAEs)
+        should use ``fitted`` directly and NOT multiply by ``by`` a
+        second time downstream. Rows with ``by = 0`` produce
+        ``fitted = 0`` exactly and do not contribute to the REML fit.
+        See :func:`gaussian_reml_fit` for the full semantic.
     """
     from ._basis import _resolve_basis_locations_tensor
 
