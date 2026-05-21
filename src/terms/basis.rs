@@ -28446,7 +28446,7 @@ mod tests {
             &d2,
             &DuchonOperatorPenaltySpec::default(),
             p_order,
-            s_order,
+            s_order as f64 as f64,
             None,
             None,
             0,
