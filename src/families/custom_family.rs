@@ -17,7 +17,8 @@ use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    MatrixFreeSpdOperator, compute_block_penalty_logdet_derivs, exact_intersection_nullity,
+    MatrixFreeSpdOperator, PenaltySubspaceTrace, compute_block_penalty_logdet_derivs,
+    exact_intersection_nullity, exact_pseudo_logdet, positive_eigenvalue_threshold,
     spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
