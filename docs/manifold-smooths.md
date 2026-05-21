@@ -32,10 +32,6 @@ panel: the smooth manifold the fits recover.
 ![rotating-shape demo of six geometric smooths recovered from noisy 3-D
 point clouds](images/geometric_shapes_demo.gif){ width="100%" }
 
-The same shapes, rendered higher-resolution as a static still:
-
-![still version](images/geometric_shapes_demo.png){ width="100%" }
-
 A slower MP4 (first half of the loop, played at 2/3 speed) for
 closer inspection:
 
