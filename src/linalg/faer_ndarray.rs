@@ -815,9 +815,20 @@ pub fn fast_joint_hessian_2x2<
         .min(n);
 
     let mut out = Array2::<f64>::zeros((total, total).f());
-    let mut waa_xa_buf = Array2::<f64>::zeros((chunk_rows, pa).f());
-    let mut wab_xb_buf = Array2::<f64>::zeros((chunk_rows, pb).f());
-    let mut wbb_xb_buf = Array2::<f64>::zeros((chunk_rows, pb).f());
+    // Row-major weighted buffers so the per-row scale loops have stride-1
+    // writes (the previous F-order layout strided writes by chunk_rows
+    // across `pa` / `pb`, gutting vectorization on the per-PIRLS-iter
+    // joint Hessian assembly). faer's matmul handles either layout.
+    let mut waa_xa_buf = Array2::<f64>::zeros((chunk_rows, pa));
+    let mut wab_xb_buf = Array2::<f64>::zeros((chunk_rows, pb));
+    let mut wbb_xb_buf = Array2::<f64>::zeros((chunk_rows, pb));
+
+    let xa_is_row_major = x_a.is_standard_layout();
+    let xb_is_row_major = x_b.is_standard_layout();
+    let waa_slice_opt = w_aa.as_slice();
+    let wab_slice_opt = w_ab.as_slice();
+    let wbb_slice_opt = w_bb.as_slice();
+
     {
         let mut out_mat = array2_to_matmut(&mut out);
 
@@ -826,22 +837,69 @@ pub fn fast_joint_hessian_2x2<
             let xa_slice = x_a.slice(s![start..start + rows, ..]);
             let xb_slice = x_b.slice(s![start..start + rows, ..]);
 
-            // Weight X_a and X_b in a single pass through this chunk
+            // Weight X_a and X_b in a single pass through this chunk.
             {
-                let mut waa_chunk = waa_xa_buf.slice_mut(s![0..rows, ..]);
-                let mut wab_chunk = wab_xb_buf.slice_mut(s![0..rows, ..]);
-                let mut wbb_chunk = wbb_xb_buf.slice_mut(s![0..rows, ..]);
-                for local in 0..rows {
-                    let i = start + local;
-                    let waa_i = w_aa[i];
-                    let wab_i = w_ab[i];
-                    let wbb_i = w_bb[i];
-                    for col in 0..pa {
-                        waa_chunk[[local, col]] = xa_slice[[local, col]] * waa_i;
+                let waa_chunk = waa_xa_buf
+                    .as_slice_mut()
+                    .expect("row-major waa chunk is contiguous");
+                let wab_chunk = wab_xb_buf
+                    .as_slice_mut()
+                    .expect("row-major wab chunk is contiguous");
+                let wbb_chunk = wbb_xb_buf
+                    .as_slice_mut()
+                    .expect("row-major wbb chunk is contiguous");
+
+                if xa_is_row_major
+                    && xb_is_row_major
+                    && let (Some(xa_all), Some(xb_all)) = (x_a.as_slice(), x_b.as_slice())
+                    && let (Some(waa_all), Some(wab_all), Some(wbb_all)) =
+                        (waa_slice_opt, wab_slice_opt, wbb_slice_opt)
+                {
+                    for local in 0..rows {
+                        let i = start + local;
+                        let waa_i = waa_all[i];
+                        let wab_i = wab_all[i];
+                        let wbb_i = wbb_all[i];
+                        let xa_off = i * pa;
+                        let xa_row = &xa_all[xa_off..xa_off + pa];
+                        let xb_off = i * pb;
+                        let xb_row = &xb_all[xb_off..xb_off + pb];
+                        let waa_off = local * pa;
+                        let wab_off = local * pb;
+                        let wbb_off = local * pb;
+                        let waa_row = &mut waa_chunk[waa_off..waa_off + pa];
+                        for col in 0..pa {
+                            waa_row[col] = xa_row[col] * waa_i;
+                        }
+                        let wab_row = &mut wab_chunk[wab_off..wab_off + pb];
+                        let wbb_row = &mut wbb_chunk[wbb_off..wbb_off + pb];
+                        for col in 0..pb {
+                            let xij = xb_row[col];
+                            wab_row[col] = xij * wab_i;
+                            wbb_row[col] = xij * wbb_i;
+                        }
                     }
-                    for col in 0..pb {
-                        wab_chunk[[local, col]] = xb_slice[[local, col]] * wab_i;
-                        wbb_chunk[[local, col]] = xb_slice[[local, col]] * wbb_i;
+                } else {
+                    for local in 0..rows {
+                        let i = start + local;
+                        let waa_i = w_aa[i];
+                        let wab_i = w_ab[i];
+                        let wbb_i = w_bb[i];
+                        let waa_off = local * pa;
+                        let wab_off = local * pb;
+                        let wbb_off = local * pb;
+                        let waa_row = &mut waa_chunk[waa_off..waa_off + pa];
+                        let xa_row = xa_slice.row(local);
+                        for (col, xij) in xa_row.iter().enumerate() {
+                            waa_row[col] = xij * waa_i;
+                        }
+                        let wab_row = &mut wab_chunk[wab_off..wab_off + pb];
+                        let wbb_row = &mut wbb_chunk[wbb_off..wbb_off + pb];
+                        let xb_row = xb_slice.row(local);
+                        for (col, xij) in xb_row.iter().enumerate() {
+                            wab_row[col] = xij * wab_i;
+                            wbb_row[col] = xij * wbb_i;
+                        }
                     }
                 }
             }
