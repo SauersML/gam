@@ -1883,7 +1883,14 @@ impl SpatialLogKappaCoords {
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        Self::aniso_bounds_from_data(data, spec, term_indices, dims_per_term, options, AnisoBoundEnd::Lower)
+        Self::aniso_bounds_from_data(
+            data,
+            spec,
+            term_indices,
+            dims_per_term,
+            options,
+            AnisoBoundEnd::Lower,
+        )
     }
 
     /// Anisotropic-aware upper bounds derived from per-term data geometry.
@@ -1896,7 +1903,14 @@ impl SpatialLogKappaCoords {
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        Self::aniso_bounds_from_data(data, spec, term_indices, dims_per_term, options, AnisoBoundEnd::Upper)
+        Self::aniso_bounds_from_data(
+            data,
+            spec,
+            term_indices,
+            dims_per_term,
+            options,
+            AnisoBoundEnd::Upper,
+        )
     }
 
     /// Shared implementation for the lower/upper aniso bounds. The bound end

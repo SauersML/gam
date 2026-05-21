@@ -491,6 +491,7 @@ impl InteractiveVisualizer {
         let secondary_lane = model.secondary_lane.clone();
         let edf_terms = model.edf_terms.clone();
         let diagnostics_lines = model.diagnostics_lines.clone();
+        let log_tail: Vec<String> = model.log_tail.iter().cloned().collect();
         let diagnostics_condition = model.diagnostics_condition;
         let diagnostics_step_size = model.diagnostics_step_size;
         let diagnostics_ridge = model.diagnostics_ridge;
@@ -712,16 +713,21 @@ impl InteractiveVisualizer {
                 "Convergence signal (base 10 log gradient norm): {:.3}",
                 grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
             ));
-            diagnostics.push("Recent Diagnostics and Warnings:".to_string());
+            // Show the live log stream (mirrored by ProgressLogger into
+            // model.log_tail) here so the chart panel doubles as the
+            // user's tail -f. The old `diagnostics_lines` list is still
+            // surfaced as a single most-recent line via push_diagnostic
+            // earlier in the panel; the bottom area is the log scroll.
+            diagnostics.push("Recent log:".to_string());
 
             let base_reserved = diagnostics.len() + 1;
             let availrows = chunks[1].height.saturating_sub(2) as usize;
-            let max_diag_lines = availrows.saturating_sub(base_reserved).max(1);
-            if diagnostics_lines.is_empty() {
-                diagnostics.push("  (no diagnostics yet)".to_string());
+            let max_log_lines = availrows.saturating_sub(base_reserved).max(1);
+            if log_tail.is_empty() && diagnostics_lines.is_empty() {
+                diagnostics.push("  (no log records yet)".to_string());
             } else {
-                let start = diagnostics_lines.len().saturating_sub(max_diag_lines);
-                for line in diagnostics_lines.into_iter().skip(start) {
+                let start = log_tail.len().saturating_sub(max_log_lines);
+                for line in log_tail.into_iter().skip(start) {
                     diagnostics.push(format!("  {line}"));
                 }
             }
@@ -929,16 +935,30 @@ impl VisualizerSession {
         if !enabled {
             return Self::default();
         }
-        let notebook_or_noninteractive = should_use_text_only_progress();
-        let interactive =
-            !notebook_or_noninteractive && io::stdout().is_terminal() && io::stderr().is_terminal();
-        let state_inner = if interactive {
-            match InteractiveVisualizer::new() {
-                Ok(v) => VisualizerState::Interactive(v),
-                Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
-            }
-        } else {
-            VisualizerState::Dumb(DumbVisualizer::new(true))
+        // New activation rule: try /dev/tty first, fall back to Dumb on
+        // failure. We DON'T require stdout/stderr to be TTYs — when the
+        // user runs through `tee` (run.sh does this to capture the run
+        // file), stdout/stderr are pipes and the old rule disabled the
+        // chart entirely. Routing the chart to /dev/tty decouples it
+        // from the logging pipeline so both can run at once: chart on
+        // the real terminal, logs flowing through the tee to a file.
+        //
+        // When the process has no controlling terminal at all (cron,
+        // systemd, sandbox) /dev/tty open fails and we land in Dumb
+        // mode, which keeps emitting line-based progress on stderr —
+        // same behavior as before for headless runners. The notebook
+        // text-only flag is preserved for that fall-through so Jupyter
+        // notebook cells still get the compact text renderer.
+        // text_only is unconditionally true on the fall-through path:
+        // by definition we landed here because we have no usable
+        // /dev/tty, so the MultiProgress draw target (which writes
+        // ANSI to stderr) would garble whatever pipe is on the other
+        // end of stderr. The line-based renderer is safe through any
+        // pipe, including `tee`.
+        let _ = should_use_text_only_progress();
+        let state_inner = match InteractiveVisualizer::new() {
+            Ok(v) => VisualizerState::Interactive(v),
+            Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
         };
         let session = Self {
             state: Arc::new(Mutex::new(state_inner)),
