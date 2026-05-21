@@ -106,6 +106,14 @@ def competing_risks_cif(
         raise ValueError("competing_risks_cif requires at least one endpoint prediction")
     if len(names) != len(prediction_seq):
         raise ValueError("endpoint_names must match the number of endpoint predictions")
+    if len(set(names)) != len(names):
+        raise ValueError("endpoint_names must be unique")
+    for idx, prediction in enumerate(prediction_seq):
+        if not isinstance(prediction, SurvivalPrediction):
+            raise TypeError(
+                "competing_risks_cif expects SurvivalPrediction objects; "
+                f"endpoint {idx} has type {type(prediction).__name__}"
+            )
 
     times_arr = np.asarray(times, dtype=float).reshape(-1)
     try:

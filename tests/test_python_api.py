@@ -701,6 +701,43 @@ def test_competing_risks_cif_validates_inputs() -> None:
         gamfit.competing_risks_cif([pred, two_row_pred], times=[0.0, 1.0])
     with pytest.raises(ValueError, match="endpoint_names must match"):
         gamfit.competing_risks_cif([pred, two_row_pred], times=[0.0, 1.0], endpoint_names=["one"])
+    with pytest.raises(ValueError, match="endpoint_names must be unique"):
+        gamfit.competing_risks_cif([pred, pred], times=[0.0, 1.0], endpoint_names=["same", "same"])
+    with pytest.raises(TypeError, match="SurvivalPrediction"):
+        gamfit.competing_risks_cif([typing.cast(typing.Any, object())], times=[0.0, 1.0])
+
+
+def test_competing_risks_cif_plateaus_and_probability_bounds() -> None:
+    times = np.array([0.0, 1.0, 3.0, 7.0, 12.0], dtype=float)
+    cumulative = np.array(
+        [
+            [[0.0, 0.2, 0.2, 0.5, 1.1], [0.0, 0.0, 0.4, 0.4, 0.9]],
+            [[0.0, 0.1, 0.3, 0.3, 0.7], [0.0, 0.2, 0.2, 0.8, 0.8]],
+            [[0.0, 0.0, 0.2, 0.6, 0.6], [0.0, 0.1, 0.5, 0.5, 1.5]],
+        ],
+        dtype=float,
+    )
+    preds = {
+        f"cause_{idx + 1}": gamfit.SurvivalPrediction(
+            model_class="survival",
+            parameters=np.zeros((2, 1), dtype=float),
+            parameter_names=("eta",),
+            times=times,
+            cumulative_hazard=cumulative[idx],
+            survival=np.exp(-cumulative[idx]),
+            hazard=np.zeros_like(cumulative[idx]),
+        )
+        for idx in range(3)
+    }
+
+    result = gamfit.competing_risks_cif(preds, times=times)
+
+    assert result.cif.shape == (3, 2, times.size)
+    np.testing.assert_allclose(result.cif.sum(axis=0), 1.0 - result.overall_survival, atol=1e-12)
+    assert np.all((result.cif >= 0.0) & (result.cif <= 1.0))
+    assert np.all((result.overall_survival >= 0.0) & (result.overall_survival <= 1.0))
+    assert np.all(np.diff(result.cif, axis=2) >= -1e-12)
+    assert result.cif[0, 0, 1] == pytest.approx(result.cif[0, 0, 2])
 
 
 def test_survival_prediction_write_csv_preserves_ids(tmp_path: pathlib.Path) -> None:
