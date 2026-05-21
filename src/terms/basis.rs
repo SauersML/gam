@@ -27940,6 +27940,75 @@ mod tests {
         ));
     }
 
+    /// Inner check for the joint-null-space property. The construction
+    /// must produce `null(λ_0 S_0 + λ_1 S_1 + λ_2 S_2) = span{1}` — the
+    /// constant function is the only direction with zero joint penalty.
+    /// `data`/`spec` parameterize the test across dimensions / null-space
+    /// orders so a single helper can pin the property at d=1, 2, 3, 4
+    /// (and any other config the integer-power validator admits).
+    fn assert_scale_free_joint_null_is_only_constant(
+        data: ArrayView2<'_, f64>,
+        spec: &DuchonBasisSpec,
+    ) {
+        use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+        let out =
+            build_duchon_basis(data, spec).expect("Duchon basis should build for joint-null test");
+        let design = out.design.to_dense();
+        let (n, p) = design.dim();
+        assert!(
+            n >= p,
+            "need n ≥ p to recover v_const via least squares: n={n}, p={p}"
+        );
+        let ones = Array1::<f64>::ones(n);
+        let xtx = crate::faer_ndarray::fast_atb(&design, &design);
+        let xt_ones = crate::faer_ndarray::fast_atv(&design, &ones);
+        let mut xtx_reg = xtx.clone();
+        for i in 0..p {
+            xtx_reg[[i, i]] += 1e-14 * (xtx[[i, i]].abs().max(1.0));
+        }
+        let chol = xtx_reg
+            .cholesky(faer::Side::Lower)
+            .expect("XᵀX SPD with ridge");
+        let v_const = chol.solvevec(&xt_ones);
+        let recon = crate::faer_ndarray::fast_av(&design, &v_const);
+        let err = (&recon - &ones).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            err < 1e-8,
+            "v_const must reproduce the constant function (d={}): max |Xv − 1| = {err}",
+            data.ncols()
+        );
+        let lambdas = [1.0_f64, 1.0_f64, 1.0_f64];
+        assert_eq!(
+            out.penalties.len(),
+            lambdas.len(),
+            "spec must emit exactly the operator triplet"
+        );
+        let mut joint = Array2::<f64>::zeros((p, p));
+        for (lam, s) in lambdas.iter().zip(out.penalties.iter()) {
+            joint.scaled_add(*lam, s);
+        }
+        let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
+        let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let joint_scale = joint.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+        assert!(
+            s_v_norm < 1e-10 * joint_scale,
+            "constant must lie in joint null space (d={}): ||S v_const|| = {s_v_norm}, ||S|| = {joint_scale}",
+            data.ncols()
+        );
+        let (evals, _) = joint
+            .eigh(faer::Side::Lower)
+            .expect("symmetric joint penalty has real eigenvalues");
+        let max_eval = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let zero_threshold = 1e-10 * max_eval.max(1.0);
+        let zero_count = evals.iter().filter(|&&e| e <= zero_threshold).count();
+        assert_eq!(
+            zero_count,
+            1,
+            "joint penalty must have exactly one zero eigenvalue (d={}); got {zero_count} below {zero_threshold}, eigenvalues = {evals:?}",
+            data.ncols()
+        );
+    }
+
     /// The construction is supposed to deliver exactly *one* unpenalized
     /// direction — the constant function — across the joint penalty
     /// `λ_0 S_0 + λ_1 S_1 + λ_2 S_2`. This test pins that property
