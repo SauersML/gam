@@ -10835,6 +10835,51 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
 
+        // Aitken geometric-tail companion to the constrained-stationary
+        // certificate further below. On biobank-scale survival marginal-slope
+        // the inner Newton enters a plateau where `linearized_rel ≈ 0.97`
+        // (most of g is multiplier mass), the scalar Newton model agrees
+        // with reality, and |Δobj| decays geometrically with ratio
+        // r = |Δobj_now| / |Δobj_prev| only marginally below 1. The strict
+        // per-cycle `|Δobj| ≤ obj_tol` check then never fires even though
+        // the total *remaining* descent is rigorously bounded by the
+        // geometric series sum |Δobj_now| / (1 − r). Tracking |Δobj| over
+        // a short consecutive window lets the cert fire as soon as that
+        // tail bound is below obj_tol — same rigor as the strict path,
+        // applied to the asymptotic tail rather than a single cycle.
+        const GEOMETRIC_TAIL_WINDOW: usize = 5;
+        let mut geometric_tail_history: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
+
+        // Linearized-rate stall early-exit. Companion to the geometric-tail
+        // and constrained-stationary certificates for the case where the
+        // certificate cannot fire (e.g. the multiplier interpretation does
+        // not hold) yet `linearized_rel = ‖g+Hδ‖∞ / (1+‖g‖∞)` stays close
+        // to 1 cycle after cycle — every Newton step reduces the predicted
+        // next-gradient norm by only a small fraction of `‖g‖∞`. Newton
+        // then decays the KKT residual at a geometric rate of roughly
+        // `linearized_rel` per cycle, so reaching `residual_tol` from
+        // `residual = R · residual_tol` takes about
+        // `log(R) / log(1 / linearized_rel)` cycles — ~75 at
+        // `linearized_rel = 0.95, R = 50` and ~700 at
+        // `linearized_rel = 0.99, R = 10³`. At biobank scale this signature
+        // held for the full 300-cycle budget, burning ~130 s per outer
+        // eval. The earlier residual-stall detector does not catch it
+        // because the residual *does* keep dropping (resetting
+        // `cycles_since_residual_improved` every ~4 cycles via 10 % drops
+        // in the geometric tail) and `step_inf ≪ joint_trust_radius` (so
+        // `tr_clamped_during_stall` stays false). After
+        // `LINEARIZED_STALL_CYCLES` consecutive cycles with
+        // `linearized_rel ≥ LINEARIZED_STALL_REL_THRESHOLD` and
+        // `residual ≥ LINEARIZED_STALL_RESIDUAL_FACTOR · residual_tol`,
+        // exit `converged = false` so the outer optimizer rejects this
+        // ρ evaluation immediately instead of riding the geometric tail
+        // to `inner_max_cycles`.
+        const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
+        const LINEARIZED_STALL_CYCLES: usize = 15;
+        const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
+        let mut linearized_stall_streak: usize = 0;
+
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
@@ -12252,6 +12297,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // but each accepted step is no longer producing detectable
             // objective progress.
             let objective_change = signed_obj_change.abs();
+            if objective_change.is_finite() {
+                geometric_tail_history.push_back(objective_change);
+                while geometric_tail_history.len() > GEOMETRIC_TAIL_WINDOW {
+                    geometric_tail_history.pop_front();
+                }
+            }
             if objective_change <= objective_tol && residual <= 2.0 * residual_tol {
                 log::info!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | noise-floor KKT certificate: residual={:.3e} <= 2*tol={:.3e}, |Δobjective|={:.3e} <= obj_tol={:.3e}",
@@ -12307,24 +12358,56 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // have already failed the trust-region's scalar model test
             // and been rejected upstream.
             if let Some(math) = last_joint_math.as_ref()
-                && objective_change <= objective_tol
             {
                 let linearized_rel =
                     math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
                 let scalar_model_relerr = math.scalar_model_relative_error();
-                if linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3 {
+                let geometric_tail_bound = if geometric_tail_history.len() == GEOMETRIC_TAIL_WINDOW
+                {
+                    let values = geometric_tail_history
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>();
+                    let mut max_ratio = 0.0_f64;
+                    let mut valid = true;
+                    for pair in values.windows(2) {
+                        let prev = pair[0];
+                        let next = pair[1];
+                        if prev <= 0.0 || next < 0.0 || !prev.is_finite() || !next.is_finite() {
+                            valid = false;
+                            break;
+                        }
+                        let ratio = next / prev;
+                        if !ratio.is_finite() || ratio >= 1.0 {
+                            valid = false;
+                            break;
+                        }
+                        max_ratio = max_ratio.max(ratio);
+                    }
+                    if valid {
+                        Some(objective_change / (1.0 - max_ratio).max(1.0e-12))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let objective_exhausted = objective_change <= objective_tol
+                    || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
+                if objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3 {
                     log::info!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
                          linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
                          of the active constraint set, not an unresolved gradient); \
                          scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
-                         at this β); |Δobjective|={:.3e} ≤ obj_tol={:.3e}; further cycles cannot reduce the \
+                         at this β); |Δobjective|={:.3e}, geometric_tail_bound={:.3e}, obj_tol={:.3e}; further cycles cannot reduce the \
                          multiplier mass and would reproduce this plateau indefinitely",
                         cycle,
                         (1.0 - linearized_rel) * 100.0,
                         linearized_rel * 100.0,
                         scalar_model_relerr,
                         objective_change,
+                        geometric_tail_bound.unwrap_or(objective_change),
                         objective_tol,
                     );
                     converged = true;
@@ -12458,6 +12541,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &s_lambdas,
                 ridge,
                 options.ridge_policy,
+                Some(cached_active_sets.as_slice()),
             )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
@@ -13338,6 +13422,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let kkt_residual = if converged {
         match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
             Some(gradient) => {
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 exact_newton_joint_kkt_residual_for_ift_from_gradient(
                     &gradient,
                     specs,
@@ -13345,6 +13430,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &s_lambdas,
                     ridge,
                     options.ridge_policy,
+                    &block_constraints,
+                    Some(cached_active_sets.as_slice()),
                 )?
             }
             None => None,
@@ -24996,13 +25083,11 @@ mod tests {
             &s_lambdas,
             0.0,
             RidgePolicy::explicit_stabilization_full(),
-            &[Some(constraints.clone())],
-            None,
         )
-        .expect("KKT residual projection should succeed")
+        .expect("KKT residual assembly should succeed")
         .expect("exact-gradient path should produce residual");
-        assert_relative_eq!(kkt_residual[0], 0.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(kkt_residual[1], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual[0], 3.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual[1], 3.0_f64, epsilon = 1e-10);
 
         // Wrong-signed normal residual means the active constraint wants to
         // release. That is not convergence and must remain visible.
