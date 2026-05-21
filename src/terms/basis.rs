@@ -2767,16 +2767,20 @@ pub struct DuchonBasisSpec {
     /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
     /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
     pub length_scale: Option<f64>,
-    /// Integer spectral power `s`. The Riesz/polyharmonic closed form
-    /// admits any positive real `s`, but the current integer-only
-    /// signature forces high-`d` callers to ratchet the polynomial
-    /// null-space order `m` to satisfy `2(m + s) > d`. The natural fix
-    /// is `s: f64` plus a fractional Riesz path
-    /// (`r.powf(2 j − d)` already does the right thing in
-    /// `riesz_kernel_value`); the validator and convergence predicate
-    /// need updating in lockstep. Tracked as Tier 1 #1 in the
-    /// construction plan.
-    pub power: usize,
+    /// Spectral power `s`. Stored as `f64` so the API surface admits
+    /// fractional values; the existing integer-only downstream chain
+    /// (validators, closed-form convergence predicate, kernel-block
+    /// coefficient tables) reads the value via `spec.power_as_usize()`
+    /// and asserts whole-valuedness. Threading a fractional `s`
+    /// end-to-end (the natural fix for high-`d` configurations that
+    /// don't want to ratchet the polynomial null-space order to satisfy
+    /// `2(m + s) > d`) is Tier 1 #1 in the construction plan and
+    /// touches ~50 internal sites. Until that lands, fractional values
+    /// will panic at the integer-only call sites with a clear
+    /// "fractional power not yet supported" message rather than
+    /// silently truncating.
+    #[serde(alias = "power_int")]
+    pub power: f64,
     pub nullspace_order: DuchonNullspaceOrder,
     #[serde(default)]
     pub identifiability: SpatialIdentifiability,
