@@ -5249,8 +5249,9 @@ pub struct InnerSolution<'dp> {
     /// Optional inner KKT residual r = ∇_β L_pen(β̂) at the converged β̂.
     /// `Some` activates the implicit-function-theorem corrections in
     /// `reml_laml_evaluate` (cost gets −½ rᵀ H⁻¹ r, ρ-gradient gets
-    /// −rᵀ v_k with v_k = λ_k H⁻¹ S_k β̂). `None` keeps the envelope-only
-    /// behaviour for callers that genuinely guarantee exact KKT.
+    /// −rᵀ v_k with v_k = λ_k H⁻¹ S_k β̂, and the ρρ Hessian gets the
+    /// corresponding derivative). `None` keeps the envelope-only behaviour
+    /// for callers that genuinely guarantee exact KKT.
     pub kkt_residual: Option<Array1<f64>>,
 }
 
