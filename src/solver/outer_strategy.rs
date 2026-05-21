@@ -1685,6 +1685,29 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
     Some(p)
 }
 
+pub(crate) fn cache_entry_can_seed_outer(
+    entry: &crate::cache::CachedEntry,
+    expected_rho_dim: usize,
+    rho_bound: f64,
+) -> bool {
+    let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
+        return false;
+    };
+    if matches!(entry.objective, Some(v) if !v.is_finite()) {
+        return false;
+    }
+    if !(rho_bound.is_finite() && rho_bound > 0.0) {
+        return true;
+    }
+
+    const BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
+    let all_coords_saturated = payload
+        .rho
+        .iter()
+        .all(|v| v.abs() >= rho_bound - BOUNDARY_INTERIOR_MARGIN);
+    !all_coords_saturated
+}
+
 struct CheckpointingObjective<'a> {
     inner: &'a mut dyn OuterObjective,
     session: Arc<CacheSession>,
@@ -4360,9 +4383,7 @@ impl OuterProblem {
                     // Newton of useful progress within its cycle budget.
                     // Discard the entry entirely so the optimizer falls
                     // through to its normal cold-init seeding.
-                    if !saturated_coords.is_empty()
-                        && saturated_coords.len() == cached_rho.len()
-                    {
+                    if !saturated_coords.is_empty() && saturated_coords.len() == cached_rho.len() {
                         log::info!(
                             "[CACHE] discard key={}.. context={} rho_dim={} \
                              saturated_coords={:?} bound=±{:.3} \
@@ -8442,6 +8463,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_entry_seed_validity_rejects_all_saturated_payload() {
+        let usable_payload = encode_iterate(&array![9.0, 0.0], 1.0, 0).expect("encode");
+        let poisoned_payload = encode_iterate(&array![10.0, -10.0], 1.0, 0).expect("encode");
+        let usable = crate::cache::CachedEntry {
+            payload: usable_payload,
+            objective: Some(1.0),
+            iteration: Some(0),
+            kind: crate::cache::EntryKind::Checkpoint,
+            written_unix_secs: 0,
+        };
+        let poisoned = crate::cache::CachedEntry {
+            payload: poisoned_payload,
+            objective: Some(1.0),
+            iteration: Some(0),
+            kind: crate::cache::EntryKind::Checkpoint,
+            written_unix_secs: 0,
+        };
+
+        assert!(cache_entry_can_seed_outer(&usable, 2, 10.0));
+        assert!(
+            !cache_entry_can_seed_outer(&poisoned, 2, 10.0),
+            "all-boundary checkpoints must not suppress family cold-start pilots"
+        );
+    }
+
+    #[test]
     fn checkpointing_objective_mirrors_checkpoints() {
         let (_primary_dir, primary) = tmp_cache_session("ckpt-primary");
         let (_mirror_dir, mirror) = tmp_cache_session("ckpt-mirror");
@@ -8586,9 +8633,7 @@ mod tests {
         let _ = problem.run(&mut obj, "all-saturated-discard");
         let evals = seen.lock().unwrap();
         assert!(
-            !evals
-                .iter()
-                .any(|rho| rho.iter().all(|v| v.abs() >= 9.0)),
+            !evals.iter().any(|rho| rho.iter().all(|v| v.abs() >= 9.0)),
             "all-saturated checkpoint must be discarded, not clamped and evaluated; saw {:?}",
             *evals
         );
