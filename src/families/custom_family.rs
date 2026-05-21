@@ -25152,11 +25152,13 @@ mod tests {
         assert!(accepted.accepted);
         assert!((accepted.rho - 1.0).abs() < 1.0e-12);
         assert!((accepted.radius - 2.0).abs() < 1.0e-12);
+        assert_eq!(accepted.decision.label(), "grow_at_boundary");
 
         let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 1.0);
         assert!(!rejected.accepted);
         assert!(rejected.rho < 0.0);
         assert!((rejected.radius - 0.25).abs() < 1.0e-12);
+        assert_eq!(rejected.decision.label(), "shrink_reject");
 
         let rejected_inside_radius = update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0);
         assert!(!rejected_inside_radius.accepted);
@@ -25165,11 +25167,13 @@ mod tests {
             "a rejected in-radius step must be outside the next trust region"
         );
         assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
+        assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
 
         let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0);
         assert!(poor.accepted);
         assert!((poor.rho - 0.1).abs() < 1.0e-12);
         assert!((poor.radius - 0.25).abs() < 1.0e-12);
+        assert_eq!(poor.decision.label(), "shrink_marginal_accept");
     }
 
     #[test]
