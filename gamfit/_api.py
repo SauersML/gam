@@ -4,8 +4,8 @@ import json
 import math
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
@@ -34,7 +34,10 @@ class SharedPrecisionGroup:
     labels: str | Mapping[str | int, str] | None = None
 
 
-def _normalize_shared_precision_group(value: Any, default_name: str | None = None) -> SharedPrecisionGroup:
+def _normalize_shared_precision_group(
+    value: Any,
+    default_name: str | None = None,
+) -> SharedPrecisionGroup:
     if isinstance(value, SharedPrecisionGroup):
         return value
     if isinstance(value, Mapping):
@@ -58,11 +61,23 @@ def _normalize_shared_precision_group(value: Any, default_name: str | None = Non
 
 def _normalize_shared_precision_groups(groups: Any) -> list[SharedPrecisionGroup]:
     if isinstance(groups, Mapping):
-        return [
+        normalized = [
             _normalize_shared_precision_group(value, str(name))
             for name, value in groups.items()
         ]
-    return [_normalize_shared_precision_group(value) for value in groups]
+    else:
+        normalized = [_normalize_shared_precision_group(value) for value in groups]
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for group in normalized:
+        if group.name in seen:
+            duplicates.append(group.name)
+        seen.add(group.name)
+    if duplicates:
+        raise ValueError(
+            "duplicate shared precision group name(s): " + ", ".join(sorted(set(duplicates)))
+        )
+    return normalized
 
 
 def _normalize_model_mapping(models: Any) -> list[tuple[str | int, Model]]:
@@ -109,7 +124,6 @@ def _coefficient_indices_for_precision_label(state: Mapping[str, Any], label: st
             item.get("term"),
             item.get("column"),
             item.get("label"),
-            item.get("source"),
         )
         if any(str(candidate) == label for candidate in candidates if candidate is not None):
             matches.append(index)

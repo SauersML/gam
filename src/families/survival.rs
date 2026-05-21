@@ -2694,6 +2694,94 @@ mod tests {
         assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
     }
 
+    #[test]
+    fn competing_risks_cif_plateaus_and_three_causes_conserve_probability() {
+        let times = array![0.0, 1.0, 3.0, 7.0, 12.0];
+        let cumulative = Array3::from_shape_vec(
+            (3, 2, 5),
+            vec![
+                // cause 1
+                0.0, 0.2, 0.2, 0.5, 1.1, 0.0, 0.0, 0.4, 0.4, 0.9,
+                // cause 2
+                0.0, 0.1, 0.3, 0.3, 0.7, 0.0, 0.2, 0.2, 0.8, 0.8,
+                // cause 3
+                0.0, 0.0, 0.2, 0.6, 0.6, 0.0, 0.1, 0.5, 0.5, 1.5,
+            ],
+        )
+        .expect("shape");
+
+        let result =
+            assemble_competing_risks_cif(times.view(), cumulative.view()).expect("assemble CIF");
+
+        for row in 0..2 {
+            for time_idx in 0..times.len() {
+                let total_cif =
+                    result.cif[[0, row, time_idx]]
+                        + result.cif[[1, row, time_idx]]
+                        + result.cif[[2, row, time_idx]];
+                assert!(
+                    (total_cif + result.overall_survival[[row, time_idx]] - 1.0).abs() < 1e-12,
+                    "probability mass mismatch at row={row}, time_idx={time_idx}"
+                );
+                assert!((0.0..=1.0).contains(&result.overall_survival[[row, time_idx]]));
+                for cause in 0..3 {
+                    assert!((0.0..=1.0).contains(&result.cif[[cause, row, time_idx]]));
+                    if time_idx > 0 {
+                        assert!(
+                            result.cif[[cause, row, time_idx]]
+                                + 1e-12
+                                >= result.cif[[cause, row, time_idx - 1]],
+                            "CIF decreased for cause={cause}, row={row}, time_idx={time_idx}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Cause 1 is flat between t=1 and t=3 for row 0, but other causes
+        // fail in that interval; its CIF must remain exactly flat.
+        assert_eq!(result.cif[[0, 0, 1]], result.cif[[0, 0, 2]]);
+        // All causes are flat between t=3 and t=7 for row 1 except cause 2;
+        // causes 1 and 3 must not move.
+        assert_eq!(result.cif[[0, 1, 2]], result.cif[[0, 1, 3]]);
+        assert_eq!(result.cif[[2, 1, 2]], result.cif[[2, 1, 3]]);
+    }
+
+    #[test]
+    fn competing_risks_cif_rejects_bad_time_grids_and_nonfinite_hazards() {
+        let cumulative = Array3::zeros((2, 1, 2));
+
+        for times in [array![0.0, 0.0], array![1.0, 0.5], array![-1.0, 1.0]] {
+            let err = assemble_competing_risks_cif(times.view(), cumulative.view())
+                .expect_err("bad time grid should be rejected");
+            assert!(matches!(err, SurvivalError::InvalidTimeGrid));
+        }
+
+        let times = array![0.0, 1.0];
+        let nonfinite = Array3::from_shape_vec((1, 1, 2), vec![0.0, f64::NAN]).expect("shape");
+        let err = assemble_competing_risks_cif(times.view(), nonfinite.view())
+            .expect_err("nonfinite hazard should be rejected");
+        assert!(matches!(err, SurvivalError::NonFiniteInput));
+    }
+
+    #[test]
+    fn competing_risks_cif_extreme_hazards_remain_bounded() {
+        let times = array![0.0, 1.0, 2.0];
+        let cumulative =
+            Array3::from_shape_vec((2, 1, 3), vec![0.0, 500.0, 1000.0, 0.0, 250.0, 1000.0])
+                .expect("shape");
+
+        let result =
+            assemble_competing_risks_cif(times.view(), cumulative.view()).expect("assemble CIF");
+
+        for value in result.cif.iter().chain(result.overall_survival.iter()) {
+            assert!(value.is_finite());
+            assert!((0.0..=1.0).contains(value));
+        }
+        assert!((result.cif[[0, 0, 2]] + result.cif[[1, 0, 2]] - 1.0).abs() < 1e-12);
+        assert_eq!(result.overall_survival[[0, 2]], 0.0);
+    }
+
     fn toy_penalties() -> PenaltyBlocks {
         let s = array![[2.0, 0.5], [0.5, 3.0]];
         PenaltyBlocks::new(vec![PenaltyBlock {
