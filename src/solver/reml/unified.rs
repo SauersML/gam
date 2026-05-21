@@ -19691,7 +19691,7 @@ mod tests {
         // ⇒ r = (λ₁S₁+λ₂S₂)β̂ − (X'y − X'Xβ̂) = Hβ̂ − X'y.
         // At β* = H⁻¹X'y this is identically zero.
         let kkt_residual = if attach_residual {
-            Some(&h.dot(&beta_hat) - &xty)
+            Some(ProjectedKktResidual::from_projected(&h.dot(&beta_hat) - &xty))
         } else {
             None
         };
@@ -19829,6 +19829,7 @@ mod tests {
             .kkt_residual
             .as_ref()
             .unwrap()
+            .as_array()
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(
@@ -19960,6 +19961,7 @@ mod tests {
             .kkt_residual
             .as_ref()
             .unwrap()
+            .as_array()
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(

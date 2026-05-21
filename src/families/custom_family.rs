@@ -17,9 +17,9 @@ use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
     HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    MatrixFreeSpdOperator, PenaltySubspaceTrace, compute_block_penalty_logdet_derivs,
-    exact_intersection_nullity, exact_pseudo_logdet, positive_eigenvalue_threshold,
-    spectral_epsilon, spectral_regularize,
+    MatrixFreeSpdOperator, PenaltySubspaceTrace, ProjectedKktResidual,
+    compute_block_penalty_logdet_derivs, exact_intersection_nullity, exact_pseudo_logdet,
+    positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -2644,7 +2644,7 @@ pub struct BlockwiseInnerResult {
     /// Free-space-projected inner KKT residual; the projection invariant is
     /// enforced by the [`ProjectedKktResidual`] newtype so this field can only
     /// be populated by an active-set-aware constructor.
-    pub kkt_residual: Option<crate::solver::reml::unified::ProjectedKktResidual>,
+    pub kkt_residual: Option<ProjectedKktResidual>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -2663,7 +2663,10 @@ impl std::fmt::Debug for BlockwiseInnerResult {
                 "joint_workspace",
                 &self.joint_workspace.as_ref().map(|_| "<workspace>"),
             )
-            .field("kkt_residual", &self.kkt_residual.as_ref().map(|r| r.len()))
+            .field(
+                "kkt_residual",
+                &self.kkt_residual.as_ref().map(|r| r.as_array().len()),
+            )
             .finish()
     }
 }
@@ -18535,6 +18538,14 @@ fn exact_newton_joint_projected_stationarity_vector_from_gradient(
     Ok(residual)
 }
 
+/// Build the free-space-projected KKT residual for the IFT correction.
+///
+/// The active set passed via `block_active_sets` is consumed by the inner
+/// projection so the returned vector lies in `range(I − P_normal_cone)`. The
+/// [`crate::solver::estimate::reml::unified::ProjectedKktResidual`] return type makes
+/// that invariant visible at every call site — callers cannot forget to
+/// project, and `reml/unified.rs` cannot accidentally accept an unprojected
+/// vector.
 fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -18543,7 +18554,7 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     ridge: f64,
     ridge_policy: RidgePolicy,
     block_active_sets: Option<&[Option<Vec<usize>>]>,
-) -> Result<Option<Array1<f64>>, String> {
+) -> Result<Option<ProjectedKktResidual>, String> {
     let eval = family.evaluate(states)?;
     let Some(gradient) = exact_newton_joint_gradient_from_eval(&eval, specs, states)? else {
         return Ok(None);
@@ -18570,7 +18581,7 @@ fn exact_newton_joint_kkt_residual_for_ift_from_cached_gradient<F: CustomFamily 
     ridge_policy: RidgePolicy,
     block_active_sets: Option<&[Option<Vec<usize>>]>,
     cached_gradient: Option<&Array1<f64>>,
-) -> Result<Option<Array1<f64>>, String> {
+) -> Result<Option<ProjectedKktResidual>, String> {
     if let Some(gradient) = cached_gradient {
         let block_constraints = collect_block_linear_constraints(family, states, specs)?;
         return exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
@@ -18604,7 +18615,7 @@ fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
     ridge_policy: RidgePolicy,
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: Option<&[Option<Vec<usize>>]>,
-) -> Result<Option<Array1<f64>>, String> {
+) -> Result<Option<ProjectedKktResidual>, String> {
     let residual = exact_newton_joint_projected_stationarity_vector_from_gradient(
         gradient,
         states,
@@ -18616,7 +18627,7 @@ fn exact_newton_joint_projected_kkt_residual_for_ift_from_gradient(
         block_active_sets,
     )?;
     if residual.iter().all(|v| v.is_finite()) {
-        Ok(Some(residual))
+        Ok(Some(ProjectedKktResidual::from_projected(residual)))
     } else {
         Ok(None)
     }
@@ -25242,8 +25253,8 @@ mod tests {
         )
         .expect("KKT residual assembly should succeed")
         .expect("exact-gradient path should produce residual");
-        assert_relative_eq!(kkt_residual[0], 0.0_f64, epsilon = 1e-10);
-        assert_relative_eq!(kkt_residual[1], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual.as_array()[0], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual.as_array()[1], 0.0_f64, epsilon = 1e-10);
 
         // Wrong-signed normal residual means the active constraint wants to
         // release. That is not convergence and must remain visible.
@@ -25297,8 +25308,8 @@ mod tests {
         .expect("cached gradient path should not call family.evaluate()")
         .expect("cached gradient should produce a KKT residual");
 
-        assert_relative_eq!(residual[0], expected_residual[0], epsilon = 1e-12);
-        assert_relative_eq!(residual[1], expected_residual[1], epsilon = 1e-12);
+        assert_relative_eq!(residual.as_array()[0], expected_residual[0], epsilon = 1e-12);
+        assert_relative_eq!(residual.as_array()[1], expected_residual[1], epsilon = 1e-12);
     }
 
     #[test]
