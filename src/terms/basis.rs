@@ -22847,10 +22847,10 @@ pub mod closed_form_penalty {
         let a = 2 * m - q;
 
         if s == 0 {
-            return riesz_kernel_value(d, a, r);
+            return riesz_kernel_value(d, a as f64, r);
         }
         if kappa == 0.0 {
-            return riesz_kernel_value(d, a + 2 * s, r);
+            return riesz_kernel_value(d, (a + 2 * s) as f64, r);
         }
 
         let b = 2 * s;
@@ -22866,7 +22866,7 @@ pub mod closed_form_penalty {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
-            let term = coeff * riesz_kernel_value(d, j, r);
+            let term = coeff * riesz_kernel_value(d, j as f64, r);
             sum.add(term);
         }
 
@@ -24962,7 +24962,7 @@ mod tests {
                 let kappa = 1e-12_f64;
                 let stable =
                     closed_form_penalty::stable_hybrid_duchon_radial(d, m, s, kappa, r, 0)[0];
-                let riesz = closed_form_penalty::riesz_kernel_value(d, n, r);
+                let riesz = closed_form_penalty::riesz_kernel_value(d, (n) as f64, r);
                 let scale = riesz.abs().max(stable.abs()).max(1e-300);
                 let rel = (stable - riesz).abs() / scale;
                 // For ν = n − d/2 < 0 (d > 2n), the half-integer K_ν has an
@@ -32693,7 +32693,7 @@ mod tests {
     fn test_riesz_d3_j1() {
         // R_1^3(r) = 1/(4π r)
         for &r in &[0.1_f64, 1.0, 10.0] {
-            let got = riesz_kernel_value(3, 1, r);
+            let got = riesz_kernel_value(3, 1.0, r);
             let expected = 1.0 / (4.0 * std::f64::consts::PI * r);
             assert!(
                 (got - expected).abs() / expected.abs() < 1e-12,
@@ -32708,7 +32708,7 @@ mod tests {
         // Γ(3/2 - 2) = Γ(-1/2) = -2√π. 4^2 π^{3/2} Γ(2) = 16 π^{3/2}.
         // Coefficient = -2√π / (16 π^{3/2}) = -1/(8π). Times r^{2·2-3} = r.
         for &r in &[0.1_f64, 1.0, 10.0] {
-            let got = riesz_kernel_value(3, 2, r);
+            let got = riesz_kernel_value(3, 2.0, r);
             let expected = -r / (8.0 * std::f64::consts::PI);
             assert!(
                 (got - expected).abs() / expected.abs() < 1e-12,
@@ -32739,7 +32739,7 @@ mod tests {
         for &kappa in &[0.0_f64, 0.3, 1.0, 5.0] {
             for &r in &[0.2_f64, 1.0, 4.0] {
                 let got = isotropic_duchon_penalty(q, d, m, 0, kappa, r);
-                let expected = riesz_kernel_value(d, 2 * m - q, r);
+                let expected = riesz_kernel_value(d, (2 * m - q) as f64, r);
                 assert!(
                     (got - expected).abs() / expected.abs().max(1e-300) < 1e-12,
                     "pure polyharmonic mismatch (κ={kappa}, r={r}): got={got} expected={expected}"
@@ -32981,7 +32981,7 @@ mod tests {
             let g_full = isotropic_duchon_penalty(q, d, m, s, kappa, r);
             let mut riesz_sum = 0.0_f64;
             for &(j, c) in &a_coeffs {
-                riesz_sum += c * riesz_kernel_value(d, j, r);
+                riesz_sum += c * riesz_kernel_value(d, (j) as f64, r);
             }
             let matern_part = g_full - riesz_sum;
 
@@ -33268,17 +33268,17 @@ mod tests {
                 // 5-point finite-difference stencil for f''(r) and centered
                 // finite difference for f'(r).
                 let h = 1e-3_f64 * r;
-                let f_mm = riesz_kernel_value(d, j, r - 2.0 * h);
-                let f_m = riesz_kernel_value(d, j, r - h);
-                let f_0 = riesz_kernel_value(d, j, r);
-                let f_p = riesz_kernel_value(d, j, r + h);
-                let f_pp = riesz_kernel_value(d, j, r + 2.0 * h);
+                let f_mm = riesz_kernel_value(d, (j) as f64, r - 2.0 * h);
+                let f_m = riesz_kernel_value(d, (j) as f64, r - h);
+                let f_0 = riesz_kernel_value(d, (j) as f64, r);
+                let f_p = riesz_kernel_value(d, (j) as f64, r + h);
+                let f_pp = riesz_kernel_value(d, (j) as f64, r + 2.0 * h);
                 let f_pp_d2 =
                     (-f_mm + 16.0 * f_m - 30.0 * f_0 + 16.0 * f_p - f_pp) / (12.0 * h * h);
                 let f_p_d1 = (f_mm - 8.0 * f_m + 8.0 * f_p - f_pp) / (12.0 * h);
                 let lap = f_pp_d2 + (d as f64 - 1.0) / r * f_p_d1;
                 let lhs = -lap;
-                let rhs = riesz_kernel_value(d, j - 1, r);
+                let rhs = riesz_kernel_value(d, (j - 1) as f64, r);
                 let rel = (lhs - rhs).abs() / rhs.abs().max(1e-300);
                 assert!(
                     rel < 5e-5,
@@ -33303,15 +33303,15 @@ mod tests {
         for &(d, j) in cases {
             for &r in &[0.37_f64, 0.9, 2.4] {
                 let h = 2e-4_f64 * r;
-                let f_mm = riesz_kernel_value(d, j, r - 2.0 * h);
-                let f_m = riesz_kernel_value(d, j, r - h);
-                let f_0 = riesz_kernel_value(d, j, r);
-                let f_p = riesz_kernel_value(d, j, r + h);
-                let f_pp = riesz_kernel_value(d, j, r + 2.0 * h);
+                let f_mm = riesz_kernel_value(d, (j) as f64, r - 2.0 * h);
+                let f_m = riesz_kernel_value(d, (j) as f64, r - h);
+                let f_0 = riesz_kernel_value(d, (j) as f64, r);
+                let f_p = riesz_kernel_value(d, (j) as f64, r + h);
+                let f_pp = riesz_kernel_value(d, (j) as f64, r + 2.0 * h);
                 let d2 = (-f_mm + 16.0 * f_m - 30.0 * f_0 + 16.0 * f_p - f_pp) / (12.0 * h * h);
                 let d1 = (f_mm - 8.0 * f_m + 8.0 * f_p - f_pp) / (12.0 * h);
                 let lhs = -(d2 + (d as f64 - 1.0) * d1 / r);
-                let rhs = riesz_kernel_value(d, j - 1, r);
+                let rhs = riesz_kernel_value(d, (j - 1) as f64, r);
                 let abs = (lhs - rhs).abs();
                 let scale = lhs.abs().max(rhs.abs()).max(1.0);
                 assert!(
@@ -33449,7 +33449,7 @@ mod tests {
                 let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
                 let coeff =
                     sign * binom(a + b - j - 1, a - j) * kappa_sq.powi(-((a + b - j) as i32));
-                expected += coeff * riesz_kernel_value(d, j, r);
+                expected += coeff * riesz_kernel_value(d, (j) as f64, r);
             }
             let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
             for ell in 1..=b {
@@ -33484,7 +33484,7 @@ mod tests {
         let s = 2usize;
         let q = 1usize;
         let r = 1.3_f64;
-        let target = riesz_kernel_value(d, 2 * m + 2 * s - q, r);
+        let target = riesz_kernel_value(d, (2 * m + 2 * s - q) as f64, r);
         let kappas = [1.0_f64, 0.1, 0.01, 0.001];
         let mut prev_err = f64::INFINITY;
         for &kappa in &kappas {
@@ -33522,7 +33522,7 @@ mod tests {
         let s = 2usize;
         let q = 1usize;
         let r = 1.3_f64;
-        let finite_part = riesz_kernel_value(d, 2 * m + 2 * s - q, r);
+        let finite_part = riesz_kernel_value(d, (2 * m + 2 * s - q) as f64, r);
         let kappa_hi = 0.1_f64;
         let kappa_lo = 0.01_f64;
         let hi = isotropic_duchon_penalty(q, d, m, s, kappa_hi, r);
@@ -33569,7 +33569,7 @@ mod tests {
                 max_order: usize,
             ) -> Vec<f64> {
                 debug_assert_eq!(d % 2, 1);
-                let value = super::closed_form_penalty::riesz_kernel_value(d, j, r);
+                let value = super::closed_form_penalty::riesz_kernel_value(d, (j) as f64, r);
                 let p = 2 * j as i32 - d as i32;
                 let mut out = Vec::with_capacity(max_order + 1);
                 out.push(value);
@@ -33697,10 +33697,10 @@ mod tests {
         let mut coeff = 1.0_f64;
         let mut expected = 0.0_f64;
         for n in 0..80 {
-            expected += coeff * riesz_kernel_value(d, n0 + n, r);
+            expected += coeff * riesz_kernel_value(d, (n0 + n) as f64, r);
             coeff *= -((b + n) as f64) * kappa * kappa / ((n + 1) as f64);
         }
-        let leading = riesz_kernel_value(d, n0, r);
+        let leading = riesz_kernel_value(d, (n0) as f64, r);
         let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
         let rel = (got - expected).abs() / expected.abs().max(1e-300);
         assert!(
