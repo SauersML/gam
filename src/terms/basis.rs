@@ -10889,7 +10889,45 @@ fn duchon_closed_form_operator_penalty_converges(
     let four_ms = 4.0 * (p_order as f64 + s_order);
     let dp2q = (dimension + 2 * q) as f64;
     let four_m = (4 * p_order) as f64;
-    four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1
+    let uv_ir_ok = four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1;
+    if !uv_ir_ok {
+        return false;
+    }
+    // CPD-adequacy gate (Wendland Thm 8.17 / 8.18). The Lebesgue pair
+    // block is `S_q[i, j] ∝ R_J^d(|c_i − c_j|)` with `J = 2(p+s) − q`.
+    // This is a *conditionally* positive-definite kernel; PSD after
+    // projection onto the polynomial-orthogonal complement requires the
+    // spec's polynomial null-space order `p_order` to be at least the
+    // kernel's CPD order. For TPS (d=2, p=2, s=0, q=2) this reduces
+    // to the standard `p ≥ 2` requirement; for fractional `s` it tightens
+    // the existing UV/IR check exactly where it was silently letting
+    // non-CPD kernels through (e.g. d=8, p=2, s=3.5, q ∈ {1, 2} where
+    // 2J − d ∈ {12, 10} are non-negative even integers but the
+    // log-case CPD order is `(2J − d)/2 + 1 ∈ {7, 6}`, far above
+    // `p_order = 2`).
+    // β = 2J − d where J = 2(p+s) − q. Equivalently β = 4(p+s) − 2q − d
+    // = four_ms − dp2q. Stays in f64 end-to-end so fractional `s` flows.
+    let beta = four_ms - dp2q;
+    if beta < 0.0 {
+        return false;
+    }
+    const LOG_EPS: f64 = 1e-12;
+    let n_f = (beta / 2.0).round();
+    let is_log_case = dimension % 2 == 0
+        && n_f >= 0.0
+        && (n_f * 2.0 - beta).abs() < LOG_EPS;
+    let cpd_required = if is_log_case {
+        // Log case: kernel `c · r^{2n}(ln r + A_n)` is CPD of order n + 1
+        // (Wendland Thm 8.18). TPS sanity: d=2, J=2, n=1 → CPD order 2,
+        // matched exactly by the Linear null space (constants + linear).
+        (n_f as usize).saturating_add(1)
+    } else {
+        // Non-log case: kernel `c · r^β` is CPD of order ⌈(β+1)/2⌉
+        // (Wendland Thm 8.17). For odd β (the typical odd-d Riesz
+        // regime) this is `(β+1)/2`; for fractional β it rounds up.
+        ((beta + 1.0) / 2.0).ceil() as usize
+    };
+    p_order >= cpd_required
 }
 
 pub fn operator_penalty_candidates_closed_form(
@@ -28448,21 +28486,55 @@ mod tests {
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
-    // Documented known limitation (not a deferred test marker): the d=8
-    // fractional joint-null-space property does NOT currently hold for
-    // `nullspace_order = Linear` with fractional s ∈ (3, 4). At p=2, s=3.5,
-    // 30 centers, the joint penalty picks up 15 / 30 large-magnitude
-    // negative eigenvalues, meaning at least one of the analytic q=1 / q=2
-    // Sobolev pair blocks is non-PSD in that regime. The d=1, 2, 3, 4
-    // fractional cases all clear the joint-null-space property exactly,
-    // so the issue is isolated to high-d × low-p × fractional-s. A
-    // closed-form fix needs a careful re-derivation of the partial-Δ-power
-    // applied to `r^(2(m+s)-d)` for non-integer `m+s` in the Riesz block
-    // chain — orthogonal to threading `s: f64` through the signatures.
-    // No regression test exists for d=8 fractional joint-null because no
-    // implementation currently passes it; this comment records the gap
-    // so a future PR that re-derives the high-d kernel can land both the
-    // implementation and the matching test together.
+    /// Fractional `s = 3.5` in d=8, Linear null space. The pair-block
+    /// closed-form `R_J^d` for `q ∈ {1, 2}` lands in the log case (since
+    /// `2J − d ∈ {12, 10}` are non-negative even integers for `2s = 7`
+    /// integer at d=8) with Wendland CPD order `(2J−d)/2 + 1 ∈ {7, 6}` —
+    /// way above the spec's `p_order = 2`. Without the CPD-adequacy gate
+    /// in `duchon_closed_form_operator_penalty_converges`, the closed-form
+    /// matrix at centers was non-PSD (15 of 30 negative eigenvalues
+    /// before the fix). The gate now forces the collocation fallback
+    /// `D_qᵀ D_q` (PSD by construction) for any q whose Wendland CPD
+    /// order exceeds the polynomial null space we built. This test pins
+    /// that the d=8 × fractional-s high-`d` regime — the bench config
+    /// the fractional refactor was designed to unlock — works end-to-end
+    /// with the joint-null-space property intact.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_8d_fractional_s() {
+        let mut rows = Vec::new();
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..80 {
+            let mut row = [0.0_f64; 8];
+            for r in row.iter_mut() {
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                *r = (z >> 11) as f64 / (1_u64 << 53) as f64;
+            }
+            rows.push(row);
+        }
+        let n = rows.len();
+        let d = 8;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                data[[i, j]] = v;
+            }
+        }
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
+            length_scale: None,
+            power: 3.5,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
 
     #[test]
     fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
