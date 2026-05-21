@@ -38,6 +38,8 @@ _OUTPUT_LOCK = threading.Lock()
 class _TerminalOutputSanitizer:
     def __init__(self) -> None:
         self._state = "normal"
+        self._line_start = True
+        self._pending_indent = ""
 
     def feed(self, text: str) -> str:
         out: list[str] = []
@@ -47,9 +49,9 @@ class _TerminalOutputSanitizer:
                 if ch == "\x1b":
                     self._state = "esc"
                 elif ch == "\r":
-                    out.append("\n")
+                    self._emit(out, "\n")
                 elif ch in "\n\t" or (ord(ch) >= 0x20 and ch != "\x7f"):
-                    out.append(ch)
+                    self._emit(out, ch)
             elif state == "esc":
                 if ch == "[":
                     self._state = "csi"
@@ -74,19 +76,29 @@ class _TerminalOutputSanitizer:
                     self._state = "string_esc"
             elif state == "string_esc":
                 self._state = "normal" if ch == "\\" else "string"
-        return _strip_terminal_indent("".join(out))
+        return "".join(out)
 
     def flush(self) -> str:
+        tail = self._pending_indent
         self._state = "normal"
-        return ""
+        self._line_start = True
+        self._pending_indent = ""
+        return tail
 
-
-def _strip_terminal_indent(text: str) -> str:
-    parts = []
-    for part in text.splitlines(keepends=True):
-        stripped = part.lstrip(" \t")
-        parts.append(stripped if stripped.startswith("[") else part)
-    return "".join(parts)
+    def _emit(self, out: list[str], ch: str) -> None:
+        if self._line_start and ch in " \t":
+            self._pending_indent += ch
+            return
+        if self._line_start:
+            if ch == "[":
+                self._pending_indent = ""
+            else:
+                out.append(self._pending_indent)
+                self._pending_indent = ""
+            self._line_start = False
+        out.append(ch)
+        if ch == "\n":
+            self._line_start = True
 
 
 def _write_stream(sink: Any, text: str) -> None:
