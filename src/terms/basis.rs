@@ -10175,7 +10175,7 @@ pub fn closed_form_anisotropic_pair_block_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
     m: usize,
-    s: f64,
+    s: usize,
     aniso_log_scales: Option<&[f64]>,
 ) -> Array2<f64> {
     let k = centers.nrows();
@@ -10191,20 +10191,9 @@ pub fn closed_form_anisotropic_pair_block_pure(
     let j_prefactor = eta_centered.iter().sum::<f64>().exp();
 
     // Median off-diagonal anisotropic distance is needed only when the exact
-    // pure-Duchon finite self-pair is unavailable. `pure_duchon_self_pair_value`
-    // currently only handles integer `s`; for fractional `s` we fall through to
-    // the diagonal-epsilon path which the analytic radial chain handles at
-    // any real `s` via `riesz_kernel_value`.
-    let s_int = if s.is_finite() && s >= 0.0 && s.fract() == 0.0 {
-        Some(s as usize)
-    } else {
-        None
-    };
-    let pure_diag_exact = s_int
-        .and_then(|si| {
-            closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, &eta_centered)
-        })
-        .is_some();
+    // pure-Duchon finite self-pair is unavailable.
+    let pure_diag_exact =
+        closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, &eta_centered).is_some();
     let r_eps = if pure_diag_exact {
         0.0
     } else {
