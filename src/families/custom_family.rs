@@ -9118,12 +9118,18 @@ pub(crate) struct StrictSpdLmStats {
 /// from producing arbitrary ridges; if the cap is hit, the bare strict
 /// error propagates so the caller can route to a different optimization
 /// path (e.g. sparse/gradient-only standard REML at full data).
+/// Shared escalation/ridge-growth schedule used by the three
+/// `strict_*_spd_with_lm_continuation` helpers. Hoisted here so a single
+/// change updates the solve / inverse / logdet paths in lockstep.
+const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
+const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
+
 pub(crate) fn strict_solve_spd_with_lm_continuation(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
 ) -> Result<(Array1<f64>, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = 16;
-    const RIDGE_GROWTH: f64 = 10.0;
+    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
+    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
 
     if let Ok(solution) = strict_solve_spd(matrix, rhs) {
         return Ok((solution, StrictSpdLmStats::default()));
@@ -9233,8 +9239,8 @@ fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
 pub(crate) fn strict_inverse_spd_with_lm_continuation(
     matrix: &Array2<f64>,
 ) -> Result<(Array2<f64>, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = 16;
-    const RIDGE_GROWTH: f64 = 10.0;
+    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
+    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
 
     if let Ok(inv) = strict_inverse_spd(matrix) {
         return Ok((inv, StrictSpdLmStats::default()));
@@ -9333,8 +9339,8 @@ fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
 pub(crate) fn strict_logdet_spd_with_lm_continuation(
     matrix: &Array2<f64>,
 ) -> Result<(f64, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = 16;
-    const RIDGE_GROWTH: f64 = 10.0;
+    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
+    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
 
     if let Ok(logdet) = strict_logdet_spd(matrix) {
         return Ok((logdet, StrictSpdLmStats::default()));
