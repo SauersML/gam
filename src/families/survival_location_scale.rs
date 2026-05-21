@@ -4621,20 +4621,7 @@ struct TimeBlockPrepared {
 }
 
 fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
-    let active_rows: Vec<usize> = (0..lower_bounds.len())
-        .filter(|&i| lower_bounds[i].is_finite())
-        .collect();
-    if active_rows.is_empty() {
-        return None;
-    }
-    let p = lower_bounds.len();
-    let mut a = Array2::<f64>::zeros((active_rows.len(), p));
-    let mut b = Array1::<f64>::zeros(active_rows.len());
-    for (row, &idx) in active_rows.iter().enumerate() {
-        a[[row, idx]] = 1.0;
-        b[row] = lower_bounds[idx];
-    }
-    Some(LinearInequalityConstraints { a, b })
+    LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
 fn structural_time_coefficient_lower_bounds(
