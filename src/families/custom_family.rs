@@ -927,15 +927,11 @@ pub fn exact_outer_order_with_outer_hvp(
 
 /// Realized outer-derivative policy at the current problem size.
 ///
-/// Capability (the family can produce exact 2nd-order calculus) is independent
-/// of policy (we ask for it on *this* problem). At biobank scale the dense
-/// outer Hessian is mathematically available but economically catastrophic:
-/// a single `n=320 000`, `psi_dim=64` evaluation costs 200–600 s of wall-clock
-/// and dominates the total fit. Quasi-Newton outer BFGS converges to the same
-/// stationary point using only successive analytic gradients — this is **not**
-/// a feature drop, it is the optimization-theory-standard convergent
-/// alternative whose per-eval cost is `O(n · p_total · K)` rather than the
-/// Hessian's `O(n · p_total² · K)`.
+/// Capability (the family can produce exact second-order calculus) controls
+/// whether the Hessian is declared. Runtime cost controls only representation
+/// and staging choices below this layer. Large problems must stay on the exact
+/// analytic Hessian path and use an operator representation when dense assembly
+/// is too expensive; they are not demoted to first-order BFGS here.
 ///
 /// `OuterDerivativePolicy` records the family's *capability*, the *predicted
 /// per-eval cost* for both gradient-only and Hessian paths, and exposes the
@@ -957,7 +953,8 @@ pub struct OuterDerivativePolicy {
     /// What exact calculus the family advertises in principle.
     pub capability: ExactOuterDerivativeOrder,
     /// Predicted per-eval work for one `ValueGradientHessian` evaluation.
-    /// Rounded conservatively *up* via `saturating_mul`.
+    /// Rounded conservatively *up* via `saturating_mul`. Informational for
+    /// representation and diagnostics; it does not disable Hessian capability.
     pub predicted_hessian_work: u128,
     /// Predicted per-eval work for one `ValueAndGradient` evaluation.
     /// Rounded conservatively *up* via `saturating_mul`.
@@ -988,13 +985,6 @@ pub struct OuterDerivativePolicy {
 }
 
 impl OuterDerivativePolicy {
-    /// Universal full-data outer-Hessian work ceiling, in flop-equivalent
-    /// units. Above this the optimizer requests `ValueAndGradient` only;
-    /// quasi-Newton BFGS / L-BFGS picks up curvature from successive
-    /// gradients. This is **convergent** to the exact MLE, not a feature
-    /// drop — see the `OuterDerivativePolicy` doc-comment.
-    pub const OUTER_HESSIAN_WORK_BUDGET: u128 = 25_000_000;
-
     /// Per-eval gradient work ceiling above which the κ schedule switches
     /// to the staged pilot/polish path. At biobank scale (n ≳ 100 k) even
     /// the gradient sweep takes minutes per outer iter; subsampling the
@@ -1036,20 +1026,15 @@ impl OuterDerivativePolicy {
 
     /// Outer Hessian declaration for the outer-strategy planner.
     ///
-    /// `Either` ⇔ capability has Hessian *and* predicted Hessian work is
-    /// within the universal budget. Otherwise `Unavailable`, which routes
-    /// the planner to gradient-only BFGS / L-BFGS — still convergent, just
-    /// without the per-step Newton acceleration.
+    /// `Either` ⇔ capability has Hessian. Work estimates select dense vs
+    /// operator assembly later; they must not erase analytic second-order
+    /// capability from the planner.
     pub fn declared_hessian_form(&self) -> crate::solver::outer_strategy::DeclaredHessianForm {
         use crate::solver::outer_strategy::DeclaredHessianForm;
         if !self.capability.has_hessian() {
             return DeclaredHessianForm::Unavailable;
         }
-        if self.predicted_hessian_work <= Self::OUTER_HESSIAN_WORK_BUDGET {
-            DeclaredHessianForm::Either
-        } else {
-            DeclaredHessianForm::Unavailable
-        }
+        DeclaredHessianForm::Either
     }
 
     /// True when the κ optimizer should auto-route through the staged
