@@ -17,10 +17,7 @@ use gam::families::bernoulli_marginal_slope::{
     LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::families::family_meta::{
-    family_to_link, family_to_string, inverse_link_to_binomial_family, is_binomial_family,
-    pretty_familyname,
-};
+use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,
@@ -632,8 +629,8 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
 
     Err(format!(
         "--firth currently requires {}; resolved family is {}",
-        pretty_familyname(LikelihoodFamily::BinomialLogit),
-        pretty_familyname(ctx.family)
+        LikelihoodFamily::BinomialLogit.pretty_name(),
+        ctx.family.pretty_name()
     ))
 }
 
@@ -1011,7 +1008,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let effective_link = link_choice
         .as_ref()
         .map(|c| c.link)
-        .unwrap_or_else(|| family_to_link(family));
+        .unwrap_or_else(|| family.link_function());
 
     let formula_linkwiggle = parsed.linkwiggle.clone();
     if parsed.timewiggle.is_some() {
@@ -1127,7 +1124,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                         .to_string(),
                 );
             }
-            if !is_binomial_family(family) {
+            if !family.is_binomial() {
                 return Err(
                     "flexible(...) links currently require a binomial family/link".to_string(),
                 );
@@ -1403,7 +1400,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 mixture_state: saved_mixture_state_from_fit(&saved_fit),
                 sas_state: saved_sas_state_from_fit(&saved_fit),
             },
-            family_to_string(family).to_string(),
+            family.name().to_string(),
         );
         payload.unified = Some(saved_fit.clone());
         payload.fit_result = Some(saved_fit.clone());
@@ -2036,7 +2033,7 @@ fn run_fitwith_predict_noise(
         return Ok(());
     }
 
-    if !is_binomial_family(family) {
+    if !family.is_binomial() {
         return Err(
             "--predict-noise currently supports Gaussian and binomial families".to_string(),
         );
@@ -3636,7 +3633,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
     progress.advance_workflow(3);
 
-    let link = family_to_link(family);
+    let link = family.link_function();
     let weights = Array1::ones(ds.values.nrows());
     let offset = Array1::zeros(ds.values.nrows());
 
@@ -4530,7 +4527,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_distribution: Some(fitted_inverse_link.saved_string()),
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
-                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                LikelihoodFamily::RoystonParmar.name().to_string(),
             );
             payload.unified = Some(fit_result.clone());
             payload.fit_result = Some(fit_result);
@@ -4918,7 +4915,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_distribution: Some("probit".to_string()),
                     frailty: save_frailty,
                 },
-                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                LikelihoodFamily::RoystonParmar.name().to_string(),
             );
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
@@ -5347,7 +5344,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_distribution: None,
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
-                family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+                LikelihoodFamily::RoystonParmar.name().to_string(),
             );
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
@@ -5768,7 +5765,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 survival_distribution: None,
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
-            family_to_string(LikelihoodFamily::RoystonParmar).to_string(),
+            LikelihoodFamily::RoystonParmar.name().to_string(),
         );
         payload.unified = Some(fit_result.clone());
         payload.fit_result = Some(fit_result);
@@ -6460,7 +6457,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     progress.set_stage("report", "generating html");
     let input = report::ReportInput {
         model_path: args.model.display().to_string(),
-        family_name: pretty_familyname(family).to_string(),
+        family_name: family.pretty_name().to_string(),
         model_class: format!("{:?}", model.predict_model_class()),
         formula: model.formula.clone(),
         n_obs,
@@ -7886,7 +7883,7 @@ fn resolve_family(
             if explicit != from_link {
                 return Err(format!(
                     "--family '{}' conflicts with --link '{}'",
-                    family_to_string(explicit),
+                    explicit.name(),
                     link_choice_to_string(choice)
                 ));
             }
@@ -7998,7 +7995,7 @@ fn resolve_binomial_inverse_link_for_fit(
         | LikelihoodFamily::BinomialCLogLog => Ok(InverseLink::Standard(effective_link)),
         _ => Err(format!(
             "{context} is only available for binomial links, got {}",
-            family_to_string(family)
+            family.name()
         )),
     }
 }
@@ -8465,7 +8462,7 @@ fn build_model_summary(
     }
 
     ModelSummary {
-        family: pretty_familyname(family).to_string(),
+        family: family.pretty_name().to_string(),
         deviance_explained,
         reml_score: Some(fit.reml_score),
         parametric_terms,
@@ -9076,11 +9073,11 @@ mod tests {
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
-        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel, family_to_string,
+        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel,
         fit_result_from_external, linkname, load_dataset_projected, parse_formula,
         parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
         parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
-        prepend_id_column_to_prediction_csv, pretty_familyname, required_columns_for_fit,
+        prepend_id_column_to_prediction_csv, required_columns_for_fit,
         resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
         write_gaussian_location_scale_prediction_csv, write_prediction_csv,
         write_survival_binary_prediction_csv, write_survival_prediction_csv,
@@ -10700,7 +10697,7 @@ mod tests {
                 mixture_state: None,
                 sas_state: None,
             },
-            family_to_string(family),
+            family.name(),
         );
         payload.fit_result = Some(fit_result);
         payload.link = Some(linkname(link).to_string());
@@ -10988,11 +10985,11 @@ mod tests {
     #[test]
     fn pretty_familynames_are_human_readable() {
         assert_eq!(
-            pretty_familyname(LikelihoodFamily::BinomialLogit),
+            LikelihoodFamily::BinomialLogit.pretty_name(),
             "Binomial Logit"
         );
         assert_eq!(
-            pretty_familyname(LikelihoodFamily::GaussianIdentity),
+            LikelihoodFamily::GaussianIdentity.pretty_name(),
             "Gaussian Identity"
         );
     }

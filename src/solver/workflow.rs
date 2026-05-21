@@ -2178,7 +2178,6 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
 // High-level formula-to-fit API
 // ---------------------------------------------------------------------------
 
-use crate::families::family_meta::{family_to_string, is_binomial_family};
 use crate::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     add_survival_time_derivative_guard_offset, append_zero_tail_columns,
@@ -2475,7 +2474,7 @@ pub fn resolve_family(
             if explicit_family != from_link {
                 return Err(format!(
                     "family '{}' conflicts with link",
-                    family_to_string(explicit_family)
+                    explicit_family.name()
                 ));
             }
         }
@@ -2824,7 +2823,7 @@ fn materialize_standard<'a>(
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
 
     let wiggle = effective_linkwiggle.as_ref().and_then(|cfg| {
-        if !is_binomial_family(family) {
+        if !family.is_binomial() {
             return None;
         }
         let link_kind = link_choice
@@ -3996,7 +3995,7 @@ fn materialize_location_scale<'a>(
         );
     }
 
-    if is_binomial_family(family) {
+    if family.is_binomial() {
         let link_kind = link_choice
             .as_ref()
             .map(|c| InverseLink::Standard(c.link))
