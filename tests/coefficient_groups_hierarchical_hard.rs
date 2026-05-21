@@ -73,18 +73,15 @@ fn mixed_term_spec() -> TermCollectionSpec {
 fn dense_with_mean(spec: &PenaltySpec, p: usize) -> (Array2<f64>, Array1<f64>) {
     match spec {
         PenaltySpec::DenseWithMean { matrix, prior_mean } => {
-            let mean = prior_mean
-                .clone()
-                .evaluate_for_test(p)
-                .unwrap_or_else(|| {
-                    // Fallback: walk the public enum.  We compute the mean by
-                    // probing well-known constructors.  If the helper isn't
-                    // available, panic so the missing surface is visible.
-                    panic!(
-                        "test helper requires `CoefficientPriorMean::evaluate_for_test`; \
+            let mean = prior_mean.clone().evaluate_for_test(p).unwrap_or_else(|| {
+                // Fallback: walk the public enum.  We compute the mean by
+                // probing well-known constructors.  If the helper isn't
+                // available, panic so the missing surface is visible.
+                panic!(
+                    "test helper requires `CoefficientPriorMean::evaluate_for_test`; \
                          this surface does not exist in the public API yet"
-                    )
-                });
+                )
+            });
             (matrix.clone(), mean)
         }
         other => panic!("expected DenseWithMean, got {other:?}"),
@@ -145,7 +142,10 @@ fn cross_term_group_linear_plus_random_effect_penalty_quadratic_matches_analytic
 
     // The realized group penalty must be the LAST entry in penalty_specs;
     // it must be a DenseWithMean with identity on the active columns.
-    let group_penalty = realized.penalty_specs.last().expect("group penalty present");
+    let group_penalty = realized
+        .penalty_specs
+        .last()
+        .expect("group penalty present");
     let (matrix, _) = match group_penalty {
         PenaltySpec::DenseWithMean { matrix, prior_mean } => (matrix.clone(), prior_mean.clone()),
         other => panic!("expected DenseWithMean, got {other:?}"),
@@ -158,7 +158,10 @@ fn cross_term_group_linear_plus_random_effect_penalty_quadratic_matches_analytic
         .find(|(name, _)| name == "lin_a_plus_re_g")
         .map(|(_, cols)| cols.clone())
         .expect("group columns recorded");
-    assert!(active_cols.len() >= 2, "must span linear + at least one RE coef");
+    assert!(
+        active_cols.len() >= 2,
+        "must span linear + at least one RE coef"
+    );
 
     // Build a deterministic β with all entries nonzero.
     let mut beta = Array1::<f64>::zeros(p);
@@ -167,11 +170,7 @@ fn cross_term_group_linear_plus_random_effect_penalty_quadratic_matches_analytic
     }
 
     // Analytic quadratic with μ=0: sum of β_j^2 for active columns.
-    let analytic = 0.5
-        * active_cols
-            .iter()
-            .map(|&j| beta[j] * beta[j])
-            .sum::<f64>();
+    let analytic = 0.5 * active_cols.iter().map(|&j| beta[j] * beta[j]).sum::<f64>();
     let matrix_quad = penalty_quadratic(&matrix, &Array1::zeros(p), &beta);
     assert!(
         (matrix_quad - analytic).abs() < 1e-12,

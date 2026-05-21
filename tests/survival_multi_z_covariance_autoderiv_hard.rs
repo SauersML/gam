@@ -242,8 +242,8 @@ fn t03_correlated_spd_sigma_classifies_full_and_quadratic_form_matches() {
                 scores[[i, a]] = s;
             }
         }
-        let cov = marginal_slope_covariance_from_scores(scores.view(), &weights)
-            .expect("classifier ok");
+        let cov =
+            marginal_slope_covariance_from_scores(scores.view(), &weights).expect("classifier ok");
         assert_eq!(
             cov.shape(),
             MarginalSlopeCovarianceShape::Full,
@@ -267,9 +267,7 @@ fn t03_correlated_spd_sigma_classifies_full_and_quadratic_form_matches() {
             );
         }
     }
-    println!(
-        "t03 summary: full={full_hits}/{seeds}, max_quadratic_form_rel_err={max_rel_err:.3e}"
-    );
+    println!("t03 summary: full={full_hits}/{seeds}, max_quadratic_form_rel_err={max_rel_err:.3e}");
 }
 
 // ====================================================================
@@ -363,8 +361,7 @@ fn t05_weights_select_correlated_half() {
     // Uniform
     let w_uniform = Array1::<f64>::from_elem(n, 1.0);
 
-    let cov_corr =
-        marginal_slope_covariance_from_scores(scores.view(), &w_corr).expect("cov corr");
+    let cov_corr = marginal_slope_covariance_from_scores(scores.view(), &w_corr).expect("cov corr");
     let cov_indep =
         marginal_slope_covariance_from_scores(scores.view(), &w_indep).expect("cov indep");
     let cov_uniform =
@@ -381,7 +378,10 @@ fn t05_weights_select_correlated_half() {
     // verify "follows weighted covariance".
     // Use the quadratic form on v=[1,-1]/sqrt(2): this is small when col1
     // and col2 are highly correlated and ~variance otherwise.
-    let v = [std::f64::consts::FRAC_1_SQRT_2, -std::f64::consts::FRAC_1_SQRT_2];
+    let v = [
+        std::f64::consts::FRAC_1_SQRT_2,
+        -std::f64::consts::FRAC_1_SQRT_2,
+    ];
     let q_corr = cov_corr.quadratic_form(&v).expect("qf corr");
     let q_indep = cov_indep.quadratic_form(&v).expect("qf indep");
     println!("t05 quadratic form on (1,-1)/√2: corr={q_corr:.3e}, indep={q_indep:.3e}");
@@ -611,22 +611,20 @@ fn t10_k_eq_1_always_diagonal_or_err() {
         let w = ones_weights(n);
         let result = marginal_slope_covariance_from_scores(col.view(), &w);
         match result {
-            Ok(cov) => {
-                match cov {
-                    MarginalSlopeCovariance::Diagonal(diag) => {
-                        assert_eq!(
-                            diag.len(),
-                            1,
-                            "case {case}: Diagonal must have length 1, got {}",
-                            diag.len()
-                        );
-                    }
-                    other => panic!(
-                        "case {case}: K=1 must return Diagonal, got {:?}",
-                        other.shape()
-                    ),
+            Ok(cov) => match cov {
+                MarginalSlopeCovariance::Diagonal(diag) => {
+                    assert_eq!(
+                        diag.len(),
+                        1,
+                        "case {case}: Diagonal must have length 1, got {}",
+                        diag.len()
+                    );
                 }
-            }
+                other => panic!(
+                    "case {case}: K=1 must return Diagonal, got {:?}",
+                    other.shape()
+                ),
+            },
             Err(_) => {
                 // Err is also acceptable (e.g. degenerate zero variance).
             }
