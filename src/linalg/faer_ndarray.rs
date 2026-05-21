@@ -613,9 +613,7 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
             let chunk_slice = wx_chunk
                 .as_slice_mut()
                 .expect("row-major chunk is contiguous");
-            if x_is_row_major
-                && let (Some(x_all), Some(w_all)) = (x.as_slice(), w_slice_opt)
-            {
+            if x_is_row_major && let (Some(x_all), Some(w_all)) = (x.as_slice(), w_slice_opt) {
                 for local in 0..rows {
                     let src = start + local;
                     let wi = w_all[src];
@@ -707,9 +705,7 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
             let chunk_slice = wy_chunk
                 .as_slice_mut()
                 .expect("row-major chunk is contiguous");
-            if y_is_row_major
-                && let (Some(y_all), Some(w_all)) = (y.as_slice(), w_slice_opt)
-            {
+            if y_is_row_major && let (Some(y_all), Some(w_all)) = (y.as_slice(), w_slice_opt) {
                 for local in 0..rows {
                     let src = start + local;
                     let wi = w_all[src];
