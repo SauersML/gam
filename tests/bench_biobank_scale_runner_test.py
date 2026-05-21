@@ -38,6 +38,15 @@ def _write_csv(path: Path, rows: typing.Sequence[typing.Mapping[str, object]]) -
 
 
 class BiobankScaleRunnerTests(unittest.TestCase):
+    def test_terminal_output_sanitizer_removes_cursor_controls_across_chunks(self) -> None:
+        sanitizer = _RUNNER._TerminalOutputSanitizer()
+        text = (
+            sanitizer.feed("progress\r        [1s] ok \x1b[")
+            + sanitizer.feed("2K next\x1b]0;title")
+            + sanitizer.feed("\x07 done\n")
+        )
+        self.assertEqual(text, "progress\n[1s] ok  next done\n")
+
     def test_default_biobank_matrix_keeps_400k_binomial_marginal_slope_lane(self) -> None:
         cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
 

@@ -1506,18 +1506,14 @@ def heartbeat_loop(proc: subprocess.Popen[bytes], cmd_preview: str, stop_event: 
         # warning at 80% so CI logs grep on `[HEARTBEAT-WARN]` to find
         # near-timeout cases without needing to compute timing manually.
         if timeout is not None and not warned_80pct and elapsed >= 0.8 * timeout:
-            print(
+            _print_stderr(
                 f"[HEARTBEAT-WARN] elapsed={elapsed:.1f}s exceeded 80% of cmd_timeout={timeout:.0f}s",
-                file=sys.stderr,
-                flush=True,
             )
             warned_80pct = True
-        print(
+        _print_stderr(
             f"[HEARTBEAT] elapsed={elapsed:8.1f}s cmd='{cmd_preview}' pid={proc.pid} "
             f"cpu={snap.get('cpu_pct', 'n/a')}% mem={snap.get('mem_pct', 'n/a')}% "
             f"rss={fmt_kib(snap.get('rss_kib'))} vsz={fmt_kib(snap.get('vsz_kib'))}",
-            file=sys.stderr,
-            flush=True,
         )
         wait_sec = HEARTBEAT_INITIAL_INTERVAL_SEC if elapsed < HEARTBEAT_INITIAL_WINDOW_SEC else HEARTBEAT_INTERVAL_SEC
         if stop_event.wait(wait_sec):
@@ -1548,14 +1544,14 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
 
     def pump(pipe: Any, sink: Any, capture: list[str], phase_capture: list[str] | None = None) -> None:
         total = 0
+        sanitizer = _TerminalOutputSanitizer()
         try:
             while True:
                 chunk = pipe.read(4096)
                 if not chunk:
                     break
-                text = chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-                sink.write(text)
-                sink.flush()
+                text = sanitizer.feed(chunk.decode("utf-8", errors="replace"))
+                _write_stream(sink, text)
                 capture.append(text)
                 total += len(text)
                 if total > MAX_CAPTURE_CHARS:
@@ -1581,6 +1577,10 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
                         ):
                             phase_capture.append(line)
         finally:
+            tail = sanitizer.flush()
+            if tail:
+                _write_stream(sink, tail)
+                capture.append(tail)
             pipe.close()
 
     t_out = threading.Thread(target=pump, args=(proc.stdout, sys.stdout, out_buf), daemon=True)
@@ -1613,7 +1613,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, s
             f"[HEARTBEAT] command-timeout rc=124 timeout_sec={_CMD_TIMEOUT_SEC} "
             f"pid={proc.pid} cmd='{preview}'"
         )
-        print(msg, file=sys.stderr, flush=True)
+        _print_stderr(msg)
         # Emit the phase summary EVEN ON TIMEOUT — the most useful place
         # to see WHICH phase was running when the budget ran out.
         _emit_phase_summary("".join(phase_buf), preview, timed_out=True, rc=124)

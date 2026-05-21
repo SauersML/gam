@@ -6284,11 +6284,29 @@ pub fn reml_laml_evaluate(
         .as_ref()
         .filter(|r: &&Array1<f64>| r.len() == hop.dim());
     if let Some(r) = kkt_residual_vec {
-        let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
-        rhs.column_mut(0).assign(r);
-        let w_mat = hop.solve_multi(&rhs);
-        let w: Array1<f64> = w_mat.column(0).to_owned();
-        let cost_correction: f64 = -0.5_f64 * r.view().dot(&w);
+        // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
+        // LAML fix is active (`penalty_subspace_trace = Some`), the
+        // mathematically correct inverse here is the Moore-Penrose
+        // pseudo-inverse projected onto `range(S_+)` — not the full
+        // `H⁻¹`. The full-H solve at near-singular boundary states
+        // (the biobank survival marginal-slope pathology) amplifies
+        // floating-point noise in `r` outside `range(S_+)` by
+        // `1/σ_min(H) ≈ 10¹²`, which then propagates into a 10¹³-magnitude
+        // gradient component and traps the outer optimizer at max-iter.
+        // The projected pseudo-inverse kills any spurious null-space
+        // component of `r` before the inverse is applied, recovering
+        // the honest correction.
+        let cost_correction = if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+            let proj_r = crate::faer_ndarray::fast_atv(&kernel.u_s, r);
+            let h_proj_inv_r = kernel.h_proj_inverse.dot(&proj_r);
+            -0.5_f64 * proj_r.dot(&h_proj_inv_r)
+        } else {
+            let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
+            rhs.column_mut(0).assign(r);
+            let w_mat = hop.solve_multi(&rhs);
+            let w: Array1<f64> = w_mat.column(0).to_owned();
+            -0.5_f64 * r.view().dot(&w)
+        };
         if cost_correction.is_finite() {
             cost += cost_correction;
         }
@@ -6728,16 +6746,35 @@ pub fn reml_laml_evaluate(
     // scale only applies to the H-dependent trace terms.
     if let Some(r) = kkt_residual_vec {
         if k > 0 {
-            let mut rhs = Array2::<f64>::zeros((hop.dim(), k));
-            for (idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
-                rhs.column_mut(idx).assign(a_k_beta);
-            }
-            let solved = hop.solve_multi(&rhs);
-            for k_idx in 0..k {
-                let v_k: Array1<f64> = solved.column(k_idx).to_owned();
-                let corr: f64 = r.view().dot(&v_k);
-                if corr.is_finite() {
-                    grad[k_idx] -= corr;
+            // Gradient-side IFT correction `grad[k] -= rᵀ H⁻¹ (λ_k S_k β̂)`.
+            // Same near-singular pathology as the cost correction above:
+            // the full-H solve at boundary states amplifies floating-point
+            // noise in `r` outside `range(S_+)` by `1/σ_min(H)`, producing
+            // spurious 10¹²-fold gradient inflation. Route through
+            // `PenaltySubspaceTrace::bilinear_pseudo_inverse` whenever the
+            // rank-deficient LAML fix is active — `λ_k S_k β̂ ∈ col(S_k) ⊂
+            // range(S_+)` by construction, so the projection introduces
+            // no bias in the numerator, only the well-conditioning the
+            // problem actually has.
+            if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                for (k_idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
+                    let corr = kernel.bilinear_pseudo_inverse(r, a_k_beta);
+                    if corr.is_finite() {
+                        grad[k_idx] -= corr;
+                    }
+                }
+            } else {
+                let mut rhs = Array2::<f64>::zeros((hop.dim(), k));
+                for (idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
+                    rhs.column_mut(idx).assign(a_k_beta);
+                }
+                let solved = hop.solve_multi(&rhs);
+                for k_idx in 0..k {
+                    let v_k: Array1<f64> = solved.column(k_idx).to_owned();
+                    let corr: f64 = r.view().dot(&v_k);
+                    if corr.is_finite() {
+                        grad[k_idx] -= corr;
+                    }
                 }
             }
         }
