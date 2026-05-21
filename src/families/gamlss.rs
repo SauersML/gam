@@ -86,6 +86,20 @@ const MIN_WEIGHT: f64 = 1e-12;
 /// IRLS step. Hoisted out of each loop so all three families share the same
 /// numerical regime.
 const ETA_HARD_CLAMP: f64 = 30.0;
+
+/// Saturated `exp(η)` used by every log-link mean reconstruction in this
+/// module: clamp η into `[−ETA_HARD_CLAMP, ETA_HARD_CLAMP]` so `exp` stays
+/// finite, then floor at `MIN_WEIGHT` so downstream divisions never see
+/// exact zero. Centralising the formula here means a tolerance change
+/// propagates to all three families (Poisson / Gaussian / Gamma) without
+/// risk of one path drifting.
+#[inline]
+fn saturated_exp_eta(eta: f64) -> f64 {
+    eta.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP)
+        .exp()
+        .max(MIN_WEIGHT)
+}
+
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
@@ -12757,9 +12771,7 @@ impl CustomFamilyGenerative for PoissonLogFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
-        let mean = gamlss_rowwise_map(eta.len(), |i| {
-            eta[i].clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP).exp().max(MIN_WEIGHT)
-        });
+        let mean = gamlss_rowwise_map(eta.len(), |i| saturated_exp_eta(eta[i]));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Poisson,
@@ -12903,9 +12915,7 @@ impl CustomFamilyGenerative for GammaLogFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
-        let mean = gamlss_rowwise_map(eta.len(), |i| {
-            eta[i].clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP).exp().max(MIN_WEIGHT)
-        });
+        let mean = gamlss_rowwise_map(eta.len(), |i| saturated_exp_eta(eta[i]));
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gamma { shape: self.shape },

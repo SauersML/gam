@@ -6338,11 +6338,20 @@ pub fn reml_laml_evaluate(
     // here is the length match against the Hessian operator. `None` means the
     // caller is presenting an exact-KKT mode and the envelope identities are
     // already valid.
-    let kkt_residual_vec: Option<&Array1<f64>> = solution
-        .kkt_residual
-        .as_ref()
-        .map(ProjectedKktResidual::as_array)
-        .filter(|r: &&Array1<f64>| r.len() == hop.dim());
+    let kkt_residual_vec: Option<&Array1<f64>> = match solution.kkt_residual.as_ref() {
+        Some(residual) => {
+            let r = residual.as_array();
+            if r.len() != hop.dim() {
+                return Err(format!(
+                    "projected KKT residual length mismatch: got {}, expected {}",
+                    r.len(),
+                    hop.dim()
+                ));
+            }
+            Some(r)
+        }
+        None => None,
+    };
     let kkt_residual_correction_active = kkt_residual_vec.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
     if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
@@ -7315,8 +7324,8 @@ pub fn reml_laml_evaluate(
                  marking analytic gradient unavailable so outer optimizer does not chase a \
                  mathematically impossible descent direction. Outer-Hessian assembly skipped on \
                  this evaluation to avoid spending wall-clock on a result the optimizer would \
-                 discard. Remedy: populate BlockwiseInnerResult::kkt_residual on the convergent \
-                 path so the IFT correction grad[k] -= rᵀ·v_k can run.",
+                 discard. This means the inner solution reached the unified evaluator without \
+                 a projected KKT residual, so the IFT correction grad[k] -= rᵀ·v_k could not run.",
                 max_abs,
                 max_idx,
                 predicted_change,
@@ -19691,7 +19700,9 @@ mod tests {
         // ⇒ r = (λ₁S₁+λ₂S₂)β̂ − (X'y − X'Xβ̂) = Hβ̂ − X'y.
         // At β* = H⁻¹X'y this is identically zero.
         let kkt_residual = if attach_residual {
-            Some(ProjectedKktResidual::from_projected(&h.dot(&beta_hat) - &xty))
+            Some(ProjectedKktResidual::from_projected(
+                &h.dot(&beta_hat) - &xty,
+            ))
         } else {
             None
         };
@@ -19795,6 +19806,28 @@ mod tests {
             barrier_config: None,
             kkt_residual,
         }
+    }
+
+    #[test]
+    fn malformed_projected_kkt_residual_is_contract_error() {
+        let rho: Vec<f64> = vec![1.0, -0.5];
+        let beta_hat = array![0.1, -0.2, 0.3];
+        let mut sol = build_gaussian_solution_at_beta(&rho, beta_hat, false);
+        sol.dispersion = DispersionHandling::Fixed {
+            phi: 1.0,
+            include_logdet_h: true,
+            include_logdet_s: true,
+        };
+        sol.kkt_residual = Some(ProjectedKktResidual::from_projected(array![0.0, 0.0]));
+
+        let err = match reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None) {
+            Ok(_) => panic!("wrong-length projected KKT residual must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("projected KKT residual length mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     /// At exact KKT (r = 0) the IFT correction is identically zero.

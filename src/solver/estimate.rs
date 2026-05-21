@@ -5721,9 +5721,7 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if family.is_binomial_mixture()
-        && opts.mixture_link.is_none()
-    {
+    if family.is_binomial_mixture() && opts.mixture_link.is_none() {
         return Err(EstimationError::InvalidInput(
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
