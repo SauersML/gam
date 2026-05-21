@@ -1,7 +1,7 @@
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+#[cfg(not(test))]
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
@@ -346,12 +346,14 @@ struct InteractiveVisualizer {
 // from a panic hook (it's behind a Mutex and the panic might be holding
 // it), so we cache a clone of the fd here at activation time.
 static TTY_HANDLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+#[cfg(not(test))]
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn tty_handle_slot() -> &'static Mutex<Option<File>> {
     TTY_HANDLE.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(not(test))]
 fn install_tty_handle(handle: File) {
     if let Ok(mut g) = tty_handle_slot().lock() {
         *g = Some(handle);
@@ -364,7 +366,7 @@ fn clear_tty_handle() {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(not(test), unix))]
 fn open_dev_tty() -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -372,7 +374,7 @@ fn open_dev_tty() -> io::Result<File> {
         .open("/dev/tty")
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(test), not(unix)))]
 fn open_dev_tty() -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -385,6 +387,7 @@ fn open_dev_tty() -> io::Result<File> {
 // instead of stuck in alt-screen + raw mode, and (b) preserves the last
 // few hundred log records in whatever was capturing stderr — typically
 // the `tee` pipe in run.sh that backs the run's $RESULTS file.
+#[cfg(not(test))]
 fn install_panic_hook() {
     PANIC_HOOK_INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
