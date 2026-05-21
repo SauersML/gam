@@ -2937,12 +2937,30 @@ impl FittedModel {
             || self.baseline_timewiggle_degree.is_some()
             || self.baseline_timewiggle_penalty_orders.is_some()
             || self.baseline_timewiggle_double_penalty.is_some()
-            || self.beta_baseline_timewiggle.is_some();
-        if has_any_saved_baseline_time_wiggle && self.saved_baseline_time_wiggle()?.is_none() {
-            return Err(
-                "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
-                    .to_string(),
-            );
+            || self.beta_baseline_timewiggle.is_some()
+            || self.beta_baseline_timewiggle_by_cause.is_some();
+        let is_joint_cause_specific = self
+            .survival_cause_count
+            .is_some_and(|cause_count| cause_count > 1);
+        if has_any_saved_baseline_time_wiggle {
+            if is_joint_cause_specific {
+                let complete = self.baseline_timewiggle_knots.is_some()
+                    && self.baseline_timewiggle_degree.is_some()
+                    && self.baseline_timewiggle_penalty_orders.is_some()
+                    && self.baseline_timewiggle_double_penalty.is_some()
+                    && self.beta_baseline_timewiggle_by_cause.is_some();
+                if !complete {
+                    return Err(
+                        "saved joint cause-specific survival model has incomplete baseline-timewiggle state; expected metadata and per-cause coefficients"
+                            .to_string(),
+                    );
+                }
+            } else if self.saved_baseline_time_wiggle()?.is_none() {
+                return Err(
+                    "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
+                        .to_string(),
+                );
+            }
         }
         if self
             .survival_likelihood
