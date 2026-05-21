@@ -13569,7 +13569,7 @@ pub fn freeze_term_collection_from_design(
                     // captured during the actual basis build.
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
                     length_scale: None,
-                    power: 0,
+                    power: 0.0,
                     nullspace_order: DuchonNullspaceOrder::Zero,
                     identifiability: original_identifiability,
                     aniso_log_scales: None,
@@ -13741,7 +13741,7 @@ pub fn freeze_term_collection_from_design(
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
                 s.length_scale = *length_scale;
-                s.power = *power;
+                s.power = *power as f64;
                 s.nullspace_order = *nullspace_order;
                 s.identifiability = match identifiability_transform {
                     Some(z) => SpatialIdentifiability::FrozenTransform {
