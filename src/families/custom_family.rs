@@ -13336,14 +13336,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
     let kkt_residual = if converged {
-        exact_newton_joint_kkt_residual_for_ift(
-            family,
-            specs,
-            &states,
-            &s_lambdas,
-            ridge,
-            options.ridge_policy,
-        )?
+        match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
+            Some(gradient) => {
+                exact_newton_joint_kkt_residual_for_ift_from_gradient(
+                    &gradient,
+                    specs,
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                )?
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -17863,12 +17868,76 @@ fn projected_stationarity_inf_norm(
     .unwrap_or(raw_inf)
 }
 
+fn projected_stationarity_vector(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: Option<&LinearInequalityConstraints>,
+    known_active_rows: Option<&[usize]>,
+) -> Array1<f64> {
+    let Some(constraints) = constraints else {
+        return residual.clone();
+    };
+    projected_linear_constraint_stationarity_vector(
+        residual,
+        beta,
+        constraints,
+        known_active_rows,
+    )
+    .unwrap_or_else(|| residual.clone())
+}
+
 fn projected_linear_constraint_stationarity_inf_norm(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
     known_active_rows: Option<&[usize]>,
 ) -> Option<f64> {
+    let projected = projected_linear_constraint_stationarity_vector(
+        residual,
+        beta,
+        constraints,
+        known_active_rows,
+    )?;
+    let primal_violation = linear_constraint_primal_violation(beta, constraints)?;
+    Some(
+        projected
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+            .max(primal_violation),
+    )
+}
+
+fn linear_constraint_primal_violation(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> Option<f64> {
+    if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
+        return None;
+    }
+    let mut primal_violation = 0.0_f64;
+    for row in 0..constraints.a.nrows() {
+        if constraints.b[row] == f64::NEG_INFINITY {
+            continue;
+        }
+        if !constraints.b[row].is_finite() {
+            return None;
+        }
+        let value = constraints.a.row(row).dot(beta);
+        let slack = value - constraints.b[row];
+        if !slack.is_finite() {
+            return None;
+        }
+        primal_violation = primal_violation.max((-slack).max(0.0));
+    }
+    Some(primal_violation)
+}
+
+fn projected_linear_constraint_stationarity_vector(
+    residual: &Array1<f64>,
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    known_active_rows: Option<&[usize]>,
+) -> Option<Array1<f64>> {
     let p = beta.len();
     if residual.len() != p
         || constraints.a.ncols() != p
@@ -17877,13 +17946,11 @@ fn projected_linear_constraint_stationarity_inf_norm(
         return None;
     }
     let n_rows = constraints.a.nrows();
-    let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     // Union the slack-detected active rows with the optional QP-supplied
     // hint. Using a boolean membership table preserves a canonical row order
     // (matching the constraint matrix) so the rank-reduction below is
     // deterministic across calls.
     let mut in_active = vec![false; n_rows];
-    let mut primal_violation = 0.0_f64;
     if let Some(hint) = known_active_rows {
         for &row in hint {
             if row < n_rows && constraints.b[row].is_finite() {
@@ -17904,7 +17971,6 @@ fn projected_linear_constraint_stationarity_inf_norm(
         if !slack.is_finite() {
             return None;
         }
-        primal_violation = primal_violation.max((-slack).max(0.0));
         if in_active[row] {
             continue;
         }
@@ -17916,13 +17982,13 @@ fn projected_linear_constraint_stationarity_inf_norm(
     }
     let mut active_rows: Vec<usize> = (0..n_rows).filter(|&row| in_active[row]).collect();
     if active_rows.is_empty() {
-        return Some(raw_inf.max(primal_violation));
+        return Some(residual.clone());
     }
 
     for _ in 0..constraints.a.nrows().max(1) {
         let k = active_rows.len();
         if k == 0 {
-            return Some(raw_inf.max(primal_violation));
+            return Some(residual.clone());
         }
         let mut a_active = Array2::<f64>::zeros((k, p));
         let mut b_active = Array1::<f64>::zeros(k);
@@ -17935,7 +18001,7 @@ fn projected_linear_constraint_stationarity_inf_norm(
             rank_reduce_rows_pivoted_qr(a_active, b_active, groups);
         let k_reduced = a_reduced.nrows();
         if k_reduced == 0 {
-            return Some(raw_inf.max(primal_violation));
+            return Some(residual.clone());
         }
 
         let mut gram = a_reduced.dot(&a_reduced.t());
@@ -17948,7 +18014,7 @@ fn projected_linear_constraint_stationarity_inf_norm(
         let factor =
             match StableSolver::new("linear constraint KKT residual projection").factorize(&gram) {
                 Ok(factor) => factor,
-                Err(_) => return Some(raw_inf.max(primal_violation)),
+                Err(_) => return Some(residual.clone()),
             };
         let mut lambda = rhs;
         {
@@ -17956,7 +18022,7 @@ fn projected_linear_constraint_stationarity_inf_norm(
             factor.solve_in_place(lambda_col.as_mut());
         }
         if !lambda.iter().all(|v| v.is_finite()) {
-            return Some(raw_inf.max(primal_violation));
+            return Some(residual.clone());
         }
         let lambda_scale = lambda.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         let dual_tol = 1e-8 * lambda_scale.max(1.0);
@@ -17979,16 +18045,10 @@ fn projected_linear_constraint_stationarity_inf_norm(
             continue;
         }
 
-        let projected = residual - &a_reduced.t().dot(&lambda);
-        let stationarity = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        return Some(stationarity.max(primal_violation));
+        return Some(residual - &a_reduced.t().dot(&lambda));
     }
 
-    let mut inf = 0.0_f64;
-    for value in residual {
-        inf = inf.max(value.abs());
-    }
-    Some(inf.max(primal_violation))
+    Some(residual.clone())
 }
 
 fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
@@ -18290,16 +18350,30 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
     ridge: f64,
     ridge_policy: RidgePolicy,
 ) -> Result<Option<Array1<f64>>, String> {
-    let block_constraints = collect_block_linear_constraints(family, states, specs)?;
-    if block_constraints.iter().any(Option::is_some) {
-        return Ok(None);
-    }
     let eval = family.evaluate(states)?;
     let Some(gradient) = exact_newton_joint_gradient_from_eval(&eval, specs, states)? else {
         return Ok(None);
     };
-    let residual = exact_newton_joint_stationarity_vector_from_gradient(
+    exact_newton_joint_kkt_residual_for_ift_from_gradient(
         &gradient,
+        specs,
+        states,
+        s_lambdas,
+        ridge,
+        ridge_policy,
+    )
+}
+
+fn exact_newton_joint_kkt_residual_for_ift_from_gradient(
+    gradient: &Array1<f64>,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Option<Array1<f64>>, String> {
+    let residual = exact_newton_joint_stationarity_vector_from_gradient(
+        gradient,
         states,
         specs,
         s_lambdas,
@@ -24690,6 +24764,10 @@ mod tests {
         let inf_projected =
             projected_stationarity_inf_norm(&residual_active, &beta_active, Some(&single), None);
         assert_relative_eq!(inf_projected, 0.1_f64, epsilon = 1e-12);
+        let vec_projected =
+            projected_stationarity_vector(&residual_active, &beta_active, Some(&single), None);
+        assert_relative_eq!(vec_projected[0], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(vec_projected[1], -0.1_f64, epsilon = 1e-12);
 
         // Also verify the per-coord handling of an explicitly-unconstrained
         // row (b = -inf) in the two-row form: β_0 has a finite lower bound
@@ -24842,6 +24920,14 @@ mod tests {
             None,
         );
         assert_relative_eq!(inf_valid, 0.0_f64, epsilon = 1e-10);
+        let vec_valid = projected_stationarity_vector(
+            &residual_valid_multiplier,
+            &beta_active,
+            Some(&constraints),
+            None,
+        );
+        assert_relative_eq!(vec_valid[0], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(vec_valid[1], 0.0_f64, epsilon = 1e-10);
 
         let residual_wrong_sign = array![-3.0, -3.0];
         let inf_wrong = projected_stationarity_inf_norm(
@@ -24903,6 +24989,20 @@ mod tests {
         )
         .expect("stationarity projection should succeed");
         assert_relative_eq!(projected, 0.0_f64, epsilon = 1e-10);
+        let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_gradient(
+            &gradient,
+            std::slice::from_ref(&spec),
+            &[state.clone()],
+            &s_lambdas,
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            &[Some(constraints.clone())],
+            None,
+        )
+        .expect("KKT residual projection should succeed")
+        .expect("exact-gradient path should produce residual");
+        assert_relative_eq!(kkt_residual[0], 0.0_f64, epsilon = 1e-10);
+        assert_relative_eq!(kkt_residual[1], 0.0_f64, epsilon = 1e-10);
 
         // Wrong-signed normal residual means the active constraint wants to
         // release. That is not convergence and must remain visible.

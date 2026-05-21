@@ -6291,11 +6291,11 @@ pub fn reml_laml_evaluate(
     // corrections below are the exact first and second ρ derivatives of this
     // same scalar Newton correction under fixed-dispersion LAML.
     //
-    // Filter: callers populate `kkt_residual` only on the convergent
-    // unconstrained joint-Newton path (`custom_family.rs`
-    // `exact_newton_joint_stationarity_vector_from_gradient`); `None` means
-    // the caller is presenting an exact-KKT mode and the envelope identities
-    // are already valid.
+    // Filter: callers populate `kkt_residual` only on convergent inner paths.
+    // Constrained callers must pass the free-space/projected residual: valid
+    // active-set multipliers are normal-cone terms, not errors to correct.
+    // `None` means the caller is presenting an exact-KKT mode and the envelope
+    // identities are already valid.
     let kkt_residual_vec: Option<&Array1<f64>> = solution
         .kkt_residual
         .as_ref()
