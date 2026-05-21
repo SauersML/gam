@@ -6967,8 +6967,37 @@ pub fn reml_laml_evaluate(
         ));
     }
 
+    // Run the envelope-gradient sanity check *before* the outer-Hessian
+    // assembly. When the inner-KKT IFT correction was not applied and the
+    // envelope formula predicts a √ε-step cost change > 4·|cost| (i.e. the
+    // gradient is mathematically inconsistent with the function), the
+    // analytic gradient will be marked unavailable below. The Hessian
+    // computed from the same ill-conditioned inner state would also be
+    // untrustworthy and would just be discarded by the outer optimizer —
+    // and for biobank-scale custom families the assembly can take 20+
+    // minutes per evaluation. Decide once here, then reuse the verdict
+    // for both the gradient and the Hessian outputs.
+    let cost_scale = cost.abs().max(1.0);
+    let resolve_step = f64::EPSILON.sqrt();
+    let envelope_inconsistent = grad
+        .iter()
+        .enumerate()
+        .map(|(i, g)| (i, g.abs()))
+        .reduce(|a, b| if a.1 >= b.1 { a } else { b })
+        .and_then(|(max_idx, max_abs)| {
+            let predicted_change = max_abs * resolve_step;
+            if max_abs.is_finite() && predicted_change > 4.0 * cost_scale {
+                Some((max_idx, max_abs, predicted_change))
+            } else {
+                None
+            }
+        });
+    let kkt_residual_was_applied = kkt_residual_vec.is_some();
+    let envelope_suppresses_outputs =
+        envelope_inconsistent.is_some() && !kkt_residual_was_applied;
+
     // Outer Hessian (if requested).
-    let hessian = if mode == EvalMode::ValueGradientHessian {
+    let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
         // First, allow the family to short-circuit with its own exact outer
         // Hv operator.  Default `None` keeps the fall-through identical to
         // the historical kernel-based assembly path; CTN/survival/GAMLSS
@@ -7136,38 +7165,23 @@ pub fn reml_laml_evaluate(
 
     // Envelope-gradient sanity tripwire — last line of defense.
     //
-    // When the inner solver populated `solution.kkt_residual`, the IFT
-    // correction `grad[k] −= rᵀ · v_k` was applied above and the gradient is
-    // honest regardless of inner KKT residual magnitude. When the residual
-    // was None (legacy callers, rho-only profiled paths that haven't been
-    // plumbed yet), the envelope formula is unguarded — for those, retain
-    // the tripwire: if the analytic gradient predicts a √ε-step cost change
-    // far exceeding |cost|, the gradient is mathematically inconsistent
-    // with the function (cf. the failing biobank survival marginal-slope
-    // case where |g|∞ ≈ 10¹⁴ while |cost| ≈ 10⁵ and the function was flat).
-    // Mark unavailable so the outer wrapper either falls back to FD or
-    // aborts cleanly, instead of grinding TR to floor for minutes on a
-    // wrong descent direction.
+    // The verdict (`envelope_inconsistent` + `kkt_residual_was_applied`)
+    // was already computed before the outer-Hessian assembly so that an
+    // unsalvageable gradient short-circuits the (potentially 20+ minute)
+    // Hessian build. Translate the verdict into the final gradient output
+    // and emit the user-facing log line at most once per evaluation:
+    //
+    // * IFT correction not applied + envelope inconsistent → suppress
+    //   gradient and Hessian; the outer wrapper falls back to FD or
+    //   aborts cleanly instead of grinding TR to floor on a wrong
+    //   descent direction.
+    // * IFT correction applied + envelope inconsistent → keep gradient
+    //   (it's the principled total derivative); just log the unusual
+    //   magnitude at debug.
+    // * Envelope consistent → keep gradient silently.
     //
     // Threshold ratio > 4 keeps healthy near-stationary gradients
     // (|g|∞ ≈ √ε · |cost|, ratio ≈ 1) from tripping.
-    let cost_scale = cost.abs().max(1.0);
-    let resolve_step = f64::EPSILON.sqrt();
-    let envelope_inconsistent = grad
-        .iter()
-        .enumerate()
-        .map(|(i, g)| (i, g.abs()))
-        .reduce(|a, b| if a.1 >= b.1 { a } else { b })
-        .and_then(|(max_idx, max_abs)| {
-            let predicted_change = max_abs * resolve_step;
-            if max_abs.is_finite() && predicted_change > 4.0 * cost_scale {
-                Some((max_idx, max_abs, predicted_change))
-            } else {
-                None
-            }
-        });
-
-    let kkt_residual_was_applied = kkt_residual_vec.is_some();
     let gradient_out = match envelope_inconsistent {
         Some((max_idx, max_abs, predicted_change)) if !kkt_residual_was_applied => {
             log::warn!(
@@ -7175,9 +7189,10 @@ pub fn reml_laml_evaluate(
                  |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
                  Envelope formula contaminated by inner KKT residual on ill-conditioned H block; \
                  marking analytic gradient unavailable so outer optimizer does not chase a \
-                 mathematically impossible descent direction. Remedy: populate \
-                 BlockwiseInnerResult::kkt_residual on the convergent path so the IFT correction \
-                 grad[k] -= rᵀ·v_k can run.",
+                 mathematically impossible descent direction. Outer-Hessian assembly skipped on \
+                 this evaluation to avoid spending wall-clock on a result the optimizer would \
+                 discard. Remedy: populate BlockwiseInnerResult::kkt_residual on the convergent \
+                 path so the IFT correction grad[k] -= rᵀ·v_k can run.",
                 max_abs,
                 max_idx,
                 predicted_change,
