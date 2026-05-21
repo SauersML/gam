@@ -2590,6 +2590,8 @@ impl FittedModel {
         let mut writer = std::io::BufWriter::new(file);
         serde_json::to_writer(&mut writer, &normalized)
             .map_err(|e| format!("failed to serialize model: {e}"))?;
+        std::io::Write::flush(&mut writer)
+            .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
         Ok(())
     }
 
