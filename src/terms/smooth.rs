@@ -1687,6 +1687,16 @@ pub(crate) struct SpatialLogKappaCoords {
     dims_per_term: Vec<usize>,
 }
 
+/// Which end of the ψ bound the shared `aniso_bounds_from_data` helper is
+/// computing. The lower end uses `-max_length_scale.ln()` as the pure-Duchon
+/// fallback and the `.0` element of `spatial_term_psi_bounds`; the upper end
+/// uses `-min_length_scale.ln()` and `.1`. Everything else is identical.
+#[derive(Clone, Copy)]
+enum AnisoBoundEnd {
+    Lower,
+    Upper,
+}
+
 impl SpatialLogKappaCoords {
     /// Construct from an explicit dims layout plus values.
     pub(crate) fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
