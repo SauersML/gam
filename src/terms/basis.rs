@@ -9965,8 +9965,14 @@ fn duchon_kernel_radial_triplet(
                     &coeffs_local
                 }
             };
-            let jets =
-                duchon_radial_jets(r, length_scale, p_order, s_order as usize, k_dim, coeffs_ref)?;
+            let jets = duchon_radial_jets(
+                r,
+                length_scale,
+                p_order,
+                s_order as usize,
+                k_dim,
+                coeffs_ref,
+            )?;
             (jets.phi, jets.phi_r, jets.phi_rr)
         }
     };
@@ -11888,7 +11894,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                     r,
                     length_scale,
                     p_order,
-                        s_order,
+                    s_order,
                     dim,
                     coeffs.as_ref(),
                 )?;
@@ -28437,7 +28443,7 @@ mod tests {
             &d2,
             &DuchonOperatorPenaltySpec::default(),
             p_order,
-            s_order as f64,
+            s_order,
             None,
             None,
             0,
@@ -28644,7 +28650,7 @@ mod tests {
             centers.view(),
             1, // q = 1 (tension), maximal closed-form q for these orders
             p_order,
-            s_order as f64,
+            s_order,
             None,
         );
         // Q^T G_raw Q — the kernel sub-block.
