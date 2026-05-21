@@ -1,25 +1,8 @@
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 
-#[inline]
-pub fn family_to_string(f: LikelihoodFamily) -> &'static str {
-    f.name()
-}
-
-#[inline]
-pub fn family_to_link(f: LikelihoodFamily) -> LinkFunction {
-    f.link_function()
-}
-
-#[inline]
-pub fn is_binomial_family(f: LikelihoodFamily) -> bool {
-    f.is_binomial()
-}
-
-#[inline]
-pub fn pretty_familyname(f: LikelihoodFamily) -> &'static str {
-    f.pretty_name()
-}
-
+/// Resolve the binomial-flavoured `LikelihoodFamily` implied by an
+/// `InverseLink`. Identity falls back to logit so historic callers that
+/// stored a raw link without family discriminator still round-trip.
 #[inline]
 pub fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
     match link {
