@@ -19026,7 +19026,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_biobank_rho_policy_uses_row_kernel_work() {
+    fn survival_marginal_slope_rigid_small_projected_trace_keeps_exact_hessian() {
         let n = 39_722usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![
@@ -19055,8 +19055,14 @@ mod tests {
         let row_kernel_work = (n as u128)
             .saturating_mul(rho_dim)
             .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
+        let projected_trace_work = (n as u128)
+            .saturating_mul(rho_dim)
+            .saturating_mul(p_total.saturating_mul(p_total));
 
-        assert_eq!(policy.predicted_hessian_work, row_kernel_work);
+        assert_eq!(
+            policy.predicted_hessian_work,
+            row_kernel_work.max(projected_trace_work)
+        );
         assert!(
             row_kernel_work < generic_dense_work,
             "rigid row-kernel work must be cheaper than generic dense Hessian work"
@@ -19075,6 +19081,66 @@ mod tests {
         assert_eq!(
             hessian,
             crate::solver::outer_strategy::DeclaredHessianForm::Either
+        );
+    }
+
+    #[test]
+    fn survival_marginal_slope_rigid_biobank_projected_trace_demotes_outer_hessian() {
+        let n = 195_780usize;
+        let family = make_block_psi_test_family(n);
+        let specs = vec![
+            dummy_penalized_blockspec(12, 1),
+            dummy_penalized_blockspec(11, 2),
+            dummy_penalized_blockspec(10, 1),
+        ];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: true,
+            ..BlockwiseFitOptions::default()
+        };
+
+        let policy = family.outer_derivative_policy(&specs, 0, &options);
+        let p_total = specs
+            .iter()
+            .map(|spec| spec.design.ncols() as u128)
+            .sum::<u128>();
+        let rho_dim = specs
+            .iter()
+            .map(|spec| spec.penalties.len() as u128)
+            .sum::<u128>();
+        let row_kernel_work = (n as u128)
+            .saturating_mul(rho_dim)
+            .saturating_mul(p_total.saturating_add(N_PRIMARY as u128));
+        let projected_trace_work = (n as u128)
+            .saturating_mul(rho_dim)
+            .saturating_mul(p_total.saturating_mul(p_total));
+
+        assert_eq!(p_total, 33);
+        assert_eq!(rho_dim, 4);
+        assert!(
+            row_kernel_work
+                <= crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "the old row-kernel-only estimate would incorrectly select ARC"
+        );
+        assert!(
+            projected_trace_work
+                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "projected logdet-H cross traces are the dominant biobank Hessian cost"
+        );
+        assert_eq!(policy.predicted_hessian_work, projected_trace_work);
+        assert_eq!(
+            policy.declared_hessian_form(),
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
+        );
+
+        let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
+        assert_eq!(
+            gradient,
+            crate::solver::outer_strategy::Derivative::Analytic
+        );
+        assert_eq!(
+            hessian,
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
         );
     }
 

@@ -10090,13 +10090,13 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
         }
         return j_prefactor
             * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                q, m, s, kappa, eta_raw, powers, &r_eps_buf,
+                q, m, s as f64, kappa, eta_raw, powers, &r_eps_buf,
             );
     }
 
     j_prefactor
         * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-            q, m, s, kappa, eta_raw, powers, r,
+            q, m, s as f64, kappa, eta_raw, powers, r,
         )
 }
 
@@ -10230,13 +10230,13 @@ pub fn closed_form_anisotropic_pair_block_pure(
                     }
                     j_prefactor
                         * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                            q, m, s, 0.0, eta_slice, &powers, &r_eps_buf,
+                            q, m, s as f64, 0.0, eta_slice, &powers, &r_eps_buf,
                         )
                 }
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                        q, m, s, 0.0, eta_slice, &powers, &r_buf,
+                        q, m, s as f64, 0.0, eta_slice, &powers, &r_buf,
                     )
             };
             unsafe {
@@ -22782,7 +22782,12 @@ pub mod closed_form_penalty {
             let block = if kappa_factor == 0.0 {
                 None
             } else {
-                Some(riesz_block_radial_derivatives(d, (base + n) as f64, r, max_order))
+                Some(riesz_block_radial_derivatives(
+                    d,
+                    (base + n) as f64,
+                    r,
+                    max_order,
+                ))
             };
             let term_norm = block
                 .as_ref()
@@ -23471,7 +23476,10 @@ pub mod closed_form_penalty {
     /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
     fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
         assert!(d >= 1);
-        assert!(j.is_finite() && j >= 1.0, "riesz_block: need j ≥ 1, got {j}");
+        assert!(
+            j.is_finite() && j >= 1.0,
+            "riesz_block: need j ≥ 1, got {j}"
+        );
         assert!(r > 0.0);
 
         let two_j = 2.0 * j;
@@ -23783,7 +23791,7 @@ pub mod closed_form_penalty {
         );
 
         let powers = AnisoMetricPowers::new(eta);
-        anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, &powers, r)
+        anisotropic_duchon_penalty_radial_with_powers(q, m, s as f64, kappa, eta, &powers, r)
     }
 
     pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
@@ -24607,7 +24615,8 @@ pub mod closed_form_penalty {
         let max_order_h = (2 * q + 2).min(6);
         let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
             aniso_invariants_eta_jacobian_with_powers(eta, r, powers);
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
+        let fr =
+            radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
         let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
         let big_j = eta.iter().sum::<f64>().exp();
         let value = big_j * g;
@@ -28080,7 +28089,10 @@ mod tests {
             .expect("XᵀX SPD with ridge");
         let v_const = chol.solvevec(&xt_ones);
         let recon = crate::faer_ndarray::fast_av(&design, &v_const);
-        let err = (&recon - &ones).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let err = (&recon - &ones)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
         assert!(
             err < 1e-8,
             "v_const must reproduce the constant function (d={}): max |Xv − 1| = {err}",
