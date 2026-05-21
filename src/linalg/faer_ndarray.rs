@@ -596,18 +596,47 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
         .min(n);
 
     let mut result = Array2::<f64>::zeros((p, p).f());
-    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    // Row-major wx_chunk so the per-row scaling loop has stride-1 writes
+    // alongside stride-1 reads from a row-major X. The previous F-order
+    // wx_chunk forced strided writes by `chunk_rows`, breaking
+    // vectorization and cache locality on the per-PIRLS-iter Hessian
+    // assembly. faer's matmul handles either layout via FaerArrayView.
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
     let mut out_view = array2_to_matmut(&mut result);
+
+    let x_is_row_major = x.is_standard_layout();
+    let w_slice_opt = w.as_slice();
 
     for start in (0..n).step_by(chunk_rows) {
         let rows = (n - start).min(chunk_rows);
         {
-            let x_slice = x.slice(s![start..start + rows, ..]);
-            let mut chunk = wx_chunk.slice_mut(s![0..rows, ..]);
-            for local in 0..rows {
-                let wi = w[start + local];
-                for col in 0..p {
-                    chunk[[local, col]] = x_slice[[local, col]] * wi;
+            let chunk_slice = wx_chunk
+                .as_slice_mut()
+                .expect("row-major chunk is contiguous");
+            if x_is_row_major
+                && let (Some(x_all), Some(w_all)) = (x.as_slice(), w_slice_opt)
+            {
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = w_all[src];
+                    let src_off = src * p;
+                    let dst_off = local * p;
+                    let src_row = &x_all[src_off..src_off + p];
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for col in 0..p {
+                        dst_row[col] = src_row[col] * wi;
+                    }
+                }
+            } else {
+                let x_slice = x.slice(s![start..start + rows, ..]);
+                for local in 0..rows {
+                    let wi = w[start + local];
+                    let xrow = x_slice.row(local);
+                    let dst_off = local * p;
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for (col, xij) in xrow.iter().enumerate() {
+                        dst_row[col] = xij * wi;
+                    }
                 }
             }
         }
@@ -664,18 +693,44 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
         .min(n);
 
     let mut result = Array2::<f64>::zeros((px, q).f());
-    let mut wy_chunk = Array2::<f64>::zeros((chunk_rows, q).f());
+    // Row-major wy_chunk — same rationale as fast_xt_diag_x: stride-1
+    // writes alongside stride-1 reads from a row-major Y.
+    let mut wy_chunk = Array2::<f64>::zeros((chunk_rows, q));
     let mut out_view = array2_to_matmut(&mut result);
+
+    let y_is_row_major = y.is_standard_layout();
+    let w_slice_opt = w.as_slice();
 
     for start in (0..n).step_by(chunk_rows) {
         let rows = (n - start).min(chunk_rows);
         {
-            let y_slice = y.slice(s![start..start + rows, ..]);
-            let mut chunk = wy_chunk.slice_mut(s![0..rows, ..]);
-            for local in 0..rows {
-                let wi = w[start + local];
-                for col in 0..q {
-                    chunk[[local, col]] = y_slice[[local, col]] * wi;
+            let chunk_slice = wy_chunk
+                .as_slice_mut()
+                .expect("row-major chunk is contiguous");
+            if y_is_row_major
+                && let (Some(y_all), Some(w_all)) = (y.as_slice(), w_slice_opt)
+            {
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = w_all[src];
+                    let src_off = src * q;
+                    let dst_off = local * q;
+                    let src_row = &y_all[src_off..src_off + q];
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + q];
+                    for col in 0..q {
+                        dst_row[col] = src_row[col] * wi;
+                    }
+                }
+            } else {
+                let y_slice = y.slice(s![start..start + rows, ..]);
+                for local in 0..rows {
+                    let wi = w[start + local];
+                    let yrow = y_slice.row(local);
+                    let dst_off = local * q;
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + q];
+                    for (col, yij) in yrow.iter().enumerate() {
+                        dst_row[col] = yij * wi;
+                    }
                 }
             }
         }
