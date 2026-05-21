@@ -2581,26 +2581,21 @@ pub struct BlockwiseFitOptions {
     pub cache_mirror_sessions: Vec<Arc<crate::cache::Session>>,
 }
 
+pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
+
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
-            // Biobank-scale survival marginal-slope at n≈200k probit-survival
-            // converges monotonically (Δobj decreasing, |δ|∞ shrinking) but
-            // takes ~150-250 joint-Newton cycles to reach KKT residual
-            // tolerance: the joint Hessian over [β, log-slope] is genuinely
-            // ill-conditioned (cross-coupled near-singular directions in
-            // production data), so per-cycle progress is small relative to
-            // gradient norm even with perfect TR prediction ratios.
-            // `fit_survival_marginal_slope_terms` raises this to 300
-            // explicitly, but the bump only takes effect on options threaded
-            // through that function — direct callers of `inner_blockwise_fit`
-            // and code paths that construct fresh `BlockwiseFitOptions` see
-            // the default.  At biobank scale, 100 cycles is the difference
-            // between "fit converges" and "seed validation rejects every
-            // seed."  300 matches the survival bump; well-conditioned fits
-            // (Gaussian, logistic, small-n) exit on KKT well before 100
-            // cycles anyway, so the higher ceiling adds no work for them.
-            inner_max_cycles: 300,
+            // Biobank-scale custom-family marginal-slope fits can have a
+            // long, monotone joint-Newton tail: objective and step size keep
+            // shrinking, but the exact KKT residual may need several hundred
+            // additional cycles after the old 300-cycle cap. The outer
+            // REML/LAML derivative path is correct only at a stationary inner
+            // mode, so a merely descended iterate must not be accepted as
+            // converged. Use a production-sized cap by default and rely on the
+            // KKT/objective certificates to exit early for well-conditioned
+            // Gaussian, logistic, and small-n fits.
+            inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
             inner_tol: 1e-6,
             outer_max_iter: 60,
             outer_tol: 1e-5,
@@ -19189,6 +19184,20 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn default_inner_cycle_budget_covers_biobank_joint_newton_tail() {
+        let options = BlockwiseFitOptions::default();
+
+        assert_eq!(
+            options.inner_max_cycles,
+            DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES
+        );
+        assert!(
+            options.inner_max_cycles > 300,
+            "startup validation must not reject still-descending exact joint solves at the old cap"
+        );
+    }
 
     #[test]
     fn joint_penalty_subspace_trace_matches_projected_logdet_derivative() {
