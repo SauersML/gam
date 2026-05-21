@@ -18481,7 +18481,7 @@ fn duchon_kernel_amplification(
                     r,
                     length_scale,
                     p_order,
-                    s_order,
+                    duchon_power_to_usize(s_order),
                     d,
                     coeffs,
                 ) {
@@ -18565,8 +18565,8 @@ fn build_duchon_basis_designwithworkspace(
     // to span the requested polynomial block; emits a warning inside the helper.
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = duchon_power_to_usize(power);
-    validate_duchon_kernel_orders(length_scale, p_order, s_order as f64, d)?;
+    let s_order: f64 = power;
+    validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
@@ -18575,9 +18575,11 @@ fn build_duchon_basis_designwithworkspace(
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
 
     let coeffs = if let Some(ls) = length_scale {
+        // Hybrid Matérn partial-fraction expansion needs integer s; assert
+        // at this boundary so the scale-free path stays fractional-clean.
         Some(duchon_partial_fraction_coeffs(
             p_order,
-            s_order,
+            duchon_power_to_usize(s_order),
             1.0 / ls.max(1e-300),
         ))
     } else {

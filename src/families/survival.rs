@@ -8,7 +8,7 @@ use crate::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
 use crate::types::{Coefficients, LinearPredictor};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -2368,6 +2368,83 @@ pub struct CrudeRiskResult {
     pub risk: f64,
     pub diseasegradient: Array1<f64>,
     pub mortalitygradient: Array1<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompetingRisksCifResult {
+    pub cif: Array3<f64>,
+    pub overall_survival: Array2<f64>,
+}
+
+pub fn assemble_competing_risks_cif(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazard: ArrayView3<'_, f64>,
+) -> Result<CompetingRisksCifResult, SurvivalError> {
+    let (n_endpoints, n_rows, n_times) = cumulative_hazard.dim();
+    if n_endpoints == 0 || n_rows == 0 || n_times == 0 || times.len() != n_times {
+        return Err(SurvivalError::DimensionMismatch);
+    }
+    if times.iter().any(|time| !time.is_finite() || *time < 0.0) {
+        return Err(SurvivalError::NonFiniteInput);
+    }
+    if times
+        .iter()
+        .zip(times.iter().skip(1))
+        .any(|(previous, current)| current <= previous)
+    {
+        return Err(SurvivalError::InvalidIntegrationSetup);
+    }
+    if cumulative_hazard.iter().any(|value| !value.is_finite()) {
+        return Err(SurvivalError::NonFiniteInput);
+    }
+
+    let max_abs_hazard = cumulative_hazard
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let monotone_tolerance = 1.0e-10_f64 * max_abs_hazard.max(1.0);
+    let mut cif = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
+    let mut overall_survival = Array2::<f64>::zeros((n_rows, n_times));
+
+    for row in 0..n_rows {
+        let mut previous_cif = vec![0.0_f64; n_endpoints];
+        let mut previous_cumulative = vec![0.0_f64; n_endpoints];
+        let mut previous_total_cumulative = 0.0_f64;
+        for time_idx in 0..n_times {
+            let mut increments = vec![0.0_f64; n_endpoints];
+            let mut total_increment = 0.0_f64;
+            for endpoint in 0..n_endpoints {
+                let current = cumulative_hazard[[endpoint, row, time_idx]];
+                if current < -monotone_tolerance {
+                    return Err(SurvivalError::NonMonotoneCumulativeHazard);
+                }
+                let raw_increment = current - previous_cumulative[endpoint];
+                if raw_increment < -monotone_tolerance {
+                    return Err(SurvivalError::NonMonotoneCumulativeHazard);
+                }
+                let increment = raw_increment.max(0.0);
+                increments[endpoint] = increment;
+                total_increment += increment;
+                previous_cumulative[endpoint] = current.max(0.0);
+            }
+
+            let survival_left = (-previous_total_cumulative).exp();
+            let interval_failure = -(-total_increment).exp_m1();
+            for endpoint in 0..n_endpoints {
+                if total_increment > 0.0 {
+                    previous_cif[endpoint] +=
+                        survival_left * interval_failure * increments[endpoint] / total_increment;
+                }
+                cif[[endpoint, row, time_idx]] = previous_cif[endpoint].clamp(0.0, 1.0);
+            }
+            previous_total_cumulative += total_increment;
+            overall_survival[[row, time_idx]] = (-previous_total_cumulative).exp().clamp(0.0, 1.0);
+        }
+    }
+
+    Ok(CompetingRisksCifResult {
+        cif,
+        overall_survival,
+    })
 }
 
 fn compute_gauss_legendre_nodes(n: usize) -> Vec<(f64, f64)> {
