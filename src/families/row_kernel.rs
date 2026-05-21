@@ -895,24 +895,24 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
                     .into_owned(),
             );
         }
-        let mut w_col = Array1::<f64>::zeros(n_rows);
         for a in 0..K {
             for b in a..K {
-                for r in 0..n_rows {
-                    w_col[r] = t_flat[r * (K * K) + a * K + b];
-                }
-                // jf_a_weighted = jf_a · diag(w)
+                // jf_a_weighted = jf_a · diag(w) where w[r] = t_flat[r*K² + a*K + b].
+                // Stride-1 reads from row-major jf_axis_blocks[a] and writes to
+                // its clone; multiply by zero is mathematically the same as
+                // assigning zero, so the previous if-then split costs more than
+                // it saves on biobank shapes.
                 let mut jf_a_weighted = jf_axis_blocks[a].clone();
+                let weighted_slice = jf_a_weighted
+                    .as_slice_mut()
+                    .expect("row-major weighted block is contiguous");
+                let stride = K * K;
                 for r in 0..n_rows {
-                    let wr = w_col[r];
-                    if wr == 0.0 {
-                        for c in 0..rank {
-                            jf_a_weighted[[r, c]] = 0.0;
-                        }
-                    } else {
-                        for c in 0..rank {
-                            jf_a_weighted[[r, c]] *= wr;
-                        }
+                    let wr = t_flat[r * stride + a * K + b];
+                    let row_off = r * rank;
+                    let row = &mut weighted_slice[row_off..row_off + rank];
+                    for c in 0..rank {
+                        row[c] *= wr;
                     }
                 }
                 let contrib = crate::faer_ndarray::fast_atb(&jf_a_weighted, &jf_axis_blocks[b]);
