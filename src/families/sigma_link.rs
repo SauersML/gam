@@ -339,23 +339,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exp_sigma_derivatives_match_finite_difference() {
+    /// FD check shared by the `exp_sigma` and `logb_sigma` derivative
+    /// tests. Captures the closed-form analytic derivatives at `eta`
+    /// and compares them against second/third FD stencils built from
+    /// the link's scalar σ(η) over a small offset, with relative
+    /// tolerances tuned for the d²/d³ stencil amplification (the d³
+    /// stencil amplifies roundoff by ~1/h³).
+    fn assert_sigma_derivs_match_fd(
+        sigma_at: impl Fn(f64) -> f64,
+        derivs_at: impl Fn(f64) -> (f64, f64, f64, f64),
+    ) {
         let h = 1e-5;
         let h3 = 2e-3;
         let points = [-6.0, -3.5, -1.2, 0.0, 0.8, 2.1, 6.0];
 
         for &eta in &points {
-            let (s, d1, d2, d3) = exp_sigma_derivs_up_to_third_scalar(eta);
-            let s_plus = exp_sigma_from_eta_scalar(eta + h);
-            let s_minus = exp_sigma_from_eta_scalar(eta - h);
+            let (s, d1, d2, d3) = derivs_at(eta);
+            let s_plus = sigma_at(eta + h);
+            let s_minus = sigma_at(eta - h);
 
             let d1fd = (s_plus - s_minus) / (2.0 * h);
             let d2fd = (s_plus - 2.0 * s + s_minus) / (h * h);
             let d2_at = |x: f64| {
-                let xp = exp_sigma_from_eta_scalar(x + h3);
-                let xc = exp_sigma_from_eta_scalar(x);
-                let xm = exp_sigma_from_eta_scalar(x - h3);
+                let xp = sigma_at(x + h3);
+                let xc = sigma_at(x);
+                let xm = sigma_at(x - h3);
                 (xp - 2.0 * xc + xm) / (h3 * h3)
             };
             let d3fd = (d2_at(eta + h3) - d2_at(eta - h3)) / (2.0 * h3);
@@ -368,6 +376,14 @@ mod tests {
             assert!((d2 - d2fd).abs() < 1e-5 * d2_scale);
             assert!((d3 - d3fd).abs() < 5e-4 * d3_scale);
         }
+    }
+
+    #[test]
+    fn exp_sigma_derivatives_match_finite_difference() {
+        assert_sigma_derivs_match_fd(
+            exp_sigma_from_eta_scalar,
+            exp_sigma_derivs_up_to_third_scalar,
+        );
     }
 
     #[test]
@@ -481,29 +497,10 @@ mod tests {
 
     #[test]
     fn logb_sigma_derivatives_match_finite_difference() {
-        let h = 1e-5;
-        let h3 = 2e-3;
-        let points = [-6.0, -3.5, -1.2, 0.0, 0.8, 2.1, 6.0];
-        for &eta in &points {
-            let (s, d1, d2, d3) = logb_sigma_derivs_up_to_third_scalar(eta);
-            let s_plus = logb_sigma_from_eta_scalar(eta + h);
-            let s_minus = logb_sigma_from_eta_scalar(eta - h);
-            let d1fd = (s_plus - s_minus) / (2.0 * h);
-            let d2fd = (s_plus - 2.0 * s + s_minus) / (h * h);
-            let d2_at = |x: f64| {
-                let xp = logb_sigma_from_eta_scalar(x + h3);
-                let xc = logb_sigma_from_eta_scalar(x);
-                let xm = logb_sigma_from_eta_scalar(x - h3);
-                (xp - 2.0 * xc + xm) / (h3 * h3)
-            };
-            let d3fd = (d2_at(eta + h3) - d2_at(eta - h3)) / (2.0 * h3);
-            let d1_scale = d1.abs().max(d1fd.abs()).max(1.0);
-            let d2_scale = d2.abs().max(d2fd.abs()).max(1.0);
-            let d3_scale = d3.abs().max(d3fd.abs()).max(1.0);
-            assert!((d1 - d1fd).abs() < 1e-8 * d1_scale);
-            assert!((d2 - d2fd).abs() < 1e-5 * d2_scale);
-            assert!((d3 - d3fd).abs() < 5e-4 * d3_scale);
-        }
+        assert_sigma_derivs_match_fd(
+            logb_sigma_from_eta_scalar,
+            logb_sigma_derivs_up_to_third_scalar,
+        );
     }
 
     #[test]
