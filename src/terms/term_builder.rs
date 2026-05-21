@@ -186,10 +186,12 @@ pub fn build_termspec(
                 coefficient_max,
             } => {
                 let col = resolve_col(col_map, name)?;
-                let auto_kind =
-                    ds.column_kinds.get(col).copied().ok_or_else(|| {
-                        format!("internal column-kind lookup failed for '{name}'")
-                    })?;
+                let auto_kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
+                    TermBuilderError::missing_column(format!(
+                        "internal column-kind lookup failed for '{name}'"
+                    ))
+                    .to_string()
+                })?;
                 if *explicit {
                     linear_terms.push(LinearTermSpec {
                         name: name.clone(),
@@ -213,9 +215,10 @@ pub fn build_termspec(
                         }
                         ColumnKindTag::Categorical => {
                             if coefficient_min.is_some() || coefficient_max.is_some() {
-                                return Err(format!(
+                                return Err(TermBuilderError::incompatible_config(format!(
                                     "coefficient constraints are not supported for categorical auto-random-effect term '{name}'; use group({name}) or an unconstrained numeric term"
-                                ));
+                                ))
+                                .to_string());
                             }
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
@@ -234,14 +237,17 @@ pub fn build_termspec(
                 prior,
             } => {
                 let col = resolve_col(col_map, name)?;
-                let auto_kind =
-                    ds.column_kinds.get(col).copied().ok_or_else(|| {
-                        format!("internal column-kind lookup failed for '{name}'")
-                    })?;
+                let auto_kind = ds.column_kinds.get(col).copied().ok_or_else(|| {
+                    TermBuilderError::missing_column(format!(
+                        "internal column-kind lookup failed for '{name}'"
+                    ))
+                    .to_string()
+                })?;
                 if !matches!(auto_kind, ColumnKindTag::Continuous | ColumnKindTag::Binary) {
-                    return Err(format!(
+                    return Err(TermBuilderError::incompatible_config(format!(
                         "bounded() currently supports only numeric columns, got categorical '{name}'"
-                    ));
+                    ))
+                    .to_string());
                 }
                 linear_terms.push(LinearTermSpec {
                     name: name.clone(),
@@ -290,11 +296,15 @@ pub fn build_termspec(
                 if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
                     let by_kind_tag = ds.column_kinds.get(by_col).copied().ok_or_else(|| {
-                        format!("internal column-kind lookup failed for by variable '{by_name}'")
+                        TermBuilderError::missing_column(format!(
+                            "internal column-kind lookup failed for by variable '{by_name}'"
+                        ))
+                        .to_string()
                     })?;
                     let by_kind = match by_kind_tag {
                         ColumnKindTag::Categorical => {
-                            let levels = sorted_levels_for_column(ds.values.column(by_col))?;
+                            let levels = sorted_levels_for_column(ds.values.column(by_col))
+                                .map_err(|e| e.to_string())?;
                             let ordered = inner_options
                                 .get("ordered")
                                 .map(|v| {
@@ -336,10 +346,10 @@ pub fn build_termspec(
                 // Consumed at formula level, not design terms.
             }
             ParsedTerm::LogSlopeSurface { .. } => {
-                return Err(
-                    "logslope(...) declarations must be resolved by the marginal-slope formula path before building a term spec"
-                        .to_string(),
-                );
+                return Err(TermBuilderError::malformed_formula(
+                    "logslope(...) declarations must be resolved by the marginal-slope formula path before building a term spec",
+                )
+                .to_string());
             }
         }
     }
@@ -1565,10 +1575,10 @@ pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
 }
 
-fn parse_math_f64(raw: &str) -> Result<f64, String> {
+fn parse_math_f64(raw: &str) -> Result<f64, TermBuilderError> {
     let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
-        return Err("None/null is not a number".to_string());
+        return Err(TermBuilderError::invalid_option("None/null is not a number"));
     }
     let lower = t
         .to_ascii_lowercase()
@@ -1584,20 +1594,21 @@ fn parse_math_f64(raw: &str) -> Result<f64, String> {
         let coef = if rest.is_empty() {
             1.0
         } else {
-            rest.parse::<f64>()
-                .map_err(|_| format!("invalid numeric expression '{raw}'"))?
+            rest.parse::<f64>().map_err(|_| {
+                TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
+            })?
         };
         return Ok(coef * std::f64::consts::PI);
     }
     if let Some(rest) = lower.strip_prefix("pi*") {
-        let coef = rest
-            .parse::<f64>()
-            .map_err(|_| format!("invalid numeric expression '{raw}'"))?;
+        let coef = rest.parse::<f64>().map_err(|_| {
+            TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
+        })?;
         return Ok(coef * std::f64::consts::PI);
     }
-    lower
-        .parse::<f64>()
-        .map_err(|_| format!("invalid numeric expression '{raw}'"))
+    lower.parse::<f64>().map_err(|_| {
+        TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
+    })
 }
 
 fn split_list_option(raw: &str) -> Vec<String> {
@@ -1612,18 +1623,22 @@ fn split_list_option(raw: &str) -> Vec<String> {
 fn option_usize_list_any(
     options: &BTreeMap<String, String>,
     keys: &[&str],
-) -> Result<Option<Vec<usize>>, String> {
+) -> Result<Option<Vec<usize>>, TermBuilderError> {
     for key in keys {
         if let Some(raw) = options.get(*key) {
             let vals = split_list_option(raw);
             if vals.is_empty() {
-                return Err(format!("{key} must contain at least one integer"));
+                return Err(TermBuilderError::invalid_option(format!(
+                    "{key} must contain at least one integer"
+                )));
             }
             let parsed = vals
                 .iter()
                 .map(|v| {
                     v.parse::<usize>().map_err(|_| {
-                        format!("{key} entries must be non-negative integers, got '{v}'")
+                        TermBuilderError::invalid_option(format!(
+                            "{key} entries must be non-negative integers, got '{v}'"
+                        ))
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1637,29 +1652,29 @@ fn expand_margin_usize_option(
     name: &str,
     values: Vec<usize>,
     ndim: usize,
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>, TermBuilderError> {
     match values.len() {
         1 => Ok(vec![values[0]; ndim]),
         n if n == ndim => Ok(values),
-        n => Err(format!(
+        n => Err(TermBuilderError::invalid_option(format!(
             "{name} must be scalar or have one entry per margin ({ndim}), got {n}"
-        )),
+        ))),
     }
 }
 
 fn parse_periodic_axes(
     options: &BTreeMap<String, String>,
     ndim: usize,
-) -> Result<Vec<bool>, String> {
+) -> Result<Vec<bool>, TermBuilderError> {
     let mut out = vec![false; ndim];
     let Some(raw) = options.get("periodic").or_else(|| options.get("cyclic")) else {
         if let Some(raw_bc) = options.get("bc") {
             let vals = split_list_option(raw_bc);
             if vals.len() != ndim {
-                return Err(format!(
+                return Err(TermBuilderError::invalid_option(format!(
                     "bc must have one entry per margin ({ndim}), got {}",
                     vals.len()
-                ));
+                )));
             }
             for (i, v) in vals.iter().enumerate() {
                 let l = v.trim_matches('"').trim_matches('\'').to_ascii_lowercase();
@@ -1685,13 +1700,15 @@ fn parse_periodic_axes(
             if v.is_empty() {
                 continue;
             }
-            let axis = v
-                .parse::<usize>()
-                .map_err(|_| format!("periodic axes must be zero-based integers, got '{v}'"))?;
+            let axis = v.parse::<usize>().map_err(|_| {
+                TermBuilderError::invalid_option(format!(
+                    "periodic axes must be zero-based integers, got '{v}'"
+                ))
+            })?;
             if axis >= ndim {
-                return Err(format!(
+                return Err(TermBuilderError::invalid_option(format!(
                     "periodic axis {axis} out of range for {ndim}D smooth"
-                ));
+                )));
             }
             out[axis] = true;
         }
@@ -1702,16 +1719,16 @@ fn parse_periodic_axes(
 fn validate_tensor_bc_entries(
     options: &BTreeMap<String, String>,
     ndim: usize,
-) -> Result<(), String> {
+) -> Result<(), TermBuilderError> {
     let Some(raw_bc) = options.get("bc") else {
         return Ok(());
     };
     let vals = split_list_option(raw_bc);
     if vals.len() != ndim {
-        return Err(format!(
+        return Err(TermBuilderError::invalid_option(format!(
             "bc must have one entry per margin ({ndim}), got {}",
             vals.len()
-        ));
+        )));
     }
     for (dim, value) in vals.iter().enumerate() {
         let l = value
@@ -1724,9 +1741,9 @@ fn validate_tensor_bc_entries(
         ) {
             continue;
         }
-        return Err(format!(
+        return Err(TermBuilderError::unsupported_feature(format!(
             "tensor smooth bc entry {dim}={value:?} is not supported. Tensor margins currently support only periodic/cyclic/cc or natural/free/none; use separate s(..., bc=...) terms for endpoint clamped/anchored 1D boundary conditions."
-        ));
+        )));
     }
     Ok(())
 }
@@ -1734,7 +1751,7 @@ fn validate_tensor_bc_entries(
 fn parse_periods(
     options: &BTreeMap<String, String>,
     periodic: &[bool],
-) -> Result<Vec<Option<f64>>, String> {
+) -> Result<Vec<Option<f64>>, TermBuilderError> {
     let ndim = periodic.len();
     let mut out = vec![None; ndim];
     let Some(raw) = options.get("period").or_else(|| options.get("periods")) else {
@@ -1744,7 +1761,9 @@ fn parse_periods(
     if vals.len() == 1 && periodic.iter().filter(|&&b| b).count() == 1 {
         let value = parse_math_f64(&vals[0])?;
         if value <= 0.0 || !value.is_finite() {
-            return Err("period entries must be positive finite values".to_string());
+            return Err(TermBuilderError::invalid_option(
+                "period entries must be positive finite values",
+            ));
         }
         if let Some(axis) = periodic.iter().position(|&b| b) {
             out[axis] = Some(value);
@@ -1752,10 +1771,10 @@ fn parse_periods(
         return Ok(out);
     }
     if vals.len() != ndim {
-        return Err(format!(
+        return Err(TermBuilderError::invalid_option(format!(
             "period must have one entry per margin ({ndim}), got {}",
             vals.len()
-        ));
+        )));
     }
     for (i, v) in vals.iter().enumerate() {
         let l = v.to_ascii_lowercase();
@@ -1764,7 +1783,9 @@ fn parse_periods(
         }
         let value = parse_math_f64(v)?;
         if value <= 0.0 || !value.is_finite() {
-            return Err("period entries must be positive finite values".to_string());
+            return Err(TermBuilderError::invalid_option(
+                "period entries must be positive finite values",
+            ));
         }
         out[i] = Some(value);
     }
@@ -1774,7 +1795,7 @@ fn parse_periods(
 fn parse_period_origins(
     options: &BTreeMap<String, String>,
     periodic: &[bool],
-) -> Result<Vec<Option<f64>>, String> {
+) -> Result<Vec<Option<f64>>, TermBuilderError> {
     let ndim = periodic.len();
     let mut out = vec![None; ndim];
     let Some(raw) = options.get("origin").or_else(|| options.get("origins")) else {
@@ -1788,10 +1809,10 @@ fn parse_period_origins(
         return Ok(out);
     }
     if vals.len() != ndim {
-        return Err(format!(
+        return Err(TermBuilderError::invalid_option(format!(
             "origin must have one entry per margin ({ndim}), got {}",
             vals.len()
-        ));
+        )));
     }
     for (i, v) in vals.iter().enumerate() {
         let l = v.to_ascii_lowercase();
@@ -1806,7 +1827,7 @@ fn parse_period_origins(
 fn option_math_f64_any(
     options: &BTreeMap<String, String>,
     keys: &[&str],
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, TermBuilderError> {
     for key in keys {
         if let Some(raw) = options.get(*key) {
             return parse_math_f64(raw).map(Some);
@@ -1819,7 +1840,7 @@ fn parse_periodic_domain_1d(
     options: &BTreeMap<String, String>,
     data_min: f64,
     _data_max: f64,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), TermBuilderError> {
     let start = option_math_f64_any(
         options,
         &[
@@ -1844,16 +1865,15 @@ fn parse_periodic_domain_1d(
         (Some(domain_start), Some(domain_end)) => {
             let period = domain_end - domain_start;
             if !period.is_finite() || period <= 0.0 {
-                return Err(format!(
+                return Err(TermBuilderError::invalid_option(format!(
                     "period_end must be greater than period_start for periodic smooths, got start={domain_start}, end={domain_end}"
-                ));
+                )));
             }
             Ok((domain_start, period))
         }
-        (Some(_), None) | (None, Some(_)) => Err(
-            "periodic smooths require both period_start and period_end when either is provided"
-                .to_string(),
-        ),
+        (Some(_), None) | (None, Some(_)) => Err(TermBuilderError::invalid_option(
+            "periodic smooths require both period_start and period_end when either is provided",
+        )),
         (None, None) => {
             let explicit_period = parse_periods(options, &[true])?[0];
             let explicit_origin = option_math_f64_any(
@@ -1868,13 +1888,14 @@ fn parse_periodic_domain_1d(
                     // range is [ε, 2π−ε], so the inferred period is slightly less
                     // than 2π and predictions at t=0 vs t=2π reach different points
                     // on the inferred circle. Force the user to be explicit.
-                    Err("periodic=true requires an explicit `period=<value>` (or \
+                    Err(TermBuilderError::invalid_option(
+                        "periodic=true requires an explicit `period=<value>` (or \
                          `period_start=<lo>, period_end=<hi>`). Silent inference \
                          from data range would set period = data_max − data_min, \
                          which is sample-dependent and rarely what users mean \
                          (e.g. uniform draws on [0, 2π] give period ≈ 2π − 2ε, \
-                         not 2π, leading to off-by-ε wrap discontinuities)."
-                        .to_string())
+                         not 2π, leading to off-by-ε wrap discontinuities).",
+                    ))
                 }
             }
         }
@@ -2104,7 +2125,7 @@ pub fn parse_duchon_order(
 
 fn parse_matern_identifiability(
     options: &BTreeMap<String, String>,
-) -> Result<MaternIdentifiability, String> {
+) -> Result<MaternIdentifiability, TermBuilderError> {
     let Some(raw) = options.get("identifiability").map(String::as_str) else {
         return Ok(MaternIdentifiability::default());
     };
@@ -2116,15 +2137,15 @@ fn parse_matern_identifiability(
         "linear" | "center_linear_orthogonal" | "center-linear-orthogonal" => {
             Ok(MaternIdentifiability::CenterLinearOrthogonal)
         }
-        other => Err(format!(
+        other => Err(TermBuilderError::unsupported_feature(format!(
             "invalid Matérn identifiability '{other}'; expected one of: none, sum_tozero, linear"
-        )),
+        ))),
     }
 }
 
 fn parse_spatial_identifiability(
     options: &BTreeMap<String, String>,
-) -> Result<SpatialIdentifiability, String> {
+) -> Result<SpatialIdentifiability, TermBuilderError> {
     let Some(raw) = options.get("identifiability").map(String::as_str) else {
         return Ok(SpatialIdentifiability::default());
     };
@@ -2134,18 +2155,18 @@ fn parse_spatial_identifiability(
         | "orthogonal_to_parametric"
         | "orthogonal-to-parametric"
         | "parametric_orthogonal" => Ok(SpatialIdentifiability::OrthogonalToParametric),
-        "frozen" => Err(
-            "spatial identifiability 'frozen' is internal-only; use none or orthogonal_to_parametric".to_string(),
-        ),
-        other => Err(format!(
-            "invalid spatial identifiability '{other}'; expected one of: none, orthogonal_to_parametric"
+        "frozen" => Err(TermBuilderError::unsupported_feature(
+            "spatial identifiability 'frozen' is internal-only; use none or orthogonal_to_parametric",
         )),
+        other => Err(TermBuilderError::unsupported_feature(format!(
+            "invalid spatial identifiability '{other}'; expected one of: none, orthogonal_to_parametric"
+        ))),
     }
 }
 
 fn parse_tensor_identifiability(
     options: &BTreeMap<String, String>,
-) -> Result<TensorBSplineIdentifiability, String> {
+) -> Result<TensorBSplineIdentifiability, TermBuilderError> {
     let Some(raw) = options.get("identifiability").map(String::as_str) else {
         return Ok(TensorBSplineIdentifiability::default());
     };
@@ -2153,11 +2174,13 @@ fn parse_tensor_identifiability(
         "none" => Ok(TensorBSplineIdentifiability::None),
         "sum_tozero" | "sum-to-zero" | "centered" => Ok(TensorBSplineIdentifiability::SumToZero),
         "frozen" | "frozen_transform" | "frozen-transform" => Err(
-            "tensor identifiability 'frozen' is internal-only; use none or sum_tozero".to_string(),
+            TermBuilderError::unsupported_feature(
+                "tensor identifiability 'frozen' is internal-only; use none or sum_tozero",
+            ),
         ),
-        other => Err(format!(
+        other => Err(TermBuilderError::unsupported_feature(format!(
             "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
-        )),
+        ))),
     }
 }
 
