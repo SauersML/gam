@@ -640,33 +640,16 @@ fn op(transpose: bool) -> cublasOperation_t {
     }
 }
 
+impl super::runtime::HasGpuDevice for CublasRuntime {
+    fn device(&self) -> &GpuDeviceInfo {
+        &self.device
+    }
+}
+
 fn with_runtime<T>(
-    mut f: impl FnMut(&mut CublasRuntime) -> Option<T>,
+    f: impl FnMut(&mut CublasRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
-    let runtimes = cublas_runtimes();
-    if runtimes.is_empty() {
-        return None;
-    }
-    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
-    // Phase 1: non-blocking sweep. Skip devices another thread is driving.
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].try_lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device.clone()));
-        }
-    }
-    // Phase 2: every device was busy; fall back to a blocking acquisition.
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device.clone()));
-        }
-    }
-    None
+    super::runtime::with_runtime_two_phase(cublas_runtimes(), f)
 }
 
 fn cublas_runtimes() -> &'static [Mutex<CublasRuntime>] {
