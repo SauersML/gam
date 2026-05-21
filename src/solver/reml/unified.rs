@@ -15978,7 +15978,7 @@ mod tests {
             }),
         ];
 
-        for (idx, (batched_mat, serial_mat)) in batched.iter().zip(serial.iter()).enumerate() {
+        for (_idx, (batched_mat, serial_mat)) in batched.iter().zip(serial.iter()).enumerate() {
             for row in 0..batched_mat.nrows() {
                 for col in 0..batched_mat.ncols() {
                     assert_relative_eq!(
