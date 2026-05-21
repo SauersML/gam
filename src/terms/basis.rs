@@ -11090,6 +11090,89 @@ pub fn operator_penalty_candidates_closed_form_pure(
     out
 }
 
+/// Native polyharmonic kernel reproducing-norm penalty for scale-free
+/// (`length_scale = None`) Duchon bases.
+///
+/// For the polyharmonic kernel `K(x, y) = φ(|x − y|)` of order `m + s`
+/// (`m = p_order`, `s = s_order`), the RKHS inner product on the span of
+/// the basis functions `{φ_k(·) = K(·, c_k)}` is exactly the kernel
+/// evaluated at center pairs:
+///
+/// ```text
+///   ⟨f, g⟩_H = β_fᵀ G β_g,   G_{kl} = K(c_k, c_l) = φ(|c_k − c_l|).
+/// ```
+///
+/// Polynomial nullspace columns get an exact zero block: polynomials of
+/// order `< m` live in the unpenalized null space of the polyharmonic
+/// norm by construction.
+///
+/// This is the principled scale-free penalty: the basis and the penalty
+/// live in the *same* RKHS, no bounded-domain Lebesgue integral is
+/// required, and the smoother has no reversion to a prior mean at any
+/// finite distance — the equivalent kernel's effective bandwidth emerges
+/// from `λ`-vs-data-density rather than from a kernel-baked correlation
+/// length. The operator triplet alternative
+/// (`operator_penalty_candidates_closed_form_pure`) trades that for two
+/// extra knobs whose `λ_0 ∫f²` and `λ_1 ∫|∇f|²` terms reintroduce
+/// reversion scales through the penalty, defeating the basis's
+/// scale-free property.
+fn native_kernel_penalty_candidate_pure_duchon(
+    centers: ArrayView2<'_, f64>,
+    p_order: usize,
+    s_order: usize,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let coeff = PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), d);
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let mut g_raw = Array2::<f64>::zeros((k, k));
+    fill_symmetric_from_row_kernel(&mut g_raw, |i, j| {
+        let r = if let Some(scales) = axis_scales.as_deref() {
+            aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+        } else {
+            euclidean_distance_rows(centers, i, centers, j)
+        };
+        Ok(coeff.eval(r))
+    })?;
+    let g_kernel = if let Some(z) = kernel_nullspace {
+        let zt_g = fast_atb(z, &g_raw);
+        fast_ab(&zt_g, z)
+    } else {
+        g_raw
+    };
+    let kernel_cols = g_kernel.nrows();
+    let total_pre_cols = kernel_cols + polynomial_block_cols;
+    let g_padded = if polynomial_block_cols == 0 {
+        g_kernel
+    } else {
+        let mut padded = Array2::<f64>::zeros((total_pre_cols, total_pre_cols));
+        padded
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&g_kernel);
+        padded
+    };
+    let g_total = if let Some(t) = outer_identifiability {
+        let tt_g = fast_atb(t, &g_padded);
+        fast_ab(&tt_g, t)
+    } else {
+        g_padded
+    };
+    let g_sym = symmetrize(&g_total);
+    let (matrix, normalization_scale) = normalize_penalty(&g_sym);
+    Ok(vec![PenaltyCandidate {
+        matrix,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale,
+        kronecker_factors: None,
+        op: None,
+    }])
+}
+
 fn operator_penalty_candidates_from_collocation(
     d0: &Array2<f64>,
     d1: &Array2<f64>,
@@ -27820,15 +27903,15 @@ mod tests {
         }
     }
 
-    /// Scale-free Duchon (length_scale = None) emits the operator-triplet
-    /// (mass + tension + stiffness) when the user spec leaves all three
-    /// active. The Duchon polyharmonic basis itself is scale-free, but the
-    /// triplet is a perfectly valid quadratic-form penalty on the basis
-    /// coefficients — three independent Lebesgue functionals on `f`, with
-    /// implicit unit-conversion length scales living in the penalty
-    /// (Type B), never in the kernel (Type A).
+    /// Scale-free Duchon emits a single Primary penalty equal to the
+    /// polyharmonic kernel reproducing norm. The operator triplet
+    /// alternative would reintroduce reversion-toward-prior length scales
+    /// through `λ_0 ∫f²` and `λ_1 ∫|∇f|²`, defeating the basis's
+    /// scale-free property; only the kernel norm (`λ_2`-flavoured,
+    /// polyharmonic seminorm) preserves "no reversion at any finite
+    /// distance" and keeps basis and penalty inside the same RKHS.
     #[test]
-    fn test_build_duchon_basis_uses_operator_penalty_triplet() {
+    fn test_build_scale_free_duchon_basis_uses_native_kernel_penalty() {
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -27847,21 +27930,10 @@ mod tests {
             periodic: false,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penalties.len(), 1);
+        assert_eq!(out.penaltyinfo.len(), 1);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penaltyinfo[0].source,
-            PenaltySource::OperatorMass
-        ));
-        assert!(matches!(
-            out.penaltyinfo[1].source,
-            PenaltySource::OperatorTension
-        ));
-        assert!(matches!(
-            out.penaltyinfo[2].source,
-            PenaltySource::OperatorStiffness
-        ));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
     }
 
     #[test]
