@@ -18698,14 +18698,14 @@ mod tests {
         // exact (∂V/∂β = r, no `denom/dp` chain factor as in the profiled
         // Gaussian path).  Matches the production survival-marginal-slope
         // path that the biobank failure exercises.
-        let to_fixed = |mut sol: InnerSolution<'_>| -> InnerSolution<'_> {
+        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
                 include_logdet_s: true,
             };
             sol
-        };
+        }
 
         // FD reference: evaluate at re-solved β*(ρ±ε), which is what an
         // ideal inner solver would deliver.  Use ValueOnly to avoid the
@@ -18756,15 +18756,22 @@ mod tests {
         let perturb = Array1::from_vec(vec![0.02, -0.015, 0.025]);
         let beta_hat = &beta_star + &perturb;
 
-        let sol_envelope =
-            to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false));
+        let sol_envelope = to_fixed(build_gaussian_solution_at_beta(
+            &rho,
+            beta_hat.clone(),
+            false,
+        ));
         let grad_envelope =
             reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
                 .unwrap()
                 .gradient
                 .unwrap();
 
-        let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true));
+        let sol_ift = to_fixed(build_gaussian_solution_at_beta(
+            &rho,
+            beta_hat.clone(),
+            true,
+        ));
         let r_norm = sol_ift
             .kkt_residual
             .as_ref()
