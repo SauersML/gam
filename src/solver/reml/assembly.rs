@@ -241,6 +241,14 @@ pub struct InnerAssembly<'dp> {
     pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
+
+    // === Implicit-function-theorem correction input ===
+    /// Optional inner KKT residual r = ∇_β L_pen(β̂) at the converged β̂.
+    /// `Some` activates the IFT correction in `reml_laml_evaluate` that
+    /// absorbs inner KKT slack into the outer cost and gradient (see
+    /// `InnerSolution::kkt_residual`). `None` keeps the envelope-only
+    /// behaviour for callers that genuinely guarantee exact KKT.
+    pub kkt_residual: Option<Array1<f64>>,
 }
 
 impl<'dp> InnerAssembly<'dp> {

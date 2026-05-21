@@ -5245,6 +5245,24 @@ pub struct InnerSolution<'dp> {
     /// When present, the barrier cost and Hessian corrections are added to the
     /// outer REML/LAML objective.
     pub barrier_config: Option<BarrierConfig>,
+
+    /// Optional inner KKT residual vector r = ∇_β L_pen(β̂) = -∇ℓ(β̂) + S(λ)β̂
+    /// at the inner-converged β̂, in the same block-concatenated layout as
+    /// `beta`.
+    ///
+    /// At an exact inner KKT point this vector is zero and the envelope-theorem
+    /// gradient formula
+    ///   dV/dρ_k = ½ λ_k β̂ᵀ S_k β̂ + ½ λ_k tr(H⁻¹ S_k) − ½ λ_k tr(S⁺ S_k)
+    /// is the total derivative.  When the inner solver exits the noise-floor
+    /// KKT certificate (`custom_family.rs:12037`) with `r ≠ 0` — common on
+    /// biobank-scale problems where one coordinate's H block is nearly
+    /// singular — the principled total derivative picks up an extra term
+    ///   dV/dρ_k = (envelope) − rᵀ · v_k,   v_k := λ_k H⁻¹ S_k β̂
+    /// and the cost picks up `cost := cost − ½ rᵀ H⁻¹ r`.
+    /// Setting this field activates both corrections in `reml_laml_evaluate`.
+    /// `None` keeps the envelope-only behavior unchanged for callers that
+    /// genuinely guarantee exact KKT.
+    pub kkt_residual: Option<Array1<f64>>,
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -5275,6 +5293,7 @@ pub struct InnerSolutionBuilder<'dp> {
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
     barrier_config: Option<BarrierConfig>,
+    kkt_residual: Option<Array1<f64>>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -5312,6 +5331,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -5396,6 +5416,16 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    /// Install the inner KKT residual r = ∇_β L_pen(β̂) at the converged
+    /// β̂. When `Some`, activates the implicit-function-theorem corrections
+    /// to the LAML cost and gradient in `reml_laml_evaluate` that absorb
+    /// the inner solver's residual KKT error (see
+    /// `InnerSolution::kkt_residual`).
+    pub fn kkt_residual(mut self, residual: Option<Array1<f64>>) -> Self {
+        self.kkt_residual = residual;
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
@@ -5431,6 +5461,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: self.rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
             barrier_config: self.barrier_config,
+            kkt_residual: self.kkt_residual,
         }
     }
 }
@@ -14842,6 +14873,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -15170,6 +15202,7 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15387,6 +15420,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15526,6 +15560,7 @@ mod tests {
             })),
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15616,6 +15651,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho = vec![0.0_f64; k];
         let result =
@@ -15789,6 +15825,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -15887,6 +15924,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
         let rho = [lambda.ln()];
 
@@ -16048,6 +16086,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let rho = [0.0]; // λ = 1
@@ -16106,6 +16145,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
@@ -16207,6 +16247,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         };
 
         let result =
@@ -16283,6 +16324,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -16454,6 +16496,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -16505,6 +16548,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -18225,6 +18269,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
