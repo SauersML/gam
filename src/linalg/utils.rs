@@ -4,7 +4,19 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, Zip};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView1, Data, Dimension, Zip};
+
+/// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.). This
+/// is the canonical helper; module-local `array1_is_finite` / `array2_is_finite`
+/// in `solver/pirls.rs` and `solver/active_set.rs` now forward here.
+#[inline]
+pub(crate) fn array_is_finite<S, D>(values: &ArrayBase<S, D>) -> bool
+where
+    S: Data<Elem = f64>,
+    D: Dimension,
+{
+    values.iter().all(|v| v.is_finite())
+}
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;

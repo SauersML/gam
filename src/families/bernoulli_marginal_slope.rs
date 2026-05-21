@@ -253,8 +253,7 @@ impl EmpiricalZGrid {
 pub enum LatentMeasureKind {
     StandardNormal,
     GlobalEmpirical {
-        nodes: Vec<f64>,
-        weights: Vec<f64>,
+        grid: EmpiricalZGrid,
     },
     LocalEmpirical {
         feature_cols: Vec<usize>,
@@ -279,8 +278,8 @@ impl LatentMeasureKind {
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
             Self::StandardNormal => Ok(()),
-            Self::GlobalEmpirical { nodes, weights } => {
-                validate_empirical_z_grid(nodes, weights, context)
+            Self::GlobalEmpirical { grid } => {
+                validate_empirical_z_grid(&grid.nodes, &grid.weights, context)
             }
             Self::LocalEmpirical {
                 feature_cols,
@@ -374,10 +373,7 @@ impl LatentMeasureKind {
     ) -> Result<Option<EmpiricalZGrid>, String> {
         match self {
             Self::StandardNormal => Ok(None),
-            Self::GlobalEmpirical { nodes, weights } => Ok(Some(EmpiricalZGrid {
-                nodes: nodes.clone(),
-                weights: weights.clone(),
-            })),
+            Self::GlobalEmpirical { grid } => Ok(Some(grid.clone())),
             Self::LocalEmpirical {
                 grids,
                 train_row_mixtures,
@@ -904,10 +900,7 @@ fn build_global_empirical_latent_measure(
     grid_size: usize,
 ) -> Result<LatentMeasureKind, String> {
     let grid = build_empirical_z_grid(z, weights, grid_size, "empirical latent measure")?;
-    let measure = LatentMeasureKind::GlobalEmpirical {
-        nodes: grid.nodes,
-        weights: grid.weights,
-    };
+    let measure = LatentMeasureKind::GlobalEmpirical { grid };
     measure.validate("empirical latent measure")?;
     Ok(measure)
 }

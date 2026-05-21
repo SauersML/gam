@@ -48,16 +48,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
 
-/// Generic finiteness check for any `f64` ndarray view (1-D or 2-D); replaces
-/// the previously-duplicated `array1_is_finite` / `array2_is_finite` pair.
-#[inline]
-fn array_is_finite<S, D>(values: &ndarray::ArrayBase<S, D>) -> bool
-where
-    S: ndarray::Data<Elem = f64>,
-    D: ndarray::Dimension,
-{
-    values.iter().all(|v| v.is_finite())
-}
+use crate::linalg::utils::array_is_finite;
 
 #[inline]
 fn array1_is_finite(values: &Array1<f64>) -> bool {
