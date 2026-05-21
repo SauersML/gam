@@ -192,15 +192,15 @@ impl DenseOrOperator<'_> {
 /// materializer's error so callers can pin which block failed.
 fn dense_block_from_spec<'a>(
     spec: &'a ParameterBlockSpec,
-    material_policy: &crate::resource::MaterialPolicy,
+    material_policy: &crate::resource::MaterializationPolicy,
     materialization_label: &str,
 ) -> Result<Cow<'a, Array2<f64>>, String> {
     match spec.design.as_dense_ref() {
         Some(d) => Ok(Cow::Borrowed(d)),
         None => Ok(Cow::Owned(
             spec.design
-                .try_to_dense_with_policy(material_policy, materialization_label)
-                .map_err(|e| e.to_string())?
+                .try_to_dense_with_policy(material_policy, "gamlss dense_block_from_spec")
+                .map_err(|e| format!("{materialization_label}: {e}"))?
                 .as_ref()
                 .clone(),
         )),
@@ -221,7 +221,7 @@ fn dense_locscale_block_designs_fromspecs<'a>(
     primary_block_idx: usize,
     log_sigma_block_idx: usize,
     primary_label: &str,
-    material_policy: &crate::resource::MaterialPolicy,
+    material_policy: &crate::resource::MaterializationPolicy,
 ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
     if specs.len() != expected_count {
         return Err(format!(
@@ -8711,41 +8711,16 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        if specs.len() != 3 {
-            return Err(format!(
-                "GaussianLocationScaleWiggleFamily expects 3 specs, got {}",
-                specs.len()
-            ));
-        }
-        let xmu = match specs[Self::BLOCK_MU].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_MU]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "GaussianLocationScaleWiggle dense_block_designs_fromspecs mu",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_LOG_SIGMA]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "GaussianLocationScaleWiggle dense_block_designs_fromspecs log_sigma",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        Ok((xmu, x_ls))
+        dense_locscale_block_designs_fromspecs(
+            specs,
+            3,
+            "GaussianLocationScaleWiggleFamily",
+            "GaussianLocationScaleWiggle",
+            Self::BLOCK_MU,
+            Self::BLOCK_LOG_SIGMA,
+            "mu",
+            &self.policy.material_policy(),
+        )
     }
 
     fn exact_joint_dense_block_designs<'a>(
@@ -13328,41 +13303,16 @@ impl BinomialLocationScaleFamily {
         &self,
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        if specs.len() != 2 {
-            return Err(format!(
-                "BinomialLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
-                specs.len()
-            ));
-        }
-        let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_T]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScale dense_block_designs_fromspecs threshold",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        let x_ls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_LOG_SIGMA]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScale dense_block_designs_fromspecs log_sigma",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        Ok((xt, x_ls))
+        dense_locscale_block_designs_fromspecs(
+            specs,
+            2,
+            "BinomialLocationScaleFamily",
+            "BinomialLocationScale",
+            Self::BLOCK_T,
+            Self::BLOCK_LOG_SIGMA,
+            "threshold",
+            &self.policy.material_policy(),
+        )
     }
 
     fn exact_joint_dense_block_designs<'a>(
@@ -16669,41 +16619,16 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        if specs.len() != 3 {
-            return Err(format!(
-                "BinomialLocationScaleWiggleFamily expects 3 specs, got {}",
-                specs.len()
-            ));
-        }
-        let xt = match specs[Self::BLOCK_T].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_T]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScaleWiggle dense_block_designs_fromspecs threshold",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        let xls = match specs[Self::BLOCK_LOG_SIGMA].design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                specs[Self::BLOCK_LOG_SIGMA]
-                    .design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScaleWiggle dense_block_designs_fromspecs log_sigma",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        Ok((xt, xls))
+        dense_locscale_block_designs_fromspecs(
+            specs,
+            3,
+            "BinomialLocationScaleWiggleFamily",
+            "BinomialLocationScaleWiggle",
+            Self::BLOCK_T,
+            Self::BLOCK_LOG_SIGMA,
+            "threshold",
+            &self.policy.material_policy(),
+        )
     }
 
     fn exact_joint_dense_block_designs<'a>(
