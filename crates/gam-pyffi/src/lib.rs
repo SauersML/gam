@@ -643,11 +643,25 @@ fn duchon_function_norm_penalty<'py>(
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
-    let penalty = built
-        .penalties
-        .first()
-        .ok_or_else(|| py_value_error("Duchon function-norm penalty was not built".to_string()))?
-        .clone();
+    // The scale-free pure-Duchon path emits the operator triplet (mass,
+    // tension, stiffness); the function-norm seminorm is the curvature
+    // (stiffness) block — `∫|∇^(p+s) f|²`-flavoured — *not* the leading
+    // mass entry, which was previously returned by mistake when the
+    // factory was a single Primary candidate. Look up the stiffness slot
+    // by source so the FFI returns the correct object regardless of the
+    // factory's candidate ordering.
+    let stiffness_idx = built
+        .penaltyinfo
+        .iter()
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
+        .ok_or_else(|| {
+            py_value_error(
+                "Duchon function-norm penalty (stiffness) was not built; \
+                 ensure spec.operator_penalties.stiffness is Active"
+                    .to_string(),
+            )
+        })?;
+    let penalty = built.penalties[stiffness_idx].clone();
     Ok(penalty.into_pyarray(py).unbind())
 }
 
