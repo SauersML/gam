@@ -18613,9 +18613,36 @@ fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'sta
         )
     })?;
     if !outer_result.converged {
-        return Err(CustomFamilyError::Optimization(
-            custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
-        ));
+        // Box-constrained boundary saturation (typical pathology: three of
+        // four log-λ at the +10 upper bound, the ARC step direction is
+        // dominated by the boundary coupling so every trial step rejects
+        // through max-iter) leaves ARC reporting `converged = false`
+        // after the iteration cap, even though the iterate itself is
+        // usable: finite cost, finite ρ, and a gradient that passes the
+        // envelope-sanity tripwire `|g|∞·√ε < 4·|f|` the unified
+        // evaluator already enforces upstream. Hard-failing on this would
+        // throw away the optimizer's best-effort iterate and force the
+        // caller to either restart the fit from scratch or get nothing.
+        //
+        // The principled response is to treat the iterate as a usable
+        // box-constrained minimum approximation: proceed to the final
+        // inner refit + covariance assembly with this ρ, but propagate
+        // the optimizer's own `converged = false` flag to downstream
+        // consumers via `outer_converged` so the result product stays
+        // honest about which kind of optimum it is. Only when the
+        // iterate itself is inadmissible (non-finite cost or ρ,
+        // mathematically inconsistent gradient) do we still hard-fail.
+        if outer_result.is_acceptable_best_effort() {
+            log::warn!(
+                "{} — proceeding with best-effort iterate (cost is finite, gradient passes \
+                 envelope-sanity tripwire; result product carries outer_converged = false)",
+                custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
+            );
+        } else {
+            return Err(CustomFamilyError::Optimization(
+                custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
+            ));
+        }
     }
     let outer_grad_norm = outer_result.final_grad_norm_or_nan();
     let rho_star = outer_result.rho;
