@@ -2641,7 +2641,10 @@ pub struct BlockwiseInnerResult {
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
     pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    pub kkt_residual: Option<Array1<f64>>,
+    /// Free-space-projected inner KKT residual; the projection invariant is
+    /// enforced by the [`ProjectedKktResidual`] newtype so this field can only
+    /// be populated by an active-set-aware constructor.
+    pub kkt_residual: Option<crate::solver::reml::unified::ProjectedKktResidual>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -25257,6 +25260,45 @@ mod tests {
         )
         .expect("stationarity projection should succeed");
         assert_relative_eq!(unprojected, 4.0_f64, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn kkt_residual_uses_cached_joint_gradient_without_re_evaluating_family() {
+        let spec = ParameterBlockSpec {
+            name: "cached-gradient".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0, 0.0],
+                [0.0, 1.0]
+            ])),
+            offset: array![0.0, 0.0],
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+        };
+        let state = ParameterBlockState {
+            beta: array![2.0, -1.0],
+            eta: array![2.0, -1.0],
+        };
+        let s_lambda = Array2::<f64>::eye(2);
+        let expected_residual = array![0.25, -0.5];
+        let cached_gradient = s_lambda.dot(&state.beta) - &expected_residual;
+
+        let residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
+            &OneBlockAlwaysErrorFamily,
+            std::slice::from_ref(&spec),
+            std::slice::from_ref(&state),
+            std::slice::from_ref(&s_lambda),
+            0.0,
+            RidgePolicy::explicit_stabilization_full(),
+            None,
+            Some(&cached_gradient),
+        )
+        .expect("cached gradient path should not call family.evaluate()")
+        .expect("cached gradient should produce a KKT residual");
+
+        assert_relative_eq!(residual[0], expected_residual[0], epsilon = 1e-12);
+        assert_relative_eq!(residual[1], expected_residual[1], epsilon = 1e-12);
     }
 
     #[test]
