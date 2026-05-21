@@ -46,6 +46,25 @@ pub(crate) struct PersistentWarmStartRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct PersistentBlockInnerSummary {
+    pub log_likelihood: f64,
+    pub penalty_value: f64,
+    pub cycles: usize,
+    pub converged: bool,
+    pub block_logdet_h: f64,
+    pub block_logdet_s: f64,
+}
+
+impl PersistentBlockInnerSummary {
+    fn is_valid(&self) -> bool {
+        self.log_likelihood.is_finite()
+            && self.penalty_value.is_finite()
+            && self.block_logdet_h.is_finite()
+            && self.block_logdet_s.is_finite()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct PersistentBlockWarmStartRecord {
     pub version: u32,
     pub key: String,
@@ -59,17 +78,7 @@ pub(crate) struct PersistentBlockWarmStartRecord {
     pub block_beta: Vec<Vec<f64>>,
     pub active_sets: Vec<Option<Vec<usize>>>,
     #[serde(default)]
-    pub inner_log_likelihood: Option<f64>,
-    #[serde(default)]
-    pub inner_penalty_value: Option<f64>,
-    #[serde(default)]
-    pub inner_cycles: Option<usize>,
-    #[serde(default)]
-    pub inner_converged: Option<bool>,
-    #[serde(default)]
-    pub inner_block_logdet_h: Option<f64>,
-    #[serde(default)]
-    pub inner_block_logdet_s: Option<f64>,
+    pub inner: Option<PersistentBlockInnerSummary>,
 }
 
 impl PersistentBlockWarmStartRecord {
@@ -92,12 +101,7 @@ impl PersistentBlockWarmStartRecord {
             rho: Vec::new(),
             block_beta: Vec::new(),
             active_sets: Vec::new(),
-            inner_log_likelihood: None,
-            inner_penalty_value: None,
-            inner_cycles: None,
-            inner_converged: None,
-            inner_block_logdet_h: None,
-            inner_block_logdet_s: None,
+            inner: None,
         }
     }
 
@@ -129,10 +133,7 @@ impl PersistentBlockWarmStartRecord {
                 .zip(block_dims.iter())
                 .all(|(beta, dim)| beta.len() == *dim && beta.iter().all(|v| v.is_finite()))
             && self.active_sets.len() == block_dims.len()
-            && self.inner_log_likelihood.is_none_or(f64::is_finite)
-            && self.inner_penalty_value.is_none_or(f64::is_finite)
-            && self.inner_block_logdet_h.is_none_or(f64::is_finite)
-            && self.inner_block_logdet_s.is_none_or(f64::is_finite)
+            && self.inner.as_ref().is_none_or(|inner| inner.is_valid())
     }
 }
 

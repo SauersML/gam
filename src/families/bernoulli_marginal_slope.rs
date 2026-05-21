@@ -478,7 +478,6 @@ impl LatentZPolicy {
             max_abs_excess_kurtosis: 20.0,
         }
     }
-
 }
 
 impl Default for LatentZPolicy {
