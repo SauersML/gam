@@ -3872,7 +3872,7 @@ fn fit_dataset_impl(
     };
     payload.group_metadata = fit_config.group_metadata.clone();
     let model = FittedModel::from_payload(payload);
-    serde_json::to_vec_pretty(&model).map_err(|err| format!("failed to serialize model: {err}"))
+    serde_json::to_vec(&model).map_err(|err| format!("failed to serialize model: {err}"))
 }
 
 fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
