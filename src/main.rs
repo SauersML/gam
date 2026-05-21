@@ -9081,6 +9081,7 @@ mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
+        ResidualDistribution,
         LinkMode, MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
         SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
