@@ -17443,10 +17443,10 @@ pub fn fit_survival_marginal_slope_terms(
     let outer_cache_seed_available = options
         .cache_session
         .as_ref()
-        .and_then(|session| session.peek_load())
-        .is_some_and(|entry| {
-            crate::solver::outer_strategy::cache_entry_can_seed_outer(
-                &entry,
+        .and_then(|session| session.peek_load_with_source())
+        .is_some_and(|loaded| {
+            crate::solver::outer_strategy::cache_entry_would_help_outer(
+                &loaded,
                 setup.rho_dim(),
                 CUSTOM_FAMILY_RHO_BOUND,
             )
