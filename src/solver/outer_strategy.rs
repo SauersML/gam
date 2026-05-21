@@ -4302,15 +4302,86 @@ impl OuterProblem {
                     .as_ref()
                     .is_none_or(|rho| rho != &cached_rho)
                 {
+                    // Boundary-interior margin on cache-loaded seeds.
+                    //
+                    // Some families (notably the survival marginal-slope
+                    // and other custom-family outer-gradient assemblers
+                    // that do not yet route through the projected-kernel
+                    // cancellation in `runtime.rs`) compute an outer
+                    // gradient that becomes numerically unreliable when
+                    // ρ_i saturates at the box bound — the
+                    // `tr(H⁻¹ Ḣ_k)` and `λ_k tr(S_λ⁺ S_k)` trace pair
+                    // fails to cancel and the analytic ∂L/∂ρ blows up by
+                    // many orders of magnitude. An optimizer reseeded
+                    // exactly on a saturated cached ρ then makes no
+                    // progress (the ARC trust-region rejects every
+                    // proposal at that geometry) and stalls into the
+                    // deterministic-replay detector.
+                    //
+                    // Worse, every accepted outer eval is persisted, so a
+                    // run that was interrupted mid-fit (Ctrl-C / OOM /
+                    // SIGKILL) writes its last-accepted intermediate ρ —
+                    // which may be at the bound for spurious reasons — as
+                    // the durable seed for the next run, making the bad
+                    // state sticky across restarts.
+                    //
+                    // The fix is a small interior margin on the LOAD
+                    // side only. If the cached ρ has any coordinate at
+                    // (or within `MARGIN` of) the box bound, we pull it
+                    // strictly inside the box. The optimizer then probes
+                    // local geometry from an interior point with a
+                    // well-defined gradient. If the data truly prefers
+                    // ρ_i → +bound (or −bound), it walks back to the
+                    // boundary in one or two outer iterations at
+                    // negligible cost; if the saturated coordinate was
+                    // an artifact of a stale checkpoint, the optimizer
+                    // is no longer trapped.
+                    //
+                    // The `Final` entry-kind branch above is intentionally
+                    // not clamped: that path short-circuits to return the
+                    // cached ρ as the answer (the caller marked it final
+                    // and converged), so re-walking from interior would
+                    // defeat the optimization-skip purpose.
+                    const BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
+                    let bound = config.rho_bound;
+                    let interior = (bound - BOUNDARY_INTERIOR_MARGIN).max(0.0);
+                    let saturated_coords: Vec<usize> = cached_rho
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| {
+                            if v.abs() >= bound - BOUNDARY_INTERIOR_MARGIN {
+                                Some(i)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let seed_rho = if saturated_coords.is_empty() {
+                        cached_rho
+                    } else {
+                        let clamped = cached_rho.mapv(|v| v.clamp(-interior, interior));
+                        log::info!(
+                            "[CACHE] hit-clamp key={}.. context={} rho_dim={} \
+                             saturated_coords={:?} bound=±{:.3} clamped_to=±{:.3} \
+                             reason=stale-or-trapping-boundary-seed",
+                            short_key,
+                            context,
+                            clamped.len(),
+                            saturated_coords,
+                            bound,
+                            interior,
+                        );
+                        clamped
+                    };
                     log::info!(
                         "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
                         short_key,
                         context,
-                        cached_rho.len(),
+                        seed_rho.len(),
                         prior_obj_display,
                         entry.iteration.unwrap_or(0),
                     );
-                    config.initial_rho = Some(cached_rho);
+                    config.initial_rho = Some(seed_rho);
                     config.screen_initial_rho = false;
                     had_hit = true;
                 } else {
