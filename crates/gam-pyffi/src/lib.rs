@@ -634,7 +634,7 @@ fn duchon_function_norm_penalty<'py>(
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
-        power: 0,
+        power: 0.0,
         nullspace_order: duchon_nullspace_from_m(m),
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
@@ -5525,7 +5525,7 @@ fn duchon_basis_1d_impl(
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix),
         length_scale: None,
-        power: 0,
+        power: 0.0,
         nullspace_order: duchon_nullspace_from_m(m),
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
