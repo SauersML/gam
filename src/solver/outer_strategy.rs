@@ -8817,10 +8817,11 @@ mod tests {
             }
             fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
                 *self.eval_count.lock().unwrap() += 1;
+                // f(θ) = ‖θ‖² → ∇f = 2θ, ∇²f = 2I.
                 Ok(OuterEval {
                     cost: theta.dot(theta),
-                    gradient: theta.clone(),
-                    hessian: HessianResult::Unavailable,
+                    gradient: 2.0 * theta,
+                    hessian: HessianResult::Analytic(2.0 * Array2::<f64>::eye(theta.len())),
                     inner_beta_hint: None,
                 })
             }
@@ -8890,10 +8891,11 @@ mod tests {
                 Ok(theta.dot(theta))
             }
             fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                // f(θ) = ‖θ‖² → ∇f = 2θ, ∇²f = 2I.
                 Ok(OuterEval {
                     cost: theta.dot(theta),
-                    gradient: theta.clone(),
-                    hessian: HessianResult::Unavailable,
+                    gradient: 2.0 * theta,
+                    hessian: HessianResult::Analytic(2.0 * Array2::<f64>::eye(theta.len())),
                     inner_beta_hint: None,
                 })
             }
