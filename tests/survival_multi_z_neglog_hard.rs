@@ -60,7 +60,9 @@ fn neglog_reference(
     probit_scale: f64,
 ) -> f64 {
     let observed: Vec<f64> = slopes.iter().map(|&g| probit_scale * g).collect();
-    let var = covariance.quadratic_form(&observed).expect("quadratic form");
+    let var = covariance
+        .quadratic_form(&observed)
+        .expect("quadratic form");
     let c = (1.0 + var).sqrt();
 
     // Cross-check vs. library scale.
@@ -71,18 +73,13 @@ fn neglog_reference(
         "scale mismatch: ref={c:.17e} lib={c_lib:.17e}"
     );
 
-    let linear: f64 = observed
-        .iter()
-        .zip(z.iter())
-        .map(|(&o, &zi)| o * zi)
-        .sum();
+    let linear: f64 = observed.iter().zip(z.iter()).map(|(&o, &zi)| o * zi).sum();
     let eta0 = q0 * c + linear;
     let eta1 = q1 * c + linear;
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
     let ad1 = qd1 * c;
     weight
-        * ((1.0 - event) * (-(normal_cdf(-eta1)).ln())
-            + normal_cdf(-eta0).ln()
+        * ((1.0 - event) * (-(normal_cdf(-eta1)).ln()) + normal_cdf(-eta0).ln()
             - event * log_phi_eta1
             - event * ad1.ln())
 }
@@ -158,8 +155,9 @@ fn neglog_matches_closed_form_across_dims_shapes_events() {
             for shape_id in 0..3u32 {
                 for fixture in 0..30u64 {
                     seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                    let mut rng =
-                        SplitMix64::new(seed ^ ((k as u64) << 32) ^ fixture ^ ((shape_id as u64) << 16));
+                    let mut rng = SplitMix64::new(
+                        seed ^ ((k as u64) << 32) ^ fixture ^ ((shape_id as u64) << 16),
+                    );
 
                     let covariance = match shape_id {
                         0 => make_diagonal(&mut rng, k),
@@ -292,8 +290,7 @@ fn neglog_errors_when_derivative_guard_is_violated() {
 
 #[test]
 fn neglog_finite_and_continuous_just_above_guard() {
-    let covariance =
-        MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.3], [0.3, 0.8]]);
+    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.3], [0.3, 0.8]]);
     let slopes = [0.21, -0.14];
     let z = [0.5, -0.7];
     let probit_scale = 0.9;
@@ -327,7 +324,10 @@ fn neglog_finite_and_continuous_just_above_guard() {
             probit_scale,
         )
         .expect("neglog above guard");
-        assert!(v.is_finite(), "v not finite at i={i} qd1={qd1:.3e}: {v:.17e}");
+        assert!(
+            v.is_finite(),
+            "v not finite at i={i} qd1={qd1:.3e}: {v:.17e}"
+        );
         values.push(v);
     }
     for (i, w) in values.windows(2).enumerate() {
@@ -340,8 +340,7 @@ fn neglog_finite_and_continuous_just_above_guard() {
 
 #[test]
 fn neglog_is_linear_in_weight_and_zero_for_zero_weight() {
-    let covariance =
-        MarginalSlopeCovariance::Diagonal(ndarray::array![1.2, 0.7, 0.5]);
+    let covariance = MarginalSlopeCovariance::Diagonal(ndarray::array![1.2, 0.7, 0.5]);
     let slopes = [0.18, -0.22, 0.1];
     let z = [0.6, -0.4, 0.9];
     let probit_scale = 0.8;
@@ -351,13 +350,31 @@ fn neglog_is_linear_in_weight_and_zero_for_zero_weight() {
     let event = 1.0;
 
     let base = survival_marginal_slope_vector_neglog(
-        q0, q1, qd1, &slopes, &z, &covariance, 1.0, event, 1e-9, probit_scale,
+        q0,
+        q1,
+        qd1,
+        &slopes,
+        &z,
+        &covariance,
+        1.0,
+        event,
+        1e-9,
+        probit_scale,
     )
     .expect("neglog unit weight");
 
     for &w in &[0.25_f64, 0.5, 2.0, 3.7] {
         let v = survival_marginal_slope_vector_neglog(
-            q0, q1, qd1, &slopes, &z, &covariance, w, event, 1e-9, probit_scale,
+            q0,
+            q1,
+            qd1,
+            &slopes,
+            &z,
+            &covariance,
+            w,
+            event,
+            1e-9,
+            probit_scale,
         )
         .expect("neglog weighted");
         let expected = w * base;
@@ -369,10 +386,22 @@ fn neglog_is_linear_in_weight_and_zero_for_zero_weight() {
     }
 
     let zero = survival_marginal_slope_vector_neglog(
-        q0, q1, qd1, &slopes, &z, &covariance, 0.0, event, 1e-9, probit_scale,
+        q0,
+        q1,
+        qd1,
+        &slopes,
+        &z,
+        &covariance,
+        0.0,
+        event,
+        1e-9,
+        probit_scale,
     )
     .expect("neglog zero weight");
-    assert_eq!(zero, 0.0, "weight=0 should yield exactly 0.0 (got {zero:.17e})");
+    assert_eq!(
+        zero, 0.0,
+        "weight=0 should yield exactly 0.0 (got {zero:.17e})"
+    );
     assert_eq!(zero.to_bits(), 0.0_f64.to_bits(), "weight=0 should be +0.0");
 }
 
@@ -443,10 +472,7 @@ fn neglog_invariant_under_joint_negation_of_z_and_slopes() {
 
 #[test]
 fn neglog_lone_sign_flip_changes_value() {
-    let covariance = MarginalSlopeCovariance::Full(ndarray::array![
-        [1.0, 0.25],
-        [0.25, 0.7],
-    ]);
+    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.25], [0.25, 0.7],]);
     let slopes = [0.31, -0.22];
     let z = [0.8, -0.5];
     let probit_scale = 0.95;
@@ -457,14 +483,32 @@ fn neglog_lone_sign_flip_changes_value() {
     let qd1 = 0.9;
 
     let base = survival_marginal_slope_vector_neglog(
-        q0, q1, qd1, &slopes, &z, &covariance, weight, event, 1e-9, probit_scale,
+        q0,
+        q1,
+        qd1,
+        &slopes,
+        &z,
+        &covariance,
+        weight,
+        event,
+        1e-9,
+        probit_scale,
     )
     .expect("base");
     let neg_z: Vec<f64> = z.iter().map(|&v| -v).collect();
     let neg_slopes: Vec<f64> = slopes.iter().map(|&v| -v).collect();
 
     let flip_z = survival_marginal_slope_vector_neglog(
-        q0, q1, qd1, &slopes, &neg_z, &covariance, weight, event, 1e-9, probit_scale,
+        q0,
+        q1,
+        qd1,
+        &slopes,
+        &neg_z,
+        &covariance,
+        weight,
+        event,
+        1e-9,
+        probit_scale,
     )
     .expect("flip_z");
     let flip_slopes = survival_marginal_slope_vector_neglog(
@@ -509,7 +553,16 @@ fn neglog_invariant_under_probit_scale_slope_rescale() {
     let s_base = 0.95_f64;
 
     let base = survival_marginal_slope_vector_neglog(
-        q0, q1, qd1, &slopes, &z, &covariance, weight, event, 1e-9, s_base,
+        q0,
+        q1,
+        qd1,
+        &slopes,
+        &z,
+        &covariance,
+        weight,
+        event,
+        1e-9,
+        s_base,
     )
     .expect("base");
 
@@ -541,14 +594,22 @@ fn neglog_invariant_under_probit_scale_slope_rescale() {
 
 #[test]
 fn neglog_errors_on_dimension_mismatch() {
-    let covariance =
-        MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.2], [0.2, 0.8]]);
+    let covariance = MarginalSlopeCovariance::Full(ndarray::array![[1.0, 0.2], [0.2, 0.8]]);
     let slopes_ok = [0.3, -0.2];
     let z_ok = [0.5, -0.4];
 
     // z too short.
     let err = survival_marginal_slope_vector_neglog(
-        0.1, 0.4, 0.9, &slopes_ok, &[0.5], &covariance, 1.0, 1.0, 1e-9, 1.0,
+        0.1,
+        0.4,
+        0.9,
+        &slopes_ok,
+        &[0.5],
+        &covariance,
+        1.0,
+        1.0,
+        1e-9,
+        1.0,
     )
     .expect_err("z dim mismatch must error");
     assert!(!err.is_empty());
@@ -590,8 +651,7 @@ fn neglog_errors_on_dimension_mismatch() {
 
 #[test]
 fn neglog_nonfinite_inputs_yield_error_or_nonfinite() {
-    let covariance =
-        MarginalSlopeCovariance::Diagonal(ndarray::array![1.0, 0.5]);
+    let covariance = MarginalSlopeCovariance::Diagonal(ndarray::array![1.0, 0.5]);
     let good_slopes = [0.21, -0.13];
     let good_z = [0.5, -0.3];
     let probit_scale = 0.9;
