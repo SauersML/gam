@@ -18543,10 +18543,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 return Err(EstimationError::RemlOptimizationFailed(e));
             }
         };
+        let inner_beta_hint = Some(Array1::from_iter(
+            eval_result
+                .warm_start
+                .block_beta
+                .iter()
+                .flat_map(|beta| beta.iter().copied()),
+        ));
         Ok(OuterEval {
             cost: eval_result.objective,
             gradient: eval_result.gradient,
             hessian: eval_result.outer_hessian,
+            inner_beta_hint,
         })
     };
 

@@ -40,12 +40,14 @@ fn repro_outer_smoothing_linesearch_failure_via_run_outer() {
                         cost: 833.403058988699,
                         gradient: ndarray::array![1.1751972450892738, 0.0, 0.0],
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 } else {
                     Ok(OuterEval {
                         cost: f64::INFINITY,
                         gradient: Array1::zeros(3),
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 }
             },
