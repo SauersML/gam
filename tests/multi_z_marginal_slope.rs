@@ -104,16 +104,24 @@ fn multi_z_covariance_shape_auto_derives_from_score_geometry() {
         .expect("diagonal covariance");
     assert_eq!(diagonal.shape(), MarginalSlopeCovarianceShape::Diagonal);
 
-    let full_scores = array![
-        [-1.0, -0.8],
-        [0.2, 0.7],
-        [1.4, 0.1],
-        [0.5, -1.2],
-        [-0.7, 1.5],
-        [1.1, 0.9]
-    ];
+    // Full case: construct two columns whose sample off-diagonal is far above
+    // the 4σ statistical floor used by the classifier.  Mixing the two
+    // harmonics cos(2π·3t) and cos(2π·5t) gives orthogonal basis functions
+    // with var ≈ 1/2 each; col2 = 0.7·col1 + 0.4·col1_other_harmonic injects
+    // a cov[0,1] ≈ 0.35 ≈ 7·SE_offdiag at N=64.  Both eigenvalues stay well
+    // above rank_tol, so the classifier falls through to Full (not LowRank).
+    const N_FULL: usize = 64;
+    let mut full_scores = ndarray::Array2::<f64>::zeros((N_FULL, 2));
+    for i in 0..N_FULL {
+        let t = (i as f64) / (N_FULL as f64);
+        let h3 = (2.0 * std::f64::consts::PI * 3.0 * t).cos();
+        let h5 = (2.0 * std::f64::consts::PI * 5.0 * t).cos();
+        full_scores[[i, 0]] = h3;
+        full_scores[[i, 1]] = 0.7 * h3 + 0.4 * h5;
+    }
+    let weights_full = Array1::ones(N_FULL);
     let full =
-        marginal_slope_covariance_from_scores(full_scores.view(), &weights).expect("full cov");
+        marginal_slope_covariance_from_scores(full_scores.view(), &weights_full).expect("full cov");
     assert_eq!(full.shape(), MarginalSlopeCovarianceShape::Full);
 
     let low_rank_scores = array![

@@ -3026,16 +3026,48 @@ pub fn marginal_slope_covariance_from_scores(
         }
     }
 
-    let diag_max = (0..k).fold(0.0_f64, |acc, idx| acc.max(cov[[idx, idx]].abs()));
-    let mut offdiag_max = 0.0_f64;
-    for i in 0..k {
-        for j in 0..k {
-            if i != j {
-                offdiag_max = offdiag_max.max(cov[[i, j]].abs());
+    // ── Shape classification ──
+    //
+    // Mark the sample covariance as Diagonal when every off-diagonal is
+    // indistinguishable from zero, where "indistinguishable" combines
+    // BOTH a numerical floor and a statistical floor:
+    //
+    //   * numerical: 1e-10 · (1 + diag_max) — catches structurally-zero
+    //     off-diagonals (e.g. post-orthogonalised production input).
+    //
+    //   * statistical: 4 · √(σ_aa · σ_bb / N_eff) — under H0 (the population
+    //     is diagonal), the off-diagonal sample covariance has asymptotic
+    //     standard error √(σ_aa σ_bb / N_eff).  A 4σ pairwise threshold is
+    //     Bonferroni-safe for K up to ~30 at α≈0.01 (K(K-1)/2 ≤ 435 pairs).
+    //     Without this, raw IID-normal scores with N=10⁴ are classified as
+    //     Full because their O(1/√N) sample noise trips the numerical floor.
+    //
+    // N_eff is Kish's effective sample size for weighted statistics:
+    //   N_eff = (Σ w_i)² / Σ w_i².
+    let sum_w_sq = weights.iter().map(|&w| w * w).sum::<f64>();
+    let n_eff = if sum_w_sq > 0.0 {
+        (total_weight * total_weight) / sum_w_sq
+    } else {
+        1.0
+    };
+    let diag: Vec<f64> = (0..k).map(|i| cov[[i, i]]).collect();
+    let diag_max = diag.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let numerical_floor = 1e-10 * (1.0 + diag_max);
+    const OFFDIAG_Z_THRESHOLD: f64 = 4.0;
+    let mut is_diagonal = true;
+    'outer: for a in 0..k {
+        for b in (a + 1)..k {
+            let stat_se = (diag[a].max(0.0) * diag[b].max(0.0) / n_eff)
+                .max(0.0)
+                .sqrt();
+            let threshold = numerical_floor.max(OFFDIAG_Z_THRESHOLD * stat_se);
+            if cov[[a, b]].abs() > threshold {
+                is_diagonal = false;
+                break 'outer;
             }
         }
     }
-    if k == 1 || offdiag_max <= 1e-10 * (1.0 + diag_max) {
+    if k == 1 || is_diagonal {
         return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
     }
 

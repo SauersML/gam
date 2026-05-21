@@ -128,12 +128,12 @@ def competing_risks_cif(
         raise ValueError(
             "all endpoint predictions must return the same (n_rows, n_times) shape"
         ) from exc
-    payload = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
+    cif, overall_survival = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
     return CompetingRisksCIF(
-        times=np.asarray(payload["times"], dtype=float),
-        cif=np.asarray(payload["cif"], dtype=float),
-        overall_survival=np.asarray(payload["overall_survival"], dtype=float),
-        cumulative_hazard=np.asarray(payload["cumulative_hazard"], dtype=float),
+        times=times_arr,
+        cif=np.asarray(cif, dtype=float),
+        overall_survival=np.asarray(overall_survival, dtype=float),
+        cumulative_hazard=cumulative_hazard,
         endpoint_names=names,
     )
 

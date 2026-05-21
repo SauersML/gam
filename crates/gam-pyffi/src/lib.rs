@@ -505,17 +505,14 @@ fn competing_risks_cif<'py>(
     py: Python<'py>,
     times: PyReadonlyArray1<'py, f64>,
     cumulative_hazard: PyReadonlyArray3<'py, f64>,
-) -> PyResult<Py<PyDict>> {
-    let times = times.as_array().to_owned();
-    let cumulative_hazard = cumulative_hazard.as_array().to_owned();
+) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
     let (cif, overall_survival) =
-        competing_risks_cif_impl(times.view(), cumulative_hazard.view()).map_err(py_value_error)?;
-    let out = PyDict::new(py);
-    out.set_item("times", times.into_pyarray(py))?;
-    out.set_item("cif", cif.into_pyarray(py))?;
-    out.set_item("overall_survival", overall_survival.into_pyarray(py))?;
-    out.set_item("cumulative_hazard", cumulative_hazard.into_pyarray(py))?;
-    Ok(out.unbind())
+        competing_risks_cif_impl(times.as_array(), cumulative_hazard.as_array())
+            .map_err(py_value_error)?;
+    Ok((
+        cif.into_pyarray(py).unbind(),
+        overall_survival.into_pyarray(py).unbind(),
+    ))
 }
 
 fn competing_risks_cif_impl(
