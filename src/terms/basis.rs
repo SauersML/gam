@@ -12185,7 +12185,7 @@ fn bessel_k_real_half_integer_or_integer(nu_abs: f64, z: f64) -> Result<f64, Bas
 #[derive(Clone, Copy)]
 struct PolyharmonicBlockCoeff {
     c: f64,
-    power: f64,
+    power: usize,
     is_log_case: bool,
 }
 
@@ -12745,13 +12745,13 @@ fn validate_duchon_collocation_orders(
     // matrices ultimately built from these collocation operators are of
     // the form S = D_k^T D_k and are PSD by construction; the discipline
     // here is purely about *existence* of D_k itself.
-    let spectral_order = 2 * (p_order + s_order);
-    if max_operator_derivative_order >= 1 && spectral_order <= k_dim + 1 {
+    let spectral_order = 2.0 * (p_order as f64 + s_order);
+    if max_operator_derivative_order >= 1 && spectral_order <= k_dim as f64 + 1.0 {
         return Err(BasisError::InvalidInput(format!(
             "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
         )));
     }
-    if max_operator_derivative_order >= 2 && spectral_order <= k_dim + 2 {
+    if max_operator_derivative_order >= 2 && spectral_order <= k_dim as f64 + 2.0 {
         return Err(BasisError::InvalidInput(format!(
             "Duchon D2 collocation requires 2*(p+s) > dimension+2; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
         )));
