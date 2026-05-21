@@ -177,6 +177,13 @@ struct PyPredictOptions {
     with_uncertainty: bool,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PyPairedCifOptions {
+    times: Vec<f64>,
+    level: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct SummaryCoefficientRow {
     index: usize,
@@ -287,6 +294,28 @@ struct SurvivalPredictionPayload {
 }
 
 #[derive(Serialize)]
+struct PairedSamplePayload {
+    class: &'static str,
+    n_draws: usize,
+    target: SamplePayload,
+    competing: SamplePayload,
+}
+
+#[derive(Serialize)]
+struct PairedCifPayload {
+    class: &'static str,
+    level: f64,
+    times: Vec<f64>,
+    n_draws: usize,
+    n_rows: usize,
+    n_times: usize,
+    cif_flat: Vec<f64>,
+    mean_flat: Vec<f64>,
+    lower_flat: Vec<f64>,
+    upper_flat: Vec<f64>,
+}
+
+#[derive(Serialize)]
 struct ValidationPayload {
     formula: String,
     family_name: String,
@@ -324,6 +353,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "extend_with_group",
             "predict",
             "predict_array",
+            "competing_risks_cif",
             "sample",
             "summary",
             "check",
@@ -365,6 +395,45 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
         ],
     )?;
     Ok(info.unbind())
+}
+
+#[pyfunction]
+fn competing_risks_cif<'py>(
+    py: Python<'py>,
+    cumulative_hazards: Vec<PyReadonlyArray2<'py, f64>>,
+    times: PyReadonlyArray1<'py, f64>,
+) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
+    let n_endpoints = cumulative_hazards.len();
+    if n_endpoints == 0 {
+        return Err(py_value_error(
+            "competing_risks_cif requires at least one endpoint prediction".to_string(),
+        ));
+    }
+    let first = cumulative_hazards[0].as_array();
+    let (n_rows, n_times) = first.dim();
+    let mut cumulative_hazard = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
+    for (endpoint, hazard) in cumulative_hazards.iter().enumerate() {
+        let hazard_view = hazard.as_array();
+        if hazard_view.dim() != (n_rows, n_times) {
+            return Err(py_value_error(format!(
+                "all endpoint predictions must return the same (n_rows, n_times) shape; \
+                 got {:?} for endpoint {}, expected {:?}",
+                hazard_view.dim(),
+                endpoint,
+                (n_rows, n_times)
+            )));
+        }
+        cumulative_hazard
+            .slice_mut(s![endpoint, .., ..])
+            .assign(&hazard_view);
+    }
+    let result =
+        gam::survival::assemble_competing_risks_cif(times.as_array(), cumulative_hazard.view())
+            .map_err(|err| py_value_error(err.to_string()))?;
+    Ok((
+        result.cif.into_pyarray(py).unbind(),
+        result.overall_survival.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction]
@@ -450,6 +519,115 @@ fn predict_array<'py>(
     let out = predict_array_impl(&model_bytes, x.as_array(), options_json.as_deref())
         .map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn competing_risks_cif<'py>(
+    py: Python<'py>,
+    times: PyReadonlyArray1<'py, f64>,
+    cumulative_hazard: PyReadonlyArray3<'py, f64>,
+) -> PyResult<Py<PyDict>> {
+    let times = times.as_array().to_owned();
+    let cumulative_hazard = cumulative_hazard.as_array().to_owned();
+    let (cif, overall_survival) =
+        competing_risks_cif_impl(times.view(), cumulative_hazard.view()).map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    out.set_item("times", times.into_pyarray(py))?;
+    out.set_item("cif", cif.into_pyarray(py))?;
+    out.set_item("overall_survival", overall_survival.into_pyarray(py))?;
+    out.set_item("cumulative_hazard", cumulative_hazard.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+fn competing_risks_cif_impl(
+    times: ArrayView1<'_, f64>,
+    cumulative_hazard: ArrayView3<'_, f64>,
+) -> Result<(Array3<f64>, Array2<f64>), String> {
+    let (n_endpoints, n_rows, n_times) = cumulative_hazard.dim();
+    if n_times == 0 || times.is_empty() {
+        return Err("competing_risks_cif requires at least one time".to_string());
+    }
+    if times.len() != n_times {
+        return Err(format!(
+            "competing_risks_cif got {} times but cumulative hazards have {} time columns",
+            times.len(),
+            n_times
+        ));
+    }
+    if n_endpoints == 0 {
+        return Err("competing_risks_cif requires at least one endpoint".to_string());
+    }
+    if n_rows == 0 {
+        return Err("competing_risks_cif requires at least one prediction row".to_string());
+    }
+    if times.iter().any(|time| !time.is_finite()) {
+        return Err("competing_risks_cif times must be finite".to_string());
+    }
+    if times.iter().any(|time| *time < 0.0) {
+        return Err("competing_risks_cif times must be non-negative".to_string());
+    }
+    for time_index in 1..n_times {
+        if times[time_index] <= times[time_index - 1] {
+            return Err("competing_risks_cif times must be strictly increasing".to_string());
+        }
+    }
+
+    let mut max_abs_cumulative = 0.0_f64;
+    for value in cumulative_hazard.iter() {
+        if !value.is_finite() {
+            return Err("endpoint cumulative hazards must be finite".to_string());
+        }
+        max_abs_cumulative = max_abs_cumulative.max(value.abs());
+    }
+    let tolerance = 1.0e-10 * max_abs_cumulative.max(1.0);
+    let mut increments = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
+    for endpoint in 0..n_endpoints {
+        for row in 0..n_rows {
+            let mut previous = 0.0;
+            for time_index in 0..n_times {
+                let current = cumulative_hazard[[endpoint, row, time_index]];
+                let increment = current - previous;
+                if increment < -tolerance {
+                    return Err(
+                        "endpoint cumulative hazards must be non-decreasing over the requested times"
+                            .to_string(),
+                    );
+                }
+                increments[[endpoint, row, time_index]] = increment.max(0.0);
+                previous = current;
+            }
+        }
+    }
+
+    let mut cif = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
+    let mut overall_survival = Array2::<f64>::zeros((n_rows, n_times));
+    for row in 0..n_rows {
+        let mut previous_total_cumulative = 0.0;
+        let mut running_cif = vec![0.0; n_endpoints];
+        for time_index in 0..n_times {
+            let mut total_cumulative = 0.0;
+            let mut total_increment = 0.0;
+            for endpoint in 0..n_endpoints {
+                total_cumulative += cumulative_hazard[[endpoint, row, time_index]];
+                total_increment += increments[[endpoint, row, time_index]];
+            }
+
+            let survival_left = (-previous_total_cumulative).exp();
+            let interval_failure = -(-total_increment).exp_m1();
+            if total_increment > 0.0 {
+                for endpoint in 0..n_endpoints {
+                    let weight = increments[[endpoint, row, time_index]] / total_increment;
+                    running_cif[endpoint] += weight * survival_left * interval_failure;
+                }
+            }
+            for endpoint in 0..n_endpoints {
+                cif[[endpoint, row, time_index]] = running_cif[endpoint].clamp(0.0, 1.0);
+            }
+            overall_survival[[row, time_index]] = (-total_cumulative).exp().clamp(0.0, 1.0);
+            previous_total_cumulative = total_cumulative;
+        }
+    }
+    Ok((cif, overall_survival))
 }
 
 #[pyfunction]
@@ -3137,6 +3315,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
+    module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;

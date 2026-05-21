@@ -18671,7 +18671,7 @@ fn build_duchon_basis_designwithworkspace(
                             r,
                             length_scale,
                             p_order,
-                            s_order,
+                            duchon_power_to_usize(s_order),
                             d,
                             coeffs.as_ref(),
                         )?
