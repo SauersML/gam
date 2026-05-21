@@ -357,8 +357,11 @@ mod tests {
         };
         s.preload(seeded);
 
-        let peeked = s.peek_load().expect("peek should see preloaded seed");
-        assert_eq!(peeked.payload, b"seed");
+        let peeked = s
+            .peek_load_with_source()
+            .expect("peek should see preloaded seed");
+        assert_eq!(peeked.entry.payload, b"seed");
+        assert_eq!(peeked.source, LoadSource::Preloaded);
 
         let loaded = s
             .try_load()
