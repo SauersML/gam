@@ -7221,14 +7221,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: vec![
-                BlockWorkingSet::Diagonal {
-                    working_response: zmu,
-                    working_weights: wmu,
-                },
-                BlockWorkingSet::Diagonal {
-                    working_response: z_ls,
-                    working_weights: w_ls,
-                },
+                BlockWorkingSet::diagonal_checked(zmu, wmu)?,
+                BlockWorkingSet::diagonal_checked(z_ls, w_ls)?,
             ],
         })
     }
@@ -10622,18 +10616,9 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: vec![
-                BlockWorkingSet::Diagonal {
-                    working_response: zmu,
-                    working_weights: wmu,
-                },
-                BlockWorkingSet::Diagonal {
-                    working_response: zls,
-                    working_weights: wls,
-                },
-                BlockWorkingSet::Diagonal {
-                    working_response: zw,
-                    working_weights: ww,
-                },
+                BlockWorkingSet::diagonal_checked(zmu, wmu)?,
+                BlockWorkingSet::diagonal_checked(zls, wls)?,
+                BlockWorkingSet::diagonal_checked(zw, ww)?,
             ],
         })
     }
@@ -11870,14 +11855,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(FamilyEvaluation {
             log_likelihood: ll,
             blockworking_sets: vec![
-                BlockWorkingSet::Diagonal {
-                    working_response: z_eta,
-                    working_weights: w_eta,
-                },
-                BlockWorkingSet::Diagonal {
-                    working_response: z_wiggle,
-                    working_weights: w_wiggle,
-                },
+                BlockWorkingSet::diagonal_checked(z_eta, w_eta)?,
+                BlockWorkingSet::diagonal_checked(z_wiggle, w_wiggle)?,
             ],
         })
     }
@@ -12805,10 +12784,7 @@ fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
 
     Ok(FamilyEvaluation {
         log_likelihood: ll,
-        blockworking_sets: vec![BlockWorkingSet::Diagonal {
-            working_response: z,
-            working_weights: w,
-        }],
+        blockworking_sets: vec![BlockWorkingSet::diagonal_checked(z, w)?],
     })
 }
 
