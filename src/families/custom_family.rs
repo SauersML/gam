@@ -12170,6 +12170,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
+            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
+                family,
+                specs,
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -12181,7 +12189,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
-                kkt_residual: None,
+                kkt_residual,
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -12216,6 +12224,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
+                kkt_residual: None,
             });
         }
         if coupled_exact_joint_required {
@@ -12957,6 +12966,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
+    let kkt_residual = if converged {
+        exact_newton_joint_kkt_residual_for_ift(
+            family,
+            specs,
+            &states,
+            &s_lambdas,
+            ridge,
+            options.ridge_policy,
+        )?
+    } else {
+        None
+    };
 
     Ok(BlockwiseInnerResult {
         block_states: states,
@@ -12969,6 +12990,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         block_logdet_s,
         s_lambdas,
         joint_workspace: None,
+        kkt_residual,
     })
 }
 
@@ -18794,6 +18816,7 @@ mod tests {
             block_logdet_s: 0.0,
             s_lambdas: vec![s_lambda.clone()],
             joint_workspace: None,
+            kkt_residual: None,
         };
         let per_block = vec![rho.clone()];
         let options = BlockwiseFitOptions {
@@ -18964,6 +18987,7 @@ mod tests {
                 block_logdet_s: 0.0,
                 s_lambdas: vec![s_lambda.clone()],
                 joint_workspace: None,
+                kkt_residual: None,
             };
             let per_block = vec![rho.clone()];
             let options = BlockwiseFitOptions {
