@@ -15943,6 +15943,56 @@ mod tests {
     }
 
     #[test]
+    fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
+        let kernel = PenaltySubspaceTrace {
+            u_s: array![[1.0, 0.0], [0.2, 0.8], [-0.1, 0.6]],
+            h_proj_inverse: array![[0.8, 0.1], [0.1, 0.6]],
+        };
+        let dense = array![[0.4, 0.1, -0.2], [0.1, 0.7, 0.3], [-0.2, 0.3, 0.5]];
+        let op_matrix = array![[0.3, -0.2, 0.1], [-0.2, 0.9, 0.4], [0.1, 0.4, 0.8]];
+        let composite_dense = array![[0.05, 0.01, 0.0], [0.01, -0.02, 0.03], [0.0, 0.03, 0.04]];
+        let drifts = vec![
+            DriftDerivResult::Dense(dense.clone()),
+            DriftDerivResult::Operator(Arc::new(DenseMatrixHyperOperator {
+                matrix: op_matrix.clone(),
+            })),
+            DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                dim_hint: 3,
+                dense: Some(composite_dense.clone()),
+                operators: vec![Arc::new(DenseMatrixHyperOperator {
+                    matrix: op_matrix.clone(),
+                })],
+            })),
+        ];
+
+        let batched = penalty_subspace_reduce_drifts_batched(&kernel, &drifts);
+        let serial = vec![
+            kernel.reduce(&dense),
+            kernel.reduce_operator(&DenseMatrixHyperOperator {
+                matrix: op_matrix.clone(),
+            }),
+            kernel.reduce_operator(&CompositeHyperOperator {
+                dim_hint: 3,
+                dense: Some(composite_dense),
+                operators: vec![Arc::new(DenseMatrixHyperOperator { matrix: op_matrix })],
+            }),
+        ];
+
+        for (idx, (batched_mat, serial_mat)) in batched.iter().zip(serial.iter()).enumerate() {
+            for row in 0..batched_mat.nrows() {
+                for col in 0..batched_mat.ncols() {
+                    assert_relative_eq!(
+                        batched_mat[[row, col]],
+                        serial_mat[[row, col]],
+                        epsilon = 1e-12,
+                        max_relative = 1e-12,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn subspace_trace_large_k_routes_to_projected_operator() {
         let h = array![[3.0, 0.2], [0.2, 5.0]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
