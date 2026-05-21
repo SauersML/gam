@@ -3114,6 +3114,46 @@ pub fn evaluate_cell_moments_uncached(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
+    evaluate_cell_state_dispatched(
+        cell,
+        max_degree,
+        evaluate_affine_cell_state,
+        evaluate_non_affine_cell_state,
+    )
+}
+
+/// Evaluate only the moment vector needed by derivative contractions.
+///
+/// This deliberately does not compute the cell probability value
+/// `∫ φ(z) Φ(η(z)) dz`. Derivative contractions consume
+/// `∫ z^k exp(-q(z)) dz` moments only, so keeping the value out of the return
+/// type prevents this cheaper evaluator from satisfying value-bearing calls.
+pub fn evaluate_cell_derivative_moments_uncached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    evaluate_cell_state_dispatched(
+        cell,
+        max_degree,
+        evaluate_affine_cell_derivative_state,
+        evaluate_non_affine_cell_derivative_state,
+    )
+}
+
+/// Shared branch dispatch for the value-bearing and derivative-only cell
+/// evaluators. Both walk the same decision tree (semi-infinite tail → must
+/// be affine; finite cell → branch-by-coefficients with the sextic
+/// degenerate-lowering path), differing only in which pair of
+/// `(affine, non_affine)` evaluator helpers to delegate to.  The two helpers
+/// are passed as `fn` pointers so the dispatch monomorphizes per `S` and
+/// keeps the existing pre-condition errors / unreachable branch handling
+/// in lockstep across both evaluators.
+fn evaluate_cell_state_dispatched<S>(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+    affine: fn(DenestedCubicCell, usize) -> Result<S, String>,
+    non_affine: fn(DenestedCubicCell, ExactCellBranch, usize) -> Result<S, String>,
+) -> Result<S, String> {
     let left_inf = !cell.left.is_finite();
     let right_inf = !cell.right.is_finite();
     if left_inf || right_inf {
@@ -3127,7 +3167,7 @@ pub fn evaluate_cell_moments_uncached(
                 cell.left, cell.right, cell.c2, cell.c3
             ));
         }
-        return evaluate_affine_cell_state(cell, max_degree);
+        return affine(cell, max_degree);
     }
     if cell.right <= cell.left {
         return Err(format!(
@@ -3137,7 +3177,7 @@ pub fn evaluate_cell_moments_uncached(
     }
     let branch = branch_cell(cell)?;
     if branch == ExactCellBranch::Affine {
-        return evaluate_affine_cell_state(cell, max_degree);
+        return affine(cell, max_degree);
     }
     if branch == ExactCellBranch::Sextic {
         let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
@@ -3148,12 +3188,12 @@ pub fn evaluate_cell_moments_uncached(
         }
         if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
             return match lower_branch {
-                ExactCellBranch::Quartic => evaluate_non_affine_cell_state(
+                ExactCellBranch::Quartic => non_affine(
                     DenestedCubicCell { c3: 0.0, ..cell },
                     ExactCellBranch::Quartic,
                     max_degree,
                 ),
-                ExactCellBranch::Affine => evaluate_affine_cell_state(
+                ExactCellBranch::Affine => affine(
                     DenestedCubicCell {
                         c2: 0.0,
                         c3: 0.0,
@@ -3165,68 +3205,7 @@ pub fn evaluate_cell_moments_uncached(
             };
         }
     }
-    evaluate_non_affine_cell_state(cell, branch, max_degree)
-}
-
-/// Evaluate only the moment vector needed by derivative contractions.
-///
-/// This deliberately does not compute the cell probability value
-/// `∫ φ(z) Φ(η(z)) dz`. Derivative contractions consume
-/// `∫ z^k exp(-q(z)) dz` moments only, so keeping the value out of the return
-/// type prevents this cheaper evaluator from satisfying value-bearing calls.
-pub fn evaluate_cell_derivative_moments_uncached(
-    cell: DenestedCubicCell,
-    max_degree: usize,
-) -> Result<CellDerivativeMomentState, String> {
-    let left_inf = !cell.left.is_finite();
-    let right_inf = !cell.right.is_finite();
-    if left_inf || right_inf {
-        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
-        {
-            return Err(format!(
-                "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
-                cell.left, cell.right, cell.c2, cell.c3
-            ));
-        }
-        return evaluate_affine_cell_derivative_state(cell, max_degree);
-    }
-    if cell.right <= cell.left {
-        return Err(format!(
-            "finite cell must have left < right, got [{}, {}]",
-            cell.left, cell.right
-        ));
-    }
-    let branch = branch_cell(cell)?;
-    if branch == ExactCellBranch::Affine {
-        return evaluate_affine_cell_derivative_state(cell, max_degree);
-    }
-    if branch == ExactCellBranch::Sextic {
-        let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
-        if !lead.is_finite() {
-            return Err(format!(
-                "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"
-            ));
-        }
-        if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
-            return match lower_branch {
-                ExactCellBranch::Quartic => evaluate_non_affine_cell_derivative_state(
-                    DenestedCubicCell { c3: 0.0, ..cell },
-                    ExactCellBranch::Quartic,
-                    max_degree,
-                ),
-                ExactCellBranch::Affine => evaluate_affine_cell_derivative_state(
-                    DenestedCubicCell {
-                        c2: 0.0,
-                        c3: 0.0,
-                        ..cell
-                    },
-                    max_degree,
-                ),
-                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
-            };
-        }
-    }
-    evaluate_non_affine_cell_derivative_state(cell, branch, max_degree)
+    non_affine(cell, branch, max_degree)
 }
 
 /// Evaluate a de-nested cubic cell through a fit-lifetime byte-limited LRU cache.
