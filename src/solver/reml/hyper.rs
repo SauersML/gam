@@ -562,7 +562,7 @@ impl<'a> RemlState<'a> {
                         v.len()
                     )));
                 }
-                Ok(dense.t().dot(v))
+                Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
             TauDesignTerm::Implicit(deriv) => {
                 deriv.transformed_transpose_mul(qs, free_basis_opt, v)
@@ -600,7 +600,7 @@ impl<'a> RemlState<'a> {
                         v.len()
                     )));
                 }
-                Ok(dense.t().dot(v))
+                Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
             TauDesignTerm::Implicit(deriv) => deriv.transpose_mul_original(v),
         }
@@ -647,7 +647,7 @@ impl<'a> RemlState<'a> {
                         v.len()
                     )));
                 }
-                Ok(dense.t().dot(v))
+                Ok(crate::faer_ndarray::fast_atv(dense, v))
             }
             TauTauDesignTerm::Implicit(deriv) => match basis {
                 TauPairBasis::Original => deriv.transpose_mul_original(v),
@@ -1285,7 +1285,7 @@ impl<'a> RemlState<'a> {
 
         let e_eval;
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+            beta_eval = crate::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
             e_eval = reparam_result.e_transformed.dot(z);
         } else {
             e_eval = reparam_result.e_transformed.clone();
@@ -1773,7 +1773,7 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+            beta_eval = crate::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
 
         let x_design =
@@ -2287,7 +2287,7 @@ impl<'a> RemlState<'a> {
 
         let mut beta_eval = pirls_result.beta_transformed.as_ref().clone();
         if let Some(z) = free_basis_opt.as_ref() {
-            beta_eval = z.t().dot(pirls_result.beta_transformed.as_ref());
+            beta_eval = crate::faer_ndarray::fast_atv(z, pirls_result.beta_transformed.as_ref());
         }
         let p_dim = beta_eval.len();
         let lambdas = rho.mapv(f64::exp);
