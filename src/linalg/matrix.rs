@@ -6787,7 +6787,7 @@ mod tests {
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
-    use crate::resource::MatrixMaterializationError;
+    use crate::resource::{MatrixMaterializationError, ResourcePolicy};
     use crate::testing::no_densify_design;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
