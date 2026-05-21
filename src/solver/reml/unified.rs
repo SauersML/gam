@@ -19654,32 +19654,62 @@ mod tests {
         let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
         let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
 
+        let log_det_s_at = |rho_eval: &[f64]| -> f64 {
+            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|&r| r.exp()).collect();
+            let mut s_eval = Array2::zeros((p, p));
+            s_eval.scaled_add(lambdas_eval[0], &s1);
+            s_eval.scaled_add(lambdas_eval[1], &s2);
+            let (s_eigs_eval, _) = s_eval.eigh(faer::Side::Lower).unwrap();
+            let threshold_eval = positive_eigenvalue_threshold(s_eigs_eval.as_slice().unwrap());
+            exact_pseudo_logdet(s_eigs_eval.as_slice().unwrap(), threshold_eval)
+        };
+
         let mut det1 = Array1::zeros(rho.len());
         let eps = 1e-7;
         for k in 0..rho.len() {
             let mut rho_plus = rho.to_vec();
             rho_plus[k] += eps;
-            let lambdas_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
-            let mut s_plus = Array2::zeros((p, p));
-            s_plus.scaled_add(lambdas_plus[0], &s1);
-            s_plus.scaled_add(lambdas_plus[1], &s2);
-            let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
-            let threshold_plus = positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
-            let log_det_s_plus =
-                exact_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), threshold_plus);
+            let log_det_s_plus = log_det_s_at(&rho_plus);
 
             let mut rho_minus = rho.to_vec();
             rho_minus[k] -= eps;
-            let lambdas_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
-            let mut s_minus = Array2::zeros((p, p));
-            s_minus.scaled_add(lambdas_minus[0], &s1);
-            s_minus.scaled_add(lambdas_minus[1], &s2);
-            let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
-            let threshold_minus = positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
-            let log_det_s_minus =
-                exact_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), threshold_minus);
+            let log_det_s_minus = log_det_s_at(&rho_minus);
 
             det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
+        }
+        let mut det2 = Array2::zeros((rho.len(), rho.len()));
+        let eps2 = 1e-5;
+        for i in 0..rho.len() {
+            for j in i..rho.len() {
+                let value = if i == j {
+                    let mut rho_plus = rho.to_vec();
+                    rho_plus[i] += eps2;
+                    let mut rho_minus = rho.to_vec();
+                    rho_minus[i] -= eps2;
+                    (log_det_s_at(&rho_plus) - 2.0 * log_det_s + log_det_s_at(&rho_minus))
+                        / (eps2 * eps2)
+                } else {
+                    let mut pp = rho.to_vec();
+                    pp[i] += eps2;
+                    pp[j] += eps2;
+                    let mut pm = rho.to_vec();
+                    pm[i] += eps2;
+                    pm[j] -= eps2;
+                    let mut mp = rho.to_vec();
+                    mp[i] -= eps2;
+                    mp[j] += eps2;
+                    let mut mm = rho.to_vec();
+                    mm[i] -= eps2;
+                    mm[j] -= eps2;
+                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp)
+                        + log_det_s_at(&mm))
+                        / (4.0 * eps2 * eps2)
+                };
+                det2[[i, j]] = value;
+                if i != j {
+                    det2[[j, i]] = value;
+                }
+            }
         }
 
         InnerSolution {
@@ -19694,7 +19724,7 @@ mod tests {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
-                second: None,
+                second: Some(det2),
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
