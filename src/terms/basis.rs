@@ -27992,7 +27992,10 @@ mod tests {
         let v_const = chol.solvevec(&xt_ones);
         // Sanity: design · v_const ≈ 1 across all rows.
         let recon = crate::faer_ndarray::fast_av(&design, &v_const);
-        let err = (&recon - &ones).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        let err = (&recon - &ones)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
         assert!(
             err < 1e-8,
             "v_const must reproduce the constant function: max |Xv − 1| = {err}"
