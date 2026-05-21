@@ -18601,7 +18601,11 @@ mod tests {
         .expect("projection parts build");
         let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
         assert_eq!(kernel.u_s.ncols(), 2);
-        assert_relative_eq!(logdet, (5.0_f64 * 11.0 - 0.2_f64 * 0.2).ln(), epsilon = 1e-12);
+        assert_relative_eq!(
+            logdet,
+            (5.0_f64 * 11.0 - 0.2_f64 * 0.2).ln(),
+            epsilon = 1e-12
+        );
 
         let analytic = kernel.trace_projected_logdet(&drift);
         let eps = 1.0e-6;
@@ -18625,7 +18629,12 @@ mod tests {
         .expect("minus projection parts build");
         let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
 
-        assert_relative_eq!(analytic, finite_difference, epsilon = 1e-8, max_relative = 1e-8);
+        assert_relative_eq!(
+            analytic,
+            finite_difference,
+            epsilon = 1e-8,
+            max_relative = 1e-8
+        );
     }
 
     #[test]
