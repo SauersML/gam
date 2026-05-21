@@ -83,10 +83,10 @@ use gam::survival_construction::{
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
-    SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
+    ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
     SurvivalLocationScaleTermSpec, TimeBlockInput, TimeWiggleBlockInput,
     predict_survival_location_scale, project_onto_linear_constraints,
-    residual_distribution_inverse_link,
+    residual_distribution_from_inverse_link, residual_distribution_inverse_link,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::survival_predict::{
@@ -4524,7 +4524,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
-                    survival_distribution: Some(fitted_inverse_link.saved_string()),
+                    survival_distribution: residual_distribution_from_inverse_link(
+                        &fitted_inverse_link,
+                    ),
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
                 LikelihoodFamily::RoystonParmar.name().to_string(),
@@ -4626,7 +4628,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 Some(survival_noise_transform.non_intercept_start);
             payload.survival_noise_projection_ridge_alpha =
                 Some(survival_noise_transform.projection_ridge_alpha);
-            payload.survival_distribution = Some(fitted_inverse_link.saved_string());
+            payload.survival_distribution =
+                residual_distribution_from_inverse_link(&fitted_inverse_link);
             set_training_feature_metadata_from_dataset(&mut payload, &ds);
             payload.resolved_termspec = Some(
                 freeze_term_collection_from_design(
@@ -4912,7 +4915,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
-                    survival_distribution: Some("probit".to_string()),
+                    survival_distribution: Some(ResidualDistribution::Gaussian),
                     frailty: save_frailty,
                 },
                 LikelihoodFamily::RoystonParmar.name().to_string(),
@@ -9946,7 +9949,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("location-scale".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -11928,7 +11931,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -12754,7 +12757,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
-                survival_distribution: Some("gaussian".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -12765,7 +12768,7 @@ mod tests {
         payload.survivalspec = Some("net".to_string());
         payload.survival_baseline_target = Some("linear".to_string());
         payload.survival_likelihood = Some("transformation".to_string());
-        payload.survival_distribution = Some("gaussian".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         let model = SavedModel::from_payload(payload);
 
         let err = super::load_survival_time_basis_config_from_model(&model)
@@ -12812,7 +12815,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13031,7 +13034,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13044,7 +13047,7 @@ mod tests {
         payload.survivalspec = Some("net".to_string());
         payload.survival_baseline_target = Some("linear".to_string());
         payload.survival_likelihood = Some("marginal-slope".to_string());
-        payload.survival_distribution = Some("probit".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.survival_time_basis = Some("ispline".to_string());
         payload.formula_logslope = Some("ls ~ 1".to_string());
         payload.z_column = Some("z".to_string());
@@ -13174,7 +13177,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13223,7 +13226,7 @@ mod tests {
         payload.survivalspec = Some("net".to_string());
         payload.survival_baseline_target = Some("linear".to_string());
         payload.survival_likelihood = Some("marginal-slope".to_string());
-        payload.survival_distribution = Some("probit".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.survival_time_basis = Some("ispline".to_string());
         payload.survival_time_anchor = Some(0.0);
         payload.formula_logslope = Some("1".to_string());
@@ -13307,7 +13310,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
-                survival_distribution: Some("gaussian".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13321,7 +13324,7 @@ mod tests {
         payload.survival_baseline_shape = Some(1.2);
         payload.survival_time_basis = Some("none".to_string());
         payload.survival_likelihood = Some("transformation".to_string());
-        payload.survival_distribution = Some("gaussian".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.set_training_feature_metadata(vec![], vec![]);
         payload.resolved_termspec = Some(empty_termspec());
         let model = SavedModel::from_payload(payload);
@@ -13377,7 +13380,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
-                survival_distribution: Some("gaussian".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13398,7 +13401,7 @@ mod tests {
         payload.survival_time_basis = Some("none".to_string());
         payload.survivalridge_lambda = Some(1e-4);
         payload.survival_likelihood = Some("transformation".to_string());
-        payload.survival_distribution = Some("gaussian".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.set_training_feature_metadata(
             vec!["entry".to_string(), "exit".to_string()],
             vec![(0.0, 0.0); 2],
@@ -13678,7 +13681,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("transformation".to_string()),
-                survival_distribution: Some("gaussian".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
             "survival",
@@ -13706,7 +13709,7 @@ mod tests {
         payload.survival_time_basis = Some("none".to_string());
         payload.survivalridge_lambda = Some(1e-4);
         payload.survival_likelihood = Some("transformation".to_string());
-        payload.survival_distribution = Some("gaussian".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.set_training_feature_metadata(
             vec!["entry".to_string(), "exit".to_string()],
             vec![(0.0, 0.0); 2],
