@@ -1140,7 +1140,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     } else {
         None
     };
-    let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+    let latent_cloglog_state = if family.is_latent_cloglog() {
         Some(latent_cloglog_state_from_frailty_spec(
             &frailty,
             "latent-cloglog-binomial",
@@ -1382,7 +1382,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
 
     if let Some(out) = args.out {
         progress.set_stage("fit", "writing fitted model");
-        let latent_cloglog_state = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+        let latent_cloglog_state = if family.is_latent_cloglog() {
             Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
                 "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
             ))

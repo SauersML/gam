@@ -5721,7 +5721,7 @@ where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+    if family.is_binomial_mixture()
         && opts.mixture_link.is_none()
     {
         return Err(EstimationError::InvalidInput(
@@ -5755,7 +5755,7 @@ where
             | crate::types::LikelihoodFamily::BinomialCLogLog
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic) {
+                if family.is_binomial_beta_logistic() {
                     crate::types::LikelihoodFamily::BinomialBetaLogistic
                 } else {
                     crate::types::LikelihoodFamily::BinomialSas

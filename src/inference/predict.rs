@@ -4971,7 +4971,7 @@ where
             .map(|i| -> Result<f64, EstimationError> {
                 let se_i = etavar[i].max(0.0).sqrt();
                 let (_, mut meanvar) = strategy.posterior_meanvariance(&quadctx, eta[i], se_i)?;
-                if matches!(family, crate::types::LikelihoodFamily::BinomialSas)
+                if family.is_binomial_sas()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Sas { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -4988,7 +4988,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if matches!(family, crate::types::LikelihoodFamily::BinomialBetaLogistic)
+                if family.is_binomial_beta_logistic()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::BetaLogistic { covariance, .. } => covariance.as_ref(),
                         _ => None,
@@ -5008,7 +5008,7 @@ where
                     let g = [jets.djet_depsilon.mu, jets.djet_dlog_delta.mu];
                     meanvar += quadratic_form(cov_theta, &g)?;
                 }
-                if matches!(family, crate::types::LikelihoodFamily::BinomialMixture)
+                if family.is_binomial_mixture()
                     && let Some(cov_theta) = fitted_link_state.as_ref().and_then(|s| match s {
                         FittedLinkState::Mixture { covariance, .. } => covariance.as_ref(),
                         _ => None,
