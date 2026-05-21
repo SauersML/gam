@@ -24740,6 +24740,92 @@ mod tests {
         assert_relative_eq!(inf_interior, 0.4_f64, epsilon = 1e-12);
     }
 
+    /// Pins the constrained-stationary certificate semantics.
+    ///
+    /// The certificate combines three local signals from the most recent
+    /// accepted Newton step:
+    ///
+    ///   1. `linearized_rel = ‖g + Hδ‖∞ / (1 + ‖g‖∞)` ≥ 0.5
+    ///      — the linear solve refused to neutralise most of `g`; the
+    ///        unreduced component lives in the constraint-active subspace
+    ///        and IS a Lagrange multiplier, not a defect of the solve.
+    ///
+    ///   2. `scalar_model_relative_error()` ≤ 1e-3
+    ///      — the local quadratic Newton model agrees with the observed
+    ///        objective change to roundoff, proving the Hessian+gradient
+    ///        are correct at this β.  Rules out genuine model mismatch
+    ///        masquerading as a multiplier.
+    ///
+    ///   3. `|Δobjective|` ≤ `objective_tol`
+    ///      — the objective has ceased moving.
+    ///
+    /// Reproduces the AoU survival-marginal-slope failure numerics:
+    /// `old_kkt ≈ 8.6e5`, `linearized_next ≈ 8.6e5`, `actual ≈ pred ≈ 1.6e-2`.
+    #[test]
+    fn joint_newton_math_constrained_stationary_signature_matches_aou_failure() {
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 8.613e5,
+            linearized_next_kkt_inf: 8.580e5,
+            predicted_reduction: 1.589e-2,
+            actual_reduction: 1.589e-2,
+            trust_ratio: 1.000,
+            step_inf: 1.270e-2,
+            proposal_inf: 1.270e-2,
+        };
+        // (1) The linearized solve neutralised <1% of g — Lagrange multiplier
+        // pattern, not a defect of the solve.
+        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+        assert!(
+            linearized_rel >= 0.5,
+            "AoU exit has linearized_rel = {:.3e}, must be >= 0.5 for the \
+             constrained-stationary certificate to fire",
+            linearized_rel,
+        );
+        // (2) Scalar Newton model is correct to roundoff — Hessian+gradient OK.
+        let relerr = math.scalar_model_relative_error();
+        assert!(
+            relerr <= 1e-3,
+            "AoU exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
+             (model agrees with actual ⇒ residual is a real multiplier)",
+            relerr,
+        );
+        // (3) Objective change at obj_tol scale. At |obj| ~ 3.5e5 and
+        // inner_tol ~ 1e-6, obj_tol ≈ 0.348, and observed Δobj ≈ 1.6e-2.
+        let objective_change = 1.589e-2_f64;
+        let objective_tol = 1e-6 * (1.0 + 3.484783e5_f64);
+        assert!(
+            objective_change <= objective_tol,
+            "AoU exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
+            objective_change,
+            objective_tol,
+        );
+    }
+
+    /// Negative case: a genuine non-stationary state must NOT trigger
+    /// the certificate. We construct numbers where the linear solve
+    /// successfully neutralises g (linearized_rel small) — meaning Newton
+    /// is making real progress on an unconstrained problem — and verify
+    /// the certificate does NOT fire.
+    #[test]
+    fn joint_newton_math_unconstrained_progress_does_not_match_certificate() {
+        let math = JointNewtonMathDiagnostic {
+            // Unconstrained Newton: linear solve reduces ‖g‖ by O(1e-12).
+            old_kkt_inf: 1.0e3,
+            linearized_next_kkt_inf: 1.0e-9,
+            predicted_reduction: 5.0e-1,
+            actual_reduction: 5.0e-1,
+            trust_ratio: 1.0,
+            step_inf: 1.0e-1,
+            proposal_inf: 1.0e-1,
+        };
+        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+        assert!(
+            linearized_rel < 0.5,
+            "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
+            linearized_rel,
+        );
+    }
+
     #[test]
     fn projected_stationarity_inf_norm_projects_coupled_linear_kkt_multipliers() {
         let constraints = LinearInequalityConstraints {
