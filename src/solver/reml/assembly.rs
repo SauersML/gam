@@ -236,7 +236,7 @@ pub struct InnerAssembly<'dp> {
     pub firth: Option<Arc<FirthDenseOperator>>,
     pub nullspace_dim: Option<f64>,
     pub barrier_config: Option<BarrierConfig>,
-    pub kkt_residual: Option<Array1<f64>>,
+    pub kkt_residual: Option<ProjectedKktResidual>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
@@ -272,10 +272,7 @@ impl<'dp> InnerAssembly<'dp> {
             builder = builder.nullspace_dim_override(nd);
         }
         builder = builder.barrier_config(self.barrier_config);
-        builder = builder.kkt_residual(
-            self.kkt_residual
-                .map(ProjectedKktResidual::from_projected),
-        );
+        builder = builder.kkt_residual(self.kkt_residual);
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);
