@@ -9947,8 +9947,14 @@ fn duchon_kernel_radial_triplet(
     // operator scalars (q, lap, t) in the penalty code.
     let triplet = match length_scale {
         None => {
-            let m = pure_duchon_block_order(p_order, s_order as f64) as usize;
-            polyharmonic_kernel_triplet(r, m as f64, k_dim)?
+            // Keep the block order in `f64`: fractional `s_order` rides
+            // through `pure_duchon_block_order` → `polyharmonic_kernel_triplet`
+            // → `polyharmonic_block_jet4` end-to-end. Truncating to
+            // `usize` here was the bug — for `s=1.5, p=2, d=4` it
+            // collapsed `m=3.5` to `m=3` and tripped the integer-only
+            // log-case branch at `m=d/2`, producing NaN at `r=0`.
+            let m = pure_duchon_block_order(p_order, s_order as f64);
+            polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
             if !length_scale.is_finite() || length_scale <= 0.0 {
