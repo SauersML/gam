@@ -138,6 +138,7 @@ pub struct SurvivalTransformationTermSpec {
     pub timewiggle: Option<LinkWiggleFormulaSpec>,
     pub weibull_seed: Option<(f64, f64)>,
     pub ridge_lambda: f64,
+    pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
 }
 
 pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> bool {
@@ -1635,7 +1636,7 @@ fn fit_survival_transformation_model(
             penalty_blocks,
             beta0,
             exact_derivative_guard,
-            &config.penalty_block_gamma_priors,
+            &spec.penalty_block_gamma_priors,
         );
     }
     let opts = crate::pirls::WorkingModelPirlsOptions {
@@ -3862,6 +3863,7 @@ fn materialize_survival<'a>(
                     timewiggle: effective_timewiggle.clone(),
                     weibull_seed,
                     ridge_lambda: config.ridge_lambda,
+                    penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
                 },
                 cache_session: None,
             })
