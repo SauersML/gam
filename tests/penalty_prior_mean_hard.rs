@@ -164,7 +164,6 @@ fn shifted_quadratic_at_beta_equals_mean_is_exact_zero() {
 
 #[test]
 fn shifted_quadratic_identity_under_translation() {
-    let mut rng = Rng::new(0xC3);
     for seed in 0..200u64 {
         let mut local = Rng::new(0xC3_0000 ^ seed);
         let dim = 2 + ((seed as usize) % 7);
@@ -358,7 +357,6 @@ fn shifted_quadratic_hessian_equals_s_independent_of_mean() {
 
 #[test]
 fn block_centered_penalties_sum_to_joint_quadratic() {
-    let mut rng = Rng::new(0x17);
     let total = 10usize;
     for seed in 0..20u64 {
         let mut local = Rng::new(0x17_0000 ^ seed);
@@ -426,7 +424,6 @@ fn block_centered_penalties_sum_to_joint_quadratic() {
 
 #[test]
 fn joint_shift_of_mean_and_beta_leaves_quadratic_invariant() {
-    let mut rng = Rng::new(0x28);
     for seed in 0..50u64 {
         let mut local = Rng::new(0x28_0000 ^ seed);
         let dim = 3 + ((seed as usize) % 6);
@@ -456,22 +453,18 @@ fn joint_shift_of_mean_and_beta_leaves_quadratic_invariant() {
 
 #[test]
 fn nullspace_component_of_prior_mean_is_invisible() {
-    let mut rng = Rng::new(0x39);
     let dim: usize = 6;
     // Build a low-rank root so null(S) is non-trivial (rank < dim).
     let rank: usize = 4;
     for seed in 0..20u64 {
         let mut local = Rng::new(0x39_0000 ^ seed);
-        let root = random_root(&mut local, rank, dim);
-        // Construct a vector orthogonal to range(root.t()) (i.e. in null(S)):
-        // solve root · v = 0 by picking any vector in the kernel of `root`.
-        // For a random `rank x dim` matrix with rank < dim, we obtain a
-        // nullspace vector by QR-like Gram-Schmidt against root's rows.
-        let mut v = random_vector(&mut local, dim, 1.0);
-        for r in 0..rank {
-            let row = root.row(r).to_owned();
-            let dot = row.dot(&v) / row.dot(&row).max(1e-300);
-            v = v - &(row.mapv(|x| x * dot));
+        let mut root = Array2::<f64>::zeros((rank, dim));
+        for axis in 0..rank {
+            root[[axis, axis]] = 1.0;
+        }
+        let mut v = Array1::<f64>::zeros(dim);
+        for axis in rank..dim {
+            v[axis] = local.next_f64();
         }
         // Sanity: v ∈ null(root) ⇒ S v = root.t()·(root·v) = 0.
         let rv = root.dot(&v);

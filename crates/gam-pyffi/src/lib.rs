@@ -204,6 +204,7 @@ struct SummaryPayload {
     reml_score: f64,
     iterations: usize,
     edf_total: Option<f64>,
+    lambdas: Vec<f64>,
     coefficients: Vec<SummaryCoefficientRow>,
 }
 
@@ -4798,6 +4799,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
+        lambdas: fit.lambdas.to_vec(),
         coefficients,
     };
     serde_json::to_string(&payload).map_err(|err| format!("failed to serialize summary: {err}"))
