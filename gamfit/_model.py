@@ -1015,6 +1015,13 @@ class Model:
             self._summary_cache = Summary.from_dict(payload)
         return self._summary_cache
 
+    def smoothing_parameters(self) -> dict[int, float]:
+        """Return fitted smoothing/precision parameters by penalty index."""
+        lambdas = self.summary().get("lambdas")
+        if not isinstance(lambdas, list):
+            return {}
+        return {idx: float(value) for idx, value in enumerate(lambdas)}
+
     def check(self, data: Any) -> SchemaCheck:
         """Validate ``data`` against the model's training schema.
 

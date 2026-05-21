@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
@@ -14,6 +16,225 @@ from ._model import Model
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
+
+
+@dataclass(frozen=True)
+class SharedPrecisionGroup:
+    """Cross-fit coefficient precision group.
+
+    ``name`` is the shared precision coordinate. By default it selects the
+    same named coefficient term/column/label in every model. ``labels`` can
+    override that with either one label for all models or a mapping keyed by
+    the model name/index supplied to :func:`cross_fit_shared_precision_groups`.
+    """
+
+    name: str
+    shape: float = 1.0
+    rate: float = 0.0
+    labels: str | Mapping[str | int, str] | None = None
+
+
+def _normalize_shared_precision_group(value: Any, default_name: str | None = None) -> SharedPrecisionGroup:
+    if isinstance(value, SharedPrecisionGroup):
+        return value
+    if isinstance(value, Mapping):
+        name = value.get("name", value.get("label", default_name))
+        if name is None:
+            raise ValueError("shared precision group mapping needs a name/label")
+        shape = value.get("shape", value.get("a", value.get("a_p", 1.0)))
+        rate = value.get("rate", value.get("b", value.get("b_p", 0.0)))
+        labels = value.get("labels", value.get("terms", value.get("selectors")))
+        return SharedPrecisionGroup(
+            name=str(name),
+            shape=float(shape),
+            rate=float(rate),
+            labels=labels,
+        )
+    if default_name is not None:
+        shape, rate = value
+        return SharedPrecisionGroup(default_name, float(shape), float(rate))
+    raise TypeError("shared precision groups must be SharedPrecisionGroup or mapping entries")
+
+
+def _normalize_shared_precision_groups(groups: Any) -> list[SharedPrecisionGroup]:
+    if isinstance(groups, Mapping):
+        return [
+            _normalize_shared_precision_group(value, str(name))
+            for name, value in groups.items()
+        ]
+    return [_normalize_shared_precision_group(value) for value in groups]
+
+
+def _normalize_model_mapping(models: Any) -> list[tuple[str | int, Model]]:
+    if isinstance(models, Mapping):
+        items = list(models.items())
+    else:
+        items = list(enumerate(models))
+    if not items:
+        raise ValueError("at least one model is required")
+    out: list[tuple[str | int, Model]] = []
+    for key, model in items:
+        if not isinstance(model, Model):
+            raise TypeError("cross-fit shared precision groups require Model instances")
+        out.append((key, model))
+    return out
+
+
+def _shared_group_label(group: SharedPrecisionGroup, model_key: str | int) -> str:
+    labels = group.labels
+    if labels is None:
+        return group.name
+    if isinstance(labels, str):
+        return labels
+    if model_key in labels:
+        return str(labels[model_key])
+    key_text = str(model_key)
+    if key_text in labels:
+        return str(labels[key_text])
+    raise ValueError(
+        f"shared precision group {group.name!r} has no label for model {model_key!r}"
+    )
+
+
+def _coefficient_indices_for_precision_label(state: Mapping[str, Any], label: str) -> list[int]:
+    provenance = state.get("coefficient_provenance")
+    if not isinstance(provenance, list):
+        raise ValueError("model coefficient state does not include coefficient provenance")
+    matches: list[int] = []
+    for fallback_index, item in enumerate(provenance):
+        if not isinstance(item, Mapping):
+            continue
+        index = int(item.get("index", fallback_index))
+        candidates = (
+            item.get("term"),
+            item.get("column"),
+            item.get("label"),
+            item.get("source"),
+        )
+        if any(str(candidate) == label for candidate in candidates if candidate is not None):
+            matches.append(index)
+    return matches
+
+
+def cross_fit_shared_precision_groups(
+    models: Sequence[Model] | Mapping[str, Model],
+    groups: Sequence[SharedPrecisionGroup | Mapping[str, Any]] | Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Compute EB precision updates shared across separately fitted models.
+
+    For each declared group ``p``, the update is
+
+    ``lambda_p = (N_fits(p) * d_p + 2 * (a_p - 1)) / (sum_q_p + 2 * b_p)``,
+
+    where ``sum_q_p`` pools ``||beta_p||² + tr(Sigma_pp)`` over models where
+    the selected term/column/label appears. If a model does not contain the
+    selected block, it is skipped for that group.
+    """
+
+    import numpy as np
+
+    model_items = _normalize_model_mapping(models)
+    group_specs = _normalize_shared_precision_groups(groups)
+    if not group_specs:
+        raise ValueError("at least one shared precision group is required")
+
+    states: dict[str | int, Mapping[str, Any]] = {}
+    for key, model in model_items:
+        try:
+            states[key] = json.loads(rust_module().coefficient_state_json(model._model_bytes))
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
+    result: dict[str, dict[str, Any]] = {}
+    for group in group_specs:
+        shape = float(group.shape)
+        rate = float(group.rate)
+        if not math.isfinite(shape) or shape <= 0.0:
+            raise ValueError(
+                f"shared precision group {group.name!r} requires finite shape > 0"
+            )
+        if not math.isfinite(rate) or rate < 0.0:
+            raise ValueError(
+                f"shared precision group {group.name!r} requires finite rate >= 0"
+            )
+
+        fit_entries: list[dict[str, Any]] = []
+        dims: set[int] = set()
+        quadratic_sum = 0.0
+        for key, _model in model_items:
+            state = states[key]
+            label = _shared_group_label(group, key)
+            indices = _coefficient_indices_for_precision_label(state, label)
+            if not indices:
+                continue
+            beta = np.asarray(state.get("beta", []), dtype=float)
+            cov_n = int(state.get("covariance_n", 0))
+            cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
+            if beta.size != cov_n or cov_flat.size != cov_n * cov_n:
+                raise ValueError(
+                    f"model {key!r} has inconsistent beta/covariance dimensions"
+                )
+            index_array = np.asarray(indices, dtype=int)
+            if np.any(index_array < 0) or np.any(index_array >= cov_n):
+                raise ValueError(
+                    f"model {key!r} has coefficient provenance outside covariance bounds"
+                )
+            cov = cov_flat.reshape(cov_n, cov_n)
+            beta_block = beta[index_array]
+            trace = float(np.trace(cov[np.ix_(index_array, index_array)]))
+            beta_norm_sq = float(beta_block.dot(beta_block))
+            contribution = beta_norm_sq + trace
+            if not math.isfinite(contribution):
+                raise ValueError(
+                    f"shared precision group {group.name!r} has non-finite contribution in model {key!r}"
+                )
+            quadratic_sum += contribution
+            dims.add(int(index_array.size))
+            fit_entries.append(
+                {
+                    "model": key,
+                    "label": label,
+                    "coefficient_indices": [int(i) for i in indices],
+                    "dimension": int(index_array.size),
+                    "beta_norm_sq": beta_norm_sq,
+                    "trace_covariance": trace,
+                    "quadratic_contribution": contribution,
+                }
+            )
+
+        if not fit_entries:
+            raise ValueError(
+                f"shared precision group {group.name!r} did not match any model coefficients"
+            )
+        if len(dims) != 1:
+            raise ValueError(
+                f"shared precision group {group.name!r} matched inconsistent dimensions: {sorted(dims)}"
+            )
+        dimension = dims.pop()
+        numerator = len(fit_entries) * dimension + 2.0 * (shape - 1.0)
+        denominator = quadratic_sum + 2.0 * rate
+        if numerator <= 0.0:
+            raise ValueError(
+                f"shared precision group {group.name!r} has non-positive MAP numerator"
+            )
+        if denominator <= 0.0 or not math.isfinite(denominator):
+            raise ValueError(
+                f"shared precision group {group.name!r} has non-positive/non-finite denominator"
+            )
+        lam = numerator / denominator
+        result[group.name] = {
+            "lambda": lam,
+            "log_lambda": math.log(lam),
+            "shape": shape,
+            "rate": rate,
+            "n_fits": len(fit_entries),
+            "dimension": dimension,
+            "quadratic_sum": quadratic_sum,
+            "numerator": numerator,
+            "denominator": denominator,
+            "fits": fit_entries,
+        }
+    return result
 
 
 def build_info() -> dict[str, Any]:
