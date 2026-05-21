@@ -1718,8 +1718,28 @@ fn decode_iterate(bytes: &[u8], expected_rho_dim: usize) -> Option<IteratePayloa
     Some(p)
 }
 
-const CACHE_BOUNDARY_INTERIOR_MARGIN: f64 = 1.0;
-
+/// Outcome of inspecting a cache entry as a seed for the outer optimizer.
+///
+/// The classifier rejects only entries that fail structural validity
+/// (wrong dimension, non-finite payload). It does NOT reshape ρ based on
+/// saturation: every finite, well-shaped entry is honored as the next
+/// run's seed.
+///
+/// Previously this enum carried `saturated_coords` / `clamped_to` /
+/// "all-coords-saturated-poisoned-entry" branches that pulled boundary
+/// ρ inward or discarded fully-saturated entries. Those were read-side
+/// band-aids over the real bug: the warm-start contract stored ρ but
+/// not β, so resuming at boundary ρ forced PIRLS to recompute β from
+/// cold-start against a Hessian with condition number `≈ e^{2·rho_bound}`,
+/// and Newton degraded to O(1/k) descent that exhausted the cycle budget.
+///
+/// The contract is now `(ρ, β)`: the schema-2 iterate payload carries
+/// both, and [`CheckpointingObjective`] refuses to persist a divergent
+/// inner state (non-finite cost or β). Boundary ρ — when written under
+/// the new invariant — is a *legitimate* finding (the smoothness wants
+/// to be near-null), and the cached β puts the next inner solve at the
+/// previously converged iterate where the gradient is already at zero.
+/// No clamp or shape-based discard is needed.
 #[derive(Debug)]
 pub(crate) enum CacheSeedDecision {
     ExactFinal {
@@ -1732,21 +1752,18 @@ pub(crate) enum CacheSeedDecision {
         rho: Array1<f64>,
         prior_obj_display: f64,
         iteration: u64,
-        saturated_coords: Vec<usize>,
-        clamped_to: Option<f64>,
     },
     Discard {
         reason: &'static str,
         prior_obj_display: f64,
         all_rho_finite: Option<bool>,
-        saturated_coords: Vec<usize>,
     },
 }
 
 pub(crate) fn classify_cache_entry_for_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
-    rho_bound: f64,
+    _rho_bound: f64,
 ) -> CacheSeedDecision {
     let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
@@ -1754,7 +1771,6 @@ pub(crate) fn classify_cache_entry_for_outer(
             reason: "payload-shape-mismatch",
             prior_obj_display: entry.objective.unwrap_or(f64::NAN),
             all_rho_finite: None,
-            saturated_coords: Vec::new(),
         };
     };
     let cached_rho = Array1::from_vec(payload.rho);
@@ -1764,7 +1780,6 @@ pub(crate) fn classify_cache_entry_for_outer(
             reason: "non-finite-payload",
             prior_obj_display,
             all_rho_finite: Some(cached_rho.iter().all(|v| v.is_finite())),
-            saturated_coords: Vec::new(),
         };
     }
     if !cached_rho.iter().all(|v| v.is_finite()) {
@@ -1772,7 +1787,6 @@ pub(crate) fn classify_cache_entry_for_outer(
             reason: "non-finite-payload",
             prior_obj_display,
             all_rho_finite: Some(false),
-            saturated_coords: Vec::new(),
         };
     }
     if loaded.source == LoadSource::Exact && entry.kind == crate::cache::EntryKind::Final {
@@ -1786,55 +1800,10 @@ pub(crate) fn classify_cache_entry_for_outer(
             prior_obj_display,
         };
     }
-
-    if !(rho_bound.is_finite() && rho_bound > CACHE_BOUNDARY_INTERIOR_MARGIN) {
-        return CacheSeedDecision::Seed {
-            rho: cached_rho,
-            prior_obj_display,
-            iteration: entry.iteration.unwrap_or(payload.eval_id),
-            saturated_coords: Vec::new(),
-            clamped_to: None,
-        };
-    }
-
-    let saturation_threshold = rho_bound - CACHE_BOUNDARY_INTERIOR_MARGIN;
-    let saturated_coords: Vec<usize> = cached_rho
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| {
-            if v.abs() >= saturation_threshold {
-                Some(i)
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !saturated_coords.is_empty() && saturated_coords.len() == cached_rho.len() {
-        return CacheSeedDecision::Discard {
-            reason: "all-coords-saturated-poisoned-entry",
-            prior_obj_display,
-            all_rho_finite: Some(true),
-            saturated_coords,
-        };
-    }
-
-    if saturated_coords.is_empty() {
-        CacheSeedDecision::Seed {
-            rho: cached_rho,
-            prior_obj_display,
-            iteration: entry.iteration.unwrap_or(payload.eval_id),
-            saturated_coords,
-            clamped_to: None,
-        }
-    } else {
-        let interior = saturation_threshold.max(0.0);
-        CacheSeedDecision::Seed {
-            rho: cached_rho.mapv(|v| v.clamp(-interior, interior)),
-            prior_obj_display,
-            iteration: entry.iteration.unwrap_or(payload.eval_id),
-            saturated_coords,
-            clamped_to: Some(interior),
-        }
+    CacheSeedDecision::Seed {
+        rho: cached_rho,
+        prior_obj_display,
+        iteration: entry.iteration.unwrap_or(payload.eval_id),
     }
 }
 
@@ -4470,27 +4439,12 @@ impl OuterProblem {
                     rho,
                     prior_obj_display,
                     iteration,
-                    saturated_coords,
-                    clamped_to,
                 } => {
                     if config
                         .initial_rho
                         .as_ref()
                         .is_none_or(|initial| initial != &rho)
                     {
-                        if let Some(interior) = clamped_to {
-                            log::info!(
-                                "[CACHE] hit-clamp key={}.. context={} rho_dim={} \
-                                 saturated_coords={:?} bound=±{:.3} clamped_to=±{:.3} \
-                                 reason=stale-or-trapping-boundary-seed",
-                                short_key,
-                                context,
-                                rho.len(),
-                                saturated_coords,
-                                config.rho_bound,
-                                interior,
-                            );
-                        }
                         log::info!(
                             "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
                             short_key,
@@ -4525,33 +4479,17 @@ impl OuterProblem {
                     );
                 }
                 CacheSeedDecision::Discard {
-                    reason: "non-finite-payload",
+                    reason,
                     prior_obj_display,
                     all_rho_finite,
-                    ..
                 } => {
                     log::info!(
-                        "[CACHE] skip key={}.. context={} reason=non-finite-payload prior_obj={:.6e} all_rho_finite={}",
+                        "[CACHE] skip key={}.. context={} reason={} prior_obj={:.6e} all_rho_finite={}",
                         short_key,
                         context,
+                        reason,
                         prior_obj_display,
                         all_rho_finite.unwrap_or(false),
-                    );
-                }
-                CacheSeedDecision::Discard {
-                    reason,
-                    saturated_coords,
-                    ..
-                } => {
-                    log::info!(
-                        "[CACHE] discard key={}.. context={} rho_dim={} \
-                         saturated_coords={:?} bound=±{:.3} reason={}",
-                        short_key,
-                        context,
-                        saturated_coords.len(),
-                        saturated_coords,
-                        config.rho_bound,
-                        reason,
                     );
                 }
             }
@@ -8721,49 +8659,60 @@ mod tests {
     }
 
     #[test]
-    fn cache_entry_seed_policy_uses_helpful_cache_and_rejects_poisoned_checkpoints() {
-        let usable_payload = encode_iterate(&array![9.0, 0.0], None, 1.0, 0).expect("encode");
-        let poisoned_payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
-        let usable = crate::cache::LoadedEntry {
-            entry: crate::cache::CachedEntry {
-                payload: usable_payload,
-                objective: Some(1.0),
-                iteration: Some(0),
-                kind: crate::cache::EntryKind::Checkpoint,
-                written_unix_secs: 0,
-            },
-            source: crate::cache::LoadSource::Preloaded,
-        };
-        let poisoned = crate::cache::LoadedEntry {
-            entry: crate::cache::CachedEntry {
-                payload: poisoned_payload,
-                objective: Some(1.0),
-                iteration: Some(0),
-                kind: crate::cache::EntryKind::Checkpoint,
-                written_unix_secs: 0,
-            },
-            source: crate::cache::LoadSource::Preloaded,
-        };
+    fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
+        // The classifier no longer reshapes ρ based on shape. Any finite,
+        // correctly-dimensioned payload is honored as the next run's seed.
+        // Boundary-saturated entries written under the v2 (ρ, β) invariant
+        // are a *legitimate* finding — the smoothness wants to be near-null
+        // — and the persisted β puts the next inner solve at zero-gradient,
+        // making the cold-β failure mode impossible to re-create from cache.
+        for rho_seed in [array![9.0, 0.0], array![10.0, -10.0], array![-10.0, 10.0]] {
+            let payload = encode_iterate(&rho_seed, None, 1.0, 0).expect("encode");
+            let loaded = crate::cache::LoadedEntry {
+                entry: crate::cache::CachedEntry {
+                    payload,
+                    objective: Some(1.0),
+                    iteration: Some(0),
+                    kind: crate::cache::EntryKind::Checkpoint,
+                    written_unix_secs: 0,
+                },
+                source: crate::cache::LoadSource::Preloaded,
+            };
 
-        assert!(cache_entry_would_help_outer(&usable, 2, 10.0));
-        let CacheSeedDecision::Seed {
-            saturated_coords,
-            clamped_to,
-            ..
-        } = classify_cache_entry_for_outer(&usable, 2, 10.0)
-        else {
-            panic!("partially saturated warm start should be repaired and used");
+            assert!(cache_entry_would_help_outer(&loaded, 2, 10.0));
+            let CacheSeedDecision::Seed { rho, .. } =
+                classify_cache_entry_for_outer(&loaded, 2, 10.0)
+            else {
+                panic!(
+                    "finite seed {:?} must be honored unchanged; the read-side clamp / \
+                     all-saturated-discard branches were band-aids over the missing β cache",
+                    rho_seed
+                );
+            };
+            assert_eq!(rho, rho_seed, "ρ must round-trip without reshaping");
+        }
+    }
+
+    #[test]
+    fn cache_entry_classifier_rejects_only_structural_failures() {
+        // Only structural failures discard: wrong dimension, non-finite cost,
+        // non-finite ρ. Saturation, β presence, schema-1 mismatches are not
+        // "discards" — they're either honored or surfaced as decode failures.
+        let nonfinite_cost = encode_iterate(&array![0.5, 0.5], None, f64::NAN, 0).expect("encode");
+        let loaded = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload: nonfinite_cost,
+                objective: Some(f64::NAN),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
         };
-        assert_eq!(saturated_coords, vec![0]);
-        assert_eq!(clamped_to, Some(9.0));
-        assert!(
-            !cache_entry_would_help_outer(&poisoned, 2, 10.0),
-            "all-boundary checkpoints must not suppress family cold-start pilots"
-        );
         assert!(matches!(
-            classify_cache_entry_for_outer(&poisoned, 2, 10.0),
+            classify_cache_entry_for_outer(&loaded, 2, 10.0),
             CacheSeedDecision::Discard {
-                reason: "all-coords-saturated-poisoned-entry",
+                reason: "non-finite-payload",
                 ..
             }
         ));
@@ -8890,8 +8839,22 @@ mod tests {
     }
 
     #[test]
-    fn all_saturated_cached_rho_is_discarded_before_seed_validation() {
-        let (_d, session) = tmp_cache_session("all-saturated-discard");
+    fn all_saturated_cached_rho_is_honored_as_seed() {
+        // Inverse of the prior `all_saturated_cached_rho_is_discarded_before_seed_validation`
+        // test. Under v1 the cache stored ρ-only, so resuming at boundary ρ
+        // forced PIRLS to cold-start β against a Hessian with condition
+        // number `≈ e^{2·rho_bound}` — Newton degraded to O(1/k) descent
+        // that exhausted the cycle budget. The "discard if all-saturated"
+        // branch was a read-side band-aid; it suppressed a legitimate
+        // resume signal in exchange for tolerating the broken contract.
+        //
+        // Under v2 the iterate payload carries (ρ, β). When β is persisted
+        // alongside boundary ρ the next inner solve opens at zero gradient,
+        // and the conditioning is no longer a barrier. Therefore the
+        // classifier no longer reshapes ρ based on saturation: every
+        // finite, correctly-dimensioned entry is used as the seed. This
+        // test pins that contract.
+        let (_d, session) = tmp_cache_session("all-saturated-honored");
         let payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
         session.checkpoint(&payload, Some(1.0), Some(0));
         assert!(
@@ -8933,16 +8896,11 @@ mod tests {
             >,
         );
 
-        let _ = problem.run(&mut obj, "all-saturated-discard");
+        let _ = problem.run(&mut obj, "all-saturated-honored");
         let evals = seen.lock().unwrap();
         assert!(
-            !evals.iter().any(|rho| rho.iter().all(|v| v.abs() >= 9.0)),
-            "all-saturated checkpoint must be discarded, not clamped and evaluated; saw {:?}",
-            *evals
-        );
-        assert!(
-            evals.iter().any(|rho| rho == &array![0.0, 0.0]),
-            "normal generated/initial seed should remain available after poisoned cache discard; saw {:?}",
+            evals.iter().any(|rho| rho == &array![10.0, -10.0]),
+            "cached saturated ρ must be evaluated unchanged under v2 (ρ, β) invariant; saw {:?}",
             *evals
         );
     }
