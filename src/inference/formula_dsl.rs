@@ -686,15 +686,6 @@ pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     )
 }
 
-pub fn saved_link_name_supports_joint_wiggle(link_name: &str) -> bool {
-    let link_name = link_name.trim().to_ascii_lowercase();
-    link_name != "sas"
-        && link_name != "beta-logistic"
-        && !link_name.starts_with("latent-cloglog")
-        && !link_name.starts_with("blended(")
-        && !link_name.starts_with("mixture(")
-}
-
 pub fn require_inverse_link_supports_joint_wiggle(
     link: &InverseLink,
     context: &str,
