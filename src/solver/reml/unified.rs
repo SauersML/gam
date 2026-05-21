@@ -18491,4 +18491,300 @@ mod tests {
             rel_unproj
         );
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Implicit-function-theorem (IFT) correction: math validation
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Builds a Gaussian REML problem where the inner KKT condition can be
+    // solved in closed form, then deliberately perturbs β̂ away from β*.
+    // Verifies the math derived in `reml_laml_evaluate`:
+    //
+    //   r = 0  ⇒  IFT correction = 0  ⇒  cost+gradient unchanged.
+    //   r ≠ 0  ⇒  envelope formula mismatches FD by O(‖r‖·‖v_k‖);
+    //            IFT-corrected formula matches FD to higher order.
+
+    /// Build a Gaussian InnerSolution at an *arbitrary* β̂ (not necessarily
+    /// the inner optimum), recomputing log_likelihood, penalty_quadratic,
+    /// and the KKT residual r = S(λ)β̂ − ∇ℓ(β̂) consistently.
+    fn build_gaussian_solution_at_beta(
+        rho: &[f64],
+        beta_hat: Array1<f64>,
+        attach_residual: bool,
+    ) -> InnerSolution<'_> {
+        let p = 3usize;
+        let n = 50usize;
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let xty = array![5.0, 3.0, 2.0];
+        let yty = 20.0;
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        let mut h = xtx.clone();
+        h.scaled_add(lambdas[0], &s1);
+        h.scaled_add(lambdas[1], &s2);
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        let penalty_quad =
+            lambdas[0] * beta_hat.dot(&s1.dot(&beta_hat))
+                + lambdas[1] * beta_hat.dot(&s2.dot(&beta_hat));
+        let deviance = yty - 2.0 * beta_hat.dot(&xty) + beta_hat.dot(&xtx.dot(&beta_hat));
+        let log_likelihood = -0.5 * deviance;
+
+        // KKT residual r = S(λ)β̂ − ∇ℓ(β̂).  For Gaussian:
+        //   ℓ(β) = −½(yᵀy − 2 βᵀX'y + βᵀX'Xβ),   ∇ℓ(β) = X'y − X'Xβ.
+        // ⇒ r = (λ₁S₁+λ₂S₂)β̂ − (X'y − X'Xβ̂) = Hβ̂ − X'y.
+        // At β* = H⁻¹X'y this is identically zero.
+        let kkt_residual = if attach_residual {
+            Some(&h.dot(&beta_hat) - &xty)
+        } else {
+            None
+        };
+
+        let r1 = penalty_matrix_root(&s1).unwrap();
+        let r2 = penalty_matrix_root(&s2).unwrap();
+
+        let mut s_total = Array2::zeros((p, p));
+        s_total.scaled_add(lambdas[0], &s1);
+        s_total.scaled_add(lambdas[1], &s2);
+        let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
+        let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
+        let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
+
+        let mut det1 = Array1::zeros(rho.len());
+        let eps = 1e-7;
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.to_vec();
+            rho_plus[k] += eps;
+            let lambdas_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
+            let mut s_plus = Array2::zeros((p, p));
+            s_plus.scaled_add(lambdas_plus[0], &s1);
+            s_plus.scaled_add(lambdas_plus[1], &s2);
+            let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
+            let threshold_plus =
+                positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
+            let log_det_s_plus =
+                exact_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), threshold_plus);
+
+            let mut rho_minus = rho.to_vec();
+            rho_minus[k] -= eps;
+            let lambdas_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
+            let mut s_minus = Array2::zeros((p, p));
+            s_minus.scaled_add(lambdas_minus[0], &s1);
+            s_minus.scaled_add(lambdas_minus[1], &s2);
+            let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
+            let threshold_minus =
+                positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
+            let log_det_s_minus =
+                exact_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), threshold_minus);
+
+            det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
+        }
+
+        InnerSolution {
+            log_likelihood,
+            penalty_quadratic: penalty_quad,
+            hessian_op: Arc::new(op),
+            beta: beta_hat,
+            penalty_coords: vec![
+                PenaltyCoordinate::from_dense_root(r1),
+                PenaltyCoordinate::from_dense_root(r2),
+            ],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: log_det_s,
+                first: det1,
+                second: None,
+            },
+            deriv_provider: Box::new(GaussianDerivatives),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: n,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            kkt_residual,
+        }
+    }
+
+    /// At exact KKT (r = 0) the IFT correction is identically zero.
+    /// Attaching `Some(zeros)` must not perturb the envelope cost/gradient.
+    #[test]
+    fn ift_correction_vanishes_at_exact_kkt() {
+        let rho = vec![1.0, -0.5];
+        // Recompute exact β* = H⁻¹X'y at this ρ.
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let xty = array![5.0, 3.0, 2.0];
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+        let mut h = xtx.clone();
+        h.scaled_add(lambdas[0], &s1);
+        h.scaled_add(lambdas[1], &s2);
+        let op_for_solve = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let beta_star = op_for_solve.solve(&xty);
+
+        let sol_envelope =
+            build_gaussian_solution_at_beta(&rho, beta_star.clone(), false);
+        let grad_envelope =
+            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
+                .unwrap()
+                .gradient
+                .unwrap();
+        let cost_envelope =
+            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
+
+        let sol_with_residual =
+            build_gaussian_solution_at_beta(&rho, beta_star.clone(), true);
+        let r_norm = sol_with_residual
+            .kkt_residual
+            .as_ref()
+            .unwrap()
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            r_norm < 1e-10,
+            "residual at exact β* should be numerically zero, got ‖r‖∞ = {:.3e}",
+            r_norm
+        );
+
+        let result_ift =
+            reml_laml_evaluate(&sol_with_residual, &rho, EvalMode::ValueAndGradient, None)
+                .unwrap();
+        let grad_ift = result_ift.gradient.unwrap();
+        let cost_ift = result_ift.cost;
+
+        assert_relative_eq!(cost_ift, cost_envelope, epsilon = 1e-10, max_relative = 1e-10);
+        for k in 0..rho.len() {
+            assert_relative_eq!(
+                grad_ift[k],
+                grad_envelope[k],
+                epsilon = 1e-10,
+                max_relative = 1e-8
+            );
+        }
+    }
+
+    /// With β̂ perturbed off β* and the matching r attached, the IFT-corrected
+    /// gradient must match a re-solved FD reference much better than the
+    /// uncorrected envelope formula evaluated at the perturbed β̂.
+    #[test]
+    fn ift_correction_recovers_fd_at_perturbed_beta() {
+        let rho = vec![0.5, 0.3];
+
+        // Re-solve for exact β* at ρ.
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let xty = array![5.0, 3.0, 2.0];
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+        let mut h = xtx.clone();
+        h.scaled_add(lambdas[0], &s1);
+        h.scaled_add(lambdas[1], &s2);
+        let op_for_solve = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let beta_star = op_for_solve.solve(&xty);
+
+        // FD reference: evaluate at re-solved β*(ρ±ε), which is what an
+        // ideal inner solver would deliver.  Use ValueOnly to avoid the
+        // recursive gradient path.
+        let fd_eps = 1e-5;
+        let mut fd_grad = Array1::<f64>::zeros(rho.len());
+        for k in 0..rho.len() {
+            let mut rho_plus = rho.clone();
+            rho_plus[k] += fd_eps;
+            let cost_plus = reml_laml_evaluate(
+                &build_gaussian_test_solution(&rho_plus),
+                &rho_plus,
+                EvalMode::ValueOnly,
+                None,
+            )
+            .unwrap()
+            .cost;
+
+            let mut rho_minus = rho.clone();
+            rho_minus[k] -= fd_eps;
+            let cost_minus = reml_laml_evaluate(
+                &build_gaussian_test_solution(&rho_minus),
+                &rho_minus,
+                EvalMode::ValueOnly,
+                None,
+            )
+            .unwrap()
+            .cost;
+
+            fd_grad[k] = (cost_plus - cost_minus) / (2.0 * fd_eps);
+        }
+
+        // Perturb β̂ off β* — small enough that linear IFT recovers cleanly.
+        let perturb = Array1::from_vec(vec![0.02, -0.015, 0.025]);
+        let beta_hat = &beta_star + &perturb;
+
+        let sol_envelope =
+            build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false);
+        let grad_envelope =
+            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
+                .unwrap()
+                .gradient
+                .unwrap();
+
+        let sol_ift = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true);
+        let r_norm = sol_ift
+            .kkt_residual
+            .as_ref()
+            .unwrap()
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(
+            r_norm > 1e-3,
+            "perturbed β̂ should produce a non-trivial residual, got ‖r‖∞ = {:.3e}",
+            r_norm
+        );
+        let grad_ift =
+            reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueAndGradient, None)
+                .unwrap()
+                .gradient
+                .unwrap();
+
+        // IFT correction must shrink the gradient error meaningfully on at
+        // least one coordinate, and never blow it up on any.
+        let mut at_least_one_improved = false;
+        for k in 0..rho.len() {
+            let err_envelope = (grad_envelope[k] - fd_grad[k]).abs();
+            let err_ift = (grad_ift[k] - fd_grad[k]).abs();
+            assert!(
+                err_ift <= err_envelope * 1.05 + 1e-9,
+                "IFT correction must not enlarge gradient error: coord={} envelope_err={:.3e} \
+                 ift_err={:.3e} FD={:.6e}",
+                k,
+                err_envelope,
+                err_ift,
+                fd_grad[k]
+            );
+            if err_ift < err_envelope * 0.5 && err_envelope > 1e-6 {
+                at_least_one_improved = true;
+            }
+        }
+        assert!(
+            at_least_one_improved,
+            "IFT correction should improve gradient accuracy on at least one coord: \
+             envelope=[{:.3e}, {:.3e}] ift=[{:.3e}, {:.3e}] fd=[{:.3e}, {:.3e}]",
+            (grad_envelope[0] - fd_grad[0]).abs(),
+            (grad_envelope[1] - fd_grad[1]).abs(),
+            (grad_ift[0] - fd_grad[0]).abs(),
+            (grad_ift[1] - fd_grad[1]).abs(),
+            fd_grad[0],
+            fd_grad[1],
+        );
+    }
 }

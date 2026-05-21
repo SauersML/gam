@@ -2909,6 +2909,54 @@ fn store_persistent_custom_family_warm_start(
     {
         return;
     }
+    // Saturation gate: don't persist iterates whose ρ has any coordinate
+    // at extreme smoothing magnitude. λ_i = exp(9) ≈ 8100 is already
+    // "essentially shrunk to nullspace" for any reasonable design, and
+    // ρ_i ≥ 9 typically indicates either (a) a legitimate but
+    // active-bound optimum where the outer optimizer is up against its
+    // box (`with_rho_bound(10.0)` at the custom-family bridge), or (b)
+    // a non-converged intermediate iterate that drifted toward the box
+    // — both of which make poor *seed* material for the next run. A
+    // seed at the box pins the outer gradient computation in a regime
+    // where (for families that don't yet route through the joint
+    // penalty-subspace-trace projection in `joint_outer_evaluate`) the
+    // analytic `tr(H⁻¹ Ḣ_k)` / `λ_k tr(S_λ⁺ S_k)` cancellation fails
+    // and `|g|` blows up by many orders of magnitude, trapping ARC's
+    // trust-region acceptor and surfacing as the deterministic-replay
+    // stall (observed in the biobank hypertension marginal-slope fit
+    // on the gamfit 0.1.92 release line).
+    //
+    // The load-side counterpart at the cache-hit injection point (see
+    // `outer_strategy.rs` `[CACHE] hit-clamp`) pulls any
+    // already-on-disk saturated ρ into the box interior before
+    // seeding. This write-side guard is the complement: if a fit
+    // genuinely needs ρ at the bound, the optimizer can re-walk back
+    // to it cheaply in one or two iterations from the previous
+    // non-saturated checkpoint — at no cost to convergence quality,
+    // and at the gain of never feeding the next run a trapping seed.
+    //
+    // Threshold rationale: the customary `rho_bound` for custom-family
+    // outer config is 10.0, and the load-side clamp uses a 1.0
+    // interior margin. Using 9.0 here keeps the persist/load
+    // thresholds aligned end-to-end.
+    const SATURATION_THRESHOLD: f64 = 9.0;
+    if warm_start
+        .rho
+        .iter()
+        .any(|&v| v.abs() >= SATURATION_THRESHOLD)
+    {
+        log::debug!(
+            "[warm-start-cache] skip persist custom-family key={} \
+             reason=rho-saturated threshold=±{:.1} rho_inf_norm={:.3e}",
+            key,
+            SATURATION_THRESHOLD,
+            warm_start
+                .rho
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs())),
+        );
+        return;
+    }
     let mut record =
         PersistentBlockWarmStartRecord::new(key.to_string(), n_rows, block_names, block_dims);
     record.updated_unix_secs = record.created_unix_secs;
