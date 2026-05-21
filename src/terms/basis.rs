@@ -3802,56 +3802,34 @@ impl StreamingRadialState {
         let dim = metric_weights.len();
         debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
 
-        // Pack ~1024 rows per parallel task so rayon scheduling overhead is
-        // amortized even at biobank shapes (n ≈ 2e5, n_knots ≈ 10 → ~200
-        // tasks).
-        const ROWS_PER_TASK: usize = 1024;
-        let stride = ROWS_PER_TASK.saturating_mul(n_knots).max(n_knots);
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let any_failed = AtomicBool::new(false);
-        use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-        phi.par_chunks_mut(stride)
-            .zip(q.par_chunks_mut(stride))
-            .zip(t.par_chunks_mut(stride))
-            .enumerate()
-            .for_each(|(task_idx, ((phi_blk, q_blk), t_blk))| {
-                if any_failed.load(Ordering::Relaxed) {
-                    return;
+        // SERIAL fill: `ensure_triplet_cache` is called from inside outer
+        // `into_par_iter` workers (e.g. the per-axis cross-trace sweep at
+        // `projected_operator_terms_batched`). A nested `par_chunks_mut`
+        // inside this `OnceLock::get_or_init` closure would deadlock the
+        // global rayon pool — every outer worker blocks on the OnceLock
+        // while the one that won the race tries to schedule child tasks no
+        // worker is free to pick up (see `feedback_oncelock_rayon_deadlock`).
+        // The serial sweep is ~100 ms at biobank shapes (n ≈ 2e5,
+        // n_knots ≈ 10), amortized once over many subsequent O(1) reads.
+        for i in 0..n {
+            let row_off = i * n_knots;
+            for j in 0..n_knots {
+                let mut r2 = 0.0_f64;
+                for a in 0..dim {
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    r2 += metric_weights[a] * h * h;
                 }
-                let rows_in_task = phi_blk.len() / n_knots;
-                let i_start = task_idx * (stride / n_knots);
-                for local_i in 0..rows_in_task {
-                    let i = i_start + local_i;
-                    debug_assert!(i < self.data.nrows());
-                    let row_off = local_i * n_knots;
-                    for j in 0..n_knots {
-                        let mut r2 = 0.0_f64;
-                        for a in 0..dim {
-                            let h = unsafe {
-                                self.data.uget((i, a)) - self.centers.uget((j, a))
-                            };
-                            r2 += metric_weights[a] * h * h;
-                        }
-                        match self.radial_kind.eval_design_triplet(r2.sqrt()) {
-                            Ok((pv, qv, tv)) => {
-                                phi_blk[row_off + j] = pv;
-                                q_blk[row_off + j] = qv;
-                                t_blk[row_off + j] = tv;
-                            }
-                            Err(_) => {
-                                any_failed.store(true, Ordering::Relaxed);
-                                return;
-                            }
-                        }
+                match self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                    Ok((pv, qv, tv)) => {
+                        phi[row_off + j] = pv;
+                        q[row_off + j] = qv;
+                        t[row_off + j] = tv;
                     }
+                    Err(_) => return None,
                 }
-            });
-
-        if any_failed.load(Ordering::Acquire) {
-            None
-        } else {
-            Some(StreamingTripletCache { phi, q, t })
+            }
         }
+        Some(StreamingTripletCache { phi, q, t })
     }
 
     #[inline]
