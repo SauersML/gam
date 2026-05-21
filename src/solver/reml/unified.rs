@@ -1606,6 +1606,7 @@ impl HyperCoordPair {
 /// When unavailable, the outer Hessian is approximate (fine for BFGS/ARC,
 /// insufficient for exact Newton quadratic convergence).
 /// Result of a fixed-drift derivative evaluation: can be dense or operator-backed.
+#[derive(Clone)]
 pub enum DriftDerivResult {
     Dense(Array2<f64>),
     Operator(Arc<dyn HyperOperator>),
