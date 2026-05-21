@@ -29331,7 +29331,7 @@ mod tests {
 
     #[test]
     fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
-        let (_, _, tps_phi_rr) = polyharmonic_kernel_triplet(0.0, 2, 2).expect("thin-plate jet");
+        let (_, _, tps_phi_rr) = polyharmonic_kernel_triplet(0.0, 2.0, 2).expect("thin-plate jet");
         assert!(
             tps_phi_rr.is_infinite() && tps_phi_rr.is_sign_negative(),
             "2D thin-plate phi_rr(0) should diverge to -inf, got {tps_phi_rr}"
@@ -29344,7 +29344,7 @@ mod tests {
         );
 
         let (_, gradient_first, gradient_second) =
-            polyharmonic_kernel_triplet(0.0, 2, 3).expect("3D first-derivative jet");
+            polyharmonic_kernel_triplet(0.0, 2.0, 3).expect("3D first-derivative jet");
         assert_abs_diff_eq!(
             gradient_first,
             -1.0 / (8.0 * std::f64::consts::PI),
