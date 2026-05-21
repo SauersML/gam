@@ -38,7 +38,7 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
-use gam::smooth::{TermCollectionSpec, freeze_term_collection_from_design};
+use gam::smooth::{TermCollectionDesign, TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
@@ -522,7 +522,9 @@ fn competing_risks_cif_impl<'py>(
         .iter()
         .map(|hazard| hazard.as_array())
         .collect::<Vec<_>>();
-    let result = gam::survival::assemble_competing_risks_cif_from_endpoints(times, &endpoint_views)
+    let cumulative_hazard =
+        ndarray::stack(Axis(0), &endpoint_views).map_err(|err| err.to_string())?;
+    let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
         .map_err(|err| err.to_string())?;
     Ok((result.cif, result.overall_survival))
 }
@@ -3406,11 +3408,12 @@ fn fit_dataset_impl(
                 &fit_config,
                 family,
                 &saved_fit,
+                &standard_result.design,
                 standard_result.resolvedspec,
                 standard_result.adaptive_diagnostics,
                 standard_result.wiggle_knots.map(|knots| knots.to_vec()),
                 standard_result.wiggle_degree,
-            )
+            )?
         }
         FitRequest::TransformationNormal(tn_request) => {
             let fit_result = fit_model(FitRequest::TransformationNormal(tn_request))?;
@@ -6410,11 +6413,12 @@ fn build_standard_payload(
     fit_config: &FitConfig,
     family: LikelihoodFamily,
     saved_fit: &gam::estimate::UnifiedFitResult,
+    design: &TermCollectionDesign,
     resolved_termspec: TermCollectionSpec,
     adaptive_regularization_diagnostics: Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
     wiggle_knots: Option<Vec<f64>>,
     wiggle_degree: Option<usize>,
-) -> FittedModelPayload {
+) -> Result<FittedModelPayload, String> {
     let latent_cloglog_state =
         if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
             Some(saved_latent_cloglog_state_from_fit(saved_fit).expect(
@@ -6443,11 +6447,14 @@ fn build_standard_payload(
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
-    payload.resolved_termspec = Some(resolved_termspec);
+    payload.resolved_termspec = Some(
+        freeze_term_collection_from_design(&resolved_termspec, design)
+            .map_err(|err| format!("failed to freeze standard term spec: {err}"))?,
+    );
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    payload
+    Ok(payload)
 }
 
 fn build_transformation_normal_ffi_payload(
@@ -7690,13 +7697,15 @@ fn paired_cumulative_incidence_table_impl(
         }
 
         let eval_times_array = Array1::from_vec(eval_times.clone());
-        let cumulative_hazards = [
+        let endpoint_views = [
             target_result.cumulative_hazard.view(),
             competing_result.cumulative_hazard.view(),
         ];
-        let assembled = gam::survival::assemble_competing_risks_cif_from_endpoints(
+        let cumulative_hazards =
+            ndarray::stack(Axis(0), &endpoint_views).map_err(|err| err.to_string())?;
+        let assembled = gam::survival::assemble_competing_risks_cif(
             eval_times_array.view(),
-            &cumulative_hazards,
+            cumulative_hazards.view(),
         )
         .map_err(|err| err.to_string())?;
         let cif = assembled.cif;

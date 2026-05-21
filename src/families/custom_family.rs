@@ -10447,6 +10447,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cached.block_logdet_h,
                 cached.block_logdet_s,
             );
+            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
+                family,
+                specs,
+                &states,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+            )?;
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -10458,7 +10466,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s: cached.block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
-                kkt_residual: None,
+                kkt_residual,
             });
         }
         // Soft warm-start across rho changes.
