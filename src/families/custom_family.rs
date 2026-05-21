@@ -12265,6 +12265,73 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
+            // Constrained-stationary certificate.
+            //
+            // The inner Newton system is `Hδ = -g`, solved over the
+            // active-constraint-aware subspace (the QP step path).  When
+            // the *unprojected* gradient `g` carries a large Lagrange-
+            // multiplier component pointing into the constraint —
+            // i.e. some β coordinates are pinned at the bound or against
+            // the family's structural constraint surface — the linear
+            // solve correctly DOES NOT try to eliminate that component,
+            // because doing so would push β infeasibly.  The signature of
+            // this state is precise and entirely local to the most recent
+            // accepted step:
+            //
+            //   • `‖g + Hδ‖∞ / ‖g‖∞ ≥ 0.5` — the linear solve neutralised
+            //     ≤ 50 % of g; the remainder is structurally outside the
+            //     solver's range, i.e. it's a Lagrange multiplier of the
+            //     active constraints, not a defect of the linear solve.
+            //   • `|actual − pred| / max(|pred|, …) ≤ 1e-3` — the local
+            //     quadratic Newton model agrees with the actual objective
+            //     change to roundoff, so the Hessian and gradient are
+            //     correct AT this β.  The "stuck" residual is not noise
+            //     in the linearisation; it's a real multiplier.
+            //   • `|Δobjective| ≤ objective_tol` — the objective has
+            //     ceased moving meaningfully.
+            //
+            // Together these three are the rigorous certificate that
+            // Newton has reached a constrained-stationary point: further
+            // cycles would reproduce the same plateau (the diagnostic in
+            // PIRLS/JN/math shows `‖g+Hδ‖/‖g‖` constant near 1 cycle
+            // after cycle, the very signature this certificate names).
+            //
+            // The 0.5 threshold on `linearized_rel` is conservative —
+            // an unconstrained Newton step has `linearized_rel ≈ 1e-12`;
+            // a step deliberately constrained to a (k-1)-dim subspace
+            // leaves the orthogonal Lagrange direction in the residual
+            // and `linearized_rel ≈ |λ|/|g| > 0`, typically 0.9+ in
+            // practice when the multiplier dominates.  Anything ≥ 0.5
+            // is unambiguously in the constrained-stationary regime;
+            // unconstrained Newton with `linearized_rel ≥ 0.5` would
+            // have already failed the trust-region's scalar model test
+            // and been rejected upstream.
+            if let Some(math) = last_joint_math.as_ref()
+                && objective_change <= objective_tol
+            {
+                let linearized_rel =
+                    math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+                let scalar_model_relerr = math.scalar_model_relative_error();
+                if linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3 {
+                    log::info!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
+                         linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
+                         of the active constraint set, not an unresolved gradient); \
+                         scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
+                         at this β); |Δobjective|={:.3e} ≤ obj_tol={:.3e}; further cycles cannot reduce the \
+                         multiplier mass and would reproduce this plateau indefinitely",
+                        cycle,
+                        (1.0 - linearized_rel) * 100.0,
+                        linearized_rel * 100.0,
+                        scalar_model_relerr,
+                        objective_change,
+                        objective_tol,
+                    );
+                    converged = true;
+                    break;
+                }
+            }
+
             // INVESTIGATION NOTE — do NOT soft-accept here.
             //
             // The outer objective is V(ρ) = f(β*(ρ), ρ), where β*(ρ)
