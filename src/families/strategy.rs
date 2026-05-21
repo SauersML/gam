@@ -106,6 +106,32 @@ impl ResolvedFamilyStrategy {
             .as_ref()
             .and_then(InverseLink::latent_cloglog_state)
     }
+
+    #[inline]
+    fn require_latent_cloglog_state(
+        &self,
+    ) -> Result<&crate::types::LatentCLogLogState, EstimationError> {
+        self.latent_cloglog_state().ok_or_else(|| missing_state(self.family, "latent cloglog"))
+    }
+
+    #[inline]
+    fn require_sas_state(&self) -> Result<&crate::types::SasLinkState, EstimationError> {
+        self.sas_state().ok_or_else(|| missing_state(self.family, "SAS link"))
+    }
+
+    #[inline]
+    fn require_mixture_state(&self) -> Result<&crate::types::MixtureLinkState, EstimationError> {
+        self.mixture_state().ok_or_else(|| missing_state(self.family, "mixture link"))
+    }
+}
+
+#[cold]
+fn missing_state(family: LikelihoodFamily, what: &str) -> EstimationError {
+    EstimationError::InvalidInput(format!(
+        "{} requires fitted {} state",
+        family.pretty_name(),
+        what
+    ))
 }
 
 impl FamilyStrategy for ResolvedFamilyStrategy {
@@ -161,12 +187,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             )
             .map(|v| v.mean),
             LikelihoodFamily::BinomialLatentCLogLog => {
-                let state = self.latent_cloglog_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialLatentCLogLog posterior mean requires fixed latent cloglog state"
-                            .to_string(),
-                    )
-                })?;
+                let state = self.require_latent_cloglog_state()?;
                 latent_cloglog_inverse_link_jet(quadctx, eta, se_eta.hypot(state.latent_sd))
                     .map(|v| v.mean)
             }
@@ -182,12 +203,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 .map(|v| v.mean)
             }
             LikelihoodFamily::BinomialMixture => {
-                let state = self.mixture_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialMixture posterior mean requires fitted mixture link state"
-                            .to_string(),
-                    )
-                })?;
+                let state = self.require_mixture_state()?;
                 integrated_family_moments_jetwith_state(
                     quadctx,
                     LikelihoodFamily::BinomialMixture,
@@ -224,12 +240,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
             LikelihoodFamily::BinomialLatentCLogLog => {
-                let state = self.latent_cloglog_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialLatentCLogLog posterior mean requires fixed latent cloglog state"
-                            .to_string(),
-                    )
-                })?;
+                let state = self.require_latent_cloglog_state()?;
                 let total_sigma = se_eta.hypot(state.latent_sd);
                 let m1 = latent_cloglog_inverse_link_jet(quadctx, eta, total_sigma)?.mean;
                 let m2 = normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
@@ -243,11 +254,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
             LikelihoodFamily::BinomialSas => {
-                let state = self.sas_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialSas posterior mean requires fitted SAS link state".to_string(),
-                    )
-                })?;
+                let state = self.require_sas_state()?;
                 let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
                     let p = crate::mixture_link::sas_inverse_link_jet(
                         x,
@@ -260,12 +267,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
             LikelihoodFamily::BinomialBetaLogistic => {
-                let state = self.sas_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialBetaLogistic posterior mean requires fitted link state"
-                            .to_string(),
-                    )
-                })?;
+                let state = self.require_sas_state()?;
                 let (m1, m2) = normal_expectation_1d_adaptive_pair(quadctx, eta, se_eta, |x| {
                     let p = crate::mixture_link::beta_logistic_inverse_link_jet(
                         x,
@@ -278,12 +280,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
             LikelihoodFamily::BinomialMixture => {
-                let state = self.mixture_state().ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "BinomialMixture posterior mean requires fitted mixture link state"
-                            .to_string(),
-                    )
-                })?;
+                let state = self.require_mixture_state()?;
                 let m1 = integrated_family_moments_jetwith_state(
                     quadctx,
                     LikelihoodFamily::BinomialMixture,
