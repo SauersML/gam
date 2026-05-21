@@ -9124,20 +9124,30 @@ pub(crate) struct StrictSpdLmStats {
 const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
 const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 
-pub(crate) fn strict_solve_spd_with_lm_continuation(
+/// Shared engine: try the bare strict path, fall through to an escalating
+/// LM δ-ridge Cholesky, and finally an eigen-floor fallback that clamps every
+/// eigenvalue from below at `eps_floor = 1e-12 · max|λ|`. Each caller
+/// (solve / inverse / logdet) supplies the three operation-specific closures.
+///
+/// Centralizing the LM/eigen scaffolding here both removes ~180 lines of
+/// near-duplicated code and guarantees the three sibling helpers stay in
+/// lockstep — any future change to the schedule, the trace_scale heuristic,
+/// or the eigen-floor logic now lives in exactly one place.
+fn strict_spd_lm_engine<R>(
     matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-) -> Result<(Array1<f64>, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
-    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
-
-    if let Ok(solution) = strict_solve_spd(matrix, rhs) {
-        return Ok((solution, StrictSpdLmStats::default()));
+    op_label: &'static str,
+    empty: R,
+    bare_path: impl FnOnce(&Array2<f64>) -> Result<R, String>,
+    process_chol: impl FnOnce(&crate::faer_ndarray::FaerCholeskyFactor) -> R,
+    process_eigen: impl FnOnce(&Array1<f64>, &Array2<f64>, f64) -> R,
+) -> Result<(R, StrictSpdLmStats), String> {
+    if let Ok(r) = bare_path(matrix) {
+        return Ok((r, StrictSpdLmStats::default()));
     }
 
     let p = matrix.nrows();
     if p == 0 {
-        return Ok((Array1::<f64>::zeros(0), StrictSpdLmStats::default()));
+        return Ok((empty, StrictSpdLmStats::default()));
     }
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
@@ -9145,70 +9155,79 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
     let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
 
     let mut delta = delta0;
-    for escalation in 1..=MAX_ESCALATIONS {
+    for escalation in 1..=STRICT_SPD_LM_MAX_ESCALATIONS {
         let mut ridged = sym.clone();
         for i in 0..p {
             ridged[[i, i]] += delta;
         }
-        match ridged.cholesky(Side::Lower) {
-            Ok(chol) => {
-                return Ok((
-                    chol.solvevec(rhs),
-                    StrictSpdLmStats {
-                        delta_used: delta,
-                        escalations: escalation,
-                    },
-                ));
-            }
-            Err(_) => {
-                delta *= RIDGE_GROWTH;
-            }
+        if let Ok(chol) = ridged.cholesky(Side::Lower) {
+            return Ok((
+                process_chol(&chol),
+                StrictSpdLmStats {
+                    delta_used: delta,
+                    escalations: escalation,
+                },
+            ));
         }
+        delta *= STRICT_SPD_LM_RIDGE_GROWTH;
     }
 
-    // δ-ridge schedule exhausted; fall back to rank-aware eigen-floor solve.
-    // Floors every eigenvalue at `eps_floor = 1e-12 · max|λ|` so the resulting
-    // step is `Q diag(1/Λ̃) Qᵀ rhs` — well-conditioned modes solved exactly,
-    // rank-deficient directions resolved with controlled curvature. Mirrors
-    // the eigen-floor fallback in `strict_inverse_spd_with_lm_continuation`
-    // and gives the pilot a warm geometry to hand to operator Newton/ARC
-    // instead of bouncing all the way out to a cold full-data run.
+    // δ-ridge schedule exhausted; fall back to rank-aware eigen-floor handling.
+    // Floors every eigenvalue at `eps_floor = 1e-12 · max|λ|` so well-conditioned
+    // modes are resolved exactly and rank-deficient directions are handled with
+    // controlled curvature, preventing the spatial-adaptive pilot from collapsing
+    // to a cold full-data run.
+    let max_esc = STRICT_SPD_LM_MAX_ESCALATIONS;
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
         format!(
-            "strict pseudo-laplace SPD solve failed even with LM δ-ridge continuation \
-             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
+            "{op_label} failed even with LM δ-ridge continuation \
+             (escalated {max_esc} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
              eigen-floor fallback also failed: {e}"
         )
     })?;
     let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
     let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
-    // x = Q diag(1/Λ̃) Qᵀ rhs.
-    let mut q_t_rhs = Array1::<f64>::zeros(p);
-    for k in 0..p {
-        let mut acc = 0.0;
-        for i in 0..p {
-            acc += evecs[[i, k]] * rhs[i];
-        }
-        q_t_rhs[k] = acc;
-    }
-    for k in 0..p {
-        q_t_rhs[k] /= evals[k].max(eps_floor);
-    }
-    let mut x = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        let mut acc = 0.0;
-        for k in 0..p {
-            acc += evecs[[i, k]] * q_t_rhs[k];
-        }
-        x[i] = acc;
-    }
     Ok((
-        x,
+        process_eigen(&evals, &evecs, eps_floor),
         StrictSpdLmStats {
             delta_used: delta,
-            escalations: MAX_ESCALATIONS + 1,
+            escalations: STRICT_SPD_LM_MAX_ESCALATIONS + 1,
         },
     ))
+}
+
+pub(crate) fn strict_solve_spd_with_lm_continuation(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+) -> Result<(Array1<f64>, StrictSpdLmStats), String> {
+    let p = matrix.nrows();
+    strict_spd_lm_engine(
+        matrix,
+        "strict pseudo-laplace SPD solve",
+        Array1::<f64>::zeros(0),
+        |m| strict_solve_spd(m, rhs),
+        |chol| chol.solvevec(rhs),
+        |evals, evecs, eps_floor| {
+            // x = Q diag(1/Λ̃) Qᵀ rhs.
+            let mut q_t_rhs = Array1::<f64>::zeros(p);
+            for k in 0..p {
+                let mut acc = 0.0;
+                for i in 0..p {
+                    acc += evecs[[i, k]] * rhs[i];
+                }
+                q_t_rhs[k] = acc / evals[k].max(eps_floor);
+            }
+            let mut x = Array1::<f64>::zeros(p);
+            for i in 0..p {
+                let mut acc = 0.0;
+                for k in 0..p {
+                    acc += evecs[[i, k]] * q_t_rhs[k];
+                }
+                x[i] = acc;
+            }
+            x
+        },
+    )
 }
 
 fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
@@ -9239,76 +9258,34 @@ fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
 pub(crate) fn strict_inverse_spd_with_lm_continuation(
     matrix: &Array2<f64>,
 ) -> Result<(Array2<f64>, StrictSpdLmStats), String> {
-    const MAX_ESCALATIONS: usize = STRICT_SPD_LM_MAX_ESCALATIONS;
-    const RIDGE_GROWTH: f64 = STRICT_SPD_LM_RIDGE_GROWTH;
-
-    if let Ok(inv) = strict_inverse_spd(matrix) {
-        return Ok((inv, StrictSpdLmStats::default()));
-    }
-
     let p = matrix.nrows();
-    if p == 0 {
-        return Ok((Array2::<f64>::zeros((0, 0)), StrictSpdLmStats::default()));
-    }
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
-    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
-
-    let mut delta = delta0;
-    for escalation in 1..=MAX_ESCALATIONS {
-        let mut ridged = sym.clone();
-        for i in 0..p {
-            ridged[[i, i]] += delta;
-        }
-        if let Ok(chol) = ridged.cholesky(Side::Lower) {
+    strict_spd_lm_engine(
+        matrix,
+        "strict pseudo-laplace SPD inverse",
+        Array2::<f64>::zeros((0, 0)),
+        strict_inverse_spd,
+        |chol| {
             let mut ident = Array2::<f64>::eye(p);
             chol.solve_mat_in_place(&mut ident);
             symmetrize_dense_in_place(&mut ident);
-            return Ok((
-                ident,
-                StrictSpdLmStats {
-                    delta_used: delta,
-                    escalations: escalation,
-                },
-            ));
-        }
-        delta *= RIDGE_GROWTH;
-    }
-
-    // δ-ridge schedule exhausted; fall back to eigen-floor reconstruction.
-    // Clamp every eigenvalue from below by eps_floor = 1e-12 · max|λ|, then
-    // reconstruct V · diag(1/λ_clamped) · Vᵀ. Preserves all well-conditioned
-    // modes exactly and replaces rank-deficient directions with a
-    // controlled high-curvature pseudoinverse.
-    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
-        format!(
-            "strict pseudo-laplace SPD inverse failed even with LM δ-ridge continuation \
-             (escalated {MAX_ESCALATIONS} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
-             eigen-floor fallback also failed: {e}"
-        )
-    })?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
-    let mut inv = Array2::<f64>::zeros((p, p));
-    for (k, &ev) in evals.iter().enumerate() {
-        let ev_clamped = ev.max(eps_floor);
-        let inv_ev = 1.0 / ev_clamped;
-        for i in 0..p {
-            let vi = evecs[[i, k]];
-            for j in 0..p {
-                inv[[i, j]] += inv_ev * vi * evecs[[j, k]];
-            }
-        }
-    }
-    symmetrize_dense_in_place(&mut inv);
-    Ok((
-        inv,
-        StrictSpdLmStats {
-            delta_used: delta,
-            escalations: MAX_ESCALATIONS + 1,
+            ident
         },
-    ))
+        |evals, evecs, eps_floor| {
+            // V · diag(1/max(λ, eps_floor)) · Vᵀ.
+            let mut inv = Array2::<f64>::zeros((p, p));
+            for (k, &ev) in evals.iter().enumerate() {
+                let inv_ev = 1.0 / ev.max(eps_floor);
+                for i in 0..p {
+                    let vi = evecs[[i, k]];
+                    for j in 0..p {
+                        inv[[i, j]] += inv_ev * vi * evecs[[j, k]];
+                    }
+                }
+            }
+            symmetrize_dense_in_place(&mut inv);
+            inv
+        },
+    )
 }
 
 fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
