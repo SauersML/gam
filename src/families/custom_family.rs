@@ -18613,36 +18613,9 @@ fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'sta
         )
     })?;
     if !outer_result.converged {
-        // Box-constrained boundary saturation (typical pathology: three of
-        // four log-λ at the +10 upper bound, the ARC step direction is
-        // dominated by the boundary coupling so every trial step rejects
-        // through max-iter) leaves ARC reporting `converged = false`
-        // after the iteration cap, even though the iterate itself is
-        // usable: finite cost, finite ρ, and a gradient that passes the
-        // envelope-sanity tripwire `|g|∞·√ε < 4·|f|` the unified
-        // evaluator already enforces upstream. Hard-failing on this would
-        // throw away the optimizer's best-effort iterate and force the
-        // caller to either restart the fit from scratch or get nothing.
-        //
-        // The principled response is to treat the iterate as a usable
-        // box-constrained minimum approximation: proceed to the final
-        // inner refit + covariance assembly with this ρ, but propagate
-        // the optimizer's own `converged = false` flag to downstream
-        // consumers via `outer_converged` so the result product stays
-        // honest about which kind of optimum it is. Only when the
-        // iterate itself is inadmissible (non-finite cost or ρ,
-        // mathematically inconsistent gradient) do we still hard-fail.
-        if outer_result.is_acceptable_best_effort() {
-            log::warn!(
-                "{} — proceeding with best-effort iterate (cost is finite, gradient passes \
-                 envelope-sanity tripwire; result product carries outer_converged = false)",
-                custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
-            );
-        } else {
-            return Err(CustomFamilyError::Optimization(
-                custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
-            ));
-        }
+        return Err(CustomFamilyError::Optimization(
+            custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
+        ));
     }
     let outer_grad_norm = outer_result.final_grad_norm_or_nan();
     let rho_star = outer_result.rho;
@@ -19466,30 +19439,34 @@ mod tests {
             }
         }
 
-        // ── Realistic penalty-drift closure.
-        // ∂H/∂ρ_k along direction d: H = H_unpen + Σ_k λ_k S_k (where each
-        // S_k is the embedded full-block matrix). ∂H/∂ρ_k = λ_k S_k. The
-        // closure takes a direction d in ρ-space and returns Σ_k d[k] λ_k
-        // S_k_full as a Dense DriftDerivResult.
-        let s_full_per_coord = vec![
-            s_time_full.clone(),
-            s_marg_0_full.clone(),
-            s_marg_1_full.clone(),
-            s_logs_full.clone(),
-        ];
-        let lams_for_closure = lams.clone();
-        let compute_dh = move |d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-            assert_eq!(d.len(), 4);
-            let mut out = Array2::<f64>::zeros((p_total, p_total));
-            for k in 0..4 {
-                let scale = d[k] * lams_for_closure[k];
-                if scale == 0.0 {
-                    continue;
-                }
-                out.scaled_add(scale, &s_full_per_coord[k]);
-            }
-            Ok(Some(DriftDerivResult::Dense(out)))
+        // ── Hessian β-chain closure.
+        // CONTRACT: `compute_dh(v_k)` takes a β-space direction `v_k`
+        // (length p_total = `∂β/∂ρ_k` under the envelope) and returns
+        // `D_beta H[v_k]` — the third-order tensor of H contracted with
+        // `v_k`. The penalty-drift component `λ_k S_k` is added by
+        // `joint_outer_evaluate` automatically from `inner.s_lambdas` —
+        // this closure adds ONLY the β-chained piece.
+        //
+        // For an idealized H_unpen that is independent of β (linear model
+        // limit, no nonlinear inner geometry), `D_beta H = 0` and the
+        // closure returns `Ok(None)`. This is exactly the regime the
+        // existing single-block `biobank_scale_rho_scan_*` test exercises
+        // and finds projection-invariant. The marginal-slope family's
+        // Hessian DOES depend on β (through the joint geometry), so the
+        // closure is non-trivial in production — and that is the
+        // candidate source of the gradient blowup.
+        //
+        // This test takes the idealized path (`Ok(None)`) so any blowup
+        // observed here is attributable to `joint_outer_evaluate`'s
+        // multi-block / rank-deficient-S handling alone. If this test
+        // PASSES (gradient bounded), the bug must live in the family's
+        // `hessian_derivative_correction_result` β-chain — not in the
+        // evaluator. If it FAILS, the evaluator itself has the defect at
+        // biobank scale + Duchon-shape S.
+        let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+            Ok(None)
         };
+        let compute_dh = no_dh;
         let no_d2h = |_u: &Array1<f64>,
                       _v: &Array1<f64>|
          -> Result<Option<DriftDerivResult>, String> { Ok(None) };

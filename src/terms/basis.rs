@@ -10175,7 +10175,7 @@ pub fn closed_form_anisotropic_pair_block_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
     m: usize,
-    s: usize,
+    s: f64,
     aniso_log_scales: Option<&[f64]>,
 ) -> Array2<f64> {
     let k = centers.nrows();
@@ -10190,10 +10190,22 @@ pub fn closed_form_anisotropic_pair_block_pure(
     };
     let j_prefactor = eta_centered.iter().sum::<f64>().exp();
 
-    // Median off-diagonal anisotropic distance is needed only when the exact
-    // pure-Duchon finite self-pair is unavailable.
-    let pure_diag_exact =
-        closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, &eta_centered).is_some();
+    // Median off-diagonal anisotropic distance is needed only when the
+    // exact pure-Duchon finite self-pair is unavailable. The integer-only
+    // self-pair helper is consulted only when `s` is whole-valued;
+    // fractional `s` always falls through to the analytic radial chain
+    // below, which now accepts `f64` via the threaded
+    // `radial_derivatives_of_isotropic_duchon` cascade.
+    let s_int = if s.fract() == 0.0 && s >= 0.0 {
+        Some(s as usize)
+    } else {
+        None
+    };
+    let pure_diag_exact = s_int
+        .and_then(|si| {
+            closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, &eta_centered)
+        })
+        .is_some();
     let r_eps = if pure_diag_exact {
         0.0
     } else {
@@ -10216,11 +10228,14 @@ pub fn closed_form_anisotropic_pair_block_pure(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = if i == j {
-                // Self-pair (R = 0). Prefer the exact finite-part limit when
-                // available, otherwise use the same ε-regularized convention.
-                if let Some(closed) =
-                    closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, eta_slice)
-                {
+                // Self-pair (R = 0). Prefer the exact finite-part limit
+                // when available (integer s only); otherwise use the same
+                // ε-regularized convention via the analytic radial chain
+                // (which now accepts fractional s end-to-end).
+                let closed_self = s_int.and_then(|si| {
+                    closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, eta_slice)
+                });
+                if let Some(closed) = closed_self {
                     j_prefactor * closed
                 } else {
                     let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
@@ -10230,13 +10245,13 @@ pub fn closed_form_anisotropic_pair_block_pure(
                     }
                     j_prefactor
                         * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                            q, m, s as f64, 0.0, eta_slice, &powers, &r_eps_buf,
+                            q, m, s, 0.0, eta_slice, &powers, &r_eps_buf,
                         )
                 }
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                        q, m, s as f64, 0.0, eta_slice, &powers, &r_buf,
+                        q, m, s, 0.0, eta_slice, &powers, &r_buf,
                     )
             };
             unsafe {

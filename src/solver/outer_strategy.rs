@@ -4503,54 +4503,6 @@ impl OuterResult {
         self.final_grad_norm
             .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}"))
     }
-
-    /// Lightweight verdict for graceful-degradation callers that prefer
-    /// returning a best-effort iterate over hard-failing when the outer
-    /// optimizer reaches its iteration cap on a hard-to-optimize problem
-    /// (typical pathology: box-constrained minimum with three of four
-    /// log-λ saturated at the +10 upper bound; the ARC step direction is
-    /// dominated by the boundary coupling and rejects through max-iter).
-    ///
-    /// Returns `true` when **every** acceptance condition holds:
-    ///
-    /// 1. `final_value` is finite — the inner solver delivered a usable
-    ///    cost at the final iterate (not NaN/Inf from a divergent step).
-    /// 2. Every component of `rho` is finite — no NaN log-λ that would
-    ///    propagate into the final inner refit's penalty assembly.
-    /// 3. If a gradient is attached, every component is finite **and** the
-    ///    envelope-sanity tripwire passes: `|g|∞·√ε < 4·|f|`. This is the
-    ///    same threshold the unified REML/LAML evaluator uses to mark a
-    ///    gradient unavailable on ill-conditioned H blocks. The threshold
-    ///    is permissive (allows |g|/|f| up to `4/√ε ≈ 2.7·10⁸`); its job
-    ///    is to catch obviously corrupted gradients, not to certify
-    ///    convergence-grade smallness.
-    ///
-    /// When this returns `true` and the optimizer's own `converged` flag
-    /// is `false`, the caller should keep `OuterResult::converged` as it
-    /// is (honest reporting that the optimizer did not formally converge)
-    /// and still continue to the downstream stages (e.g. the final inner
-    /// refit + covariance assembly). When `false`, the iterate is
-    /// inadmissible and a hard failure is the right outcome.
-    pub fn is_acceptable_best_effort(&self) -> bool {
-        if !self.final_value.is_finite() {
-            return false;
-        }
-        if !self.rho.iter().all(|v| v.is_finite()) {
-            return false;
-        }
-        if let Some(ref grad) = self.final_gradient {
-            if grad.iter().any(|v| !v.is_finite()) {
-                return false;
-            }
-            let max_abs = grad.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            let cost_scale = self.final_value.abs().max(1.0);
-            let predicted_change = max_abs * f64::EPSILON.sqrt();
-            if predicted_change > 4.0 * cost_scale {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
