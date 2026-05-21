@@ -8610,6 +8610,117 @@ mod tests {
     }
 
     #[test]
+    fn iterate_payload_v1_entries_orphaned_by_schema_bump() {
+        // Pre-2026-05 the outer-iterate payload stored ρ-only with schema=1.
+        // Loading such an entry into a binary that ships the v2 (ρ,β) schema
+        // returned a ρ-only seed and forced the inner solve to reconstruct β
+        // from cold start; for saturated ρ (|ρ_i| near rho_bound) this gave
+        // inner-Hessian κ ≈ e^{2·rho_bound} and Newton degraded to O(1/k)
+        // descent, exhausting the cycle budget before KKT. Bumping the
+        // schema 1 → 2 makes those poisoned entries unreadable so the next
+        // run cold-starts cleanly.
+        #[derive(serde::Serialize)]
+        struct LegacyV1Payload {
+            schema: u32,
+            rho: Vec<f64>,
+            cost: f64,
+            eval_id: u64,
+        }
+        let v1_bytes = serde_json::to_vec(&LegacyV1Payload {
+            schema: 1,
+            rho: vec![10.0; 8],
+            cost: 3.459864e5,
+            eval_id: 3,
+        })
+        .expect("encode v1");
+        assert!(
+            decode_iterate(&v1_bytes, 8).is_none(),
+            "v1 payloads must be rejected so the runner falls through to cold start",
+        );
+    }
+
+    #[test]
+    fn iterate_payload_round_trips_beta() {
+        // Every persisted entry that comes with an inner-β hint round-trips
+        // (ρ, β) together — that pair lets a resume open inner PIRLS in the
+        // basin of quadratic attraction regardless of where ρ sits.
+        let rho = array![10.0, -10.0, 5.0];
+        let beta = array![0.12, -0.34, 0.56, 7.89];
+        let bytes = encode_iterate(&rho, Some(&beta), 1.0, 7).expect("encode");
+        let decoded = decode_iterate(&bytes, rho.len()).expect("decode");
+        assert_eq!(decoded.rho, rho.to_vec());
+        assert_eq!(decoded.beta, beta.to_vec());
+        // ρ-only writes (β = None) still encode but with an empty beta slot.
+        let ro_bytes = encode_iterate(&rho, None, 1.0, 7).expect("encode-rho-only");
+        let ro = decode_iterate(&ro_bytes, rho.len()).expect("decode-rho-only");
+        assert!(ro.beta.is_empty());
+    }
+
+    #[test]
+    fn note_persists_inner_beta_hint_from_eval() {
+        // Write-side proof of the principled fix: when the inner solver
+        // surfaces β via OuterEval::inner_beta_hint, CheckpointingObjective
+        // captures it on every accepted eval AND exposes it for finalize.
+        let (_d, session) = tmp_cache_session("note-persists-beta");
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Unavailable);
+        let mut inner: ClosureObjective<_, _, _> = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(1.0),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: Some(array![1.5, 2.5, 3.5]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
+        let _ = wrapped.eval(&array![0.5]).expect("eval ok");
+        let on_disk = session
+            .try_load()
+            .expect("eval with finite β must persist a (ρ,β) checkpoint");
+        let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
+        assert_eq!(payload.beta, vec![1.5, 2.5, 3.5]);
+        let captured = wrapped.last_inner_beta().expect("β was captured");
+        assert_eq!(captured.to_vec(), vec![1.5, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn note_rejects_nonfinite_inner_beta() {
+        // A divergent inner state must NOT poison the cache: persisting a
+        // non-finite β would re-create the failure mode the schema bump fixed.
+        let (_d, session) = tmp_cache_session("note-rejects-bad-beta");
+        let problem = OuterProblem::new(1).with_gradient(Derivative::Unavailable);
+        let mut inner: ClosureObjective<_, _, _> = problem.build_objective(
+            (),
+            |_: &mut (), _: &Array1<f64>| Ok(1.0),
+            |_: &mut (), theta: &Array1<f64>| {
+                Ok(OuterEval {
+                    cost: theta[0] * theta[0],
+                    gradient: array![2.0 * theta[0]],
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: Some(array![f64::NAN, 0.5]),
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
+        let _ = wrapped.eval(&array![0.5]).expect("eval ok");
+        assert!(
+            session.try_load().is_none(),
+            "non-finite β must abort the checkpoint write, not poison the cache",
+        );
+        assert!(
+            wrapped.last_inner_beta().is_none(),
+            "non-finite β must not be exposed via last_inner_beta()",
+        );
+    }
+
+    #[test]
     fn cache_entry_seed_policy_uses_helpful_cache_and_rejects_poisoned_checkpoints() {
         let usable_payload = encode_iterate(&array![9.0, 0.0], None, 1.0, 0).expect("encode");
         let poisoned_payload = encode_iterate(&array![10.0, -10.0], None, 1.0, 0).expect("encode");
