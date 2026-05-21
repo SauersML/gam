@@ -6403,6 +6403,29 @@ impl DesignMatrix {
         }
     }
 
+    /// Returns the design as a contiguous `Array2<f64>`.
+    ///
+    /// **Bypass contract** (regression-pinned at
+    /// `to_dense_arc_bypasses_policy_cap_strict_policy_still_refuses`): for
+    /// operator-backed dense designs this streams row chunks via the
+    /// operator's `row_chunk_into` and does NOT consult the
+    /// `ResourcePolicy::max_single_materialization_bytes` cap. A caller
+    /// reaching this method has already committed to a dense
+    /// `Array2<f64>` consumer and owns the memory budget; consulting a
+    /// conservative byte cap here would refuse legitimate workloads
+    /// (e.g. the 4194304×10 Duchon basis at biobank scale that
+    /// historically panicked with "refusing to densify operator-backed
+    /// design").
+    ///
+    /// Strict-operator math (`DerivativeStorageMode::AnalyticOperatorRequired`)
+    /// must instead call
+    /// `try_to_dense_arc_with_policy(ctx, &ResourcePolicy::analytic_operator_required())`,
+    /// which keeps refusal semantics intact for biobank invariants.
+    ///
+    /// Sparse designs still honor their own internal
+    /// `MAX_SPARSE_TO_DENSE_BYTES` cap (which is a separate hard limit
+    /// guarding against accidental n×p dense materialization of a sparse
+    /// design that should have stayed sparse).
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(matrix) => matrix.to_dense(),
@@ -6414,6 +6437,8 @@ impl DesignMatrix {
         }
     }
 
+    /// Arc-shared variant of [`Self::to_dense`]; same bypass contract for the
+    /// operator-backed dense branch (no policy guard), same sparse cap.
     pub fn to_dense_arc(&self) -> Arc<Array2<f64>> {
         match self {
             Self::Dense(matrix) => matrix.to_dense_arc(),
