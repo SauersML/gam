@@ -2701,10 +2701,8 @@ mod tests {
             (3, 2, 5),
             vec![
                 // cause 1
-                0.0, 0.2, 0.2, 0.5, 1.1, 0.0, 0.0, 0.4, 0.4, 0.9,
-                // cause 2
-                0.0, 0.1, 0.3, 0.3, 0.7, 0.0, 0.2, 0.2, 0.8, 0.8,
-                // cause 3
+                0.0, 0.2, 0.2, 0.5, 1.1, 0.0, 0.0, 0.4, 0.4, 0.9, // cause 2
+                0.0, 0.1, 0.3, 0.3, 0.7, 0.0, 0.2, 0.2, 0.8, 0.8, // cause 3
                 0.0, 0.0, 0.2, 0.6, 0.6, 0.0, 0.1, 0.5, 0.5, 1.5,
             ],
         )
@@ -2715,10 +2713,9 @@ mod tests {
 
         for row in 0..2 {
             for time_idx in 0..times.len() {
-                let total_cif =
-                    result.cif[[0, row, time_idx]]
-                        + result.cif[[1, row, time_idx]]
-                        + result.cif[[2, row, time_idx]];
+                let total_cif = result.cif[[0, row, time_idx]]
+                    + result.cif[[1, row, time_idx]]
+                    + result.cif[[2, row, time_idx]];
                 assert!(
                     (total_cif + result.overall_survival[[row, time_idx]] - 1.0).abs() < 1e-12,
                     "probability mass mismatch at row={row}, time_idx={time_idx}"
@@ -2728,8 +2725,7 @@ mod tests {
                     assert!((0.0..=1.0).contains(&result.cif[[cause, row, time_idx]]));
                     if time_idx > 0 {
                         assert!(
-                            result.cif[[cause, row, time_idx]]
-                                + 1e-12
+                            result.cif[[cause, row, time_idx]] + 1e-12
                                 >= result.cif[[cause, row, time_idx - 1]],
                             "CIF decreased for cause={cause}, row={row}, time_idx={time_idx}"
                         );
