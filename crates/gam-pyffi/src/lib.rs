@@ -41,11 +41,11 @@ use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 use gam::smooth::{TermCollectionDesign, TermCollectionSpec, freeze_term_collection_from_design};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BasisOptions, BasisWorkspace, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    build_duchon_basis, build_duchon_basiswithworkspace, build_duchon_operator_penalty_matrices,
-    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
-    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
+    build_duchon_basis, build_duchon_operator_penalty_matrices, build_thin_plate_penalty_matrix,
+    create_basis, create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily};
