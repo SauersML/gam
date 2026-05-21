@@ -3005,7 +3005,11 @@ pub enum BasisMetadata {
     Duchon {
         centers: Array2<f64>,
         length_scale: Option<f64>,
-        power: usize,
+        /// Real-valued spectral power `s`. Stored as `f64` so the metadata
+        /// preserves the fractional values now accepted at the spec layer
+        /// and consumed end-to-end on the scale-free (`length_scale=None`)
+        /// closed-form chain.
+        power: f64,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).

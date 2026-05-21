@@ -14935,6 +14935,250 @@ mod tests {
     use approx::assert_relative_eq;
     use ndarray::array;
 
+    // ─── Verification tests for the projected-pseudo-inverse IFT fix ─────
+    //
+    // The hypothesis: when the inner KKT residual `r` has spurious noise
+    // outside `range(S_+)` and H has a near-null eigenvalue in
+    // `null(S_+)`, the full-H solve `H⁻¹·r` amplifies that noise by
+    // `1/σ_min(H)`. Routing the IFT correction through
+    // `(U_S · H_proj⁻¹ · U_Sᵀ)` kills the noise without biasing the
+    // honest correction. The tests below verify this with synthetic H
+    // matrices whose eigenstructure we control directly.
+
+    /// Helper: build a 5×5 diagonal SPD H with one eigenvalue placed in a
+    /// chosen direction. `placement` selects whether the small eigenvalue
+    /// lives inside `range(S_+)` (col 0..4) or inside `null(S_+)` (col 4).
+    fn synthetic_h_with_small_eig(
+        small_eig: f64,
+        placement: SmallEigPlacement,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let p = 5usize;
+        let r = 4usize;
+        let mut h_full = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h_full[[i, i]] = 1.0;
+        }
+        let (small_idx, u_s_cols): (usize, Vec<usize>) = match placement {
+            // Small direction is the unpenalized parametric column (e_4);
+            // `U_S` spans e_0..e_3 — the projection excludes the near-null
+            // direction entirely, so the projected pseudo-inverse never
+            // touches the small eigenvalue.
+            SmallEigPlacement::OutsideRangeSPlus => (4, vec![0, 1, 2, 3]),
+            // Small direction lives inside `range(S_+)` (e_0); the
+            // projection retains it and the projected pseudo-inverse must
+            // still amplify by `1/σ_min` — this is the case where the fix
+            // does *not* help and a different remediation (truncated SVD
+            // / Tikhonov) would be required. The test makes that
+            // explicit.
+            SmallEigPlacement::InsideRangeSPlus => (0, vec![0, 1, 2, 3]),
+        };
+        h_full[[small_idx, small_idx]] = small_eig;
+        // Anchor the non-small in-subspace direction at a moderately large
+        // eigenvalue so the "outside" placement still produces a noticeable
+        // contrast against the full-H result.
+        if matches!(placement, SmallEigPlacement::OutsideRangeSPlus) {
+            // Boost diag entry 0 so the full-H block on `range(S_+)` is
+            // well-conditioned — only the e_4 direction is degenerate.
+        }
+        let mut u_s = Array2::<f64>::zeros((p, r));
+        for (col_pos, &row) in u_s_cols.iter().enumerate() {
+            u_s[[row, col_pos]] = 1.0;
+        }
+        (h_full, u_s)
+    }
+
+    #[derive(Clone, Copy)]
+    enum SmallEigPlacement {
+        OutsideRangeSPlus,
+        InsideRangeSPlus,
+    }
+
+    /// Build a `PenaltySubspaceTrace` from a full H + U_S pair, using the
+    /// exact same formula the production code uses: `H_proj⁻¹ = (U_Sᵀ H
+    /// U_S)⁻¹`. Inverts the projected matrix analytically for the test.
+    fn build_subspace_kernel(h_full: &Array2<f64>, u_s: &Array2<f64>) -> PenaltySubspaceTrace {
+        let h_proj = u_s.t().dot(h_full).dot(u_s);
+        // 4×4 diagonal inverse — trivial here, computed via `.inv` via faer
+        // would also work but we keep the test independent of the linalg
+        // backend so the verification is direct.
+        let r = h_proj.nrows();
+        let mut h_proj_inverse = Array2::<f64>::zeros((r, r));
+        for i in 0..r {
+            assert!(
+                h_proj[[i, i]].abs() > 0.0,
+                "test fixture must keep H_proj diagonal nonzero"
+            );
+            h_proj_inverse[[i, i]] = 1.0 / h_proj[[i, i]];
+        }
+        PenaltySubspaceTrace {
+            u_s: u_s.clone(),
+            h_proj_inverse,
+        }
+    }
+
+    /// Direct ground-truth full-H inverse bilinear form `aᵀ H⁻¹ b`. The
+    /// test fixtures all use diagonal H so we invert componentwise.
+    fn full_h_inv_bilinear(h_full: &Array2<f64>, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        let p = h_full.nrows();
+        let mut acc = 0.0_f64;
+        for i in 0..p {
+            assert!(h_full[[i, i]].abs() > 0.0);
+            acc += a[i] * b[i] / h_full[[i, i]];
+        }
+        acc
+    }
+
+    /// **Mechanism test, line of evidence 1**: when the near-null
+    /// eigenvalue of H sits in `null(S_+)` (the unpenalized parametric
+    /// direction — intercept/sex/prs_z for the failing biobank survival
+    /// marginal-slope), the full-H `r ↦ H⁻¹ r` solve amplifies any
+    /// spurious noise component of `r` in that direction by
+    /// `1/σ_min(H)`, while the projected pseudo-inverse drops that
+    /// component entirely and recovers the honest correction.
+    #[test]
+    fn ift_projected_pseudo_inverse_kills_null_subspace_noise() {
+        let small_eig = 1e-12_f64;
+        let (h_full, u_s) =
+            synthetic_h_with_small_eig(small_eig, SmallEigPlacement::OutsideRangeSPlus);
+        let kernel = build_subspace_kernel(&h_full, &u_s);
+        // r: honest signal in range(S_+) + tiny noise in null(S_+).
+        let r_honest = array![1.0_f64, 0.0, 0.0, 0.0, 0.0];
+        let r_noise = array![0.0_f64, 0.0, 0.0, 0.0, 1e-3];
+        let r_total = &r_honest + &r_noise;
+        // a_k = λ_k · S_k · β̂ lies in range(S_+) by construction (every
+        // S_k has range ⊂ range(S_+)). Pick a non-trivial alignment with
+        // r_honest so the IFT correction is non-zero in the well-
+        // conditioned subspace.
+        let a_k = array![0.0_f64, 1.0, 0.0, 0.0, 0.0];
+
+        // Honest reference: pseudo-inverse evaluated on the noise-free r
+        // (gives the correction we'd see at exact inner KKT).
+        let corr_honest = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_honest, &a_k);
+        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r_total, &a_k);
+        let corr_full = full_h_inv_bilinear(&h_full, &r_total, &a_k);
+
+        // Projected pseudo-inverse: matches the honest reference exactly
+        // because the noise component lives in `null(U_S)` and dies under
+        // the `U_Sᵀ` projection.
+        assert_relative_eq!(corr_proj, corr_honest, max_relative = 1e-12);
+        // Full-H bilinear form on this fixture happens to also match the
+        // honest result *here* (a_k has no e_4 component, so the
+        // amplified noise direction never sees a multiplier from a_k).
+        // Switch to a configuration where a_k DOES have e_4 alignment
+        // to expose the full-H pathology.
+        let _ = corr_full;
+    }
+
+    /// **Mechanism test, line of evidence 2** — the failure mode itself:
+    /// when `r` AND `a_k` both have spurious components in the near-null
+    /// direction (the realistic floating-point pattern at the failing
+    /// biobank iterate), the full-H solve produces a `~ηξ/σ_min`-scale
+    /// blow-up while the projected pseudo-inverse stays bounded. With
+    /// `η = ξ = 1e-3` and `σ_min = 1e-12`, the full-H result is `1e6`
+    /// while the projection drops it to 0 — six orders of magnitude
+    /// reduction in noise, on the same input.
+    #[test]
+    fn ift_full_h_solve_amplifies_null_subspace_noise_by_inverse_small_eig() {
+        let small_eig = 1e-12_f64;
+        let (h_full, u_s) =
+            synthetic_h_with_small_eig(small_eig, SmallEigPlacement::OutsideRangeSPlus);
+        let kernel = build_subspace_kernel(&h_full, &u_s);
+
+        let eta = 1e-3_f64; // noise scale on r in null(S_+)
+        let xi = 1e-3_f64; // noise scale on a_k in null(S_+)
+        let r = array![0.0_f64, 0.0, 0.0, 0.0, eta];
+        let a_k = array![0.0_f64, 0.0, 0.0, 0.0, xi];
+
+        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
+
+        // Projection: U_Sᵀ kills both r and a_k entirely (they live in
+        // `null(S_+) = span(e_4)` which is orthogonal to U_S's columns),
+        // so the correction is exactly zero.
+        assert!(
+            corr_proj.abs() < 1e-15,
+            "projected correction must drop pure-null-subspace contributions, got {corr_proj:.3e}"
+        );
+        // Full-H solve: `η · (1/σ_min) · ξ = 1e-3 · 1e12 · 1e-3 = 1e6`.
+        // This is the noise-amplification mechanism behind the observed
+        // |g|∞ ≈ 10¹³ on the failing biobank iterate (scale it by the
+        // tighter noise floor and the per-coord magnitude of a_k).
+        let expected_full = eta * xi / small_eig;
+        assert_relative_eq!(corr_full, expected_full, max_relative = 1e-12);
+        // Quantitative ratio: the projected fix delivers `≥ ~6 orders of
+        // magnitude` noise reduction on this synthetic fixture, and the
+        // ratio grows linearly with `1/σ_min(H)` — i.e. the worse H is
+        // conditioned, the more the projected approach saves.
+        assert!(
+            corr_full / 1.0 >= 1e5,
+            "full-H solve must produce a large blow-up for this fixture"
+        );
+    }
+
+    /// **Mechanism test, line of evidence 3** (honest counter-example):
+    /// when the near-null eigenvalue lives *inside* `range(S_+)`, the
+    /// projection cannot help — `H_proj` inherits the same small
+    /// eigenvalue and the bilinear form has the same amplification. This
+    /// test pins that limit so future readers know exactly where the fix
+    /// breaks down; if the failing-biobank H matches this geometry the
+    /// fix is the wrong remediation and we need truncated-SVD /
+    /// Tikhonov regularization instead. The current production
+    /// experience (gradient drops by orders of magnitude after the fix)
+    /// is the empirical evidence that the failing geometry is the
+    /// outside-`range(S_+)` case in tests 1 and 2 above.
+    #[test]
+    fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_inside_range_s_plus() {
+        let small_eig = 1e-12_f64;
+        let (h_full, u_s) =
+            synthetic_h_with_small_eig(small_eig, SmallEigPlacement::InsideRangeSPlus);
+        let kernel = build_subspace_kernel(&h_full, &u_s);
+
+        let eta = 1e-3_f64;
+        let xi = 1e-3_f64;
+        let r = array![eta, 0.0, 0.0, 0.0, 0.0]; // noise in e_0, which is in range(S_+)
+        let a_k = array![xi, 0.0, 0.0, 0.0, 0.0];
+
+        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
+
+        // Both methods give the same blow-up `ηξ/σ_min = 1e6` because
+        // the near-null eigenvalue is inside the projected subspace.
+        let expected = eta * xi / small_eig;
+        assert_relative_eq!(corr_proj, expected, max_relative = 1e-12);
+        assert_relative_eq!(corr_full, expected, max_relative = 1e-12);
+    }
+
+    /// **Sanity test, line of evidence 4**: the projected pseudo-inverse
+    /// does NOT bias the well-conditioned case — when H is well-
+    /// conditioned and `r`, `a_k` are honest in-subspace signals, the
+    /// projection and the full-H solve agree to machine precision. This
+    /// keeps the fix from introducing a regression on Gaussian-identity
+    /// fixtures (where the subspace-projection-LAML fix is not active
+    /// and the existing code path is correct).
+    #[test]
+    fn ift_projected_pseudo_inverse_matches_full_h_on_well_conditioned_fixture() {
+        // Well-conditioned H — every eigenvalue O(1).
+        let p = 5usize;
+        let r_subspace = 4usize;
+        let mut h_full = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h_full[[i, i]] = (i as f64 + 1.0) * 2.0;
+        }
+        let mut u_s = Array2::<f64>::zeros((p, r_subspace));
+        for j in 0..r_subspace {
+            u_s[[j, j]] = 1.0;
+        }
+        let kernel = build_subspace_kernel(&h_full, &u_s);
+
+        let r = array![0.3_f64, -0.7, 1.2, 0.4, 0.0]; // honest in range(S_+)
+        let a_k = array![0.5_f64, 0.1, -0.2, 0.8, 0.0]; // honest in range(S_+)
+
+        let corr_proj = penalty_subspace_bilinear_pseudo_inverse(&kernel, &r, &a_k);
+        let corr_full = full_h_inv_bilinear(&h_full, &r, &a_k);
+
+        assert_relative_eq!(corr_proj, corr_full, max_relative = 1e-12);
+    }
+
     fn make_factor_key(seed: u64) -> ProjectedFactorKey {
         // Build a unique-by-seed key without going through
         // `from_factor_view` so the test can inject fingerprints
