@@ -6354,6 +6354,21 @@ pub fn reml_laml_evaluate(
     };
     let kkt_residual_correction_active = kkt_residual_vec.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
+    // One-shot structured log of the IFT gate. Debug-level so it doesn't
+    // spam normal runs but is immediately greppable when debugging an
+    // envelope-gradient consistency failure (search for `[ift-gate]`).
+    log::debug!(
+        "[ift-gate] kkt_residual.is_some()={} dispersion={} correction_active={} subspace_trace.is_some()={} hop.dim()={} k={}",
+        solution.kkt_residual.is_some(),
+        match &solution.dispersion {
+            DispersionHandling::Fixed { .. } => "Fixed",
+            DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
+        },
+        kkt_residual_correction_active,
+        solution.penalty_subspace_trace.is_some(),
+        hop.dim(),
+        k,
+    );
     if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
@@ -7317,6 +7332,16 @@ pub fn reml_laml_evaluate(
     // (|g|∞ ≈ √ε · |cost|, ratio ≈ 1) from tripping.
     let gradient_out = match envelope_inconsistent {
         Some((max_idx, max_abs, predicted_change)) if !kkt_residual_was_applied => {
+            // Self-diagnosing warning. The three gates that control whether
+            // the IFT correction can run all map to observable booleans, so
+            // the next failing run pinpoints the cause without another
+            // debugging round.
+            let kkt_some = solution.kkt_residual.is_some();
+            let dispersion_label = match &solution.dispersion {
+                DispersionHandling::Fixed { .. } => "Fixed",
+                DispersionHandling::ProfiledGaussian => "ProfiledGaussian",
+            };
+            let kernel_present = solution.penalty_subspace_trace.is_some();
             log::warn!(
                 "[reml_laml envelope-gradient consistency] |g|∞ = {:.3e} at coord {} predicts \
                  |Δcost| ≈ {:.3e} along a √ε step while |cost| = {:.3e} (ratio {:.2e}). \
@@ -7324,13 +7349,27 @@ pub fn reml_laml_evaluate(
                  marking analytic gradient unavailable so outer optimizer does not chase a \
                  mathematically impossible descent direction. Outer-Hessian assembly skipped on \
                  this evaluation to avoid spending wall-clock on a result the optimizer would \
-                 discard. This means the inner solution reached the unified evaluator without \
-                 a projected KKT residual, so the IFT correction grad[k] -= rᵀ·v_k could not run.",
+                 discard. \
+                 IFT-gate diagnostics: kkt_residual.is_some()={} (must be true; this is the \
+                 projected-KKT residual the inner solver hands over), dispersion={} (must be \
+                 `Fixed` for the LAML IFT identity to hold), penalty_subspace_trace.is_some()={} \
+                 (when true the cost IFT uses bilinear_pseudo_inverse on range(S₊); when false \
+                 the full H⁻¹·r solve is the only path and is unsafe on near-singular H). \
+                 If kkt_residual.is_some()=false the convergent inner path forgot to populate \
+                 `BlockwiseInnerResult::kkt_residual` (call \
+                 `exact_newton_joint_kkt_residual_for_ift(..., Some(active_sets))` on return). \
+                 If kkt_residual.is_some()=true but the warning still fires, the dispersion or \
+                 length gate above tripped — the convergent path emitted a residual but the \
+                 evaluator refused it; check the length-mismatch hard error earlier in this \
+                 function or the dispersion variant printed here.",
                 max_abs,
                 max_idx,
                 predicted_change,
                 cost_scale,
                 predicted_change / cost_scale,
+                kkt_some,
+                dispersion_label,
+                kernel_present,
             );
             None
         }
