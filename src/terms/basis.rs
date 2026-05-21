@@ -22585,30 +22585,41 @@ pub mod closed_form_penalty {
     /// recurrence `Δ R_j^d = -R_{j-1}^d` holds exactly away from the
     /// origin. This removes the previous null-space polynomial residue in
     /// log-Riesz regimes and keeps the anisotropic `(-Δ_B)^q` path analytic.
-    pub fn riesz_kernel_value(d: usize, j: usize, r: f64) -> f64 {
+    pub fn riesz_kernel_value(d: usize, j: f64, r: f64) -> f64 {
         assert!(d >= 1, "riesz_kernel_value: d must be ≥ 1");
-        assert!(j >= 1, "riesz_kernel_value: j must be ≥ 1");
+        assert!(
+            j.is_finite() && j >= 1.0,
+            "riesz_kernel_value: j must be ≥ 1, got {j}"
+        );
         assert!(r > 0.0, "riesz_kernel_value: r must be > 0");
 
-        // Detect log case: 2j == d + 2n for some n ≥ 0
-        let two_j = 2 * j;
-        if two_j >= d && (two_j - d) % 2 == 0 {
-            let n = (two_j - d) / 2;
-            let sign = if n % 2 == 0 { -1.0 } else { 1.0 }; // (-1)^{n+1}
-            let denom = 2.0_f64.powi((two_j - 1) as i32)
-                * std::f64::consts::PI.powf(d as f64 / 2.0)
-                * gamma_fn(j as f64)
-                * factorial_f64(n);
-            return sign / denom
-                * r.powi((2 * n) as i32)
-                * (r.ln() + log_riesz_finite_part_shift(d, n));
+        // Detect log case: 2j is a non-negative even integer offset of `d`.
+        // For integer `j` this is exact; for fractional `j` it never fires
+        // because `2j − d` won't be an even integer to within `LOG_EPS`.
+        let two_j = 2.0 * j;
+        const LOG_EPS: f64 = 1e-12;
+        let offset = two_j - d as f64;
+        if offset >= -LOG_EPS && (offset.round() - offset).abs() < LOG_EPS {
+            let n_f64 = (offset / 2.0).round();
+            if n_f64 >= 0.0 && (n_f64 * 2.0 - offset).abs() < LOG_EPS {
+                let n = n_f64 as usize;
+                let two_j_i = (two_j.round()) as i32;
+                let sign = if n % 2 == 0 { -1.0 } else { 1.0 }; // (−1)^{n+1}
+                let denom = 2.0_f64.powi(two_j_i - 1)
+                    * std::f64::consts::PI.powf(d as f64 / 2.0)
+                    * gamma_fn(j)
+                    * factorial_f64(n);
+                return sign / denom
+                    * r.powi((2 * n) as i32)
+                    * (r.ln() + log_riesz_finite_part_shift(d, n));
+            }
         }
 
-        // Non-log case
+        // Non-log case (admits fractional `j`).
         let half_d = d as f64 / 2.0;
-        let num = gamma_fn(half_d - j as f64);
-        let denom = 4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64);
-        num / denom * r.powf(2.0 * j as f64 - d as f64)
+        let num = gamma_fn(half_d - j);
+        let denom = 4.0_f64.powf(j) * std::f64::consts::PI.powf(half_d) * gamma_fn(j);
+        num / denom * r.powf(2.0 * j - d as f64)
     }
 
     /// Canonical log-Riesz finite-part constant for
