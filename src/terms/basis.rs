@@ -9889,7 +9889,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         centers: centers.to_owned(),
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         pure_block_order,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
@@ -11827,7 +11827,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         dim,
         max_operator_derivative_order,
     )?;
@@ -16074,7 +16074,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         centers.view(),
         Some(length_scale),
         p_order,
-        s_order,
+        s_order as f64,
         1,
         None,
         Some(&coeffs),
@@ -16709,7 +16709,7 @@ fn build_duchon_design_psi_aniso_derivatives(
     let radial_kind = RadialScalarKind::Duchon {
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         dim,
         coeffs: coeffs.clone(),
     };
@@ -18429,7 +18429,7 @@ fn duchon_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     d: usize,
     aniso_log_scales: Option<&[f64]>,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
@@ -18634,7 +18634,7 @@ fn build_duchon_basis_designwithworkspace(
         centers,
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         d,
         aniso_log_scales,
         coeffs.as_ref(),
@@ -18768,7 +18768,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
         center_matrix.view(),
         None,
         p_order,
-        s_order,
+        s_order as f64,
         1,
         None,
         None,
@@ -19059,7 +19059,7 @@ fn build_periodic_duchon_basis_1d(
         centers.view(),
         spec.length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         1,
         None,
         coeffs.as_ref(),
@@ -19268,14 +19268,22 @@ pub fn build_duchon_basiswithworkspace(
         let d = data.ncols();
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-        let s_order = spec.power_as_usize();
+        let s_order: f64 = spec.power;
         let length_scale = spec.length_scale;
+        let s_order_int = length_scale.map(|_| duchon_power_to_usize(s_order));
         let coeffs = length_scale.map(|ls| {
-            duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls.max(1e-300))
+            // Hybrid Matérn (length_scale = Some) uses the integer
+            // partial-fraction chain; assert at this boundary so the
+            // scale-free path stays fractional-clean.
+            duchon_partial_fraction_coeffs(
+                p_order,
+                s_order_int.expect("hybrid Duchon requires integer power"),
+                1.0 / ls.max(1e-300),
+            )
         });
         let pure_poly_coeff = if length_scale.is_none() {
             Some(PolyharmonicBlockCoeff::new(
-                (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+                pure_duchon_block_order(p_order, s_order),
                 d,
             ))
         } else {
@@ -19311,7 +19319,7 @@ pub fn build_duchon_basiswithworkspace(
                         r,
                         length_scale,
                         p_order,
-                        s_order,
+                        s_order_int.expect("hybrid Duchon requires integer power"),
                         d,
                         coeffs.as_ref(),
                     )
@@ -19339,7 +19347,7 @@ pub fn build_duchon_basiswithworkspace(
                         r,
                         length_scale,
                         p_order,
-                        s_order,
+                        s_order_int.expect("hybrid Duchon requires integer power"),
                         d,
                         coeffs.as_ref(),
                     )
