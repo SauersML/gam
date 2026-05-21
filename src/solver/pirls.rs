@@ -897,12 +897,18 @@ impl WorkingState {
     }
 
     /// Near-stationary band (10× the strict KKT tolerance) under EITHER
-    /// scale-invariant criterion. Used as a "good-enough" plateau check that
-    /// classifies a fit as `StalledAtValidMinimum` rather than as a hard
-    /// non-convergence.
+    /// scale-invariant criterion. Used as a "good-enough" plateau check
+    /// that classifies a fit as `StalledAtValidMinimum` rather than as a
+    /// hard non-convergence. The band is `10 · tol` without a
+    /// floor — a caller asking for `tol = 1e-12` gets a 1e-11 band, not
+    /// the 1e-5 the old `tol.max(1e-6) * 10` formula silently widened it
+    /// to. The 1e-6 floor was masking real convergence regressions
+    /// (e.g. `constant_prior_mean_centers_penalty`'s LM-ridge induced
+    /// 2.5e-8 bias visible only when the user asked for sub-1e-6
+    /// precision).
     #[inline]
     pub fn near_stationary_kkt(&self, g_norm: f64, tol: f64) -> bool {
-        let near_tol = tol.max(1e-6) * 10.0;
+        let near_tol = tol * 10.0;
         g_norm <= near_tol * self.kkt_dimension_scale()
             || self.relative_gradient_norm(g_norm) <= near_tol
     }
