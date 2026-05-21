@@ -13,6 +13,32 @@ pub struct LinearInequalityConstraints {
 }
 
 impl LinearInequalityConstraints {
+    /// Construct with the equal-row-count invariant enforced. The dimensions
+    /// `a.nrows() == b.len()` are required by every downstream KKT / active-set
+    /// routine; routing every construction site through this constructor
+    /// eliminates a class of "rows out of sync" bugs at the type boundary.
+    #[inline]
+    pub fn new(a: Array2<f64>, b: Array1<f64>) -> Result<Self, String> {
+        if a.nrows() != b.len() {
+            return Err(format!(
+                "LinearInequalityConstraints: row count mismatch (A has {} rows, b has length {})",
+                a.nrows(),
+                b.len(),
+            ));
+        }
+        Ok(Self { a, b })
+    }
+
+    /// Internal helper for sites that have *just* produced `(a, b)` with the
+    /// invariant guaranteed (e.g. via a row-by-row push loop). Skips the
+    /// runtime length check; callers that aren't in that position must use
+    /// [`Self::new`] instead.
+    #[inline]
+    pub(crate) fn from_paired(a: Array2<f64>, b: Array1<f64>) -> Self {
+        debug_assert_eq!(a.nrows(), b.len(), "paired constraint shape invariant");
+        Self { a, b }
+    }
+
     /// Build the per-coordinate `β_i ≥ lower_bounds[i]` inequality system.
     /// Non-finite entries are treated as "no bound" and skipped; returns
     /// `None` when every entry is non-finite so callers can short-circuit
@@ -31,7 +57,7 @@ impl LinearInequalityConstraints {
             a[[r, idx]] = 1.0;
             b[r] = lower_bounds[idx];
         }
-        Some(Self { a, b })
+        Some(Self::from_paired(a, b))
     }
 }
 
@@ -391,7 +417,7 @@ pub(crate) fn compress_active_working_set(
     let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a_out, b_out, groups_out);
 
     Ok(CompressedActiveWorkingSet {
-        constraints: LinearInequalityConstraints { a: a_out, b: b_out },
+        constraints: LinearInequalityConstraints::from_paired(a_out, b_out),
         groups: groups_out,
         original_active_count: active.len(),
     })

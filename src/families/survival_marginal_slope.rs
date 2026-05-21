@@ -5213,6 +5213,9 @@ impl SurvivalMarginalSlopeFamily {
                 64,
             );
         }
+        // This routine also emits its own format!()-based String errors below
+        // (non-finite derivative, residual rejection), so the enclosing return
+        // type stays Result<_, String>; convert the typed solver error here.
         let solution = solve_result.map_err(|e| e.to_string())?;
         let a = solution.root;
         // The solver already evaluated `eval` at `solution.root` during the

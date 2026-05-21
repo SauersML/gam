@@ -7274,7 +7274,7 @@ fn build_transformed_lower_bound_constraints(
         a.row_mut(r).assign(&qs.row(idx));
         b[r] = lb[idx];
     }
-    Some(LinearInequalityConstraints { a, b })
+    Some(LinearInequalityConstraints::from_paired(a, b))
 }
 
 fn build_transformed_lower_bound_constraints_with_transform(
@@ -7302,7 +7302,7 @@ fn build_transformed_lower_bound_constraints_with_transform(
         a.row_mut(r).assign(&row);
         b[r] = lb[idx];
     }
-    Some(LinearInequalityConstraints { a, b })
+    Some(LinearInequalityConstraints::from_paired(a, b))
 }
 
 fn build_transformed_linear_constraints(
@@ -7313,10 +7313,10 @@ fn build_transformed_linear_constraints(
     if lc.a.ncols() != qs.nrows() {
         return None;
     }
-    Some(LinearInequalityConstraints {
-        a: lc.a.dot(qs),
-        b: lc.b.clone(),
-    })
+    Some(LinearInequalityConstraints::from_paired(
+        lc.a.dot(qs),
+        lc.b.clone(),
+    ))
 }
 
 fn build_transformed_linear_constraints_with_transform(
