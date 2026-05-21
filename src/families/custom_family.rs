@@ -12146,8 +12146,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Newton equation.
                 let quadratic_defect = math_diag.quadratic_defect_ratio(residual);
                 let scalar_model_relerr = math_diag.scalar_model_relative_error();
-                let linearized_rel = math_diag.linearized_next_kkt_inf
-                    / (1.0 + math_diag.old_kkt_inf.max(math_diag.predicted_reduction.abs()));
+                let linearized_rel =
+                    math_diag.linearized_next_kkt_inf / (1.0 + math_diag.old_kkt_inf);
                 last_joint_math = Some(math_diag.clone());
                 if verbose_cycle || residual > 100.0 * residual_tol || scalar_model_relerr > 1e-3 {
                     log::info!(
@@ -12303,24 +12303,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             //   new_kkt = ‖g(β+δ)‖∞,
             //   scalar_model relerr = |actual-pred|/max(1,|pred|).
             //
-            // That is the proof surface. If `linearized_next` is tiny but
-            // `new_kkt` remains large, the solve is accurate but the Newton
-            // model is not predictive of stationarity (true nonlinearity,
-            // Hessian/gradient mismatch, or rank/constraint geometry). If
-            // `linearized_next` is large, the linear solve/operator itself is
-            // the defect. If the scalar model is accurate while the vector
-            // identity is bad, objective-only soft convergence is exactly the
-            // wrong fix.
+            // That is the proof surface. The diagnostic reports the measured
+            // linear solve residual, post-step KKT residual, scalar model
+            // error, and step sizes directly; downstream analysis should use
+            // those numbers rather than this solver attaching labels.
 
             // Residual-stall early-exit. The strict and noise-floor
             // certificates above require the KKT residual to land within
             // a small multiple of residual_tol. On survival marginal-slope
             // at biobank scale the residual oscillates in a band that is
-            // orders of magnitude above tol without trending down — the
-            // outer ρ has pushed inner H into a near-singular geometry
-            // where the unconstrained Newton proposal blows up (|prop|∞
-            // 10³–10⁶), the TR clamps it, and each clamped step shuffles
-            // β by O(1) without driving ‖∇L − Sβ‖∞ closer to KKT.
+            // orders of magnitude above tol without trending down while
+            // the unconstrained proposal has |prop|∞ in the 10³–10⁶ range,
+            // the TR clamps it, and each clamped step moves β by O(1)
+            // without driving ‖∇L − Sβ‖∞ closer to KKT.
             //
             // Spending the remaining cycle budget on this pattern hits
             // inner_max_cycles "non-converged", which then routes the
@@ -12360,14 +12355,31 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
                 && tr_clamped_during_stall
             {
+                let last_math_summary = last_joint_math
+                    .as_ref()
+                    .map(|math| {
+                        format!(
+                            "last_newton_math={{old_kkt={:.3e}, linearized_next={:.3e}, actual={:+.3e}, pred={:+.3e}, rho={:+.3e}, scalar_relerr={:.3e}, step_inf={:.3e}, proposal_inf={:.3e}}}",
+                            math.old_kkt_inf,
+                            math.linearized_next_kkt_inf,
+                            math.actual_reduction,
+                            math.predicted_reduction,
+                            math.trust_ratio,
+                            math.scalar_model_relative_error(),
+                            math.step_inf,
+                            math.proposal_inf,
+                        )
+                    })
+                    .unwrap_or_else(|| "last_newton_math=<none>".to_string());
                 log::warn!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} (best_seen={:.3e}, no-improve cycles={}) accepted_|δ|∞={:.3e} r={:.3e}; near-singular joint Hessian — returning unconverged with finite β so the outer optimizer backs off this ρ region instead of running to inner_max_cycles and triggering the stale-mode bridge gradient.",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | residual-stall early-exit: residual={:.3e} best_seen={:.3e} no_improve_cycles={} accepted_step_inf={:.3e} trust_radius={:.3e} {}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles.",
                     cycle,
                     residual,
                     best_residual_seen,
                     cycles_since_residual_improved,
                     accepted_step_inf,
                     joint_trust_radius,
+                    last_math_summary,
                 );
                 converged = false;
                 break;
@@ -12410,47 +12422,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
         if cycles_done >= inner_max_cycles {
             if !converged {
-                // Engine-level diagnostic.  The same warning previously
-                // logged only the total objective drop, which does not
-                // distinguish the three modes that look identical in
-                // the outer error path:
-                //
-                //   (a) HESSIAN APPROXIMATION — `family.exact_newton_joint_hessian`
-                //       defaults to a BLOCK-DIAGONAL assembly when not
-                //       overridden (see custom_family.rs:1698, default
-                //       `exact_newton_joint_hessian_from_exact_blocks`),
-                //       which drops every cross-block second derivative.
-                //       For coupled families that means quasi-Newton
-                //       with linear convergence rate determined by the
-                //       off-diagonal mass.
-                //
-                //   (b) GRADIENT/HESSIAN INCONSISTENCY — the joint
-                //       gradient and joint Hessian assemblies use
-                //       different code paths.  If they evaluate
-                //       different formulae (e.g. observed-info Hessian
-                //       paired with Fisher-info gradient, or a missing
-                //       cross-block ∂g_a/∂β_b that is present in g but
-                //       absent from H), Newton iterates do not satisfy
-                //       g_{k+1} = O(|δ|²) and the residual stalls at
-                //       a rate proportional to the inconsistency.
-                //
-                //   (c) RANK DEFICIENCY — `H + λS` has a near-zero
-                //       eigenvalue with an eigenvector that the
-                //       residual lives partly in.  Newton steps along
-                //       that direction are unbounded in floating point
-                //       (or, with the safety ridge, truncated), so the
-                //       residual component in that direction never
-                //       decays.  The "residual-stall early-exit" branch
-                //       at line ~12240 fires on the *extreme* case of
-                //       this; a milder rank deficiency simply burns
-                //       the cycle budget without tripping that gate.
-                //
-                // Per-block gradient inf-norms tell (a) from (b)/(c):
-                // in (a) each block's component is reduced quadratically
-                // (∼O(|δ|²)), and the residual is dominated by the
-                // off-diagonal coupling term that the block-diagonal
-                // Hessian ignores; in (b)/(c) one block stays large
-                // while others converge.
+                // Engine-level diagnostic. Emit measured quantities only:
+                // objective movement, coefficient scale, per-block dimensions,
+                // per-block β and gradient scales, the unprojected stationarity
+                // norm at exit, the Hessian source shape, and the last accepted
+                // Newton identity diagnostics. The outer error path has no
+                // access to these internals, so this line is the complete
+                // numerical record needed to decide the next fix.
                 let block_grad_norms: Vec<f64> = match cached_joint_gradient.as_ref() {
                     Some(joint_grad) => {
                         let mut acc = 0usize;
@@ -12475,14 +12453,39 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                     None => vec![f64::NAN; states.len()],
                 };
+                let block_widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
+                let block_beta_inf: Vec<f64> = states
+                    .iter()
+                    .map(|s| s.beta.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max))
+                    .collect();
                 let descent_total = initial_joint_objective - lastobjective;
                 let beta_inf_final = states
                     .iter()
                     .flat_map(|s| s.beta.iter().copied())
                     .map(f64::abs)
                     .fold(0.0_f64, f64::max);
-                let block_diag_default = !family.exact_newton_joint_hessian_beta_dependent()
-                    && specs.len() >= 2;
+                let block_diag_default =
+                    !family.exact_newton_joint_hessian_beta_dependent() && specs.len() >= 2;
+                let exit_unprojected_kkt_inf = cached_joint_gradient
+                    .as_ref()
+                    .and_then(|joint_grad| {
+                        exact_newton_joint_stationarity_vector_from_gradient(
+                            joint_grad,
+                            &states,
+                            specs,
+                            &s_lambdas,
+                            ridge,
+                            options.ridge_policy,
+                        )
+                        .ok()
+                    })
+                    .map(|residual| {
+                        residual
+                            .iter()
+                            .map(|x: &f64| x.abs())
+                            .fold(0.0_f64, f64::max)
+                    })
+                    .unwrap_or(f64::NAN);
                 let last_math_summary = last_joint_math
                     .as_ref()
                     .map(|math| {
@@ -12500,12 +12503,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     })
                     .unwrap_or_else(|| "last_newton_math=<none>".to_string());
                 log::warn!(
-                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective {:.6e}->{:.6e} (Δ={:+.3e}) |β|∞={:.3e} block_grad_inf={:?} block_diag_hessian_default={} {}; if descent total is large but per-block gradient infs are all comparable, the joint Hessian likely drops cross-block coupling (case (a)); if one block stays orders-of-magnitude larger than others, suspect gradient/Hessian inconsistency or rank deficiency (case (b)/(c)).  Returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
+                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective_start={:.6e} objective_end={:.6e} objective_drop={:+.3e} beta_inf={:.3e} exit_unprojected_kkt_inf={:.3e} total_p={} total_n={} block_widths={:?} block_beta_inf={:?} block_grad_inf={:?} block_diag_hessian_default={} {}; returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
                     cycles_done,
                     initial_joint_objective,
                     lastobjective,
                     descent_total,
                     beta_inf_final,
+                    exit_unprojected_kkt_inf,
+                    total_p,
+                    total_joint_n,
+                    block_widths,
+                    block_beta_inf,
                     block_grad_norms,
                     block_diag_default,
                     last_math_summary,
