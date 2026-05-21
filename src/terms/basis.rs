@@ -27940,6 +27940,90 @@ mod tests {
         ));
     }
 
+    /// The construction is supposed to deliver exactly *one* unpenalized
+    /// direction — the constant function — across the joint penalty
+    /// `λ_0 S_0 + λ_1 S_1 + λ_2 S_2`. This test pins that property
+    /// directly: it computes the basis-coordinate vector `v_const` such
+    /// that `design · v_const ≡ 1`, asserts `(λ_0 S_0 + λ_1 S_1 + λ_2 S_2)
+    /// · v_const` is zero to working precision, and asserts that the joint
+    /// penalty has rank `p − 1` (so no second unpenalized direction sneaks
+    /// in). Without this test we were only checking the cardinality and
+    /// labels of the triplet, not the actual joint-null-space dimension —
+    /// the property the centered-mass design exists to deliver.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
+        let data = array![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+        let design = out.design.to_dense();
+        let (n, p) = design.dim();
+        assert!(n >= p, "need n ≥ p to recover v_const via least squares");
+        let ones = Array1::<f64>::ones(n);
+        // Solve (Xᵀ X) v = Xᵀ 1 for the basis-coord vector of the
+        // constant function. Use a tiny ridge so the case where the basis
+        // exactly contains a column of ones still yields a well-defined v;
+        // the constant-function-recovery test below catches any solver
+        // misbehaviour anyway.
+        let xtx = crate::faer_ndarray::fast_atb(&design, &design);
+        let xt_ones = crate::faer_ndarray::fast_atv(&design, &ones);
+        let mut xtx_reg = xtx.clone();
+        for i in 0..p {
+            xtx_reg[[i, i]] += 1e-14 * (xtx[[i, i]].abs().max(1.0));
+        }
+        let chol = xtx_reg
+            .cholesky(faer::Side::Lower)
+            .expect("XᵀX SPD with ridge");
+        let v_const = chol.solvevec(&xt_ones);
+        // Sanity: design · v_const ≈ 1 across all rows.
+        let recon = crate::faer_ndarray::fast_av(&design, &v_const);
+        let err = (&recon - &ones).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        assert!(
+            err < 1e-8,
+            "v_const must reproduce the constant function: max |Xv − 1| = {err}"
+        );
+        // Joint penalty with equal weights — any positive choice works.
+        let lambdas = [1.0_f64, 1.0_f64, 1.0_f64];
+        let mut joint = Array2::<f64>::zeros((p, p));
+        for (lam, s) in lambdas.iter().zip(out.penalties.iter()) {
+            joint.scaled_add(*lam, s);
+        }
+        // S · v_const must be zero (intercept in joint null space).
+        let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
+        let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let joint_scale = joint.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+        assert!(
+            s_v_norm < 1e-10 * joint_scale,
+            "constant direction must lie in joint null space: ||S v_const|| = {s_v_norm}, ||S|| = {joint_scale}"
+        );
+        // Joint null space must have *only* the constant — every other
+        // direction picks up positive penalty.
+        let (evals, _) = joint
+            .eigh(faer::Side::Lower)
+            .expect("symmetric joint penalty has real eigenvalues");
+        let max_eval = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let zero_threshold = 1e-10 * max_eval.max(1.0);
+        let zero_count = evals.iter().filter(|&&e| e <= zero_threshold).count();
+        assert_eq!(
+            zero_count, 1,
+            "joint penalty must have exactly one zero eigenvalue (the intercept); got {zero_count} below {zero_threshold}, eigenvalues = {evals:?}"
+        );
+    }
+
     #[test]
     fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
         // The pure-Duchon `operator_penalty_candidates_closed_form_pure`
