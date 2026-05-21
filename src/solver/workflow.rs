@@ -1,5 +1,6 @@
 use crate::custom_family::{
     BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family,
+    fit_custom_family_with_rho_prior,
 };
 use crate::estimate::{
     AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
@@ -973,6 +974,7 @@ fn fit_cause_specific_survival_transformation_custom(
     penalty_blocks: Vec<PenaltyBlock>,
     beta0_flat: Array1<f64>,
     derivative_floor: f64,
+    penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view());
     if cause_count <= 1 {
@@ -1076,14 +1078,17 @@ fn fit_cause_specific_survival_transformation_custom(
     }
 
     let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
-    let mut fit = fit_custom_family(
-        &family,
-        &block_specs,
-        &BlockwiseFitOptions {
-            compute_covariance: false,
-            ..Default::default()
-        },
-    )
+    let fit_options = BlockwiseFitOptions {
+        compute_covariance: false,
+        ..Default::default()
+    };
+    let rho_prior =
+        cause_specific_survival_rho_prior(penalty_blocks.len(), penalty_block_gamma_priors)?;
+    let mut fit = if matches!(rho_prior, crate::types::RhoPrior::Flat) {
+        fit_custom_family(&family, &block_specs, &fit_options)
+    } else {
+        fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
+    }
     .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
     fit.likelihood_family = Some(LikelihoodFamily::RoystonParmar);
     let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
@@ -1099,6 +1104,63 @@ fn fit_cause_specific_survival_transformation_custom(
         time_base_ncols: spec.time_build.x_exit_time.ncols(),
         baseline_timewiggle: prepared.timewiggle_block,
     })
+}
+
+fn cause_specific_survival_rho_prior(
+    penalty_count: usize,
+    penalty_block_gamma_priors: &[(String, f64, f64)],
+) -> Result<crate::types::RhoPrior, String> {
+    if penalty_block_gamma_priors.is_empty() {
+        return Ok(crate::types::RhoPrior::Flat);
+    }
+    let mut keyed = BTreeMap::<String, (f64, f64)>::new();
+    for (label, shape, rate) in penalty_block_gamma_priors {
+        if keyed.insert(label.clone(), (*shape, *rate)).is_some() {
+            return Err(format!(
+                "duplicate Gamma precision hyperprior for penalty block label '{label}'"
+            ));
+        }
+        if !shape.is_finite() || *shape <= 0.0 {
+            return Err(format!(
+                "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
+            ));
+        }
+        if !rate.is_finite() || *rate < 0.0 {
+            return Err(format!(
+                "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
+            ));
+        }
+    }
+    let mut consumed = Vec::<String>::new();
+    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(penalty_count);
+    for penalty_idx in 0..penalty_count {
+        let label = format!("cause_specific_survival_penalty_{penalty_idx}");
+        if let Some((shape, rate)) = keyed.get(&label) {
+            consumed.push(label);
+            priors.push(crate::types::RhoPrior::GammaPrecision {
+                shape: *shape,
+                rate: *rate,
+            });
+        } else {
+            priors.push(crate::types::RhoPrior::Flat);
+        }
+    }
+    let unknown = keyed
+        .keys()
+        .filter(|label| !consumed.iter().any(|known| known == *label))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        let available = (0..penalty_count)
+            .map(|idx| format!("cause_specific_survival_penalty_{idx}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
+            unknown.join(", ")
+        ));
+    }
+    Ok(crate::types::RhoPrior::Independent(priors))
 }
 
 fn hash_workflow_array_view(
@@ -1573,6 +1635,7 @@ fn fit_survival_transformation_model(
             penalty_blocks,
             beta0,
             exact_derivative_guard,
+            &config.penalty_block_gamma_priors,
         );
     }
     let opts = crate::pirls::WorkingModelPirlsOptions {

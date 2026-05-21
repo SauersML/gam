@@ -120,10 +120,7 @@ def competing_risks_cif(
         raise ValueError(
             "all endpoint predictions must return the same (n_rows, n_times) shape"
         ) from exc
-    try:
-        payload = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
-    except ValueError as exc:
-        raise map_exception(exc) from exc
+    payload = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
     return CompetingRisksCIF(
         times=np.asarray(payload["times"], dtype=float),
         cif=np.asarray(payload["cif"], dtype=float),
@@ -2315,7 +2312,9 @@ def _coverage_provenance_groups(
 
 
 __all__ = [
+    "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "Model",
     "SurvivalPrediction",
+    "competing_risks_cif",
 ]
