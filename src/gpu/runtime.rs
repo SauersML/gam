@@ -86,9 +86,9 @@ fn libcuda_loadable() -> bool {
 ///
 /// Only fall back to the bundled-wheel preload when cudarc's normal
 /// search fails outright (a host with no CUDA on the loader path at
-/// all). And in every case, a defensive scan of `/proc/self/maps`
-/// (`detect_cuda_library_conflicts`) refuses cuBLAS work if a SONAME
-/// family ended up with more than one mapped file anyway.
+/// all). And in every case, a diagnostic scan of `/proc/self/maps`
+/// (`detect_cuda_library_conflicts`) warns if a SONAME family ended up
+/// with more than one mapped file.
 pub fn libcublas_loadable() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -99,7 +99,8 @@ pub fn libcublas_loadable() -> bool {
         // visible to `detect_cuda_library_conflicts` is exactly the
         // one CudaBlas::new will use, not a transient probe.
         if unsafe { cudarc::cublas::sys::is_culib_present() } && force_init_culib_persistent() {
-            return verify_no_cuda_library_conflicts();
+            warn_cuda_library_conflicts();
+            return true;
         }
         // Fall back to the bundled-wheel preload only if the system
         // stack is genuinely unreachable.
@@ -107,7 +108,8 @@ pub fn libcublas_loadable() -> bool {
         if !force_init_culib_persistent() {
             return false;
         }
-        verify_no_cuda_library_conflicts()
+        warn_cuda_library_conflicts();
+        true
     })
 }
 
@@ -149,17 +151,14 @@ fn force_init_culib_persistent() -> bool {
 /// destroy mismatch it surfaces as a SIGABRT from glibc anyway —
 /// observable, not silenced.
 #[cfg(target_os = "linux")]
-fn verify_no_cuda_library_conflicts() -> bool {
-    if let Err(report) = detect_cuda_library_conflicts() {
+fn warn_cuda_library_conflicts() {
+    if let Some(report) = detect_cuda_library_conflicts() {
         log::warn!("[GPU] {report}");
     }
-    true
 }
 
 #[cfg(not(target_os = "linux"))]
-fn verify_no_cuda_library_conflicts() -> bool {
-    true
-}
+fn warn_cuda_library_conflicts() {}
 
 /// Return the canonical CUDA library family for a file basename, or
 /// `None` if the basename isn't a CUDA library we care about.
@@ -184,19 +183,16 @@ fn cuda_library_family(basename: &str) -> Option<&'static str> {
     }
 }
 
-/// Detect whether more than one distinct file is mapped into the
-/// process for the same CUDA SONAME family.
-///
-/// On `Ok(())`, mappings are consistent. On `Err`, the string is a
-/// multi-line, actionable report naming every conflicting path —
-/// suitable for passing straight to `log::error!`.
+/// Detect whether more than one distinct file is mapped into the process
+/// for the same CUDA SONAME family. Returns a multi-line, actionable report
+/// naming every conflicting path.
 #[cfg(target_os = "linux")]
-fn detect_cuda_library_conflicts() -> Result<(), String> {
+fn detect_cuda_library_conflicts() -> Option<String> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let maps = match std::fs::read_to_string("/proc/self/maps") {
         Ok(content) => content,
-        Err(_) => return Ok(()),
+        Err(_) => return None,
     };
     let mut by_family: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for line in maps.lines() {
@@ -223,7 +219,7 @@ fn detect_cuda_library_conflicts() -> Result<(), String> {
         .map(|(f, p)| (f, p.into_iter().collect()))
         .collect();
     if conflicts.is_empty() {
-        return Ok(());
+        return None;
     }
     let mut msg = String::from(
         "CUDA library duplicate mapping: more than one distinct file \
@@ -244,7 +240,7 @@ fn detect_cuda_library_conflicts() -> Result<(), String> {
          reachable to the loader: either the system toolkit (usually \
          /usr/local/cuda*) or the pip nvidia-*-cu12 wheels, not both.",
     );
-    Err(msg)
+    Some(msg)
 }
 
 #[cfg(target_os = "linux")]
@@ -939,6 +935,41 @@ struct GpuDeviceDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_no_cuda_library_conflicts_returns_true_even_when_detector_reports() {
+        // Whether the running host has duplicate mappings or not, the
+        // verifier must return true: cudarc's culib() is a process-wide
+        // OnceLock<Library>, so handle / destroy routing through that
+        // single Library handle cannot flip libraries between calls.
+        // Disabling CUDA on a duplicate-mapping report was a false
+        // positive that forced unnecessary CPU fallback on dual-stack
+        // Colab / AoU images.
+        assert!(verify_no_cuda_library_conflicts());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cuda_library_family_matches_versioned_and_unversioned_names() {
+        // The detector's accuracy depends on canonicalizing
+        // libcublas.so.12, libcublas.so.12.8.4.1, and libcublas.so to
+        // the same family — otherwise duplicates would be missed.
+        assert_eq!(cuda_library_family("libcublas.so.12"), Some("libcublas"));
+        assert_eq!(
+            cuda_library_family("libcublas.so.12.8.4.1"),
+            Some("libcublas")
+        );
+        assert_eq!(cuda_library_family("libcublas.so"), Some("libcublas"));
+        // libcublasLt is a distinct family despite the prefix.
+        assert_eq!(
+            cuda_library_family("libcublasLt.so.12"),
+            Some("libcublasLt")
+        );
+        // Unrelated libraries do not produce a family match.
+        assert_eq!(cuda_library_family("libfoo.so"), None);
+        assert_eq!(cuda_library_family("libc.so.6"), None);
+    }
 
     #[test]
     fn global_probe_is_idempotent_and_safe_without_driver() {
