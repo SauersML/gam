@@ -28021,6 +28021,8 @@ mod tests {
     /// the property the centered-mass design exists to deliver.
     #[test]
     fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
+        // d=3 — the legacy 5-point cube-corner fixture. Linear null space
+        // with power=1 satisfies both 2(p+s) > d and 2s < d.
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -28038,63 +28040,94 @@ mod tests {
             operator_penalties: DuchonOperatorPenaltySpec::default(),
             periodic: false,
         };
-        let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        let design = out.design.to_dense();
-        let (n, p) = design.dim();
-        assert!(n >= p, "need n ≥ p to recover v_const via least squares");
-        let ones = Array1::<f64>::ones(n);
-        // Solve (Xᵀ X) v = Xᵀ 1 for the basis-coord vector of the
-        // constant function. Use a tiny ridge so the case where the basis
-        // exactly contains a column of ones still yields a well-defined v;
-        // the constant-function-recovery test below catches any solver
-        // misbehaviour anyway.
-        let xtx = crate::faer_ndarray::fast_atb(&design, &design);
-        let xt_ones = crate::faer_ndarray::fast_atv(&design, &ones);
-        let mut xtx_reg = xtx.clone();
-        for i in 0..p {
-            xtx_reg[[i, i]] += 1e-14 * (xtx[[i, i]].abs().max(1.0));
-        }
-        use crate::faer_ndarray::FaerCholesky;
-        let chol = xtx_reg
-            .cholesky(faer::Side::Lower)
-            .expect("XᵀX SPD with ridge");
-        let v_const = chol.solvevec(&xt_ones);
-        // Sanity: design · v_const ≈ 1 across all rows.
-        let recon = crate::faer_ndarray::fast_av(&design, &v_const);
-        let err = (&recon - &ones)
-            .iter()
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            err < 1e-8,
-            "v_const must reproduce the constant function: max |Xv − 1| = {err}"
-        );
-        // Joint penalty with equal weights — any positive choice works.
-        let lambdas = [1.0_f64, 1.0_f64, 1.0_f64];
-        let mut joint = Array2::<f64>::zeros((p, p));
-        for (lam, s) in lambdas.iter().zip(out.penalties.iter()) {
-            joint.scaled_add(*lam, s);
-        }
-        // S · v_const must be zero (intercept in joint null space).
-        let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
-        let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let joint_scale = joint.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
-        assert!(
-            s_v_norm < 1e-10 * joint_scale,
-            "constant direction must lie in joint null space: ||S v_const|| = {s_v_norm}, ||S|| = {joint_scale}"
-        );
-        // Joint null space must have *only* the constant — every other
-        // direction picks up positive penalty.
-        let (evals, _) = joint
-            .eigh(faer::Side::Lower)
-            .expect("symmetric joint penalty has real eigenvalues");
-        let max_eval = evals.iter().cloned().fold(0.0_f64, f64::max);
-        let zero_threshold = 1e-10 * max_eval.max(1.0);
-        let zero_count = evals.iter().filter(|&&e| e <= zero_threshold).count();
-        assert_eq!(
-            zero_count, 1,
-            "joint penalty must have exactly one zero eigenvalue (the intercept); got {zero_count} below {zero_threshold}, eigenvalues = {evals:?}"
-        );
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
+    /// d=1: Linear null space (constant + linear) with power=0 satisfies
+    /// 2(1+0) > 1 (RKHS) and 2·0 < 1 (CPD). Joint null must still be the
+    /// constant only — the linear direction picks up the centered-mass
+    /// gauge.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_1d() {
+        let data = array![[0.0], [0.5], [1.0], [1.5], [2.0], [2.5], [3.0], [3.5]];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+            length_scale: None,
+            power: 0,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
+    /// d=2: Degree-2 null space (constants + 2 linears + 3 quadratics)
+    /// with power=0 satisfies 2(2+0) > 2 and 2·0 < 2. Joint null must
+    /// remain the constant alone — linear and quadratic directions are
+    /// penalized by the centered mass + tension/stiffness.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+            [0.5, 0.0],
+            [0.0, 0.5],
+            [1.0, 0.5]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: None,
+            power: 0,
+            nullspace_order: DuchonNullspaceOrder::Degree(2),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
+    /// d=4: Degree-2 null space with power=1 satisfies 2(2+1) > 4 and
+    /// 2·1 < 4. Higher-d sanity check that the construction's joint-null
+    /// property holds beyond the legacy d=3 fixture.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d() {
+        let data = array![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 0.0],
+            [0.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.5, 0.5, 0.5, 0.5],
+            [0.25, 0.5, 0.75, 0.5],
+            [0.75, 0.25, 0.5, 0.5],
+            [0.5, 0.75, 0.25, 0.5]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+            length_scale: None,
+            power: 1,
+            nullspace_order: DuchonNullspaceOrder::Degree(2),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
     #[test]
