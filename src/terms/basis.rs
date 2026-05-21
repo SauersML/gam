@@ -9761,7 +9761,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         let aniso_for_helper = Some(aniso_log_scales);
         let kernel_z = Some(&z_kernel);
         let substitute = |q: usize, info: &mut PerOperatorInfo| -> Option<Vec<Vec<Array2<f64>>>> {
-            if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order, d) {
+            if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order as f64, d) {
                 return None;
             }
             let (cf_s, cf_first, cf_second_diag, cf_cross) =
@@ -10838,12 +10838,15 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
 fn duchon_closed_form_operator_penalty_converges(
     q: usize,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     dimension: usize,
 ) -> bool {
-    let four_ms = 4 * (p_order + s_order);
-    let dp2q = dimension + 2 * q;
-    let four_m = 4 * p_order;
+    // Real-valued conditions so fractional `s_order` falls inside the
+    // convergent regime when admissible. Integer values reduce to the
+    // original strict inequalities exactly.
+    let four_ms = 4.0 * (p_order as f64 + s_order);
+    let dp2q = (dimension + 2 * q) as f64;
+    let four_m = (4 * p_order) as f64;
     four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1
 }
 
@@ -10886,7 +10889,7 @@ pub fn operator_penalty_candidates_closed_form(
     // (Cholesky on the small materialized H is faster).
     let emit_operator = centers.nrows() > CLOSED_FORM_OPERATOR_THRESHOLD;
 
-    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order, d) {
+    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
         closed_form_operator_penalty_in_total_basis(
             centers,
             1,
@@ -10902,7 +10905,7 @@ pub fn operator_penalty_candidates_closed_form(
         symmetrize(&fast_ata(d1))
     };
     let (s1, c1) = normalize_penalty(&s1_raw);
-    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order, d) {
+    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d) {
         closed_form_operator_penalty_in_total_basis(
             centers,
             2,
@@ -10925,7 +10928,7 @@ pub fn operator_penalty_candidates_closed_form(
         if !emit_operator {
             return None;
         }
-        if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order, d) {
+        if !duchon_closed_form_operator_penalty_converges(q, p_order, s_order as f64, d) {
             return None;
         }
         let raw_op = std::sync::Arc::new(
@@ -11094,7 +11097,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
     // partial-fraction precondition `2m ≥ q + 1`; without it, closed-form
     // panics on configs like m=1, q=2. Even-dimensional log-Riesz branches are
     // admitted because `riesz_kernel_value` now uses the canonical finite part.
-    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order, d) {
+    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
         closed_form_operator_penalty_in_total_basis_pure(
             centers,
             1,
@@ -11110,7 +11113,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
     };
     let (s1, c1) = normalize_penalty(&s1_raw);
 
-    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order, d) {
+    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d) {
         closed_form_operator_penalty_in_total_basis_pure(
             centers,
             2,
@@ -15749,7 +15752,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     // the closed-form block because they are the unpenalized Duchon nullspace.
     let kappa = 1.0 / length_scale.max(1e-300);
     let aniso = spec.aniso_log_scales.as_deref();
-    if duchon_closed_form_operator_penalty_converges(1, p_order, s_order, d) {
+    if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
         let (cf_s, cf_s_psi, cf_s_psi_psi) = closed_form_psi_derivatives_in_total_basis(
             centers,
             1,
@@ -15765,7 +15768,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
         s1_psi = cf_s_psi;
         s1_psi_psi = cf_s_psi_psi;
     }
-    if duchon_closed_form_operator_penalty_converges(2, p_order, s_order, d) {
+    if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d) {
         let (cf_s, cf_s_psi, cf_s_psi_psi) = closed_form_psi_derivatives_in_total_basis(
             centers,
             2,
