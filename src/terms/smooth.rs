@@ -3673,7 +3673,7 @@ fn build_shape_constraint_design_1d(
             let evalspec = DuchonBasisSpec {
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
-                power: *power,
+                power: *power as f64,
                 nullspace_order: *nullspace_order,
                 identifiability: identifiability_transform
                     .as_ref()
@@ -13668,7 +13668,7 @@ pub fn freeze_term_collection_from_design(
                             centers.clone(),
                         ),
                         length_scale: *length_scale,
-                        power: *power,
+                        power: *power as f64,
                         nullspace_order: *nullspace_order,
                         identifiability,
                         aniso_log_scales: meta_aniso.clone(),

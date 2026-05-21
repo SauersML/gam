@@ -2805,6 +2805,23 @@ pub struct DuchonBasisSpec {
     pub periodic: bool,
 }
 
+impl DuchonBasisSpec {
+    /// Cast the f64 [`Self::power`] back to `usize` for the integer-only
+    /// downstream chain. Panics with a clear message if the value isn't
+    /// whole — fractional `s` is the Tier 1 #1 refactor target and isn't
+    /// supported end-to-end yet. Use this at every site that previously
+    /// read `spec.power` as a `usize`; future fractional support replaces
+    /// the call sites with a paired f64 path.
+    pub fn power_as_usize(&self) -> usize {
+        let p = self.power;
+        assert!(
+            p.is_finite() && p >= 0.0 && p.fract() == 0.0,
+            "DuchonBasisSpec.power = {p}: fractional / non-integer values are not yet supported by the integer-only downstream chain; pass an integer value (e.g. `1.0`, `2.0`)"
+        );
+        p as usize
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DuchonOperatorPenaltySpec {
     pub mass: OperatorPenaltySpec,
@@ -7535,7 +7552,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let duchon_spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: Some(spec.length_scale),
-            power: s,
+            power: s as f64,
             nullspace_order,
             identifiability: spec.identifiability.clone(),
             aniso_log_scales: None,
@@ -15454,7 +15471,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     })?;
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
@@ -15821,7 +15838,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
         data,
         centers.view(),
         spec.length_scale,
-        spec.power,
+        spec.power_as_usize(),
         spec.nullspace_order,
         spec.aniso_log_scales.as_deref(),
         workspace,
@@ -15937,7 +15954,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     validate_duchon_kernel_orders(Some(length_scale), p_order, s_order, 1)?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
@@ -16583,7 +16600,7 @@ fn build_duchon_design_psi_aniso_derivatives(
 
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale.max(1e-300);
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
 
@@ -16752,7 +16769,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         .map(|transform| transform.ncols())
         .unwrap_or(p_padded);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     validate_duchon_collocation_orders(
         None,
         p_order,
@@ -16789,7 +16806,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
     let (per_axis, cross_terms, cross_provider) = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
         None,
-        spec.power,
+        spec.power_as_usize(),
         effective_nullspace_order,
         raw_eta,
         identifiability_transform.as_ref(),
@@ -16851,7 +16868,7 @@ pub fn build_duchon_basis_log_kappa_aniso_derivatives(
     let (per_axis, cross_pairs, cross_provider) = build_duchon_operator_penalty_aniso_derivatives(
         centers.view(),
         Some(length_scale),
-        spec.power,
+        spec.power_as_usize(),
         effective_nullspace_order,
         eta,
         identifiability_transform.as_ref(),
@@ -18041,7 +18058,7 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     // 4. apply any frozen identifiability transform
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
@@ -18927,7 +18944,7 @@ fn build_periodic_duchon_basis_1d(
     let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    let s_order = spec.power;
+    let s_order = spec.power_as_usize();
     validate_duchon_kernel_orders(spec.length_scale, p_order, s_order, 1)?;
     let z = kernel_constraint_nullspace(
         centers.view(),
@@ -19100,7 +19117,7 @@ fn build_periodic_duchon_basis_1d(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
-            power: spec.power,
+            power: spec.power_as_usize(),
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
@@ -19136,7 +19153,7 @@ pub fn build_duchon_basiswithworkspace(
     validate_duchon_collocation_orders(
         spec.length_scale,
         p_order,
-        spec.power,
+        spec.power_as_usize(),
         data.ncols(),
         max_active_operator_order,
     )?;
@@ -19160,7 +19177,7 @@ pub fn build_duchon_basiswithworkspace(
         let d = data.ncols();
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-        let s_order = spec.power;
+        let s_order = spec.power_as_usize();
         let length_scale = spec.length_scale;
         let coeffs = length_scale
             .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
@@ -19265,7 +19282,7 @@ pub fn build_duchon_basiswithworkspace(
             data,
             centers.view(),
             spec.length_scale,
-            spec.power,
+            spec.power_as_usize(),
             effective_nullspace_order,
             aniso.as_deref(),
             workspace,
@@ -19288,7 +19305,7 @@ pub fn build_duchon_basiswithworkspace(
         centers.view(),
         None,
         spec.length_scale,
-        spec.power,
+        spec.power_as_usize(),
         effective_nullspace_order,
         aniso.as_deref(),
         identifiability_transform.as_ref().map(|z| z.view()),
@@ -19330,7 +19347,7 @@ pub fn build_duchon_basiswithworkspace(
             &ops.d2,
             &spec.operator_penalties,
             p_order,
-            spec.power,
+            spec.power_as_usize(),
             length_scale,
             aniso.as_deref(),
             Some(&kernel_transform),
@@ -19357,7 +19374,7 @@ pub fn build_duchon_basiswithworkspace(
             &ops.d2,
             &spec.operator_penalties,
             p_order,
-            spec.power,
+            spec.power_as_usize(),
             aniso.as_deref(),
             Some(&kernel_transform),
             poly_cols,
@@ -19391,7 +19408,7 @@ pub fn build_duchon_basiswithworkspace(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
-            power: spec.power,
+            power: spec.power_as_usize(),
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
