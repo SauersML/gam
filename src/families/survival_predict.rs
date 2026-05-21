@@ -81,6 +81,25 @@ pub struct SurvivalPredictResult {
     pub eta_se: Option<Array1<f64>>,
 }
 
+/// Joint cause-specific competing-risks prediction result.
+pub struct CompetingRisksPredictResult {
+    pub times: Vec<f64>,
+    pub endpoint_names: Vec<String>,
+    /// Cause-specific instantaneous hazards, shaped endpoint x row x time.
+    pub hazard: Vec<Array2<f64>>,
+    /// Endpoint-specific survival surfaces exp(-H_k(t)), endpoint x row x time.
+    pub survival: Vec<Array2<f64>>,
+    /// Cause-specific cumulative hazards, endpoint x row x time.
+    pub cumulative_hazard: Vec<Array2<f64>>,
+    /// Aalen-Johansen cumulative incidence, endpoint x row x time.
+    pub cif: Vec<Array2<f64>>,
+    /// Overall survival exp(-sum_k H_k(t)), row x time.
+    pub overall_survival: Array2<f64>,
+    /// Per-endpoint linear predictor at each row's own exit time, endpoint x row.
+    pub linear_predictor: Vec<Array1<f64>>,
+    pub likelihood_mode: SurvivalLikelihoodMode,
+}
+
 /// Run the survival prediction pipeline.
 ///
 /// Pure library function: no progress bars, no file I/O, no uncertainty
@@ -754,14 +773,31 @@ fn evaluate_rp_row(
 ) -> Result<(f64, f64, f64), String> {
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     let saved_runtime = model.saved_prediction_runtime()?;
-    let saved_timewiggle = saved_runtime.baseline_time_wiggle.clone();
+    evaluate_rp_row_with_beta(
+        &fit_saved.beta,
+        saved_runtime.baseline_time_wiggle.as_ref(),
+        row_time,
+        cov_row,
+        eta_time_offset_row,
+        derivative_time_offset_row,
+        primary_offset_row,
+    )
+}
+
+fn evaluate_rp_row_with_beta(
+    beta: &Array1<f64>,
+    saved_timewiggle: Option<&SavedBaselineTimeWiggleRuntime>,
+    row_time: &SurvivalTimeBuildOutput,
+    cov_row: &Array1<f64>,
+    eta_time_offset_row: f64,
+    derivative_time_offset_row: f64,
+    primary_offset_row: f64,
+) -> Result<(f64, f64, f64), String> {
     let p_time = row_time.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle
-        .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
     let p = p_time + p_timewiggle + p_cov;
-    let beta = fit_saved.beta.clone();
     if beta.len() != p {
         return Err(format!(
             "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
@@ -781,7 +817,7 @@ fn evaluate_rp_row(
             .x_derivative_time
             .dot(&beta.slice(s![..p_time]).to_owned())[0];
     }
-    if let Some(runtime) = saved_timewiggle.as_ref() {
+    if let Some(runtime) = saved_timewiggle {
         let knots = Array1::from_vec(runtime.knots.clone());
         let beta_w = beta.slice(s![p_time..p_time + p_timewiggle]).to_owned();
         let eta_exit_row = Array1::from_elem(1, eta_time_offset_row);
