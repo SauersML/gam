@@ -2,14 +2,13 @@ use crossterm::execute;
 #[cfg(not(test))]
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
-use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::{LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -25,12 +24,8 @@ const MAX_DIAGNOSTIC_LINES: usize = 10;
 const LOG_TAIL_CAP: usize = 200;
 
 static LOGGER: ProgressLogger = ProgressLogger;
-static ACTIVE_MULTIPROGRESS: OnceLock<Mutex<Option<MultiProgress>>> = OnceLock::new();
 static LOG_START: OnceLock<Instant> = OnceLock::new();
-
-fn active_multiprogress() -> &'static Mutex<Option<MultiProgress>> {
-    ACTIVE_MULTIPROGRESS.get_or_init(|| Mutex::new(None))
-}
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 struct ProgressLogger;
 
@@ -43,7 +38,7 @@ impl Log for ProgressLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let line = format_log_record(record);
+        let lines = format_log_record(record);
         // Mirror into the active visualizer's log_tail so the chart's
         // Diagnostics panel streams live records, and so the panic hook
         // can replay them after a crash. Best-effort: if the feed is
@@ -51,20 +46,42 @@ impl Log for ProgressLogger {
         // — the canonical log destination is stderr.
         if let Some(feed) = current_active_feed() {
             let mut model = lock_model(&feed.model);
-            model.log_tail.push_back(line.clone());
-            while model.log_tail.len() > LOG_TAIL_CAP {
-                model.log_tail.pop_front();
+            for line in &lines {
+                model.log_tail.push_back(line.clone());
+                while model.log_tail.len() > LOG_TAIL_CAP {
+                    model.log_tail.pop_front();
+                }
             }
         }
-        writeln!(io::stderr(), "{line}").ok();
+        let _guard = LOG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stderr = io::stderr().lock();
+        for line in lines {
+            writeln!(stderr, "{line}").ok();
+        }
     }
 
     fn flush(&self) {}
 }
 
-fn format_log_record(record: &Record<'_>) -> String {
+fn format_log_record(record: &Record<'_>) -> Vec<String> {
     let elapsed = LOG_START.get_or_init(Instant::now).elapsed();
-    format!("[{}] {}", human_elapsed(elapsed), record.args())
+    let prefix = format!("[{}]", human_elapsed(elapsed));
+    sanitize_log_message(&record.args().to_string())
+        .lines()
+        .map(|line| format!("{prefix} {line}"))
+        .collect()
+}
+
+fn sanitize_log_message(message: &str) -> String {
+    message
+        .chars()
+        .filter_map(|ch| match ch {
+            '\r' => Some('\n'),
+            '\n' | '\t' => Some(ch),
+            ch if ch.is_control() => None,
+            ch => Some(ch),
+        })
+        .collect()
 }
 
 fn human_elapsed(elapsed: Duration) -> String {
@@ -93,12 +110,6 @@ pub fn init_logging() {
     // makes the runtime's "are GPUs being used?" answer visible at the
     // top of the log.
     crate::gpu::warm();
-}
-
-fn install_multiprogress(mp: Option<MultiProgress>) {
-    if let Ok(mut guard) = active_multiprogress().lock() {
-        *guard = mp;
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -431,11 +442,7 @@ fn install_panic_hook() {
 }
 
 struct DumbVisualizer {
-    multi: Option<MultiProgress>,
-    primary_bar: ProgressBar,
-    secondary_bar: ProgressBar,
     last_draw: Instant,
-    text_only: bool,
     last_lines: Vec<String>,
 }
 
@@ -837,49 +844,20 @@ enum StatusClass {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LaneTone {
-    Primary,
-    Secondary,
-}
-
 impl DumbVisualizer {
-    fn new(text_only: bool) -> Self {
-        let (multi, primary_bar, secondary_bar) = if text_only {
-            (None, ProgressBar::hidden(), ProgressBar::hidden())
-        } else {
-            let multi = MultiProgress::with_draw_target(ProgressDrawTarget::stderr());
-            let primary_bar = multi.add(ProgressBar::hidden());
-            let secondary_bar = multi.add(ProgressBar::hidden());
-            primary_bar.set_style(primary_style());
-            secondary_bar.set_style(secondary_style());
-            install_multiprogress(Some(multi.clone()));
-            (Some(multi), primary_bar, secondary_bar)
-        };
+    fn new() -> Self {
         Self {
-            multi,
-            primary_bar,
-            secondary_bar,
             last_draw: Instant::now() - DUMB_DRAW_INTERVAL,
-            text_only,
             last_lines: Vec::new(),
         }
     }
 
     fn maybe_draw(&mut self, model: &VisualizerModel, force: bool) {
-        if !self.text_only {
-            self.sync_bars(model);
-        }
         if !force && self.last_draw.elapsed() < DUMB_DRAW_INTERVAL {
             return;
         }
         self.draw(model, force);
         self.last_draw = Instant::now();
-    }
-
-    fn sync_bars(&self, model: &VisualizerModel) {
-        sync_bar(&self.primary_bar, &model.primary_lane, &model);
-        sync_bar(&self.secondary_bar, &model.secondary_lane, &model);
     }
 
     fn draw(&mut self, model: &VisualizerModel, force: bool) {
@@ -893,71 +871,6 @@ impl DumbVisualizer {
 
     fn teardown(&mut self, model: &VisualizerModel) {
         self.maybe_draw(model, true);
-        if let Some(multi) = &self.multi {
-            multi.clear().ok();
-        }
-        install_multiprogress(None);
-    }
-}
-
-fn primary_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.cyan} [{elapsed_precise}] ▕{bar:40.cyan/blue}▏ {percent:>3}% | ETA: {eta_precise} | {msg}",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("█▉▊▋▌▍▎▏ ")
-}
-
-fn secondary_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.magenta} [{elapsed_precise}] ▕{bar:40.magenta/blue}▏ {percent:>3}% | ETA: {eta_precise} | {msg}",
-    )
-    .unwrap_or_else(|_| ProgressStyle::default_bar())
-    .progress_chars("█▉▊▋▌▍▎▏ ")
-}
-
-fn sync_bar(bar: &ProgressBar, lane: &LaneState, model: &VisualizerModel) {
-    if lane.label.is_empty() {
-        bar.set_draw_target(ProgressDrawTarget::hidden());
-        return;
-    }
-    bar.set_draw_target(ProgressDrawTarget::stderr());
-    match lane.total {
-        Some(total) if total > 0 => {
-            bar.set_length(total as u64);
-            bar.set_position(lane.current.min(total) as u64);
-        }
-        _ => {
-            bar.enable_steady_tick(Duration::from_millis(120));
-        }
-    }
-    let mut msg = format!(
-        "{} | LAML: {} | |grad|: {} | Ridge: {}",
-        lane.label,
-        format_metric(model.current_cost, "{:.4}"),
-        format_metric(model.current_grad, "{:.3e}"),
-        model
-            .diagnostics_ridge
-            .map(|v| format!("{v:.1e}"))
-            .unwrap_or_else(|| "n/a".to_string()),
-    );
-    if lane.done {
-        msg.push_str(" | converged");
-    }
-    bar.set_style(style_for_lane(
-        classify_lane_status(lane, classify_model_status(model)),
-        if lane.label.contains("Warmup")
-            || lane.label.contains("Sample")
-            || lane.label.contains("Inner")
-        {
-            LaneTone::Secondary
-        } else {
-            LaneTone::Primary
-        },
-    ));
-    bar.set_message(msg);
-    if lane.done {
-        bar.finish_and_clear();
     }
 }
 
@@ -1005,14 +918,13 @@ impl VisualizerSession {
         // canonical run file harder to read than plain records. Keep an
         // active feed so solver internals can still publish progress samples,
         // but route the session to a silent dumb renderer.
-        let _ = should_use_text_only_progress();
         let state_inner = if live_visualization_enabled() {
             match InteractiveVisualizer::new() {
                 Ok(v) => VisualizerState::Interactive(v),
-                Err(_) => VisualizerState::Dumb(DumbVisualizer::new(true)),
+                Err(_) => VisualizerState::Dumb(DumbVisualizer::new()),
             }
         } else {
-            VisualizerState::Dumb(DumbVisualizer::new(true))
+            VisualizerState::Dumb(DumbVisualizer::new())
         };
         let session = Self {
             state: Arc::new(Mutex::new(state_inner)),
@@ -1331,38 +1243,6 @@ fn status_label(class: StatusClass) -> &'static str {
     }
 }
 
-fn style_for_lane(class: StatusClass, tone: LaneTone) -> ProgressStyle {
-    let template = match (tone, class) {
-        (LaneTone::Primary, StatusClass::Running) => {
-            "{spinner:.cyan} [{elapsed_precise}] ▕{bar:40.cyan/blue}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Primary, StatusClass::Success) => {
-            "{spinner:.green} [{elapsed_precise}] ▕{bar:40.green/blue}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Primary, StatusClass::Warning) => {
-            "{spinner:.yellow} [{elapsed_precise}] ▕{bar:40.yellow/red}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Primary, StatusClass::Error) => {
-            "{spinner:.red} [{elapsed_precise}] ▕{bar:40.red/yellow}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Secondary, StatusClass::Running) => {
-            "{spinner:.magenta} [{elapsed_precise}] ▕{bar:40.magenta/blue}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Secondary, StatusClass::Success) => {
-            "{spinner:.green} [{elapsed_precise}] ▕{bar:40.green/magenta}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Secondary, StatusClass::Warning) => {
-            "{spinner:.yellow} [{elapsed_precise}] ▕{bar:40.yellow/magenta}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-        (LaneTone::Secondary, StatusClass::Error) => {
-            "{spinner:.red} [{elapsed_precise}] ▕{bar:40.red/magenta}▏ {percent:>3}% | ETA: {eta_precise} | {msg}"
-        }
-    };
-    ProgressStyle::with_template(template)
-        .unwrap_or_else(|_| ProgressStyle::default_bar())
-        .progress_chars("█▉▊▋▌▍▎▏ ")
-}
-
 fn summary_panel_lines(
     stage: &str,
     detail: &str,
@@ -1663,10 +1543,6 @@ fn normalize_total(total: usize) -> usize {
     total.max(1)
 }
 
-fn should_use_text_only_progress() -> bool {
-    !io::stdout().is_terminal() || !io::stderr().is_terminal()
-}
-
 fn live_visualization_enabled() -> bool {
     false
 }
@@ -1722,6 +1598,12 @@ mod tests {
         let session = VisualizerSession::new(false);
         let lines = dumb_render_lines(&snapshot(&session));
         assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn log_sanitizer_splits_carriage_returns_and_drops_controls() {
+        let sanitized = sanitize_log_message("abc\rdef\u{1b}[2K\nghi\tjkl");
+        assert_eq!(sanitized, "abc\ndef[2K\nghi\tjkl");
     }
 
     #[test]

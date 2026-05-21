@@ -22931,7 +22931,7 @@ pub mod closed_form_penalty {
     pub fn anisotropic_duchon_penalty(
         q: usize,
         m: usize,
-        s: usize,
+        s: f64,
         kappa: f64,
         eta: &[f64],
         r: &[f64],
@@ -22943,7 +22943,7 @@ pub mod closed_form_penalty {
         );
         assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
         assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-        anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
+        anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta, r)
     }
 
     /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -23846,7 +23846,7 @@ pub mod closed_form_penalty {
         if let Some(common_eta) = uniform_eta_value(eta) {
             let euclidean_r2 = squared_norm(r);
             if let Some(value) =
-                uniform_metric_radial_duchon_penalty(q, m, s, kappa, d, common_eta, euclidean_r2)
+                uniform_metric_radial_duchon_penalty(q, m, (s) as f64, kappa, d, common_eta, euclidean_r2)
             {
                 return value;
             }
@@ -33126,7 +33126,7 @@ mod tests {
         for k in 0..6 {
             let t = (k as f64) * 0.2 - 0.5; // η_1 sweep ∈ [-0.5, 0.5]
             let eta = vec![t, 0.1, -0.2];
-            let v = anisotropic_duchon_penalty(1, 1, 1, 1.0, &eta, &r);
+            let v = anisotropic_duchon_penalty(1, 1, 1.0, 1.0, &eta, &r);
             assert!(v.is_finite(), "non-finite g_q at eta_1={t}");
             if let Some(p) = prev {
                 // Smoothness sanity: small step in η should produce a small change.
@@ -33817,7 +33817,7 @@ mod tests {
 
         let v_eta = |eta_use: &[f64]| -> f64 {
             eta_use.iter().sum::<f64>().exp()
-                * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
+                * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta_use, &r)
         };
         let h_eta = 2.0e-5_f64;
         for axis in 0..eta.len() {
@@ -33837,7 +33837,7 @@ mod tests {
         }
 
         let v_kappa =
-            |kk: f64| -> f64 { big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r) };
+            |kk: f64| -> f64 { big_j * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kk, &eta, &r) };
         let h_kappa = 1.0e-4 * kappa;
         let dk_fd = (v_kappa(kappa + h_kappa) - v_kappa(kappa - h_kappa)) / (2.0 * h_kappa);
         let denom = dk_fd.abs().max(bundle.d_kappa.abs()).max(1.0e-12);
@@ -33888,7 +33888,7 @@ mod tests {
                 let eta = vec![0.0_f64; d];
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let aniso = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
+                let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
                 let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
                 let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
                 assert!(
@@ -33912,7 +33912,7 @@ mod tests {
             let eta = vec![0.0_f64; d];
             let mut r = vec![0.0_f64; d];
             r[0] = big_r;
-            let aniso = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
+            let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
             let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
             let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
             assert!(
@@ -33983,7 +33983,7 @@ mod tests {
         let eta = vec![c, 0.0_f64, 0.0_f64];
         let r = vec![1.0_f64, 0.0_f64, 0.0_f64];
 
-        let aniso_bare = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
+        let aniso_bare = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
         let z_norm = (-c).exp();
         let iso_at_z = isotropic_duchon_penalty(q, d, m, s as f64, kappa, z_norm);
 
@@ -34054,8 +34054,8 @@ mod tests {
             ];
             for r in r_choices {
                 for eta in eta_choices {
-                    let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r);
-                    let wrapped = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, eta, r);
+                    let radial = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta, r);
+                    let wrapped = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, eta, r);
                     let rel =
                         (radial - wrapped).abs() / wrapped.abs().max(radial.abs()).max(1e-300);
                     assert!(
@@ -34100,7 +34100,7 @@ mod tests {
             for &big_r in &[0.4_f64, 1.0, 2.5] {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+                let radial = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r);
                 let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
                 let abs = (radial - expected).abs();
                 let scale = expected.abs().max(radial.abs()).max(1.0);
@@ -34189,10 +34189,10 @@ mod tests {
                 let kappa_new = kappa * (-mu).exp();
 
                 let j_raw = eta_raw.iter().sum::<f64>().exp();
-                let g_raw = j_raw * anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta_raw, &r);
+                let g_raw = j_raw * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta_raw, &r);
 
                 let j_c = eta_c.iter().sum::<f64>().exp();
-                let g_c = j_c * anisotropic_duchon_penalty_radial(q, m, s, kappa_new, &eta_c, &r);
+                let g_c = j_c * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa_new, &eta_c, &r);
 
                 let prefactor = (((2 * d) as f64 - (4 * m) as f64 - (4 * s) as f64) * mu).exp();
                 let predicted = prefactor * g_c;
@@ -34370,7 +34370,7 @@ mod tests {
                                 r_vec[0] = big_r;
 
                                 let radial =
-                                    anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_vec);
+                                    anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r_vec);
                                 let expected = isotropic_radial_laplacian_power_from_q0(
                                     q, d, m, s, kappa, big_r,
                                 );
@@ -34422,7 +34422,7 @@ mod tests {
                     kappa,
                     b.sqrt() * euclidean_r,
                 );
-            let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+            let radial = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r);
             let rel = (radial - expected).abs() / expected.abs().max(radial.abs()).max(1e-300);
             assert!(
                 rel < 1e-12,
@@ -34480,7 +34480,7 @@ mod tests {
                 let eta: Vec<f64> = (0..d).map(|_| (det_rand(&mut seed) - 0.5) * 0.6).collect();
                 let r: Vec<f64> = (0..d).map(|_| 0.4 + 1.0 * det_rand(&mut seed)).collect();
 
-                let h2_direct = anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
+                let h2_direct = anisotropic_duchon_penalty_radial(2, m, (s) as f64, kappa, &eta, &r);
 
                 let mut s1 = 0.0_f64;
                 let mut s2 = 0.0_f64;
@@ -34541,7 +34541,7 @@ mod tests {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
 
-                let g2 = anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
+                let g2 = anisotropic_duchon_penalty_radial(2, m, (s) as f64, kappa, &eta, &r);
 
                 let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, 4);
                 let r1 = big_r;
@@ -34581,8 +34581,8 @@ mod tests {
                 let r: Vec<f64> = (0..d).map(|_| 0.3 + 1.5 * det_rand(&mut seed)).collect();
                 let r_neg: Vec<f64> = r.iter().map(|&x| -x).collect();
 
-                let v_pos = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
-                let v_neg = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r_neg);
+                let v_pos = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r);
+                let v_neg = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r_neg);
                 let denom = v_pos.abs().max(1e-300);
                 let rel = (v_pos - v_neg).abs() / denom;
                 assert!(
@@ -34612,7 +34612,7 @@ mod tests {
             for &big_r in &[1e-1_f64, 1e-2, 1e-3, 1e-4, 1e-5] {
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let v = anisotropic_duchon_penalty_radial(q, m, s, kappa, &eta, &r);
+                let v = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, &eta, &r);
                 assert!(
                     v.is_finite(),
                     "pair-block diverged at small R: q={q} d={d} m={m} s={s} R={big_r}"
@@ -34696,7 +34696,7 @@ mod tests {
                 let bare_dk = kappa_first_derivative(q, m, s, kappa, &eta, &r);
                 assert!((big_j * bare_dk - bundle.d_kappa).abs() < 1e-12);
                 let v_at = |kk: f64| -> f64 {
-                    big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r)
+                    big_j * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kk, &eta, &r)
                 };
                 let h1 = 1e-3 * kappa;
                 let h2 = 0.5 * h1;
@@ -34736,7 +34736,7 @@ mod tests {
                 for l in 0..d {
                     let v_at = |eta_use: &[f64]| -> f64 {
                         eta_use.iter().sum::<f64>().exp()
-                            * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
+                            * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta_use, &r)
                     };
                     let h1 = 1e-3_f64;
                     let h2 = 0.5 * h1;
@@ -34792,7 +34792,7 @@ mod tests {
                 let bare_d2k = kappa_second_derivative(q, m, s, kappa, &eta, &r);
                 assert!((big_j * bare_d2k - bundle.d2_kappa).abs() < 1e-12);
                 let v_at = |kk: f64| -> f64 {
-                    big_j * anisotropic_duchon_penalty_radial(q, m, s, kk, &eta, &r)
+                    big_j * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kk, &eta, &r)
                 };
                 let v0 = v_at(kappa);
                 let h1 = 1e-3 * kappa;
@@ -34835,7 +34835,7 @@ mod tests {
                 let big_j = eta.iter().sum::<f64>().exp();
                 let v_at = |eta_use: &[f64]| -> f64 {
                     eta_use.iter().sum::<f64>().exp()
-                        * anisotropic_duchon_penalty_radial(q, m, s, kappa, eta_use, &r)
+                        * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta_use, &r)
                 };
                 let v0 = v_at(&eta);
                 let h = 1e-3_f64;
@@ -34925,7 +34925,7 @@ mod tests {
                 let big_j = eta.iter().sum::<f64>().exp();
                 let v_at = |eta_use: &[f64], kk: f64| -> f64 {
                     eta_use.iter().sum::<f64>().exp()
-                        * anisotropic_duchon_penalty_radial(q, m, s, kk, eta_use, &r)
+                        * anisotropic_duchon_penalty_radial(q, m, (s) as f64, kk, eta_use, &r)
                 };
                 let h_e = 1e-3_f64;
                 let h_k = 1e-3 * kappa;
