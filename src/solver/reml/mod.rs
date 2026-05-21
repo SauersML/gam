@@ -402,6 +402,51 @@ mod tests {
         assert!(policy.prefer_gradient_only());
     }
 
+    /// Common shape for the design-motion + penalty-motion REML test fixtures
+    /// (Gaussian-identity and binomial-logit at present): both carry the
+    /// same `(y, w, X, S0, cfg, ρ)` plus a perturbation pair, and need the
+    /// same three helpers (`state`, `state_perturbed`, `fd_directional_gradient`).
+    /// Per-fixture `new()` constructors fill the fields with family-specific
+    /// data; the helpers below are shared via default impls so every fixture
+    /// pays the boilerplate once.
+    trait LogitDesignMotionFixture {
+        fn y(&self) -> &Array1<f64>;
+        fn w(&self) -> &Array1<f64>;
+        fn x(&self) -> &Array2<f64>;
+        fn s0(&self) -> &Array2<f64>;
+        fn cfg(&self) -> &RemlConfig;
+        fn rho(&self) -> &Array1<f64>;
+
+        fn state(&self) -> RemlState<'_> {
+            build_logit_state(self.y(), self.w(), self.x(), self.s0(), self.cfg())
+        }
+
+        fn state_perturbed(
+            &self,
+            x_tau: &Array2<f64>,
+            s_tau: &Array2<f64>,
+            eps: f64,
+        ) -> (RemlState<'_>, RemlState<'_>) {
+            let x_plus = self.x() + &x_tau.mapv(|v| eps * v);
+            let x_minus = self.x() - &x_tau.mapv(|v| eps * v);
+            let s_plus = self.s0() + &s_tau.mapv(|v| eps * v);
+            let s_minus = self.s0() - &s_tau.mapv(|v| eps * v);
+            (
+                build_logit_state(self.y(), self.w(), &x_plus, &s_plus, self.cfg()),
+                build_logit_state(self.y(), self.w(), &x_minus, &s_minus, self.cfg()),
+            )
+        }
+
+        /// Central FD approximation to the directional cost derivative at ρ.
+        fn fd_directional_gradient(&self, x_tau: &Array2<f64>, s_tau: &Array2<f64>) -> f64 {
+            let h = 2e-5;
+            let (state_plus, state_minus) = self.state_perturbed(x_tau, s_tau, h);
+            let v_plus = state_plus.compute_cost(self.rho()).expect("cost+");
+            let v_minus = state_minus.compute_cost(self.rho()).expect("cost-");
+            (v_plus - v_minus) / (2.0 * h)
+        }
+    }
+
     fn build_logit_state<'a>(
         y: &'a Array1<f64>,
         w: &'a Array1<f64>,
@@ -473,8 +518,8 @@ mod tests {
             PirlsCoordinateFrame::OriginalSparseNative => bundle.h_total.as_ref().clone(),
             PirlsCoordinateFrame::TransformedQs => {
                 let qs = &pr.reparam_result.qs;
-                let tmp = qs.dot(bundle.h_total.as_ref());
-                tmp.dot(&qs.t())
+                let tmp = crate::faer_ndarray::fast_ab(qs, bundle.h_total.as_ref());
+                crate::faer_ndarray::fast_abt(&tmp, qs)
             }
         }
     }
@@ -773,16 +818,18 @@ mod tests {
 
         // B from implicit solve:
         //   H B = X_τ^T g - X^T W(X_τ β̂) - S_τ β̂.
-        let x_tau_beta = x_tau.dot(&beta);
+        let x_tau_beta = crate::faer_ndarray::fast_av(&x_tau, &beta);
         let weighted_x_tau_beta = &pr.finalweights * &x_tau_beta;
-        let rhs = x_tau.t().dot(&u) - x.t().dot(&weighted_x_tau_beta) - s_tau.dot(&beta);
+        let rhs = crate::faer_ndarray::fast_atv(&x_tau, &u)
+            - crate::faer_ndarray::fast_atv(&x, &weighted_x_tau_beta)
+            - s_tau.dot(&beta);
         let chol = h_orig.cholesky(Side::Lower).expect("chol(H)");
         let b_analytic = chol.solvevec(&rhs);
 
         // H_τ from exact total derivative:
         //   H_τ = X_τ^T W X + X^T W X_τ + X^T W_τ X + S_τ,
         // with W_τ provided by the family directional curvature callback.
-        let eta_dot = &x_tau_beta + &x.dot(&b_analytic);
+        let eta_dot = &x_tau_beta + &crate::faer_ndarray::fast_av(&x, &b_analytic);
         let w_direction = crate::pirls::directionalworking_curvature_from_c_array(
             &pr.solve_c_array,
             &pr.finalweights,
@@ -796,17 +843,17 @@ mod tests {
                 xwtau_x = RemlState::row_scale(&xwtau_x, &diag);
             }
         }
-        let mut h_tau_analytic = x_tau.t().dot(&wx);
-        h_tau_analytic += &x.t().dot(&wx_tau);
-        h_tau_analytic += &x.t().dot(&xwtau_x);
+        let mut h_tau_analytic = crate::faer_ndarray::fast_atb(&x_tau, &wx);
+        h_tau_analytic += &crate::faer_ndarray::fast_atb(&x, &wx_tau);
+        h_tau_analytic += &crate::faer_ndarray::fast_atb(&x, &xwtau_x);
         h_tau_analytic += &s_tau;
 
         // Fit-block stationarity cancellation:
         //   -ℓ_β^T B + β̂^T S B = 0.
         // Here S is the effective penalty in the inner Hessian surface:
         //   S = H - X^T W X.
-        let ell_beta = x.t().dot(&u);
-        let s_eff = &h_orig - &x.t().dot(&wx);
+        let ell_beta = crate::faer_ndarray::fast_atv(&x, &u);
+        let s_eff = &h_orig - &crate::faer_ndarray::fast_atb(&x, &wx);
         let cancellation = -ell_beta.dot(&b_analytic) + beta.dot(&s_eff.dot(&b_analytic));
 
         // Finite differences in τ against re-fit objective and mode.
@@ -1690,34 +1737,15 @@ mod tests {
             }
         }
 
-        fn state(&self) -> RemlState<'_> {
-            build_logit_state(&self.y, &self.w, &self.x, &self.s0, &self.cfg)
-        }
+    }
 
-        fn state_perturbed(
-            &self,
-            x_tau: &Array2<f64>,
-            s_tau: &Array2<f64>,
-            eps: f64,
-        ) -> (RemlState<'_>, RemlState<'_>) {
-            let x_plus = &self.x + &x_tau.mapv(|v| eps * v);
-            let x_minus = &self.x - &x_tau.mapv(|v| eps * v);
-            let s_plus = &self.s0 + &s_tau.mapv(|v| eps * v);
-            let s_minus = &self.s0 - &s_tau.mapv(|v| eps * v);
-            (
-                build_logit_state(&self.y, &self.w, &x_plus, &s_plus, &self.cfg),
-                build_logit_state(&self.y, &self.w, &x_minus, &s_minus, &self.cfg),
-            )
-        }
-
-        /// Central FD approximation to the directional cost derivative.
-        fn fd_directional_gradient(&self, x_tau: &Array2<f64>, s_tau: &Array2<f64>) -> f64 {
-            let h = 2e-5;
-            let (state_plus, state_minus) = self.state_perturbed(x_tau, s_tau, h);
-            let v_plus = state_plus.compute_cost(&self.rho).expect("cost+");
-            let v_minus = state_minus.compute_cost(&self.rho).expect("cost-");
-            (v_plus - v_minus) / (2.0 * h)
-        }
+    impl LogitDesignMotionFixture for GaussianRemlFixture {
+        fn y(&self) -> &Array1<f64> { &self.y }
+        fn w(&self) -> &Array1<f64> { &self.w }
+        fn x(&self) -> &Array2<f64> { &self.x }
+        fn s0(&self) -> &Array2<f64> { &self.s0 }
+        fn cfg(&self) -> &RemlConfig { &self.cfg }
+        fn rho(&self) -> &Array1<f64> { &self.rho }
     }
 
     #[test]
@@ -2164,34 +2192,15 @@ mod tests {
             }
         }
 
-        fn state(&self) -> RemlState<'_> {
-            build_logit_state(&self.y, &self.w, &self.x, &self.s0, &self.cfg)
-        }
+    }
 
-        fn state_perturbed(
-            &self,
-            x_tau: &Array2<f64>,
-            s_tau: &Array2<f64>,
-            eps: f64,
-        ) -> (RemlState<'_>, RemlState<'_>) {
-            let x_plus = &self.x + &x_tau.mapv(|v| eps * v);
-            let x_minus = &self.x - &x_tau.mapv(|v| eps * v);
-            let s_plus = &self.s0 + &s_tau.mapv(|v| eps * v);
-            let s_minus = &self.s0 - &s_tau.mapv(|v| eps * v);
-            (
-                build_logit_state(&self.y, &self.w, &x_plus, &s_plus, &self.cfg),
-                build_logit_state(&self.y, &self.w, &x_minus, &s_minus, &self.cfg),
-            )
-        }
-
-        /// Central FD approximation to the directional cost derivative.
-        fn fd_directional_gradient(&self, x_tau: &Array2<f64>, s_tau: &Array2<f64>) -> f64 {
-            let h = 2e-5;
-            let (state_plus, state_minus) = self.state_perturbed(x_tau, s_tau, h);
-            let v_plus = state_plus.compute_cost(&self.rho).expect("cost+");
-            let v_minus = state_minus.compute_cost(&self.rho).expect("cost-");
-            (v_plus - v_minus) / (2.0 * h)
-        }
+    impl LogitDesignMotionFixture for BinomialLogitDesignMotionFixture {
+        fn y(&self) -> &Array1<f64> { &self.y }
+        fn w(&self) -> &Array1<f64> { &self.w }
+        fn x(&self) -> &Array2<f64> { &self.x }
+        fn s0(&self) -> &Array2<f64> { &self.s0 }
+        fn cfg(&self) -> &RemlConfig { &self.cfg }
+        fn rho(&self) -> &Array1<f64> { &self.rho }
     }
 
     // ── n=30, p=5 binomial-logit design-motion gradient tests ────────
