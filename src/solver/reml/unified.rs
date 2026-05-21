@@ -6308,9 +6308,7 @@ pub fn reml_laml_evaluate(
         // component of `r` before the inverse is applied, recovering
         // the honest correction.
         let cost_correction = if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-            let proj_r = crate::faer_ndarray::fast_atv(&kernel.u_s, r);
-            let h_proj_inv_r = kernel.h_proj_inverse.dot(&proj_r);
-            -0.5_f64 * proj_r.dot(&h_proj_inv_r)
+            -0.5_f64 * penalty_subspace_bilinear_pseudo_inverse(kernel, r, r)
         } else {
             let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
             rhs.column_mut(0).assign(r);
@@ -6762,14 +6760,17 @@ pub fn reml_laml_evaluate(
             // the full-H solve at boundary states amplifies floating-point
             // noise in `r` outside `range(S_+)` by `1/σ_min(H)`, producing
             // spurious 10¹²-fold gradient inflation. Route through
-            // `PenaltySubspaceTrace::bilinear_pseudo_inverse` whenever the
+            // the projected pseudo-inverse whenever the
             // rank-deficient LAML fix is active — `λ_k S_k β̂ ∈ col(S_k) ⊂
             // range(S_+)` by construction, so the projection introduces
             // no bias in the numerator, only the well-conditioning the
             // problem actually has.
-            if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+            if let Some(kernel) = solution.penalty_subspace_trace.as_deref() {
+                let proj_r = crate::faer_ndarray::fast_atv(&kernel.u_s, r);
+                let h_proj_inv_r = kernel.h_proj_inverse.dot(&proj_r);
                 for (k_idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
-                    let corr = kernel.bilinear_pseudo_inverse(r, a_k_beta);
+                    let proj_ak = crate::faer_ndarray::fast_atv(&kernel.u_s, a_k_beta);
+                    let corr = h_proj_inv_r.dot(&proj_ak);
                     if corr.is_finite() {
                         grad[k_idx] -= corr;
                     }
