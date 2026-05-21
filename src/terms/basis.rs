@@ -28416,6 +28416,84 @@ mod tests {
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
+    /// Fractional `s = 0.5` in d=2 with Degree-2 nullspace. Hits the
+    /// `2s = 1 < d = 2` (CPD) and `2(p+s) = 5 > d+2 = 4` (D₂ collocation)
+    /// regimes simultaneously — integer `s` can't satisfy both at this
+    /// p/d. Sub-1 spectral power exercises a part of the Riesz kernel
+    /// (`r^(2(p+s)−d) = r¹`) that integer values skip over.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d_fractional_s() {
+        let data = array![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [0.75, 0.25],
+            [0.5, 0.0],
+            [0.0, 0.5],
+            [1.0, 0.5]
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: None,
+            power: 0.5,
+            nullspace_order: DuchonNullspaceOrder::Degree(2),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
+    /// Fractional `s = 3.5` in d=8, Degree-3 nullspace. The high-`d`
+    /// regime is exactly where fractional shines: integer s satisfying
+    /// `2(p+s) > d+2q = 12` and `2s < d = 8` jointly requires
+    /// `p+s > 6` and `s < 4`. With `p=3` (Degree-3), integer s must be 4
+    /// (which fails CPD `2·4 < 8`); only fractional s in `(3, 4)` works.
+    /// This test pins that the d=8 high-dimensional bench config the
+    /// fractional refactor was designed to unlock is actually reachable.
+    #[test]
+    fn test_scale_free_duchon_joint_null_space_is_only_the_constant_8d_fractional_s() {
+        let mut rows = Vec::new();
+        // Spread 64 points around the d=8 hypercube vertices and centroid.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..64 {
+            let mut row = [0.0_f64; 8];
+            for r in row.iter_mut() {
+                // simple SplitMix64 → uniform [0, 1]
+                state = state.wrapping_add(0x9E3779B97F4A7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+                z ^= z >> 31;
+                *r = (z >> 11) as f64 / (1_u64 << 53) as f64;
+            }
+            rows.push(row);
+        }
+        let n = rows.len();
+        let d = 8;
+        let mut data = Array2::<f64>::zeros((n, d));
+        for (i, row) in rows.iter().enumerate() {
+            for (j, &v) in row.iter().enumerate() {
+                data[[i, j]] = v;
+            }
+        }
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
+            length_scale: None,
+            power: 3.5,
+            nullspace_order: DuchonNullspaceOrder::Degree(3),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: false,
+        };
+        assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
+    }
+
     #[test]
     fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
         // The pure-Duchon `operator_penalty_candidates_closed_form_pure`
