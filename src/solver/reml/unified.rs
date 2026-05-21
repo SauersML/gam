@@ -2630,6 +2630,42 @@ fn penalty_subspace_trace_drifts_batched(
     trace_logdet_drifts_projected_factor_batched(drifts, &factor, &cache)
 }
 
+fn penalty_subspace_reduce_drifts_batched(
+    kernel: &PenaltySubspaceTrace,
+    drifts: &[DriftDerivResult],
+) -> Vec<Array2<f64>> {
+    let rank = kernel.u_s.ncols();
+    let mut reduced = (0..drifts.len())
+        .map(|_| Array2::<f64>::zeros((rank, rank)))
+        .collect::<Vec<_>>();
+    let mut terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+    for (idx, drift) in drifts.iter().enumerate() {
+        match drift {
+            DriftDerivResult::Dense(matrix) => {
+                reduced[idx] += &kernel.reduce(matrix);
+            }
+            DriftDerivResult::Operator(op) => {
+                collect_projected_matrix_terms(
+                    idx,
+                    1.0,
+                    op.as_ref(),
+                    &kernel.u_s,
+                    &mut reduced,
+                    &mut terms,
+                );
+            }
+        }
+    }
+    if !terms.is_empty() {
+        let cache = ProjectedFactorCache::default();
+        let batched = project_hyper_operators_batched(drifts.len(), &terms, &kernel.u_s, &cache);
+        for (dst, projected) in reduced.iter_mut().zip(batched.iter()) {
+            *dst += projected;
+        }
+    }
+    reduced
+}
+
 impl HyperOperator for CompositeHyperOperator {
     fn as_composite(&self) -> Option<&CompositeHyperOperator> {
         Some(self)
@@ -8187,18 +8223,13 @@ fn compute_outer_hessian(
     // pair; per-pair cost is then O(r²) instead of O(p²) per cross.
     let subspace = solution.penalty_subspace_trace.as_deref();
     let reduced_h_drifts: Option<Vec<Array2<f64>>> = subspace.map(|kernel| {
-        let mut reduced = Vec::with_capacity(k + ext_dim);
-        for matrix in &h_k_matrices {
-            reduced.push(kernel.reduce(matrix));
-        }
-        for drift in &ext_h_drifts {
-            let reduced_drift = match drift {
-                DriftDerivResult::Dense(matrix) => kernel.reduce(matrix),
-                DriftDerivResult::Operator(operator) => kernel.reduce_operator(operator.as_ref()),
-            };
-            reduced.push(reduced_drift);
-        }
-        reduced
+        let mut drifts = h_k_matrices
+            .iter()
+            .cloned()
+            .map(DriftDerivResult::Dense)
+            .collect::<Vec<_>>();
+        drifts.extend(ext_h_drifts.iter().cloned());
+        penalty_subspace_reduce_drifts_batched(kernel, &drifts)
     });
     let exact_logdet_cross_traces = if incl_logdet_h && stochastic_cross_traces.is_none() {
         if let (Some(kernel), Some(reduced)) = (subspace, reduced_h_drifts.as_ref()) {
@@ -9703,22 +9734,36 @@ fn build_outer_hessian_operator(
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dense_hop_opt = hop.as_dense_spectral();
         if let Some(kernel) = subspace {
-            let reduced: Vec<Array2<f64>> = coords
+            let drift_parts = coords
                 .iter()
                 .map(|coord| {
-                    let mut out = Array2::<f64>::zeros((
-                        kernel.h_proj_inverse.nrows(),
-                        kernel.h_proj_inverse.ncols(),
-                    ));
-                    if let Some(matrix) = coord.total_drift.dense.as_ref() {
-                        out += &kernel.reduce(matrix);
+                    let dense = coord.total_drift.dense.clone();
+                    let op = if coord.total_drift.operators.is_empty() {
+                        None
+                    } else {
+                        Some(Arc::new(CompositeHyperOperator {
+                            dim_hint: hop.dim(),
+                            dense: None,
+                            operators: coord.total_drift.operators.clone(),
+                        }) as Arc<dyn HyperOperator>)
+                    };
+                    match (dense, op) {
+                        (Some(matrix), Some(operator)) => {
+                            DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                                dim_hint: hop.dim(),
+                                dense: Some(matrix),
+                                operators: vec![operator],
+                            }))
+                        }
+                        (Some(matrix), None) => DriftDerivResult::Dense(matrix),
+                        (None, Some(operator)) => DriftDerivResult::Operator(operator),
+                        (None, None) => {
+                            DriftDerivResult::Dense(Array2::zeros((hop.dim(), hop.dim())))
+                        }
                     }
-                    for op in &coord.total_drift.operators {
-                        out += &kernel.reduce_operator(op.as_ref());
-                    }
-                    out
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let reduced = penalty_subspace_reduce_drifts_batched(kernel, &drift_parts);
             let pairs: Vec<(usize, usize)> = (0..total)
                 .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
                 .collect();
