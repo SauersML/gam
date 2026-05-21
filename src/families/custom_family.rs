@@ -6017,72 +6017,6 @@ fn inner_penalized_objective(
     )
 }
 
-/// Build the non-converged outer-eval result for the rho-only profiled path
-/// (`psi_dim == 0`).
-///
-/// Returns `HessianResult::Unavailable` to mark that the profiled outer Hessian
-/// assembly was deliberately skipped: that assembly is O(p²)–O(p³) per outer
-/// eval and only makes mathematical sense at an inner KKT point (the IFT
-/// identity `∂β̂/∂ρ = -H⁻¹ ∂(...)/∂ρ` requires inner stationarity).  At
-/// non-converged β, running the assembly would burn cycles to produce a
-/// matrix that does not approximate `∂²V/∂ρ²` — and `inner_converged: false`
-/// already tells the outer optimizer wrapper to reject the step.
-/// `nonconverged_inner_skips_profiled_outer_hessian_assembly` pins this
-/// behavior for the rho-only path.
-fn nonconverged_outer_eval_result(
-    inner: &BlockwiseInnerResult,
-    rho: &Array1<f64>,
-    theta_dim: usize,
-    include_logdet_h: bool,
-    include_logdet_s: bool,
-    context: &str,
-) -> Result<OuterObjectiveEvalResult, String> {
-    Ok(OuterObjectiveEvalResult {
-        objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
-        gradient: Array1::<f64>::zeros(theta_dim),
-        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
-        warm_start: constrained_warm_start_from_inner(rho, inner),
-        inner_converged: false,
-    })
-}
-
-/// Build the non-converged outer-eval result for the joint-hyper path with
-/// `psi_dim > 0`.
-///
-/// The joint-hyper API contract extends the gradient and Hessian to span
-/// `[rho, psi]`-many coordinates — that's the whole point of the API: callers
-/// route ψ-coords (length scales, anisotropy, mixture / SAS / cloglog
-/// hyperparameters) through the same outer-eval surface as ρ and read shape
-/// off the result.  Returning `HessianResult::Unavailable` here would drop
-/// the joint shape silently, leaving downstream contract-checking call sites
-/// (e.g.
-/// `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
-/// no way to distinguish "the joint plumbing exists but inner stalled" from
-/// "the joint plumbing was never wired up."  Surface a shape-correct
-/// `[theta_dim × theta_dim]` zero Hessian to preserve the structural
-/// invariant.  Value untrustworthiness is still signalled by
-/// `inner_converged: false`; the outer optimizer wrapper short-circuits on
-/// that flag before reading values, so the zero Hessian never reaches a
-/// downstream consumer that would use it as a curvature estimate.
-fn nonconverged_outer_joint_hyper_eval_result(
-    inner: &BlockwiseInnerResult,
-    rho: &Array1<f64>,
-    theta_dim: usize,
-    include_logdet_h: bool,
-    include_logdet_s: bool,
-    context: &str,
-) -> Result<OuterObjectiveEvalResult, String> {
-    Ok(OuterObjectiveEvalResult {
-        objective: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
-        gradient: Array1::<f64>::zeros(theta_dim),
-        outer_hessian: crate::solver::outer_strategy::HessianResult::Analytic(
-            Array2::<f64>::zeros((theta_dim, theta_dim)),
-        ),
-        warm_start: constrained_warm_start_from_inner(rho, inner),
-        inner_converged: false,
-    })
-}
-
 fn nonconverged_outer_efs_result(
     inner: &BlockwiseInnerResult,
     rho: &Array1<f64>,
@@ -14872,7 +14806,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho, penalty_counts)?;
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
         log::warn!(
             "[OUTER] custom-family EFS inner solve did not converge after {} cycle(s); \
@@ -16058,50 +15992,16 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
-        log::warn!(
-            "[OUTER] custom-family inner solve did not converge after {} cycle(s); \
-             skipping exact outer derivative assembly for theta_dim={} (rho_dim={}, psi_dim={})",
-            inner.cycles,
-            theta_dim,
-            rho_dim,
-            psi_dim,
-        );
-        // The joint-hyper API splits its shape contract along `psi_dim`:
-        //
-        //   * `psi_dim == 0` — the rho-only profiled outer Hessian path.  The
-        //     outer optimizer wrapper short-circuits on `inner_converged: false`
-        //     before ever reading the Hessian slot, so producing values would
-        //     be wasted O(p³) work.  Return `Unavailable`.  Pinned by
-        //     `nonconverged_inner_skips_profiled_outer_hessian_assembly`.
-        //
-        //   * `psi_dim > 0` — the joint [rho, psi] hyper path.  The shape of
-        //     the returned gradient and Hessian is itself an observable
-        //     contract: downstream callers (and tests like
-        //     `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
-        //     verify that the joint plumbing extends the outer surface across
-        //     the appended ψ coordinates.  Return a shape-correct stub so the
-        //     joint contract remains observable.  `inner_converged: false`
-        //     still carries value untrustworthiness for callers that care.
-        if psi_dim > 0 {
-            return nonconverged_outer_joint_hyper_eval_result(
-                &inner,
-                rho_current,
-                theta_dim,
-                include_logdet_h,
-                include_logdet_s,
-                "custom-family non-converged inner solve (joint hyper)",
-            )
-            .map_err(CustomFamilyError::from);
-        }
-        return nonconverged_outer_eval_result(
-            &inner,
-            rho_current,
-            theta_dim,
-            include_logdet_h,
-            include_logdet_s,
-            "custom-family non-converged inner solve",
+        return Err(format!(
+            "custom-family inner solve did not converge after {} cycle(s); \
+             refusing to expose profile objective derivatives for theta_dim={} \
+             (rho_dim={}, psi_dim={}). The analytic outer gradient/Hessian \
+             require the inner KKT equation F_beta(beta, theta)=0; returning \
+             a value with zero or shape-only derivatives is mathematically \
+             inconsistent.",
+            inner.cycles, theta_dim, rho_dim, psi_dim
         )
-        .map_err(CustomFamilyError::from);
+        .into());
     }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
@@ -17039,12 +16939,14 @@ fn derivative_quality_options_and_warm_start(
     const DIRECT_JOINT_HYPER_MIN_CYCLES: usize = 200;
 
     let mut eval_options = options.clone();
-    // The alignment exists so exact joint-hyper evaluations resolve the inner
-    // solve at the outer optimizer's requested gradient scale. With zero
-    // ψ-derivative blocks there is no IFT pullback to make accurate, so we do
-    // not tighten a looser caller tolerance; we still loosen a stricter
-    // default inner tolerance to the outer scale because seed validation does
-    // not gain useful hyperparameter information from a finer β residual.
+    // The alignment exists so exact joint-hyper evaluations with real ψ
+    // coordinates resolve the inner solve at the outer optimizer's requested
+    // derivative scale. With zero ψ-derivative blocks this API is just the
+    // rho-only outer surface; mutating its inner tolerance makes the direct
+    // joint-hyper path evaluate a different function than the rho-only path.
+    if !has_psi_derivatives {
+        return (eval_options, None);
+    }
     //
     // Do not hard-force f64-precision KKT solves for every ψ-bearing model:
     // biobank-scale survival marginal-slope fits have row-summed objectives
@@ -17059,10 +16961,7 @@ fn derivative_quality_options_and_warm_start(
         .max(DIRECT_JOINT_HYPER_INNER_TOL_FLOOR);
     let tolerance_differs = eval_options.inner_tol != direct_joint_hyper_inner_tol;
     let tightening = eval_options.inner_tol > direct_joint_hyper_inner_tol;
-    let loosening = eval_options.inner_tol < direct_joint_hyper_inner_tol;
-    let align = eval_options.inner_max_cycles > 1
-        && tolerance_differs
-        && (has_psi_derivatives || loosening);
+    let align = eval_options.inner_max_cycles > 1 && tolerance_differs;
     if !align {
         return (eval_options, None);
     }
@@ -20055,8 +19954,8 @@ mod tests {
         );
         let (rho_default, _) = derivative_quality_options_and_warm_start(&options, None, false);
         assert_eq!(
-            rho_default.inner_tol, options.outer_tol,
-            "rho-only exact joint-hyper eval should loosen a stricter default inner tolerance to the outer scale"
+            rho_default.inner_tol, options.inner_tol,
+            "rho-only exact joint-hyper eval must preserve the rho-only outer surface"
         );
 
         let tighter_options = BlockwiseFitOptions {
@@ -20716,7 +20615,7 @@ mod tests {
     }
 
     #[test]
-    fn nonconverged_inner_skips_profiled_outer_hessian_assembly() {
+    fn nonconverged_inner_refuses_profile_derivatives() {
         let spec = default_diagonal_exact_hook_spec();
         let result = evaluate_custom_family_joint_hyper(
             &DefaultDiagonalExactHookFamily,
@@ -20732,15 +20631,14 @@ mod tests {
             &[vec![]],
             None,
             EvalMode::ValueGradientHessian,
-        )
-        .expect("non-converged inner solve should return a recoverable outer result");
+        );
 
-        assert!(!result.inner_converged);
-        assert_eq!(result.gradient.len(), 1);
-        assert!(matches!(
-            result.outer_hessian,
-            crate::solver::outer_strategy::HessianResult::Unavailable
-        ));
+        let err = result.expect_err("non-converged inner solve must not expose derivatives");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("inner solve did not converge") && msg.contains("refusing to expose"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
