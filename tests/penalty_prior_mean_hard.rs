@@ -550,8 +550,7 @@ fn reml_centered_penalty_coordinate_invariance_under_joint_shift() {
         let scale = 0.25 + (seed as f64 % 5.0);
 
         let coord_base = PenaltyCoordinate::from_dense_root_with_mean(root.clone(), mean.clone());
-        let coord_shift =
-            PenaltyCoordinate::from_dense_root_with_mean(root, mean.clone() + &delta);
+        let coord_shift = PenaltyCoordinate::from_dense_root_with_mean(root, mean.clone() + &delta);
 
         let q_base = coord_base.shifted_quadratic(&beta, scale);
         let q_shift = coord_shift.shifted_quadratic(&(beta.clone() + &delta), scale);
