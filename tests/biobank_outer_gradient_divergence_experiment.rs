@@ -30,7 +30,7 @@
 
 use faer::Side;
 use gam::faer_ndarray::FaerEigh;
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array2, array};
 
 /// Build a fixed symmetric PD `H_unpen` and a fixed rank-deficient `S`
 /// (rank 2, nullspace 1). All entries chosen so that the col(S) /
@@ -46,11 +46,7 @@ fn fixture() -> (Array2<f64>, Array2<f64>) {
     // Scale by `n_scale` to approximate the per-row Hessian magnitude in
     // the biobank fit (n ~ 2e5).
     let n_scale = 2.0e5_f64;
-    let h: Array2<f64> = array![
-        [4.0, 0.2, 7.0],
-        [0.2, 9.0, -3.0],
-        [7.0, -3.0, 30.0],
-    ];
+    let h: Array2<f64> = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0],];
     let h = h.mapv(|v| v * n_scale);
     (h, s)
 }
@@ -147,7 +143,10 @@ fn unprojected_full_space_gradient_blows_up_at_saturated_rho() {
         }
     }
 
-    eprintln!("\n=== biobank outer-gradient divergence experiment ===\n{}", report);
+    eprintln!(
+        "\n=== biobank outer-gradient divergence experiment ===\n{}",
+        report
+    );
 
     // Claim 1: at rho = 0 (lambda = 1) the two routes agree to small numerical noise.
     // (At lambda = 1 the matrix is well conditioned so both inversions are accurate.)
