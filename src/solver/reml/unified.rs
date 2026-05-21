@@ -18693,6 +18693,20 @@ mod tests {
         let op_for_solve = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let beta_star = op_for_solve.solve(&xty);
 
+        // Use Fixed-dispersion V = -ℓ + ½βᵀSβ + ½(log|H| − log|S|_+).
+        // This is the parameterisation under which the IFT correction is
+        // exact (∂V/∂β = r, no `denom/dp` chain factor as in the profiled
+        // Gaussian path).  Matches the production survival-marginal-slope
+        // path that the biobank failure exercises.
+        let to_fixed = |mut sol: InnerSolution<'_>| -> InnerSolution<'_> {
+            sol.dispersion = DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            };
+            sol
+        };
+
         // FD reference: evaluate at re-solved β*(ρ±ε), which is what an
         // ideal inner solver would deliver.  Use ValueOnly to avoid the
         // recursive gradient path.
@@ -18701,25 +18715,39 @@ mod tests {
         for k in 0..rho.len() {
             let mut rho_plus = rho.clone();
             rho_plus[k] += fd_eps;
-            let cost_plus = reml_laml_evaluate(
-                &build_gaussian_test_solution(&rho_plus),
+            let mut h_plus = xtx.clone();
+            let lambdas_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
+            h_plus.scaled_add(lambdas_plus[0], &s1);
+            h_plus.scaled_add(lambdas_plus[1], &s2);
+            let beta_star_plus = DenseSpectralOperator::from_symmetric(&h_plus)
+                .unwrap()
+                .solve(&xty);
+            let sol_plus = to_fixed(build_gaussian_solution_at_beta(
                 &rho_plus,
-                EvalMode::ValueOnly,
-                None,
-            )
-            .unwrap()
-            .cost;
+                beta_star_plus,
+                false,
+            ));
+            let cost_plus = reml_laml_evaluate(&sol_plus, &rho_plus, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
 
             let mut rho_minus = rho.clone();
             rho_minus[k] -= fd_eps;
-            let cost_minus = reml_laml_evaluate(
-                &build_gaussian_test_solution(&rho_minus),
+            let mut h_minus = xtx.clone();
+            let lambdas_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
+            h_minus.scaled_add(lambdas_minus[0], &s1);
+            h_minus.scaled_add(lambdas_minus[1], &s2);
+            let beta_star_minus = DenseSpectralOperator::from_symmetric(&h_minus)
+                .unwrap()
+                .solve(&xty);
+            let sol_minus = to_fixed(build_gaussian_solution_at_beta(
                 &rho_minus,
-                EvalMode::ValueOnly,
-                None,
-            )
-            .unwrap()
-            .cost;
+                beta_star_minus,
+                false,
+            ));
+            let cost_minus = reml_laml_evaluate(&sol_minus, &rho_minus, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost;
 
             fd_grad[k] = (cost_plus - cost_minus) / (2.0 * fd_eps);
         }
@@ -18728,14 +18756,15 @@ mod tests {
         let perturb = Array1::from_vec(vec![0.02, -0.015, 0.025]);
         let beta_hat = &beta_star + &perturb;
 
-        let sol_envelope = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false);
+        let sol_envelope =
+            to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false));
         let grad_envelope =
             reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
                 .unwrap()
                 .gradient
                 .unwrap();
 
-        let sol_ift = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true);
+        let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true));
         let r_norm = sol_ift
             .kkt_residual
             .as_ref()
