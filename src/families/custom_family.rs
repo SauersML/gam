@@ -8273,6 +8273,19 @@ struct JointHessianBundle<'a> {
         Option<Box<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + 'a>>,
     compute_d2h:
         Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
+    /// Optional batched second-derivative callback. The unified evaluator's
+    /// outer-Hessian ρ-ρ pair loop forwards the K(K+1)/2 (v_k, v_l) pairs
+    /// here in one call when set, so families that fuse the per-row D²H walk
+    /// (e.g. survival marginal-slope scanning n rows once per outer eval)
+    /// amortise the row-walk across all pairs instead of paying it per pair.
+    compute_d2h_many: Option<
+        Box<
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+                + 'a,
+        >,
+    >,
     owned_compute_dh:
         Option<Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>>,
     owned_compute_dh_many: Option<
@@ -8281,6 +8294,19 @@ struct JointHessianBundle<'a> {
     owned_compute_d2h: Option<
         Arc<
             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
+        >,
+    >,
+    /// Owned twin of `compute_d2h_many`. Threaded through to
+    /// `OwnedJointDerivProvider` so the unified evaluator can share the
+    /// callback across rayon worker threads when the outer Hessian routes
+    /// through the parallel pair dispatch.
+    owned_compute_d2h_many: Option<
+        Arc<
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -8596,9 +8622,11 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             compute_dh,
             compute_dh_many,
             compute_d2h,
+            compute_d2h_many: None,
             owned_compute_dh: Some(owned_compute_dh),
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
+            owned_compute_d2h_many: None,
             rho_curvature_scale: curvature.rho_curvature_scale,
             hessian_logdet_correction: curvature.hessian_logdet_correction,
         }));
@@ -8669,9 +8697,11 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             compute_dh,
             compute_dh_many,
             compute_d2h,
+            compute_d2h_many: None,
             owned_compute_dh: Some(owned_compute_dh),
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
+            owned_compute_d2h_many: None,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -8778,9 +8808,11 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             compute_dh,
             compute_dh_many: None,
             compute_d2h,
+            compute_d2h_many: None,
             owned_compute_dh: Some(owned_compute_dh),
             owned_compute_dh_many: None,
             owned_compute_d2h: Some(owned_compute_d2h),
+            owned_compute_d2h_many: None,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
