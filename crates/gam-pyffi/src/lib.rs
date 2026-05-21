@@ -7689,17 +7689,17 @@ fn paired_cumulative_incidence_table_impl(
             _ => {}
         }
 
-        let mut cumulative = Array3::<f64>::zeros((2, n_rows, n_eval_times));
-        cumulative
-            .slice_mut(s![0, .., ..])
-            .assign(&target_result.cumulative_hazard);
-        cumulative
-            .slice_mut(s![1, .., ..])
-            .assign(&competing_result.cumulative_hazard);
-        let (cif, _overall_survival) = competing_risks_cif_impl(
-            Array1::from_vec(eval_times.clone()).view(),
-            cumulative.view(),
-        )?;
+        let eval_times_array = Array1::from_vec(eval_times.clone());
+        let cumulative_hazards = [
+            target_result.cumulative_hazard.view(),
+            competing_result.cumulative_hazard.view(),
+        ];
+        let assembled = gam::survival::assemble_competing_risks_cif_from_endpoints(
+            eval_times_array.view(),
+            &cumulative_hazards,
+        )
+        .map_err(|err| err.to_string())?;
+        let cif = assembled.cif;
         for row in 0..n_rows {
             for &time_idx in &requested_indices {
                 cif_flat.push(cif[[0, row, time_idx]]);
