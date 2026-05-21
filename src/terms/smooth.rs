@@ -8401,6 +8401,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 } else {
                     HessianResult::Unavailable
                 },
+                inner_beta_hint: None,
             });
         }
 
@@ -8475,6 +8476,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             cost: result.objective,
             gradient: result.gradient,
             hessian: hessian_result,
+            inner_beta_hint: None,
         })
     };
 
@@ -13108,6 +13110,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 cost,
                 gradient: grad,
                 hessian: hess,
+                inner_beta_hint: None,
             }),
             Err(err) => Err(err),
         }
@@ -13415,6 +13418,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 cost,
                 gradient: grad,
                 hessian: hess,
+                inner_beta_hint: None,
             }),
             Err(err) => Err(err),
         }
@@ -15332,6 +15336,7 @@ where
                         cost,
                         gradient: grad,
                         hessian: hess,
+                        inner_beta_hint: None,
                     });
                 }
             }
@@ -15395,6 +15400,7 @@ where
                         cost,
                         gradient: grad,
                         hessian: hess,
+                        inner_beta_hint: None,
                     })
                 }
                 Err(err) => {

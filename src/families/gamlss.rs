@@ -3665,6 +3665,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 cost: *cached_cost,
                 gradient: cached_grad.clone(),
                 hessian: cached_hess.clone(),
+                inner_beta_hint: None,
             });
         }
         let need_hessian = matches!(order, OuterEvalOrder::ValueGradientHessian)
@@ -3690,6 +3691,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             cost: eval.objective,
             gradient: eval.gradient,
             hessian: hessian_result,
+            inner_beta_hint: None,
         })
     };
 

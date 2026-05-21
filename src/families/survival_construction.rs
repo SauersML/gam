@@ -675,6 +675,7 @@ where
             cost,
             gradient,
             hessian: HessianResult::Unavailable,
+            inner_beta_hint: None,
         })
     };
     let mut obj = problem.build_objective(
@@ -781,6 +782,7 @@ where
             cost,
             gradient,
             hessian: HessianResult::Analytic(hessian),
+            inner_beta_hint: None,
         })
     };
     let mut obj = problem.build_objective(

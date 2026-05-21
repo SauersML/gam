@@ -1336,6 +1336,12 @@ pub struct OuterEval {
     pub cost: f64,
     pub gradient: Array1<f64>,
     pub hessian: HessianResult,
+    /// Optional inner-solver iterate at this ρ. Families whose inner
+    /// solve produces a PIRLS β (GAM, custom-family marginal-slope, …)
+    /// populate this so the persistent-cache layer can store `(ρ, β)`
+    /// together. Empty for callers that have no inner state or don't
+    /// expose it; the cache gracefully writes a ρ-only record then.
+    pub inner_beta_hint: Option<Array1<f64>>,
 }
 
 impl OuterEval {
@@ -1349,6 +1355,7 @@ impl OuterEval {
             cost: f64::INFINITY,
             gradient: Array1::zeros(n_params),
             hessian: HessianResult::Unavailable,
+            inner_beta_hint: None,
         }
     }
 }
@@ -1371,6 +1378,7 @@ impl Clone for OuterEval {
             cost: self.cost,
             gradient: self.gradient.clone(),
             hessian: self.hessian.clone(),
+            inner_beta_hint: None,
         }
     }
 }
@@ -1383,6 +1391,7 @@ impl std::fmt::Debug for OuterEval {
             .field("hessian", &self.hessian)
             .finish()
     }
+    inner_beta_hint: None,
 }
 
 impl Clone for HessianResult {
@@ -6244,6 +6253,7 @@ mod tests {
                     cost: 1.0,
                     gradient: Array1::zeros(1),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             eval_order_fn: None::<
@@ -6290,6 +6300,7 @@ mod tests {
                     cost: theta[11].abs(),
                     gradient: Array1::zeros(theta.len()),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             eval_order_fn: None::<
@@ -6358,6 +6369,7 @@ mod tests {
                         cost: theta[0] * theta[0],
                         gradient: array![2.0 * theta[0]],
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -6411,6 +6423,7 @@ mod tests {
                         cost,
                         gradient: array![4.0],
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -6470,6 +6483,7 @@ mod tests {
                                 HessianResult::Analytic(array![[2.0]])
                             }
                         },
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -6531,6 +6545,7 @@ mod tests {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7079,6 +7094,7 @@ mod tests {
                     cost: 0.5 * theta.dot(theta),
                     gradient: theta.clone(),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7192,6 +7208,7 @@ mod tests {
                     cost: 0.0,
                     gradient: Array1::zeros(1),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7222,6 +7239,7 @@ mod tests {
                     gradient: array![2.0 * theta[0]],
                     // First-order paths must ignore Hessian payload quality.
                     hessian: HessianResult::Analytic(array![[f64::NAN, 0.0], [0.0, 1.0]]),
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7243,6 +7261,7 @@ mod tests {
                 cost: 0.0,
                 gradient: Array1::zeros(1),
                 hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
             },
         )
         .expect_err("gradient mismatch should be rejected");
@@ -7296,6 +7315,7 @@ mod tests {
                         cost: 0.0,
                         gradient: Array1::zeros(1),
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 } else {
                     Ok(OuterEval::infeasible(theta.len()))
@@ -7328,6 +7348,7 @@ mod tests {
                     cost: 0.0,
                     gradient: array![0.0],
                     hessian: HessianResult::Analytic(array![[-1.0]]),
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7368,6 +7389,7 @@ mod tests {
                     hessian: HessianResult::Operator(Arc::new(
                         FailingSeedMaterializationOperator { dim: 1 },
                     )),
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7424,6 +7446,7 @@ mod tests {
                     cost: x.powi(4),
                     gradient: array![4.0 * x.powi(3)],
                     hessian: HessianResult::Analytic(array![[12.0 * x.powi(2)]]),
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7543,6 +7566,7 @@ mod tests {
                         cost: if theta[0] < -1.0 { 0.0 } else { 10.0 },
                         gradient: array![0.0],
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -7591,6 +7615,7 @@ mod tests {
                         cost: theta[0] * theta[0],
                         gradient: array![2.0 * theta[0]],
                         hessian: HessianResult::Analytic(array![[2.0]]),
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -7651,6 +7676,7 @@ mod tests {
                             cost: 0.0,
                             gradient: array![0.0],
                             hessian: HessianResult::Analytic(array![[1.0]]),
+                            inner_beta_hint: None,
                         })
                     } else {
                         Ok(OuterEval::infeasible(theta.len()))
@@ -7708,6 +7734,7 @@ mod tests {
                             cost: 0.0,
                             gradient: array![0.0],
                             hessian: HessianResult::Analytic(array![[1.0]]),
+                            inner_beta_hint: None,
                         })
                     } else {
                         Ok(OuterEval::infeasible(theta.len()))
@@ -7779,6 +7806,7 @@ mod tests {
                             cost: 0.0,
                             gradient: array![0.0],
                             hessian: HessianResult::Unavailable,
+                            inner_beta_hint: None,
                         })
                     } else {
                         Ok(OuterEval::infeasible(theta.len()))
@@ -7827,6 +7855,7 @@ mod tests {
                     cost: theta[0].abs(),
                     gradient: array![0.0],
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             |_: &mut (), theta: &Array1<f64>, _: OuterEvalOrder| {
@@ -7834,6 +7863,7 @@ mod tests {
                     cost: theta[0].abs(),
                     gradient: array![0.0],
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             {
@@ -7928,6 +7958,7 @@ mod tests {
                             cost: 0.0,
                             gradient: array![0.0],
                             hessian: HessianResult::Analytic(array![[1.0]]),
+                            inner_beta_hint: None,
                         })
                     } else {
                         Ok(OuterEval::infeasible(theta.len()))
@@ -8072,6 +8103,7 @@ mod tests {
                     cost: 0.5 * theta.dot(theta),
                     gradient: theta.clone(),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -8113,6 +8145,7 @@ mod tests {
                     cost: 0.0,
                     gradient: Array1::zeros(1),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -8343,6 +8376,7 @@ mod tests {
                         cost: (theta[0] - 0.25).powi(2),
                         gradient: array![2.0 * (theta[0] - 0.25)],
                         hessian: HessianResult::Analytic(array![[2.0]]),
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -8383,6 +8417,7 @@ mod tests {
                         cost: (theta[0] - 0.25).powi(2),
                         gradient: array![2.0 * (theta[0] - 0.25)],
                         hessian: HessianResult::Unavailable,
+                        inner_beta_hint: None,
                     })
                 }
             },
@@ -8619,6 +8654,7 @@ mod tests {
                     cost: theta.dot(theta),
                     gradient: theta.clone(),
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut Arc<Mutex<Vec<Array1<f64>>>>)>,

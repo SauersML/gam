@@ -7023,6 +7023,7 @@ impl<'a> RemlState<'a> {
             cost: result.cost,
             gradient,
             hessian,
+            inner_beta_hint: None,
         };
         {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();

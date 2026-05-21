@@ -621,6 +621,7 @@ mod tests {
             cost: 3.5,
             gradient: array![1.0, -2.0],
             hessian: HessianResult::Unavailable,
+            inner_beta_hint: None,
         };
 
         cache.store_outer_eval(&rho_key, &eval);
