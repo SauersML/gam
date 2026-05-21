@@ -24850,7 +24850,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.4),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -27845,7 +27845,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
@@ -27890,7 +27890,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
@@ -27944,7 +27944,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28067,7 +28067,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28087,7 +28087,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
             length_scale: None,
-            power: 0,
+            power: 0.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28118,7 +28118,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: None,
-            power: 0,
+            power: 0.0,
             nullspace_order: DuchonNullspaceOrder::Degree(2),
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28163,7 +28163,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 16 },
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Degree(3),
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28779,7 +28779,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28821,7 +28821,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -28845,7 +28845,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -29791,7 +29791,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(1.0),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -29835,7 +29835,7 @@ mod tests {
         let mut spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
@@ -29916,7 +29916,7 @@ mod tests {
         let mut spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
@@ -29979,7 +29979,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -30025,7 +30025,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
@@ -30103,7 +30103,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -30184,7 +30184,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.8),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -30236,7 +30236,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -31074,7 +31074,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -31135,7 +31135,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: Some(vec![0.0, 0.0]),
@@ -31196,7 +31196,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
@@ -31236,7 +31236,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
@@ -31280,7 +31280,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
@@ -31396,7 +31396,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
-            power: 1,
+            power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.05, -0.15]),
@@ -31528,7 +31528,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -31561,7 +31561,7 @@ mod tests {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
