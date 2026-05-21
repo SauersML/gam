@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
@@ -68,6 +68,69 @@ class CompetingRisksPrediction:
     overall_survival: Any
     linear_predictor: Any
     columns: dict[str, list[float]]
+
+
+@dataclass(frozen=True)
+class CompetingRisksCIF:
+    """Cause-specific cumulative incidence assembled by the Rust core."""
+
+    times: Any
+    cif: Any
+    overall_survival: Any
+    cumulative_hazard: Any
+    endpoint_names: tuple[str, ...]
+
+
+def competing_risks_cif(
+    predictions: Mapping[str, "SurvivalPrediction"] | Sequence["SurvivalPrediction"],
+    *,
+    times: Any,
+    endpoint_names: Sequence[str] | None = None,
+) -> CompetingRisksCIF:
+    """Assemble competing-risks CIFs from cause-specific survival predictions."""
+    import numpy as np
+
+    if isinstance(predictions, Mapping):
+        names = tuple(str(name) for name in predictions)
+        prediction_seq = tuple(predictions.values())
+        if endpoint_names is not None and tuple(endpoint_names) != names:
+            raise ValueError("endpoint_names must match the supplied prediction mapping keys")
+    else:
+        prediction_seq = tuple(predictions)
+        names = (
+            tuple(f"endpoint_{idx + 1}" for idx in range(len(prediction_seq)))
+            if endpoint_names is None
+            else tuple(str(name) for name in endpoint_names)
+        )
+    if not prediction_seq:
+        raise ValueError("competing_risks_cif requires at least one endpoint prediction")
+    if len(names) != len(prediction_seq):
+        raise ValueError("endpoint_names must match the number of endpoint predictions")
+
+    times_arr = np.asarray(times, dtype=float).reshape(-1)
+    try:
+        cumulative_hazard = np.stack(
+            [
+                np.asarray(prediction.cumulative_hazard_at(times_arr), dtype=float)
+                for prediction in prediction_seq
+            ],
+            axis=0,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "all endpoint predictions must return the same (n_rows, n_times) shape"
+        ) from exc
+    try:
+        payload = rust_module().competing_risks_cif(times_arr, cumulative_hazard)
+    except ValueError as exc:
+        raise map_exception(exc) from exc
+    return CompetingRisksCIF(
+        times=np.asarray(payload["times"], dtype=float),
+        cif=np.asarray(payload["cif"], dtype=float),
+        overall_survival=np.asarray(payload["overall_survival"], dtype=float),
+        cumulative_hazard=np.asarray(payload["cumulative_hazard"], dtype=float),
+        endpoint_names=names,
+    )
 
 
 @dataclass
