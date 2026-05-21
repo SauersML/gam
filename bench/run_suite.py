@@ -100,6 +100,73 @@ HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
 _MAX_CAPTURE_CHARS = 200000
+_OUTPUT_LOCK = threading.Lock()
+
+
+class _TerminalOutputSanitizer:
+    def __init__(self) -> None:
+        self._state = "normal"
+
+    def feed(self, text: str) -> str:
+        out: list[str] = []
+        for ch in text:
+            state = self._state
+            if state == "normal":
+                if ch == "\x1b":
+                    self._state = "esc"
+                elif ch == "\r":
+                    out.append("\n")
+                elif ch in "\n\t" or (ord(ch) >= 0x20 and ch != "\x7f"):
+                    out.append(ch)
+            elif state == "esc":
+                if ch == "[":
+                    self._state = "csi"
+                elif ch == "]":
+                    self._state = "osc"
+                elif ch in "PX^_":
+                    self._state = "string"
+                else:
+                    self._state = "normal"
+            elif state == "csi":
+                if "@" <= ch <= "~":
+                    self._state = "normal"
+            elif state == "osc":
+                if ch == "\x07":
+                    self._state = "normal"
+                elif ch == "\x1b":
+                    self._state = "osc_esc"
+            elif state == "osc_esc":
+                self._state = "normal" if ch == "\\" else "osc"
+            elif state == "string":
+                if ch == "\x1b":
+                    self._state = "string_esc"
+            elif state == "string_esc":
+                self._state = "normal" if ch == "\\" else "string"
+        return _strip_terminal_indent("".join(out))
+
+    def flush(self) -> str:
+        self._state = "normal"
+        return ""
+
+
+def _strip_terminal_indent(text: str) -> str:
+    parts = []
+    for part in text.splitlines(keepends=True):
+        stripped = part.lstrip(" \t")
+        parts.append(stripped if stripped.startswith("[") else part)
+    return "".join(parts)
+
+
+def _write_stream(sink: typing.Any, text: str) -> None:
+    if not text:
+        return
+    with _OUTPUT_LOCK:
+        sink.write(text)
+        sink.flush()
+
+
+def _print_stderr(message: str) -> None:
+    _write_stream(sys.stderr, f"{message}\n")
 
 
 def _require_lifelines_survival_helpers() -> typing.Any:
@@ -431,7 +498,7 @@ def _heartbeat_loop(proc: typing.Any, cmd: typing.Any, stop_event: typing.Any, s
     if len(cmd) > 5:
         cmd_preview += " ..."
     start = monotonic()
-    print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
+    _print_stderr(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start))
     while True:
         elapsed = monotonic() - start
         wait_sec = (
@@ -443,7 +510,7 @@ def _heartbeat_loop(proc: typing.Any, cmd: typing.Any, stop_event: typing.Any, s
             break
         if proc.poll() is not None:
             break
-        print(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start), file=sys.stderr, flush=True)
+        _print_stderr(_collect_heartbeat_snapshot(proc, cmd_preview, stats, start))
 
 
 def _workspace_tempdir(prefix: str) -> typing.Any:
@@ -486,19 +553,26 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
 
     def _pump(pipe: typing.Any, sink: typing.Any, buf: typing.Any, char_count_name: typing.Any) -> None:
         nonlocal out_chars, err_chars
+        sanitizer = _TerminalOutputSanitizer()
         try:
             while True:
                 chunk = pipe.read(4096)
                 if not chunk:
                     break
-                text = chunk.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-                sink.write(text)
-                sink.flush()
+                text = sanitizer.feed(chunk.decode("utf-8", errors="replace"))
+                _write_stream(sink, text)
                 if char_count_name == "out":
                     out_chars = _append_capped(buf, text, out_chars)
                 else:
                     err_chars = _append_capped(buf, text, err_chars)
         finally:
+            tail = sanitizer.flush()
+            if tail:
+                _write_stream(sink, tail)
+                if char_count_name == "out":
+                    out_chars = _append_capped(buf, tail, out_chars)
+                else:
+                    err_chars = _append_capped(buf, tail, err_chars)
             try:
                 pipe.close()
             except Exception:
@@ -535,8 +609,8 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
             f"pid={proc.pid} cmd='{(' '.join(str(x) for x in cmd[:5]) + (' ...' if len(cmd) > 5 else ''))}'\n"
         )
         err_chars = _append_capped(err_buf, timeout_msg, err_chars)
-        print(timeout_msg, file=sys.stderr, flush=True)
-    print(
+        _write_stream(sys.stderr, timeout_msg)
+    _print_stderr(
         f"[HEARTBEAT] command-exit rc={rc} pid={proc.pid} "
         f"samples={hb_stats.get('samples', 0)} "
         f"peak_proc_rss={_fmt_kib(hb_stats.get('peak_proc_rss_kib', 0))} "
@@ -548,9 +622,7 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
         f"last_sys_ram_pct={_fmt_pct(hb_stats.get('last_mem_used_kib'), hb_stats.get('last_mem_total_kib'))} "
         f"last_cgroup={_fmt_kib(hb_stats.get('last_cgroup_cur_kib'))}/{_fmt_kib(hb_stats.get('last_cgroup_max_kib'))} "
         f"last_bench_free={_fmt_kib(hb_stats.get('last_bench_free_kib'))}/{_fmt_kib(hb_stats.get('last_bench_total_kib'))} "
-        f"last_tmp_free={_fmt_kib(hb_stats.get('last_tmp_free_kib'))}/{_fmt_kib(hb_stats.get('last_tmp_total_kib'))}",
-        file=sys.stderr,
-        flush=True,
+        f"last_tmp_free={_fmt_kib(hb_stats.get('last_tmp_free_kib'))}/{_fmt_kib(hb_stats.get('last_tmp_total_kib'))}"
     )
     return rc, "".join(out_buf), "".join(err_buf)
 
