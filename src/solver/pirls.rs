@@ -1364,9 +1364,7 @@ impl PirlsPenalty {
 
     fn apply(&self, beta: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense { s_transformed, .. } => {
-                crate::faer_ndarray::fast_av(s_transformed, beta)
-            }
+            Self::Dense { s_transformed, .. } => crate::faer_ndarray::fast_av(s_transformed, beta),
             Self::Diagonal { diag, .. } => diag * beta,
         }
     }

@@ -102,7 +102,6 @@ impl MarginalSlopeCalibrationProtocol {
             Self::default_latent_score(),
         )
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -122,5 +121,4 @@ impl SurvivalMarginalSlopeProtocol {
             baseline_target: SurvivalBaselineTarget::GompertzMakeham,
         }
     }
-
 }

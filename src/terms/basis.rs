@@ -3783,29 +3783,31 @@ impl StreamingRadialState {
                 .zip(t.par_chunks_mut(n_knots))
                 .enumerate()
                 .collect();
-            chunks.into_par_iter().for_each(|(i, ((phi_row, q_row), t_row))| {
-                for j in 0..n_knots {
-                    let r2 = match &self.axis_mode {
-                        StreamingAxisMode::PerAxis { metric_weights }
-                        | StreamingAxisMode::ScalarTotal { metric_weights } => {
-                            let dim = metric_weights.len();
-                            let mut acc = 0.0_f64;
-                            for a in 0..dim {
-                                let h = unsafe {
-                                    self.data.uget((i, a)) - self.centers.uget((j, a))
-                                };
-                                acc += metric_weights[a] * h * h;
+            chunks
+                .into_par_iter()
+                .for_each(|(i, ((phi_row, q_row), t_row))| {
+                    for j in 0..n_knots {
+                        let r2 = match &self.axis_mode {
+                            StreamingAxisMode::PerAxis { metric_weights }
+                            | StreamingAxisMode::ScalarTotal { metric_weights } => {
+                                let dim = metric_weights.len();
+                                let mut acc = 0.0_f64;
+                                for a in 0..dim {
+                                    let h = unsafe {
+                                        self.data.uget((i, a)) - self.centers.uget((j, a))
+                                    };
+                                    acc += metric_weights[a] * h * h;
+                                }
+                                acc
                             }
-                            acc
+                        };
+                        if let Ok((p_, qv, tv)) = self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                            phi_row[j] = p_;
+                            q_row[j] = qv;
+                            t_row[j] = tv;
                         }
-                    };
-                    if let Ok((p_, qv, tv)) = self.radial_kind.eval_design_triplet(r2.sqrt()) {
-                        phi_row[j] = p_;
-                        q_row[j] = qv;
-                        t_row[j] = tv;
                     }
-                }
-            });
+                });
             StreamingTripletCache { phi, q, t }
         }))
     }
@@ -5533,8 +5535,8 @@ impl ImplicitDesignPsiDerivative {
                         let phi = self.phi_values[idx];
                         let q = self.q_values[idx];
                         let cphi = c * phi;
-                        let axis_row = &axis_slice[idx * n_total_axes
-                            ..idx * n_total_axes + n_total_axes];
+                        let axis_row =
+                            &axis_slice[idx * n_total_axes..idx * n_total_axes + n_total_axes];
                         for a in 0..n_axes {
                             out[a][[local, j]] = q * axis_row[a] + cphi;
                         }
