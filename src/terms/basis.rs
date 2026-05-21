@@ -11090,6 +11090,85 @@ pub fn operator_penalty_candidates_closed_form_pure(
     out
 }
 
+/// Native polyharmonic kernel reproducing-norm penalty for scale-free
+/// (`length_scale = None`) Duchon bases.
+///
+/// For the polyharmonic kernel `K(x, y) = φ(|x − y|)` of order `m + s`
+/// (`m = p_order`, `s = s_order`), the RKHS inner product on the span of
+/// the basis functions `{φ_k(·) = K(·, c_k)}` is exactly the kernel
+/// evaluated at center pairs:
+///
+/// ```text
+///   ⟨f, g⟩_H = β_fᵀ G β_g,   G_{kl} = K(c_k, c_l) = φ(|c_k − c_l|).
+/// ```
+///
+/// Polynomial nullspace columns get an exact zero block: polynomials of
+/// order `< m` live in the unpenalized null space of the polyharmonic
+/// norm by construction.
+///
+/// This is the single principled penalty for the scale-free path. The
+/// operator-triplet decomposition `(mass, tension, stiffness)` used by
+/// [`operator_penalty_candidates_closed_form_pure`] is only meaningful
+/// when a finite length scale balances the three Lebesgue functionals
+/// against the kernel norm; without one, the three are not independent
+/// and presenting them as three separate λ knobs would be misleading.
+fn native_kernel_penalty_candidate_pure_duchon(
+    centers: ArrayView2<'_, f64>,
+    p_order: usize,
+    s_order: usize,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_nullspace: Option<&Array2<f64>>,
+    polynomial_block_cols: usize,
+    outer_identifiability: Option<&Array2<f64>>,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let coeff = PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), d);
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let mut g_raw = Array2::<f64>::zeros((k, k));
+    fill_symmetric_from_row_kernel(&mut g_raw, |i, j| {
+        let r = if let Some(scales) = axis_scales.as_deref() {
+            aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+        } else {
+            euclidean_distance_rows(centers, i, centers, j)
+        };
+        Ok(coeff.eval(r))
+    })?;
+    let g_kernel = if let Some(z) = kernel_nullspace {
+        let zt_g = fast_atb(z, &g_raw);
+        fast_ab(&zt_g, z)
+    } else {
+        g_raw
+    };
+    let kernel_cols = g_kernel.nrows();
+    let total_pre_cols = kernel_cols + polynomial_block_cols;
+    let g_padded = if polynomial_block_cols == 0 {
+        g_kernel
+    } else {
+        let mut padded = Array2::<f64>::zeros((total_pre_cols, total_pre_cols));
+        padded
+            .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+            .assign(&g_kernel);
+        padded
+    };
+    let g_total = if let Some(t) = outer_identifiability {
+        let tt_g = fast_atb(t, &g_padded);
+        fast_ab(&tt_g, t)
+    } else {
+        g_padded
+    };
+    let g_sym = symmetrize(&g_total);
+    let (matrix, normalization_scale) = normalize_penalty(&g_sym);
+    Ok(vec![PenaltyCandidate {
+        matrix,
+        nullspace_dim_hint: 0,
+        source: PenaltySource::Primary,
+        normalization_scale,
+        kronecker_factors: None,
+        op: None,
+    }])
+}
+
 fn operator_penalty_candidates_from_collocation(
     d0: &Array2<f64>,
     d1: &Array2<f64>,
@@ -19252,6 +19331,16 @@ pub fn build_duchon_basiswithworkspace(
     // Q^T G_raw Q matches the collocation kernel sub-block in the limit
     // (pointwise basis evaluations of the Lebesgue Gram). Linear+ no longer
     // forces the collocation D^T D fallback.
+    // Scale-free Duchon (`length_scale = None`) collapses to a single
+    // Primary penalty: the polyharmonic kernel's RKHS reproducing norm.
+    // Without a finite length scale, the (mass, tension, stiffness)
+    // operator triplet is degenerate — the three Lebesgue functionals are
+    // not independent because there is no scale to balance them against
+    // the kernel norm, which is the *only* intrinsic inner product on the
+    // pure-Duchon RKHS. The `operator_penalties` spec is intentionally
+    // ignored in this branch: any non-default choice would be silently
+    // collinear with the kernel norm. The Matérn-like (`length_scale =
+    // Some`) branch still emits the triplet, which is well-defined there.
     let candidates = if let Some(length_scale) = spec.length_scale {
         operator_penalty_candidates_closed_form(
             centers.view(),
@@ -19268,19 +19357,15 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform.as_ref(),
         )
     } else {
-        operator_penalty_candidates_closed_form_pure(
+        native_kernel_penalty_candidate_pure_duchon(
             centers.view(),
-            &ops.d0,
-            &ops.d1,
-            &ops.d2,
-            &spec.operator_penalties,
             p_order,
             spec.power,
             aniso.as_deref(),
             Some(&kernel_transform),
             poly_cols,
             identifiability_transform.as_ref(),
-        )
+        )?
     };
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
