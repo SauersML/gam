@@ -16008,6 +16008,49 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         SurvivalMarginalSlopeFamily::log_likelihood_only_with_options(self, block_states, options)
     }
 
+    fn joint_line_search_log_likelihood_workspace(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        _line_search_options: &BlockwiseFitOptions,
+        workspace_options: &BlockwiseFitOptions,
+    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        if self.per_z_logslope_active()
+            || self.effective_flex_active(block_states)?
+            || self.flex_timewiggle_active()
+        {
+            return Ok(None);
+        }
+        let Some(workspace) = self.exact_newton_joint_hessian_workspace_with_options(
+            block_states,
+            specs,
+            workspace_options,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? else {
+            return Ok(None);
+        };
+        Ok(Some((log_likelihood, workspace)))
+    }
+
+    fn joint_line_search_log_likelihood_evaluation(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        line_search_options: &BlockwiseFitOptions,
+        workspace_options: &BlockwiseFitOptions,
+    ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
+        self.joint_line_search_log_likelihood_workspace(
+            block_states,
+            specs,
+            line_search_options,
+            workspace_options,
+        )
+        .map(|maybe| maybe.map(|(log_likelihood, workspace)| (log_likelihood, Some(workspace))))
+    }
+
     fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
