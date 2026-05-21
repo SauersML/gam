@@ -420,21 +420,9 @@ pub struct GlmLikelihoodSpec {
 impl GlmLikelihoodSpec {
     #[inline]
     pub fn canonical(family: GlmLikelihoodFamily) -> Self {
-        let scale = match family {
-            GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            GlmLikelihoodFamily::GammaLog => {
-                LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 }
-            }
-            GlmLikelihoodFamily::BinomialLogit
-            | GlmLikelihoodFamily::BinomialProbit
-            | GlmLikelihoodFamily::BinomialCLogLog
-            | GlmLikelihoodFamily::BinomialSas
-            | GlmLikelihoodFamily::BinomialBetaLogistic
-            | GlmLikelihoodFamily::BinomialMixture
-            | GlmLikelihoodFamily::PoissonLog => {
-                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
-            }
-        };
+        // GLM families are a strict subset of LikelihoodFamily, so the
+        // canonical scale comes from the unified table to avoid drift.
+        let scale = LikelihoodFamily::from(family).default_scale_metadata();
         Self { family, scale }
     }
 
