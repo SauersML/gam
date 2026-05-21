@@ -96,6 +96,54 @@ pub struct MixtureLinkState {
     pub pi: Array1<f64>,
 }
 
+impl MixtureLinkState {
+    /// Construct with the size invariants enforced. A `MixtureLinkState` is
+    /// only well-formed when `components.len() == pi.len()` and
+    /// `rho.len() + 1 == components.len()` (the last logit is fixed at zero).
+    /// This constructor surfaces those constraints at the type boundary so
+    /// downstream consumers can rely on them without re-checking.
+    #[inline]
+    pub fn new(
+        components: Vec<LinkComponent>,
+        rho: Array1<f64>,
+        pi: Array1<f64>,
+    ) -> Result<Self, String> {
+        let k = components.len();
+        if k < 2 {
+            return Err(format!(
+                "MixtureLinkState requires at least two components, got {k}"
+            ));
+        }
+        if pi.len() != k {
+            return Err(format!(
+                "MixtureLinkState pi has length {}, expected {}",
+                pi.len(),
+                k
+            ));
+        }
+        if rho.len() + 1 != k {
+            return Err(format!(
+                "MixtureLinkState rho has length {}, expected {}",
+                rho.len(),
+                k - 1
+            ));
+        }
+        Ok(Self {
+            components,
+            rho,
+            pi,
+        })
+    }
+
+    /// Number of components in the mixture. Always >= 2 by invariant.
+    #[inline]
+    pub fn num_components(&self) -> usize {
+        debug_assert_eq!(self.components.len(), self.pi.len());
+        debug_assert_eq!(self.rho.len() + 1, self.components.len());
+        self.components.len()
+    }
+}
+
 /// User-facing configuration for the continuous sinh-arcsinh inverse link.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SasLinkSpec {
