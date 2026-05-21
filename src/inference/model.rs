@@ -2585,10 +2585,11 @@ impl FittedModel {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
-        let payload = serde_json::to_string_pretty(&normalized)
-            .map_err(|e| format!("failed to serialize model: {e}"))?;
-        fs::write(path, payload)
+        let file = fs::File::create(path)
             .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, &normalized)
+            .map_err(|e| format!("failed to serialize model: {e}"))?;
         Ok(())
     }
 
