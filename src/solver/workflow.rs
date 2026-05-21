@@ -4253,7 +4253,7 @@ mod tests {
             spec.nullspace_order,
             DuchonNullspaceOrder::Degree(2)
         ));
-        assert_eq!(spec.power, 0);
+        assert_eq!(spec.power, 0.0);
     }
 
     #[test]
@@ -4273,7 +4273,7 @@ mod tests {
         };
         assert_eq!(spec.length_scale, Some(1.0));
         assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Zero);
-        assert_eq!(spec.power, 2);
+        assert_eq!(spec.power, 2.0);
     }
 
     #[test]
