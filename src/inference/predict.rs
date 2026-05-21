@@ -1268,10 +1268,7 @@ impl BernoulliMarginalSlopePredictor {
     ) -> Result<Option<EmpiricalZGrid>, EstimationError> {
         match &self.latent_measure {
             LatentMeasureKind::StandardNormal => Ok(None),
-            LatentMeasureKind::GlobalEmpirical { nodes, weights } => Ok(Some(EmpiricalZGrid {
-                nodes: nodes.clone(),
-                weights: weights.clone(),
-            })),
+            LatentMeasureKind::GlobalEmpirical { grid } => Ok(Some(grid.clone())),
             LatentMeasureKind::LocalEmpirical {
                 centers,
                 grids,
@@ -1893,8 +1890,7 @@ impl BernoulliMarginalSlopePredictor {
             abs_tol,
             64,
             48,
-        )
-        .map_err(|e| EstimationError::InvalidInput(e.to_string()))?;
+        )?;
 
         if f_best.abs() > abs_tol {
             return Err(EstimationError::InvalidInput(format!(
@@ -2018,7 +2014,7 @@ impl BernoulliMarginalSlopePredictor {
                     }));
                     (final_eta_internal, marginal_scales, logslope_scales)
                 }
-                LatentMeasureKind::GlobalEmpirical { nodes, weights } => {
+                LatentMeasureKind::GlobalEmpirical { grid } => {
                     let mut final_eta = Array1::<f64>::zeros(n);
                     let mut marginal_scales = Array1::<f64>::zeros(n);
                     let mut logslope_scales = Array1::<f64>::zeros(n);
@@ -2027,8 +2023,8 @@ impl BernoulliMarginalSlopePredictor {
                             .empirical_rigid_intercept_and_gradient(
                                 marginal_eta[i],
                                 logslope_eta[i],
-                                nodes,
-                                weights,
+                                &grid.nodes,
+                                &grid.weights,
                             )?;
                         final_eta[i] = intercept + scale * logslope_eta[i] * z[i];
                         marginal_scales[i] = a_marginal;

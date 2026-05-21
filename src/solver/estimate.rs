@@ -1726,6 +1726,9 @@ pub enum EstimationError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("monotone root solve: {0}")]
+    MonotoneRoot(#[from] crate::families::monotone_root::MonotoneRootError),
+
     #[error("Calibrator training failed: {0}")]
     CalibratorTrainingFailed(String),
 

@@ -394,7 +394,7 @@ fn probit_log_survival_and_ratio_derivatives(eta: f64) -> (f64, f64, f64, f64, f
     (log_survival, ratio, dr, ddr, dddr)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResidualDistribution {
     Gaussian,
     Gumbel,

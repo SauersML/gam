@@ -5104,6 +5104,32 @@ impl PenaltySubspaceTrace {
         let h_proj_inv_b = self.h_proj_inverse.dot(&proj_b);
         proj_a.dot(&h_proj_inv_b)
     }
+
+    /// Apply the projected pseudo-inverse `K = U_S · H_proj⁻¹ · U_Sᵀ` to a
+    /// vector `a`, returning the minimum-norm solution `v = K · a` of the
+    /// system `H v = a` restricted to `range(S₊)`.
+    ///
+    /// This is the correct stand-in for `H⁻¹ · a` in all per-coordinate
+    /// outer-gradient/Hessian formulas when the rank-deficient LAML fix is
+    /// active (`penalty_subspace_trace = Some`). The full `H⁻¹ · a` solve
+    /// amplifies any component of `a` outside `range(H_free)` by
+    /// `1/σ_min(H_active_normal)` — which on biobank-scale survival
+    /// marginal-slope is ~10¹² and propagates into outer gradients of
+    /// magnitude 10¹⁴, suppressed by the envelope tripwire downstream and
+    /// killing every seed before the fit can take a step. The projected
+    /// pseudo-inverse drops the null-space contribution by construction,
+    /// returning the gradient that lives on the constrained manifold —
+    /// which is what LAML on the projected-Hessian cost demands for
+    /// derivative-consistency with the projected `log|U_Sᵀ H U_S|` term.
+    ///
+    /// Costs `O(p·r + r²)` for the two `U_S`-contractions plus the `r × r`
+    /// solve — strictly cheaper than the `O(p²)` full `hop.solve_multi`
+    /// when `r ≪ p`, and bounded regardless of `σ_min(H)`.
+    pub fn apply_pseudo_inverse(&self, a: &Array1<f64>) -> Array1<f64> {
+        let proj_a = crate::faer_ndarray::fast_atv(&self.u_s, a);
+        let h_proj_inv_a = self.h_proj_inverse.dot(&proj_a);
+        crate::faer_ndarray::fast_av(&self.u_s, &h_proj_inv_a)
+    }
 }
 
 /// KKT residual `r = ∇_β L_pen(β̂)` at the converged inner iterate, already
@@ -6499,30 +6525,65 @@ pub fn reml_laml_evaluate(
             Vec::new(),
         )
     } else {
-        let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
-        let mut col_idx = 0;
-        if need_family_corrections {
-            for a_k_beta in rho_curvature_a_k_betas.iter() {
-                rhs_stack.column_mut(col_idx).assign(a_k_beta);
+        // Per-coordinate `v_k = H⁻¹ · a_k` mode responses. When the
+        // rank-deficient LAML fix is active (`penalty_subspace_trace =
+        // Some`), the full `hop.solve_multi` path amplifies any component
+        // of `a_k` outside `range(H_free)` by `1/σ_min(H_active_normal)`
+        // — which on biobank-scale survival marginal-slope is ~10¹² and
+        // propagates into family-correction terms with magnitude 10¹⁴,
+        // tripping the envelope-consistency check downstream and killing
+        // every seed. The projected pseudo-inverse `K = U_S · H_proj⁻¹ ·
+        // U_Sᵀ` is the principled stand-in for `H⁻¹` on the constrained
+        // manifold — it returns the minimum-norm solution of `H v = a`
+        // restricted to `range(S₊)`, matches the derivative of the
+        // projected `log|U_Sᵀ H U_S|` cost term, and is bounded
+        // regardless of `σ_min(H)`. Route every v_k / v_i through the
+        // kernel when it is installed; fall back to the full solve only
+        // when no kernel is available.
+        let kernel = solution.penalty_subspace_trace.as_ref();
+        if let Some(kernel) = kernel {
+            let rho_v_ks = if need_family_corrections {
+                Some(
+                    rho_curvature_a_k_betas
+                        .iter()
+                        .map(|a_k| kernel.apply_pseudo_inverse(a_k))
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                None
+            };
+            let ext_v_is: Vec<Array1<f64>> = solution
+                .ext_coords
+                .iter()
+                .map(|coord| kernel.apply_pseudo_inverse(&coord.g))
+                .collect();
+            (rho_v_ks, ext_v_is)
+        } else {
+            let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
+            let mut col_idx = 0;
+            if need_family_corrections {
+                for a_k_beta in rho_curvature_a_k_betas.iter() {
+                    rhs_stack.column_mut(col_idx).assign(a_k_beta);
+                    col_idx += 1;
+                }
+            }
+            for coord in solution.ext_coords.iter() {
+                rhs_stack.column_mut(col_idx).assign(&coord.g);
                 col_idx += 1;
             }
+            debug_assert_eq!(col_idx, total_cols);
+            let solved_stack = hop.solve_multi(&rhs_stack);
+            let rho_v_ks = if need_family_corrections {
+                Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
+            } else {
+                None
+            };
+            let ext_offset = if need_family_corrections { k } else { 0 };
+            let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
+                .map(|i| solved_stack.column(ext_offset + i).to_owned())
+                .collect();
+            (rho_v_ks, ext_v_is)
         }
-        for coord in solution.ext_coords.iter() {
-            rhs_stack.column_mut(col_idx).assign(&coord.g);
-            col_idx += 1;
-        }
-        debug_assert_eq!(col_idx, total_cols);
-        let solved_stack = hop.solve_multi(&rhs_stack);
-        let rho_v_ks = if need_family_corrections {
-            Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
-        } else {
-            None
-        };
-        let ext_offset = if need_family_corrections { k } else { 0 };
-        let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
-            .map(|i| solved_stack.column(ext_offset + i).to_owned())
-            .collect();
-        (rho_v_ks, ext_v_is)
     };
     let coord_corrections: Vec<Option<DriftDerivResult>> = if need_family_corrections {
         let rho_vs = rho_v_ks
