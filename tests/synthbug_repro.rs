@@ -123,11 +123,15 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
                     num_centers: DUCHON_CENTERS,
                 },
                 length_scale: Some(1.0),
+<<<<<<< Updated upstream
                 // Mirror the term_builder policy auto-escalation: explicit power=2
                 // with order=Zero and length_scale=Some(1.0) in d=10 is bumped to
                 // the minimum admissible power for full triple-operator collocation,
                 // which is `s_op = (d + max_op + 2 - 2p)/2 = (10 + 2 + 2 - 2)/2 = 6`.
                 power: 6.0,
+=======
+                power: 6,
+>>>>>>> Stashed changes
                 nullspace_order: DuchonNullspaceOrder::Zero,
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: None,
