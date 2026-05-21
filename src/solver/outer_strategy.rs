@@ -8753,8 +8753,7 @@ mod tests {
             source: crate::cache::LoadSource::Preloaded,
         };
         let CacheSeedDecision::Seed {
-            beta: decoded_beta,
-            ..
+            beta: decoded_beta, ..
         } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
         else {
             panic!("expected Seed decision");
@@ -8774,8 +8773,7 @@ mod tests {
             source: crate::cache::LoadSource::Preloaded,
         };
         let CacheSeedDecision::Seed {
-            beta: decoded_beta,
-            ..
+            beta: decoded_beta, ..
         } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
         else {
             panic!("expected Seed decision");
@@ -8826,10 +8824,7 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(
-                &mut self,
-                beta: &Array1<f64>,
-            ) -> Result<(), EstimationError> {
+            fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
                 *self.seeded.lock().unwrap() = Some(beta.clone());
                 Ok(())
             }
@@ -8900,10 +8895,7 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(
-                &mut self,
-                _beta: &Array1<f64>,
-            ) -> Result<(), EstimationError> {
+            fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
                 *self.seed_calls.lock().unwrap() += 1;
                 Ok(())
             }

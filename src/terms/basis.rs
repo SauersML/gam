@@ -10913,9 +10913,7 @@ fn duchon_closed_form_operator_penalty_converges(
     }
     const LOG_EPS: f64 = 1e-12;
     let n_f = (beta / 2.0).round();
-    let is_log_case = dimension % 2 == 0
-        && n_f >= 0.0
-        && (n_f * 2.0 - beta).abs() < LOG_EPS;
+    let is_log_case = dimension % 2 == 0 && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
     let cpd_required = if is_log_case {
         // Log case: kernel `c · r^{2n}(ln r + A_n)` is CPD of order n + 1
         // (Wendland Thm 8.18). TPS sanity: d=2, J=2, n=1 → CPD order 2,
