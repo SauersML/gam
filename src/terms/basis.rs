@@ -19861,7 +19861,7 @@ fn thin_plate_kernel_triplet_from_scaled_distance(
         3 => Ok((-scaled_distance, -1.0, 0.0)),
         _ => polyharmonic_kernel_triplet(
             scaled_distance,
-            thin_plate_penalty_order(dimension),
+            thin_plate_penalty_order(dimension) as f64,
             dimension,
         ),
     }
