@@ -1873,35 +1873,7 @@ impl SpatialLogKappaCoords {
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        debug_assert_eq!(term_indices.len(), dims_per_term.len());
-        let total: usize = dims_per_term.iter().sum();
-        let mut values = Array1::<f64>::zeros(total);
-        let options_lo = -options.max_length_scale.ln();
-        let mut cursor = 0;
-        for (slot, &term_idx) in term_indices.iter().enumerate() {
-            let d = dims_per_term[slot];
-            let psi_lo = if is_pure_duchon_aniso_term(spec, term_idx) {
-                options_lo
-            } else {
-                spatial_term_psi_bounds(data, spec, term_idx, options).0
-            };
-            let axis_offsets = if is_pure_duchon_aniso_term(spec, term_idx) || d <= 1 {
-                vec![0.0; d]
-            } else {
-                get_spatial_aniso_log_scales(spec, term_idx)
-                    .filter(|eta| eta.len() == d)
-                    .map(|eta| center_aniso_log_scales(&eta))
-                    .unwrap_or_else(|| vec![0.0; d])
-            };
-            for offset in 0..d {
-                values[cursor + offset] = psi_lo + axis_offsets[offset];
-            }
-            cursor += d;
-        }
-        Self {
-            values,
-            dims_per_term: dims_per_term.to_vec(),
-        }
+        Self::aniso_bounds_from_data(data, spec, term_indices, dims_per_term, options, AnisoBoundEnd::Lower)
     }
 
     /// Anisotropic-aware upper bounds derived from per-term data geometry.
@@ -1914,17 +1886,40 @@ impl SpatialLogKappaCoords {
         dims_per_term: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
+        Self::aniso_bounds_from_data(data, spec, term_indices, dims_per_term, options, AnisoBoundEnd::Upper)
+    }
+
+    /// Shared implementation for the lower/upper aniso bounds. The bound end
+    /// only changes which options scale (`max_length_scale` vs
+    /// `min_length_scale`) becomes the pure-Duchon fallback bound and which
+    /// element of the `(lo, hi)` data-geometry tuple is consumed; the
+    /// per-term cursor walk and aniso-offset handling are identical.
+    fn aniso_bounds_from_data(
+        data: ArrayView2<'_, f64>,
+        spec: &TermCollectionSpec,
+        term_indices: &[usize],
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+        end: AnisoBoundEnd,
+    ) -> Self {
         debug_assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
-        let options_hi = -options.min_length_scale.ln();
+        let options_psi = match end {
+            AnisoBoundEnd::Lower => -options.max_length_scale.ln(),
+            AnisoBoundEnd::Upper => -options.min_length_scale.ln(),
+        };
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let d = dims_per_term[slot];
-            let psi_hi = if is_pure_duchon_aniso_term(spec, term_idx) {
-                options_hi
+            let psi_bound = if is_pure_duchon_aniso_term(spec, term_idx) {
+                options_psi
             } else {
-                spatial_term_psi_bounds(data, spec, term_idx, options).1
+                let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
+                match end {
+                    AnisoBoundEnd::Lower => lo,
+                    AnisoBoundEnd::Upper => hi,
+                }
             };
             let axis_offsets = if is_pure_duchon_aniso_term(spec, term_idx) || d <= 1 {
                 vec![0.0; d]
@@ -1935,7 +1930,7 @@ impl SpatialLogKappaCoords {
                     .unwrap_or_else(|| vec![0.0; d])
             };
             for offset in 0..d {
-                values[cursor + offset] = psi_hi + axis_offsets[offset];
+                values[cursor + offset] = psi_bound + axis_offsets[offset];
             }
             cursor += d;
         }
