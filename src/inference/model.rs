@@ -8,6 +8,7 @@ use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
+use crate::families::survival_location_scale::ResidualDistribution;
 use crate::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message,
 };
@@ -309,7 +310,7 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
-    pub survival_distribution: Option<String>,
+    pub survival_distribution: Option<ResidualDistribution>,
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
     /// Per-column (min, max) of the training input matrix, parallel to
@@ -671,7 +672,7 @@ pub enum FittedFamily {
         #[serde(default)]
         survival_likelihood: Option<String>,
         #[serde(default)]
-        survival_distribution: Option<String>,
+        survival_distribution: Option<ResidualDistribution>,
         frailty: FrailtySpec,
     },
     LatentSurvival {
@@ -3360,7 +3361,7 @@ mod tests {
             FittedFamily::Survival {
                 likelihood: LikelihoodFamily::RoystonParmar,
                 survival_likelihood: Some("marginal-slope".to_string()),
-                survival_distribution: Some("probit".to_string()),
+                survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: FrailtySpec::None,
             },
             "survival".to_string(),
@@ -3368,7 +3369,7 @@ mod tests {
         payload.fit_result = Some(fit.clone());
         payload.unified = Some(fit);
         payload.survival_likelihood = Some("marginal-slope".to_string());
-        payload.survival_distribution = Some("probit".to_string());
+        payload.survival_distribution = Some(ResidualDistribution::Gaussian);
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.data_schema = Some(DataSchema {
             columns: vec![SchemaColumn {

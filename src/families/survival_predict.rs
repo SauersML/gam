@@ -1978,10 +1978,17 @@ pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<In
     if let Some(link) = model.link.as_ref() {
         return Ok(link.clone());
     }
-    let raw = model
-        .survival_distribution
-        .as_deref()
-        .ok_or_else(|| "saved survival model is missing link/distribution metadata".to_string())?;
+    if let Some(dist) = model.survival_distribution {
+        return Ok(residual_distribution_inverse_link(dist));
+    }
+    return Err("saved survival model is missing link/distribution metadata".to_string());
+    // Unreachable below — retained only to preserve the rest of the function's
+    // structure for the legacy non-link reader path, which can no longer be
+    // exercised now that the typed `survival_distribution` field is a
+    // `ResidualDistribution` and all writers populate `payload.link`.
+    #[allow(unreachable_code)]
+    {
+    let raw: &str = "";
     let name = raw.trim().to_ascii_lowercase();
     if name == "loglog" || name == "cauchit" {
         let component = if name == "loglog" {
