@@ -174,7 +174,7 @@ pub struct FittedModelPayload {
     pub unified: Option<UnifiedFitResult>,
     #[serde(default)]
     pub data_schema: Option<DataSchema>,
-    pub link: Option<String>,
+    pub link: Option<InverseLink>,
     #[serde(default)]
     pub mixture_link_param_covariance: Option<Vec<Vec<f64>>>,
     #[serde(default)]
@@ -3349,7 +3349,7 @@ mod tests {
         payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
         payload.marginal_baseline = Some(0.0);
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload
     }
 
@@ -3385,7 +3385,7 @@ mod tests {
         payload.z_column = Some("z".to_string());
         payload.latent_z_normalization = Some(SavedLatentZNormalization { mean: 0.0, sd: 1.0 });
         payload.logslope_baseline = Some(0.0);
-        payload.link = Some("probit".to_string());
+        payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
         payload
     }
 
