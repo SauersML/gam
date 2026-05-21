@@ -27817,8 +27817,15 @@ mod tests {
         }
     }
 
+    /// Scale-free Duchon (length_scale = None) emits the operator-triplet
+    /// (mass + tension + stiffness) when the user spec leaves all three
+    /// active. The Duchon polyharmonic basis itself is scale-free, but the
+    /// triplet is a perfectly valid quadratic-form penalty on the basis
+    /// coefficients — three independent Lebesgue functionals on `f`, with
+    /// implicit unit-conversion length scales living in the penalty
+    /// (Type B), never in the kernel (Type A).
     #[test]
-    fn test_build_scale_free_duchon_basis_uses_native_kernel_penalty() {
+    fn test_build_duchon_basis_uses_operator_penalty_triplet() {
         let data = array![
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
@@ -27837,10 +27844,21 @@ mod tests {
             periodic: false,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 1);
-        assert_eq!(out.penaltyinfo.len(), 1);
+        assert_eq!(out.penalties.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 3);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
+        assert!(matches!(
+            out.penaltyinfo[0].source,
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penaltyinfo[1].source,
+            PenaltySource::OperatorTension
+        ));
+        assert!(matches!(
+            out.penaltyinfo[2].source,
+            PenaltySource::OperatorStiffness
+        ));
     }
 
     #[test]
