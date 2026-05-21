@@ -57,7 +57,13 @@ from ._api import (
 from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
-from ._model import CompetingRisksPrediction, Model, SurvivalPrediction
+from ._model import (
+    CompetingRisksCIF,
+    CompetingRisksPrediction,
+    Model,
+    SurvivalPrediction,
+    competing_risks_cif,
+)
 from ._response_geometry import (
     ResponseGeometryModel,
     alr,
