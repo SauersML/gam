@@ -18485,34 +18485,6 @@ fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
         ridge,
         ridge_policy,
     )
-    .map(|residual| {
-        residual.map(|raw_residual| {
-            let block_constraints =
-                collect_block_linear_constraints(family, states, specs).unwrap_or_default();
-            if block_constraints.len() != states.len() {
-                return raw_residual;
-            }
-            let mut projected_residual = Array1::<f64>::zeros(raw_residual.len());
-            let mut offset = 0usize;
-            for b in 0..states.len() {
-                let width = specs[b].design.ncols();
-                let start = offset;
-                let end = offset + width;
-                let raw_block = raw_residual.slice(ndarray::s![start..end]).to_owned();
-                let projected = projected_stationarity_vector(
-                    &raw_block,
-                    &states[b].beta,
-                    block_constraints[b].as_ref(),
-                    None,
-                );
-                projected_residual
-                    .slice_mut(ndarray::s![start..end])
-                    .assign(&projected);
-                offset = end;
-            }
-            projected_residual
-        })
-    })
 }
 
 fn exact_newton_joint_kkt_residual_for_ift_from_gradient(
