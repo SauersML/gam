@@ -7044,27 +7044,31 @@ pub fn reml_laml_evaluate(
         crate::solver::outer_strategy::HessianResult::Unavailable
     };
 
-    // Sanity check: a finite-precision smooth function f : ℝᵏ → ℝ with
-    // |f| ≈ |cost| cannot legitimately report an analytic gradient component
-    // whose magnitude exceeds what a step the outer optimizer can *resolve*
-    // would predict. The smallest meaningful step in ρ-space is roughly
-    // √ε · max(1, |ρ_k|) (below that, f(ρ+δ) − f(ρ) is buried in floating-
-    // point noise of cost itself). Along that step the gradient predicts a
-    // cost change of |g_k| · √ε. If that predicted change exceeds |cost|,
-    // the gradient is internally inconsistent with the function it claims to
-    // differentiate: the optimizer would step, the function would not move,
-    // every trust-region attempt would be rejected, and TR collapses to its
-    // floor — the exact failure mode observed on biobank-scale survival
-    // marginal-slope fits where the inner solver exited the noise-floor KKT
-    // certificate (custom_family.rs:12037) with a non-zero β-gradient
-    // residual on a coordinate whose H block was poorly conditioned, leaving
-    // an unmodeled IFT correction (-H⁻¹ · residual) baked into the envelope
-    // formula.  Log a single line so a later run correlates the warning with
-    // TrustRegionRejectFloor downstream.  Threshold is `ratio > 4` rather
-    // than `> 1` so a healthy near-stationary gradient (|g|∞ comparable to
-    // √ε · |cost|, ratio ≈ 1) does not trip it; only gradients overshooting
-    // by ≥ 4× the function magnitude — orders of magnitude past anything an
-    // honest IFT correction would explain — fire.
+    // Envelope-gradient sanity check.
+    //
+    // The gradient assembled above is the envelope-theorem expression
+    //   ∂V/∂ρ_k = ½ λ_k β̂ᵀ S_k β̂ + ½ λ_k tr(H⁻¹ S_k) − ½ λ_k tr(S⁺ S_k),
+    // which holds when β̂ satisfies the inner KKT condition ∇_β L_pen(β̂)=0.
+    // The principled total derivative at non-zero KKT residual r is
+    //   dV/dρ_k = (envelope)  −  rᵀ · v_k,    v_k := λ_k H⁻¹ S_k β̂
+    // (rho_v_ks at line ~6328 above already computes the v_k vectors).
+    // When the inner exits via the noise-floor KKT certificate
+    // (custom_family.rs:12037) with ‖r‖ > 0 on a coordinate whose H block
+    // is poorly conditioned, the dropped rᵀ v_k term inflates by ‖H⁻¹‖·‖r‖
+    // and the envelope formula reports a gradient component orders of
+    // magnitude past anything the function itself can produce — the exact
+    // failure mode on biobank-scale survival marginal-slope fits.
+    //
+    // Until the residual vector r is plumbed through InnerAssembly so the
+    // rᵀ v_k correction can be applied, detect the pathology after the fact:
+    // a smooth function with |f| ≈ |cost| cannot legitimately report an
+    // analytic gradient component whose √ε·|g_k| predicted change exceeds
+    // the function's own magnitude (anything smaller than √ε·|cost| is
+    // buried in f's floating-point noise — the outer optimizer literally
+    // cannot resolve a step that small as moving the function). Marking
+    // gradient unavailable on detection trades a 70-minute silent TR
+    // collapse for a fast, named, actionable failure. Threshold ratio>4
+    // keeps a healthy gradient (|g|∞ ≈ √ε·|cost|, ratio≈1) from tripping.
     let cost_scale = cost.abs().max(1.0);
     let resolve_step = f64::EPSILON.sqrt();
     let envelope_inconsistent = grad
