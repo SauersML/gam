@@ -22782,7 +22782,7 @@ pub mod closed_form_penalty {
             let block = if kappa_factor == 0.0 {
                 None
             } else {
-                Some(riesz_block_radial_derivatives(d, base + n, r, max_order))
+                Some(riesz_block_radial_derivatives(d, (base + n) as f64, r, max_order))
             };
             let term_norm = block
                 .as_ref()
@@ -23469,33 +23469,36 @@ pub mod closed_form_penalty {
     /// Radial derivatives `[R^{(0)}, …, R^{(max_order)}]` of a single
     /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
     /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
-    fn riesz_block_radial_derivatives(d: usize, j: usize, r: f64, max_order: usize) -> Vec<f64> {
+    fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
         assert!(d >= 1);
-        assert!(j >= 1);
+        assert!(j.is_finite() && j >= 1.0, "riesz_block: need j ≥ 1, got {j}");
         assert!(r > 0.0);
 
-        let two_j = 2 * j;
+        let two_j = 2.0 * j;
         let half_d = d as f64 / 2.0;
         let mut out = Vec::with_capacity(max_order + 1);
 
-        if two_j >= d && (two_j - d) % 2 == 0 {
-            // Log case: R_j^d(r) = c · r^{2n} · (ln(r) + A_n), with the
-            // canonical finite-part shift chosen by
-            // Δ R_{d/2+n}^d = -R_{d/2+n-1}^d.
-            let n = (two_j - d) / 2;
+        // Log case detection: `2j − d` is a non-negative even integer
+        // (within ε). For fractional `j` this never fires.
+        const LOG_EPS: f64 = 1e-12;
+        let offset = two_j - d as f64;
+        let log_case = offset >= -LOG_EPS && {
+            let n_f = (offset / 2.0).round();
+            n_f >= 0.0 && (n_f * 2.0 - offset).abs() < LOG_EPS
+        };
+        if log_case {
+            // R_j^d(r) = c · r^{2n} · (ln r + A_n).
+            let n_f = (offset / 2.0).round();
+            let n = n_f as usize;
+            let two_j_i = two_j.round() as i32;
             let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
-            let denom = 2.0_f64.powi((two_j - 1) as i32)
+            let denom = 2.0_f64.powi(two_j_i - 1)
                 * std::f64::consts::PI.powf(d as f64 / 2.0)
-                * gamma_fn(j as f64)
+                * gamma_fn(j)
                 * factorial_f64(n);
             let c = sign / denom;
             let two_n = 2 * n;
             let shift = log_riesz_finite_part_shift(d, n);
-            // (r^{2n} · (ln r + A_n))^{(k)}
-            // = Σ C(k,i) (r^{2n})^{(i)} ((ln r + A_n))^{(k-i)}
-            // (r^{2n})^{(i)} = falling_fact(2n, i) · r^{2n - i} for i ≤ 2n; else 0
-            // (ln r + A_n)^{(0)} = ln r + A_n
-            // (ln r)^{(j)} = (-1)^{j-1} (j-1)! r^{-j} for j ≥ 1
             for k in 0..=max_order {
                 let mut sum = 0.0_f64;
                 for i in 0..=k {
@@ -23522,21 +23525,19 @@ pub mod closed_form_penalty {
             return out;
         }
 
-        // Non-log case: c · r^p with p = 2j - d (integer exponent — both
-        // 2j and d are integers, so all successive derivatives keep the
-        // exponent integer-valued). Use `powi` for ~5–10× speedup over
-        // the transcendental `powf` on this hot path.
-        let c = gamma_fn(half_d - j as f64)
-            / (4.0_f64.powi(j as i32) * std::f64::consts::PI.powf(half_d) * gamma_fn(j as f64));
-        let p_int: i32 = 2 * j as i32 - d as i32;
+        // Non-log case: c · r^p with p = 2j − d (real-valued for fractional
+        // j). Successive derivatives multiply by the current exponent and
+        // decrement it by 1; with non-integer p we use `powf` throughout.
+        let c = gamma_fn(half_d - j)
+            / (4.0_f64.powf(j) * std::f64::consts::PI.powf(half_d) * gamma_fn(j));
         let mut coef = c;
-        let mut exp_i: i32 = p_int;
-        out.push(coef * r.powi(exp_i));
+        let mut exp = 2.0 * j - d as f64;
+        out.push(coef * r.powf(exp));
         for _ in 0..max_order {
-            // d/dr[c · r^p] = c·p · r^{p-1}
-            coef *= exp_i as f64;
-            exp_i -= 1;
-            out.push(coef * r.powi(exp_i));
+            // d/dr[c · r^p] = c·p · r^{p−1}
+            coef *= exp;
+            exp -= 1.0;
+            out.push(coef * r.powf(exp));
         }
         out
     }
@@ -23545,14 +23546,7 @@ pub mod closed_form_penalty {
     /// isotropic Duchon kernel `f(R) = isotropic_duchon_penalty(0, d, m, s as f64, κ, R)`.
     ///
     /// Used by the radial-derivative anisotropic form.  Requires `R > 0`.
-    pub fn radial_derivatives_of_isotropic_duchon(
-        d: usize,
-        m: usize,
-        s: usize,
-        kappa: f64,
-        r: f64,
-        max_order: usize,
-    ) -> Vec<f64> {
+    pub fn radial_derivatives_of_isotropic_duchon(d: usize, m: usize, (s: f64) as f64, kappa: f64, r: f64, max_order: usize, ) -> Vec<f64> {
         assert!(
             r > 0.0,
             "radial_derivatives_of_isotropic_duchon: r must be > 0"
@@ -23565,18 +23559,36 @@ pub mod closed_form_penalty {
             max_order <= 6,
             "radial_derivatives_of_isotropic_duchon: max_order ≤ 6"
         );
+        assert!(
+            s.is_finite() && s >= 0.0,
+            "radial_derivatives_of_isotropic_duchon: s must be finite and ≥ 0, got {s}"
+        );
 
         // a = 2m (we differentiate f = isotropic Duchon at q=0; the q is
         // applied externally via Δ_B^q in g_q).  Match isotropic_duchon_penalty(q=0).
         let a = 2 * m;
 
-        if s == 0 {
+        if s == 0.0 {
             // Pure Riesz: f = R_{a}^d(r)
-            return riesz_block_radial_derivatives(d, a, r, max_order);
+            return riesz_block_radial_derivatives(d, a as f64, r, max_order);
         }
         if kappa == 0.0 {
-            return riesz_block_radial_derivatives(d, a + 2 * s, r, max_order);
+            // Scale-free Duchon with fractional s rides directly into the
+            // Riesz block-derivatives at the real-valued block order
+            // `j = a + 2s` — `riesz_block_radial_derivatives` already
+            // accepts fractional `j` via `r.powf(2j − d)` and the
+            // log-case detector ε-bounds.
+            return riesz_block_radial_derivatives(d, a as f64 + 2.0 * s, r, max_order);
         }
+
+        // Hybrid Matérn-blend (κ > 0) still uses the integer partial-fraction
+        // chain below; reject fractional s up front rather than truncating
+        // silently.
+        assert!(
+            s.fract() == 0.0,
+            "radial_derivatives_of_isotropic_duchon: hybrid Matérn (κ > 0) requires integer s, got {s}"
+        );
+        let s = s as usize;
 
         // Hybrid case (s ≥ 1, κ > 0). Three charts in priority order:
         //
@@ -23626,7 +23638,7 @@ pub mod closed_form_penalty {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
-            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            let block = riesz_block_radial_derivatives(d, (j) as f64, r, max_order);
             for (k, v) in block.into_iter().enumerate() {
                 let term = coeff * v;
                 total_acc[k].add(term);
@@ -23827,7 +23839,7 @@ pub mod closed_form_penalty {
         // finite-part Riesz series when κR is small. That keeps q>0 values and
         // η/κ derivatives on one analytic representative.
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order);
 
         match q {
             0 => fr[0],
@@ -23857,7 +23869,7 @@ pub mod closed_form_penalty {
 
         let big_r = (b * euclidean_r2).sqrt();
         let max_order = if q == 0 { 0 } else { 2 * q };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order);
         let big_r2 = big_r * big_r;
         let s1 = (d as f64) * b;
         let s2 = (d as f64) * b * b;
@@ -24109,7 +24121,7 @@ pub mod closed_form_penalty {
             let binom = binomial_f64(a + b - j - 1, a - j);
             let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
             let a_j_prime = -(2.0 * n_j as f64 / kappa) * a_j;
-            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            let block = riesz_block_radial_derivatives(d, (j) as f64, r, max_order);
             for (k, v) in block.into_iter().enumerate() {
                 total[k].add(a_j_prime * v);
             }
@@ -24177,7 +24189,7 @@ pub mod closed_form_penalty {
             let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
             let nj_f = n_j as f64;
             let a_j_dd = (2.0 * nj_f * (2.0 * nj_f + 1.0) / kappa_sq) * a_j;
-            let block = riesz_block_radial_derivatives(d, j, r, max_order);
+            let block = riesz_block_radial_derivatives(d, (j) as f64, r, max_order);
             for (k, v) in block.into_iter().enumerate() {
                 total[k].add(a_j_dd * v);
             }
@@ -24573,7 +24585,7 @@ pub mod closed_form_penalty {
         let max_order_h = (2 * q + 2).min(6);
         let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
             aniso_invariants_eta_jacobian_with_powers(eta, r, powers);
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order_h);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
         let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
         let big_j = eta.iter().sum::<f64>().exp();
         let value = big_j * g;
@@ -33669,7 +33681,7 @@ mod tests {
         let expected_dkk = finite_part_series(d, a, b, kappa, r, max_order, 2);
 
         let value = isotropic_duchon_penalty(0, d, m, s as f64, kappa, r);
-        let radial = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, max_order);
+        let radial = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, r, max_order);
         let dk = radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order);
         let dkk =
             radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order);
@@ -33814,7 +33826,7 @@ mod tests {
     ) -> f64 {
         use super::closed_form_penalty::radial_derivatives_of_isotropic_duchon;
 
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 2 * q);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, 2 * q);
         match q {
             0 => fr[0],
             1 => -(fr[2] + ((d as f64) - 1.0) * fr[1] / big_r),
@@ -34082,7 +34094,7 @@ mod tests {
         let r = 0.7_f64;
         let h = 1e-3_f64;
 
-        let derivs = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, 4);
+        let derivs = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, r, 4);
         // Cross-check derivs[0] against isotropic_duchon_penalty(q=0, …)
         let f0 = isotropic_duchon_penalty(0, d, m, s as f64, kappa, r);
         assert!(
@@ -34451,7 +34463,7 @@ mod tests {
                     u2 += b * b * b * rk2;
                 }
                 let big_r = r2.sqrt();
-                let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
+                let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, 4);
 
                 let r1 = big_r;
                 let r2p = r1 * r1;
@@ -34497,7 +34509,7 @@ mod tests {
 
                 let g2 = anisotropic_duchon_penalty_radial(2, m, s, kappa, &eta, &r);
 
-                let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, 4);
+                let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, 4);
                 let r1 = big_r;
                 let r2 = r1 * r1;
                 let r3 = r2 * r1;
