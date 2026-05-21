@@ -1,6 +1,6 @@
 [package]
 name = "gam-pyffi"
-version = "0.1.96"
+version = "0.1.97"
 edition = "2024"
 rust-version = "1.93"
 publish = false
