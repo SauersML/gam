@@ -27449,7 +27449,10 @@ mod tests {
         // With auto_outer_subsample = false the guard short-circuits; a
         // fresh family's counter must remain at 0 across many calls.
         let family_off = make_block_psi_test_family(n);
-        let opts_off = BlockwiseFitOptions::default();
+        let opts_off = BlockwiseFitOptions {
+            auto_outer_subsample: false,
+            ..BlockwiseFitOptions::default()
+        };
         for step in 0..5 {
             let rho_step = Array1::<f64>::from_elem(rho_dim, step as f64 * 0.1);
             family_off
