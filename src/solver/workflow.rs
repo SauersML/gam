@@ -2755,7 +2755,7 @@ fn materialize_standard<'a>(
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
-    let latent_cloglog = if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+    let latent_cloglog = if family.is_latent_cloglog() {
         let sigma = match config.frailty.clone().unwrap_or(FrailtySpec::None) {
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(sigma),
@@ -3989,7 +3989,7 @@ fn materialize_location_scale<'a>(
         double_penalty: cfg.double_penalty,
     });
 
-    if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
+    if family.is_latent_cloglog() {
         return Err(
             "latent-cloglog-binomial is not implemented for location-scale fitting".to_string(),
         );

@@ -8170,7 +8170,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     let sas_link_state = options
         .sas_link
         .map(|spec| {
-            if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
+            if family.is_binomial_beta_logistic() {
                 state_from_beta_logisticspec(spec)
             } else {
                 state_from_sasspec(spec)
@@ -9111,7 +9111,7 @@ fn evaluate_standard_familyobservations(
                     Some(InverseLink::Mixture(state.clone()))
                 } else if let Some(state) = sas_link_state {
                     Some(
-                        if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
+                        if family.is_binomial_beta_logistic() {
                             InverseLink::BetaLogistic(*state)
                         } else {
                             InverseLink::Sas(*state)
@@ -11066,7 +11066,7 @@ fn fit_bounded_term_collection_with_design(
         sas_link_state: options
             .sas_link
             .map(|spec| {
-                if matches!(family, LikelihoodFamily::BinomialBetaLogistic) {
+                if family.is_binomial_beta_logistic() {
                     state_from_beta_logisticspec(spec)
                 } else {
                     state_from_sasspec(spec)
