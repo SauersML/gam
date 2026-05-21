@@ -5396,17 +5396,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    /// Install the inner KKT residual r = ∇_β L_pen(β̂) at the converged
-    /// β̂. When `Some`, activates the implicit-function-theorem corrections
-    /// to the LAML cost and gradient in `reml_laml_evaluate` that absorb
-    /// the inner solver's residual KKT error (see
-    /// `InnerSolution::kkt_residual`).
-    #[allow(dead_code)]
-    pub fn kkt_residual(mut self, residual: Option<Array1<f64>>) -> Self {
-        self.kkt_residual = residual;
-        self
-    }
-
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
@@ -5442,7 +5431,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: self.rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
             barrier_config: self.barrier_config,
-            kkt_residual: self.kkt_residual,
         }
     }
 }
