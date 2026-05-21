@@ -2813,13 +2813,16 @@ impl DuchonBasisSpec {
     /// read `spec.power` as a `usize`; future fractional support replaces
     /// the call sites with a paired f64 path.
     pub fn power_as_usize(&self) -> usize {
-        let p = self.power;
-        assert!(
-            p.is_finite() && p >= 0.0 && p.fract() == 0.0,
-            "DuchonBasisSpec.power = {p}: fractional / non-integer values are not yet supported by the integer-only downstream chain; pass an integer value (e.g. `1.0`, `2.0`)"
-        );
-        p as usize
+        duchon_power_to_usize(self.power)
     }
+}
+
+fn duchon_power_to_usize(power: f64) -> usize {
+    assert!(
+        power.is_finite() && power >= 0.0 && power.fract() == 0.0,
+        "DuchonBasisSpec.power = {power}: fractional / non-integer values are not yet supported by the integer-only downstream chain; pass an integer value (e.g. `1.0`, `2.0`)"
+    );
+    power as usize
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9351,7 +9354,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
     assert_eq!(dim, d);
 
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = power;
+    let s_order = duchon_power_to_usize(power);
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
@@ -9359,9 +9362,10 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         d,
         duchon_max_active_operator_derivative_order(operator_penalties),
     )?;
-    let coeffs = length_scale
-        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
-    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
+    let coeffs = length_scale.map(|scale| {
+        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / scale.max(1e-300))
+    });
+    let pure_block_order = pure_duchon_block_order(p_order, s_order) as usize;
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let z_cols = z_kernel.ncols();
@@ -9942,7 +9946,7 @@ fn duchon_kernel_radial_triplet(
     // operator scalars (q, lap, t) in the penalty code.
     let triplet = match length_scale {
         None => {
-            let m = pure_duchon_block_order(p_order, s_order as f64) as usize;
+            let m = pure_duchon_block_order(p_order, s_order) as usize;
             polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
@@ -9956,7 +9960,7 @@ fn duchon_kernel_radial_triplet(
             let coeffs_ref = match coeffs {
                 Some(c) => c,
                 None => {
-                    coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+                    coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
                     &coeffs_local
                 }
             };
@@ -11809,7 +11813,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
 ) -> Result<CollocationOperatorMatrices, BasisError> {
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = power;
+    let s_order = duchon_power_to_usize(power);
     let p_colloc = centers.nrows();
     let dim = centers.ncols();
     validate_duchon_collocation_orders(
@@ -11827,8 +11831,9 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             )));
         }
     }
-    let coeffs = length_scale
-        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
+    let coeffs = length_scale.map(|scale| {
+        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / scale.max(1e-300))
+    });
     let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(centered_aniso_metric_weights);
     let row_scales = if let Some(w) = collocationweights {
         if w.len() != p_colloc {
@@ -12834,7 +12839,7 @@ fn duchon_matern_kernel_general_from_distance(
     let coeffs_ref = if let Some(c) = coeffs {
         c
     } else {
-        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
         &coeffs_local
     };
     let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
@@ -15546,7 +15551,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
         centers.ncols(),
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let p = centers.nrows();
@@ -15905,7 +15910,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
         data,
         centers.view(),
         spec.length_scale,
-        spec.power_as_usize(),
+        spec.power,
         spec.nullspace_order,
         spec.aniso_log_scales.as_deref(),
         workspace,
@@ -16023,7 +16028,8 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
+    let coeffs =
+        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -16669,7 +16675,7 @@ fn build_duchon_design_psi_aniso_derivatives(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale.max(1e-300);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
 
     // Z_kernel: null-space constraint projection for Duchon polynomial conditions.
     let z_kernel =
@@ -16844,7 +16850,7 @@ fn build_pure_duchon_basis_log_kappa_aniso_derivatives(
         dim,
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
-    let block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
+    let block_order = pure_duchon_block_order(p_order, s_order) as usize;
     let mut design_result = build_aniso_design_psi_derivatives_shared(
         data,
         centers.view(),
@@ -18127,7 +18133,7 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
@@ -18307,7 +18313,7 @@ pub fn create_duchon_spline_basiswithworkspace(
     // Gram matrix is built with the same nullspace as the design.
     let nullspace_order = design.nullspace_order;
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = power;
+    let s_order = duchon_power_to_usize(power);
     let d = centers.ncols();
     let k = centers.nrows();
     let coeffs = if let Some(ls) = length_scale {
@@ -18542,7 +18548,7 @@ fn build_duchon_basis_designwithworkspace(
     // to span the requested polynomial block; emits a warning inside the helper.
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
-    let s_order = power;
+    let s_order = duchon_power_to_usize(power);
     validate_duchon_kernel_orders(length_scale, p_order, s_order as f64, d)?;
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
@@ -18728,7 +18734,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
         duchon_effective_nullspace_order(center_matrix.view(), nullspace_order)
     };
     let p_order = duchon_p_from_nullspace_order(effective_order);
-    let s_order = power;
+    let s_order = duchon_power_to_usize(power);
     validate_duchon_kernel_orders(None, p_order, s_order as f64, 1)?;
     let z =
         kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
@@ -19023,7 +19029,7 @@ fn build_periodic_duchon_basis_1d(
     let mut basis = Array2::<f64>::zeros((data.nrows(), kernel_cols + 1));
     let coeffs = spec
         .length_scale
-        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls.max(1e-300)));
     let pure_poly_coeff = if spec.length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
             (pure_duchon_block_order(p_order, s_order as f64)) as f64,
@@ -19247,8 +19253,9 @@ pub fn build_duchon_basiswithworkspace(
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
         let s_order = spec.power_as_usize();
         let length_scale = spec.length_scale;
-        let coeffs = length_scale
-            .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
+        let coeffs = length_scale.map(|ls| {
+            duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls.max(1e-300))
+        });
         let pure_poly_coeff = if length_scale.is_none() {
             Some(PolyharmonicBlockCoeff::new(
                 (pure_duchon_block_order(p_order, s_order as f64)) as f64,
@@ -19350,7 +19357,7 @@ pub fn build_duchon_basiswithworkspace(
             data,
             centers.view(),
             spec.length_scale,
-            spec.power_as_usize(),
+            spec.power,
             effective_nullspace_order,
             aniso.as_deref(),
             workspace,
@@ -29272,7 +29279,7 @@ mod tests {
         let s_order = 1usize;
         let dim = 3usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let got = duchon_matern_kernel_general_from_distance(
             0.0,
             Some(length_scale),
@@ -29342,7 +29349,7 @@ mod tests {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 2usize;
         let dim = 2usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0);
         let weights = [4.0, 0.25];
         let sum_weights = weights.iter().sum::<f64>();
 
@@ -29814,7 +29821,7 @@ mod tests {
         let p_order = 2usize;
         let s_order = power;
         let d = 1usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let z_kernel =
             kernel_constraint_nullspace(centers.view(), nullspace_order, &mut workspace.cache)
                 .expect("z kernel");
@@ -30628,8 +30635,8 @@ mod tests {
         let scaled_r = scale * r;
         let delta = duchon_scaling_exponent(p_order, s_order, k_dim);
 
-        let coeffs_1 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_1);
-        let coeffs_2 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_2);
+        let coeffs_1 = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa_1);
+        let coeffs_2 = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa_2);
 
         let phi_1 = duchon_matern_kernel_general_from_distance(
             scaled_r,
@@ -30710,7 +30717,7 @@ mod tests {
         let k_dim = 4usize;
         let length_scale = 0.85;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
 
         let core =
             duchon_radial_core_psi_triplet(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
@@ -30733,8 +30740,9 @@ mod tests {
         let eps = 2e-5_f64;
         let ls_plus = 1.0 / (kappa * eps.exp());
         let ls_minus = 1.0 / (kappa * (-eps).exp());
-        let coeffs_plus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_plus);
-        let coeffs_minus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_minus);
+        let coeffs_plus = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls_plus);
+        let coeffs_minus =
+            duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls_minus);
         let (phi_rr_plus, _, _) =
             duchonphi_rr_collision_psi_triplet(ls_plus, p_order, s_order, k_dim, &coeffs_plus)
                 .expect("plus collision phi_rr");
@@ -30759,7 +30767,7 @@ mod tests {
         let k_dim = 2usize;
         let length_scale = 0.9_f64;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr triplet");
@@ -30767,7 +30775,7 @@ mod tests {
         let eps = 2.0e-5_f64;
         let at = |psi_step: f64| -> f64 {
             let ls = 1.0 / (kappa * psi_step.exp());
-            let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls);
+            let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls);
             duchonphi_rr_collision_psi_triplet(ls, p_order, s_order, k_dim, &coeffs_step)
                 .expect("collision phi_rr at perturbed kappa")
                 .0
@@ -30795,7 +30803,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
         let (phi_rr, _, _) =
@@ -30823,7 +30831,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
         let (phi_rr, _, _) =
@@ -30844,7 +30852,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
 
         for &r in &[0.01, 0.1, 0.5, 1.0, 2.0] {
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
@@ -30875,7 +30883,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
 
         for &r in &[0.1, 0.5, 1.0, 2.0] {
             let eps = 1e-3 * r;
@@ -30931,7 +30939,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
 
         for &r in &[0.1_f64, 0.5, 1.0, 2.0] {
             let h = 1e-2 * r.max(1e-6);
@@ -30972,7 +30980,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
 
         let jets_0 = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
@@ -31001,7 +31009,7 @@ mod tests {
         let s_order = 5usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let t_rr_collision =
             duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi''''''")
@@ -31029,7 +31037,7 @@ mod tests {
         let k_dim = 16usize;
         let length_scale = 1.0;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
         let r = 1e-5;
 
         let jets =
@@ -31056,7 +31064,7 @@ mod tests {
         let s_order = 1usize;
         let k_dim = 16usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale;
         let r_small = 0.25 * r_floor;
 
@@ -31081,7 +31089,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 16usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let r = 1e-5;
 
         let jets =
@@ -31106,7 +31114,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let (_, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             0.0,
             Some(length_scale),
@@ -32009,7 +32017,7 @@ mod tests {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let dim = 4usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
@@ -32054,7 +32062,7 @@ mod tests {
         let p_order = 1usize;
         let s_order = 4usize;
         let dim = 10usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
@@ -32099,7 +32107,7 @@ mod tests {
         let p_order = 1usize;
         let s_order = 0usize;
         let dim = 3usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
