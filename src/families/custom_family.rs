@@ -871,6 +871,64 @@ pub enum BlockWorkingSet {
     },
 }
 
+impl BlockWorkingSet {
+    /// Construct a `Diagonal` working set with the length invariant
+    /// (`working_response.len() == working_weights.len()`) enforced at the
+    /// type boundary. Use this from any new code path that produces a
+    /// diagonal IRLS block; the legacy struct-literal form is preserved for
+    /// existing call sites pending a full migration.
+    #[inline]
+    pub fn diagonal_checked(
+        working_response: Array1<f64>,
+        working_weights: Array1<f64>,
+    ) -> Result<Self, String> {
+        if working_response.len() != working_weights.len() {
+            return Err(format!(
+                "BlockWorkingSet::Diagonal length mismatch: working_response={}, working_weights={}",
+                working_response.len(),
+                working_weights.len(),
+            ));
+        }
+        Ok(Self::Diagonal {
+            working_response,
+            working_weights,
+        })
+    }
+
+    /// Validate that an existing `BlockWorkingSet` satisfies its internal
+    /// invariants. Cheap (one length comparison for the diagonal case);
+    /// useful as a debug-assert at consumer boundaries.
+    #[inline]
+    pub fn check_invariants(&self) -> Result<(), String> {
+        match self {
+            Self::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                if working_response.len() != working_weights.len() {
+                    return Err(format!(
+                        "BlockWorkingSet::Diagonal invariant violated: z.len()={}, w.len()={}",
+                        working_response.len(),
+                        working_weights.len(),
+                    ));
+                }
+            }
+            Self::ExactNewton { gradient, hessian } => {
+                let p = gradient.len();
+                let h_rows = hessian.nrows();
+                let h_cols = hessian.ncols();
+                if h_rows != p || h_cols != p {
+                    return Err(format!(
+                        "BlockWorkingSet::ExactNewton dim mismatch: gradient.len()={p}, \
+                         hessian shape=({h_rows}, {h_cols})"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactNewtonOuterObjective {
     RidgedQuadraticReml,

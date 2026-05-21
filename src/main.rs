@@ -9417,6 +9417,8 @@ mod tests {
                 64,
                 64,
             )
+            // Top-level CLI entry returns Result<_, String>; stringify the typed
+            // monotone-root error here to keep the surrounding pipeline uniform.
             .map_err(|e| e.to_string())?;
             let target_survival = gam::probability::normal_cdf(-q);
             let tail_mass = target_survival.min(1.0 - target_survival).max(0.0);

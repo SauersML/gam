@@ -19,31 +19,25 @@ use crate::families::survival_construction::{
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_distribution,
+    normalize_survival_time_pair, parse_survival_baseline_config,
     parse_survival_likelihood_mode, require_structural_survival_time_basis,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
     survival_likelihood_modename,
 };
 use crate::families::survival_location_scale::residual_distribution_inverse_link;
 use crate::gamlss::buildwiggle_block_input_from_knots;
-use crate::inference::formula_dsl::parse_link_choice;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
 use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
 use crate::linalg::matrix::DesignMatrix;
-use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, state_from_beta_logisticspec, state_from_sasspec,
-    state_fromspec,
-};
+use crate::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{
-    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkSpec, SasLinkSpec,
-};
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
@@ -1978,101 +1972,16 @@ pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<In
     if let Some(link) = model.link.as_ref() {
         return Ok(link.clone());
     }
+    // With the typed `survival_distribution: Option<ResidualDistribution>`
+    // schema, the only legacy-fallback path remaining is reconstructing the
+    // standard residual-distribution inverse link from the typed enum when an
+    // older payload did not set `model.link`. Stateful links (Sas /
+    // BetaLogistic / Mixture / LatentCLogLog) were always written via
+    // `payload.link` and have no `ResidualDistribution` representation.
     if let Some(dist) = model.survival_distribution {
         return Ok(residual_distribution_inverse_link(dist));
     }
-    return Err("saved survival model is missing link/distribution metadata".to_string());
-    // Unreachable below — retained only to preserve the rest of the function's
-    // structure for the legacy non-link reader path, which can no longer be
-    // exercised now that the typed `survival_distribution` field is a
-    // `ResidualDistribution` and all writers populate `payload.link`.
-    #[allow(unreachable_code)]
-    {
-    let raw: &str = "";
-    let name = raw.trim().to_ascii_lowercase();
-    if name == "loglog" || name == "cauchit" {
-        let component = if name == "loglog" {
-            LinkComponent::LogLog
-        } else {
-            LinkComponent::Cauchit
-        };
-        return state_fromspec(&MixtureLinkSpec {
-            components: vec![component],
-            initial_rho: Array1::zeros(0),
-        })
-        .map(InverseLink::Mixture)
-        .map_err(|e| format!("invalid saved survival {name} link state: {e}"));
-    }
-    let choice = match parse_link_choice(Some(raw), false) {
-        Ok(v) => v,
-        Err(_) => {
-            let dist = parse_survival_distribution(raw)?;
-            return Ok(residual_distribution_inverse_link(dist));
-        }
-    };
-    let fit = model
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| "saved survival model is missing fit_result".to_string())?;
-    let Some(choice) = choice else {
-        let dist = parse_survival_distribution(raw)?;
-        return Ok(residual_distribution_inverse_link(dist));
-    };
-    if let Some(components) = choice.mixture_components {
-        let rho = match &fit.fitted_link {
-            FittedLinkState::Mixture { state, .. } => state.rho.clone(),
-            _ => {
-                return Err(
-                    "saved survival blended-link model missing fitted mixture link parameters"
-                        .to_string(),
-                );
-            }
-        };
-        return state_fromspec(&MixtureLinkSpec {
-            components,
-            initial_rho: rho,
-        })
-        .map(InverseLink::Mixture)
-        .map_err(|e| format!("invalid saved survival blended link state: {e}"));
-    }
-    match choice.link {
-        crate::types::LinkFunction::Sas => {
-            let (epsilon, log_delta) = match &fit.fitted_link {
-                FittedLinkState::Sas { state, .. } => (state.epsilon, state.log_delta),
-                _ => {
-                    return Err(
-                        "saved survival SAS model missing fitted SAS link parameters".to_string(),
-                    );
-                }
-            };
-            state_from_sasspec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: log_delta,
-            })
-            .map(InverseLink::Sas)
-            .map_err(|e| format!("invalid saved survival SAS state: {e}"))
-        }
-        crate::types::LinkFunction::BetaLogistic => {
-            let (epsilon, delta) = match &fit.fitted_link {
-                FittedLinkState::BetaLogistic { state, .. } => {
-                    (state.epsilon, state.log_delta)
-                }
-                _ => {
-                    return Err(
-                        "saved survival beta-logistic model missing fitted beta-logistic link parameters"
-                            .to_string(),
-                    )
-                }
-            };
-            state_from_beta_logisticspec(SasLinkSpec {
-                initial_epsilon: epsilon,
-                initial_log_delta: delta,
-            })
-            .map(InverseLink::BetaLogistic)
-            .map_err(|e| format!("invalid saved survival beta-logistic state: {e}"))
-        }
-        other => Ok(InverseLink::Standard(other)),
-    }
+    Err("saved survival model is missing link/distribution metadata".to_string())
 }
 
 /// Concatenate referenced 1-D arrays into a single owned `Array1<f64>`.
