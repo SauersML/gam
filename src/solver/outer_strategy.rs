@@ -8798,10 +8798,14 @@ mod tests {
         }
         impl OuterObjective for RecordingObj {
             fn capability(&self) -> OuterCapability {
+                // Analytic gradient AND analytic Hessian so the planner picks
+                // the same Hessian-bearing path a real fit takes; using
+                // Unavailable here would test a degenerate plan.
                 OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: DeclaredHessianForm::Dense,
                     n_params: 2,
-                    gradient_available: true,
-                    hessian_form: HessianForm::Unavailable,
+                    psi_dim: 0,
                     fixed_point_available: false,
                     barrier_config: None,
                     prefer_gradient_only: false,
@@ -8868,10 +8872,14 @@ mod tests {
         }
         impl OuterObjective for CountingObj {
             fn capability(&self) -> OuterCapability {
+                // Analytic gradient AND analytic Hessian so the planner picks
+                // the same Hessian-bearing path a real fit takes; using
+                // Unavailable here would test a degenerate plan.
                 OuterCapability {
+                    gradient: Derivative::Analytic,
+                    hessian: DeclaredHessianForm::Dense,
                     n_params: 2,
-                    gradient_available: true,
-                    hessian_form: HessianForm::Unavailable,
+                    psi_dim: 0,
                     fixed_point_available: false,
                     barrier_config: None,
                     prefer_gradient_only: false,
