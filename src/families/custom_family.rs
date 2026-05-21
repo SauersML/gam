@@ -2657,7 +2657,7 @@ impl Default for BlockwiseFitOptions {
             inner_tol: 1e-6,
             outer_max_iter: 60,
             outer_tol: 1e-5,
-            minweight: 1e-12,
+            minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             // `ridge_floor` is an ExplicitPrior in the canonical
             // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):
             // its δ enters the quadratic term, the Laplace Hessian, and the
@@ -2667,7 +2667,7 @@ impl Default for BlockwiseFitOptions {
             // wanting solver-only damping should construct a custom policy
             // (or, preferably, a `StabilizationLedger::numerical_perturbation`)
             // rather than reusing this field.
-            ridge_floor: 1e-12,
+            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
             ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
             use_remlobjective: true,
             // Default ON: families expose exact outer Hessians whenever their
@@ -7741,7 +7741,7 @@ fn stable_logdet_with_ridge_policy(
                         .as_slice()
                         .map(|sl| sl.to_vec())
                         .unwrap_or_else(|| evals.iter().copied().collect());
-                    let eps = spectral_epsilon(&eval_vec).max(ridge.max(1e-14));
+                    let eps = spectral_epsilon(&eval_vec).max(ridge.max(CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR));
                     let n_negative = eval_vec.iter().filter(|&&ev| ev < -eps).count();
                     if n_negative > 0 {
                         // Diagnostic only: indefiniteness is now handled
@@ -9182,6 +9182,27 @@ pub(crate) struct StrictSpdLmStats {
 const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
 const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 
+/// Floor applied to IRLS working weights so downstream divisions cannot hit
+/// exact zero. Used as the default `minweight` in `CustomFamilyOptions` and
+/// mirrored in tests that override it.
+const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = 1e-12;
+
+/// Default initial ridge δ for the explicit-stabilization Cholesky escalation
+/// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty
+/// log-determinant via the active `RidgePolicy`.
+const CUSTOM_FAMILY_RIDGE_FLOOR: f64 = 1e-12;
+
+/// Relative eigenvalue floor used wherever an eigendecomposition needs to
+/// distinguish "real" curvature from noise: `eps_floor = EVAL_FLOOR · max|λ|`.
+/// Applied uniformly in the strict-SPD LM eigen fallback, positive-part
+/// pseudo-inverse, and penalty-direction projection.
+const CUSTOM_FAMILY_EVAL_FLOOR: f64 = 1e-12;
+
+/// Absolute relative-condition guard used to prevent the eigen / spectral
+/// floors from collapsing to zero when `max|λ|` is itself tiny. Combined with
+/// `CUSTOM_FAMILY_EVAL_FLOOR · max|λ|` via `.max(...)`.
+const CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR: f64 = 1e-14;
+
 /// Shared engine: try the bare strict path, fall through to an escalating
 /// LM δ-ridge Cholesky, and finally an eigen-floor fallback that clamps every
 /// eigenvalue from below at `eps_floor = 1e-12 · max|λ|`. Each caller
@@ -9210,7 +9231,7 @@ fn strict_spd_lm_engine<R>(
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
     let trace_scale = (0..p).map(|i| sym[[i, i]].abs()).sum::<f64>() / (p as f64);
-    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(1e-12);
+    let delta0 = (f64::EPSILON * trace_scale.max(1.0)).max(CUSTOM_FAMILY_RIDGE_FLOOR);
 
     let mut delta = delta0;
     for escalation in 1..=STRICT_SPD_LM_MAX_ESCALATIONS {
@@ -9244,7 +9265,7 @@ fn strict_spd_lm_engine<R>(
         )
     })?;
     let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let eps_floor = (1e-12 * max_abs_eval).max(1e-300);
+    let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
     Ok((
         process_eigen(&evals, &evecs, eps_floor),
         StrictSpdLmStats {
@@ -9437,7 +9458,8 @@ fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f
         .eigh(Side::Lower)
         .map_err(|e| format!("positive-part covariance eigendecomposition failed: {e}"))?;
     let max_abs_eigenvalue = eigenvalues.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let tol = (max_abs_eigenvalue * 1e-12).max(ridge_floor.max(1e-14));
+    let tol = (max_abs_eigenvalue * CUSTOM_FAMILY_EVAL_FLOOR)
+        .max(ridge_floor.max(CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR));
     let p = matrix.nrows();
     let mut pinv = Array2::<f64>::zeros((p, p));
     for (k, &ev) in eigenvalues.iter().enumerate() {
@@ -10668,7 +10690,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // above 1e-12 · max|λ| counts as a real penalty
                     // direction; everything else is the null space the
                     // penalty cannot resolve.
-                    let pos_threshold = (1e-12 * max_abs_eval).max(1e-300);
+                    let pos_threshold = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
                     let beta_prior_norm: f64 = beta_seed.iter().map(|v| v * v).sum::<f64>().sqrt();
                     // Form β_proj = U_pos U_posᵀ β.
                     let mut beta_proj = Array1::<f64>::zeros(p);

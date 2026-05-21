@@ -30,6 +30,98 @@ use crate::smooth::{
 };
 
 // ---------------------------------------------------------------------------
+// Typed errors
+// ---------------------------------------------------------------------------
+
+/// Typed errors emitted by term-builder helpers. `Display` reproduces the exact
+/// pre-refactor `format!(...)` text byte-for-byte, so callers that string-match
+/// on the message (tests, log assertions) keep working unchanged. Public-API
+/// functions still return `Result<_, String>` and use `.to_string()` shims at
+/// their boundary to stay compatible with callers in protected modules.
+#[derive(Clone, Debug)]
+pub enum TermBuilderError {
+    /// Column-resolution / column-kind lookup failures, including "column does
+    /// not exist" diagnostics produced via `missing_column_message`.
+    MissingColumn { reason: String },
+    /// User-specified configuration is internally inconsistent (e.g. too few
+    /// variables for a smooth type, conflicting size options, requested basis
+    /// dimension below the polynomial nullspace).
+    IncompatibleConfig { reason: String },
+    /// Option parsing failure: malformed numeric expression, unknown option
+    /// key, out-of-range integer, list-length mismatch, etc.
+    InvalidOption { reason: String },
+    /// User requested a feature that is intentionally not supported (unknown
+    /// smooth type / method / kernel / identifiability, non-zero anchor,
+    /// internal-only token, etc.).
+    UnsupportedFeature { reason: String },
+    /// Input data is degenerate for the requested term (constant column,
+    /// non-finite categorical entries, ...).
+    DegenerateData { reason: String },
+    /// Term-collection-stage formula error — a node that the caller was
+    /// supposed to resolve upstream reached the builder.
+    MalformedFormula { reason: String },
+}
+
+impl std::fmt::Display for TermBuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TermBuilderError::MissingColumn { reason }
+            | TermBuilderError::IncompatibleConfig { reason }
+            | TermBuilderError::InvalidOption { reason }
+            | TermBuilderError::UnsupportedFeature { reason }
+            | TermBuilderError::DegenerateData { reason }
+            | TermBuilderError::MalformedFormula { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl From<TermBuilderError> for String {
+    fn from(err: TermBuilderError) -> String {
+        err.to_string()
+    }
+}
+
+// Constructor helpers — keep error-site code compact and consistent.
+impl TermBuilderError {
+    #[inline]
+    fn missing_column(reason: impl Into<String>) -> Self {
+        TermBuilderError::MissingColumn {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn incompatible_config(reason: impl Into<String>) -> Self {
+        TermBuilderError::IncompatibleConfig {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn invalid_option(reason: impl Into<String>) -> Self {
+        TermBuilderError::InvalidOption {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn unsupported_feature(reason: impl Into<String>) -> Self {
+        TermBuilderError::UnsupportedFeature {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn degenerate_data(reason: impl Into<String>) -> Self {
+        TermBuilderError::DegenerateData {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn malformed_formula(reason: impl Into<String>) -> Self {
+        TermBuilderError::MalformedFormula {
+            reason: reason.into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Column resolution
 // ---------------------------------------------------------------------------
 
@@ -263,11 +355,13 @@ pub fn build_termspec(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
-fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, String> {
+fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, TermBuilderError> {
     let mut levels = std::collections::BTreeSet::<u64>::new();
     for &v in col.iter() {
         if !v.is_finite() {
-            return Err("categorical column contains non-finite values".to_string());
+            return Err(TermBuilderError::degenerate_data(
+                "categorical column contains non-finite values",
+            ));
         }
         levels.insert(v.to_bits());
     }
@@ -320,7 +414,7 @@ fn parse_bspline_endpoint_condition(
     side: &str,
     global_bc: Option<&str>,
     side_filter: SideFilter,
-) -> Result<BSplineEndpointBoundaryCondition, String> {
+) -> Result<BSplineEndpointBoundaryCondition, TermBuilderError> {
     let applies_global = matches!(
         (side, side_filter),
         (_, SideFilter::Both) | ("left", SideFilter::Left) | ("right", SideFilter::Right)
@@ -344,23 +438,23 @@ fn parse_bspline_endpoint_condition(
             // generic "Matrix conditioning issue / basis function generation
             // failed" wrapped error during fit.
             if value != 0.0 {
-                return Err(format!(
+                return Err(TermBuilderError::unsupported_feature(format!(
                     "anchored {side} endpoint with non-zero value {value} is not supported yet; \
                      pass anchor value 0 (or omit `anchor_{side}=`) and subtract the offset from \
                      `y` before fitting if you need to pin the boundary at a non-zero level."
-                ));
+                )));
             }
             Ok(BSplineEndpointBoundaryCondition::Anchored { value })
         }
-        other => Err(format!(
+        other => Err(TermBuilderError::unsupported_feature(format!(
             "unsupported B-spline boundary condition '{other}' for {side} endpoint; use free|clamped|anchored"
-        )),
+        ))),
     }
 }
 
 fn parse_bspline_boundary_conditions(
     options: &BTreeMap<String, String>,
-) -> Result<BSplineBoundaryConditions, String> {
+) -> Result<BSplineBoundaryConditions, TermBuilderError> {
     let global_bc = options.get("bc").map(String::as_str);
     let side_filter = match options
         .get("side")
@@ -371,9 +465,9 @@ fn parse_bspline_boundary_conditions(
         Some("left") | Some("start") => SideFilter::Left,
         Some("right") | Some("end") => SideFilter::Right,
         Some(other) => {
-            return Err(format!(
+            return Err(TermBuilderError::unsupported_feature(format!(
                 "unsupported B-spline boundary side '{other}'; use left|right|both"
-            ));
+            )));
         }
     };
     Ok(BSplineBoundaryConditions {
