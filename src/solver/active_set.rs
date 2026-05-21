@@ -12,6 +12,29 @@ pub struct LinearInequalityConstraints {
     pub b: Array1<f64>,
 }
 
+impl LinearInequalityConstraints {
+    /// Build the per-coordinate `β_i ≥ lower_bounds[i]` inequality system.
+    /// Non-finite entries are treated as "no bound" and skipped; returns
+    /// `None` when every entry is non-finite so callers can short-circuit
+    /// the no-constraint case without allocating the empty A/b pair.
+    pub fn from_per_coordinate_lower_bounds(lower_bounds: &Array1<f64>) -> Option<Self> {
+        let active_rows: Vec<usize> = (0..lower_bounds.len())
+            .filter(|&i| lower_bounds[i].is_finite())
+            .collect();
+        if active_rows.is_empty() {
+            return None;
+        }
+        let p = lower_bounds.len();
+        let mut a = Array2::<f64>::zeros((active_rows.len(), p));
+        let mut b = Array1::<f64>::zeros(active_rows.len());
+        for (r, &idx) in active_rows.iter().enumerate() {
+            a[[r, idx]] = 1.0;
+            b[r] = lower_bounds[idx];
+        }
+        Some(Self { a, b })
+    }
+}
+
 /// KKT diagnostics for inequality-constrained Newton subproblems.
 ///
 /// Constraints are represented as `A * beta >= b` in the same coefficient

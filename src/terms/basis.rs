@@ -19252,17 +19252,24 @@ pub fn build_duchon_basiswithworkspace(
     // Q^T G_raw Q matches the collocation kernel sub-block in the limit
     // (pointwise basis evaluations of the Lebesgue Gram). Linear+ no longer
     // forces the collocation D^T D fallback.
-    // The basis and the penalty are separate choices. The Duchon
-    // polyharmonic basis itself is scale-free (no characteristic length
-    // baked into the kernel functions), and the operator triplet
-    // (mass, tension, stiffness) is a perfectly valid penalty *on that
-    // basis*: three independent quadratic forms on the coefficient
-    // vector with their own implicit unit-conversion length scales (Type
-    // B, data-determined by REML/GCV), distinct from a Matérn-style
-    // kernel correlation length (Type A) that would propagate through
-    // every covariance evaluation. Length-scale-Some uses the closed-form
-    // (Matérn-Lebesgue) factory; length_scale-None uses the closed-form
-    // pure (polyharmonic-Lebesgue) factory. Both emit three candidates.
+    // Scale-free (`length_scale = None`) Duchon collapses to a single
+    // Primary penalty: the polyharmonic kernel reproducing norm
+    // `G_{kl} = K(c_k, c_l) = φ(|c_k − c_l|)` on the kernel block, with
+    // an exact zero block for the polynomial nullspace columns.
+    //
+    // The triplet alternative (`mass + tension + stiffness`) is well
+    // defined on this basis but the `λ_0 ∫f²` and `λ_1 ∫|∇f|²` terms
+    // sneak a reversion length back in through the penalty: they pull
+    // the fit toward 0 / a constant in data-sparse regions over a
+    // distance set by `λ / data-density`. That is exactly the Type A
+    // behaviour the basis was chosen to avoid. Only the top-order term
+    // `λ_2 ∫|∇^(m+s) f|²` (= the polyharmonic seminorm = the kernel
+    // reproducing norm) preserves "no reversion at any finite distance".
+    // It also dodges the bounded-domain requirement that `∫f²` imposes
+    // on `ℝᵈ` and keeps the basis and the penalty inside the same RKHS.
+    // The Matérn-like (`length_scale = Some`) branch still emits the
+    // triplet, which is well defined there because the finite scale
+    // makes the three terms genuinely independent.
     let candidates = if let Some(length_scale) = spec.length_scale {
         operator_penalty_candidates_closed_form(
             centers.view(),
@@ -19279,19 +19286,15 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform.as_ref(),
         )
     } else {
-        operator_penalty_candidates_closed_form_pure(
+        native_kernel_penalty_candidate_pure_duchon(
             centers.view(),
-            &ops.d0,
-            &ops.d1,
-            &ops.d2,
-            &spec.operator_penalties,
             p_order,
             spec.power,
             aniso.as_deref(),
             Some(&kernel_transform),
             poly_cols,
             identifiability_transform.as_ref(),
-        )
+        )?
     };
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
