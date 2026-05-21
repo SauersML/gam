@@ -855,15 +855,9 @@ fn compress_positive_collinear_constraints(
     LinearInequalityConstraints { a: a_out, b: b_out }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MonotonicityPenalty {
     pub tolerance: f64,
-}
-
-impl Default for MonotonicityPenalty {
-    fn default() -> Self {
-        Self { tolerance: 0.0 }
-    }
 }
 
 #[derive(Debug, Clone)]
