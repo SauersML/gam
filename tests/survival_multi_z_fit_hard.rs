@@ -162,32 +162,132 @@ fn total_neglog(
     Ok(acc)
 }
 
-// ── Test 1 — Truth-recovery (neglog minimised at truth across 30 seeds) ──
+/// Simulate (z, q, qd1, event) where `event` is drawn from the marginal-slope
+/// model at `true_slopes` and `covariance`.  This ensures the population-
+/// expected negative log-likelihood is genuinely minimised at `true_slopes`
+/// (the previous `simulate` drew events as Bernoulli(0.5), independent of
+/// the slopes, so the chosen "truth" was not the population optimum).
+fn simulate_events_from_truth(
+    seed: u64,
+    true_slopes: &[f64; K],
+    covariance: &MarginalSlopeCovariance,
+) -> SimData {
+    let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mut z = Array2::<f64>::zeros((N, K));
+    let mut q0 = Array1::<f64>::zeros(N);
+    let mut q1 = Array1::<f64>::zeros(N);
+    let mut qd1 = Array1::<f64>::zeros(N);
+    let mut event = Array1::<f64>::zeros(N);
+
+    for i in 0..N {
+        let (g1, g2) = next_gauss_pair(&mut state);
+        z[[i, 0]] = g1;
+        z[[i, 1]] = g2;
+
+        let (gq, _) = next_gauss_pair(&mut state);
+        let base = 0.25 * gq;
+        q0[i] = base - 0.6;
+        q1[i] = base + 0.6;
+        qd1[i] = 0.7 + 0.1 * next_unit(&mut state);
+
+        let z_row = [z[[i, 0]], z[[i, 1]]];
+        let eta0 = survival_marginal_slope_vector_eta(
+            q0[i], &z_row, true_slopes, covariance, PROBIT_SCALE,
+        )
+        .expect("eta0");
+        let eta1 = survival_marginal_slope_vector_eta(
+            q1[i], &z_row, true_slopes, covariance, PROBIT_SCALE,
+        )
+        .expect("eta1");
+        let p_surv_0 = normal_cdf(-eta0).max(f64::MIN_POSITIVE);
+        let p_surv_1 = normal_cdf(-eta1);
+        let p_event = (1.0 - (p_surv_1 / p_surv_0)).clamp(0.0, 1.0);
+
+        event[i] = if next_unit(&mut state) < p_event { 1.0 } else { 0.0 };
+    }
+    SimData {
+        z,
+        weights: Array1::<f64>::ones(N),
+        q0,
+        q1,
+        qd1,
+        event,
+    }
+}
+
+// ── Test 1 — Truth is a population minimum of the negative log-likelihood ──
 //
-// With N=2000 and K=2, the per-row neglog at the TRUE slopes must be lower
-// than at ±5% multiplicative perturbations of each slope, on every seed.
+// At the TRUE slopes, the population-expected per-row neglog is minimal.
+// Per seed the sample neglog has O(δ·√N) drift; aggregating across 30 seeds
+// and SYMMETRIZING over (±δ) cancels the linear-in-δ score term and leaves
+// the (positive) quadratic Fisher term.  Expected aggregate excess at δ=5%
+// is ≈ ½·δ²·N·seeds·I_per_row ≈ 7-8; we use margin 1.0 (≫ Monte-Carlo SD).
+//
+// The previous version of this test sampled events as Bernoulli(0.5)
+// independently of the slopes, so `true_slopes` was NOT the population
+// optimum — perturbations could (and did) reduce the sample neglog at any
+// fixed seed.  We now sample events from the true marginal-slope model.
 #[test]
 fn survival_multi_z_fit_truth_neglog_minimised_at_true_slopes_30_seeds() {
     let true_slopes = [0.32_f64, -0.21_f64];
-    for seed_idx in 0..30u64 {
-        let data = simulate(0x511_0001 + seed_idx, 0.0);
-        let covariance =
-            marginal_slope_covariance_from_scores(data.z.view(), &data.weights).expect("cov");
+    // Use the population covariance (identity) for both event simulation
+    // and likelihood evaluation, so the truth is the exact population
+    // optimum (no model mismatch between generating and evaluating Σ).
+    let covariance = MarginalSlopeCovariance::Diagonal(Array1::<f64>::ones(K));
 
-        let nl_truth = total_neglog(&data, &true_slopes, &covariance).expect("truth nl");
+    const SEEDS: u64 = 30;
+    let mut sum_truth = 0.0_f64;
+    let mut sum_pert_plus = [0.0_f64; K];
+    let mut sum_pert_minus = [0.0_f64; K];
 
-        for sign in [-1.0_f64, 1.0_f64] {
-            for which in 0..K {
-                let mut perturbed = true_slopes;
-                perturbed[which] *= 1.0 + sign * 0.05;
-                let nl = total_neglog(&data, &perturbed, &covariance).expect("perturbed nl");
-                assert!(
-                    nl > nl_truth - 1e-6,
-                    "seed_idx={seed_idx} which={which} sign={sign} \
-                     nl(perturbed)={nl:.9} not greater than nl(truth)={nl_truth:.9}"
-                );
-            }
+    for seed_idx in 0..SEEDS {
+        let data = simulate_events_from_truth(0x511_0001 + seed_idx, &true_slopes, &covariance);
+        sum_truth += total_neglog(&data, &true_slopes, &covariance).expect("truth nl");
+
+        for which in 0..K {
+            let mut plus = true_slopes;
+            plus[which] *= 1.0 + 0.05;
+            sum_pert_plus[which] +=
+                total_neglog(&data, &plus, &covariance).expect("plus nl");
+
+            let mut minus = true_slopes;
+            minus[which] *= 1.0 - 0.05;
+            sum_pert_minus[which] +=
+                total_neglog(&data, &minus, &covariance).expect("minus nl");
         }
+    }
+
+    for which in 0..K {
+        // Symmetrized aggregate excess: ≈ δ² · N · seeds · I_per_row.
+        // The linear-in-δ score term cancels between ±δ; only the
+        // quadratic Fisher term survives.  This is the principled test
+        // of "truth is a population minimum".
+        let avg_pert = 0.5 * (sum_pert_plus[which] + sum_pert_minus[which]);
+        let excess = avg_pert - sum_truth;
+        assert!(
+            excess > 1.0,
+            "aggregate symmetrized excess too small at which={which}: \
+             excess={excess:.3} (sum_truth={sum_truth:.3}, \
+             sum_pert_plus={:.3}, sum_pert_minus={:.3})",
+            sum_pert_plus[which], sum_pert_minus[which]
+        );
+
+        // Each side individually must also be positive on average (the
+        // linear-in-δ noise has SD ≈ δ·√(N·seeds·I) ≈ 4; a margin of −5
+        // catches any catastrophic curvature sign flip without false
+        // positives from MC noise).
+        assert!(
+            sum_pert_plus[which] - sum_truth > -5.0,
+            "+5% perturbation aggregate dropped neglog far below truth at which={which}: \
+             sum_pert_plus={:.3}, sum_truth={sum_truth:.3}",
+            sum_pert_plus[which]
+        );
+        assert!(
+            sum_pert_minus[which] - sum_truth > -5.0,
+            "-5% perturbation aggregate dropped neglog far below truth at which={which}: \
+             sum_pert_minus={:.3}, sum_truth={sum_truth:.3}",
+            sum_pert_minus[which]
+        );
     }
 }
 
