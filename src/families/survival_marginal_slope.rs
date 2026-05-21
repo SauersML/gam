@@ -19071,7 +19071,7 @@ mod tests {
     }
 
     #[test]
-    fn survival_marginal_slope_rigid_biobank_keeps_analytic_hessian_after_batched_projected_trace()
+    fn survival_marginal_slope_rigid_hypertension_shape_routes_to_exact_gradient_bfgs()
     {
         let n = 195_780usize;
         let family = make_block_psi_test_family(n);
@@ -19103,13 +19103,13 @@ mod tests {
         assert_eq!(rho_dim, 4);
         assert!(
             row_kernel_work
-                <= crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
-            "batched projected trace keeps the analytic Hessian route within budget"
+                > crate::custom_family::OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET,
+            "the hypertension biobank shape should exceed the ARC/Hessian stability budget"
         );
         assert_eq!(policy.predicted_hessian_work, row_kernel_work);
         assert_eq!(
             policy.declared_hessian_form(),
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
         );
 
         let (gradient, hessian) = custom_family_outer_derivatives(&family, &specs, &options);
@@ -19119,7 +19119,7 @@ mod tests {
         );
         assert_eq!(
             hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
         );
     }
 
