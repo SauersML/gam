@@ -5320,6 +5320,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -5439,6 +5440,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_ext_pair_fn: self.rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
             barrier_config: self.barrier_config,
+            kkt_residual: self.kkt_residual,
         }
     }
 }
@@ -6292,19 +6294,16 @@ pub fn reml_laml_evaluate(
         .kkt_residual
         .as_ref()
         .filter(|r| r.len() == hop.dim());
-    let kkt_residual_w: Option<Array1<f64>> = if let Some(r) = kkt_residual_vec {
+    if let Some(r) = kkt_residual_vec {
         let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
         rhs.column_mut(0).assign(r);
         let w_mat = hop.solve_multi(&rhs);
-        let w = w_mat.column(0).to_owned();
+        let w = w_mat.column(0);
         let cost_correction = -0.5 * r.dot(&w);
         if cost_correction.is_finite() {
             cost += cost_correction;
         }
-        Some(w)
-    } else {
-        None
-    };
+    }
 
     if !cost.is_finite() {
         return Err(format!(
@@ -6754,7 +6753,6 @@ pub fn reml_laml_evaluate(
             }
         }
     }
-    let _ = &kkt_residual_w; // referenced for documentation; w is the cost-correction artefact
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
     //
@@ -16366,6 +16364,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -16537,6 +16536,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -16588,6 +16588,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
@@ -18308,6 +18309,7 @@ mod tests {
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
             barrier_config: None,
+            kkt_residual: None,
         }
     }
 
