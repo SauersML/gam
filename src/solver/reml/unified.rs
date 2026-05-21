@@ -116,7 +116,7 @@ use crate::linalg::matrix::DesignMatrix;
 
 #[cfg(test)]
 pub mod debug_stash {
-    use std::sync::Mutex;
+    use std::cell::RefCell;
 
     #[derive(Clone, Debug, Default)]
     pub struct TermStash {
@@ -142,32 +142,47 @@ pub mod debug_stash {
         pub projection_active: Option<bool>,
     }
 
-    // Process-global storage rather than `thread_local!`: the EIG-DECOMP
-    // diagnostic in `reml_laml_evaluate` writes from inside a rayon
-    // `into_par_iter` closure that rayon may dispatch onto a worker
-    // thread distinct from the test thread that later reads the stash.
-    // Thread-local storage made the test thread see an empty
-    // `TermStash` whenever rayon stole the work, deterministically
-    // breaking the projection-pin and per-row-FD regression tests.
-    static TERMS: Mutex<TermStash> = Mutex::new(TermStash {
-        c_x_tau_beta_diag: None,
-        c_x_v_psi_diag: None,
-        unprojected_tr: None,
-        production_tr: None,
-        projection_active: None,
-    });
-
-    /// Replace the global `TermStash` with `stash`. Called from the
-    /// EIG-DECOMP diagnostic block in `reml_laml_evaluate`. Tests read
-    /// the most recently stored stash via `take_terms()`.
-    pub fn store_terms(stash: TermStash) {
-        *TERMS.lock().expect("TermStash mutex poisoned") = stash;
+    // Thread-local storage keyed on the THREAD THAT CALLED `reml_laml_evaluate`
+    // (i.e. the test thread). The diagnostic block inside the function is
+    // physically computed by a rayon worker for `ext_idx == 0`, but the
+    // worker's stash is plumbed back through the par_iter return value
+    // and `store_terms` is invoked on the calling thread after the
+    // parallel loop completes. That makes thread-local correct again —
+    // each test thread reads its own captures, even when `cargo test`
+    // runs the suite at full parallelism and many tests are inside
+    // `reml_laml_evaluate` simultaneously.
+    //
+    // A previous attempt to share a single process-global `Mutex<TermStash>`
+    // deterministically corrupted concurrent tests: thread A would call
+    // `take_terms()` after its own evaluate returned, but if thread B's
+    // evaluate had stored a stash in between, A read B's data. Routing
+    // the write back to the calling thread's thread-local is the only
+    // arrangement that keeps the per-test capture intact under parallel
+    // testing.
+    thread_local! {
+        static TERMS: RefCell<TermStash> = const { RefCell::new(TermStash {
+            c_x_tau_beta_diag: None,
+            c_x_v_psi_diag: None,
+            unprojected_tr: None,
+            production_tr: None,
+            projection_active: None,
+        }) };
     }
-    /// Consume the global `TermStash` and return its contents. Tests
-    /// call this after running an evaluation to inspect the diagnostic
-    /// captures (`unprojected_tr`, `production_tr`, `c_x_*_diag`, etc.).
+
+    /// Replace the calling thread's `TermStash` with `stash`. Called by
+    /// `reml_laml_evaluate` from the calling thread AFTER its ext-coord
+    /// par_iter has produced the stash on a rayon worker and returned
+    /// it via the closure's tuple. Tests read the stored stash via
+    /// `take_terms()` from the same thread.
+    pub fn store_terms(stash: TermStash) {
+        TERMS.with(|cell| *cell.borrow_mut() = stash);
+    }
+    /// Consume the calling thread's `TermStash` and return its contents.
+    /// Tests call this after running an evaluation to inspect the
+    /// diagnostic captures (`unprojected_tr`, `production_tr`,
+    /// `c_x_*_diag`, etc.).
     pub fn take_terms() -> TermStash {
-        std::mem::take(&mut *TERMS.lock().expect("TermStash mutex poisoned"))
+        TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
     }
 }
 
@@ -6699,6 +6714,18 @@ pub fn reml_laml_evaluate(
     // All extended coordinates store canonical fixed-β stationarity
     // derivatives g_i = F_{βi}. IFT gives β_i = -H^{-1}g_i, exactly like
     // the ρ block.
+    // Per-call sink for the EIG-DECOMP diagnostic stash. Under `#[cfg(test)]`
+    // the rayon worker for `ext_idx == 0` populates this with the captured
+    // `TermStash`; after the par_iter completes the calling thread copies
+    // it into its own thread-local via `debug_stash::store_terms`. Building
+    // the stash inside the worker and handing it back through a per-call
+    // sink eliminates the cross-thread overwrites that a process-global
+    // sink suffered under concurrent tests.
+    #[cfg(test)]
+    let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStash>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    #[cfg(test)]
+    let ext_stash_sink_for_closure = ext_stash_sink.clone();
     let ext_grad_entries: Result<Vec<(usize, f64)>, String> = (0..ext_dim)
         .into_par_iter()
         .map(|ext_idx| {
@@ -6844,7 +6871,14 @@ pub fn reml_laml_evaluate(
                         let v_i = &ext_v_is[ext_idx];
                         stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
                     }
-                    debug_stash::store_terms(stash);
+                    // Hand the stash back through the per-call sink. The
+                    // calling thread copies it into its own thread-local
+                    // after the par_iter completes, so concurrent tests
+                    // each end up reading their OWN ext_idx==0 capture
+                    // rather than racing on a shared global slot.
+                    *ext_stash_sink_for_closure
+                        .lock()
+                        .expect("EIG-DECOMP stash sink mutex poisoned") = Some(stash);
                 }
             }
 
@@ -6872,6 +6906,22 @@ pub fn reml_laml_evaluate(
         .collect();
     for (idx, value) in ext_grad_entries? {
         grad[idx] = value;
+    }
+
+    // Drain the per-call EIG-DECOMP sink into the calling thread's
+    // thread-local stash. The rayon worker that produced the stash may
+    // live on a different thread, but `store_terms` writes to the
+    // current thread's TLS — which is also the thread the test will
+    // call `take_terms()` from, because everything between
+    // `evaluate_joint_reml_outer_eval_at_theta` and `reml_laml_evaluate`
+    // is synchronous and stays on the test thread.
+    #[cfg(test)]
+    if let Some(stash) = ext_stash_sink
+        .lock()
+        .expect("EIG-DECOMP stash sink mutex poisoned")
+        .take()
+    {
+        debug_stash::store_terms(stash);
     }
 
     // Add correction gradients (ρ-only).
