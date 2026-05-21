@@ -18686,6 +18686,144 @@ mod tests {
     }
 
     #[test]
+    fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penalty() {
+        let ranges = vec![(0, 3)];
+        let rho = array![0.0];
+        let beta = array![1.0, -1.0, 3.0];
+        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
+        let spec = ParameterBlockSpec {
+            name: "surface".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+                1, 3,
+            )))),
+            offset: Array1::zeros(1),
+            penalties: vec![PenaltyMatrix::Dense(s_lambda.clone())],
+            nullspace_dims: vec![1],
+            initial_log_lambdas: rho.clone(),
+            initial_beta: Some(beta.clone()),
+        };
+        let specs = vec![spec];
+        let inner = BlockwiseInnerResult {
+            block_states: vec![ParameterBlockState {
+                beta: beta.clone(),
+                eta: Array1::zeros(1),
+            }],
+            active_sets: vec![None],
+            log_likelihood: 0.0,
+            penalty_value: 0.5 * beta.dot(&fast_av(&s_lambda, &beta)),
+            cycles: 1,
+            converged: true,
+            block_logdet_h: 0.0,
+            block_logdet_s: 0.0,
+            s_lambdas: vec![s_lambda.clone()],
+            joint_workspace: None,
+        };
+        let per_block = vec![rho.clone()];
+        let options = BlockwiseFitOptions {
+            use_remlobjective: true,
+            use_outer_hessian: false,
+            ..BlockwiseFitOptions::default()
+        };
+        let no_dh =
+            |_direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+        let no_d2h = |_u: &Array1<f64>,
+                      _v: &Array1<f64>|
+         -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+
+        let projected = joint_outer_evaluate(
+            &inner,
+            &specs,
+            &per_block,
+            &rho,
+            &beta,
+            JointHessianSource::Dense(h.clone()),
+            &ranges,
+            3,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            true,
+            false,
+            true,
+            EvalMode::ValueAndGradient,
+            &options,
+            crate::types::RhoPrior::Flat,
+            PseudoLogdetMode::Smooth,
+            &no_dh,
+            None,
+            &no_d2h,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("projected outer evaluation succeeds");
+
+        let unprojected = joint_outer_evaluate(
+            &inner,
+            &specs,
+            &per_block,
+            &rho,
+            &beta,
+            JointHessianSource::Dense(h.clone()),
+            &ranges,
+            3,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            true,
+            true,
+            false,
+            false,
+            EvalMode::ValueAndGradient,
+            &options,
+            crate::types::RhoPrior::Flat,
+            PseudoLogdetMode::Smooth,
+            &no_dh,
+            None,
+            &no_d2h,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("unprojected outer evaluation succeeds");
+
+        let (_, kernel) = joint_penalty_subspace_trace_parts(
+            &JointHessianSource::Dense(h.clone()),
+            &ranges,
+            std::slice::from_ref(&s_lambda),
+            3,
+            0.0,
+        )
+        .expect("projection kernel builds");
+        let projected_trace = kernel
+            .expect("rank-deficient penalty has positive subspace")
+            .trace_projected_logdet(&s_lambda);
+        let expected_gradient =
+            0.5 * beta.dot(&fast_av(&s_lambda, &beta)) + 0.5 * projected_trace - 0.5 * 2.0;
+
+        assert_relative_eq!(
+            projected.gradient[0],
+            expected_gradient,
+            epsilon = 1e-12,
+            max_relative = 1e-12
+        );
+        assert!(
+            (projected.gradient[0] - unprojected.gradient[0]).abs() > 1e-2,
+            "the full-space trace must not silently replace the projected trace"
+        );
+    }
+
+    #[test]
     fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
         let options = BlockwiseFitOptions {
             inner_tol: 1e-6,

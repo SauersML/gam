@@ -287,9 +287,7 @@ impl super::runtime::HasGpuDevice for CusolverRuntime {
     }
 }
 
-fn with_runtime<T>(
-    f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
-) -> Option<(T, GpuDeviceInfo)> {
+fn with_runtime<T>(f: impl FnMut(&mut CusolverRuntime) -> Option<T>) -> Option<(T, GpuDeviceInfo)> {
     super::runtime::with_runtime_two_phase(cusolver_runtimes(), f)
 }
 

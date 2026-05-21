@@ -18526,9 +18526,8 @@ mod tests {
         h.scaled_add(lambdas[1], &s2);
         let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
-        let penalty_quad =
-            lambdas[0] * beta_hat.dot(&s1.dot(&beta_hat))
-                + lambdas[1] * beta_hat.dot(&s2.dot(&beta_hat));
+        let penalty_quad = lambdas[0] * beta_hat.dot(&s1.dot(&beta_hat))
+            + lambdas[1] * beta_hat.dot(&s2.dot(&beta_hat));
         let deviance = yty - 2.0 * beta_hat.dot(&xty) + beta_hat.dot(&xtx.dot(&beta_hat));
         let log_likelihood = -0.5 * deviance;
 
@@ -18562,8 +18561,7 @@ mod tests {
             s_plus.scaled_add(lambdas_plus[0], &s1);
             s_plus.scaled_add(lambdas_plus[1], &s2);
             let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
-            let threshold_plus =
-                positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
+            let threshold_plus = positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
             let log_det_s_plus =
                 exact_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), threshold_plus);
 
@@ -18574,8 +18572,7 @@ mod tests {
             s_minus.scaled_add(lambdas_minus[0], &s1);
             s_minus.scaled_add(lambdas_minus[1], &s2);
             let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
-            let threshold_minus =
-                positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
+            let threshold_minus = positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
             let log_det_s_minus =
                 exact_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), threshold_minus);
 
@@ -18633,20 +18630,17 @@ mod tests {
         let op_for_solve = DenseSpectralOperator::from_symmetric(&h).unwrap();
         let beta_star = op_for_solve.solve(&xty);
 
-        let sol_envelope =
-            build_gaussian_solution_at_beta(&rho, beta_star.clone(), false);
+        let sol_envelope = build_gaussian_solution_at_beta(&rho, beta_star.clone(), false);
         let grad_envelope =
             reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
                 .unwrap()
                 .gradient
                 .unwrap();
-        let cost_envelope =
-            reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueOnly, None)
-                .unwrap()
-                .cost;
+        let cost_envelope = reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueOnly, None)
+            .unwrap()
+            .cost;
 
-        let sol_with_residual =
-            build_gaussian_solution_at_beta(&rho, beta_star.clone(), true);
+        let sol_with_residual = build_gaussian_solution_at_beta(&rho, beta_star.clone(), true);
         let r_norm = sol_with_residual
             .kkt_residual
             .as_ref()
@@ -18660,12 +18654,16 @@ mod tests {
         );
 
         let result_ift =
-            reml_laml_evaluate(&sol_with_residual, &rho, EvalMode::ValueAndGradient, None)
-                .unwrap();
+            reml_laml_evaluate(&sol_with_residual, &rho, EvalMode::ValueAndGradient, None).unwrap();
         let grad_ift = result_ift.gradient.unwrap();
         let cost_ift = result_ift.cost;
 
-        assert_relative_eq!(cost_ift, cost_envelope, epsilon = 1e-10, max_relative = 1e-10);
+        assert_relative_eq!(
+            cost_ift,
+            cost_envelope,
+            epsilon = 1e-10,
+            max_relative = 1e-10
+        );
         for k in 0..rho.len() {
             assert_relative_eq!(
                 grad_ift[k],
@@ -18730,8 +18728,7 @@ mod tests {
         let perturb = Array1::from_vec(vec![0.02, -0.015, 0.025]);
         let beta_hat = &beta_star + &perturb;
 
-        let sol_envelope =
-            build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false);
+        let sol_envelope = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false);
         let grad_envelope =
             reml_laml_evaluate(&sol_envelope, &rho, EvalMode::ValueAndGradient, None)
                 .unwrap()
@@ -18750,11 +18747,10 @@ mod tests {
             "perturbed β̂ should produce a non-trivial residual, got ‖r‖∞ = {:.3e}",
             r_norm
         );
-        let grad_ift =
-            reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueAndGradient, None)
-                .unwrap()
-                .gradient
-                .unwrap();
+        let grad_ift = reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueAndGradient, None)
+            .unwrap()
+            .gradient
+            .unwrap();
 
         // IFT correction must shrink the gradient error meaningfully on at
         // least one coordinate, and never blow it up on any.

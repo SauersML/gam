@@ -646,9 +646,7 @@ impl super::runtime::HasGpuDevice for CublasRuntime {
     }
 }
 
-fn with_runtime<T>(
-    f: impl FnMut(&mut CublasRuntime) -> Option<T>,
-) -> Option<(T, GpuDeviceInfo)> {
+fn with_runtime<T>(f: impl FnMut(&mut CublasRuntime) -> Option<T>) -> Option<(T, GpuDeviceInfo)> {
     super::runtime::with_runtime_two_phase(cublas_runtimes(), f)
 }
 
