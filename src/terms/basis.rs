@@ -12651,7 +12651,7 @@ fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
 fn validate_duchon_kernel_orders(
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     k_dim: usize,
 ) -> Result<(), BasisError> {
     if k_dim == 0 {
@@ -12704,13 +12704,18 @@ fn validate_duchon_kernel_orders(
     //     1/|xi|^{2(p+s)}, which is a finite distribution at the origin
     //     iff `2(p+s) > d`. Below that threshold the radial kernel value
     //     diverges and there is nothing to evaluate.
-    if length_scale.is_none() && 2 * s_order >= k_dim {
+    if !s_order.is_finite() || s_order < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon spectral power must be finite and ≥ 0; got s={s_order}"
+        )));
+    }
+    if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
         return Err(BasisError::InvalidInput(format!(
             "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
         )));
     }
-    let spectral_order = 2 * (p_order + s_order);
-    if spectral_order <= k_dim {
+    let spectral_order = 2.0 * (p_order as f64 + s_order);
+    if spectral_order <= k_dim as f64 {
         return Err(BasisError::InvalidInput(format!(
             "Duchon pointwise kernel values require 2*(p+s) > dimension; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
         )));
@@ -12721,7 +12726,7 @@ fn validate_duchon_kernel_orders(
 fn validate_duchon_collocation_orders(
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     k_dim: usize,
     max_operator_derivative_order: usize,
 ) -> Result<(), BasisError> {
@@ -18503,7 +18508,7 @@ fn build_duchon_basis_designwithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
-    power: usize,
+    power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
