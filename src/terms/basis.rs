@@ -10889,25 +10889,40 @@ fn duchon_closed_form_operator_penalty_converges(
     let four_ms = 4.0 * (p_order as f64 + s_order);
     let dp2q = (dimension + 2 * q) as f64;
     let four_m = (4 * p_order) as f64;
-    let uv_ir_ok = four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1;
-    if !uv_ir_ok {
-        return false;
-    }
-    // CPD-adequacy gate (Wendland Thm 8.17 / 8.18). The Lebesgue pair
-    // block is `S_q[i, j] ∝ R_J^d(|c_i − c_j|)` with `J = 2(p+s) − q`.
-    // This is a *conditionally* positive-definite kernel; PSD after
-    // projection onto the polynomial-orthogonal complement requires the
-    // spec's polynomial null-space order `p_order` to be at least the
-    // kernel's CPD order. For TPS (d=2, p=2, s=0, q=2) this reduces
-    // to the standard `p ≥ 2` requirement; for fractional `s` it tightens
-    // the existing UV/IR check exactly where it was silently letting
-    // non-CPD kernels through (e.g. d=8, p=2, s=3.5, q ∈ {1, 2} where
-    // 2J − d ∈ {12, 10} are non-negative even integers but the
-    // log-case CPD order is `(2J − d)/2 + 1 ∈ {7, 6}`, far above
-    // `p_order = 2`).
-    // β = 2J − d where J = 2(p+s) − q. Equivalently β = 4(p+s) − 2q − d
-    // = four_ms − dp2q. Stays in f64 end-to-end so fractional `s` flows.
-    let beta = four_ms - dp2q;
+    four_ms > dp2q && dp2q > four_m && 2 * p_order >= q + 1
+}
+
+/// CPD-adequacy gate for the *scale-free* (`length_scale = None`) Duchon
+/// closed-form pair block. The pure-polyharmonic pair block is
+/// `S_q[i, j] ∝ R_J^d(|c_i − c_j|)` with `J = 2(p+s) − q`, which is only
+/// *conditionally* positive-definite — its projection onto the
+/// polynomial-orthogonal complement is PSD iff the spec's polynomial
+/// null-space order is at least the kernel's CPD order
+/// (Wendland Thm 8.17 / 8.18).
+///
+/// For the *hybrid* Matérn-blended path (`length_scale = Some`) the kernel
+/// is strictly positive definite (Matérn regularization at low
+/// frequencies), so no CPD restriction is needed — the UV/IR convergence
+/// check is sufficient. This function is therefore only consulted from
+/// the pure-Duchon candidate factory.
+///
+/// Concrete tripwire: at `d=8, p_order=2, s_order=3.5` with the Linear
+/// null space, the closed-form pair block for q ∈ {1, 2} has CPD order
+/// `(2J − d)/2 + 1 ∈ {7, 6}` (log case fires because `2s = 7` makes
+/// `2J − d` an even integer at even `d`). Without this gate the
+/// closed-form matrix at centers was non-PSD (15 / 30 negative
+/// eigenvalues); with this gate, both q's route to collocation
+/// `D_qᵀD_q` (PSD by construction). TPS sanity: `d=2, p=2, s=0, q=2`
+/// gives `2J − d = 2`, log case, CPD order = 2, matched exactly by
+/// the Linear null space.
+fn duchon_pure_closed_form_pair_block_cpd_adequate(
+    q: usize,
+    p_order: usize,
+    s_order: f64,
+    dimension: usize,
+) -> bool {
+    // β = 2J − d where J = 2(p+s) − q. Equivalently β = 4(p+s) − 2q − d.
+    let beta = 4.0 * (p_order as f64 + s_order) - 2.0 * q as f64 - dimension as f64;
     if beta < 0.0 {
         return false;
     }
@@ -10916,13 +10931,12 @@ fn duchon_closed_form_operator_penalty_converges(
     let is_log_case = dimension % 2 == 0 && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
     let cpd_required = if is_log_case {
         // Log case: kernel `c · r^{2n}(ln r + A_n)` is CPD of order n + 1
-        // (Wendland Thm 8.18). TPS sanity: d=2, J=2, n=1 → CPD order 2,
-        // matched exactly by the Linear null space (constants + linear).
+        // (Wendland Thm 8.18).
         (n_f as usize).saturating_add(1)
     } else {
         // Non-log case: kernel `c · r^β` is CPD of order ⌈(β+1)/2⌉
-        // (Wendland Thm 8.17). For odd β (the typical odd-d Riesz
-        // regime) this is `(β+1)/2`; for fractional β it rounds up.
+        // (Wendland Thm 8.17). For odd β this is `(β+1)/2`; for
+        // fractional β it rounds up.
         ((beta + 1.0) / 2.0).ceil() as usize
     };
     p_order >= cpd_required
@@ -11186,7 +11200,18 @@ pub fn operator_penalty_candidates_closed_form_pure(
     // partial-fraction precondition `2m ≥ q + 1`; without it, closed-form
     // panics on configs like m=1, q=2. Even-dimensional log-Riesz branches are
     // admitted because `riesz_kernel_value` now uses the canonical finite part.
-    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
+    // Closed-form pair block is admitted only when both the UV/IR
+    // convergence predicate AND Wendland's CPD-adequacy condition hold;
+    // the second guards against silently-non-PSD pair blocks when the
+    // polynomial null space is too small to absorb the kernel's CPD
+    // order (e.g. d=8, p_order=2, s_order=3.5 log-case). Failing
+    // either test routes to collocation `D_qᵀD_q`, which is PSD by
+    // construction.
+    let closed_form_ok = |q: usize| -> bool {
+        duchon_closed_form_operator_penalty_converges(q, p_order, s_order, d)
+            && duchon_pure_closed_form_pair_block_cpd_adequate(q, p_order, s_order, d)
+    };
+    let s1_raw = if closed_form_ok(1) {
         closed_form_operator_penalty_in_total_basis_pure(
             centers,
             1,
@@ -11202,7 +11227,7 @@ pub fn operator_penalty_candidates_closed_form_pure(
     };
     let (s1, c1) = normalize_penalty(&s1_raw);
 
-    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d) {
+    let s2_raw = if closed_form_ok(2) {
         closed_form_operator_penalty_in_total_basis_pure(
             centers,
             2,
