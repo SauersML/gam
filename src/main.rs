@@ -36,7 +36,7 @@ use gam::inference::data::{
 };
 use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
-    effectivelinkwiggle_formulaspec, formula_rhs_text, linkname, parse_formula, parse_link_choice,
+    effectivelinkwiggle_formulaspec, formula_rhs_text, parse_formula, parse_link_choice,
     parse_matching_auxiliary_formula, parse_surv_response,
     require_inverse_link_supports_joint_wiggle, require_likelihood_family_supports_joint_wiggle,
     require_linkchoice_supports_joint_wiggle, validate_auxiliary_formula_controls,
@@ -7954,8 +7954,8 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
         return format!("blended({names})");
     }
     match choice.mode {
-        LinkMode::Strict => linkname(choice.link).to_string(),
-        LinkMode::Flexible => format!("flexible({})", linkname(choice.link)),
+        LinkMode::Strict => choice.link.name().to_string(),
+        LinkMode::Flexible => format!("flexible({})", choice.link.name()),
     }
 }
 
@@ -9074,7 +9074,7 @@ mod tests {
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
         covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel,
-        fit_result_from_external, linkname, load_dataset_projected, parse_formula,
+        fit_result_from_external, load_dataset_projected, parse_formula,
         parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
         parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
         prepend_id_column_to_prediction_csv, required_columns_for_fit,
@@ -10700,7 +10700,7 @@ mod tests {
             family.name(),
         );
         payload.fit_result = Some(fit_result);
-        payload.link = Some(linkname(link).to_string());
+        payload.link = Some(link.name().to_string());
         payload.linkwiggle_knots = Some(wiggle_knots);
         payload.linkwiggle_degree = Some(wiggle_degree);
         payload.set_training_feature_metadata(vec![], vec![]);

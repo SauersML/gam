@@ -1818,10 +1818,6 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
     }
 }
 
-pub fn linkname(link: LinkFunction) -> &'static str {
-    link.name()
-}
-
 pub fn parse_link_component(v: &str) -> Result<LinkComponent, String> {
     match v.trim() {
         "logit" => Ok(LinkComponent::Logit),
