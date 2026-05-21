@@ -5248,10 +5248,10 @@ pub struct InnerSolution<'dp> {
 
     /// Optional inner KKT residual r = ∇_β L_pen(β̂) at the converged β̂.
     /// `Some` activates the implicit-function-theorem corrections in
-    /// `reml_laml_evaluate` (cost gets −½ rᵀ H⁻¹ r, ρ-gradient gets
-    /// −rᵀ v_k with v_k = λ_k H⁻¹ S_k β̂, and the ρρ Hessian gets the
-    /// corresponding derivative). `None` keeps the envelope-only behaviour
-    /// for callers that genuinely guarantee exact KKT.
+    /// `reml_laml_evaluate` (cost gets −½ rᵀ H⁻¹ r, ρ-gradient and ρρ Hessian
+    /// get the matching first and second derivatives of that same scalar
+    /// correction). `None` keeps the envelope-only behaviour for callers that
+    /// genuinely guarantee exact KKT.
     pub kkt_residual: Option<Array1<f64>>,
 }
 
@@ -6287,15 +6287,15 @@ pub fn reml_laml_evaluate(
     //
     // The cost correction strictly vanishes when the inner reached exact
     // KKT (r = 0).  When the inner exits via the noise-floor certificate
-    // with ‖r‖ > 0 it absorbs the leading error; combined with the matching
-    // gradient correction `grad[k] −= rᵀ · v_k` below, predicted-vs-actual
-    // remains consistent through trust-region steps.
+    // with ‖r‖ > 0 it absorbs the leading error; the gradient and Hessian
+    // corrections below are the exact first and second ρ derivatives of this
+    // same scalar Newton correction under fixed-dispersion LAML.
     //
     // Filter: callers populate `kkt_residual` only on the convergent
     // unconstrained joint-Newton path (`custom_family.rs`
-    // `exact_newton_joint_stationarity_vector_from_gradient`); `None`
-    // preserves the envelope-only behaviour for the rho-only profiled path
-    // and for legacy callers that never plumbed the residual.
+    // `exact_newton_joint_stationarity_vector_from_gradient`); `None` means
+    // the caller is presenting an exact-KKT mode and the envelope identities
+    // are already valid.
     let kkt_residual_vec: Option<&Array1<f64>> = solution
         .kkt_residual
         .as_ref()
@@ -6741,12 +6741,24 @@ pub fn reml_laml_evaluate(
     // The envelope formula above is the total derivative dV/dρ_k *only* when
     // β̂ satisfies the inner KKT condition ∇_β L_pen(β̂) = 0.  When the inner
     // exits via the noise-floor certificate with `r = ∇_β L_pen(β̂) ≠ 0`,
-    // the principled gradient picks up an extra chain-rule term:
+    // the corrected scalar objective is the one-step Newton profile
     //
-    //   dβ̂/dρ_k = −H⁻¹ ∂g_β/∂ρ_k = −H⁻¹ · (λ_k S_k β̂) = −H⁻¹ a_k_β
-    //   dV(β*(ρ),ρ)/dρ_k ≈ g_env(β̂)[k] + (∂g_env/∂β)ᵀ(β* − β̂)
-    //                    ≈ g_env(β̂)[k] + (λ_k S_k β̂)ᵀ · (−H⁻¹ r)
-    //                    =  g_env(β̂)[k]  −  rᵀ · v_k,   v_k := λ_k H⁻¹ S_k β̂
+    //   Ṽ(ρ) = V(β̂, ρ) − ½ rᵀ H⁻¹ r.
+    //
+    // Holding β̂ fixed while differentiating the correction gives, with
+    // q = H⁻¹r, A_k = λ_k S_k, and a_k = A_k β̂:
+    //
+    //   ∂_k r = a_k,        ∂_k H = A_k
+    //   ∂_k q = H⁻¹(a_k − A_k q)
+    //   ∂_k(-½ rᵀq) = −a_kᵀq + ½ qᵀA_kq.
+    //
+    // The leading `−a_kᵀq` term is the familiar `−rᵀv_k` correction; the
+    // `+½ qᵀA_kq` term is second-order in the KKT residual but is required if
+    // the analytic gradient is to be the derivative of the corrected scalar
+    // objective. The Hessian builder receives the corresponding second
+    // derivative from `compute_kkt_residual_rho_corrections` so ARC sees one
+    // coherent objective model instead of an envelope Hessian for a corrected
+    // value/gradient pair.
     //
     // The correction strictly vanishes when r = 0.  When the inner exit
     // accepts ‖r‖ > 0 on a coordinate whose H block is poorly conditioned
@@ -6759,7 +6771,7 @@ pub fn reml_laml_evaluate(
     //
     // Use `rho_penalty_a_k_betas` (with `lambdas`), NOT `rho_v_ks` (whose
     // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
-    // the IFT identity above is in the actual S(λ) basis, and the curvature
+    // the residual correction is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
     let kkt_rho_corrections = if let Some(r) =
         kkt_residual_vec.filter(|_| kkt_residual_correction_active && k > 0)
@@ -19908,6 +19920,130 @@ mod tests {
             (grad_ift[1] - fd_grad[1]).abs(),
             fd_grad[0],
             fd_grad[1],
+        );
+    }
+
+    /// The analytic rho Hessian must differentiate the same KKT-residual
+    /// correction used by the value and gradient. This is the minimized
+    /// reproduction of the biobank failure mode: an off-KKT inner mode with a
+    /// finite residual made the envelope Hessian inconsistent, so ARC chased a
+    /// curvature model for the wrong objective.
+    #[test]
+    fn ift_correction_recovers_fd_hessian_at_perturbed_beta() {
+        let rho: Vec<f64> = vec![0.5, 0.3];
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let xty = array![5.0, 3.0, 2.0];
+
+        fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
+            sol.dispersion = DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            };
+            sol
+        }
+
+        let solve_beta_star = |rho_eval: &[f64]| -> Array1<f64> {
+            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|&r| r.exp()).collect();
+            let mut h = xtx.clone();
+            h.scaled_add(lambdas_eval[0], &s1);
+            h.scaled_add(lambdas_eval[1], &s2);
+            DenseSpectralOperator::from_symmetric(&h)
+                .unwrap()
+                .solve(&xty)
+        };
+        let exact_profile_cost = |rho_eval: &[f64]| -> f64 {
+            let beta_star = solve_beta_star(rho_eval);
+            let sol = to_fixed(build_gaussian_solution_at_beta(rho_eval, beta_star, false));
+            reml_laml_evaluate(&sol, rho_eval, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost
+        };
+
+        let fd_eps = 2e-4;
+        let mut fd_hessian = Array2::<f64>::zeros((rho.len(), rho.len()));
+        let center_cost = exact_profile_cost(&rho);
+        for i in 0..rho.len() {
+            for j in i..rho.len() {
+                let value = if i == j {
+                    let mut rho_plus = rho.clone();
+                    rho_plus[i] += fd_eps;
+                    let mut rho_minus = rho.clone();
+                    rho_minus[i] -= fd_eps;
+                    (exact_profile_cost(&rho_plus) - 2.0 * center_cost
+                        + exact_profile_cost(&rho_minus))
+                        / (fd_eps * fd_eps)
+                } else {
+                    let mut pp = rho.clone();
+                    pp[i] += fd_eps;
+                    pp[j] += fd_eps;
+                    let mut pm = rho.clone();
+                    pm[i] += fd_eps;
+                    pm[j] -= fd_eps;
+                    let mut mp = rho.clone();
+                    mp[i] -= fd_eps;
+                    mp[j] += fd_eps;
+                    let mut mm = rho.clone();
+                    mm[i] -= fd_eps;
+                    mm[j] -= fd_eps;
+                    (exact_profile_cost(&pp) - exact_profile_cost(&pm) - exact_profile_cost(&mp)
+                        + exact_profile_cost(&mm))
+                        / (4.0 * fd_eps * fd_eps)
+                };
+                fd_hessian[[i, j]] = value;
+                if i != j {
+                    fd_hessian[[j, i]] = value;
+                }
+            }
+        }
+
+        let beta_star = solve_beta_star(&rho);
+        let beta_hat = &beta_star + &Array1::from_vec(vec![0.02, -0.015, 0.025]);
+        let sol_envelope = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat.clone(), false));
+        let hessian_envelope = reml_laml_evaluate(
+            &sol_envelope,
+            &rho,
+            EvalMode::ValueGradientHessian,
+            None,
+        )
+        .unwrap()
+        .hessian
+        .unwrap_analytic();
+
+        let sol_ift = to_fixed(build_gaussian_solution_at_beta(&rho, beta_hat, true));
+        let hessian_ift = reml_laml_evaluate(&sol_ift, &rho, EvalMode::ValueGradientHessian, None)
+            .unwrap()
+            .hessian
+            .unwrap_analytic();
+
+        let mut envelope_was_wrong = false;
+        for i in 0..rho.len() {
+            for j in 0..rho.len() {
+                let envelope_err = (hessian_envelope[[i, j]] - fd_hessian[[i, j]]).abs();
+                let ift_err = (hessian_ift[[i, j]] - fd_hessian[[i, j]]).abs();
+                assert!(
+                    ift_err <= envelope_err * 0.25 + 2e-5,
+                    "IFT Hessian correction failed at ({}, {}): envelope={:.8e} ift={:.8e} \
+                     fd={:.8e} envelope_err={:.3e} ift_err={:.3e}",
+                    i,
+                    j,
+                    hessian_envelope[[i, j]],
+                    hessian_ift[[i, j]],
+                    fd_hessian[[i, j]],
+                    envelope_err,
+                    ift_err
+                );
+                if envelope_err > 1e-4 && ift_err < envelope_err * 0.1 {
+                    envelope_was_wrong = true;
+                }
+            }
+        }
+        assert!(
+            envelope_was_wrong,
+            "test did not reproduce the Hessian bug: envelope={:?} ift={:?} fd={:?}",
+            hessian_envelope, hessian_ift, fd_hessian
         );
     }
 }
