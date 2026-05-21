@@ -9948,7 +9948,7 @@ fn duchon_kernel_radial_triplet(
     let triplet = match length_scale {
         None => {
             let m = pure_duchon_block_order(p_order, s_order as f64) as usize;
-            polyharmonic_kernel_triplet(r, m, k_dim)?
+            polyharmonic_kernel_triplet(r, m as f64, k_dim)?
         }
         Some(length_scale) => {
             if !length_scale.is_finite() || length_scale <= 0.0 {
@@ -12347,7 +12347,7 @@ fn duchon_matern_block(
 #[inline(always)]
 fn polyharmonic_kernel_triplet(
     r: f64,
-    m: usize,
+    m: f64,
     k_dim: usize,
 ) -> Result<(f64, f64, f64), BasisError> {
     let (value, first, second, _, _) = polyharmonic_block_jet4(r, m, k_dim)?;
@@ -12385,7 +12385,7 @@ fn falling_factorial_derivative(alpha: f64, order: usize) -> f64 {
 /// derivative paths.
 fn polyharmonic_block_jet4(
     r: f64,
-    m: usize,
+    m: f64,
     k_dim: usize,
 ) -> Result<(f64, f64, f64, f64, f64), BasisError> {
     if !r.is_finite() || r < 0.0 {
@@ -12393,16 +12393,27 @@ fn polyharmonic_block_jet4(
             "polyharmonic distance must be finite and non-negative".to_string(),
         ));
     }
+    assert!(
+        m.is_finite() && m > 0.0,
+        "polyharmonic_block_jet4: m must be finite and > 0, got {m}"
+    );
 
     let k_half = 0.5 * k_dim as f64;
-    let alpha = (2_i64 * (m as i64) - (k_dim as i64)) as f64;
-
-    if k_dim % 2 == 0 && m >= (k_dim / 2) {
-        let c = polyharmonic_log_sign(m, k_dim)
-            / (2.0_f64.powi((2 * m - 1) as i32)
+    let alpha = 2.0 * m - k_dim as f64;
+    // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
+    // (within ε). For fractional `m` this never fires.
+    const LOG_EPS: f64 = 1e-12;
+    let is_log_case = k_dim % 2 == 0 && {
+        let n_f = (alpha / 2.0).round();
+        n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
+    };
+    if is_log_case {
+        let m_int = m.round() as usize;
+        let c = polyharmonic_log_sign(m_int, k_dim)
+            / (2.0_f64.powi((2 * m_int - 1) as i32)
                 * std::f64::consts::PI.powf(k_half)
-                * gamma_lanczos(m as f64)
-                * gamma_lanczos((m - k_dim / 2 + 1) as f64));
+                * gamma_lanczos(m)
+                * gamma_lanczos((m_int - k_dim / 2 + 1) as f64));
         let mut out = [0.0; 5];
         for d in 0..5 {
             let e = alpha - d as f64;
@@ -12417,8 +12428,8 @@ fn polyharmonic_block_jet4(
         return Ok((out[0], out[1], out[2], out[3], out[4]));
     }
 
-    let c = gamma_lanczos(k_half - m as f64)
-        / (4.0_f64.powi(m as i32) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m as f64));
+    let c = gamma_lanczos(k_half - m)
+        / (4.0_f64.powf(m) * std::f64::consts::PI.powf(k_half) * gamma_lanczos(m));
     let mut out = [0.0; 5];
     for d in 0..5 {
         let e = alpha - d as f64;
