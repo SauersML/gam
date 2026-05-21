@@ -741,6 +741,33 @@ pub trait HessianDerivativeProvider: Send + Sync {
             .map(DriftDerivResult::Dense))
     }
 
+    /// Batched second-order correction hook. The K(K+1)/2 ρ-ρ pairs in
+    /// `compute_outer_hessian` each call
+    /// `hessian_second_derivative_correction_result(v_k, v_l, u_kl)`, and for
+    /// families whose `D²H[v_k, v_l]` operators share row-local state (a
+    /// single per-row scan across n observations that evaluates against all
+    /// triples in parallel) the batched form amortises the row-walk over all
+    /// pairs instead of re-scanning n rows per pair. The default preserves
+    /// the single-direction semantics by looping over the singular hook.
+    /// Pair the override with `has_batched_hessian_second_derivative_corrections`
+    /// so the unified evaluator only routes through this when a family
+    /// actually fuses the per-row work.
+    fn hessian_second_derivative_corrections_result(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        triples
+            .iter()
+            .map(|(v_k, v_l, u_kl)| {
+                self.hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+            })
+            .collect()
+    }
+
+    fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
+        false
+    }
+
     /// Whether this provider has non-trivial corrections.
     /// False for Gaussian, true for GLMs and coupled families.
     fn has_corrections(&self) -> bool;
