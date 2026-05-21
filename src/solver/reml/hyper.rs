@@ -259,8 +259,8 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         debug_assert_eq!(v.len(), self.p);
         let x_v = self.x_design.matrixvectormultiply(v);
-        let term1 = self.x_tau.t().dot(&(&self.c_x_u * &x_v));
-        let x_tau_v = self.x_tau.dot(v);
+        let term1 = crate::faer_ndarray::fast_atv(&self.x_tau, &(&self.c_x_u * &x_v));
+        let x_tau_v = crate::faer_ndarray::fast_av(&self.x_tau, v);
         let term2 = self
             .x_design
             .transpose_vector_multiply(&(&self.c_x_u * &x_tau_v));
