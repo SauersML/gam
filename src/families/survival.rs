@@ -2644,7 +2644,54 @@ impl PirlsWorkingModel for WorkingModelSurvival {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2, array, s};
+    use ndarray::{Array1, Array2, Array3, array, s};
+
+    #[test]
+    fn competing_risks_cif_constant_hazard_matches_closed_form() {
+        let times = array![0.0, 2.0, 5.0, 10.0];
+        let disease_rates = [0.12, 0.06];
+        let death_rates = [0.05, 0.02];
+        let cumulative = Array3::from_shape_fn((2, 2, times.len()), |(endpoint, row, time_idx)| {
+            let rate = if endpoint == 0 {
+                disease_rates[row]
+            } else {
+                death_rates[row]
+            };
+            rate * times[time_idx]
+        });
+
+        let result =
+            assemble_competing_risks_cif(times.view(), cumulative.view()).expect("assemble CIF");
+
+        for row in 0..2 {
+            let total_rate = disease_rates[row] + death_rates[row];
+            for time_idx in 0..times.len() {
+                let failure = 1.0 - (-total_rate * times[time_idx]).exp();
+                let expected_disease = disease_rates[row] / total_rate * failure;
+                let expected_death = death_rates[row] / total_rate * failure;
+                assert!((result.cif[[0, row, time_idx]] - expected_disease).abs() < 1e-12);
+                assert!((result.cif[[1, row, time_idx]] - expected_death).abs() < 1e-12);
+                assert!(
+                    (result.cif[[0, row, time_idx]]
+                        + result.cif[[1, row, time_idx]]
+                        + result.overall_survival[[row, time_idx]]
+                        - 1.0)
+                        .abs()
+                        < 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn competing_risks_cif_rejects_nonmonotone_hazards() {
+        let times = array![0.0, 1.0, 2.0];
+        let cumulative = Array3::from_shape_vec((1, 1, 3), vec![0.0, 0.2, 0.1])
+            .expect("shape");
+        let err = assemble_competing_risks_cif(times.view(), cumulative.view())
+            .expect_err("nonmonotone cumulative hazard should be rejected");
+        assert!(matches!(err, SurvivalError::NonMonotoneCumulativeHazard));
+    }
 
     fn toy_penalties() -> PenaltyBlocks {
         let s = array![[2.0, 0.5], [0.5, 3.0]];
