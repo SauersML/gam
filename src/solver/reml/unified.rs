@@ -5088,17 +5088,22 @@ impl PenaltySubspaceTrace {
         }
         h
     }
-}
 
-fn penalty_subspace_bilinear_pseudo_inverse(
-    kernel: &PenaltySubspaceTrace,
-    a: &Array1<f64>,
-    b: &Array1<f64>,
-) -> f64 {
-    let proj_a = crate::faer_ndarray::fast_atv(&kernel.u_s, a);
-    let proj_b = crate::faer_ndarray::fast_atv(&kernel.u_s, b);
-    let h_proj_inv_b = kernel.h_proj_inverse.dot(&proj_b);
-    proj_a.dot(&h_proj_inv_b)
+    /// Projected bilinear pseudo-inverse `aᵀ · K⁺ · b` where
+    /// `K⁺ = U_S · H_proj⁻¹ · U_Sᵀ`.
+    ///
+    /// Used by the rank-deficient LAML IFT correction path: when `b ∈
+    /// col(S_k) ⊂ range(S_+)`, applying the projected pseudo-inverse
+    /// instead of the full `H⁻¹` strips spurious null-space noise from
+    /// `a` (≈ the outer-stationarity residual `r`) before the inverse,
+    /// without biasing the numerator. Costs `O(p·r + r²)` versus the
+    /// `O(p²·r)` full solve.
+    pub fn bilinear_pseudo_inverse(&self, a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+        let proj_a = crate::faer_ndarray::fast_atv(&self.u_s, a);
+        let proj_b = crate::faer_ndarray::fast_atv(&self.u_s, b);
+        let h_proj_inv_b = self.h_proj_inverse.dot(&proj_b);
+        proj_a.dot(&h_proj_inv_b)
+    }
 }
 
 /// Specifies whether the model uses profiled scale (Gaussian REML) or
@@ -6308,7 +6313,7 @@ pub fn reml_laml_evaluate(
         // component of `r` before the inverse is applied, recovering
         // the honest correction.
         let cost_correction = if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-            -0.5_f64 * penalty_subspace_bilinear_pseudo_inverse(kernel, r, r)
+            -0.5_f64 * kernel.bilinear_pseudo_inverse(r, r)
         } else {
             let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
             rhs.column_mut(0).assign(r);

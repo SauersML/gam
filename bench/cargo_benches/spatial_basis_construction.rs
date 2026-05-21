@@ -40,7 +40,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: Some(1.5),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: Default::default(),
             aniso_log_scales: Some(vec![0.15, -0.05, 0.0]),
