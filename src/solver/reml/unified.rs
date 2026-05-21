@@ -4140,17 +4140,6 @@ impl HyperOperator for SparseDirectionalHyperOperator {
         out
     }
 
-    fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((self.p, self.p));
-        let mut basis = Array1::<f64>::zeros(self.p);
-        for j in 0..self.p {
-            basis[j] = 1.0;
-            self.mul_vec_into(basis.view(), out.column_mut(j));
-            basis[j] = 0.0;
-        }
-        out
-    }
-
     fn is_implicit(&self) -> bool {
         false
     }
