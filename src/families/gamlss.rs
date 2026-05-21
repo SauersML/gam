@@ -8120,7 +8120,7 @@ fn make_two_block_design_row_coeff_operator(
     })
 }
 
-struct GaussianLocationScaleJointPsiDirection {
+struct GaussianLocationScaleWiggleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
     xmu_psi: PsiDesignMap,
@@ -8135,7 +8135,7 @@ struct GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     xmu: Array2<f64>,
     x_ls: Array2<f64>,
-    psi_directions: ExactNewtonJointPsiDirectCache<GaussianLocationScaleJointPsiDirection>,
+    psi_directions: ExactNewtonJointPsiDirectCache<GaussianLocationScaleWiggleJointPsiDirection>,
 }
 
 impl GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
@@ -8167,7 +8167,7 @@ impl GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace {
     fn psi_direction(
         &self,
         psi_index: usize,
-    ) -> Result<Option<Arc<GaussianLocationScaleJointPsiDirection>>, String> {
+    ) -> Result<Option<Arc<GaussianLocationScaleWiggleJointPsiDirection>>, String> {
         self.psi_directions.get_or_try_init(psi_index, || {
             self.family.exact_newton_joint_psi_direction(
                 &self.block_states,
@@ -8664,7 +8664,7 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<GaussianLocationScaleWiggleJointPsiDirection>, String> {
         if block_states.len() != 3 || derivative_blocks.len() != 3 {
             return Err(format!(
                 "GaussianLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
@@ -8728,7 +8728,7 @@ impl GaussianLocationScaleWiggleFamily {
                         Self::BLOCK_WIGGLE => return Ok(None),
                         _ => return Ok(None),
                     }
-                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
+                    return Ok(Some(GaussianLocationScaleWiggleJointPsiDirection {
                         block_idx,
                         local_idx,
                         zmu_psi,
@@ -8747,8 +8747,8 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &GaussianLocationScaleJointPsiDirection,
-        psi_b: &GaussianLocationScaleJointPsiDirection,
+        psi_a: &GaussianLocationScaleWiggleJointPsiDirection,
+        psi_b: &GaussianLocationScaleWiggleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
@@ -9656,8 +9656,8 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_a: &GaussianLocationScaleJointPsiDirection,
-        dir_b: &GaussianLocationScaleJointPsiDirection,
+        dir_a: &GaussianLocationScaleWiggleJointPsiDirection,
+        dir_b: &GaussianLocationScaleWiggleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
@@ -10086,7 +10086,7 @@ impl GaussianLocationScaleWiggleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &GaussianLocationScaleJointPsiDirection,
+        dir_a: &GaussianLocationScaleWiggleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -12907,7 +12907,7 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
     }
 }
 
-struct BinomialLocationScaleJointPsiDirection {
+struct BinomialLocationScaleWiggleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
     x_t_psi: PsiDesignMap,
@@ -12916,7 +12916,7 @@ struct BinomialLocationScaleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
-struct BinomialLocationScaleJointPsiSecondDrifts {
+struct BinomialLocationScaleWiggleJointPsiSecondDrifts {
     x_t_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
     x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
     x_t_ab: Option<Array2<f64>>,
@@ -12931,7 +12931,7 @@ struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     x_t: Arc<Array2<f64>>,
     x_ls: Arc<Array2<f64>>,
-    psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleJointPsiDirection>,
+    psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleWiggleJointPsiDirection>,
 }
 
 impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
@@ -12963,7 +12963,7 @@ impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
     fn psi_direction(
         &self,
         psi_index: usize,
-    ) -> Result<Option<Arc<BinomialLocationScaleJointPsiDirection>>, String> {
+    ) -> Result<Option<Arc<BinomialLocationScaleWiggleJointPsiDirection>>, String> {
         self.psi_directions.get_or_try_init(psi_index, || {
             self.family.exact_newton_joint_psi_direction(
                 &self.block_states,
@@ -16572,7 +16572,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<BinomialLocationScaleWiggleJointPsiDirection>, String> {
         if block_states.len() != 3 || derivative_blocks.len() != 3 {
             return Err(format!(
                 "BinomialLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
@@ -16637,7 +16637,7 @@ impl BinomialLocationScaleWiggleFamily {
                         Self::BLOCK_WIGGLE => return Ok(None),
                         _ => return Ok(None),
                     }
-                    return Ok(Some(BinomialLocationScaleJointPsiDirection {
+                    return Ok(Some(BinomialLocationScaleWiggleJointPsiDirection {
                         block_idx,
                         local_idx,
                         z_t_psi,
@@ -16656,11 +16656,11 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &BinomialLocationScaleJointPsiDirection,
-        psi_b: &BinomialLocationScaleJointPsiDirection,
+        psi_a: &BinomialLocationScaleWiggleJointPsiDirection,
+        psi_b: &BinomialLocationScaleWiggleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<BinomialLocationScaleJointPsiSecondDrifts, String> {
+    ) -> Result<BinomialLocationScaleWiggleJointPsiSecondDrifts, String> {
         let n = self.y.len();
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
@@ -16725,7 +16725,7 @@ impl BinomialLocationScaleWiggleFamily {
             .forward_mul(beta_t.view());
         let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, pls)
             .forward_mul(beta_ls.view());
-        Ok(BinomialLocationScaleJointPsiSecondDrifts {
+        Ok(BinomialLocationScaleWiggleJointPsiSecondDrifts {
             x_t_ab_action,
             x_ls_ab_action,
             x_t_ab,
@@ -17252,8 +17252,8 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_a: &BinomialLocationScaleJointPsiDirection,
-        dir_b: &BinomialLocationScaleJointPsiDirection,
+        dir_a: &BinomialLocationScaleWiggleJointPsiDirection,
+        dir_b: &BinomialLocationScaleWiggleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
@@ -18017,7 +18017,7 @@ impl BinomialLocationScaleWiggleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &BinomialLocationScaleJointPsiDirection,
+        dir_a: &BinomialLocationScaleWiggleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
