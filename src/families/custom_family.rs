@@ -2656,6 +2656,7 @@ pub struct BlockwiseInnerResult {
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
     pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    pub kkt_residual: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -2674,6 +2675,7 @@ impl std::fmt::Debug for BlockwiseInnerResult {
                 "joint_workspace",
                 &self.joint_workspace.as_ref().map(|_| "<workspace>"),
             )
+            .field("kkt_residual", &self.kkt_residual.as_ref().map(|r| r.len()))
             .finish()
     }
 }
@@ -10428,6 +10430,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s: cached.block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
+                kkt_residual: None,
             });
         }
         // Soft warm-start across rho changes.
@@ -12178,6 +12181,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
+                kkt_residual: None,
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -13434,6 +13438,7 @@ fn build_custom_family_inner_assembly<'dp>(
         ext_coord_pair_fn,
         rho_ext_pair_fn,
         fixed_drift_deriv,
+        kkt_residual: inner.kkt_residual.clone(),
     };
 
     Ok((evaluator, ext_dim))
@@ -17730,6 +17735,77 @@ fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         offset += width;
     }
     Ok(inf_norm)
+}
+
+fn exact_newton_joint_stationarity_vector_from_gradient(
+    gradient: &Array1<f64>,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Array1<f64>, String> {
+    if states.len() != specs.len() || states.len() != s_lambdas.len() {
+        return Err(
+            "exact-newton joint stationarity vector from gradient: block dimension mismatch"
+                .to_string(),
+        );
+    }
+    let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+    if gradient.len() != total_p {
+        return Err(format!(
+            "exact-newton joint stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
+            gradient.len(),
+            total_p
+        ));
+    }
+
+    let mut residual = Array1::<f64>::zeros(total_p);
+    let mut offset = 0usize;
+    for b in 0..states.len() {
+        let width = specs[b].design.ncols();
+        let start = offset;
+        let end = offset + width;
+        let mut block =
+            s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
+        if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+            block += &states[b].beta.mapv(|v| ridge * v);
+        }
+        residual.slice_mut(ndarray::s![start..end]).assign(&block);
+        offset = end;
+    }
+    Ok(residual)
+}
+
+fn exact_newton_joint_kkt_residual_for_ift<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    states: &[ParameterBlockState],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+) -> Result<Option<Array1<f64>>, String> {
+    let block_constraints = collect_block_linear_constraints(family, states, specs)?;
+    if block_constraints.iter().any(Option::is_some) {
+        return Ok(None);
+    }
+    let eval = family.evaluate(states)?;
+    let Some(gradient) = exact_newton_joint_gradient_from_eval(&eval, specs, states)? else {
+        return Ok(None);
+    };
+    let residual = exact_newton_joint_stationarity_vector_from_gradient(
+        &gradient,
+        states,
+        specs,
+        s_lambdas,
+        ridge,
+        ridge_policy,
+    )?;
+    if residual.iter().all(|v| v.is_finite()) {
+        Ok(Some(residual))
+    } else {
+        Ok(None)
+    }
 }
 
 fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
