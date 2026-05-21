@@ -164,15 +164,6 @@ def assert_no_cuda_library_conflicts(context: str) -> None:
         "or the pip nvidia-*-cu12 wheels, not both.\n"
         f"{details}\n"
     )
-    return
-    details = format_cuda_diagnostics()
-    raise RuntimeError(
-        f"CUDA library conflict before {context}. Multiple distinct shared objects "
-        "for the same CUDA SONAME family are already mapped in this Python process. "
-        "glibc deduplicates dlopen by file identity rather than SONAME, so cuBLAS "
-        "handle ownership can split across implementations and abort with "
-        f"'double free or corruption (!prev)'.\n{details}"
-    )
 
 
 def _cuda_library_candidates() -> tuple[Path, ...]:
