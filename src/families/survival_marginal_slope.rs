@@ -17153,6 +17153,14 @@ pub fn fit_survival_marginal_slope_terms(
     let fit_started = std::time::Instant::now();
     let mut spec = spec;
     validate_spec(&spec)?;
+    let mut options = options.clone();
+    if options.inner_max_cycles < 300 {
+        options.inner_max_cycles = 300;
+    }
+    if options.inner_tol < options.outer_tol {
+        options.inner_tol = options.outer_tol;
+    }
+    let options = &options;
     if spec.base_link != InverseLink::Standard(LinkFunction::Probit) {
         return Err(format!(
             "survival-marginal-slope currently supports only probit base_link, got {:?}",
