@@ -142,6 +142,12 @@ struct VisualizerModel {
     secondary_lane: LaneState,
     edf_terms: Vec<(String, f64, f64)>,
     diagnostics_lines: Vec<String>,
+    // Tail of the log stream, mirrored by `ProgressLogger`. Rendered as
+    // the chart's bottom "Recent log" panel and replayed to stderr by
+    // the panic hook so a crash leaves the last few hundred log lines
+    // in the tee'd run file even though the alt-screen swallowed them
+    // on the terminal.
+    log_tail: VecDeque<String>,
     diagnostics_condition: Option<f64>,
     diagnostics_step_size: Option<f64>,
     diagnostics_ridge: Option<f64>,
@@ -168,6 +174,7 @@ impl Default for VisualizerModel {
             secondary_lane: LaneState::default(),
             edf_terms: Vec::new(),
             diagnostics_lines: Vec::new(),
+            log_tail: VecDeque::with_capacity(LOG_TAIL_CAP),
             diagnostics_condition: None,
             diagnostics_step_size: None,
             diagnostics_ridge: None,
@@ -323,8 +330,91 @@ fn maybe_redraw_throttled(feed: &ActiveFeed) {
 }
 
 struct InteractiveVisualizer {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<File>>,
+    // Independent File handle on /dev/tty kept solely for teardown: at
+    // drop time we write LeaveAlternateScreen here so the user's
+    // terminal returns to the main buffer cleanly. Cloning the fd makes
+    // this safe to use even while the ratatui Terminal still owns its
+    // own handle.
+    tty_for_teardown: File,
     last_draw: Instant,
+}
+
+// Process-wide handle on /dev/tty used by the panic hook to leave the
+// alternate screen even when the panicking thread isn't the one that
+// installed the visualizer. We can't reach into the InteractiveVisualizer
+// from a panic hook (it's behind a Mutex and the panic might be holding
+// it), so we cache a clone of the fd here at activation time.
+static TTY_HANDLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+fn tty_handle_slot() -> &'static Mutex<Option<File>> {
+    TTY_HANDLE.get_or_init(|| Mutex::new(None))
+}
+
+fn install_tty_handle(handle: File) {
+    if let Ok(mut g) = tty_handle_slot().lock() {
+        *g = Some(handle);
+    }
+}
+
+fn clear_tty_handle() {
+    if let Ok(mut g) = tty_handle_slot().lock() {
+        *g = None;
+    }
+}
+
+#[cfg(unix)]
+fn open_dev_tty() -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+}
+
+#[cfg(not(unix))]
+fn open_dev_tty() -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "/dev/tty not available on this platform",
+    ))
+}
+
+// Install once. The hook restores terminal state and dumps the log tail
+// to stderr so a crash mid-fit (a) leaves the shell prompt usable
+// instead of stuck in alt-screen + raw mode, and (b) preserves the last
+// few hundred log records in whatever was capturing stderr — typically
+// the `tee` pipe in run.sh that backs the run's $RESULTS file.
+fn install_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore terminal first so subsequent stderr writes scroll
+            // in the main buffer rather than under the alt-screen.
+            disable_raw_mode().ok();
+            if let Ok(mut guard) = tty_handle_slot().lock()
+                && let Some(file) = guard.as_mut()
+            {
+                let _ = execute!(file, LeaveAlternateScreen);
+                let _ = file.flush();
+            }
+            // Replay recent log tail so the tee'd run file ends with
+            // real context, not just a bare panic message.
+            if let Some(feed) = current_active_feed() {
+                let model = lock_model(&feed.model);
+                let _ = writeln!(
+                    io::stderr(),
+                    "\n=== visualizer crash: last {} log line(s) ===",
+                    model.log_tail.len()
+                );
+                for line in &model.log_tail {
+                    let _ = writeln!(io::stderr(), "{line}");
+                }
+                let _ = writeln!(io::stderr(), "=== end log tail ===\n");
+            }
+            prev(info);
+        }));
+    });
 }
 
 struct DumbVisualizer {
@@ -338,15 +428,42 @@ struct DumbVisualizer {
 
 impl InteractiveVisualizer {
     fn new() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
-        Ok(Self {
-            terminal,
-            last_draw: Instant::now() - INTERACTIVE_DRAW_INTERVAL,
-        })
+        // Never claim the alt-screen during the test binary: shared
+        // global terminal state racing with parallel tests is a recipe
+        // for hangs, and the existing "use Dumb when not attached to
+        // TTY" tests rely on this short-circuit to assert their
+        // invariants without needing to fake a tty.
+        #[cfg(test)]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "interactive visualizer disabled under cfg(test)",
+            ));
+        }
+        #[cfg(not(test))]
+        {
+            // Route the chart to /dev/tty rather than stdout, so it
+            // works even when the parent shell pipes stdout/stderr
+            // through `tee` (as run.sh does to capture $RESULTS). Logs
+            // continue to go to stderr → tee → file; the chart goes to
+            // the real controlling terminal. Two independent surfaces,
+            // no cross-contamination.
+            let tty_write = open_dev_tty()?;
+            let tty_for_teardown = tty_write.try_clone()?;
+            let tty_for_hook = tty_write.try_clone()?;
+            enable_raw_mode()?;
+            let mut tty_init = tty_write.try_clone()?;
+            execute!(tty_init, EnterAlternateScreen)?;
+            install_tty_handle(tty_for_hook);
+            install_panic_hook();
+            let backend = CrosstermBackend::new(tty_write);
+            let terminal = Terminal::new(backend)?;
+            Ok(Self {
+                terminal,
+                tty_for_teardown,
+                last_draw: Instant::now() - INTERACTIVE_DRAW_INTERVAL,
+            })
+        }
     }
 
     fn maybe_draw(&mut self, model: &VisualizerModel, force: bool) {
@@ -627,7 +744,9 @@ impl InteractiveVisualizer {
     fn teardown(&mut self, model: &VisualizerModel) {
         self.maybe_draw(model, true);
         disable_raw_mode().ok();
-        execute!(io::stdout(), LeaveAlternateScreen).ok();
+        execute!(self.tty_for_teardown, LeaveAlternateScreen).ok();
+        let _ = self.tty_for_teardown.flush();
+        clear_tty_handle();
     }
 }
 
