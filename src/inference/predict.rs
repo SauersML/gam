@@ -686,11 +686,8 @@ impl PredictableModel for StandardPredictor {
                     let rows_in_chunk = q0_chunk.len();
                     let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
                     {
-                        let grad_slice = grad
-                            .as_slice_mut()
-                            .expect("row-major grad is contiguous");
-                        if let (Some(x_all), Some(dq_all)) =
-                            (x_main.as_slice(), dq_dq0.as_slice())
+                        let grad_slice = grad.as_slice_mut().expect("row-major grad is contiguous");
+                        if let (Some(x_all), Some(dq_all)) = (x_main.as_slice(), dq_dq0.as_slice())
                         {
                             for i in 0..rows_in_chunk {
                                 let dqi = dq_all[i];
