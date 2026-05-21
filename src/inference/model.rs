@@ -947,46 +947,15 @@ fn validate_marginal_slope_saved_fit(
     link_deviation: Option<&SavedAnchoredDeviationRuntime>,
     fit_label: &str,
 ) -> Result<(), String> {
-    let expected_blocks =
-        2 + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
-    if fit.blocks.len() != expected_blocks {
-        return Err(format!(
-            "bernoulli marginal-slope saved {fit_label} requires exactly {expected_blocks} coefficient blocks [marginal, logslope{}{}], got {}",
-            if score_warp.is_some() {
-                ", score-warp"
-            } else {
-                ""
-            },
-            if link_deviation.is_some() {
-                ", link-deviation"
-            } else {
-                ""
-            },
-            fit.blocks.len(),
-        ));
-    }
-    if let Some(runtime) = score_warp {
-        let beta = &fit.blocks[2].beta;
-        if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "bernoulli marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
-        }
-    }
-    if let Some(runtime) = link_deviation {
-        let idx = 2 + usize::from(score_warp.is_some());
-        let beta = &fit.blocks[idx].beta;
-        if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "bernoulli marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
-        }
-    }
-    Ok(())
+    validate_marginal_slope_saved_fit_impl(
+        fit,
+        score_warp,
+        link_deviation,
+        fit_label,
+        "bernoulli",
+        2,
+        "marginal, logslope",
+    )
 }
 
 fn validate_survival_marginal_slope_saved_fit(
@@ -995,40 +964,67 @@ fn validate_survival_marginal_slope_saved_fit(
     link_deviation: Option<&SavedAnchoredDeviationRuntime>,
     fit_label: &str,
 ) -> Result<(), String> {
+    validate_marginal_slope_saved_fit_impl(
+        fit,
+        score_warp,
+        link_deviation,
+        fit_label,
+        "survival",
+        3,
+        "time, marginal, slope",
+    )
+}
+
+/// Shared block-count + coefficient-dimension validation for the bernoulli
+/// and survival marginal-slope saved-fit gates. The only family-specific
+/// inputs are the family kind string ("bernoulli" / "survival"), the base
+/// block count (2 for bernoulli, 3 for survival — the survival path has an
+/// extra time block), and the base-block role list rendered in the error
+/// message ("marginal, logslope" / "time, marginal, slope"). The score-warp
+/// / link-deviation tail follows the same shape in both families.
+fn validate_marginal_slope_saved_fit_impl(
+    fit: &UnifiedFitResult,
+    score_warp: Option<&SavedAnchoredDeviationRuntime>,
+    link_deviation: Option<&SavedAnchoredDeviationRuntime>,
+    fit_label: &str,
+    family_kind: &str,
+    base_block_count: usize,
+    base_block_role_list: &str,
+) -> Result<(), String> {
     let expected_blocks =
-        3 + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
+        base_block_count + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
     if fit.blocks.len() != expected_blocks {
+        let score_warp_suffix = if score_warp.is_some() {
+            ", score-warp"
+        } else {
+            ""
+        };
+        let link_deviation_suffix = if link_deviation.is_some() {
+            ", link-deviation"
+        } else {
+            ""
+        };
         return Err(format!(
-            "survival marginal-slope saved {fit_label} requires {expected_blocks} blocks [time, marginal, slope{}{}], got {}",
-            if score_warp.is_some() {
-                ", score-warp"
-            } else {
-                ""
-            },
-            if link_deviation.is_some() {
-                ", link-deviation"
-            } else {
-                ""
-            },
+            "{family_kind} marginal-slope saved {fit_label} requires {expected_blocks} blocks [{base_block_role_list}{score_warp_suffix}{link_deviation_suffix}], got {}",
             fit.blocks.len(),
         ));
     }
     if let Some(runtime) = score_warp {
-        let beta = &fit.blocks[3].beta;
+        let beta = &fit.blocks[base_block_count].beta;
         if beta.len() != runtime.basis_dim {
             return Err(format!(
-                "survival marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                "{family_kind} marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
                 beta.len(),
                 runtime.basis_dim
             ));
         }
     }
     if let Some(runtime) = link_deviation {
-        let idx = 3 + usize::from(score_warp.is_some());
+        let idx = base_block_count + usize::from(score_warp.is_some());
         let beta = &fit.blocks[idx].beta;
         if beta.len() != runtime.basis_dim {
             return Err(format!(
-                "survival marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                "{family_kind} marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
                 beta.len(),
                 runtime.basis_dim
             ));
