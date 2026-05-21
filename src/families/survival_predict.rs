@@ -464,6 +464,379 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
     })
 }
 
+pub fn predict_competing_risks_survival(
+    req: SurvivalPredictRequest<'_>,
+) -> Result<CompetingRisksPredictResult, String> {
+    let SurvivalPredictRequest {
+        model,
+        data,
+        col_map,
+        training_headers,
+        primary_offset,
+        noise_offset,
+        time_grid,
+        with_uncertainty,
+    } = req;
+
+    if with_uncertainty {
+        return Err(
+            "competing-risks survival prediction does not yet support with_uncertainty".to_string(),
+        );
+    }
+
+    let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
+    if !matches!(
+        saved_likelihood_mode,
+        SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+    ) {
+        return Err(format!(
+            "joint cause-specific prediction supports transformation/weibull survival only; got {}",
+            survival_likelihood_modename(saved_likelihood_mode)
+        ));
+    }
+
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let cause_count = model
+        .survival_cause_count
+        .unwrap_or(fit.blocks.len())
+        .max(1);
+    if cause_count <= 1 {
+        return Err(
+            "competing-risks survival prediction requires a saved model with at least two causes"
+                .to_string(),
+        );
+    }
+    if fit.blocks.len() != cause_count {
+        return Err(format!(
+            "saved competing-risks survival fit has {} coefficient blocks but metadata says {cause_count} causes",
+            fit.blocks.len()
+        ));
+    }
+    let endpoint_names = model.survival_endpoint_names.clone().unwrap_or_else(|| {
+        (1..=cause_count)
+            .map(|idx| format!("cause_{idx}"))
+            .collect()
+    });
+    if endpoint_names.len() != cause_count {
+        return Err(format!(
+            "saved competing-risks survival endpoint_names has length {}, expected {cause_count}",
+            endpoint_names.len()
+        ));
+    }
+
+    let entryname = model
+        .survival_entry
+        .as_ref()
+        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+    let exitname = model
+        .survival_exit
+        .as_ref()
+        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
+    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
+    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+
+    let termspec = resolve_termspec_for_prediction(
+        &model.resolved_termspec,
+        training_headers,
+        col_map,
+        "resolved_termspec",
+    )?;
+    let cov_clipped = model.axis_clip_to_training_ranges(data, col_map);
+    let cov_input = cov_clipped.as_ref().map_or(data, |arr| arr.view());
+    let cov_design = build_term_collection_design(cov_input, &termspec)
+        .map_err(|e| format!("failed to build competing-risks prediction design: {e}"))?;
+
+    let n = data.nrows();
+    if primary_offset.len() != n || noise_offset.len() != n {
+        return Err(format!(
+            "competing-risks prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+            primary_offset.len(),
+            noise_offset.len()
+        ));
+    }
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let pairs: Result<Vec<(f64, f64)>, _> = (0..n)
+        .into_par_iter()
+        .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
+        .collect();
+    let pairs = pairs?;
+    let mut age_entry = Array1::<f64>::zeros(n);
+    let mut age_exit = Array1::<f64>::zeros(n);
+    for (i, (t0, t1)) in pairs.into_iter().enumerate() {
+        age_entry[i] = t0;
+        age_exit[i] = t1;
+    }
+
+    let time_cfg = load_survival_time_basis_config_from_model(model)?;
+    let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
+    {
+        require_structural_survival_time_basis(
+            &time_build.basisname,
+            "saved competing-risks survival prediction",
+        )?;
+    }
+    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+
+    let per_row_eval = time_grid.is_none();
+    let eval_times: Vec<f64> = match time_grid {
+        Some(grid) => {
+            if grid.is_empty() {
+                return Err("survival time_grid must contain at least one time".to_string());
+            }
+            for (idx, &t) in grid.iter().enumerate() {
+                if !t.is_finite() || t < 0.0 {
+                    return Err(format!(
+                        "survival time_grid requires finite non-negative times (index {idx})",
+                    ));
+                }
+            }
+            grid.to_vec()
+        }
+        None => Vec::new(),
+    };
+    let t_cols = if per_row_eval { 1 } else { eval_times.len() };
+
+    let saved_timewiggle_by_cause = saved_cause_specific_timewiggles(model, &fit, cause_count)?;
+    let cov_rows = (0..n)
+        .map(|i| design_row_owned(&cov_design.design, i, "competing-risks covariate row"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut hazard = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, t_cols)))
+        .collect::<Vec<_>>();
+    let mut survival = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, t_cols)))
+        .collect::<Vec<_>>();
+    let mut cumulative_hazard = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, t_cols)))
+        .collect::<Vec<_>>();
+    let mut linear_predictor = (0..cause_count)
+        .map(|_| Array1::<f64>::zeros(n))
+        .collect::<Vec<_>>();
+
+    struct CauseRow {
+        cause: usize,
+        row: usize,
+        hazard: Vec<f64>,
+        survival: Vec<f64>,
+        cumulative: Vec<f64>,
+        eta_exit: f64,
+    }
+
+    let rows: Result<Vec<CauseRow>, String> = (0..cause_count * n)
+        .into_par_iter()
+        .map(|flat| {
+            let cause = flat / n;
+            let i = flat % n;
+            let block = &fit.blocks[cause];
+            let timewiggle = saved_timewiggle_by_cause[cause].as_ref();
+            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), String> {
+                let t_entry = age_entry[i].min(t_query);
+                let single_entry = Array1::from_elem(1, t_entry);
+                let single_exit = Array1::from_elem(1, t_query);
+                let row_time =
+                    build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
+                let (_, r_eta_exit, r_deriv_exit) = build_survival_time_offsets_for_likelihood(
+                    &single_entry,
+                    &single_exit,
+                    &baseline_cfg,
+                    saved_likelihood_mode,
+                    None,
+                )?;
+                evaluate_rp_row_with_beta(
+                    &block.beta,
+                    timewiggle,
+                    &row_time,
+                    &cov_rows[i],
+                    r_eta_exit[0],
+                    r_deriv_exit[0],
+                    primary_offset[i],
+                )
+            };
+
+            let mut out = CauseRow {
+                cause,
+                row: i,
+                hazard: vec![0.0; t_cols],
+                survival: vec![0.0; t_cols],
+                cumulative: vec![0.0; t_cols],
+                eta_exit: 0.0,
+            };
+            if per_row_eval {
+                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                out.eta_exit = eta_t;
+                out.hazard[0] = haz_t;
+                out.cumulative[0] = cum_t;
+                out.survival[0] = (-cum_t).exp().clamp(0.0, 1.0);
+            } else {
+                for (j, &t_query) in eval_times.iter().enumerate() {
+                    let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                    out.hazard[j] = haz_t;
+                    out.cumulative[j] = cum_t;
+                    out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
+                }
+                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                out.eta_exit = eta_t;
+            }
+            Ok(out)
+        })
+        .collect();
+
+    for row in rows? {
+        linear_predictor[row.cause][row.row] = row.eta_exit;
+        for j in 0..t_cols {
+            hazard[row.cause][[row.row, j]] = row.hazard[j];
+            survival[row.cause][[row.row, j]] = row.survival[j];
+            cumulative_hazard[row.cause][[row.row, j]] = row.cumulative[j];
+        }
+    }
+
+    let (cif, overall_survival) = assemble_competing_risks_cif(&cumulative_hazard)?;
+    let times_out = if per_row_eval {
+        age_exit.to_vec()
+    } else {
+        eval_times
+    };
+    Ok(CompetingRisksPredictResult {
+        times: times_out,
+        endpoint_names,
+        hazard,
+        survival,
+        cumulative_hazard,
+        cif,
+        overall_survival,
+        linear_predictor,
+        likelihood_mode: saved_likelihood_mode,
+    })
+}
+
+fn saved_cause_specific_timewiggles(
+    model: &SavedModel,
+    fit: &UnifiedFitResult,
+    cause_count: usize,
+) -> Result<Vec<Option<SavedBaselineTimeWiggleRuntime>>, String> {
+    let has_metadata = model.baseline_timewiggle_knots.is_some()
+        || model.baseline_timewiggle_degree.is_some()
+        || model.baseline_timewiggle_penalty_orders.is_some()
+        || model.baseline_timewiggle_double_penalty.is_some()
+        || model.beta_baseline_timewiggle_by_cause.is_some();
+    if !has_metadata {
+        return Ok(vec![None; cause_count]);
+    }
+    let knots = model.baseline_timewiggle_knots.clone().ok_or_else(|| {
+        "joint cause-specific survival missing baseline_timewiggle_knots".to_string()
+    })?;
+    let degree = model.baseline_timewiggle_degree.ok_or_else(|| {
+        "joint cause-specific survival missing baseline_timewiggle_degree".to_string()
+    })?;
+    let penalty_orders = model
+        .baseline_timewiggle_penalty_orders
+        .clone()
+        .ok_or_else(|| {
+            "joint cause-specific survival missing baseline_timewiggle_penalty_orders".to_string()
+        })?;
+    let double_penalty = model.baseline_timewiggle_double_penalty.ok_or_else(|| {
+        "joint cause-specific survival missing baseline_timewiggle_double_penalty".to_string()
+    })?;
+    let by_cause = model
+        .beta_baseline_timewiggle_by_cause
+        .as_ref()
+        .ok_or_else(|| {
+            "joint cause-specific survival missing beta_baseline_timewiggle_by_cause".to_string()
+        })?;
+    if by_cause.len() != cause_count {
+        return Err(format!(
+            "joint cause-specific survival has {} timewiggle coefficient blocks, expected {cause_count}",
+            by_cause.len()
+        ));
+    }
+    for (cause, (block, beta_w)) in fit.blocks.iter().zip(by_cause).enumerate() {
+        if beta_w.len() > block.beta.len() {
+            return Err(format!(
+                "joint cause-specific survival cause {} timewiggle beta has length {}, but endpoint beta has {} coefficients",
+                cause + 1,
+                beta_w.len(),
+                block.beta.len()
+            ));
+        }
+    }
+    Ok(by_cause
+        .iter()
+        .map(|beta| {
+            Some(SavedBaselineTimeWiggleRuntime {
+                knots: knots.clone(),
+                degree,
+                penalty_orders: penalty_orders.clone(),
+                double_penalty,
+                beta: beta.clone(),
+            })
+        })
+        .collect())
+}
+
+fn assemble_competing_risks_cif(
+    cumulative_hazard: &[Array2<f64>],
+) -> Result<(Vec<Array2<f64>>, Array2<f64>), String> {
+    if cumulative_hazard.is_empty() {
+        return Err("competing-risks CIF assembly requires at least one endpoint".to_string());
+    }
+    let n = cumulative_hazard[0].nrows();
+    let t = cumulative_hazard[0].ncols();
+    for (endpoint, matrix) in cumulative_hazard.iter().enumerate() {
+        if matrix.nrows() != n || matrix.ncols() != t {
+            return Err(format!(
+                "competing-risks endpoint {endpoint} cumulative hazard shape mismatch"
+            ));
+        }
+        if matrix
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "competing-risks endpoint {endpoint} cumulative hazards must be finite and non-negative"
+            ));
+        }
+    }
+
+    let k = cumulative_hazard.len();
+    let mut cif = (0..k)
+        .map(|_| Array2::<f64>::zeros((n, t)))
+        .collect::<Vec<_>>();
+    let mut overall_survival = Array2::<f64>::zeros((n, t));
+    for i in 0..n {
+        let mut prev_total: f64 = 0.0;
+        let mut running_cif = vec![0.0; k];
+        let mut prev_by_endpoint = vec![0.0; k];
+        for j in 0..t {
+            let mut increments = vec![0.0; k];
+            let mut total_increment = 0.0;
+            for endpoint in 0..k {
+                let current = cumulative_hazard[endpoint][[i, j]];
+                let increment = (current - prev_by_endpoint[endpoint]).max(0.0);
+                prev_by_endpoint[endpoint] = current;
+                increments[endpoint] = increment;
+                total_increment += increment;
+            }
+            let survival_left = (-prev_total).exp();
+            let interval_failure = -(-total_increment).exp_m1();
+            if total_increment > 0.0 {
+                for endpoint in 0..k {
+                    running_cif[endpoint] +=
+                        survival_left * interval_failure * increments[endpoint] / total_increment;
+                }
+            }
+            prev_total += total_increment;
+            overall_survival[[i, j]] = (-prev_total).exp().clamp(0.0, 1.0);
+            for endpoint in 0..k {
+                cif[endpoint][[i, j]] = running_cif[endpoint].clamp(0.0, 1.0);
+            }
+        }
+    }
+    Ok((cif, overall_survival))
+}
+
 // ---------------------------------------------------------------------------
 // Per-mode single-row evaluators.
 // ---------------------------------------------------------------------------
@@ -794,8 +1167,7 @@ fn evaluate_rp_row_with_beta(
     primary_offset_row: f64,
 ) -> Result<(f64, f64, f64), String> {
     let p_time = row_time.x_exit_time.ncols();
-    let p_timewiggle = saved_timewiggle
-        .map_or(0, |runtime| runtime.beta.len());
+    let p_timewiggle = saved_timewiggle.map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
     let p = p_time + p_timewiggle + p_cov;
     if beta.len() != p {
