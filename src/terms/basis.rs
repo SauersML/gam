@@ -19148,7 +19148,7 @@ fn build_periodic_duchon_basis_1d(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
-            power: spec.power_as_usize(),
+            power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
@@ -19439,7 +19439,7 @@ pub fn build_duchon_basiswithworkspace(
         metadata: BasisMetadata::Duchon {
             centers,
             length_scale: spec.length_scale,
-            power: spec.power_as_usize(),
+            power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
