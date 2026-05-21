@@ -7,7 +7,9 @@ use log::{LevelFilter, Log, Metadata, Record};
 use ratatui::prelude::*;
 use ratatui::text::{Line as TextLine, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
-use std::io::{self, IsTerminal, Stdout, Write};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,12 @@ const INTERACTIVE_DRAW_INTERVAL: Duration = Duration::from_millis(40);
 const DUMB_DRAW_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_HISTORY_POINTS: usize = 1200;
 const MAX_DIAGNOSTIC_LINES: usize = 10;
+// Ring of recent log records mirrored into the model so the chart's
+// Diagnostics panel can stream them live, and so the panic hook can dump
+// the last N lines to stderr (where `tee` captures them) before the
+// process aborts. Sized to fill a typical terminal-bottom panel several
+// times over without unbounded growth on long fits.
+const LOG_TAIL_CAP: usize = 200;
 
 static LOGGER: ProgressLogger = ProgressLogger;
 static ACTIVE_MULTIPROGRESS: OnceLock<Mutex<Option<MultiProgress>>> = OnceLock::new();
@@ -36,6 +44,18 @@ impl Log for ProgressLogger {
             return;
         }
         let line = format_log_record(record);
+        // Mirror into the active visualizer's log_tail so the chart's
+        // Diagnostics panel streams live records, and so the panic hook
+        // can replay them after a crash. Best-effort: if the feed is
+        // gone or the lock is contended past a brief poll, we just skip
+        // — the canonical log destination is stderr.
+        if let Some(feed) = current_active_feed() {
+            let mut model = lock_model(&feed.model);
+            model.log_tail.push_back(line.clone());
+            while model.log_tail.len() > LOG_TAIL_CAP {
+                model.log_tail.pop_front();
+            }
+        }
         if let Ok(guard) = active_multiprogress().lock()
             && let Some(mp) = guard.as_ref()
         {
