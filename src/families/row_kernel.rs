@@ -769,7 +769,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
 
         if !Self::use_blas3_projected_matrix(n_rows, rank) {
             let op_factor = self.mul_mat(factor);
-            return factor.t().dot(&op_factor);
+            return crate::faer_ndarray::fast_atb(factor, &op_factor);
         }
 
         let jf = self.compute_jf(factor);
@@ -789,7 +789,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         }
         if !Self::use_blas3_projected_matrix(n_rows, rank) {
             let op_factor = self.mul_mat(factor);
-            return factor.t().dot(&op_factor);
+            return crate::faer_ndarray::fast_atb(factor, &op_factor);
         }
 
         let jf = self.cached_jf(factor, cache);
@@ -915,7 +915,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
                         }
                     }
                 }
-                let contrib = jf_a_weighted.t().dot(&jf_axis_blocks[b]);
+                let contrib = crate::faer_ndarray::fast_atb(&jf_a_weighted, &jf_axis_blocks[b]);
                 if a == b {
                     out += &contrib;
                 } else {
