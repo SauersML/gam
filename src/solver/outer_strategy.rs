@@ -8734,6 +8734,196 @@ mod tests {
     }
 
     #[test]
+    fn classify_extracts_beta_from_v2_payload() {
+        // The classifier propagates `beta` from the v2 payload onto its
+        // Seed/ExactFinal decisions so the dispatcher can hand it to
+        // OuterObjective::seed_inner_state. Without this, the (ρ, β) payload
+        // would write β but never resurface it on resume.
+        let rho = array![1.0, 2.0];
+        let beta = array![10.0, 20.0, 30.0];
+        let payload = encode_iterate(&rho, Some(&beta), 1.0, 0).expect("encode");
+        let loaded = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload,
+                objective: Some(1.0),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
+        };
+        let CacheSeedDecision::Seed {
+            beta: decoded_beta,
+            ..
+        } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
+        else {
+            panic!("expected Seed decision");
+        };
+        assert_eq!(decoded_beta, beta.to_vec());
+
+        // ρ-only payload (legacy or family-without-β) decodes to empty beta.
+        let payload = encode_iterate(&rho, None, 1.0, 0).expect("encode");
+        let loaded = crate::cache::LoadedEntry {
+            entry: crate::cache::CachedEntry {
+                payload,
+                objective: Some(1.0),
+                iteration: Some(0),
+                kind: crate::cache::EntryKind::Checkpoint,
+                written_unix_secs: 0,
+            },
+            source: crate::cache::LoadSource::Preloaded,
+        };
+        let CacheSeedDecision::Seed {
+            beta: decoded_beta,
+            ..
+        } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
+        else {
+            panic!("expected Seed decision");
+        };
+        assert!(
+            decoded_beta.is_empty(),
+            "ρ-only payload must produce an empty beta so the dispatcher skips seed_inner_state"
+        );
+    }
+
+    #[test]
+    fn run_calls_seed_inner_state_with_cached_beta() {
+        // End-to-end read-side wiring: a cache hit carrying β must call
+        // OuterObjective::seed_inner_state(&beta) *before* the first BFGS
+        // eval. We verify this by routing through a custom OuterObjective
+        // that records the β it was seeded with.
+        struct RecordingObj {
+            seeded: Arc<Mutex<Option<Array1<f64>>>>,
+            eval_count: Arc<Mutex<usize>>,
+        }
+        impl OuterObjective for RecordingObj {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    n_params: 2,
+                    gradient_available: true,
+                    hessian_form: HessianForm::Unavailable,
+                    fixed_point_available: false,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+            fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                Ok(theta.dot(theta))
+            }
+            fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                *self.eval_count.lock().unwrap() += 1;
+                Ok(OuterEval {
+                    cost: theta.dot(theta),
+                    gradient: theta.clone(),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
+            fn reset(&mut self) {}
+            fn seed_inner_state(
+                &mut self,
+                beta: &Array1<f64>,
+            ) -> Result<(), EstimationError> {
+                *self.seeded.lock().unwrap() = Some(beta.clone());
+                Ok(())
+            }
+        }
+
+        let (_d, session) = tmp_cache_session("seed-inner-state-call");
+        let bytes = encode_iterate(&array![1.0, 2.0], Some(&array![7.5, 8.5, 9.5]), 5.0, 3)
+            .expect("encode");
+        session.checkpoint(&bytes, Some(5.0), Some(3));
+
+        let seeded: Arc<Mutex<Option<Array1<f64>>>> = Arc::new(Mutex::new(None));
+        let eval_count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let mut obj = RecordingObj {
+            seeded: Arc::clone(&seeded),
+            eval_count: Arc::clone(&eval_count),
+        };
+
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_max_iter(1)
+            .with_cache_session(Arc::clone(&session));
+        let _ = problem.run(&mut obj, "seed-inner-state-call");
+
+        let observed = seeded.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            Some(array![7.5, 8.5, 9.5]),
+            "dispatcher must call seed_inner_state with the cached β before run_outer",
+        );
+    }
+
+    #[test]
+    fn run_skips_seed_inner_state_when_payload_has_no_beta() {
+        // Symmetric guard: a ρ-only cache entry must NOT invoke
+        // seed_inner_state — calling it with an empty / zero / garbage β
+        // would silently degrade a family that has a non-trivial inner
+        // default into one started at zeros.
+        struct CountingObj {
+            seed_calls: Arc<Mutex<usize>>,
+        }
+        impl OuterObjective for CountingObj {
+            fn capability(&self) -> OuterCapability {
+                OuterCapability {
+                    n_params: 2,
+                    gradient_available: true,
+                    hessian_form: HessianForm::Unavailable,
+                    fixed_point_available: false,
+                    barrier_config: None,
+                    prefer_gradient_only: false,
+                    disable_fixed_point: false,
+                }
+            }
+            fn eval_cost(&mut self, theta: &Array1<f64>) -> Result<f64, EstimationError> {
+                Ok(theta.dot(theta))
+            }
+            fn eval(&mut self, theta: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+                Ok(OuterEval {
+                    cost: theta.dot(theta),
+                    gradient: theta.clone(),
+                    hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
+                })
+            }
+            fn reset(&mut self) {}
+            fn seed_inner_state(
+                &mut self,
+                _beta: &Array1<f64>,
+            ) -> Result<(), EstimationError> {
+                *self.seed_calls.lock().unwrap() += 1;
+                Ok(())
+            }
+        }
+
+        let (_d, session) = tmp_cache_session("seed-inner-state-skip");
+        // ρ-only payload — no β.
+        let bytes = encode_iterate(&array![1.0, 2.0], None, 5.0, 3).expect("encode");
+        session.checkpoint(&bytes, Some(5.0), Some(3));
+
+        let seed_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let mut obj = CountingObj {
+            seed_calls: Arc::clone(&seed_calls),
+        };
+
+        let problem = OuterProblem::new(2)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Unavailable)
+            .with_max_iter(1)
+            .with_cache_session(Arc::clone(&session));
+        let _ = problem.run(&mut obj, "seed-inner-state-skip");
+
+        assert_eq!(
+            *seed_calls.lock().unwrap(),
+            0,
+            "seed_inner_state must not fire when the cached payload carries no β",
+        );
+    }
+
+    #[test]
     fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
         // The classifier no longer reshapes ρ based on shape. Any finite,
         // correctly-dimensioned payload is honored as the next run's seed.
