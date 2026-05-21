@@ -14997,18 +14997,36 @@ mod tests {
     /// exact same formula the production code uses: `H_proj⁻¹ = (U_Sᵀ H
     /// U_S)⁻¹`. Inverts the projected matrix analytically for the test.
     fn build_subspace_kernel(h_full: &Array2<f64>, u_s: &Array2<f64>) -> PenaltySubspaceTrace {
+        // Compute H_proj = U_Sᵀ H U_S, then invert via eigendecomposition —
+        // exactly matching the production builder in
+        // `joint_penalty_subspace_trace_parts`
+        // (`src/families/custom_family.rs:13835`). Production uses the same
+        // Moore-Penrose recipe: eigendecompose, threshold near-zero
+        // eigenvalues, then build `Σ_i (1/σ_i) v_i v_iᵀ`. For our
+        // well-conditioned `H_proj` (the small eigenvalue of H lives
+        // OUTSIDE U_S so H_proj is full-rank by construction), every
+        // eigenvalue passes the threshold and the result is the exact
+        // inverse.
+        use crate::faer_ndarray::FaerEigh;
+        use faer::Side;
         let h_proj = u_s.t().dot(h_full).dot(u_s);
-        // 4×4 diagonal inverse — trivial here, computed via `.inv` via faer
-        // would also work but we keep the test independent of the linalg
-        // backend so the verification is direct.
+        let (evals, evecs) = h_proj
+            .eigh(Side::Lower)
+            .expect("h_proj eigh in test fixture");
         let r = h_proj.nrows();
         let mut h_proj_inverse = Array2::<f64>::zeros((r, r));
-        for i in 0..r {
+        for k in 0..evals.len() {
             assert!(
-                h_proj[[i, i]].abs() > 0.0,
-                "test fixture must keep H_proj diagonal nonzero"
+                evals[k].abs() > 1e-10,
+                "test fixture must keep H_proj non-singular; got eval[{k}] = {}",
+                evals[k]
             );
-            h_proj_inverse[[i, i]] = 1.0 / h_proj[[i, i]];
+            let inv = 1.0 / evals[k];
+            for i in 0..r {
+                for j in 0..r {
+                    h_proj_inverse[[i, j]] += inv * evecs[[i, k]] * evecs[[j, k]];
+                }
+            }
         }
         PenaltySubspaceTrace {
             u_s: u_s.clone(),
