@@ -12,8 +12,7 @@ use super::unified::{
     BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
     HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
     PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, ProjectedKktResidual,
-    RemlLamlResult,
-    penalty_matrix_root, reml_laml_evaluate,
+    RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2};
