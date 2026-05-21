@@ -13954,6 +13954,7 @@ fn joint_outer_evaluate(
                 compute_dh: owned_dh,
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
+                compute_d2h_many: None,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
@@ -13961,6 +13962,7 @@ fn joint_outer_evaluate(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
+                compute_d2h_many: None,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         };
@@ -14227,6 +14229,7 @@ fn joint_outer_evaluate_efs(
                 compute_dh: owned_dh,
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
+                compute_d2h_many: None,
                 family_outer_hessian_operator: None,
             })
         } else {
@@ -14234,6 +14237,7 @@ fn joint_outer_evaluate_efs(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
+                compute_d2h_many: None,
                 family_outer_hessian_operator: None,
             })
         };
@@ -14577,9 +14581,11 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
+                compute_d2h_many: _,
                 owned_compute_dh,
                 owned_compute_dh_many,
                 owned_compute_d2h,
+                owned_compute_d2h_many: _,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;
@@ -16256,9 +16262,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             compute_dh,
             compute_dh_many,
             compute_d2h,
+            compute_d2h_many: _,
             owned_compute_dh,
             owned_compute_dh_many,
             owned_compute_d2h,
+            owned_compute_d2h_many: _,
             rho_curvature_scale,
             hessian_logdet_correction,
         } = joint_bundle;
