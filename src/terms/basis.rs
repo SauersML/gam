@@ -19354,9 +19354,7 @@ pub fn build_duchon_basiswithworkspace(
         if matches!(
             spec.operator_penalties.mass,
             OperatorPenaltySpec::Active { .. }
-        )
-            && let Ok(design_dense) =
-                design.try_to_dense_arc("Duchon scale-free magnitude gauge")
+        ) && let Ok(design_dense) = design.try_to_dense_arc("Duchon scale-free magnitude gauge")
         {
             let data_centered = centered_design_gram(design_dense.as_ref());
             let (matrix, normalization_scale) = normalize_penalty(&data_centered);

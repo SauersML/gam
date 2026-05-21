@@ -1141,9 +1141,7 @@ impl PirlsWorkspace {
                     let x_slice = x.slice(s![start..start + rows, ..]);
                     let w_slice = weights.slice(s![start..start + rows]);
                     use rayon::slice::ParallelSliceMut;
-                    if let (Some(x_all), Some(w_all)) =
-                        (x_slice.as_slice(), w_slice.as_slice())
-                    {
+                    if let (Some(x_all), Some(w_all)) = (x_slice.as_slice(), w_slice.as_slice()) {
                         chunk_full[..rows * p]
                             .par_chunks_mut(p)
                             .enumerate()
@@ -9068,14 +9066,6 @@ pub fn e_obs_from_jets(
     pw * e_obs
 }
 
-/// Vectorised wrapper: compute per-observation observed-information weights
-/// (w, c, d) for an entire response vector, given inverse-link jets, a
-/// variance-function evaluator, dispersion φ, and prior weights.
-///
-/// `h4` is the fourth inverse-link derivative h''''(η), supplied as a
-/// separate array because `InverseLinkJet` only stores up to h''' (d3).
-///
-/// `var_jet_fn` maps μ → `VarianceJet`.
 // Direct (closed-form) observed-information weights for specific family-link
 // combinations.  These avoid the overhead of the generic noncanonical formula
 // when the algebra simplifies.
