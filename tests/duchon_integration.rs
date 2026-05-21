@@ -63,7 +63,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
                 spec: DuchonBasisSpec {
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 36 },
                     length_scale: None,
-                    power,
+                    power: power as f64,
                     nullspace_order,
                     identifiability: gam::basis::SpatialIdentifiability::default(),
                     aniso_log_scales: None,
