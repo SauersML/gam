@@ -1097,23 +1097,53 @@ impl PirlsWorkspace {
                 );
             *out += &combined.1;
         } else {
-            // Sequential: reuse the workspace WX chunk buffer.
-            if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
-                *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
+            // Sequential: reuse the workspace WX chunk buffer in row-major
+            // layout so per-row scaling has stride-1 writes alongside the
+            // stride-1 reads from a row-major X. The previous F-order chunk
+            // strided each row by `chunkrows` (≈15000 doubles), which moved
+            // every adjacent element write across an L2 cache line.
+            if weighted_x_chunk.ncols() != p
+                || weighted_x_chunk.nrows() != chunkrows
+                || !weighted_x_chunk.is_standard_layout()
+            {
+                *weighted_x_chunk = Array2::zeros((chunkrows, p));
             }
             let mut outview = array2_to_matmut(out);
             for start in (0..n).step_by(chunkrows) {
                 let rows = (n - start).min(chunkrows);
                 {
-                    let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                    let chunk_full = weighted_x_chunk
+                        .as_slice_mut()
+                        .expect("row-major chunk is contiguous");
                     let x_slice = x.slice(s![start..start + rows, ..]);
                     let w_slice = weights.slice(s![start..start + rows]);
-                    Zip::from(chunk.rows_mut())
-                        .and(x_slice.rows())
-                        .and(&w_slice)
-                        .par_for_each(|mut dst, src, &w| {
-                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
-                        });
+                    use rayon::slice::ParallelSliceMut;
+                    if let (Some(x_all), Some(w_all)) =
+                        (x_slice.as_slice(), w_slice.as_slice())
+                    {
+                        chunk_full[..rows * p]
+                            .par_chunks_mut(p)
+                            .enumerate()
+                            .for_each(|(local, dst_row)| {
+                                let src_off = local * p;
+                                let src_row = &x_all[src_off..src_off + p];
+                                let wi = w_all[local];
+                                for col in 0..p {
+                                    dst_row[col] = src_row[col] * wi;
+                                }
+                            });
+                    } else {
+                        chunk_full[..rows * p]
+                            .par_chunks_mut(p)
+                            .enumerate()
+                            .for_each(|(local, dst_row)| {
+                                let wi = w_slice[local];
+                                let src = x_slice.row(local);
+                                for (col, xij) in src.iter().enumerate() {
+                                    dst_row[col] = xij * wi;
+                                }
+                            });
+                    }
                 }
                 let x_slice = x.slice(s![start..start + rows, ..]);
                 let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
