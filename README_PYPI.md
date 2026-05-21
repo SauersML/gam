@@ -136,6 +136,23 @@ uv add "gamfit[torch]"      # PyTorch bridge
 uv add "gamfit[all]"        # everything
 ```
 
+## GPU acceleration
+
+CUDA acceleration (cuBLAS / cuSOLVER / cuSPARSE) is built in to the same
+wheel — no separate `gamfit-gpu` package. Per-op dispatch crossover is
+**measured** at probe time, so small kernels stay on the CPU where they
+are faster end-to-end. Inspect the calibrated thresholds with
+`gamfit.build_info()["cuda_diagnostics"]` or
+`gamfit.format_cuda_diagnostics()`.
+
+On hosts that expose both a system CUDA toolkit and pip
+`nvidia-*-cu12` wheels, gamfit emits one warning per process about the
+dual mapping and proceeds — this is almost always benign because glibc
+resolves `dlopen(SONAME)` to a single file. If you pair gamfit with
+`torch`, pin to a `+cu12x` build (`torch<2.12` on the cluster's
+CUDA-12.x drivers) — torch's default `+cu130` wheels need a CUDA-13
+driver.
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](https://github.com/SauersML/gam/blob/main/LICENSE).

@@ -208,6 +208,58 @@ from gamfit.sklearn import GAMRegressor
 est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 ```
 
+## GPU acceleration
+
+The Rust engine ships with optional CUDA acceleration (cuBLAS / cuSOLVER /
+cuSPARSE). It is loaded lazily at first use and falls back to the CPU
+path on any host without a working CUDA stack. There is no separate
+`gamfit-gpu` package — the same wheel works on CPU-only and GPU hosts.
+
+Per-op dispatch is driven by **measured** throughput at probe time: the
+runtime benchmarks GPU FP64, CPU FP64, and PCIe bandwidth, and refuses to
+dispatch a kernel below the crossover where host↔device transfer cost
+dominates. Small kernels (e.g. REML fits with K ≲ 16, batch ≲ 1024)
+typically stay on the CPU even when a GPU is visible. This is intentional
+— the CPU path is faster end-to-end for those shapes. To see the
+calibrated thresholds for a given host:
+
+```python
+import gamfit
+print(gamfit.build_info()["cuda_diagnostics"])
+print(gamfit.format_cuda_diagnostics())
+```
+
+### Mixed CUDA stacks (system CUDA + pip `nvidia-*-cu12` wheels)
+
+A common deployment has *both* a system CUDA toolkit (e.g.
+`/usr/local/cuda-12.9`) and PyTorch's bundled `nvidia/*-cu12` wheels
+inside the same venv. Both stacks then appear in `/proc/self/maps` for
+the same SONAME (`libcublas.so.12`, …). This is **usually benign**:
+glibc's loader resolves `dlopen(SONAME)` to exactly one file via its
+search path, so every CUDA call routes through one handle. gamfit detects
+the dual mapping, emits one warning per conflict-set, and proceeds.
+
+The catastrophic case — `cublasDestroy_v2` aborting in glibc with
+`double free or corruption` — only triggers if calling code crosses
+handles by `dlopen`-ing both files by absolute path. If that ever
+happens, keep exactly one CUDA toolkit reachable: either the system
+install or the pip wheels, not both.
+
+### Torch + CUDA version pinning
+
+`torch ≥ 2.12` ships `+cu130` wheels by default. Those fail to
+initialize on hosts whose driver advertises CUDA 12.x (the cluster case).
+If your driver is CUDA 12.x, pin torch to a `+cu12x` build:
+
+```bash
+uv pip install --index-strategy=unsafe-best-match \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    "torch<2.12"
+```
+
+gamfit itself is driver-agnostic — its CUDA path loads cuBLAS /
+cuSOLVER / cuSPARSE through whichever `libcudart.so.12` is reachable.
+
 ## Where to learn more
 
 - **Python documentation:** <https://gamfit.readthedocs.io/> — getting
