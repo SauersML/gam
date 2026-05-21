@@ -13926,6 +13926,9 @@ fn joint_outer_evaluate(
         &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
     >,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_d2h_many: Option<
+        &dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
+    >,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
@@ -13935,6 +13938,15 @@ fn joint_outer_evaluate(
     owned_compute_d2h: Option<
         Arc<
             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
+        >,
+    >,
+    owned_compute_d2h_many: Option<
+        Arc<
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -13954,7 +13966,7 @@ fn joint_outer_evaluate(
                 compute_dh: owned_dh,
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
-                compute_d2h_many: None,
+                compute_d2h_many: owned_compute_d2h_many,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         } else {
@@ -13962,7 +13974,7 @@ fn joint_outer_evaluate(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
-                compute_d2h_many: None,
+                compute_d2h_many,
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         };
@@ -14205,6 +14217,9 @@ fn joint_outer_evaluate_efs(
         &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
     >,
     compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_d2h_many: Option<
+        &dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
+    >,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
@@ -14214,6 +14229,15 @@ fn joint_outer_evaluate_efs(
     owned_compute_d2h: Option<
         Arc<
             dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
+                + Send
+                + Sync,
+        >,
+    >,
+    owned_compute_d2h_many: Option<
+        Arc<
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -14229,7 +14253,7 @@ fn joint_outer_evaluate_efs(
                 compute_dh: owned_dh,
                 compute_dh_many: owned_compute_dh_many,
                 compute_d2h: owned_d2h,
-                compute_d2h_many: None,
+                compute_d2h_many: owned_compute_d2h_many,
                 family_outer_hessian_operator: None,
             })
         } else {
@@ -14237,7 +14261,7 @@ fn joint_outer_evaluate_efs(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
-                compute_d2h_many: None,
+                compute_d2h_many,
                 family_outer_hessian_operator: None,
             })
         };
@@ -14581,11 +14605,11 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 compute_dh,
                 compute_dh_many,
                 compute_d2h,
-                compute_d2h_many: _,
+                compute_d2h_many,
                 owned_compute_dh,
                 owned_compute_dh_many,
                 owned_compute_d2h,
-                owned_compute_d2h_many: _,
+                owned_compute_d2h_many,
                 rho_curvature_scale,
                 hessian_logdet_correction,
             } = joint_bundle;
@@ -14613,9 +14637,11 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
                 compute_dh.as_ref(),
                 compute_dh_many.as_deref(),
                 compute_d2h.as_ref(),
+                compute_d2h_many.as_deref(),
                 owned_compute_dh,
                 owned_compute_dh_many,
                 owned_compute_d2h,
+                owned_compute_d2h_many,
                 None,
             )
         } else {
@@ -16152,12 +16178,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             compute_dh,
                             compute_dh_many,
                             compute_d2h,
+                            compute_d2h_many,
                             owned_compute_dh: _,
                             owned_compute_dh_many: _,
                             owned_compute_d2h: _,
+                            owned_compute_d2h_many: _,
                             rho_curvature_scale,
                             hessian_logdet_correction,
-                            ..
                         } = joint_bundle_value_only;
                         let value_only = joint_outer_evaluate(
                             &inner,
@@ -16184,6 +16211,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             compute_dh.as_ref(),
                             compute_dh_many.as_deref(),
                             compute_d2h.as_ref(),
+                            compute_d2h_many.as_deref(),
+                            None,
                             None,
                             None,
                             None,
@@ -16262,11 +16291,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             compute_dh,
             compute_dh_many,
             compute_d2h,
-            compute_d2h_many: _,
+            compute_d2h_many,
             owned_compute_dh,
             owned_compute_dh_many,
             owned_compute_d2h,
-            owned_compute_d2h_many: _,
+            owned_compute_d2h_many,
             rho_curvature_scale,
             hessian_logdet_correction,
         } = joint_bundle;
@@ -16295,9 +16324,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             compute_dh.as_ref(),
             compute_dh_many.as_deref(),
             compute_d2h.as_ref(),
+            compute_d2h_many.as_deref(),
             owned_compute_dh,
             owned_compute_dh_many,
             owned_compute_d2h,
+            owned_compute_d2h_many,
             None, // no ext_coords when psi_dim == 0
             custom_family_batched_outer_hessian_operator(
                 family,
