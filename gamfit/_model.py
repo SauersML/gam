@@ -968,7 +968,7 @@ class Model:
             return _competing_risks_prediction_from_ffi_payload(parsed)
 
         columns = _ordered_prediction_columns(parsed["columns"])
-        model_class = str(parsed.get("model_class") or self._model_class_from_summary())
+        model_class = str(parsed.get("model_class") or self._model_class_from_payload())
 
         if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
             import numpy as np
@@ -1711,10 +1711,26 @@ class Model:
         """
         return self._model_bytes
 
+    def _saved_model_payload(self) -> dict[str, Any]:
+        saved = json.loads(self._model_bytes)
+        if not isinstance(saved, dict):
+            raise ValueError("saved model payload must be a JSON object")
+        payload = saved.get("payload")
+        if not isinstance(payload, dict):
+            raise ValueError("saved model payload is missing its payload object")
+        return payload
+
+    def _saved_payload_string(self, key: str) -> str | None:
+        value = self._saved_model_payload().get(key)
+        return str(value) if value is not None else None
+
     @property
     def formula(self) -> str:
         """The fitted Wilkinson-style formula string."""
-        return str(self.summary()["formula"])
+        value = self._saved_payload_string("formula")
+        if value is None:
+            raise ValueError("saved model payload is missing formula")
+        return value
 
     @property
     def family_name(self) -> str:
@@ -1724,7 +1740,7 @@ class Model:
     @property
     def model_class(self) -> str:
         """Fitted model class string (e.g. ``"standard"``, ``"survival marginal-slope"``)."""
-        return self._model_class_from_summary()
+        return self._model_class_from_payload()
 
     @property
     def is_survival(self) -> bool:
@@ -1776,13 +1792,11 @@ class Model:
             return ()
         return tuple(dict(item) for item in value if isinstance(item, dict))
 
-    def _model_class_from_summary(self) -> str:
-        value = self.summary().get("model_class")
+    def _model_class_from_payload(self) -> str:
+        value = self._saved_payload_string("model_kind")
         if value is None:
-            metadata = self.summary().get("metadata")
-            if isinstance(metadata, dict):
-                value = metadata.get("model_class")
-        return str(value) if value is not None else "standard"
+            raise ValueError("saved model payload is missing model_kind")
+        return value
 
     def _default_survival_time_grid(
         self, headers: list[str], rows: list[list[str]]
