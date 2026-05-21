@@ -401,6 +401,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "standard",
             "transformation-normal",
             "survival",
+            "competing-risks-survival",
             "bernoulli-marginal-slope",
             "survival-marginal-slope",
             "survival-location-scale",
@@ -413,6 +414,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(info.unbind())
 }
 
+#[pyfunction]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
@@ -728,7 +730,7 @@ fn duchon_operator_penalties<'py>(
         center_matrix.view(),
         None,
         None,
-        0,
+        0.0,
         duchon_nullspace_from_m(m),
         None,
         None,
@@ -5833,7 +5835,7 @@ fn duchon_basis_1d_derivative_impl(
     create_duchon_basis_1d_derivative_dense(
         t,
         centers,
-        0,
+        0.0,
         duchon_nullspace_from_m(m),
         periodic,
         order,
@@ -6661,21 +6663,7 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.survival_entry = Some(entryname);
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
-    let cause_count = rp_result.fit.blocks.len().max(1);
-    let is_joint_cause_specific = cause_count > 1;
-    payload.survivalspec = Some(if is_joint_cause_specific {
-        "cause-specific".to_string()
-    } else {
-        "net".to_string()
-    });
-    if is_joint_cause_specific {
-        payload.survival_cause_count = Some(cause_count);
-        payload.survival_endpoint_names = Some(
-            (1..=cause_count)
-                .map(|idx| format!("cause_{idx}"))
-                .collect(),
-        );
-    }
+    payload.survivalspec = Some("net".to_string());
     payload.survival_baseline_target =
         Some(survival_baseline_targetname(baseline_cfg.target).to_string());
     payload.survival_baseline_scale = baseline_cfg.scale;
@@ -6749,7 +6737,21 @@ fn build_survival_transformation_ffi_payload(
     payload.survival_entry = Some(entryname);
     payload.survival_exit = Some(exitname);
     payload.survival_event = Some(eventname);
-    payload.survivalspec = Some("net".to_string());
+    let cause_count = rp_result.fit.blocks.len().max(1);
+    let is_joint_cause_specific = cause_count > 1;
+    payload.survivalspec = Some(if is_joint_cause_specific {
+        "cause-specific".to_string()
+    } else {
+        "net".to_string()
+    });
+    if is_joint_cause_specific {
+        payload.survival_cause_count = Some(cause_count);
+        payload.survival_endpoint_names = Some(
+            (1..=cause_count)
+                .map(|idx| format!("cause_{idx}"))
+                .collect(),
+        );
+    }
     payload.survival_baseline_target =
         Some(survival_baseline_targetname(rp_result.baseline_cfg.target).to_string());
     payload.survival_baseline_scale = rp_result.baseline_cfg.scale;
