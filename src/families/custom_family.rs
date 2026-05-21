@@ -9967,11 +9967,57 @@ impl BlockEtaCheckpoint {
     }
 }
 
+/// Classification of which branch of the trust-region radius policy
+/// fired on a single update — surfaced in cycle logs so it is possible
+/// to tell at a glance whether the inner solver is being throttled by
+/// the TR (e.g., `RejectFloor`/`ShrinkOnRejection`) or, conversely,
+/// whether the step is sitting well inside the region (`HoldInside`)
+/// so the slow convergence is NOT a TR-policy issue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JointTrustRegionDecision {
+    /// `rho > 0.75` AND `step_norm >= 0.99 * old_radius` — model is good
+    /// AND the step is at the TR boundary, so doubling reflects a real
+    /// constraint that was just lifted.
+    GrowAtBoundary,
+    /// `rho > 0.75` but the step is well inside the region; radius held
+    /// because no evidence the TR was constraining the step.  When the
+    /// inner is converging linearly and this branch fires every cycle,
+    /// the TR is NOT the bottleneck — Newton itself is finding short
+    /// steps for a reason unrelated to the trust radius.
+    HoldInside,
+    /// `0.25 <= rho <= 0.75` (moderate model fidelity) — radius held.
+    HoldModerate,
+    /// `rho < 0.25` but step accepted (positive descent above noise).
+    /// Radius shrunk to a quarter to be more conservative next cycle.
+    ShrinkOnMarginalAccept,
+    /// Step rejected — radius shrunk and capped at half the proposed
+    /// step norm so a re-proposal is constrained inside the rejected
+    /// region.
+    ShrinkOnRejection,
+    /// Radius was already at the floor before this update.  Persistent
+    /// `RejectFloor` is the unambiguous signal of a degenerate ρ region.
+    RejectFloor,
+}
+
+impl JointTrustRegionDecision {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::GrowAtBoundary => "grow_at_boundary",
+            Self::HoldInside => "hold_inside",
+            Self::HoldModerate => "hold_moderate",
+            Self::ShrinkOnMarginalAccept => "shrink_marginal_accept",
+            Self::ShrinkOnRejection => "shrink_reject",
+            Self::RejectFloor => "reject_floor",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct JointTrustRegionUpdate {
     rho: f64,
     radius: f64,
     accepted: bool,
+    decision: JointTrustRegionDecision,
 }
 
 fn update_joint_trust_region_radius(
@@ -10004,21 +10050,47 @@ fn update_joint_trust_region_radius(
     };
     let accepted = rho.is_finite() && rho > 0.0 && actual_reduction >= -noise_floor;
     let mut radius = old_radius;
-    if !accepted || rho < 0.25 {
+    let decision: JointTrustRegionDecision;
+    if !accepted {
         radius *= 0.25;
-        if !accepted && step_norm.is_finite() && step_norm > 0.0 {
+        if step_norm.is_finite() && step_norm > 0.0 {
             radius = radius.min(0.5 * step_norm);
         }
+        decision = JointTrustRegionDecision::ShrinkOnRejection;
+    } else if rho < 0.25 {
+        radius *= 0.25;
+        decision = JointTrustRegionDecision::ShrinkOnMarginalAccept;
     } else if rho > 0.75 && step_norm >= 0.99 * old_radius {
         radius *= 2.0;
+        decision = JointTrustRegionDecision::GrowAtBoundary;
+    } else if rho > 0.75 {
+        decision = JointTrustRegionDecision::HoldInside;
+    } else {
+        decision = JointTrustRegionDecision::HoldModerate;
     }
     if !radius.is_finite() || radius <= 0.0 {
         radius = 1.0e-12;
     }
+    let clamped_radius = radius.clamp(1.0e-12, 1.0e6);
+    // Promote to RejectFloor if we landed at the absolute floor.  The
+    // base classification is preserved up to this final clamp; the
+    // floor classification is just a stronger label that captures the
+    // "no descent direction exists at this radius" signal.
+    let final_decision = if clamped_radius <= 1.0e-12 + f64::EPSILON
+        && matches!(
+            decision,
+            JointTrustRegionDecision::ShrinkOnRejection
+                | JointTrustRegionDecision::ShrinkOnMarginalAccept
+        ) {
+        JointTrustRegionDecision::RejectFloor
+    } else {
+        decision
+    };
     JointTrustRegionUpdate {
         rho,
-        radius: radius.clamp(1.0e-12, 1.0e6),
+        radius: clamped_radius,
         accepted,
+        decision: final_decision,
     }
 }
 
@@ -11702,13 +11774,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     format!("r={:.3e}->{:.3e}", old_radius, joint_trust_radius)
                 };
+                // Surface the TR-policy decision so future failures
+                // distinguish "TR is throttling Newton" from "TR is not
+                // the bottleneck — Newton itself finds short steps".
+                // For the biobank linear-convergence pattern the policy
+                // is consistently `hold_inside` (ρ≈1, |δ| ≪ radius),
+                // which proves the TR is not what is keeping the step
+                // small — that came up before via "(held)" alone but
+                // the explicit decision label makes the inference
+                // immediate instead of requiring step/radius arithmetic
+                // in the reader's head.
                 let tr_attempt_sig = format!(
-                    "{:<9}  ρ={:+.3e}  Δobj={:+.3e}  pred={:+.3e}  {}  |δ|={:.3e}  |δ|∞={:.3e}  |prop|∞={:.3e}",
+                    "{:<9}  ρ={:+.3e}  Δobj={:+.3e}  pred={:+.3e}  {}  decision={:<22}  |δ|={:.3e}  |δ|∞={:.3e}  |prop|∞={:.3e}",
                     phase,
                     trust_update.rho,
                     actual_reduction,
                     predicted_reduction,
                     radius_field,
+                    trust_update.decision.label(),
                     step_norm,
                     trial_step_inf,
                     step_inf,
