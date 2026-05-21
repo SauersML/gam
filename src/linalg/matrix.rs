@@ -7488,6 +7488,53 @@ mod tests {
         }
     }
 
+    /// Regression: the original `4194304x10 (~0.31 GiB)` Duchon panic was a
+    /// policy-cap refusal inside `try_to_dense_arc_with_policy`. The infallible
+    /// entry points (`to_dense`, `to_dense_arc`, `to_dense_cow`) must bypass
+    /// that guard so callers asking for a contiguous `Array2<f64>` get one,
+    /// while strict-operator callers still see refusal through the explicit
+    /// `try_to_dense_arc_with_policy(_, &analytic_operator_required())` path.
+    /// Use a tiny operator so the contract is pinned without allocating
+    /// hundreds of MiB on CI.
+    #[test]
+    fn to_dense_arc_bypasses_policy_cap_strict_policy_still_refuses() {
+        let op = Arc::new(ChunkOnlyOperator {
+            n: 128,
+            p: 4,
+            row_chunk_calls: AtomicUsize::new(0),
+        });
+        let design = DenseDesignMatrix::from(Arc::clone(&op));
+
+        // The panic-free entry points must succeed regardless of the policy cap.
+        let dense = design.to_dense_arc();
+        assert_eq!(dense.dim(), (128, 4));
+
+        // Strict operator-required policy still refuses on the explicit
+        // policy-aware API — biobank-scale invariants preserved.
+        let strict = ResourcePolicy::analytic_operator_required();
+        let err = design
+            .try_to_dense_arc_with_policy("regression strict refuses", &strict)
+            .expect_err("strict policy must refuse lazy materialization");
+        assert!(
+            err.contains("refusing to densify operator-backed design")
+                && err.contains("AnalyticOperatorRequired"),
+            "unexpected strict-policy error: {err}"
+        );
+
+        // Tighten the size cap below the design footprint and confirm the
+        // policy-aware API rejects on size (the contract the infallible path
+        // is documented to bypass).
+        let mut tight = ResourcePolicy::default_library();
+        tight.max_single_materialization_bytes = 1;
+        let size_err = design
+            .try_to_dense_arc_with_policy("regression tight refuses", &tight)
+            .expect_err("undersized cap must refuse lazy materialization");
+        assert!(
+            size_err.contains("refusing to densify operator-backed design"),
+            "unexpected size-cap error: {size_err}"
+        );
+    }
+
     #[test]
     fn try_to_dense_by_chunks_writes_directly_into_output_slices() {
         let n = 11_000usize;
