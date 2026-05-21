@@ -3565,13 +3565,16 @@ mod tests {
         let mut eta_time = Array1::<f64>::zeros(3 * n);
         eta_time
             .slice_mut(s![0..n])
-            .assign(&family.x_time_entry.dot(&beta_time));
+            .assign(&crate::faer_ndarray::fast_av(&family.x_time_entry, &beta_time));
         eta_time
             .slice_mut(s![n..2 * n])
-            .assign(&family.x_time_exit.dot(&beta_time));
+            .assign(&crate::faer_ndarray::fast_av(&family.x_time_exit, &beta_time));
         eta_time
             .slice_mut(s![2 * n..3 * n])
-            .assign(&family.x_time_derivative_exit.dot(&beta_time));
+            .assign(&crate::faer_ndarray::fast_av(
+                &family.x_time_derivative_exit,
+                &beta_time,
+            ));
 
         let mut states = vec![
             ParameterBlockState {
@@ -3580,7 +3583,7 @@ mod tests {
             },
             ParameterBlockState {
                 beta: beta_mean.clone(),
-                eta: family.x_mean.dot(&beta_mean),
+                eta: crate::faer_ndarray::fast_av(&family.x_mean, &beta_mean),
             },
         ];
         if let Some(log_sigma) = slices.log_sigma {
@@ -3678,10 +3681,10 @@ mod tests {
         let mut eta_time = Array1::<f64>::zeros(3 * n);
         eta_time
             .slice_mut(s![0..n])
-            .assign(&family.x_time_entry.dot(&beta_time));
+            .assign(&crate::faer_ndarray::fast_av(&family.x_time_entry, &beta_time));
         eta_time
             .slice_mut(s![n..2 * n])
-            .assign(&family.x_time_exit.dot(&beta_time));
+            .assign(&crate::faer_ndarray::fast_av(&family.x_time_exit, &beta_time));
 
         vec![
             ParameterBlockState {
@@ -3690,7 +3693,7 @@ mod tests {
             },
             ParameterBlockState {
                 beta: beta_mean.clone(),
-                eta: family.x_mean.dot(&beta_mean),
+                eta: crate::faer_ndarray::fast_av(&family.x_mean, &beta_mean),
             },
         ]
     }
