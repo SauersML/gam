@@ -5405,6 +5405,11 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    pub fn kkt_residual(mut self, residual: Option<Array1<f64>>) -> Self {
+        self.kkt_residual = residual;
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
