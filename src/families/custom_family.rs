@@ -8280,9 +8280,7 @@ struct JointHessianBundle<'a> {
     /// amortise the row-walk across all pairs instead of paying it per pair.
     compute_d2h_many: Option<
         Box<
-            dyn Fn(
-                    &[(Array1<f64>, Array1<f64>)],
-                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + 'a,
         >,
     >,
@@ -8304,9 +8302,7 @@ struct JointHessianBundle<'a> {
     /// through the parallel pair dispatch.
     owned_compute_d2h_many: Option<
         Arc<
-            dyn Fn(
-                    &[(Array1<f64>, Array1<f64>)],
-                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -13052,9 +13048,7 @@ struct BorrowedJointDerivProvider<'a> {
     /// to the per-pair `compute_d2h` dispatch and preserves the historical
     /// dispatch cost.
     compute_d2h_many: Option<
-        &'a dyn Fn(
-            &[(Array1<f64>, Array1<f64>)],
-        ) -> Result<Vec<Option<DriftDerivResult>>, String>,
+        &'a dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
     >,
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
@@ -13147,17 +13141,12 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         // term1 walk over `u_kl` directions to keep the (term1, term2)
         // CompositeHyperOperator semantics that the singular hook produces.
         if let Some(compute_d2h_many) = self.compute_d2h_many {
-            let u_kls: Vec<Array1<f64>> = triples
-                .iter()
-                .map(|(_, _, u_kl)| u_kl.clone())
-                .collect();
+            let u_kls: Vec<Array1<f64>> = triples.iter().map(|(_, _, u_kl)| u_kl.clone()).collect();
             let term1s = self.hessian_derivative_corrections_result(
                 &u_kls.iter().map(|u| -u).collect::<Vec<_>>(),
             )?;
-            let pairs: Vec<(Array1<f64>, Array1<f64>)> = triples
-                .iter()
-                .map(|(v_k, v_l, _)| (-v_l, -v_k))
-                .collect();
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> =
+                triples.iter().map(|(v_k, v_l, _)| (-v_l, -v_k)).collect();
             let term2s = compute_d2h_many(&pairs)?;
             triples
                 .iter()
@@ -13166,10 +13155,7 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
                     (Some(t1), Some(t2)) => {
                         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
                             dense: None,
-                            operators: vec![
-                                t1.clone().into_operator(),
-                                t2.clone().into_operator(),
-                            ],
+                            operators: vec![t1.clone().into_operator(), t2.clone().into_operator()],
                             dim_hint: u_kl.len(),
                         };
                         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
@@ -13216,9 +13202,7 @@ struct OwnedJointDerivProvider {
     /// `BorrowedJointDerivProvider` for the dispatch contract.
     compute_d2h_many: Option<
         Arc<
-            dyn Fn(
-                    &[(Array1<f64>, Array1<f64>)],
-                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -13302,17 +13286,12 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
     ) -> Result<Vec<Option<DriftDerivResult>>, String> {
         if let Some(compute_d2h_many) = self.compute_d2h_many.as_ref() {
-            let u_kls: Vec<Array1<f64>> = triples
-                .iter()
-                .map(|(_, _, u_kl)| u_kl.clone())
-                .collect();
+            let u_kls: Vec<Array1<f64>> = triples.iter().map(|(_, _, u_kl)| u_kl.clone()).collect();
             let term1s = self.hessian_derivative_corrections_result(
                 &u_kls.iter().map(|u| -u).collect::<Vec<_>>(),
             )?;
-            let pairs: Vec<(Array1<f64>, Array1<f64>)> = triples
-                .iter()
-                .map(|(v_k, v_l, _)| (-v_l, -v_k))
-                .collect();
+            let pairs: Vec<(Array1<f64>, Array1<f64>)> =
+                triples.iter().map(|(v_k, v_l, _)| (-v_l, -v_k)).collect();
             let term2s = compute_d2h_many(&pairs)?;
             triples
                 .iter()
@@ -13321,10 +13300,7 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
                     (Some(t1), Some(t2)) => {
                         let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
                             dense: None,
-                            operators: vec![
-                                t1.clone().into_operator(),
-                                t2.clone().into_operator(),
-                            ],
+                            operators: vec![t1.clone().into_operator(), t2.clone().into_operator()],
                             dim_hint: u_kl.len(),
                         };
                         Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
@@ -13944,9 +13920,7 @@ fn joint_outer_evaluate(
     >,
     owned_compute_d2h_many: Option<
         Arc<
-            dyn Fn(
-                    &[(Array1<f64>, Array1<f64>)],
-                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -14235,9 +14209,7 @@ fn joint_outer_evaluate_efs(
     >,
     owned_compute_d2h_many: Option<
         Arc<
-            dyn Fn(
-                    &[(Array1<f64>, Array1<f64>)],
-                ) -> Result<Vec<Option<DriftDerivResult>>, String>
+            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
                 + Send
                 + Sync,
         >,
@@ -16089,15 +16061,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             rho_prior.clone(),
             family.pseudo_logdet_mode(),
             &compute_dh,
-                compute_dh_many.as_deref(),
-                &compute_d2h,
-                None,
-                Some(owned_compute_dh),
-                owned_compute_dh_many,
-                Some(owned_compute_d2h),
-                None,
-                ext_bundle,
-                custom_family_batched_outer_hessian_operator(
+            compute_dh_many.as_deref(),
+            &compute_d2h,
+            None,
+            Some(owned_compute_dh),
+            owned_compute_dh_many,
+            Some(owned_compute_d2h),
+            None,
+            ext_bundle,
+            custom_family_batched_outer_hessian_operator(
                 family,
                 synced_joint_states.as_ref(),
                 specs,
@@ -17994,8 +17966,7 @@ fn exact_newton_joint_stationarity_vector_from_gradient(
         let width = specs[b].design.ncols();
         let start = offset;
         let end = offset + width;
-        let mut block =
-            s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
+        let mut block = s_lambdas[b].dot(&states[b].beta) - gradient.slice(ndarray::s![start..end]);
         if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             block += &states[b].beta.mapv(|v| ridge * v);
         }
