@@ -1403,15 +1403,11 @@ pub trait CustomFamily {
     /// HVPs. Large problems must stay exact and select an operator
     /// representation; they are not demoted to first-order optimizers.
     ///
-    /// **Capability vs policy.** This method is the *capability query*: it
-    /// reports the highest analytic order this family implements. The
-    /// economic gate at the current problem size lives on
-    /// [`Self::outer_derivative_policy`], which compares predicted per-eval
-    /// work against [`OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`] and
-    /// downgrades to `ValueAndGradient` when the dense Hessian would
-    /// dominate the fit. Outer-optimizer call sites consult the *policy*
-    /// (not this raw order) when deciding what to request from the
-    /// evaluator.
+    /// **Capability vs representation.** This method reports the highest
+    /// analytic order this family implements. The realized policy carries
+    /// work estimates for dense/operator routing and staged κ schedules, but
+    /// those estimates do not downgrade a second-order family to a first-order
+    /// optimizer.
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
@@ -1435,17 +1431,10 @@ pub trait CustomFamily {
     /// Realized outer-derivative policy at the current problem size.
     ///
     /// Combines the capability query [`Self::exact_outer_derivative_order`]
-    /// with the predicted per-eval cost from
-    /// [`Self::coefficient_gradient_cost`] / [`Self::coefficient_hessian_cost`]
-    /// and the joint outer-coordinate dimension `rho_dim + psi_dim` to decide
-    /// what to *actually request* from the evaluator on a per-call basis.
-    ///
-    /// **This is the single point where the cost gate lives.** Older code
-    /// scattered family-specific work-limit constants (e.g.
-    /// `FLEX_DENSE_OUTER_HESSIAN_ROW_THIRD_WORK_LIMIT` and the rigid variant
-    /// in `bernoulli_marginal_slope.rs`) — those are being migrated to
-    /// per-family overrides of *this* method so the policy decision is
-    /// uniform across the codebase.
+    /// with predicted per-eval costs from [`Self::coefficient_gradient_cost`] /
+    /// [`Self::coefficient_hessian_cost`] and the joint outer-coordinate
+    /// dimension `rho_dim + psi_dim`. Capability decides derivative order;
+    /// predicted costs inform dense/operator routing and staged κ schedules.
     ///
     /// Families with non-generic cost models (Khatri–Rao CTN, matrix-free
     /// HVP families, marginal-slope row-third workloads) should override
