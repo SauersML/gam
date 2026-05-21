@@ -3543,20 +3543,7 @@ fn solve_subsystem_direction(
 fn linear_constraints_from_lower_bounds(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
-    let activerows: Vec<usize> = (0..lower_bounds.len())
-        .filter(|&i| lower_bounds[i].is_finite())
-        .collect();
-    if activerows.is_empty() {
-        return None;
-    }
-    let p = lower_bounds.len();
-    let mut a = Array2::<f64>::zeros((activerows.len(), p));
-    let mut b = Array1::<f64>::zeros(activerows.len());
-    for (r, &idx) in activerows.iter().enumerate() {
-        a[[r, idx]] = 1.0;
-        b[r] = lower_bounds[idx];
-    }
-    Some(LinearInequalityConstraints { a, b })
+    LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
 fn compute_constraint_kkt_diagnostics(
