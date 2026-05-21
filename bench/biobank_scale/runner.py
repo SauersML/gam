@@ -578,7 +578,8 @@ def survival_generation_params(cfg: dict[str, Any]) -> tuple[float, float]:
 
 def dump_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=False), encoding="utf-8")
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=False)
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
