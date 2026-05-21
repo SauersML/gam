@@ -281,36 +281,16 @@ fn route_chol_batched(p: usize, batch_size: usize) -> bool {
         .route_chol_batched(p, batch_size)
 }
 
+impl super::runtime::HasGpuDevice for CusolverRuntime {
+    fn device(&self) -> &GpuDeviceInfo {
+        &self.device
+    }
+}
+
 fn with_runtime<T>(
-    mut f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
+    f: impl FnMut(&mut CusolverRuntime) -> Option<T>,
 ) -> Option<(T, GpuDeviceInfo)> {
-    let runtimes = cusolver_runtimes();
-    if runtimes.is_empty() {
-        return None;
-    }
-    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
-    // Phase 1: non-blocking — skip any device already driven by another
-    // thread so concurrent callers spread to idle GPUs rather than
-    // serializing on the rotated slot.
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].try_lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device.clone()));
-        }
-    }
-    // Phase 2: every device was busy or every Phase-1 attempt compute-failed.
-    // Block on each in turn so we still complete the dispatch.
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device.clone()));
-        }
-    }
-    None
+    super::runtime::with_runtime_two_phase(cusolver_runtimes(), f)
 }
 
 fn cusolver_runtimes() -> &'static [Mutex<CusolverRuntime>] {

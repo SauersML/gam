@@ -671,6 +671,57 @@ impl GpuRuntime {
     }
 }
 
+/// Trait implemented by per-device runtime wrappers (`CublasRuntime`,
+/// `CusolverRuntime`) so the shared two-phase dispatch helper in
+/// [`with_runtime_two_phase`] can recover the device id after the callback
+/// has succeeded.
+pub(crate) trait HasGpuDevice {
+    fn device(&self) -> &GpuDeviceInfo;
+}
+
+/// Dispatch `f` against a pool of per-device runtimes using the two-phase
+/// rotation that cuBLAS and cuSOLVER both use:
+///
+/// 1. Pick a rotating start slot, then sweep every device with `try_lock`.
+///    Skip devices another thread already holds so concurrent callers spread
+///    to idle GPUs rather than serializing on the rotated slot.
+/// 2. If every device was busy (or every Phase 1 attempt compute-failed),
+///    fall back to a blocking `lock` on each device in turn so the dispatch
+///    still completes.
+///
+/// Returns `Some((result, device))` from the first runtime where
+/// `f(&mut runtime)` returns `Some`, or `None` if no device produced a
+/// result.
+pub(crate) fn with_runtime_two_phase<R, T>(
+    runtimes: &[std::sync::Mutex<R>],
+    mut f: impl FnMut(&mut R) -> Option<T>,
+) -> Option<(T, GpuDeviceInfo)>
+where
+    R: HasGpuDevice,
+{
+    if runtimes.is_empty() {
+        return None;
+    }
+    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
+    for offset in 0..runtimes.len() {
+        let idx = (start + offset) % runtimes.len();
+        if let Ok(mut runtime) = runtimes[idx].try_lock()
+            && let Some(out) = f(&mut runtime)
+        {
+            return Some((out, runtime.device().clone()));
+        }
+    }
+    for offset in 0..runtimes.len() {
+        let idx = (start + offset) % runtimes.len();
+        if let Ok(mut runtime) = runtimes[idx].lock()
+            && let Some(out) = f(&mut runtime)
+        {
+            return Some((out, runtime.device().clone()));
+        }
+    }
+    None
+}
+
 fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         return (*message).to_string();
