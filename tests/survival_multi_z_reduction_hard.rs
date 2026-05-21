@@ -4,8 +4,8 @@
 // and the generic Full path. If any assertion fails, that is a real bug.
 
 use gam::bernoulli_marginal_slope::{
-    marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
-    marginal_slope_probit_eta, MarginalSlopeCovariance, MarginalSlopeCovarianceShape,
+    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
+    marginal_slope_preserving_scale, marginal_slope_probit_eta,
 };
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
@@ -143,10 +143,8 @@ fn survival_k1_eta_bitwise_scalar_identity_200_fixtures() {
         let covariance = MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0]));
         let r = probit_scale * slope[0];
         let scalar = q * (1.0 + r * r).sqrt() + r * z[0];
-        let got =
-            survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale).expect(
-                "survival K=1 eta",
-            );
+        let got = survival_marginal_slope_vector_eta(q, &z, &slope, &covariance, probit_scale)
+            .expect("survival K=1 eta");
         assert_eq!(
             got.to_bits(),
             scalar.to_bits(),
@@ -279,8 +277,8 @@ fn block_diagonal_independence_with_zero_slopes_in_block_b() {
             "trial {trial}: scale block-diag != scale_A (full={scale_full:.17e}, A={scale_a:.17e})"
         );
 
-        let eta_full = marginal_slope_probit_eta(q, &z, &slopes, &cov_full, probit_scale)
-            .expect("eta full");
+        let eta_full =
+            marginal_slope_probit_eta(q, &z, &slopes, &cov_full, probit_scale).expect("eta full");
         let eta_a =
             marginal_slope_probit_eta(q, &z_a, &slopes_a, &cov_a, probit_scale).expect("eta A");
         // Slopes for block B are zero, so the linear contribution from z_B is zero.
@@ -328,15 +326,15 @@ fn zero_slope_extra_column_does_not_change_eta_or_scale() {
         let cov_ext = MarginalSlopeCovariance::Full(sigma_ext);
 
         let s_base = marginal_slope_preserving_scale(&slopes, &cov, probit_scale).expect("s base");
-        let s_ext = marginal_slope_preserving_scale(&slopes_ext, &cov_ext, probit_scale)
-            .expect("s ext");
+        let s_ext =
+            marginal_slope_preserving_scale(&slopes_ext, &cov_ext, probit_scale).expect("s ext");
         assert!(
             (s_base - s_ext).abs() <= tol,
             "trial {trial} k={k}: scale changed after appending zero-slope column (base={s_base:.17e}, ext={s_ext:.17e})"
         );
 
-        let eta_base = marginal_slope_probit_eta(q, &z, &slopes, &cov, probit_scale)
-            .expect("eta base");
+        let eta_base =
+            marginal_slope_probit_eta(q, &z, &slopes, &cov, probit_scale).expect("eta base");
         let eta_ext = marginal_slope_probit_eta(q, &z_ext, &slopes_ext, &cov_ext, probit_scale)
             .expect("eta ext");
         assert!(
