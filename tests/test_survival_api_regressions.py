@@ -54,6 +54,26 @@ def prediction_rows() -> pd.DataFrame:
     )
 
 
+def make_competing_risks(n: int = 320, seed: int = 123) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    age = rng.uniform(40.0, 75.0, n)
+    x = (age - 55.0) / 10.0
+    t1 = rng.exponential(scale=1.0 / np.exp(-3.0 + 0.25 * x), size=n)
+    t2 = rng.exponential(scale=1.0 / np.exp(-3.2 - 0.20 * x), size=n)
+    censor = rng.exponential(scale=22.0, size=n)
+    exit_time = np.minimum.reduce([t1, t2, censor]) + 0.1
+    event = np.where((t1 < t2) & (t1 < censor), 1.0, 0.0)
+    event = np.where((t2 < t1) & (t2 < censor), 2.0, event)
+    return pd.DataFrame(
+        {
+            "entry": np.zeros(n),
+            "exit": exit_time,
+            "event": event,
+            "age": age,
+        }
+    )
+
+
 def test_survival_transformation_is_reachable_from_fit() -> None:
     model = gamfit.fit(
         make_weibull(260),
@@ -64,6 +84,31 @@ def test_survival_transformation_is_reachable_from_fit() -> None:
     assert model.is_survival
     assert np.all(np.isfinite(np.asarray(pred.linear_predictor, dtype=float)))
     assert np.all(np.asarray(pred.survival, dtype=float) > 0.0)
+
+
+def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
+    train = make_competing_risks()
+    validation = gamfit.validate_formula(
+        train,
+        "Surv(entry, exit, event) ~ age",
+        survival_likelihood="weibull",
+    )
+    assert validation["model_class"] == "competing risks survival"
+
+    model = gamfit.fit(
+        train,
+        "Surv(entry, exit, event) ~ age",
+        survival_likelihood="weibull",
+    )
+    pred = model.predict(prediction_rows()[["entry", "exit", "event", "age"]])
+    assert isinstance(pred, gamfit.CompetingRisksPrediction)
+    assert pred.endpoint_names == ("cause_1", "cause_2")
+    assert pred.cif.shape[0] == 2
+    assert pred.cif.shape[1] == 3
+    assert pred.cif.shape[2] == pred.times.size
+    assert np.all(np.isfinite(pred.cif))
+    assert np.all((pred.cif >= 0.0) & (pred.cif <= 1.0))
+    assert np.all((pred.overall_survival >= 0.0) & (pred.overall_survival <= 1.0))
 
 
 def test_survival_location_scale_regressor_prediction_does_not_saturate() -> None:
