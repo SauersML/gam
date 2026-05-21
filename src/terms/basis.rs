@@ -22842,21 +22842,40 @@ pub mod closed_form_penalty {
         q: usize,
         d: usize,
         m: usize,
-        s: usize,
+        s: f64,
         kappa: f64,
         r: f64,
     ) -> f64 {
         assert!(2 * m >= q + 1, "isotropic_duchon_penalty: need 2m - q ≥ 1");
+        assert!(
+            s.is_finite() && s >= 0.0,
+            "isotropic_duchon_penalty: s must be finite and ≥ 0, got {s}"
+        );
         let a = 2 * m - q;
 
-        if s == 0 {
+        if s == 0.0 {
             return riesz_kernel_value(d, a as f64, r);
         }
         if kappa == 0.0 {
-            return riesz_kernel_value(d, (a + 2 * s) as f64, r);
+            // Pure-Riesz scale-free: fractional `s` rides directly into
+            // the kernel via `j = a + 2s`. No partial-fraction expansion
+            // needed (that path is for the hybrid Matérn-blend regime
+            // below).
+            return riesz_kernel_value(d, a as f64 + 2.0 * s, r);
         }
 
-        let b = 2 * s;
+        // Hybrid Matérn-blend (κ > 0) uses the partial-fraction
+        // expansion with integer `b = 2s`. Fractional `s` is not yet
+        // supported on this branch — its expansion uses integer
+        // binomials and powers of `κ²` that have no clean fractional
+        // generalisation. Reject up front rather than silently
+        // truncating.
+        assert!(
+            s.fract() == 0.0,
+            "isotropic_duchon_penalty: hybrid Matérn (κ > 0) requires integer s, got {s}"
+        );
+        let s_int = s as usize;
+        let b = 2 * s_int;
         if use_duchon_small_chi_riesz_series(kappa, r) {
             return duchon_small_chi_riesz_series_value(d, a, b, kappa, r);
         }
