@@ -18823,6 +18823,178 @@ mod tests {
         );
     }
 
+    // Experimental scan: drive rho up to the biobank box ceiling (+10) and
+    // record the per-coord outer gradient for projected vs unprojected
+    // joint-Hessian-logdet routing. Reproduces the optimizer-visible blow-up
+    // documented in project_biobank_marginal_slope_failure.md.
+    #[test]
+    fn biobank_scale_rho_scan_unprojected_gradient_blows_up() {
+        // Same fixture shape as the rank-deficient projected-trace test,
+        // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
+        let ranges = vec![(0, 3)];
+        let beta = array![1.0, -1.0, 3.0];
+        let s_unit: Array2<f64> =
+            array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let n_scale = 2.0e5_f64;
+        let h: Array2<f64> = array![
+            [4.0, 0.2, 7.0],
+            [0.2, 9.0, -3.0],
+            [7.0, -3.0, 30.0]
+        ]
+        .mapv(|v| v * n_scale);
+
+        let no_dh = |_d: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
+        let no_d2h =
+            |_u: &Array1<f64>, _v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                Ok(None)
+            };
+
+        eprintln!(
+            "\n=== biobank rho-scan: unprojected vs projected outer gradient ==="
+        );
+        eprintln!(
+            "{:>5}  {:>10}  {:>16}  {:>16}  {:>10}",
+            "rho", "lambda", "g_unprojected", "g_projected", "ratio"
+        );
+
+        let mut g_un_at_10 = 0.0_f64;
+        let mut g_pr_at_10 = 0.0_f64;
+
+        for &rho_val in &[0.0_f64, 2.0, 4.0, 6.0, 8.0, 10.0] {
+            let lam = rho_val.exp();
+            let rho = array![rho_val];
+            let s_lambda = s_unit.mapv(|v| v * lam);
+
+            let spec = ParameterBlockSpec {
+                name: "surface".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    Array2::zeros((1, 3)),
+                )),
+                offset: Array1::zeros(1),
+                penalties: vec![PenaltyMatrix::Dense(s_unit.clone())],
+                nullspace_dims: vec![1],
+                initial_log_lambdas: rho.clone(),
+                initial_beta: Some(beta.clone()),
+            };
+            let specs = vec![spec];
+            let inner = BlockwiseInnerResult {
+                block_states: vec![ParameterBlockState {
+                    beta: beta.clone(),
+                    eta: Array1::zeros(1),
+                }],
+                active_sets: vec![None],
+                log_likelihood: 0.0,
+                penalty_value: 0.5 * lam * beta.dot(&fast_av(&s_unit, &beta)),
+                cycles: 1,
+                converged: true,
+                block_logdet_h: 0.0,
+                block_logdet_s: 0.0,
+                s_lambdas: vec![s_lambda.clone()],
+                joint_workspace: None,
+            };
+            let per_block = vec![rho.clone()];
+            let options = BlockwiseFitOptions {
+                use_remlobjective: true,
+                use_outer_hessian: false,
+                ..BlockwiseFitOptions::default()
+            };
+
+            // project_hessian_logdet = true (current main behavior)
+            let projected = joint_outer_evaluate(
+                &inner,
+                &specs,
+                &per_block,
+                &rho,
+                &beta,
+                JointHessianSource::Dense(h.clone()),
+                &ranges,
+                3,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                true,
+                true,
+                false,
+                true,
+                EvalMode::ValueAndGradient,
+                &options,
+                crate::types::RhoPrior::Flat,
+                PseudoLogdetMode::Smooth,
+                &no_dh,
+                None,
+                &no_d2h,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("projected eval ok");
+
+            // project_hessian_logdet = false (the 0.1.92 / pre-fix behavior)
+            let unprojected = joint_outer_evaluate(
+                &inner,
+                &specs,
+                &per_block,
+                &rho,
+                &beta,
+                JointHessianSource::Dense(h.clone()),
+                &ranges,
+                3,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                true,
+                true,
+                false,
+                false,
+                EvalMode::ValueAndGradient,
+                &options,
+                crate::types::RhoPrior::Flat,
+                PseudoLogdetMode::Smooth,
+                &no_dh,
+                None,
+                &no_d2h,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("unprojected eval ok");
+
+            let g_un = unprojected.gradient[0];
+            let g_pr = projected.gradient[0];
+            eprintln!(
+                "{:>5.1}  {:>10.3e}  {:>16.6e}  {:>16.6e}  {:>10.3e}",
+                rho_val,
+                lam,
+                g_un,
+                g_pr,
+                g_un.abs() / (g_pr.abs() + 1e-30)
+            );
+            if rho_val == 10.0 {
+                g_un_at_10 = g_un.abs();
+                g_pr_at_10 = g_pr.abs();
+            }
+        }
+
+        // Claim: at rho = +10 the unprojected gradient is many orders of
+        // magnitude larger than the projected one — this is the
+        // optimizer-visible bug.
+        assert!(
+            g_un_at_10 / g_pr_at_10.max(1e-30) > 1e3,
+            "unprojected/projected ratio at rho=10 should be >= 1e3; \
+             got g_un={:.3e}, g_pr={:.3e}",
+            g_un_at_10,
+            g_pr_at_10
+        );
+    }
+
     #[test]
     fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
         let options = BlockwiseFitOptions {
