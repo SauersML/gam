@@ -23276,7 +23276,7 @@ pub mod closed_form_penalty {
     //      g_q(z; η, m, s, κ) = (-Δ_B)^q f(R)
     //  with R = |z|, B = diag(b_k), b_k = exp(-2 η_k),
     //  Δ_B = Σ_k b_k ∂²/∂z_k² (anisotropic Laplacian) and
-    //  f(R) = isotropic_duchon_penalty(0, d, m, s, κ, R).
+    //  f(R) = isotropic_duchon_penalty(0, d, m, s as f64, κ, R).
     //  Matrix entries multiply this bare kernel by J = exp(Σ η_k).
     //
     //  Acting on a radial function we get the structured forms:
@@ -23529,7 +23529,7 @@ pub mod closed_form_penalty {
     }
 
     /// Radial derivatives `[f, f', f'', …, f^{(max_order)}]`(R) of the
-    /// isotropic Duchon kernel `f(R) = isotropic_duchon_penalty(0, d, m, s, κ, R)`.
+    /// isotropic Duchon kernel `f(R) = isotropic_duchon_penalty(0, d, m, s as f64, κ, R)`.
     ///
     /// Used by the radial-derivative anisotropic form.  Requires `R > 0`.
     pub fn radial_derivatives_of_isotropic_duchon(
@@ -32760,7 +32760,7 @@ mod tests {
         let d = 3;
         for &kappa in &[0.0_f64, 0.3, 1.0, 5.0] {
             for &r in &[0.2_f64, 1.0, 4.0] {
-                let got = isotropic_duchon_penalty(q, d, m, 0, kappa, r);
+                let got = isotropic_duchon_penalty(q, d, m, 0.0, kappa, r);
                 let expected = riesz_kernel_value(d, (2 * m - q) as f64, r);
                 assert!(
                     (got - expected).abs() / expected.abs().max(1e-300) < 1e-12,
@@ -33000,7 +33000,7 @@ mod tests {
 
         for &r in &[0.5_f64, 1.5, 3.0] {
             // g_q^iso(R) - sum of Riesz pieces = sum of Matérn pieces.
-            let g_full = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let g_full = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
             let mut riesz_sum = 0.0_f64;
             for &(j, c) in &a_coeffs {
                 riesz_sum += c * riesz_kernel_value(d, (j) as f64, r);
@@ -33049,7 +33049,7 @@ mod tests {
             (2, 5, 2, 2, 1.0, 1.0),
         ];
         for &(q, d, m, s, kappa, big_r) in cases {
-            let iso = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            let iso = isotropic_duchon_penalty(q, d, m, s as f64, kappa, big_r);
             assert!(
                 iso.is_finite(),
                 "isotropic q-loaded representative is non-finite: q={q} d={d} m={m} s={s} kappa={kappa} R={big_r}"
@@ -33480,7 +33480,7 @@ mod tests {
                     * kappa_sq.powi(-((a + b - ell) as i32));
                 expected += coeff * matern_kernel_value(d, ell, kappa, r);
             }
-            let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let got = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
             let rel = (got - expected).abs() / expected.abs().max(1e-300);
             assert!(
                 rel < 1e-12,
@@ -33510,7 +33510,7 @@ mod tests {
         let kappas = [1.0_f64, 0.1, 0.01, 0.001];
         let mut prev_err = f64::INFINITY;
         for &kappa in &kappas {
-            let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let got = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
             let err = (got - target).abs() / target.abs();
             if kappa <= 0.5 {
                 assert!(
@@ -33520,7 +33520,7 @@ mod tests {
             }
             prev_err = err;
         }
-        let got = isotropic_duchon_penalty(q, d, m, s, 0.001, r);
+        let got = isotropic_duchon_penalty(q, d, m, s as f64, 0.001, r);
         let rel = (got - target).abs() / target.abs();
         assert!(
             rel < 5e-3,
@@ -33547,8 +33547,8 @@ mod tests {
         let finite_part = riesz_kernel_value(d, (2 * m + 2 * s - q) as f64, r);
         let kappa_hi = 0.1_f64;
         let kappa_lo = 0.01_f64;
-        let hi = isotropic_duchon_penalty(q, d, m, s, kappa_hi, r);
-        let lo = isotropic_duchon_penalty(q, d, m, s, kappa_lo, r);
+        let hi = isotropic_duchon_penalty(q, d, m, s as f64, kappa_hi, r);
+        let lo = isotropic_duchon_penalty(q, d, m, s as f64, kappa_lo, r);
 
         assert!(
             hi.is_finite() && lo.is_finite() && finite_part.is_finite(),
@@ -33655,7 +33655,7 @@ mod tests {
         let expected_dk = finite_part_series(d, a, b, kappa, r, max_order, 1);
         let expected_dkk = finite_part_series(d, a, b, kappa, r, max_order, 2);
 
-        let value = isotropic_duchon_penalty(0, d, m, s, kappa, r);
+        let value = isotropic_duchon_penalty(0, d, m, s as f64, kappa, r);
         let radial = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, max_order);
         let dk = radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order);
         let dkk =
@@ -33723,7 +33723,7 @@ mod tests {
             coeff *= -((b + n) as f64) * kappa * kappa / ((n + 1) as f64);
         }
         let leading = riesz_kernel_value(d, (n0) as f64, r);
-        let got = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+        let got = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
         let rel = (got - expected).abs() / expected.abs().max(1e-300);
         assert!(
             rel < 1e-11,
@@ -33829,7 +33829,7 @@ mod tests {
                 let eta = vec![0.0_f64; d];
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+                let aniso = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
                 let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
                 let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
                 assert!(
@@ -33853,7 +33853,7 @@ mod tests {
             let eta = vec![0.0_f64; d];
             let mut r = vec![0.0_f64; d];
             r[0] = big_r;
-            let aniso = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+            let aniso = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
             let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
             let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
             assert!(
@@ -33924,9 +33924,9 @@ mod tests {
         let eta = vec![c, 0.0_f64, 0.0_f64];
         let r = vec![1.0_f64, 0.0_f64, 0.0_f64];
 
-        let aniso_bare = anisotropic_duchon_penalty(q, m, s, kappa, &eta, &r);
+        let aniso_bare = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, &eta, &r);
         let z_norm = (-c).exp();
-        let iso_at_z = isotropic_duchon_penalty(q, d, m, s, kappa, z_norm);
+        let iso_at_z = isotropic_duchon_penalty(q, d, m, s as f64, kappa, z_norm);
 
         let rel = (aniso_bare - iso_at_z).abs() / iso_at_z.abs().max(1e-300);
         assert!(
@@ -33960,7 +33960,7 @@ mod tests {
         let kappa = 1.0_f64;
         let f_hat = |rho: f64| 1.0 / (rho * rho * (1.0 + rho * rho).powi(4));
         for &big_r in &[0.5_f64, 1.5, 3.0] {
-            let closed = isotropic_duchon_penalty(q, d, m, s, kappa, big_r);
+            let closed = isotropic_duchon_penalty(q, d, m, s as f64, kappa, big_r);
             let approx = fourier_inv_radial_d3(f_hat, big_r, 100.0);
             let rel = (closed - approx).abs() / closed.abs().max(1e-300);
             assert!(
@@ -33996,7 +33996,7 @@ mod tests {
             for r in r_choices {
                 for eta in eta_choices {
                     let radial = anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r);
-                    let wrapped = anisotropic_duchon_penalty(q, m, s, kappa, eta, r);
+                    let wrapped = anisotropic_duchon_penalty(q, m, s, (kappa) as f64, eta, r);
                     let rel =
                         (radial - wrapped).abs() / wrapped.abs().max(radial.abs()).max(1e-300);
                     assert!(
@@ -34071,14 +34071,14 @@ mod tests {
 
         let derivs = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, r, 4);
         // Cross-check derivs[0] against isotropic_duchon_penalty(q=0, …)
-        let f0 = isotropic_duchon_penalty(0, d, m, s, kappa, r);
+        let f0 = isotropic_duchon_penalty(0, d, m, s as f64, kappa, r);
         assert!(
             (derivs[0] - f0).abs() / f0.abs().max(1e-300) < 1e-12,
             "radial deriv 0 mismatch: got={} f0={f0}",
             derivs[0]
         );
         // FD 1st derivative of f via 2-pt central difference.
-        let f_at = |rr: f64| isotropic_duchon_penalty(0, d, m, s, kappa, rr);
+        let f_at = |rr: f64| isotropic_duchon_penalty(0, d, m, s as f64, kappa, rr);
         let fd1 = (f_at(r + h) - f_at(r - h)) / (2.0 * h);
         let rel1 = (derivs[1] - fd1).abs() / fd1.abs().max(1e-300);
         assert!(
@@ -34386,14 +34386,14 @@ mod tests {
         ];
 
         for &(d, m, s, q, kappa, r) in cases {
-            let v0 = isotropic_duchon_penalty(q, d, m, s, kappa, r);
+            let v0 = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
             assert!(
                 v0.is_finite(),
                 "primary value not finite: d={d} m={m} s={s} q={q} κ={kappa} r={r}"
             );
 
-            let v_lo = isotropic_duchon_penalty(q, d, m, s, kappa * 0.999, r);
-            let v_hi = isotropic_duchon_penalty(q, d, m, s, kappa * 1.001, r);
+            let v_lo = isotropic_duchon_penalty(q, d, m, s as f64, kappa * 0.999, r);
+            let v_hi = isotropic_duchon_penalty(q, d, m, s as f64, kappa * 1.001, r);
             let denom = v0.abs().max(1e-300);
             let jump_lo = (v_lo - v0).abs() / denom;
             let jump_hi = (v_hi - v0).abs() / denom;
