@@ -9080,8 +9080,8 @@ struct DuchonCrossPenaltyContext {
     centers: Array2<f64>,
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: f64,
-    pure_block_order: f64,
+    s_order: usize,
+    pure_block_order: usize,
     coeffs: Option<DuchonPartialFractionCoeffs>,
     aniso_log_scales: Vec<f64>,
     z_kernel: Array2<f64>,
@@ -9224,9 +9224,10 @@ impl DuchonCrossPenaltyContext {
             }
         }
 
-        let value_share = duchon_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
+        let value_share =
+            duchon_scaling_exponent(self.p_order, self.s_order as usize, d) / d as f64;
         let operator_share =
-            duchon_operator_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
+            duchon_operator_scaling_exponent(self.p_order, self.s_order as usize, d) / d as f64;
 
         let mut d0_cross_proj = self.project_operator(&d0_raw_eta_cross, p);
         if value_share != 0.0 {
@@ -9888,8 +9889,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         centers: centers.to_owned(),
         length_scale,
         p_order,
-        s_order as f64,
-        pure_block_order: pure_block_order as usize,
+        s_order,
+        pure_block_order,
         coeffs,
         aniso_log_scales: aniso_log_scales.to_vec(),
         z_kernel,
@@ -11819,7 +11820,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order,
+        s_order as f64,
         dim,
         max_operator_derivative_order,
     )?;
@@ -15547,7 +15548,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
-        s_order,
+        s_order as f64,
         centers.ncols(),
         duchon_max_active_operator_derivative_order(&spec.operator_penalties),
     )?;
@@ -16057,7 +16058,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         centers.view(),
         Some(length_scale),
         p_order,
-        s_order as f64,
+        s_order,
         1,
         None,
         Some(&coeffs),
@@ -33264,7 +33265,7 @@ mod tests {
             centers,
             q,
             p_order,
-            power,
+            duchon_power_to_usize(power),
             kappa,
             aniso_log_scales,
             ops.kernel_nullspace_transform.as_ref(),
@@ -33297,7 +33298,7 @@ mod tests {
         let k = 200;
         let d = 3;
         let length_scale = 1.0; // kappa = 1
-        let power = 2; // s_order = 2
+        let power = 2.0; // s_order = 2
         let nullspace = DuchonNullspaceOrder::Zero; // p_order = 1 (m=1)
 
         // Deterministic LCG for reproducibility (no rng dep needed).
