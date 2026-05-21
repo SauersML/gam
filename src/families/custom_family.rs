@@ -13576,14 +13576,13 @@ fn joint_penalty_subspace_trace_parts(
     s_lambdas: &[Array2<f64>],
     total: usize,
     hessian_diagonal_ridge: f64,
-    penalty_logdet_ridge: f64,
 ) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
     if total == 0 {
         return Ok((0.0, None));
     }
 
     let mut s_lambda = Array2::<f64>::zeros((total, total));
-    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, penalty_logdet_ridge);
+    add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0);
     let (s_evals, s_evecs) = s_lambda
         .eigh(Side::Lower)
         .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?;
@@ -13822,11 +13821,6 @@ fn joint_outer_evaluate(
             )
         };
 
-    let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
-        ridge
-    } else {
-        0.0
-    };
     let (projected_logdet_correction, penalty_subspace_trace) = if project_hessian_logdet
         && include_logdet_h
         && include_logdet_s
@@ -13838,7 +13832,6 @@ fn joint_outer_evaluate(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
-            penalty_logdet_ridge,
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -14101,11 +14094,6 @@ fn joint_outer_evaluate_efs(
             )
         };
 
-    let penalty_logdet_ridge = if options.ridge_policy.include_penalty_logdet {
-        ridge
-    } else {
-        0.0
-    };
     let (projected_logdet_correction, penalty_subspace_trace) = if project_hessian_logdet
         && include_logdet_h
         && include_logdet_s
@@ -14117,7 +14105,6 @@ fn joint_outer_evaluate_efs(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
-            penalty_logdet_ridge,
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -18595,6 +18582,51 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn joint_penalty_subspace_trace_matches_projected_logdet_derivative() {
+        let ranges = vec![(0, 3)];
+        let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
+        let penalties = vec![s_lambda];
+        let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
+        let drift = array![[0.7, -0.4, 11.0], [-0.4, 1.3, -5.0], [11.0, -5.0, 17.0]];
+
+        let (logdet, kernel) = joint_penalty_subspace_trace_parts(
+            &JointHessianSource::Dense(h.clone()),
+            &ranges,
+            &penalties,
+            3,
+            0.0,
+        )
+        .expect("projection parts build");
+        let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
+        assert_eq!(kernel.u_s.ncols(), 2);
+        assert_relative_eq!(logdet, (5.0_f64 * 11.0 - 0.2_f64 * 0.2).ln(), epsilon = 1e-12);
+
+        let analytic = kernel.trace_projected_logdet(&drift);
+        let eps = 1.0e-6;
+        let h_plus = &h + &(drift.mapv(|v| eps * v));
+        let h_minus = &h - &(drift.mapv(|v| eps * v));
+        let (logdet_plus, _) = joint_penalty_subspace_trace_parts(
+            &JointHessianSource::Dense(h_plus),
+            &ranges,
+            &penalties,
+            3,
+            0.0,
+        )
+        .expect("plus projection parts build");
+        let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
+            &JointHessianSource::Dense(h_minus),
+            &ranges,
+            &penalties,
+            3,
+            0.0,
+        )
+        .expect("minus projection parts build");
+        let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
+
+        assert_relative_eq!(analytic, finite_difference, epsilon = 1e-8, max_relative = 1e-8);
+    }
 
     #[test]
     fn direct_joint_hyper_inner_tolerance_follows_outer_target() {
