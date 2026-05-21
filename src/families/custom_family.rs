@@ -12395,24 +12395,81 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let objective_exhausted = objective_change <= objective_tol
                     || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
                 if objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3 {
-                    log::info!(
-                        "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
-                         linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
-                         of the active constraint set, not an unresolved gradient); \
-                         scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
-                         at this β); |Δobjective|={:.3e}, geometric_tail_bound={:.3e}, obj_tol={:.3e}; further cycles cannot reduce the \
-                         multiplier mass and would reproduce this plateau indefinitely; \
-                         active-set multiplier mass will be projected out of the KKT residual \
-                         before the outer IFT correction is assembled",
+                    // The `linearized_rel >= 0.5` signal is necessary but not
+                    // sufficient. It proves either (a) g carries a Lagrange
+                    // multiplier of an active constraint that the QP's active
+                    // set already represents — in which case the *projected*
+                    // residual is at tolerance — or (b) H is rank-deficient
+                    // in the direction of g, so Hδ ≈ 0 along the null
+                    // direction regardless of whether g is a multiplier or a
+                    // real defect. Case (b) is the survival marginal-slope
+                    // pathology at biobank scale: H σ_min ≈ 1e-12 and Newton
+                    // genuinely cannot move g, but the residual is NOT a
+                    // captured multiplier — it's an unresolved KKT defect in
+                    // the H-null subspace.
+                    //
+                    // The projected residual computed at the top of this
+                    // block (line ~12055) already subtracts the multiplier
+                    // mass of every row in `cached_active_sets`. If that
+                    // residual is at tolerance, case (a) holds and the
+                    // certificate is honest. If it's still orders of
+                    // magnitude above tolerance, case (b) holds: certifying
+                    // here would hand the unified evaluator a
+                    // `kkt_residual` with norm ≈ ‖g‖ which then gets
+                    // amplified by H⁻¹_proj in the cost/gradient IFT
+                    // corrections, contaminating the envelope formula and
+                    // triggering the "envelope-gradient consistency"
+                    // tripwire downstream. Bail with `converged = false` so
+                    // the outer optimizer rejects this ρ cleanly, exactly
+                    // as it would on any other non-converged inner exit.
+                    let cert_residual_factor = 4.0;
+                    let projected_residual_at_kkt =
+                        residual.is_finite() && residual <= cert_residual_factor * residual_tol;
+                    if projected_residual_at_kkt {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
+                             linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
+                             of the active constraint set, not an unresolved gradient); \
+                             scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
+                             at this β); projected residual={:.3e} ≤ {:.1}×tol={:.3e} (multipliers captured by active set); \
+                             |Δobjective|={:.3e}, geometric_tail_bound={:.3e}, obj_tol={:.3e}; further cycles cannot reduce the \
+                             multiplier mass and would reproduce this plateau indefinitely; \
+                             active-set multiplier mass will be projected out of the KKT residual \
+                             before the outer IFT correction is assembled",
+                            cycle,
+                            (1.0 - linearized_rel) * 100.0,
+                            linearized_rel * 100.0,
+                            scalar_model_relerr,
+                            residual,
+                            cert_residual_factor,
+                            cert_residual_factor * residual_tol,
+                            objective_change,
+                            geometric_tail_bound.unwrap_or(objective_change),
+                            objective_tol,
+                        );
+                        converged = true;
+                        break;
+                    }
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary cert REFUSED: \
+                         linearized_rel={:.3e} and scalar_relerr={:.3e} are individually consistent with a \
+                         Lagrange multiplier, but the projected residual={:.3e} > {:.1}×tol={:.3e} proves the \
+                         multiplier claim is phantom — the active-set system does not represent whatever is \
+                         pinning g, OR H is rank-deficient in the direction of g (σ_min(H) ≈ 0 makes Hδ ≈ 0 \
+                         even for a real KKT defect). Certifying here would pass a residual of magnitude ≈ ‖g‖ \
+                         to the IFT correction and amplify it by H⁻¹_proj into a contaminated envelope gradient. \
+                         Returning unconverged so the outer optimizer rejects this ρ before the contaminated \
+                         gradient is computed; |Δobjective|={:.3e}, obj_tol={:.3e}",
                         cycle,
-                        (1.0 - linearized_rel) * 100.0,
-                        linearized_rel * 100.0,
+                        linearized_rel,
                         scalar_model_relerr,
+                        residual,
+                        cert_residual_factor,
+                        cert_residual_factor * residual_tol,
                         objective_change,
-                        geometric_tail_bound.unwrap_or(objective_change),
                         objective_tol,
                     );
-                    converged = true;
+                    converged = false;
                     break;
                 }
             }
