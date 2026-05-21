@@ -23789,7 +23789,7 @@ pub mod closed_form_penalty {
     pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
         q: usize,
         m: usize,
-        s: usize,
+        s: f64,
         kappa: f64,
         eta: &[f64],
         powers: &AnisoMetricPowers,
@@ -23808,11 +23808,26 @@ pub mod closed_form_penalty {
             q <= 2,
             "anisotropic_duchon_penalty_radial_with_powers: q must be in {{0,1,2}}"
         );
+        assert!(
+            s.is_finite() && s >= 0.0,
+            "anisotropic_duchon_penalty_radial_with_powers: s must be finite and ≥ 0, got {s}"
+        );
         powers.assert_dim(r.len());
 
         let d = r.len();
+        // Integer-only helpers gate the self-pair / partial-fraction
+        // branches; fractional `s` routes around them via the
+        // already-fractional `radial_derivatives_of_isotropic_duchon`
+        // path below.
+        let s_int = if s.fract() == 0.0 {
+            Some(s as usize)
+        } else {
+            None
+        };
         if is_zero_lag(r) {
-            if let Some(bundle) = analytic_self_pair_bundle(q, m, s, kappa, eta) {
+            if let Some(si) = s_int
+                && let Some(bundle) = analytic_self_pair_bundle(q, m, si, kappa, eta)
+            {
                 return bundle.value / eta.iter().sum::<f64>().exp();
             }
             panic!(
@@ -23846,7 +23861,7 @@ pub mod closed_form_penalty {
         // finite-part Riesz series when κR is small. That keeps q>0 values and
         // η/κ derivatives on one analytic representative.
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
         match q {
             0 => fr[0],
@@ -23859,7 +23874,7 @@ pub mod closed_form_penalty {
     fn uniform_metric_radial_duchon_penalty(
         q: usize,
         m: usize,
-        s: usize,
+        s: f64,
         kappa: f64,
         d: usize,
         common_eta: f64,
