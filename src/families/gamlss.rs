@@ -16956,7 +16956,7 @@ impl BinomialLocationScaleWiggleFamily {
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_t = x_t_map.transpose_mul(score_t_xa.view()) + fast_atv(x_t, &score_t_x);
         let score_ls = x_ls_map.transpose_mul(score_ls_xa.view()) + fast_atv(x_ls, &score_ls_x);
-        let score_w = b0.t().dot(&score_w_b) + d0.t().dot(&score_w_d1);
+        let score_w = fast_atv(&b0, &score_w_b) + fast_atv(&d0, &score_w_d1);
         let mut score_psi = Array1::<f64>::zeros(total);
         score_psi.slice_mut(s![0..pt]).assign(&score_t);
         score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
@@ -20487,7 +20487,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
 
         let out_t = fast_atv(self.x_t.as_ref(), &r_t);
         let out_ls = fast_atv(self.x_ls.as_ref(), &r_ls);
-        let out_w = self.pieces.b0.t().dot(&r_b) + &self.pieces.d0.t().dot(&r_d);
+        let out_w = fast_atv(&self.pieces.b0, &r_b) + &fast_atv(&self.pieces.d0, &r_d);
 
         let mut out = Array1::<f64>::zeros(total);
         out.slice_mut(s![0..pt]).assign(&out_t);
