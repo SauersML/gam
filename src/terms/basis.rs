@@ -11013,14 +11013,27 @@ pub fn closed_form_operator_penalty_in_total_basis_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
     p_order: usize,
-    s_order: usize,
+    s_order: f64,
     aniso_log_scales: Option<&[f64]>,
     kernel_nullspace: Option<&Array2<f64>>,
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
+    // The pair-block factory still requires integer `s_order`; threading
+    // f64 deeper involves the partial-fraction / self-pair helpers. The
+    // top-of-chain API now accepts f64 so callers (and the convergence
+    // predicate at `duchon_closed_form_operator_penalty_converges`) can
+    // pass fractional values that the bottom layers (Riesz kernel,
+    // `isotropic_duchon_penalty` kappa=0 path) are already prepared to
+    // consume. Until the middle threading is complete, assert that the
+    // value arrives integer-valued.
+    assert!(
+        s_order.is_finite() && s_order >= 0.0 && s_order.fract() == 0.0,
+        "closed_form_operator_penalty_in_total_basis_pure: fractional s_order={s_order} not yet threaded through the pair-block layer"
+    );
+    let s_int = s_order as usize;
     let g_raw =
-        closed_form_anisotropic_pair_block_pure(centers, q, p_order, s_order, aniso_log_scales);
+        closed_form_anisotropic_pair_block_pure(centers, q, p_order, s_int, aniso_log_scales);
     let g_kernel = if let Some(z) = kernel_nullspace {
         let zt_g = fast_atb(z, &g_raw);
         fast_ab(&zt_g, z)
