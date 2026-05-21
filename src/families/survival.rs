@@ -2308,6 +2308,7 @@ impl WorkingModelSurvival {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            kkt_residual: None,
         }
         .evaluate(
             rho.as_slice().expect("rho must be contiguous"),
