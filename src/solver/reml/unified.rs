@@ -7549,6 +7549,36 @@ fn compute_base_h2_traces(
     if pairs.is_empty() {
         return Vec::new();
     }
+    // Dense-spectral batched path: collect every operator-backed pair into a
+    // single chunked sweep so the implicit design (compute_xf + per-axis
+    // kernel scalars) is traversed once instead of `pairs.len()` times. At
+    // biobank scale this turns the 16+ per-call `trace_logdet_operator`
+    // hot spots into a single batched evaluation.
+    if subspace.is_none() {
+        if let Some(ds) = hop.as_exact_dense_spectral() {
+            let mut out = vec![0.0_f64; pairs.len()];
+            let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+            for (idx, pair) in pairs.iter().enumerate() {
+                if let Some(op) = pair.b_operator.as_deref() {
+                    op_terms.push((idx, 1.0, op));
+                } else if pair.b_mat.nrows() > 0 {
+                    out[idx] = hop.trace_logdet_gradient(&pair.b_mat);
+                }
+            }
+            if !op_terms.is_empty() {
+                let batched = trace_projected_operator_terms_batched(
+                    pairs.len(),
+                    &op_terms,
+                    &ds.g_factor,
+                    &ds.projected_factor_cache,
+                );
+                for (idx, val) in batched.into_iter().enumerate() {
+                    out[idx] += val;
+                }
+            }
+            return out;
+        }
+    }
     if subspace.is_none()
         && hop.prefers_stochastic_trace_estimation()
         && hop.logdet_traces_match_hinv_kernel()
