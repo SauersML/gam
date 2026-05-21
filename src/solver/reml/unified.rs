@@ -6300,7 +6300,9 @@ pub fn reml_laml_evaluate(
         .kkt_residual
         .as_ref()
         .filter(|r: &&Array1<f64>| r.len() == hop.dim());
-    if let Some(r) = kkt_residual_vec {
+    let kkt_residual_correction_active =
+        kkt_residual_vec.is_some() && matches!(solution.dispersion, DispersionHandling::Fixed { .. });
+    if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
         // mathematically correct inverse here is the Moore-Penrose
@@ -6759,43 +6761,23 @@ pub fn reml_laml_evaluate(
     // computation may use `curvature_lambdas = rho_curvature_scale · lambdas`):
     // the IFT identity above is in the actual S(λ) basis, and the curvature
     // scale only applies to the H-dependent trace terms.
-    if let Some(r) = kkt_residual_vec {
-        if k > 0 {
-            // Gradient-side IFT correction `grad[k] -= rᵀ H⁻¹ (λ_k S_k β̂)`.
-            // Same near-singular pathology as the cost correction above:
-            // the full-H solve at boundary states amplifies floating-point
-            // noise in `r` outside `range(S_+)` by `1/σ_min(H)`, producing
-            // spurious 10¹²-fold gradient inflation. Route through
-            // the projected pseudo-inverse whenever the
-            // rank-deficient LAML fix is active — `λ_k S_k β̂ ∈ col(S_k) ⊂
-            // range(S_+)` by construction, so the projection introduces
-            // no bias in the numerator, only the well-conditioning the
-            // problem actually has.
-            if let Some(kernel) = solution.penalty_subspace_trace.as_deref() {
-                let proj_r = crate::faer_ndarray::fast_atv(&kernel.u_s, r);
-                let h_proj_inv_r = kernel.h_proj_inverse.dot(&proj_r);
-                for (k_idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
-                    let proj_ak = crate::faer_ndarray::fast_atv(&kernel.u_s, a_k_beta);
-                    let corr = h_proj_inv_r.dot(&proj_ak);
-                    if corr.is_finite() {
-                        grad[k_idx] -= corr;
-                    }
-                }
-            } else {
-                let mut rhs = Array2::<f64>::zeros((hop.dim(), k));
-                for (idx, a_k_beta) in rho_penalty_a_k_betas.iter().enumerate() {
-                    rhs.column_mut(idx).assign(a_k_beta);
-                }
-                let solved = hop.solve_multi(&rhs);
-                for k_idx in 0..k {
-                    let v_k: Array1<f64> = solved.column(k_idx).to_owned();
-                    let corr: f64 = r.view().dot(&v_k);
-                    if corr.is_finite() {
-                        grad[k_idx] -= corr;
-                    }
-                }
-            }
-        }
+    let kkt_rho_corrections = if let Some(r) =
+        kkt_residual_vec.filter(|_| kkt_residual_correction_active && k > 0)
+    {
+        Some(compute_kkt_residual_rho_corrections(
+            solution,
+            hop,
+            &lambdas,
+            &rho_penalty_a_k_betas,
+            r,
+            mode == EvalMode::ValueGradientHessian,
+        )?)
+    } else {
+        None
+    };
+    if let Some(corrections) = kkt_rho_corrections.as_ref() {
+        let mut sl = grad.slice_mut(ndarray::s![..k]);
+        sl += &corrections.gradient;
     }
 
     // Extended hyperparameter gradient (ψ/τ coordinates).
@@ -7062,7 +7044,7 @@ pub fn reml_laml_evaluate(
                 None
             }
         });
-    let kkt_residual_was_applied = kkt_residual_vec.is_some();
+    let kkt_residual_was_applied = kkt_residual_correction_active;
     let envelope_suppresses_outputs = envelope_inconsistent.is_some() && !kkt_residual_was_applied;
 
     // Outer Hessian (if requested).
@@ -7103,6 +7085,12 @@ pub fn reml_laml_evaluate(
             }
             let assembly_start = std::time::Instant::now();
             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
+            if let Some(kkt_hessian) = kkt_rho_corrections
+                .as_ref()
+                .and_then(|corrections| corrections.hessian.as_ref())
+            {
+                hessian.add_rho_block_dense(kkt_hessian)?;
+            }
             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
                 hessian.add_rho_block_dense(ph)?;
             }
@@ -7180,6 +7168,12 @@ pub fn reml_laml_evaluate(
                 Ok(op) => {
                     let mut hessian =
                         crate::solver::outer_strategy::HessianResult::Operator(Arc::new(op));
+                    if let Some(kkt_hessian) = kkt_rho_corrections
+                        .as_ref()
+                        .and_then(|corrections| corrections.hessian.as_ref())
+                    {
+                        hessian.add_rho_block_dense(kkt_hessian)?;
+                    }
                     if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
                         hessian.add_rho_block_dense(ph)?;
                     }
@@ -7208,6 +7202,13 @@ pub fn reml_laml_evaluate(
                 Some(&reml_workspace),
             ) {
                 Ok(mut h) => {
+                    if let Some(kkt_hessian) = kkt_rho_corrections
+                        .as_ref()
+                        .and_then(|corrections| corrections.hessian.as_ref())
+                    {
+                        let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
+                        sl += kkt_hessian;
+                    }
                     // Add prior Hessian (second derivatives of the soft prior on ρ, ρ-only).
                     if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
                         let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
@@ -7962,6 +7963,140 @@ pub(crate) struct RemlDerivativeWorkspace<'a> {
     pub rho_curvature_a_k_betas: &'a [Array1<f64>],
     pub rho_v_ks: Option<&'a [Array1<f64>]>,
     pub coord_corrections: &'a [Option<DriftDerivResult>],
+}
+
+struct KktRhoCorrections {
+    gradient: Array1<f64>,
+    hessian: Option<Array2<f64>>,
+}
+
+fn solve_kkt_residual_kernel(
+    hop: &dyn HessianOperator,
+    subspace: Option<&PenaltySubspaceTrace>,
+    rhs: &Array1<f64>,
+) -> Array1<f64> {
+    if let Some(kernel) = subspace {
+        let projected = crate::faer_ndarray::fast_atv(&kernel.u_s, rhs);
+        let solved_projected = kernel.h_proj_inverse.dot(&projected);
+        crate::faer_ndarray::fast_av(&kernel.u_s, &solved_projected)
+    } else {
+        hop.solve(rhs)
+    }
+}
+
+/// Derivatives of the same Newton/IFT residual correction used by the cost:
+///
+///   C(ρ) = -½ r(ρ)^T K(ρ) r(ρ),   K = H^{-1}
+///
+/// for fixed-dispersion LAML. At fixed β̂, `r_i = A_i β̂` and
+/// `H_i = A_i`, so
+///
+///   C_i  = -a_i^T q + ½ q^T A_i q,
+///   q    = K r,
+///   q_j  = K(a_j - A_j q),
+///   C_ij = -δ_ij a_i^T q - a_i^T q_j
+///          + q_j^T A_i q + ½δ_ij q^T A_i q.
+///
+/// This is exact for the Gaussian quadratic test problem and is the rho-rho
+/// block needed to keep analytic Hessians consistent when the custom-family
+/// inner solve exits with a finite KKT residual.
+fn compute_kkt_residual_rho_corrections(
+    solution: &InnerSolution<'_>,
+    hop: &dyn HessianOperator,
+    lambdas: &[f64],
+    penalty_a_k_betas: &[Array1<f64>],
+    residual: &Array1<f64>,
+    include_hessian: bool,
+) -> Result<KktRhoCorrections, String> {
+    let k = penalty_a_k_betas.len();
+    if k == 0 {
+        return Ok(KktRhoCorrections {
+            gradient: Array1::zeros(0),
+            hessian: include_hessian.then(|| Array2::zeros((0, 0))),
+        });
+    }
+    if lambdas.len() != k || solution.penalty_coords.len() != k {
+        return Err(format!(
+            "KKT rho correction dimension mismatch: lambdas={} coords={} rhs={}",
+            lambdas.len(),
+            solution.penalty_coords.len(),
+            k
+        ));
+    }
+    if residual.len() != hop.dim() {
+        return Err(format!(
+            "KKT residual dimension mismatch: residual={} Hessian dim={}",
+            residual.len(),
+            hop.dim()
+        ));
+    }
+
+    let subspace = solution.penalty_subspace_trace.as_deref();
+    let q = solve_kkt_residual_kernel(hop, subspace, residual);
+    let mut a_i_qs = Vec::with_capacity(k);
+    let mut a_i_dot_q = Vec::with_capacity(k);
+    let mut q_a_i_q = Vec::with_capacity(k);
+
+    for idx in 0..k {
+        let a_i_q = solution.penalty_coords[idx].scaled_matvec(&q, lambdas[idx]);
+        let linear = penalty_a_k_betas[idx].dot(&q);
+        let quadratic = q.dot(&a_i_q);
+        if !linear.is_finite() || !quadratic.is_finite() {
+            return Err(format!(
+                "KKT rho correction produced non-finite gradient ingredients at coord {idx}: \
+                 linear={linear} quadratic={quadratic}"
+            ));
+        }
+        a_i_dot_q.push(linear);
+        q_a_i_q.push(quadratic);
+        a_i_qs.push(a_i_q);
+    }
+
+    let mut gradient = Array1::<f64>::zeros(k);
+    for idx in 0..k {
+        gradient[idx] = -a_i_dot_q[idx] + 0.5 * q_a_i_q[idx];
+    }
+
+    let hessian = if include_hessian {
+        let mut q_derivs = Vec::with_capacity(k);
+        for idx in 0..k {
+            let mut rhs = penalty_a_k_betas[idx].clone();
+            rhs -= &a_i_qs[idx];
+            q_derivs.push(solve_kkt_residual_kernel(hop, subspace, &rhs));
+        }
+
+        let entry = |i: usize, j: usize| -> f64 {
+            let delta = if i == j { 1.0 } else { 0.0 };
+            -delta * a_i_dot_q[i] - penalty_a_k_betas[i].dot(&q_derivs[j])
+                + q_derivs[j].dot(&a_i_qs[i])
+                + 0.5 * delta * q_a_i_q[i]
+        };
+
+        let mut h = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            for j in i..k {
+                let raw = if i == j {
+                    entry(i, j)
+                } else {
+                    0.5 * (entry(i, j) + entry(j, i))
+                };
+                if !raw.is_finite() {
+                    return Err(format!(
+                        "KKT rho correction produced non-finite Hessian entry ({i}, {j}): {raw}"
+                    ));
+                }
+                h[[i, j]] = raw;
+                if i != j {
+                    h[[j, i]] = raw;
+                }
+            }
+        }
+        Some(h)
+    } else {
+        None
+    };
+
+    Ok(KktRhoCorrections { gradient, hessian })
 }
 
 /// Compute the outer Hessian ∂²V/∂ρₖ∂ρₗ.
@@ -17414,32 +17549,62 @@ mod tests {
         let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
 
         // Penalty logdet first derivatives (numerical FD).
+        let log_det_s_at = |rho_eval: &[f64]| -> f64 {
+            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|&r| r.exp()).collect();
+            let mut s_eval = Array2::zeros((p, p));
+            s_eval.scaled_add(lambdas_eval[0], &s1);
+            s_eval.scaled_add(lambdas_eval[1], &s2);
+            let (s_eigs_eval, _) = s_eval.eigh(faer::Side::Lower).unwrap();
+            let threshold_eval = positive_eigenvalue_threshold(s_eigs_eval.as_slice().unwrap());
+            exact_pseudo_logdet(s_eigs_eval.as_slice().unwrap(), threshold_eval)
+        };
+
         let mut det1 = Array1::zeros(rho.len());
         let eps = 1e-7;
         for k in 0..rho.len() {
             let mut rho_plus = rho.to_vec();
             rho_plus[k] += eps;
-            let lambdas_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
-            let mut s_plus = Array2::zeros((p, p));
-            s_plus.scaled_add(lambdas_plus[0], &s1);
-            s_plus.scaled_add(lambdas_plus[1], &s2);
-            let (s_eigs_plus, _) = s_plus.eigh(faer::Side::Lower).unwrap();
-            let threshold_plus = positive_eigenvalue_threshold(s_eigs_plus.as_slice().unwrap());
-            let log_det_s_plus =
-                exact_pseudo_logdet(s_eigs_plus.as_slice().unwrap(), threshold_plus);
+            let log_det_s_plus = log_det_s_at(&rho_plus);
 
             let mut rho_minus = rho.to_vec();
             rho_minus[k] -= eps;
-            let lambdas_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
-            let mut s_minus = Array2::zeros((p, p));
-            s_minus.scaled_add(lambdas_minus[0], &s1);
-            s_minus.scaled_add(lambdas_minus[1], &s2);
-            let (s_eigs_minus, _) = s_minus.eigh(faer::Side::Lower).unwrap();
-            let threshold_minus = positive_eigenvalue_threshold(s_eigs_minus.as_slice().unwrap());
-            let log_det_s_minus =
-                exact_pseudo_logdet(s_eigs_minus.as_slice().unwrap(), threshold_minus);
+            let log_det_s_minus = log_det_s_at(&rho_minus);
 
             det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
+        }
+        let mut det2 = Array2::zeros((rho.len(), rho.len()));
+        let eps2 = 1e-5;
+        for i in 0..rho.len() {
+            for j in i..rho.len() {
+                let value = if i == j {
+                    let mut rho_plus = rho.to_vec();
+                    rho_plus[i] += eps2;
+                    let mut rho_minus = rho.to_vec();
+                    rho_minus[i] -= eps2;
+                    (log_det_s_at(&rho_plus) - 2.0 * log_det_s + log_det_s_at(&rho_minus))
+                        / (eps2 * eps2)
+                } else {
+                    let mut pp = rho.to_vec();
+                    pp[i] += eps2;
+                    pp[j] += eps2;
+                    let mut pm = rho.to_vec();
+                    pm[i] += eps2;
+                    pm[j] -= eps2;
+                    let mut mp = rho.to_vec();
+                    mp[i] -= eps2;
+                    mp[j] += eps2;
+                    let mut mm = rho.to_vec();
+                    mm[i] -= eps2;
+                    mm[j] -= eps2;
+                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp)
+                        + log_det_s_at(&mm))
+                        / (4.0 * eps2 * eps2)
+                };
+                det2[[i, j]] = value;
+                if i != j {
+                    det2[[j, i]] = value;
+                }
+            }
         }
 
         InnerSolution {
@@ -17454,7 +17619,7 @@ mod tests {
             penalty_logdet: PenaltyLogdetDerivs {
                 value: log_det_s,
                 first: det1,
-                second: None,
+                second: Some(det2),
             },
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
