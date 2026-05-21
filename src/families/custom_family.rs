@@ -12189,6 +12189,63 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
+            // Outer-scale soft-convergence certificate.  The strict KKT
+            // certificate above requires `residual ≤ 2·inner_tol·scale`;
+            // that is the right gold standard for the inner solver, but it
+            // is stricter than the outer REML/LAML optimizer actually
+            // needs.  The outer optimizer queries `V(ρ)` and ∇_ρV, both
+            // evaluated at the inner optimum; the IFT pullback through
+            // the projected pseudo-inverse (0dc469bd) keeps the
+            // null-space portion of any residual from contaminating ∇_ρV.
+            // Concretely, the outer needs the OBJECTIVE accurate to
+            // ~outer_tol·(1+|obj|); per-cycle objective movement that
+            // small means further inner cycles do not change `V(ρ)` to
+            // the outer's resolution, so the inner has done its job.
+            //
+            // At biobank scale (n≈2·10⁵ probit survival, joint Hessian
+            // conditioned at ~10⁵–10⁸), Newton converges linearly with
+            // ratio ~0.95 — driving `residual` from 10⁷ at cycle 0 down
+            // to inner_tol·scale would take ~300+ cycles even with the
+            // analytic Hessian, because per-cycle progress is bounded by
+            // the smallest eigenvalue of H over the active subspace.
+            // The objective, however, plateaus to outer-scale within
+            // ~50–80 cycles. Soft-accepting at outer scale avoids
+            // running the inner past the point of diminishing returns
+            // for the outer optimizer.
+            //
+            // Safety guards (all required):
+            //   1. The objective is monotonically descending overall
+            //      (`lastobjective < initial_joint_objective`) so this is
+            //      not a stalled/oscillating run.
+            //   2. The accepted step is no longer driving meaningful
+            //      objective change at outer scale.
+            //   3. The accepted step itself is small at outer scale
+            //      (`step_inf ≤ outer_tol·(1+|β|∞)·10`).
+            //   4. At least `OUTER_SOFT_CONV_MIN_CYCLES` cycles have run,
+            //      so a transient single-cycle small Δobj near a saddle
+            //      cannot trip the early exit.
+            const OUTER_SOFT_CONV_MIN_CYCLES: usize = 20;
+            let outer_obj_tol = options.outer_tol * (1.0 + lastobjective.abs());
+            let outer_step_tol = options.outer_tol * (1.0 + beta_inf) * 10.0;
+            if cycle + 1 >= OUTER_SOFT_CONV_MIN_CYCLES
+                && lastobjective < initial_joint_objective
+                && objective_change <= outer_obj_tol
+                && accepted_step_inf <= outer_step_tol
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | outer-scale soft certificate: |Δobjective|={:.3e} <= outer_obj_tol={:.3e}, accepted_|δ|∞={:.3e} <= outer_step_tol={:.3e}, residual={:.3e} (strict tol={:.3e}); outer REML/LAML resolution reached — strict inner KKT would only refine V(ρ) below outer_tol",
+                    cycle,
+                    objective_change,
+                    outer_obj_tol,
+                    accepted_step_inf,
+                    outer_step_tol,
+                    residual,
+                    residual_tol,
+                );
+                converged = true;
+                break;
+            }
+
             // Residual-stall early-exit. The strict and noise-floor
             // certificates above require the KKT residual to land within
             // a small multiple of residual_tol. On survival marginal-slope
