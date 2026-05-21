@@ -10835,24 +10835,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
 
-        // Aitken geometric-tail companion to the constrained-stationary
-        // certificate further below. On biobank-scale survival marginal-slope
-        // the inner Newton enters a plateau where `linearized_rel ≈ 0.97`
-        // (most of g is multiplier mass), the scalar Newton model agrees
-        // with reality, and |Δobj| decays geometrically with ratio
-        // r = |Δobj_now| / |Δobj_prev| only marginally below 1. The strict
-        // per-cycle `|Δobj| ≤ obj_tol` check then never fires even though
-        // the total *remaining* descent is rigorously bounded by the
-        // geometric series sum |Δobj_now| / (1 − r). Tracking |Δobj| over
-        // a short consecutive window lets the cert fire as soon as that
-        // tail bound is below obj_tol — same rigor as the strict path,
-        // applied to the asymptotic tail rather than a single cycle.
-        const GEOMETRIC_TAIL_WINDOW: usize = 5;
-        let mut geometric_tail_history: std::collections::VecDeque<f64> =
-            std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
-
-        // Linearized-rate stall early-exit. Companion to the geometric-tail
-        // and constrained-stationary certificates for the case where the
+        // Linearized-rate stall early-exit. Companion to the
+        // constrained-stationary certificate for the case where the
         // certificate cannot fire (e.g. the multiplier interpretation does
         // not hold) yet `linearized_rel = ‖g+Hδ‖∞ / (1+‖g‖∞)` stays close
         // to 1 cycle after cycle — every Newton step reduces the predicted
