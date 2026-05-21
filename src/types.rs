@@ -303,6 +303,31 @@ impl LikelihoodFamily {
         matches!(self, Self::BinomialLogit)
     }
 
+    /// `true` for the latent-cloglog binomial family — checked at many sites
+    /// to short-circuit the latent-Gaussian quadrature path.
+    #[inline]
+    pub fn is_latent_cloglog(self) -> bool {
+        matches!(self, Self::BinomialLatentCLogLog)
+    }
+
+    /// `true` for the blended/mixture-of-inverse-links binomial family.
+    #[inline]
+    pub fn is_binomial_mixture(self) -> bool {
+        matches!(self, Self::BinomialMixture)
+    }
+
+    /// `true` for the SAS sinh-arcsinh binomial family.
+    #[inline]
+    pub fn is_binomial_sas(self) -> bool {
+        matches!(self, Self::BinomialSas)
+    }
+
+    /// `true` for the beta-logistic binomial family.
+    #[inline]
+    pub fn is_binomial_beta_logistic(self) -> bool {
+        matches!(self, Self::BinomialBetaLogistic)
+    }
+
     #[inline]
     pub fn is_binomial(self) -> bool {
         matches!(
