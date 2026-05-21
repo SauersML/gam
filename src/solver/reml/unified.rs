@@ -8009,9 +8009,11 @@ fn solve_kkt_residual_kernel(
 ///   C_ij = -δ_ij a_i^T q - a_i^T q_j
 ///          + q_j^T A_i q + ½δ_ij q^T A_i q.
 ///
-/// This is exact for the Gaussian quadratic test problem and is the rho-rho
-/// block needed to keep analytic Hessians consistent when the custom-family
-/// inner solve exits with a finite KKT residual.
+/// The dense outer Hessian already contains the exact-KKT profile term
+/// `-a_i^T K a_j`. That term is valid only when `r = 0`; the residual
+/// correction is therefore added as `a_i^T K a_j + C_ij`. This guarantees
+/// the additive block vanishes at exact KKT and is exact for the Gaussian
+/// quadratic reproduction.
 fn compute_kkt_residual_rho_corrections(
     solution: &InnerSolution<'_>,
     hop: &dyn HessianOperator,
@@ -8070,8 +8072,14 @@ fn compute_kkt_residual_rho_corrections(
     }
 
     let hessian = if include_hessian {
+        let mut a_solutions = Vec::with_capacity(k);
         let mut q_derivs = Vec::with_capacity(k);
         for idx in 0..k {
+            a_solutions.push(solve_kkt_residual_kernel(
+                hop,
+                subspace,
+                &penalty_a_k_betas[idx],
+            ));
             let mut rhs = penalty_a_k_betas[idx].clone();
             rhs -= &a_i_qs[idx];
             q_derivs.push(solve_kkt_residual_kernel(hop, subspace, &rhs));
@@ -8079,7 +8087,9 @@ fn compute_kkt_residual_rho_corrections(
 
         let entry = |i: usize, j: usize| -> f64 {
             let delta = if i == j { 1.0 } else { 0.0 };
-            -delta * a_i_dot_q[i] - penalty_a_k_betas[i].dot(&q_derivs[j])
+            let cancel_exact_kkt_profile_term = penalty_a_k_betas[i].dot(&a_solutions[j]);
+            cancel_exact_kkt_profile_term - delta * a_i_dot_q[i]
+                - penalty_a_k_betas[i].dot(&q_derivs[j])
                 + q_derivs[j].dot(&a_i_qs[i])
                 + 0.5 * delta * q_a_i_q[i]
         };
