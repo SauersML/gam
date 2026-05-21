@@ -4012,7 +4012,7 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
                 v.len()
             )));
         }
-        Ok(self.embed_vector(self.first_local.t().dot(v)))
+        Ok(self.embed_vector(crate::faer_ndarray::fast_atv(&self.first_local, v)))
     }
 
     fn forward_mul(
@@ -4039,7 +4039,7 @@ impl CustomFamilyPsiDerivativeOperator for EmbeddedDensePsiDerivativeOperator {
                 v.len()
             )));
         }
-        Ok(self.embed_vector(self.second_diag_local.t().dot(v)))
+        Ok(self.embed_vector(crate::faer_ndarray::fast_atv(&self.second_diag_local, v)))
     }
 
     fn transpose_mul_second_cross(
@@ -4970,7 +4970,7 @@ impl CustomFamilyPsiLinearMapRef<'_> {
 
     pub(crate) fn transpose_mul(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         match self {
-            Self::Dense(mat) => mat.t().dot(&v),
+            Self::Dense(mat) => crate::faer_ndarray::fast_atv(mat, &v),
             Self::First(action) => action.transpose_mul(v),
             Self::Second(action) => action.transpose_mul(v),
             Self::Zero { ncols, .. } => Array1::<f64>::zeros(*ncols),
