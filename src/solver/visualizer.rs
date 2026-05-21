@@ -395,26 +395,46 @@ fn install_panic_hook() {
             // Restore terminal first so subsequent stderr writes scroll
             // in the main buffer rather than under the alt-screen.
             disable_raw_mode().ok();
-            if let Ok(mut guard) = tty_handle_slot().lock()
+            // try_lock, not lock: the panicking thread may already
+            // hold the tty slot mutex (e.g. mid-install). std Mutex is
+            // non-reentrant, so re-entry would deadlock the panic hook
+            // itself and leave the terminal frozen in alt-screen + raw
+            // mode. Best-effort teardown is strictly better than hung
+            // teardown — the user's shell can recover from a dropped
+            // escape sequence but not from a hung Rust process.
+            if let Ok(mut guard) = tty_handle_slot().try_lock()
                 && let Some(file) = guard.as_mut()
             {
                 let _ = execute!(file, LeaveAlternateScreen);
                 let _ = file.flush();
             }
             // Replay recent log tail so the tee'd run file ends with
-            // real context, not just a bare panic message.
-            if let Some(feed) = current_active_feed() {
-                let model = lock_model(&feed.model);
+            // real context, not just a bare panic message. Same
+            // try_lock discipline as above.
+            let _ = writeln!(io::stderr(), "\n=== visualizer crash ===");
+            let mut dumped = false;
+            if let Some(slot) = ACTIVE_FEED.get()
+                && let Ok(guard) = slot.try_lock()
+                && let Some(feed) = guard.as_ref()
+                && let Ok(model) = feed.model.try_lock()
+            {
                 let _ = writeln!(
                     io::stderr(),
-                    "\n=== visualizer crash: last {} log line(s) ===",
+                    "last {} log line(s):",
                     model.log_tail.len()
                 );
                 for line in &model.log_tail {
                     let _ = writeln!(io::stderr(), "{line}");
                 }
-                let _ = writeln!(io::stderr(), "=== end log tail ===\n");
+                dumped = true;
             }
+            if !dumped {
+                let _ = writeln!(
+                    io::stderr(),
+                    "(log tail unavailable — visualizer locks contended)"
+                );
+            }
+            let _ = writeln!(io::stderr(), "=== end crash report ===\n");
             prev(info);
         }));
     });
@@ -564,7 +584,7 @@ impl InteractiveVisualizer {
             let chart = Chart::new(datasets)
                 .block(
                     Block::default()
-                        .title("Objective (LAML/REML)")
+                        .title(" Objective (LAML / REML) ")
                         .border_style(Style::default().fg(accent))
                         .borders(Borders::ALL),
                 )
@@ -684,67 +704,128 @@ impl InteractiveVisualizer {
                 .wrap(Wrap { trim: true });
             f.render_widget(model_panel, right_chunks[1]);
 
-            let mut diagnostics = Vec::<String>::new();
-            diagnostics.push(format!("Stage: {stage}"));
-            diagnostics.push(format!("Detail: {detail}"));
-            diagnostics.push(format!("Evaluation: {:.0} {eval_state}", iter));
-            diagnostics.push(format!("Status: {status}"));
-            diagnostics.push(format!("Best Objective: {:.6}", best));
-            diagnostics.push(format!("Current Objective: {:.6}", current_cost));
-            diagnostics.push(format!("Gradient Norm: {:.3e}", current_grad));
-            diagnostics.push(format!("Elapsed Time: {elapsed}s"));
-            diagnostics.push(String::new());
-            diagnostics.push(format!(
-                "Condition Number: {}",
-                diagnostics_condition
-                    .map(|v| format!("{v:.3e}"))
+            // The bottom panel mixes three streams that each want their
+            // own visual treatment, so build it as Vec<Line> with
+            // per-line styling rather than a single Paragraph of joined
+            // strings:
+            //   1. Solver metrics (default white) — current eval state
+            //   2. Numerical health (dim, color value if anomalous)
+            //   3. Pinned warnings/errors from push_diagnostic (yellow/red)
+            //   4. Live log stream from log_tail (severity-colored)
+            let label = |s: &str| Span::styled(s, Style::default().fg(Color::DarkGray));
+            let value =
+                |s: String| Span::styled(s, Style::default().fg(Color::White).bold());
+            let mut diag_lines: Vec<TextLine<'static>> = Vec::new();
+            diag_lines.push(TextLine::from(vec![
+                label("Stage:   "),
+                value(stage.clone()),
+                Span::raw("   "),
+                label("Detail: "),
+                Span::styled(detail.clone(), Style::default().fg(Color::Gray)),
+            ]));
+            diag_lines.push(TextLine::from(vec![
+                label("Eval:    "),
+                value(format!("{:.0} {eval_state}", iter)),
+                Span::raw("   "),
+                label("Status: "),
+                Span::styled(status.clone(), Style::default().fg(accent)),
+            ]));
+            diag_lines.push(TextLine::from(vec![
+                label("Best:    "),
+                value(format!("{best:.6}")),
+                Span::raw("   "),
+                label("Current: "),
+                value(format!("{current_cost:.6}")),
+                Span::raw("   "),
+                label("|grad|: "),
+                value(format!("{current_grad:.3e}")),
+                Span::raw("   "),
+                label("Elapsed: "),
+                value(format!("{elapsed}s")),
+            ]));
+            let fmt_opt = |v: Option<f64>| {
+                v.map(|x| format!("{x:.3e}"))
                     .unwrap_or_else(|| "n/a".to_string())
-            ));
-            diagnostics.push(format!(
-                "Step Size (norm delta rho): {}",
-                diagnostics_step_size
-                    .map(|v| format!("{v:.3e}"))
-                    .unwrap_or_else(|| "n/a".to_string())
-            ));
-            diagnostics.push(format!(
-                "Stabilization Ridge: {}",
-                diagnostics_ridge
-                    .map(|v| format!("{v:.3e}"))
-                    .unwrap_or_else(|| "n/a".to_string())
-            ));
-            diagnostics.push(format!(
-                "Convergence signal (base 10 log gradient norm): {:.3}",
-                grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
-            ));
-            // Show the live log stream (mirrored by ProgressLogger into
-            // model.log_tail) here so the chart panel doubles as the
-            // user's tail -f. The old `diagnostics_lines` list is still
-            // surfaced as a single most-recent line via push_diagnostic
-            // earlier in the panel; the bottom area is the log scroll.
-            diagnostics.push("Recent log:".to_string());
+            };
+            diag_lines.push(TextLine::from(vec![
+                label("κ(H): "),
+                value(fmt_opt(diagnostics_condition)),
+                Span::raw("   "),
+                label("|Δρ|: "),
+                value(fmt_opt(diagnostics_step_size)),
+                Span::raw("   "),
+                label("ridge: "),
+                value(fmt_opt(diagnostics_ridge)),
+                Span::raw("   "),
+                label("log10|grad|: "),
+                value(format!(
+                    "{:.3}",
+                    grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
+                )),
+            ]));
+            diag_lines.push(TextLine::from(""));
 
-            let base_reserved = diagnostics.len() + 1;
+            // Pinned warnings/errors from push_diagnostic. These are
+            // explicit "look at me" signals from the solver; surface
+            // them above the log stream and color by content so the
+            // user's eye lands on them first.
+            if !diagnostics_lines.is_empty() {
+                diag_lines.push(TextLine::from(Span::styled(
+                    "Warnings & notices:",
+                    Style::default().fg(Color::LightYellow).bold(),
+                )));
+                let pinned_cap = if compact { 2 } else { 3 };
+                let start = diagnostics_lines.len().saturating_sub(pinned_cap);
+                for line in diagnostics_lines.iter().skip(start) {
+                    let color = log_line_severity_color(line);
+                    diag_lines.push(TextLine::from(vec![
+                        Span::styled("  • ", Style::default().fg(color)),
+                        Span::styled(line.clone(), Style::default().fg(color)),
+                    ]));
+                }
+                diag_lines.push(TextLine::from(""));
+            }
+
+            // Live log stream — the "tail -f" inside the chart. Color
+            // each line by severity so warnings/errors leap out of the
+            // info stream. Without this the panel reads as a wall of
+            // identically-colored text and the user has to actually
+            // read each line to notice problems.
+            diag_lines.push(TextLine::from(Span::styled(
+                "Recent log (live):",
+                Style::default().fg(Color::LightCyan).bold(),
+            )));
+            let base_reserved = diag_lines.len() + 1;
             let availrows = chunks[1].height.saturating_sub(2) as usize;
             let max_log_lines = availrows.saturating_sub(base_reserved).max(1);
-            if log_tail.is_empty() && diagnostics_lines.is_empty() {
-                diagnostics.push("  (no log records yet)".to_string());
+            if log_tail.is_empty() {
+                diag_lines.push(TextLine::from(Span::styled(
+                    "  (no log records yet)",
+                    Style::default().fg(Color::DarkGray),
+                )));
             } else {
                 let start = log_tail.len().saturating_sub(max_log_lines);
                 for line in log_tail.into_iter().skip(start) {
-                    diagnostics.push(format!("  {line}"));
+                    let color = log_line_severity_color(&line);
+                    diag_lines.push(TextLine::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(line, Style::default().fg(color)),
+                    ]));
                 }
             }
-            diagnostics.push("Press Ctrl+C to abort".to_string());
+            diag_lines.push(TextLine::from(Span::styled(
+                "Press Ctrl+C to abort  ·  logs also stream to stderr",
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
 
-            let diagnostics_panel = Paragraph::new(diagnostics.join("\n"))
+            let diagnostics_panel = Paragraph::new(diag_lines)
                 .block(
                     Block::default()
-                        .title("Diagnostics")
+                        .title(" Diagnostics ")
                         .border_style(Style::default().fg(accent))
                         .borders(Borders::ALL),
                 )
-                .style(Style::default().fg(Color::White))
-                .wrap(Wrap { trim: true });
+                .wrap(Wrap { trim: false });
             f.render_widget(diagnostics_panel, chunks[1]);
         })?;
         Ok(())
@@ -1239,6 +1320,27 @@ fn contains_success_signal(text: &str) -> bool {
     ["complete", "converged", "finished", "done"]
         .iter()
         .any(|needle| text.contains(needle))
+}
+
+// Severity color for a single log line in the Diagnostics panel.
+// Inspects the formatted record text — log records arrive here already
+// formatted by `format_log_record` and may carry tags like "[WARN]" /
+// "[ERROR]" injected by individual emitters (e.g. PIRLS warnings), or
+// natural-language signals matched by the same predicates the model
+// status uses. Keeping these in one place means a line that contributes
+// to "model status = Warning" also reads as warning-colored in the
+// log scroll, so the two surfaces never disagree.
+fn log_line_severity_color(line: &str) -> Color {
+    let lower = line.to_ascii_lowercase();
+    if contains_error_signal(&lower) || lower.contains("[error]") || lower.contains("panic") {
+        Color::LightRed
+    } else if contains_warning_signal(&lower) || lower.contains("[warn") {
+        Color::LightYellow
+    } else if contains_success_signal(&lower) {
+        Color::LightGreen
+    } else {
+        Color::Gray
+    }
 }
 
 fn status_color(class: StatusClass) -> Color {
