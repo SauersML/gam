@@ -81,6 +81,11 @@ const MIN_DERIV: f64 = 1e-8;
 /// `1e-12 · max|x|² · n` stays comfortably above `f64::MIN_POSITIVE`
 /// at biobank scale.
 const MIN_WEIGHT: f64 = 1e-12;
+/// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
+/// model log-likelihood loops to keep `exp(η)` and `log(σ)` finite under the
+/// IRLS step. Hoisted out of each loop so all three families share the same
+/// numerical regime.
+const ETA_HARD_CLAMP: f64 = 30.0;
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
@@ -12710,7 +12715,6 @@ impl CustomFamily for PoissonLogFamily {
         let mut ll = 0.0;
         let mut z = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
-        const ETA_HARD_CLAMP: f64 = 30.0;
 
         for i in 0..n {
             let yi = self.y[i];
@@ -12803,7 +12807,6 @@ impl CustomFamily for GammaLogFamily {
         let mut ll = 0.0;
         let mut z = Array1::<f64>::zeros(n);
         let mut w = Array1::<f64>::zeros(n);
-        const ETA_HARD_CLAMP: f64 = 30.0;
 
         for i in 0..n {
             let yi = self.y[i];
@@ -12864,7 +12867,6 @@ impl CustomFamily for GammaLogFamily {
             return Err("GammaLogFamily shape must be finite and > 0".to_string());
         }
 
-        const ETA_HARD_CLAMP: f64 = 30.0;
         let mut dw = Array1::<f64>::zeros(n);
         for i in 0..n {
             let yi = self.y[i];
