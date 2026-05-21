@@ -8290,85 +8290,128 @@ fn compute_outer_hessian(
     };
 
     // ── ρ-ρ block ── (uses shared helpers for all trace computations)
+    //
+    // The K(K+1)/2 upper-triangular pairs are independent (each writes to a
+    // disjoint hess[[kk, ll]]/hess[[ll, kk]] cell pair) and the dominant
+    // per-pair cost — `compute_ift_correction_trace` → `kernel.trace_operator`
+    // → `op.mul_mat(U_S)` materialising a CompositeHyperOperator over a
+    // (p × r) factor — scales like O(family_callback × r × n). At biobank
+    // shape (n ≈ 2·10⁵, r ≈ 24, K = 8) the sequential walk dominates the
+    // outer-Hessian wall-clock by 1–2 orders of magnitude, so we dispatch
+    // the pair list through rayon and stitch the symmetric Array2 sequentially.
+    //
+    // `effective_deriv` is `&dyn HessianDerivativeProvider` whose trait bound
+    // includes `Send + Sync`, and `hop`, `subspace`, `glm_ingredients`,
+    // `adjoint_z_c`, `leverage`, and `fourth_trace_matrix` are all read-only
+    // shared state, so the closure body is genuinely thread-safe. The default
+    // `HyperOperator::mul_mat` already short-circuits to sequential when
+    // `rayon::current_thread_index().is_some()`, preventing nested-rayon
+    // oversubscription inside the family callbacks invoked by
+    // `compute_ift_correction_trace`.
+    let rho_pair_indices: Vec<(usize, usize)> =
+        (0..k).flat_map(|kk| (kk..k).map(move |ll| (kk, ll))).collect();
+    let rho_pair_count = rho_pair_indices.len();
+    let rho_pair_start = std::time::Instant::now();
+    log::debug!(
+        "[compute_outer_hessian rho-rho] starting {} pair(s), k={}",
+        rho_pair_count,
+        k,
+    );
 
-    for kk in 0..k {
-        for ll in kk..k {
-            let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
+    let rho_pair_values: Vec<(usize, usize, f64)> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        rho_pair_indices
+            .into_par_iter()
+            .map(|(kk, ll)| -> Result<(usize, usize, f64), String> {
+                let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
-            let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
-                exact[[kk, ll]]
-            } else if let Some(ref sct) = stochastic_cross_traces {
-                -sct[[kk, ll]]
-            } else {
-                hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
-            };
-
-            // Second Hessian drift trace via shared helpers.
-            //
-            // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
-            // base = δ_{kl} tr(K A_k)
-            // correction = compute_ift_correction_trace(RHS, v_k, v_l)
-            //
-            // `K` is the full-space `G_ε(H)` unless the rank-deficient LAML
-            // fix is active, in which case every trace routes through the
-            // projected kernel so the outer Hessian matches the projected
-            // `½ log|U_Sᵀ H U_S|_+` cost.
-            let base = if kk == ll {
-                if let Some(kernel) = subspace {
-                    kernel.trace_projected_logdet(&a_k_matrices[kk])
-                } else if solution.penalty_coords[kk].is_block_local() {
-                    let (block, start, end) = solution.penalty_coords[kk].scaled_block_local(1.0);
-                    hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
+                let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
+                    exact[[kk, ll]]
+                } else if let Some(ref sct) = stochastic_cross_traces {
+                    -sct[[kk, ll]]
                 } else {
-                    hop.trace_logdet_gradient(&a_k_matrices[kk])
+                    hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
+                };
+
+                // Second Hessian drift trace via shared helpers.
+                //
+                // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
+                // base = δ_{kl} tr(K A_k)
+                // correction = compute_ift_correction_trace(RHS, v_k, v_l)
+                //
+                // `K` is the full-space `G_ε(H)` unless the rank-deficient LAML
+                // fix is active, in which case every trace routes through the
+                // projected kernel so the outer Hessian matches the projected
+                // `½ log|U_Sᵀ H U_S|_+` cost.
+                let base = if kk == ll {
+                    if let Some(kernel) = subspace {
+                        kernel.trace_projected_logdet(&a_k_matrices[kk])
+                    } else if solution.penalty_coords[kk].is_block_local() {
+                        let (block, start, end) =
+                            solution.penalty_coords[kk].scaled_block_local(1.0);
+                        hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
+                    } else {
+                        hop.trace_logdet_gradient(&a_k_matrices[kk])
+                    }
+                } else {
+                    0.0
+                };
+
+                let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+                rhs +=
+                    &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
+                if kk == ll {
+                    rhs -= &curvature_a_k_betas[kk];
                 }
-            } else {
-                0.0
-            };
 
-            let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-            rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
-            if kk == ll {
-                rhs -= &curvature_a_k_betas[kk];
-            }
+                let correction = compute_ift_correction_trace(
+                    hop,
+                    &rhs,
+                    &v_ks[kk],
+                    &v_ks[ll],
+                    effective_deriv,
+                    adjoint_z_c.as_ref(),
+                    glm_ingredients.as_ref(),
+                    leverage.as_ref(),
+                    fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
+                    subspace,
+                )?;
 
-            let correction = compute_ift_correction_trace(
-                hop,
-                &rhs,
-                &v_ks[kk],
-                &v_ks[ll],
-                effective_deriv,
-                adjoint_z_c.as_ref(),
-                glm_ingredients.as_ref(),
-                leverage.as_ref(),
-                fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
-                subspace,
-            )?;
+                let h_kl_trace = base + correction;
 
-            let h_kl_trace = base + correction;
+                let h_val = outer_hessian_entry(
+                    rho_a_vals[kk],
+                    rho_a_vals[ll],
+                    penalty_a_k_betas[ll].dot(&v_ks[kk]),
+                    pair_a,
+                    cross_trace,
+                    h_kl_trace,
+                    det2[[kk, ll]],
+                    profiled_phi,
+                    profiled_nu,
+                    profiled_dp_cgrad,
+                    profiled_dp_cgrad2,
+                    is_profiled,
+                    incl_logdet_h,
+                    incl_logdet_s,
+                );
+                Ok((kk, ll, h_val))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
 
-            let h_val = outer_hessian_entry(
-                rho_a_vals[kk],
-                rho_a_vals[ll],
-                penalty_a_k_betas[ll].dot(&v_ks[kk]),
-                pair_a,
-                cross_trace,
-                h_kl_trace,
-                det2[[kk, ll]],
-                profiled_phi,
-                profiled_nu,
-                profiled_dp_cgrad,
-                profiled_dp_cgrad2,
-                is_profiled,
-                incl_logdet_h,
-                incl_logdet_s,
-            );
-            hess[[kk, ll]] = h_val;
-            if kk != ll {
-                hess[[ll, kk]] = h_val;
-            }
+    for (kk, ll, h_val) in rho_pair_values {
+        hess[[kk, ll]] = h_val;
+        if kk != ll {
+            hess[[ll, kk]] = h_val;
         }
     }
+
+    log::debug!(
+        "[compute_outer_hessian rho-rho] {} pair(s) done in {:.3}s",
+        rho_pair_count,
+        rho_pair_start.elapsed().as_secs_f64(),
+    );
 
     // ── ρ-ext cross block ── (uses shared helpers for all trace computations)
 

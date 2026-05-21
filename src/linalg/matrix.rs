@@ -1371,9 +1371,37 @@ impl DenseDesignOperator for DenseDesignMatrix {
                     ));
                 }
                 let xc = fast_ab(matrix, middle);
-                let mut out = Array1::<f64>::zeros(matrix.nrows());
-                for i in 0..matrix.nrows() {
-                    out[i] = matrix.row(i).dot(&xc.row(i)).max(0.0);
+                let n = matrix.nrows();
+                let p = matrix.ncols();
+                let mut out = Array1::<f64>::zeros(n);
+                if matrix.is_standard_layout()
+                    && xc.is_standard_layout()
+                    && let (Some(m_all), Some(xc_all), Some(out_slice)) =
+                        (matrix.as_slice(), xc.as_slice(), out.as_slice_mut())
+                {
+                    // Parallel per-row clamped quadratic-form diagonal with
+                    // stride-1 reads from both row-major operands. Avoids the
+                    // per-row `Array1::dot` call's overhead at biobank shapes
+                    // (n ≈ 2e5, p ≈ 33).
+                    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+                    use rayon::slice::ParallelSliceMut;
+                    out_slice
+                        .par_chunks_mut(1)
+                        .enumerate()
+                        .for_each(|(i, slot)| {
+                            let off = i * p;
+                            let m_row = &m_all[off..off + p];
+                            let xc_row = &xc_all[off..off + p];
+                            let mut acc = 0.0_f64;
+                            for j in 0..p {
+                                acc += m_row[j] * xc_row[j];
+                            }
+                            slot[0] = acc.max(0.0);
+                        });
+                } else {
+                    for i in 0..n {
+                        out[i] = matrix.row(i).dot(&xc.row(i)).max(0.0);
+                    }
                 }
                 Ok(out)
             }
