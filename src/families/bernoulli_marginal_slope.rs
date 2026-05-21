@@ -3028,22 +3028,55 @@ pub fn marginal_slope_covariance_from_scores(
 
     // ── Shape classification ──
     //
-    // Mark the sample covariance as Diagonal when every off-diagonal is
-    // indistinguishable from zero, where "indistinguishable" combines
-    // BOTH a numerical floor and a statistical floor:
+    // Order matters here.  Pick the CHEAPEST representation that does NOT
+    // lose information about the sample's rank structure:
     //
-    //   * numerical: 1e-10 · (1 + diag_max) — catches structurally-zero
-    //     off-diagonals (e.g. post-orthogonalised production input).
+    //   1. Eigendecompose.  If the matrix is rank-deficient (some
+    //      eigenvalue ≈ 0 within `rank_tol`), return LowRank.  Reporting
+    //      Diagonal in this case would silently drop the off-diagonal
+    //      coupling that captures the rank deficiency (e.g. perfectly
+    //      collinear columns), making r'Σr wrong for any r outside
+    //      span(diagonal).
     //
-    //   * statistical: 4 · √(σ_aa · σ_bb / N_eff) — under H0 (the population
-    //     is diagonal), the off-diagonal sample covariance has asymptotic
-    //     standard error √(σ_aa σ_bb / N_eff).  A 4σ pairwise threshold is
-    //     Bonferroni-safe for K up to ~30 at α≈0.01 (K(K-1)/2 ≤ 435 pairs).
-    //     Without this, raw IID-normal scores with N=10⁴ are classified as
-    //     Full because their O(1/√N) sample noise trips the numerical floor.
+    //   2. Otherwise (full rank), test whether the off-diagonals are
+    //      indistinguishable from zero — either NUMERICALLY (off-diag at
+    //      machine precision, e.g. post-orthogonalised production input)
+    //      or STATISTICALLY under H0 = independent columns (off-diag has
+    //      asymptotic SE √(σ_aa σ_bb / N_eff)).  If so, return Diagonal.
     //
-    // N_eff is Kish's effective sample size for weighted statistics:
-    //   N_eff = (Σ w_i)² / Σ w_i².
+    //   3. Otherwise return Full.
+    //
+    // The 4σ statistical floor is Bonferroni-safe for K up to ~30 at
+    // α≈0.01 (K(K-1)/2 ≤ 435 pairs).  N_eff is Kish's effective sample
+    // size: (Σ wᵢ)² / Σ wᵢ².  When N_eff is huge (biobank scale) the
+    // statistical floor collapses below the numerical floor and behaviour
+    // is identical to a pure-numerical-tolerance classifier.
+    use crate::faer_ndarray::FaerEigh;
+    let (evals, evecs) = cov
+        .eigh(faer::Side::Lower)
+        .map_err(|err| format!("marginal-slope covariance eigendecomposition failed: {err}"))?;
+    let max_eval = evals
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    let rank_tol = 1e-10 * max_eval.max(1.0);
+    let positive: Vec<(usize, f64)> = evals
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value > rank_tol).then_some((idx, value)))
+        .collect();
+    if positive.len() < k {
+        let mut factor = Array2::<f64>::zeros((k, positive.len()));
+        for (col, (idx, value)) in positive.iter().enumerate() {
+            let scale = value.sqrt();
+            for row in 0..k {
+                factor[[row, col]] = evecs[[row, *idx]] * scale;
+            }
+        }
+        return Ok(MarginalSlopeCovariance::LowRank(factor));
+    }
+
+    // Full rank.  Decide Diagonal vs Full via combined numerical/statistical
+    // off-diagonal tolerance.
     let sum_w_sq = weights.iter().map(|&w| w * w).sum::<f64>();
     let n_eff = if sum_w_sq > 0.0 {
         (total_weight * total_weight) / sum_w_sq
@@ -3068,31 +3101,7 @@ pub fn marginal_slope_covariance_from_scores(
         }
     }
     if k == 1 || is_diagonal {
-        return Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()));
-    }
-
-    use crate::faer_ndarray::FaerEigh;
-    let (evals, evecs) = cov
-        .eigh(faer::Side::Lower)
-        .map_err(|err| format!("marginal-slope covariance eigendecomposition failed: {err}"))?;
-    let max_eval = evals
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    let rank_tol = 1e-10 * max_eval.max(1.0);
-    let positive: Vec<(usize, f64)> = evals
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &value)| (value > rank_tol).then_some((idx, value)))
-        .collect();
-    if positive.len() < k {
-        let mut factor = Array2::<f64>::zeros((k, positive.len()));
-        for (col, (idx, value)) in positive.iter().enumerate() {
-            let scale = value.sqrt();
-            for row in 0..k {
-                factor[[row, col]] = evecs[[row, *idx]] * scale;
-            }
-        }
-        Ok(MarginalSlopeCovariance::LowRank(factor))
+        Ok(MarginalSlopeCovariance::Diagonal(cov.diag().to_owned()))
     } else {
         Ok(MarginalSlopeCovariance::Full(cov))
     }

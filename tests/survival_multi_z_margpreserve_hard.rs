@@ -13,7 +13,7 @@
 //! the 2e-15 tolerance.
 
 use gam::bernoulli_marginal_slope::{
-    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
+    MarginalSlopeCovariance, marginal_slope_covariance_from_scores,
 };
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
