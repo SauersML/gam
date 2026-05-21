@@ -1736,16 +1736,27 @@ mod tests {
                 s_tau_penalty: array![[0.0, 0.0, 0.0], [0.0, 0.25, 0.04], [0.0, 0.04, 0.15]],
             }
         }
-
     }
 
     impl LogitDesignMotionFixture for GaussianRemlFixture {
-        fn y(&self) -> &Array1<f64> { &self.y }
-        fn w(&self) -> &Array1<f64> { &self.w }
-        fn x(&self) -> &Array2<f64> { &self.x }
-        fn s0(&self) -> &Array2<f64> { &self.s0 }
-        fn cfg(&self) -> &RemlConfig { &self.cfg }
-        fn rho(&self) -> &Array1<f64> { &self.rho }
+        fn y(&self) -> &Array1<f64> {
+            &self.y
+        }
+        fn w(&self) -> &Array1<f64> {
+            &self.w
+        }
+        fn x(&self) -> &Array2<f64> {
+            &self.x
+        }
+        fn s0(&self) -> &Array2<f64> {
+            &self.s0
+        }
+        fn cfg(&self) -> &RemlConfig {
+            &self.cfg
+        }
+        fn rho(&self) -> &Array1<f64> {
+            &self.rho
+        }
     }
 
     #[test]
@@ -2191,16 +2202,27 @@ mod tests {
                 s_tau_penalty,
             }
         }
-
     }
 
     impl LogitDesignMotionFixture for BinomialLogitDesignMotionFixture {
-        fn y(&self) -> &Array1<f64> { &self.y }
-        fn w(&self) -> &Array1<f64> { &self.w }
-        fn x(&self) -> &Array2<f64> { &self.x }
-        fn s0(&self) -> &Array2<f64> { &self.s0 }
-        fn cfg(&self) -> &RemlConfig { &self.cfg }
-        fn rho(&self) -> &Array1<f64> { &self.rho }
+        fn y(&self) -> &Array1<f64> {
+            &self.y
+        }
+        fn w(&self) -> &Array1<f64> {
+            &self.w
+        }
+        fn x(&self) -> &Array2<f64> {
+            &self.x
+        }
+        fn s0(&self) -> &Array2<f64> {
+            &self.s0
+        }
+        fn cfg(&self) -> &RemlConfig {
+            &self.cfg
+        }
+        fn rho(&self) -> &Array1<f64> {
+            &self.rho
+        }
     }
 
     // ── n=30, p=5 binomial-logit design-motion gradient tests ────────

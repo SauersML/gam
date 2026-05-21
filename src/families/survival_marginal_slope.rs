@@ -17486,32 +17486,53 @@ pub fn fit_survival_marginal_slope_terms(
             &pilot_options,
         ) {
             Ok((block_beta, converged, cycles)) => {
-                let mut hints_mut = hints.borrow_mut();
-                if let Some(beta) = block_beta.first() {
-                    hints_mut.time_beta = Some(beta.clone());
-                }
-                if let Some(beta) = block_beta.get(1) {
-                    hints_mut.marginal_beta = Some(beta.clone());
-                }
-                if let Some(beta) = block_beta.get(2) {
-                    hints_mut.logslope_beta = Some(beta.clone());
-                }
-                if score_warp_prepared.is_some() {
-                    if let Some(beta) = block_beta.get(3) {
-                        hints_mut.score_warp_beta = Some(beta.clone());
+                // Only install the pilot's β as warm-start hints if the pilot
+                // actually reached a KKT certificate. The blockwise inner
+                // logger at custom_family.rs:12136 emits the warning
+                //   "returning non-converged warm-start iterate and rejecting
+                //    this outer REML/LAML evaluation"
+                // when its cycle budget is exhausted without convergence; the
+                // matching outer-side contract is `nonconverged_outer_eval_result`
+                // (custom_family.rs:5993), which surfaces zero gradient and
+                // HessianResult::Unavailable so the optimizer backs off. A
+                // partial pilot β can still be far from the cold-start optimum
+                // (the warning literally exists to signal that), so seeding
+                // the real outer optimizer with it can drag the first true
+                // inner solve to a degenerate region of (ρ, β)-space from
+                // which the analytic envelope gradient is no longer reliable.
+                // Discarding the partial β reverts the first real inner solve
+                // to a clean cold start at whatever ρ the outer optimizer
+                // picks (cached seed or initial_theta), which is the
+                // behaviour the warning text already promises.
+                if converged {
+                    let mut hints_mut = hints.borrow_mut();
+                    if let Some(beta) = block_beta.first() {
+                        hints_mut.time_beta = Some(beta.clone());
                     }
-                }
-                if link_dev_prepared.is_some() {
-                    let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
-                    if let Some(beta) = block_beta.get(link_idx) {
-                        hints_mut.link_dev_beta = Some(beta.clone());
+                    if let Some(beta) = block_beta.get(1) {
+                        hints_mut.marginal_beta = Some(beta.clone());
+                    }
+                    if let Some(beta) = block_beta.get(2) {
+                        hints_mut.logslope_beta = Some(beta.clone());
+                    }
+                    if score_warp_prepared.is_some() {
+                        if let Some(beta) = block_beta.get(3) {
+                            hints_mut.score_warp_beta = Some(beta.clone());
+                        }
+                    }
+                    if link_dev_prepared.is_some() {
+                        let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
+                        if let Some(beta) = block_beta.get(link_idx) {
+                            hints_mut.link_dev_beta = Some(beta.clone());
+                        }
                     }
                 }
                 log::info!(
-                    "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s",
+                    "[survival-marginal-slope/pilot] end status={} cycles={} elapsed={:.3}s hints_installed={}",
                     if converged { "converged" } else { "partial" },
                     cycles,
                     pilot_started.elapsed().as_secs_f64(),
+                    converged,
                 );
             }
             Err(err) => {

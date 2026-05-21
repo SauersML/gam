@@ -25,7 +25,8 @@ use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::solver::persistent_warm_start::{
-    PersistentBlockWarmStartRecord, StableHasher, load_block_record, store_block_record,
+    PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, StableHasher, load_block_record,
+    store_block_record,
 };
 use crate::types::{RidgeDeterminantMode, RidgePolicy};
 use faer::Side;
@@ -336,7 +337,6 @@ impl CoefficientLabel {
             column,
         }
     }
-
 }
 
 pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
@@ -423,7 +423,6 @@ impl CoefficientGroupSpec {
         self.prior = Some(prior);
         self
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2838,33 +2837,25 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
         return (Some(key), None);
     }
     let active_sets = normalize_active_sets(record.active_sets);
-    let cached_inner = match (
-        record.inner_log_likelihood,
-        record.inner_penalty_value,
-        record.inner_cycles,
-        record.inner_converged,
-        record.inner_block_logdet_h,
-        record.inner_block_logdet_s,
-    ) {
-        (
-            Some(log_likelihood),
-            Some(penalty_value),
-            Some(cycles),
-            Some(converged),
-            Some(block_logdet_h),
-            Some(block_logdet_s),
-        ) => Some(CachedInnerMode {
-            log_likelihood,
-            penalty_value,
-            cycles,
-            converged,
-            block_logdet_h,
-            block_logdet_s,
-            joint_workspace: None,
-        }),
-        _ => None,
-    };
-    log::info!("[warm-start-cache] restored custom-family persistent warm start key={key}");
+    let cached_inner = record.inner.map(|inner| CachedInnerMode {
+        log_likelihood: inner.log_likelihood,
+        penalty_value: inner.penalty_value,
+        cycles: inner.cycles,
+        converged: inner.converged,
+        block_logdet_h: inner.block_logdet_h,
+        block_logdet_s: inner.block_logdet_s,
+        joint_workspace: None,
+    });
+    let inner_status = cached_inner.as_ref().map_or("missing", |inner| {
+        if inner.converged {
+            "converged"
+        } else {
+            "partial"
+        }
+    });
+    log::info!(
+        "[warm-start-cache] restored custom-family persistent warm start key={key} inner={inner_status}"
+    );
     (
         Some(key),
         Some(ConstrainedWarmStart {
@@ -2878,6 +2869,25 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
             cached_inner,
         }),
     )
+}
+
+fn persistent_block_inner_summary(
+    warm_start: &ConstrainedWarmStart,
+) -> Option<PersistentBlockInnerSummary> {
+    warm_start.cached_inner.as_ref().and_then(|cached| {
+        (cached.log_likelihood.is_finite()
+            && cached.penalty_value.is_finite()
+            && cached.block_logdet_h.is_finite()
+            && cached.block_logdet_s.is_finite())
+        .then(|| PersistentBlockInnerSummary {
+            log_likelihood: cached.log_likelihood,
+            penalty_value: cached.penalty_value,
+            cycles: cached.cycles,
+            converged: cached.converged,
+            block_logdet_h: cached.block_logdet_h,
+            block_logdet_s: cached.block_logdet_s,
+        })
+    })
 }
 
 fn store_persistent_custom_family_warm_start(
@@ -2909,19 +2919,7 @@ fn store_persistent_custom_family_warm_start(
         .map(|beta| beta.to_vec())
         .collect();
     record.active_sets = warm_start.active_sets.clone();
-    if let Some(cached) = warm_start.cached_inner.as_ref()
-        && cached.log_likelihood.is_finite()
-        && cached.penalty_value.is_finite()
-        && cached.block_logdet_h.is_finite()
-        && cached.block_logdet_s.is_finite()
-    {
-        record.inner_log_likelihood = Some(cached.log_likelihood);
-        record.inner_penalty_value = Some(cached.penalty_value);
-        record.inner_cycles = Some(cached.cycles);
-        record.inner_converged = Some(cached.converged);
-        record.inner_block_logdet_h = Some(cached.block_logdet_h);
-        record.inner_block_logdet_s = Some(cached.block_logdet_s);
-    }
+    record.inner = persistent_block_inner_summary(warm_start);
     if let Err(err) = store_block_record(&record) {
         log::warn!("[warm-start-cache] failed to persist custom-family warm start: {err}");
     }
@@ -13288,6 +13286,7 @@ fn build_custom_family_inner_assembly<'dp>(
     ridge: f64,
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
+    penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
@@ -13376,7 +13375,7 @@ fn build_custom_family_inner_assembly<'dp>(
         rho_curvature_scale,
         rho_prior,
         hessian_logdet_correction,
-        penalty_subspace_trace: None,
+        penalty_subspace_trace,
         deriv_provider: Some(deriv_provider),
         tk_correction: 0.0,
         tk_gradient: None,
@@ -13408,6 +13407,7 @@ fn unified_joint_cost_gradient(
     ridge: f64,
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
+    penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
@@ -13434,6 +13434,7 @@ fn unified_joint_cost_gradient(
         ridge,
         rho_curvature_scale,
         hessian_logdet_correction,
+        penalty_subspace_trace,
         include_logdet_h,
         include_logdet_s,
         options,
@@ -13468,6 +13469,7 @@ fn unified_joint_efs_eval(
     ridge: f64,
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
+    penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
@@ -13486,6 +13488,7 @@ fn unified_joint_efs_eval(
         ridge,
         rho_curvature_scale,
         hessian_logdet_correction,
+        penalty_subspace_trace,
         include_logdet_h,
         include_logdet_s,
         options,
@@ -13637,8 +13640,7 @@ fn joint_penalty_subspace_trace_parts(
         let inv = 1.0 / sigma;
         for i in 0..rank {
             for j in 0..rank {
-                h_proj_inverse[[i, j]] +=
-                    inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
+                h_proj_inverse[[i, j]] += inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
             }
         }
     }
@@ -13825,31 +13827,30 @@ fn joint_outer_evaluate(
     } else {
         0.0
     };
-    let (projected_logdet_correction, _penalty_subspace_trace) =
-        if project_hessian_logdet
-            && include_logdet_h
-            && include_logdet_s
-            && pseudo_logdet_mode == PseudoLogdetMode::Smooth
-        {
-            let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
-                &h_joint_unpen,
-                ranges,
-                &scaled_s_lambdas,
-                total,
-                scaled_joint_trace_diagonal_ridge,
-                penalty_logdet_ridge,
-            )?;
-            let correction = projected_logdet - hessian_op.logdet();
-            if kernel.is_some() {
-                log::debug!(
-                    "[OUTER hessian-route] joint penalty subspace trace installed correction={:.6e}",
-                    correction
-                );
-            }
-            (correction, kernel.map(Arc::new))
-        } else {
-            (0.0, None)
-        };
+    let (projected_logdet_correction, penalty_subspace_trace) = if project_hessian_logdet
+        && include_logdet_h
+        && include_logdet_s
+        && pseudo_logdet_mode == PseudoLogdetMode::Smooth
+    {
+        let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
+            &h_joint_unpen,
+            ranges,
+            &scaled_s_lambdas,
+            total,
+            scaled_joint_trace_diagonal_ridge,
+            penalty_logdet_ridge,
+        )?;
+        let correction = projected_logdet - hessian_op.logdet();
+        if kernel.is_some() {
+            log::debug!(
+                "[OUTER hessian-route] joint penalty subspace trace installed correction={:.6e}",
+                correction
+            );
+        }
+        (correction, kernel.map(Arc::new))
+    } else {
+        (0.0, None)
+    };
     let hessian_logdet_correction = hessian_logdet_correction + projected_logdet_correction;
 
     let expected_theta_dim = rho.len()
@@ -13870,6 +13871,7 @@ fn joint_outer_evaluate(
         ridge,
         rho_curvature_scale,
         hessian_logdet_correction,
+        penalty_subspace_trace,
         include_logdet_h,
         include_logdet_s,
         options,
@@ -14104,31 +14106,30 @@ fn joint_outer_evaluate_efs(
     } else {
         0.0
     };
-    let (projected_logdet_correction, _penalty_subspace_trace) =
-        if project_hessian_logdet
-            && include_logdet_h
-            && include_logdet_s
-            && pseudo_logdet_mode == PseudoLogdetMode::Smooth
-        {
-            let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
-                &h_joint_unpen,
-                ranges,
-                &scaled_s_lambdas,
-                total,
-                scaled_joint_trace_diagonal_ridge,
-                penalty_logdet_ridge,
-            )?;
-            let correction = projected_logdet - hessian_op.logdet();
-            if kernel.is_some() {
-                log::debug!(
-                    "[OUTER hessian-route] joint EFS penalty subspace trace installed correction={:.6e}",
-                    correction
-                );
-            }
-            (correction, kernel.map(Arc::new))
-        } else {
-            (0.0, None)
-        };
+    let (projected_logdet_correction, penalty_subspace_trace) = if project_hessian_logdet
+        && include_logdet_h
+        && include_logdet_s
+        && pseudo_logdet_mode == PseudoLogdetMode::Smooth
+    {
+        let (projected_logdet, kernel) = joint_penalty_subspace_trace_parts(
+            &h_joint_unpen,
+            ranges,
+            &scaled_s_lambdas,
+            total,
+            scaled_joint_trace_diagonal_ridge,
+            penalty_logdet_ridge,
+        )?;
+        let correction = projected_logdet - hessian_op.logdet();
+        if kernel.is_some() {
+            log::debug!(
+                "[OUTER hessian-route] joint EFS penalty subspace trace installed correction={:.6e}",
+                correction
+            );
+        }
+        (correction, kernel.map(Arc::new))
+    } else {
+        (0.0, None)
+    };
     let hessian_logdet_correction = hessian_logdet_correction + projected_logdet_correction;
 
     unified_joint_efs_eval(
@@ -14143,6 +14144,7 @@ fn joint_outer_evaluate_efs(
         ridge,
         rho_curvature_scale,
         hessian_logdet_correction,
+        penalty_subspace_trace,
         include_logdet_h,
         include_logdet_s,
         options,

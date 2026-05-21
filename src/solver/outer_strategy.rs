@@ -446,7 +446,6 @@ impl DeclaredHessianForm {
     pub fn is_analytic(self) -> bool {
         !matches!(self, DeclaredHessianForm::Unavailable)
     }
-
 }
 
 /// Bridge for the partial migration from the legacy `Derivative`-only

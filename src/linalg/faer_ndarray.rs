@@ -297,7 +297,10 @@ pub fn fast_abt<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (m, k_a) = a.dim();
     let (n, k_b) = b.dim();
-    debug_assert_eq!(k_a, k_b, "A and B must have same number of columns for A·Bᵀ");
+    debug_assert_eq!(
+        k_a, k_b,
+        "A and B must have same number of columns for A·Bᵀ"
+    );
 
     if !should_use_faer_matmul(m, n, k_a) {
         return a.dot(&b.t());
