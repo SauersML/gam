@@ -50,8 +50,10 @@ impl<'a> RemlState<'a> {
         }
 
         // Build S_k = R_k^T R_k for each penalty component.
-        let s_k_matrices: Vec<Array2<f64>> =
-            rs_transformed.iter().map(|r_k| r_k.t().dot(r_k)).collect();
+        let s_k_matrices: Vec<Array2<f64>> = rs_transformed
+            .iter()
+            .map(|r_k| crate::faer_ndarray::fast_atb(r_k, r_k))
+            .collect();
 
         let lambdas_slice = lambdas.as_slice().unwrap();
 
