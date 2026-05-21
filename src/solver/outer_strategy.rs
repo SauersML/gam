@@ -4356,34 +4356,59 @@ impl OuterProblem {
                             }
                         })
                         .collect();
-                    let seed_rho = if saturated_coords.is_empty() {
-                        cached_rho
-                    } else {
-                        let clamped = cached_rho.mapv(|v| v.clamp(-interior, interior));
+                    // All-saturated cached ρ is the unique signature of a
+                    // divergent prior run (e.g. the pre-0dc469bd IFT bug
+                    // that pinned every coordinate at ±bound).  A healthy
+                    // fit cannot land every coordinate on the box; the
+                    // entry is poisoned.  Clamping to (bound - margin)
+                    // still leaves λ ∈ {e^-9, e^9}, which keeps the inner
+                    // PIRLS Hessian near-singular and starves the joint
+                    // Newton of useful progress within its cycle budget.
+                    // Discard the entry entirely so the optimizer falls
+                    // through to its normal cold-init seeding.
+                    if !saturated_coords.is_empty()
+                        && saturated_coords.len() == cached_rho.len()
+                    {
                         log::info!(
-                            "[CACHE] hit-clamp key={}.. context={} rho_dim={} \
-                             saturated_coords={:?} bound=±{:.3} clamped_to=±{:.3} \
-                             reason=stale-or-trapping-boundary-seed",
+                            "[CACHE] discard key={}.. context={} rho_dim={} \
+                             saturated_coords={:?} bound=±{:.3} \
+                             reason=all-coords-saturated-poisoned-entry",
                             short_key,
                             context,
-                            clamped.len(),
+                            cached_rho.len(),
                             saturated_coords,
                             bound,
-                            interior,
                         );
-                        clamped
-                    };
-                    log::info!(
-                        "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
-                        short_key,
-                        context,
-                        seed_rho.len(),
-                        prior_obj_display,
-                        entry.iteration.unwrap_or(0),
-                    );
-                    config.initial_rho = Some(seed_rho);
-                    config.screen_initial_rho = false;
-                    had_hit = true;
+                    } else {
+                        let seed_rho = if saturated_coords.is_empty() {
+                            cached_rho
+                        } else {
+                            let clamped = cached_rho.mapv(|v| v.clamp(-interior, interior));
+                            log::info!(
+                                "[CACHE] hit-clamp key={}.. context={} rho_dim={} \
+                                 saturated_coords={:?} bound=±{:.3} clamped_to=±{:.3} \
+                                 reason=stale-or-trapping-boundary-seed",
+                                short_key,
+                                context,
+                                clamped.len(),
+                                saturated_coords,
+                                bound,
+                                interior,
+                            );
+                            clamped
+                        };
+                        log::info!(
+                            "[CACHE] hit  key={}.. context={} rho_dim={} prior_obj={:.6e} iter={}",
+                            short_key,
+                            context,
+                            seed_rho.len(),
+                            prior_obj_display,
+                            entry.iteration.unwrap_or(0),
+                        );
+                        config.initial_rho = Some(seed_rho);
+                        config.screen_initial_rho = false;
+                        had_hit = true;
+                    }
                 } else {
                     log::info!(
                         "[CACHE] hit  key={}.. context={} rho_dim={} already-aligned prior_obj={:.6e}",
