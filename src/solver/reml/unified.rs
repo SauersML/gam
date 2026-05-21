@@ -743,15 +743,22 @@ pub trait HessianDerivativeProvider: Send + Sync {
 
     /// Batched second-order correction hook. The K(K+1)/2 ρ-ρ pairs in
     /// `compute_outer_hessian` each call
-    /// `hessian_second_derivative_correction_result(v_k, v_l, u_kl)`, and for
-    /// families whose `D²H[v_k, v_l]` operators share row-local state (a
-    /// single per-row scan across n observations that evaluates against all
-    /// triples in parallel) the batched form amortises the row-walk over all
+    /// `hessian_second_derivative_correction_result(v_k, v_l, u_kl)`; for
+    /// families whose `D²H[v_k, v_l]` operators share row-local state (one
+    /// per-row scan across n observations that evaluates against all
+    /// triples in parallel) the batched form amortises the row-walk across
     /// pairs instead of re-scanning n rows per pair. The default preserves
     /// the single-direction semantics by looping over the singular hook.
-    /// Pair the override with `has_batched_hessian_second_derivative_corrections`
-    /// so the unified evaluator only routes through this when a family
-    /// actually fuses the per-row work.
+    /// Pair the override with
+    /// `has_batched_hessian_second_derivative_corrections` so the unified
+    /// evaluator only routes through this when a family actually fuses the
+    /// per-row work.
+    ///
+    /// API stub: no caller routes through this yet — the unified evaluator
+    /// still walks the singular hook per pair. The trait method is in place
+    /// so wiring a family's batched callback later only needs the
+    /// call-site refactor, not a trait extension.
+    #[allow(dead_code)]
     fn hessian_second_derivative_corrections_result(
         &self,
         triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
@@ -764,6 +771,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
         false
     }
@@ -8351,11 +8359,64 @@ fn compute_outer_hessian(
         k,
     );
 
+    let build_rho_pair_rhs = |kk: usize, ll: usize| {
+        let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
+        rhs += &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
+        if kk == ll {
+            rhs -= &curvature_a_k_betas[kk];
+        }
+        rhs
+    };
+
+    let batched_rho_pair_corrections: Option<Vec<f64>> = if incl_logdet_h
+        && subspace.is_some()
+        && effective_deriv.has_corrections()
+        && effective_deriv.has_batched_hessian_second_derivative_corrections()
+    {
+        let mut rhs_matrix = Array2::<f64>::zeros((hop.dim(), rho_pair_count));
+        for (pair_idx, &(kk, ll)) in rho_pair_indices.iter().enumerate() {
+            let rhs = build_rho_pair_rhs(kk, ll);
+            rhs_matrix.column_mut(pair_idx).assign(&rhs);
+        }
+        let solved = hop.solve_multi(&rhs_matrix);
+        let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = rho_pair_indices
+            .iter()
+            .enumerate()
+            .map(|(pair_idx, &(kk, ll))| {
+                (
+                    v_ks[kk].clone(),
+                    v_ks[ll].clone(),
+                    solved.column(pair_idx).to_owned(),
+                )
+            })
+            .collect();
+        let corrections = effective_deriv.hessian_second_derivative_corrections_result(&triples)?;
+        let mut correction_values = vec![0.0_f64; corrections.len()];
+        if let Some(kernel) = subspace {
+            let mut present_indices = Vec::new();
+            let mut present_drifts = Vec::new();
+            for (idx, correction) in corrections.into_iter().enumerate() {
+                if let Some(drift) = correction {
+                    present_indices.push(idx);
+                    present_drifts.push(drift);
+                }
+            }
+            let traced = penalty_subspace_trace_drifts_batched(kernel, &present_drifts);
+            for (idx, value) in present_indices.into_iter().zip(traced) {
+                correction_values[idx] = value;
+            }
+        }
+        Some(correction_values)
+    } else {
+        None
+    };
+
     let rho_pair_values: Vec<(usize, usize, f64)> = {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::ParallelIterator;
         rho_pair_indices
-            .into_par_iter()
-            .map(|(kk, ll)| -> Result<(usize, usize, f64), String> {
+            .par_iter()
+            .enumerate()
+            .map(|(pair_idx, &(kk, ll))| -> Result<(usize, usize, f64), String> {
                 let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
                 let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
@@ -8390,25 +8451,23 @@ fn compute_outer_hessian(
                     0.0
                 };
 
-                let mut rhs = h_k_matrices[ll].dot(&v_ks[kk]);
-                rhs +=
-                    &solution.penalty_coords[kk].scaled_matvec(&v_ks[ll], curvature_lambdas[kk]);
-                if kk == ll {
-                    rhs -= &curvature_a_k_betas[kk];
-                }
-
-                let correction = compute_ift_correction_trace(
-                    hop,
-                    &rhs,
-                    &v_ks[kk],
-                    &v_ks[ll],
-                    effective_deriv,
-                    adjoint_z_c.as_ref(),
-                    glm_ingredients.as_ref(),
-                    leverage.as_ref(),
-                    fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
-                    subspace,
-                )?;
+                let correction = if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
+                    corrections[pair_idx]
+                } else {
+                    let rhs = build_rho_pair_rhs(kk, ll);
+                    compute_ift_correction_trace(
+                        hop,
+                        &rhs,
+                        &v_ks[kk],
+                        &v_ks[ll],
+                        effective_deriv,
+                        adjoint_z_c.as_ref(),
+                        glm_ingredients.as_ref(),
+                        leverage.as_ref(),
+                        fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
+                        subspace,
+                    )?
+                };
 
                 let h_kl_trace = base + correction;
 
