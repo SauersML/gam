@@ -1323,7 +1323,7 @@ pub fn build_smooth_basis(
                 spec: DuchonBasisSpec {
                     center_strategy,
                     length_scale,
-                    power,
+                    power: power as f64,
                     nullspace_order,
                     identifiability: parse_spatial_identifiability(options)?,
                     aniso_log_scales,
