@@ -28448,22 +28448,26 @@ mod tests {
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
 
-    /// Fractional `s = 3.5` in d=8, Degree-3 nullspace. The high-`d`
-    /// regime is exactly where fractional shines: integer s satisfying
-    /// `2(p+s) > d+2q = 12` and `2s < d = 8` jointly requires
-    /// `p+s > 6` and `s < 4`. With `p=3` (Degree-3), integer s must be 4
-    /// (which fails CPD `2·4 < 8`); only fractional s in `(3, 4)` works.
-    /// This test pins that the d=8 high-dimensional bench config the
-    /// fractional refactor was designed to unlock is actually reachable.
+    /// Fractional `s = 3.5` in d=8, Linear nullspace. The high-`d` regime
+    /// is exactly where fractional shines: with `nullspace_order = Linear`
+    /// (`m = 2`), the convergence predicate
+    /// `4(m+s) > d+2q ∧ d+2q > 4m ∧ 2m ≥ q+1` at d=8 requires
+    /// `s > 1 ∧ s < 4 ∧ 2 ≥ q+1` (so q ≤ 1). For q=2 (stiffness) closed
+    /// form needs `s > 1`; CPD adds `2s < d = 8 ⇒ s < 4`. Integer s ∈
+    /// {2, 3} works; fractional s=3.5 sits in the same convergent regime
+    /// while keeping the kernel `r^(2(m+s)−d) = r^(2(2+3.5)−8) = r³`.
+    /// Pins the d=8 high-dimensional bench config the fractional refactor
+    /// was designed to unlock.
     #[test]
     fn test_scale_free_duchon_joint_null_space_is_only_the_constant_8d_fractional_s() {
         let mut rows = Vec::new();
-        // Spread 64 points around the d=8 hypercube vertices and centroid.
+        // Spread 80 points across the d=8 hypercube via SplitMix64 — large
+        // enough that the kernel block (n_centers − m_poly_cols) is
+        // strictly positive at Linear nullspace (`m_poly_cols = 1 + d = 9`).
         let mut state: u64 = 0x9E3779B97F4A7C15;
-        for _ in 0..64 {
+        for _ in 0..80 {
             let mut row = [0.0_f64; 8];
             for r in row.iter_mut() {
-                // simple SplitMix64 → uniform [0, 1]
                 state = state.wrapping_add(0x9E3779B97F4A7C15);
                 let mut z = state;
                 z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
@@ -28482,10 +28486,10 @@ mod tests {
             }
         }
         let spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
             length_scale: None,
             power: 3.5,
-            nullspace_order: DuchonNullspaceOrder::Degree(3),
+            nullspace_order: DuchonNullspaceOrder::Linear,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
