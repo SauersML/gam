@@ -12798,8 +12798,207 @@ struct BinomialLocationScaleJointPsiSecondDrifts {
     z_ls_ab: Array1<f64>,
 }
 
-struct BinomialLocationScaleExactNewtonJointPsiWorkspace {
-    family: BinomialLocationScaleFamily,
+/// Shared interface that `BinomialLocationScaleFamily` and
+/// `BinomialLocationScaleWiggleFamily` expose to the joint ψ workspace.
+///
+/// After the prior unification both families produce the same
+/// `BinomialLocationScaleJointPsiDirection` and
+/// `BinomialLocationScaleJointPsiSecondDrifts`, so the workspace logic is
+/// genuinely identical bar the family-name fragment in the
+/// "requires dense block designs" error message. The trait gives the generic
+/// workspace one dispatch surface; each family's impl is a thin delegation
+/// to inherent methods it already owns.
+trait BinomialLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
+    /// Family-name fragment used in the workspace's dense-designs error
+    /// message, so "BinomialLocationScaleFamily" /
+    /// "BinomialLocationScaleWiggleFamily" stays visible after the workspace
+    /// impl was unified.
+    const LABEL: &'static str;
+
+    fn ws_policy(&self) -> &crate::resource::ResourcePolicy;
+
+    fn ws_exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String>;
+
+    fn ws_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
+    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String>;
+
+    fn ws_psi_second_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_a: &BinomialLocationScaleJointPsiDirection,
+        psi_b: &BinomialLocationScaleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String>;
+
+    fn ws_psi_hessian_directional_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        psi_dir: &BinomialLocationScaleJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String>;
+}
+
+impl BinomialLocationScaleJointPsiFamily for BinomialLocationScaleFamily {
+    const LABEL: &'static str = "BinomialLocationScaleFamily";
+
+    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+        &self.policy
+    }
+
+    fn ws_exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        self.exact_joint_dense_block_designs(specs)
+    }
+
+    fn ws_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
+    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+        self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_t,
+            x_ls,
+            policy,
+        )
+    }
+
+    fn ws_psi_second_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_a: &BinomialLocationScaleJointPsiDirection,
+        psi_b: &BinomialLocationScaleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        self.exact_newton_joint_psisecond_order_terms_from_parts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            x_t,
+            x_ls,
+        )
+    }
+
+    fn ws_psi_hessian_directional_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        psi_dir: &BinomialLocationScaleJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+            block_states,
+            psi_dir,
+            d_beta_flat,
+            x_t,
+            x_ls,
+        )
+    }
+}
+
+impl BinomialLocationScaleJointPsiFamily for BinomialLocationScaleWiggleFamily {
+    const LABEL: &'static str = "BinomialLocationScaleWiggleFamily";
+
+    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+        &self.policy
+    }
+
+    fn ws_exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        self.exact_joint_dense_block_designs(specs)
+    }
+
+    fn ws_psi_direction(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+        policy: &crate::resource::ResourcePolicy,
+    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+        self.exact_newton_joint_psi_direction(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            x_t,
+            x_ls,
+            policy,
+        )
+    }
+
+    fn ws_psi_second_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_a: &BinomialLocationScaleJointPsiDirection,
+        psi_b: &BinomialLocationScaleJointPsiDirection,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        self.exact_newton_joint_psisecond_order_terms_from_parts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            x_t,
+            x_ls,
+        )
+    }
+
+    fn ws_psi_hessian_directional_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        psi_dir: &BinomialLocationScaleJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        x_t: &Array2<f64>,
+        x_ls: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+            block_states,
+            psi_dir,
+            d_beta_flat,
+            x_t,
+            x_ls,
+        )
+    }
+}
+
+/// Joint exact-Newton ψ workspace shared by `BinomialLocationScaleFamily` and
+/// `BinomialLocationScaleWiggleFamily`. The two families plug in via
+/// `BinomialLocationScaleJointPsiFamily`; the struct holds the dense block
+/// designs + per-ψ direction cache and routes every workspace call through
+/// trait dispatch.
+struct BinomialLocationScaleJointPsiWorkspace<F: BinomialLocationScaleJointPsiFamily> {
+    family: F,
     block_states: Vec<ParameterBlockState>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     x_t: Arc<Array2<f64>>,
@@ -12807,18 +13006,18 @@ struct BinomialLocationScaleExactNewtonJointPsiWorkspace {
     psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleJointPsiDirection>,
 }
 
-impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
+impl<F: BinomialLocationScaleJointPsiFamily> BinomialLocationScaleJointPsiWorkspace<F> {
     fn new(
-        family: BinomialLocationScaleFamily,
+        family: F,
         block_states: Vec<ParameterBlockState>,
         specs: &[ParameterBlockSpec],
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
-        let Some((x_t, x_ls)) = family.exact_joint_dense_block_designs(Some(specs))? else {
-            return Err(
-                "BinomialLocationScaleFamily exact joint psi workspace requires dense block designs"
-                    .to_string(),
-            );
+        let Some((x_t, x_ls)) = family.ws_exact_joint_dense_block_designs(Some(specs))? else {
+            return Err(format!(
+                "{} exact joint psi workspace requires dense block designs",
+                F::LABEL,
+            ));
         };
         let x_t = shared_dense_arc(x_t.as_ref());
         let x_ls = shared_dense_arc(x_ls.as_ref());
@@ -12838,19 +13037,22 @@ impl BinomialLocationScaleExactNewtonJointPsiWorkspace {
         psi_index: usize,
     ) -> Result<Option<Arc<BinomialLocationScaleJointPsiDirection>>, String> {
         self.psi_directions.get_or_try_init(psi_index, || {
-            self.family.exact_newton_joint_psi_direction(
+            self.family.ws_psi_direction(
                 &self.block_states,
                 &self.derivative_blocks,
                 psi_index,
                 self.x_t.as_ref(),
                 self.x_ls.as_ref(),
-                &self.family.policy,
+                self.family.ws_policy(),
             )
         })
     }
 }
 
-impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWorkspace {
+impl<F> ExactNewtonJointPsiWorkspace for BinomialLocationScaleJointPsiWorkspace<F>
+where
+    F: BinomialLocationScaleJointPsiFamily,
+{
     fn second_order_terms(
         &self,
         psi_i: usize,
@@ -12862,17 +13064,14 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
         let Some(dir_j) = self.psi_direction(psi_j)? else {
             return Ok(None);
         };
-        Ok(Some(
-            self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
-                    &self.block_states,
-                    &self.derivative_blocks,
-                    dir_i.as_ref(),
-                    dir_j.as_ref(),
-                    self.x_t.as_ref(),
-                    self.x_ls.as_ref(),
-                )?,
-        ))
+        Ok(Some(self.family.ws_psi_second_order_terms_from_parts(
+            &self.block_states,
+            &self.derivative_blocks,
+            dir_i.as_ref(),
+            dir_j.as_ref(),
+            self.x_t.as_ref(),
+            self.x_ls.as_ref(),
+        )?))
     }
 
     fn hessian_directional_derivative(
@@ -12885,118 +13084,22 @@ impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleExactNewtonJointPsiWo
         };
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                        &self.block_states,
-                        dir.as_ref(),
-                        d_beta_flat,
-                        self.x_t.as_ref(),
-                        self.x_ls.as_ref(),
-                    )?,
-            ),
-        ))
-    }
-}
-
-struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    family: BinomialLocationScaleWiggleFamily,
-    block_states: Vec<ParameterBlockState>,
-    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    x_t: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
-    psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleJointPsiDirection>,
-}
-
-impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    fn new(
-        family: BinomialLocationScaleWiggleFamily,
-        block_states: Vec<ParameterBlockState>,
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    ) -> Result<Self, String> {
-        let Some((x_t, x_ls)) = family.exact_joint_dense_block_designs(Some(specs))? else {
-            return Err(
-                "BinomialLocationScaleWiggleFamily exact joint psi workspace requires dense block designs"
-                    .to_string(),
-            );
-        };
-        let x_t = shared_dense_arc(x_t.as_ref());
-        let x_ls = shared_dense_arc(x_ls.as_ref());
-        let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
-        Ok(Self {
-            family,
-            block_states,
-            derivative_blocks,
-            x_t,
-            x_ls,
-            psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
-        })
-    }
-
-    fn psi_direction(
-        &self,
-        psi_index: usize,
-    ) -> Result<Option<Arc<BinomialLocationScaleJointPsiDirection>>, String> {
-        self.psi_directions.get_or_try_init(psi_index, || {
-            self.family.exact_newton_joint_psi_direction(
-                &self.block_states,
-                &self.derivative_blocks,
-                psi_index,
-                self.x_t.as_ref(),
-                self.x_ls.as_ref(),
-                &self.family.policy,
-            )
-        })
-    }
-}
-
-impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    fn second_order_terms(
-        &self,
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some(dir_i) = self.psi_direction(psi_i)? else {
-            return Ok(None);
-        };
-        let Some(dir_j) = self.psi_direction(psi_j)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
+                self.family.ws_psi_hessian_directional_from_parts(
                     &self.block_states,
-                    &self.derivative_blocks,
-                    dir_i.as_ref(),
-                    dir_j.as_ref(),
+                    dir.as_ref(),
+                    d_beta_flat,
                     self.x_t.as_ref(),
                     self.x_ls.as_ref(),
                 )?,
-        ))
-    }
-
-    fn hessian_directional_derivative(
-        &self,
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
-        let Some(dir) = self.psi_direction(psi_index)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                        &self.block_states,
-                        dir.as_ref(),
-                        d_beta_flat,
-                        self.x_t.as_ref(),
-                        self.x_ls.as_ref(),
-                    )?,
             ),
         ))
     }
 }
+
+type BinomialLocationScaleExactNewtonJointPsiWorkspace =
+    BinomialLocationScaleJointPsiWorkspace<BinomialLocationScaleFamily>;
+type BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace =
+    BinomialLocationScaleJointPsiWorkspace<BinomialLocationScaleWiggleFamily>;
 
 impl BinomialLocationScaleFamily {
     pub const BLOCK_T: usize = 0;
