@@ -10878,6 +10878,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
         let mut linearized_stall_streak: usize = 0;
 
+        // Constrained-stationary convergence-kind flag. Set when the
+        // certificate at the bottom of the cycle body fires (`linearized_rel
+        // ≥ 0.5` AND `scalar_model_relerr ≤ 1e-3` AND objective exhausted).
+        // At a constrained-stationary KKT point ∇f = Aᵀμ where A indexes the
+        // active inequality/equality constraints and μ is the Lagrange
+        // multiplier; ∂β*/∂ρ_k lies in null(A) so the envelope chain-rule
+        // term (∇f)ᵀ(∂β*/∂ρ_k) = μᵀA(∂β*/∂ρ_k) = 0 in exact arithmetic. The
+        // IFT correction `−½ rᵀ H⁻¹ r` and `grad[k] −= rᵀ v_k` in
+        // `solver/reml/unified.rs` therefore vanish at the constrained
+        // optimum; computing them anyway via the full-H solve amplifies the
+        // multiplier-mass component of r (which is most of r in this regime)
+        // by `1/σ_min(H_active_normal)` (~10¹² on biobank survival
+        // marginal-slope), producing a gradient of magnitude ~10¹⁵–10¹⁷
+        // that the envelope-consistency tripwire then suppresses — leaving
+        // the outer optimizer with no usable gradient at all. The principled
+        // action is to mark the residual unavailable on this convergence
+        // kind so the outer IFT path is skipped entirely; the bare envelope
+        // gradient is the mathematically correct value at this β. Strict-KKT
+        // and noise-floor exits keep populating the residual (r is small in
+        // all directions there, so `rᵀ H⁻¹ r` is well-conditioned and the
+        // IFT correction is informative).
+        let mut inner_constrained_stationary: bool = false;
+
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
@@ -12395,8 +12418,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                          scalar Newton model agrees with reality to relerr={:.3e} (Hessian+gradient are correct \
                          at this β); |Δobjective|={:.3e}, geometric_tail_bound={:.3e}, obj_tol={:.3e}; further cycles cannot reduce the \
                          multiplier mass and would reproduce this plateau indefinitely; \
-                         the full KKT residual is still passed to the outer IFT correction, where \
-                         the penalty-subspace kernel can project multiplier mass before inversion",
+                         IFT residual will be suppressed at the convergent return so the outer \
+                         envelope formula uses the bare ∂f/∂ρ_k (the chain-rule correction \
+                         gᵀ ∂β/∂ρ_k = μᵀ A ∂β/∂ρ_k = 0 at this KKT point in exact arithmetic; \
+                         computing it via full-H solve only injects 1/σ_min noise)",
                         cycle,
                         (1.0 - linearized_rel) * 100.0,
                         linearized_rel * 100.0,
@@ -12405,6 +12430,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         geometric_tail_bound.unwrap_or(objective_change),
                         objective_tol,
                     );
+                    inner_constrained_stationary = true;
                     converged = true;
                     break;
                 }
@@ -12584,14 +12610,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
-            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
-                family,
-                specs,
-                &states,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-            )?;
+            let kkt_residual = if inner_constrained_stationary {
+                // See the `inner_constrained_stationary` declaration above.
+                // None signals the outer IFT path that the envelope identity
+                // is already valid at this β (the chain-rule correction
+                // term is exactly zero at a constrained KKT point); computing
+                // it through full-H amplifies multiplier mass by 1/σ_min.
+                None
+            } else {
+                exact_newton_joint_kkt_residual_for_ift(
+                    family,
+                    specs,
+                    &states,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                )?
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -13468,7 +13503,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let (block_logdet_h, block_logdet_s) =
         blockwise_logdet_terms(family, specs, &mut states, block_log_lambdas, options)?;
-    let kkt_residual = if converged {
+    let kkt_residual = if converged && !inner_constrained_stationary {
         match exact_newton_joint_gradient_from_eval(&cached_eval, specs, &states)? {
             Some(gradient) => exact_newton_joint_kkt_residual_for_ift_from_gradient(
                 &gradient,
@@ -13481,6 +13516,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             None => None,
         }
     } else {
+        // Either inner did not converge (no caller should trust an IFT
+        // correction at a non-KKT iterate) OR convergence was via the
+        // constrained-stationary certificate (see the comment on
+        // `inner_constrained_stationary` above).
         None
     };
 
