@@ -991,8 +991,9 @@ fn validate_marginal_slope_saved_fit_impl(
     base_block_count: usize,
     base_block_role_list: &str,
 ) -> Result<(), String> {
-    let expected_blocks =
-        base_block_count + usize::from(score_warp.is_some()) + usize::from(link_deviation.is_some());
+    let expected_blocks = base_block_count
+        + usize::from(score_warp.is_some())
+        + usize::from(link_deviation.is_some());
     if fit.blocks.len() != expected_blocks {
         let score_warp_suffix = if score_warp.is_some() {
             ", score-warp"

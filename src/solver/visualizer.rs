@@ -418,11 +418,7 @@ fn install_panic_hook() {
                 && let Some(feed) = guard.as_ref()
                 && let Ok(model) = feed.model.try_lock()
             {
-                let _ = writeln!(
-                    io::stderr(),
-                    "last {} log line(s):",
-                    model.log_tail.len()
-                );
+                let _ = writeln!(io::stderr(), "last {} log line(s):", model.log_tail.len());
                 for line in &model.log_tail {
                     let _ = writeln!(io::stderr(), "{line}");
                 }
@@ -713,8 +709,7 @@ impl InteractiveVisualizer {
             //   3. Pinned warnings/errors from push_diagnostic (yellow/red)
             //   4. Live log stream from log_tail (severity-colored)
             let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
-            let value =
-                |s: String| Span::styled(s, Style::default().fg(Color::White).bold());
+            let value = |s: String| Span::styled(s, Style::default().fg(Color::White).bold());
             let mut diag_lines: Vec<TextLine<'static>> = Vec::new();
             diag_lines.push(TextLine::from(vec![
                 label("Stage:   "),
