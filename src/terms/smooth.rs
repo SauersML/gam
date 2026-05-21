@@ -23024,7 +23024,18 @@ mod tests {
                 sas_link: None,
                 optimize_sas: false,
                 compute_inference: false,
-                max_iter: 18,
+                // The scale-free Duchon mass candidate is now the centered
+                // design Gram at data points (commit 718810d1), which has
+                // an exact zero eigenvalue in the constant direction
+                // instead of the rank-full collocation Gram the test was
+                // first calibrated against. The outer REML iteration
+                // sees a rank-deficient `S_mass` and converges in a few
+                // more iterations than under the old construction; the
+                // *fit quality* matches (final grad norm ≈ 6e-5 at iter
+                // 18). Budget bumped to 28 so the convergence check
+                // stays a real assertion rather than an iter-budget
+                // artefact.
+                max_iter: 28,
                 tol: 1e-5,
                 nullspace_dims: vec![],
                 linear_constraints: None,
