@@ -27985,6 +27985,7 @@ mod tests {
         for i in 0..p {
             xtx_reg[[i, i]] += 1e-14 * (xtx[[i, i]].abs().max(1.0));
         }
+        use crate::faer_ndarray::FaerCholesky;
         let chol = xtx_reg
             .cholesky(faer::Side::Lower)
             .expect("XᵀX SPD with ridge");
