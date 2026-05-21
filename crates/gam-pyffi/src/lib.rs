@@ -413,46 +413,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(info.unbind())
 }
 
-#[pyfunction]
-fn competing_risks_cif<'py>(
-    py: Python<'py>,
-    cumulative_hazards: Vec<PyReadonlyArray2<'py, f64>>,
-    times: PyReadonlyArray1<'py, f64>,
-) -> PyResult<(Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
-    let n_endpoints = cumulative_hazards.len();
-    if n_endpoints == 0 {
-        return Err(py_value_error(
-            "competing_risks_cif requires at least one endpoint prediction".to_string(),
-        ));
-    }
-    let first = cumulative_hazards[0].as_array();
-    let (n_rows, n_times) = first.dim();
-    let mut cumulative_hazard = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
-    for (endpoint, hazard) in cumulative_hazards.iter().enumerate() {
-        let hazard_view = hazard.as_array();
-        if hazard_view.dim() != (n_rows, n_times) {
-            return Err(py_value_error(format!(
-                "all endpoint predictions must return the same (n_rows, n_times) shape; \
-                 got {:?} for endpoint {}, expected {:?}",
-                hazard_view.dim(),
-                endpoint,
-                (n_rows, n_times)
-            )));
-        }
-        cumulative_hazard
-            .slice_mut(s![endpoint, .., ..])
-            .assign(&hazard_view);
-    }
-    let result =
-        gam::survival::assemble_competing_risks_cif(times.as_array(), cumulative_hazard.view())
-            .map_err(|err| py_value_error(err.to_string()))?;
-    Ok((
-        result.cif.into_pyarray(py).unbind(),
-        result.overall_survival.into_pyarray(py).unbind(),
-    ))
-}
-
-#[pyfunction]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
@@ -559,91 +519,9 @@ fn competing_risks_cif_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazard: ArrayView3<'_, f64>,
 ) -> Result<(Array3<f64>, Array2<f64>), String> {
-    let (n_endpoints, n_rows, n_times) = cumulative_hazard.dim();
-    if n_times == 0 || times.is_empty() {
-        return Err("competing_risks_cif requires at least one time".to_string());
-    }
-    if times.len() != n_times {
-        return Err(format!(
-            "competing_risks_cif got {} times but cumulative hazards have {} time columns",
-            times.len(),
-            n_times
-        ));
-    }
-    if n_endpoints == 0 {
-        return Err("competing_risks_cif requires at least one endpoint".to_string());
-    }
-    if n_rows == 0 {
-        return Err("competing_risks_cif requires at least one prediction row".to_string());
-    }
-    if times.iter().any(|time| !time.is_finite()) {
-        return Err("competing_risks_cif times must be finite".to_string());
-    }
-    if times.iter().any(|time| *time < 0.0) {
-        return Err("competing_risks_cif times must be non-negative".to_string());
-    }
-    for time_index in 1..n_times {
-        if times[time_index] <= times[time_index - 1] {
-            return Err("competing_risks_cif times must be strictly increasing".to_string());
-        }
-    }
-
-    let mut max_abs_cumulative = 0.0_f64;
-    for value in cumulative_hazard.iter() {
-        if !value.is_finite() {
-            return Err("endpoint cumulative hazards must be finite".to_string());
-        }
-        max_abs_cumulative = max_abs_cumulative.max(value.abs());
-    }
-    let tolerance = 1.0e-10 * max_abs_cumulative.max(1.0);
-    let mut increments = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
-    for endpoint in 0..n_endpoints {
-        for row in 0..n_rows {
-            let mut previous = 0.0;
-            for time_index in 0..n_times {
-                let current = cumulative_hazard[[endpoint, row, time_index]];
-                let increment = current - previous;
-                if increment < -tolerance {
-                    return Err(
-                        "endpoint cumulative hazards must be non-decreasing over the requested times"
-                            .to_string(),
-                    );
-                }
-                increments[[endpoint, row, time_index]] = increment.max(0.0);
-                previous = current;
-            }
-        }
-    }
-
-    let mut cif = Array3::<f64>::zeros((n_endpoints, n_rows, n_times));
-    let mut overall_survival = Array2::<f64>::zeros((n_rows, n_times));
-    for row in 0..n_rows {
-        let mut previous_total_cumulative = 0.0;
-        let mut running_cif = vec![0.0; n_endpoints];
-        for time_index in 0..n_times {
-            let mut total_cumulative = 0.0;
-            let mut total_increment = 0.0;
-            for endpoint in 0..n_endpoints {
-                total_cumulative += cumulative_hazard[[endpoint, row, time_index]];
-                total_increment += increments[[endpoint, row, time_index]];
-            }
-
-            let survival_left = (-previous_total_cumulative).exp();
-            let interval_failure = -(-total_increment).exp_m1();
-            if total_increment > 0.0 {
-                for endpoint in 0..n_endpoints {
-                    let weight = increments[[endpoint, row, time_index]] / total_increment;
-                    running_cif[endpoint] += weight * survival_left * interval_failure;
-                }
-            }
-            for endpoint in 0..n_endpoints {
-                cif[[endpoint, row, time_index]] = running_cif[endpoint].clamp(0.0, 1.0);
-            }
-            overall_survival[[row, time_index]] = (-total_cumulative).exp().clamp(0.0, 1.0);
-            previous_total_cumulative = total_cumulative;
-        }
-    }
-    Ok((cif, overall_survival))
+    let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard)
+        .map_err(|err| err.to_string())?;
+    Ok((result.cif, result.overall_survival))
 }
 
 #[pyfunction]
@@ -4627,9 +4505,11 @@ fn resolve_paired_nuts_configs(
     let n_chains = options
         .chains
         .unwrap_or_else(|| target_adaptive.n_chains.max(competing_adaptive.n_chains));
-    let target_accept = options
-        .target_accept
-        .unwrap_or_else(|| target_adaptive.target_accept.max(competing_adaptive.target_accept));
+    let target_accept = options.target_accept.unwrap_or_else(|| {
+        target_adaptive
+            .target_accept
+            .max(competing_adaptive.target_accept)
+    });
     let seed = options.seed.unwrap_or(target_adaptive.seed);
     let competing_seed = splitmix64(seed ^ 0x9E37_79B9_7F4A_7C15);
     (
@@ -5366,6 +5246,36 @@ fn parse_predict_options(options_json: Option<&str>) -> Result<PyPredictOptions,
                 "prediction interval must be in (0, 1); got {interval}"
             ));
         }
+    }
+    Ok(options)
+}
+
+fn parse_paired_cif_options(options_json: Option<&str>) -> Result<PyPairedCifOptions, String> {
+    let options = match options_json {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PyPairedCifOptions>(raw)
+            .map_err(|err| format!("invalid paired CIF options json: {err}"))?,
+        _ => PyPairedCifOptions::default(),
+    };
+    if options.times.is_empty() {
+        return Err("paired cumulative incidence requires at least one time".to_string());
+    }
+    for (idx, time) in options.times.iter().enumerate() {
+        if !time.is_finite() || *time < 0.0 {
+            return Err(format!(
+                "paired cumulative incidence times must be finite and non-negative; index {idx} got {time}"
+            ));
+        }
+        if idx > 0 && *time <= options.times[idx - 1] {
+            return Err(
+                "paired cumulative incidence times must be strictly increasing".to_string(),
+            );
+        }
+    }
+    let level = options.level.unwrap_or(0.95);
+    if !(0.0 < level && level < 1.0) {
+        return Err(format!(
+            "paired cumulative incidence interval level must be in (0, 1); got {level}"
+        ));
     }
     Ok(options)
 }
@@ -6760,8 +6670,11 @@ fn build_survival_marginal_slope_ffi_payload(
     });
     if is_joint_cause_specific {
         payload.survival_cause_count = Some(cause_count);
-        payload.survival_endpoint_names =
-            Some((1..=cause_count).map(|idx| format!("cause_{idx}")).collect());
+        payload.survival_endpoint_names = Some(
+            (1..=cause_count)
+                .map(|idx| format!("cause_{idx}"))
+                .collect(),
+        );
     }
     payload.survival_baseline_target =
         Some(survival_baseline_targetname(baseline_cfg.target).to_string());
@@ -7460,6 +7373,50 @@ fn predict_table_survival(
     dataset: &EncodedDataset,
     options: &PyPredictOptions,
 ) -> Result<String, String> {
+    if model
+        .payload()
+        .survival_cause_count
+        .is_some_and(|cause_count| cause_count > 1)
+    {
+        let result = predict_competing_risks_survival_result(model, dataset, options)?;
+        return serialize_competing_risks_prediction_payload(result);
+    }
+    let result = predict_survival_result(model, dataset, options)?;
+    serialize_survival_prediction_payload(model, result)
+}
+
+fn predict_competing_risks_survival_result(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+    options: &PyPredictOptions,
+) -> Result<gam::survival_predict::CompetingRisksPredictResult, String> {
+    use gam::survival_predict::{SurvivalPredictRequest, predict_competing_risks_survival};
+
+    let col_map = dataset.column_map();
+    let payload = model.payload();
+    let training_headers = payload.training_headers.as_ref();
+    let primary_offset =
+        resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
+    let noise_offset = ndarray::Array1::<f64>::zeros(dataset.values.nrows());
+    let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
+    let request = SurvivalPredictRequest {
+        model,
+        data: dataset.values.view(),
+        col_map: &col_map,
+        training_headers,
+        primary_offset: &primary_offset,
+        noise_offset: &noise_offset,
+        time_grid: time_grid_slice,
+        with_uncertainty: options.with_uncertainty,
+    };
+    predict_competing_risks_survival(request)
+}
+
+fn predict_survival_result(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+    options: &PyPredictOptions,
+) -> Result<gam::survival_predict::SurvivalPredictResult, String> {
     use gam::survival_predict::{SurvivalPredictRequest, predict_survival};
 
     let col_map = dataset.column_map();
@@ -7488,8 +7445,13 @@ fn predict_table_survival(
         time_grid: time_grid_slice,
         with_uncertainty: options.with_uncertainty,
     };
-    let result = predict_survival(request)?;
+    predict_survival(request)
+}
 
+fn serialize_survival_prediction_payload(
+    model: &FittedModel,
+    result: gam::survival_predict::SurvivalPredictResult,
+) -> Result<String, String> {
     // Rowwise flatten for JSON transport.
     let n = result.hazard.nrows();
     let t = result.hazard.ncols();
@@ -7570,6 +7532,365 @@ fn predict_table_survival(
     };
     serde_json::to_string(&survival_payload)
         .map_err(|err| format!("failed to serialize survival prediction payload: {err}"))
+}
+
+fn serialize_competing_risks_prediction_payload(
+    result: gam::survival_predict::CompetingRisksPredictResult,
+) -> Result<String, String> {
+    let mut columns = BTreeMap::<String, Vec<f64>>::new();
+    for (endpoint_idx, name) in result.endpoint_names.iter().enumerate() {
+        let suffix = name.replace('-', "_");
+        columns.insert(
+            format!("eta_{suffix}"),
+            result.linear_predictor[endpoint_idx].to_vec(),
+        );
+        let t_last = result.cif[endpoint_idx].ncols().saturating_sub(1);
+        columns.insert(
+            format!("failure_prob_{suffix}"),
+            (0..result.cif[endpoint_idx].nrows())
+                .map(|i| result.cif[endpoint_idx][[i, t_last]])
+                .collect(),
+        );
+    }
+    let t_last = result.overall_survival.ncols().saturating_sub(1);
+    columns.insert(
+        "overall_survival".to_string(),
+        (0..result.overall_survival.nrows())
+            .map(|i| result.overall_survival[[i, t_last]])
+            .collect(),
+    );
+    let likelihood_mode_str = match result.likelihood_mode {
+        gam::survival_construction::SurvivalLikelihoodMode::MarginalSlope => "marginal-slope",
+        gam::survival_construction::SurvivalLikelihoodMode::LocationScale => "location-scale",
+        gam::survival_construction::SurvivalLikelihoodMode::Transformation => "transformation",
+        gam::survival_construction::SurvivalLikelihoodMode::Weibull => "weibull",
+        gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
+        gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
+    };
+    let payload = CompetingRisksPredictionPayload {
+        class: "competing_risks_prediction",
+        model_class: "competing risks survival".to_string(),
+        likelihood_mode: likelihood_mode_str.to_string(),
+        endpoint_names: result.endpoint_names,
+        times: result.times,
+        hazard: matrices_to_nested(&result.hazard),
+        survival: matrices_to_nested(&result.survival),
+        cumulative_hazard: matrices_to_nested(&result.cumulative_hazard),
+        cif: matrices_to_nested(&result.cif),
+        overall_survival: matrix_to_nested(&result.overall_survival),
+        linear_predictor: result
+            .linear_predictor
+            .iter()
+            .map(|eta| eta.to_vec())
+            .collect(),
+        columns,
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize competing-risks prediction payload: {err}"))
+}
+
+fn matrix_to_nested(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
+    (0..matrix.nrows())
+        .map(|i| (0..matrix.ncols()).map(|j| matrix[[i, j]]).collect())
+        .collect()
+}
+
+fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
+    matrices.iter().map(matrix_to_nested).collect()
+}
+
+fn paired_cumulative_incidence_table_impl(
+    target_model_bytes: &[u8],
+    competing_model_bytes: &[u8],
+    target_samples: ArrayView2<'_, f64>,
+    competing_samples: ArrayView2<'_, f64>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    options_json: Option<&str>,
+) -> Result<String, String> {
+    let target_model = load_model_impl(target_model_bytes)?;
+    let competing_model = load_model_impl(competing_model_bytes)?;
+    if !matches!(
+        target_model.predict_model_class(),
+        PredictModelClass::Survival
+    ) || !matches!(
+        competing_model.predict_model_class(),
+        PredictModelClass::Survival
+    ) {
+        return Err("paired cumulative incidence requires two survival models".to_string());
+    }
+    if target_samples.nrows() == 0 {
+        return Err("paired cumulative incidence requires at least one paired draw".to_string());
+    }
+    if target_samples.nrows() != competing_samples.nrows() {
+        return Err(format!(
+            "paired cumulative incidence draw count mismatch: target={}, competing={}",
+            target_samples.nrows(),
+            competing_samples.nrows()
+        ));
+    }
+    let options = parse_paired_cif_options(options_json)?;
+    let level = options.level.unwrap_or(0.95);
+    let target_dataset = dataset_with_model_schema(&target_model, headers.clone(), rows.clone())?;
+    let competing_dataset = dataset_with_model_schema(&competing_model, headers, rows)?;
+    let eval_times = paired_cif_eval_times(&target_model, &target_dataset, &options.times)?;
+    let predict_options = PyPredictOptions {
+        interval: None,
+        time_grid: Some(eval_times.clone()),
+        with_uncertainty: false,
+    };
+    let requested_indices = requested_time_indices(&eval_times, &options.times)?;
+
+    let n_draws = target_samples.nrows();
+    let n_requested = options.times.len();
+    let mut cif_flat = Vec::<f64>::new();
+    let mut n_rows_out: Option<usize> = None;
+    cif_flat.reserve(n_draws * n_requested);
+
+    for draw_idx in 0..n_draws {
+        let target_draw_model =
+            model_with_replaced_beta_draw(&target_model, target_samples.row(draw_idx))?;
+        let competing_draw_model =
+            model_with_replaced_beta_draw(&competing_model, competing_samples.row(draw_idx))?;
+        let target_result =
+            predict_survival_result(&target_draw_model, &target_dataset, &predict_options)?;
+        let competing_result =
+            predict_survival_result(&competing_draw_model, &competing_dataset, &predict_options)?;
+        let n_rows = target_result.cumulative_hazard.nrows();
+        let n_eval_times = target_result.cumulative_hazard.ncols();
+        if competing_result.cumulative_hazard.dim() != (n_rows, n_eval_times) {
+            return Err(format!(
+                "paired cumulative incidence prediction shape mismatch at draw {draw_idx}: \
+                 target={:?}, competing={:?}",
+                target_result.cumulative_hazard.dim(),
+                competing_result.cumulative_hazard.dim()
+            ));
+        }
+        match n_rows_out {
+            Some(expected) if expected != n_rows => {
+                return Err(format!(
+                    "paired cumulative incidence row count changed at draw {draw_idx}: got {n_rows}, expected {expected}"
+                ));
+            }
+            None => {
+                n_rows_out = Some(n_rows);
+                cif_flat.reserve(n_draws * n_rows * n_requested);
+            }
+            _ => {}
+        }
+
+        let mut cumulative = Array3::<f64>::zeros((2, n_rows, n_eval_times));
+        cumulative
+            .slice_mut(s![0, .., ..])
+            .assign(&target_result.cumulative_hazard);
+        cumulative
+            .slice_mut(s![1, .., ..])
+            .assign(&competing_result.cumulative_hazard);
+        let (cif, _overall_survival) = competing_risks_cif_impl(
+            Array1::from_vec(eval_times.clone()).view(),
+            cumulative.view(),
+        )?;
+        for row in 0..n_rows {
+            for &time_idx in &requested_indices {
+                cif_flat.push(cif[[0, row, time_idx]]);
+            }
+        }
+    }
+
+    let n_rows = n_rows_out.unwrap_or(0);
+    let (mean_flat, lower_flat, upper_flat) =
+        summarize_paired_cif_draws(&cif_flat, n_draws, n_rows, n_requested, level)?;
+    let payload = PairedCifPayload {
+        class: "paired_cumulative_incidence",
+        level,
+        times: options.times,
+        n_draws,
+        n_rows,
+        n_times: n_requested,
+        cif_flat,
+        mean_flat,
+        lower_flat,
+        upper_flat,
+    };
+    serde_json::to_string(&payload)
+        .map_err(|err| format!("failed to serialize paired cumulative incidence: {err}"))
+}
+
+fn paired_cif_eval_times(
+    model: &FittedModel,
+    dataset: &EncodedDataset,
+    requested_times: &[f64],
+) -> Result<Vec<f64>, String> {
+    let mut eval_times = requested_times.to_vec();
+    let entry_name = model
+        .survival_entry
+        .as_ref()
+        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+    let col_map = dataset.column_map();
+    let entry_col = *col_map
+        .get(entry_name)
+        .ok_or_else(|| format!("entry column '{entry_name}' not found in prediction data"))?;
+    let max_time = *requested_times
+        .last()
+        .ok_or_else(|| "paired cumulative incidence requires at least one time".to_string())?;
+    for row in 0..dataset.values.nrows() {
+        let entry = dataset.values[[row, entry_col]];
+        if entry.is_finite() && entry >= 0.0 && entry <= max_time {
+            eval_times.push(entry);
+        }
+    }
+    eval_times.sort_by(|a, b| a.total_cmp(b));
+    eval_times.dedup_by(|a, b| *a == *b);
+    Ok(eval_times)
+}
+
+fn requested_time_indices(
+    eval_times: &[f64],
+    requested_times: &[f64],
+) -> Result<Vec<usize>, String> {
+    requested_times
+        .iter()
+        .map(|requested| {
+            eval_times
+                .binary_search_by(|candidate| candidate.total_cmp(requested))
+                .map_err(|_| {
+                    format!(
+                        "internal error: requested time {requested} missing from paired CIF evaluation grid"
+                    )
+                })
+        })
+        .collect()
+}
+
+fn summarize_paired_cif_draws(
+    cif_flat: &[f64],
+    n_draws: usize,
+    n_rows: usize,
+    n_times: usize,
+    level: f64,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    let expected = n_draws * n_rows * n_times;
+    if cif_flat.len() != expected {
+        return Err(format!(
+            "paired CIF draw payload shape mismatch: got {}, expected {expected}",
+            cif_flat.len()
+        ));
+    }
+    let alpha = (1.0 - level) / 2.0;
+    let mut mean = vec![0.0; n_rows * n_times];
+    let mut lower = vec![0.0; n_rows * n_times];
+    let mut upper = vec![0.0; n_rows * n_times];
+    let draw_stride = n_rows * n_times;
+    let mut scratch = vec![0.0; n_draws];
+    for row in 0..n_rows {
+        for time in 0..n_times {
+            let cell = row * n_times + time;
+            for draw in 0..n_draws {
+                scratch[draw] = cif_flat[draw * draw_stride + cell];
+            }
+            if scratch.iter().any(|value| !value.is_finite()) {
+                return Err("paired CIF draws contain non-finite values".to_string());
+            }
+            scratch.sort_by(|a, b| a.total_cmp(b));
+            mean[cell] = scratch.iter().sum::<f64>() / n_draws as f64;
+            lower[cell] = sorted_quantile(&scratch, alpha);
+            upper[cell] = sorted_quantile(&scratch, 1.0 - alpha);
+        }
+    }
+    Ok((mean, lower, upper))
+}
+
+fn sorted_quantile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let pos = q.clamp(0.0, 1.0) * (sorted.len() as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let weight = pos - lo as f64;
+        sorted[lo] * (1.0 - weight) + sorted[hi] * weight
+    }
+}
+
+fn model_with_replaced_beta_draw(
+    model: &FittedModel,
+    draw: ArrayView1<'_, f64>,
+) -> Result<FittedModel, String> {
+    let mut payload = model.payload().clone();
+    replace_fit_beta(&mut payload.fit_result, draw)?;
+    replace_fit_beta(&mut payload.unified, draw)?;
+    refresh_baseline_timewiggle_beta(&mut payload, draw)?;
+    Ok(FittedModel::from_payload(payload))
+}
+
+fn replace_fit_beta(
+    fit: &mut Option<gam::estimate::UnifiedFitResult>,
+    draw: ArrayView1<'_, f64>,
+) -> Result<(), String> {
+    let Some(fit) = fit.as_mut() else {
+        return Err("model is missing canonical fit_result payload; refit".to_string());
+    };
+    if fit.beta.len() != draw.len() {
+        return Err(format!(
+            "posterior draw has {} coefficients but saved fit expects {}",
+            draw.len(),
+            fit.beta.len()
+        ));
+    }
+    fit.beta.assign(&draw);
+    let mut offset = 0usize;
+    for block in fit.blocks.iter_mut() {
+        let end = offset + block.beta.len();
+        if end > draw.len() {
+            return Err(format!(
+                "posterior draw is too short for block '{}': needs {end}, has {}",
+                block.role.name(),
+                draw.len()
+            ));
+        }
+        block.beta.assign(&draw.slice(s![offset..end]));
+        offset = end;
+    }
+    if offset != draw.len() {
+        return Err(format!(
+            "posterior draw has {} coefficients but fit blocks consume {offset}",
+            draw.len()
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_baseline_timewiggle_beta(
+    payload: &mut FittedModelPayload,
+    draw: ArrayView1<'_, f64>,
+) -> Result<(), String> {
+    let Some(saved_beta) = payload.beta_baseline_timewiggle.as_mut() else {
+        return Ok(());
+    };
+    let tmp_model = FittedModel::from_payload(payload.clone());
+    let time_cfg = gam::inference::model::load_survival_time_basis_config_from_model(&tmp_model)?;
+    let anchor = payload
+        .survival_time_anchor
+        .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+    let time_row =
+        gam::families::survival_construction::evaluate_survival_time_basis_row(anchor, &time_cfg)?;
+    let start = time_row.len();
+    let end = start + saved_beta.len();
+    if end > draw.len() {
+        return Err(format!(
+            "baseline-timewiggle draw slice [{start}, {end}) exceeds posterior draw length {}",
+            draw.len()
+        ));
+    }
+    saved_beta.clear();
+    saved_beta.extend(draw.slice(s![start..end]).iter().copied());
+    Ok(())
 }
 
 #[cfg(test)]

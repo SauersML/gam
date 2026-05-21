@@ -64,7 +64,13 @@ from ._response_geometry import (
     simplex_frechet_mean,
     sphere_frechet_mean,
 )
-from ._sampling import PosteriorPredictive, PosteriorSamples, SamplingConfig
+from ._sampling import (
+    CumulativeIncidenceDraws,
+    PairedPosteriorSamples,
+    PosteriorPredictive,
+    PosteriorSamples,
+    SamplingConfig,
+)
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -107,6 +113,8 @@ __all__ = [
     "GamError",
     "CompetingRisksCIF",
     "Model",
+    "CumulativeIncidenceDraws",
+    "PairedPosteriorSamples",
     "PosteriorPredictive",
     "PosteriorSamples",
     "PredictionError",

@@ -9,7 +9,7 @@ from typing import Any, Sequence
 from ._binding import rust_module
 from ._diagnostics import Diagnostics
 from ._exceptions import map_exception
-from ._sampling import PosteriorSamples
+from ._sampling import PairedPosteriorSamples, PosteriorSamples
 from ._schema import SchemaCheck
 from ._summary import Summary
 from ._tables import (
@@ -1248,6 +1248,52 @@ class Model:
         # methods like `posterior.predict(new_data)` can fetch a design
         # matrix without the caller passing the model back in.
         return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
+
+    def sample_paired(
+        self,
+        competing: "Model",
+        data: Any,
+        competing_data: Any | None = None,
+        *,
+        samples: int | None = None,
+        warmup: int | None = None,
+        chains: int | None = None,
+        target_accept: float | None = None,
+        seed: int | None = None,
+    ) -> PairedPosteriorSamples:
+        """Draw this fit and a linked competing fit with paired draw indices."""
+        headers, rows, _table_kind = normalize_table(data)
+        competing_headers, competing_rows, _ = normalize_table(
+            data if competing_data is None else competing_data
+        )
+        payload: dict[str, Any] = {}
+        if samples is not None:
+            payload["samples"] = int(samples)
+        if warmup is not None:
+            payload["warmup"] = int(warmup)
+        if chains is not None:
+            payload["chains"] = int(chains)
+        if target_accept is not None:
+            payload["target_accept"] = float(target_accept)
+        if seed is not None:
+            payload["seed"] = int(seed)
+        try:
+            raw = rust_module().paired_sample_table(
+                self._model_bytes,
+                competing._model_bytes,
+                headers,
+                rows,
+                competing_headers,
+                competing_rows,
+                json.dumps(payload),
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return PairedPosteriorSamples.from_ffi_json(
+            raw,
+            target_model_bytes=self._model_bytes,
+            competing_model_bytes=competing._model_bytes,
+        )
 
     def design_matrix(self, data: Any) -> Any:
         """Materialised design matrix for ``data`` against the saved model.
