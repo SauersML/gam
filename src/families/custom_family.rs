@@ -915,12 +915,12 @@ impl BlockWorkingSet {
             }
             Self::ExactNewton { gradient, hessian } => {
                 let p = gradient.len();
-                let h_rows = hessian.nrows();
-                let h_cols = hessian.ncols();
-                if h_rows != p || h_cols != p {
+                if !hessian.is_square() || hessian.nrows() != p {
                     return Err(format!(
                         "BlockWorkingSet::ExactNewton dim mismatch: gradient.len()={p}, \
-                         hessian shape=({h_rows}, {h_cols})"
+                         hessian shape=({}, {})",
+                        hessian.nrows(),
+                        hessian.ncols(),
                     ));
                 }
             }
