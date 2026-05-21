@@ -179,23 +179,6 @@ impl InverseLink {
         }
     }
 
-    pub fn saved_string(&self) -> String {
-        match self {
-            Self::Standard(link) => link.name().to_string(),
-            Self::LatentCLogLog(state) => format!("latent-cloglog(sd={})", state.latent_sd),
-            Self::Sas(_) => "sas".to_string(),
-            Self::BetaLogistic(_) => "beta-logistic".to_string(),
-            Self::Mixture(state) => {
-                let names = state
-                    .components
-                    .iter()
-                    .map(|component| component.name())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("blended({names})")
-            }
-        }
-    }
 }
 
 /// Fixed prior family for smoothing parameters in joint HMC refinement.

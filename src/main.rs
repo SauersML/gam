@@ -3752,12 +3752,13 @@ fn build_survival_time_initial_beta(
     prepared: &PreparedSurvivalTimeStack,
 ) -> Array1<f64> {
     let time_initial_constraints = if likelihood_mode != SurvivalLikelihoodMode::Weibull {
-        Some(gam::pirls::LinearInequalityConstraints {
-            a: prepared.time_design_derivative_exit.to_dense(),
-            b: prepared
+        gam::pirls::LinearInequalityConstraints::new(
+            prepared.time_design_derivative_exit.to_dense(),
+            prepared
                 .derivative_offset_exit
                 .mapv(|offset| exact_derivative_guard - offset),
-        })
+        )
+        .ok()
     } else {
         None
     };
