@@ -1317,7 +1317,9 @@ pub fn formula_rhs_text(formula: &str) -> Result<String, String> {
     Ok(parsed.rhs_terms.join(" + "))
 }
 
-pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, String> {
+pub fn parse_surv_response(
+    lhs: &str,
+) -> Result<Option<(String, String, String)>, FormulaDslError> {
     let trimmed = lhs.trim();
     let call = match parse_function_call(trimmed) {
         Ok(call) => call,
@@ -1392,7 +1394,7 @@ pub fn parse_matching_auxiliary_formula(
     formula: &str,
     response: &str,
     flag_name: &str,
-) -> Result<(String, ParsedFormula), String> {
+) -> Result<(String, ParsedFormula), FormulaDslError> {
     let rhs = formula.trim();
     if top_level_formula_separator(rhs)?.is_some() {
         return Err(FormulaDslError::InvalidArgument {
@@ -1986,7 +1988,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
 pub fn parse_link_choice(
     raw: Option<&str>,
     flexible_flag: bool,
-) -> Result<Option<LinkChoice>, String> {
+) -> Result<Option<LinkChoice>, FormulaDslError> {
     if raw.is_none() && !flexible_flag {
         return Ok(None);
     }
