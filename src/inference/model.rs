@@ -124,6 +124,50 @@ impl From<FittedModelError> for String {
     }
 }
 
+// Boundary conversions so that external `Result<_, EstimationError>` /
+// `Result<_, SurvivalPredictError>` call sites continue to propagate via
+// `?` without per-callsite `.map_err`. The category mapping below mirrors
+// the pre-refactor `String` → `EstimationError::InvalidInput(s)` /
+// `SurvivalPredictError::from(s)` defaults: a typed `FittedModelError`
+// flowing across the boundary is recategorised with the same Display text.
+impl From<FittedModelError> for crate::solver::estimate::EstimationError {
+    fn from(err: FittedModelError) -> Self {
+        crate::solver::estimate::EstimationError::InvalidInput(err.to_string())
+    }
+}
+
+impl From<FittedModelError> for crate::families::survival_predict::SurvivalPredictError {
+    fn from(err: FittedModelError) -> Self {
+        // Route by saved-model category so the boundary preserves the
+        // categorical information the load path already discovered while
+        // keeping the human-readable Display text byte-equivalent.
+        let reason = err.to_string();
+        match err {
+            FittedModelError::SchemaMismatch { .. } => {
+                crate::families::survival_predict::SurvivalPredictError::IncompatibleSchema {
+                    reason,
+                }
+            }
+            FittedModelError::PayloadCorrupt { .. } => {
+                crate::families::survival_predict::SurvivalPredictError::InvalidInput { reason }
+            }
+            FittedModelError::MissingField { .. } => {
+                crate::families::survival_predict::SurvivalPredictError::MissingFitMetadata {
+                    reason,
+                }
+            }
+            FittedModelError::IncompatibleConfig { .. } => {
+                crate::families::survival_predict::SurvivalPredictError::UnsupportedConfiguration {
+                    reason,
+                }
+            }
+            FittedModelError::InvalidInput { .. } => {
+                crate::families::survival_predict::SurvivalPredictError::InvalidInput { reason }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedLatentZNormalization {
     pub mean: f64,
