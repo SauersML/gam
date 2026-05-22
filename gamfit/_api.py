@@ -182,6 +182,10 @@ def cross_fit_shared_precision_groups(
             if not indices:
                 continue
             beta = np.asarray(state.get("beta", []), dtype=float)
+            # EB must use the fixed-lambda conditional Laplace covariance. The
+            # smoothing-parameter-corrected covariance feeds lambda uncertainty
+            # back into the lambda update, inflates the trace term, and biases
+            # lambda downward.
             cov_n = int(state.get("covariance_n", 0))
             cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
             if beta.size != cov_n or cov_flat.size != cov_n * cov_n:
