@@ -2119,6 +2119,16 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
     reml_state: RemlState<'a>,
+    /// Cached design revision counter from the upstream
+    /// `SingleBlockExactJointDesignCache` (or n-block analogue). When the
+    /// caller threads a revision through `evaluate_with_order` /
+    /// `evaluate_efs` / `evaluate_cost_only`, the evaluator can detect ψ-
+    /// invariant repeat calls (cost-only line-search probes, fall-through
+    /// memoization) and short-circuit `reset_surface`'s O(Σ pₖ³) canonical
+    /// rebuild plus the bundle/PIRLS cache wipes. `None` means "no
+    /// revision yet recorded" — every subsequent call is treated as a
+    /// fresh-canonical case and the slow path runs.
+    last_canonical_revision: Option<u64>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -2183,6 +2193,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
             kronecker_factored: opts.kronecker_factored.clone(),
             reml_state,
+            last_canonical_revision: None,
         })
     }
 

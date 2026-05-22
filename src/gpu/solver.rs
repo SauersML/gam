@@ -315,7 +315,7 @@ fn cusolver_runtimes() -> &'static [Mutex<CusolverRuntime>] {
                             Some(Mutex::new(runtime))
                         }
                         Err(err) => {
-                            diagnostics::log_library_unavailable("cuSOLVER", &err);
+                            diagnostics::log_library_unavailable("cuSOLVER", &err.to_string());
                             None
                         }
                     }
