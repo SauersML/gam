@@ -1272,10 +1272,19 @@ impl TransformationNormalFamily {
         // covariate design three times per row-quantity build.
         let gamma = fast_ab(cov.as_ref(), &beta_mat.t().to_owned());
         let n = gamma.nrows();
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let rows: Vec<(f64, f64, f64, f64)> = (0..n)
-            .into_par_iter()
-            .map(|i| {
+        let mut h = Array1::<f64>::zeros(n);
+        let mut h_prime = Array1::<f64>::zeros(n);
+        let mut h_lower = Array1::<f64>::zeros(n);
+        let mut h_upper = Array1::<f64>::zeros(n);
+        // Write directly into the four preallocated arrays in parallel; the
+        // previous path collected a `Vec<(f64,f64,f64,f64)>` then serially
+        // scattered into these arrays, costing 32 bytes per row of transient
+        // allocation and a single-threaded post-pass at biobank scale.
+        ndarray::Zip::indexed(&mut h)
+            .and(&mut h_prime)
+            .and(&mut h_lower)
+            .and(&mut h_upper)
+            .par_for_each(|i, h_i, hp_i, lower_i, upper_i| {
                 let gamma_row = gamma.row(i);
                 let val_row = self.response_val_basis.row(i);
                 let deriv_row = self.response_deriv_basis.row(i);
@@ -1294,19 +1303,11 @@ impl TransformationNormalFamily {
                     lower_acc += self.response_lower_basis[k] * g_sq;
                     upper_acc += self.response_upper_basis[k] * g_sq;
                 }
-                (h_acc, hp_acc, lower_acc, upper_acc)
-            })
-            .collect();
-        let mut h = Array1::<f64>::zeros(n);
-        let mut h_prime = Array1::<f64>::zeros(n);
-        let mut h_lower = Array1::<f64>::zeros(n);
-        let mut h_upper = Array1::<f64>::zeros(n);
-        for (i, (h_i, hp_i, lower_i, upper_i)) in rows.into_iter().enumerate() {
-            h[i] = h_i;
-            h_prime[i] = hp_i;
-            h_lower[i] = lower_i;
-            h_upper[i] = upper_i;
-        }
+                *h_i = h_acc;
+                *hp_i = hp_acc;
+                *lower_i = lower_acc;
+                *upper_i = upper_acc;
+            });
         for (i, &value) in h.iter().enumerate() {
             if !value.is_finite() {
                 return Err(TransformationNormalError::NonFinite { reason: format!(

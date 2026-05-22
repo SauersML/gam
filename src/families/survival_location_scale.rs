@@ -1894,47 +1894,83 @@ impl SurvivalLocationScaleFamily {
         let mut d2_h_h0 = Array1::<f64>::zeros(n);
         let mut d2_h_h1 = Array1::<f64>::zeros(n);
 
-        let row_derivatives = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let state = self.row_predictor_state(
-                    dynamic.h_entry[i],
-                    dynamic.h_exit[i],
-                    dynamic.hdot_exit[i],
-                    dynamic.q_entry[i],
-                    dynamic.q_exit[i],
-                    dynamic.qdot_exit[i],
-                );
-                self.row_derivatives_rescaled(i, state, deriv_log_scale)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // Write each row's 21 derivative scalars directly into the
+        // preallocated output arrays in parallel. The previous path collected
+        // a `Vec<Option<SurvivalRowDerivatives>>` (21 fields per row) and then
+        // serially scattered into 21 `Array1`s — at biobank scale that is the
+        // worst-case transient allocation among the family row builders.
+        // Rows where `row_derivatives_rescaled` returns `Ok(None)` keep their
+        // zero-initialized slots (matching the previous `continue` branch).
+        /// Wrapper to send raw pointers across threads for disjoint per-row
+        /// writes.  SAFETY: each parallel iteration writes a unique index `i`
+        /// into a buffer of length `n`, and the pointers do not outlive the
+        /// surrounding scope.
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut f64);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
 
-        for (i, row) in row_derivatives.into_iter().enumerate() {
-            let Some(row) = row else {
-                continue;
+        let p_d1_q = SendPtr(d1_q.as_mut_ptr());
+        let p_d2_q = SendPtr(d2_q.as_mut_ptr());
+        let p_d3_q = SendPtr(d3_q.as_mut_ptr());
+        let p_d1_q0 = SendPtr(d1_q0.as_mut_ptr());
+        let p_d2_q0 = SendPtr(d2_q0.as_mut_ptr());
+        let p_d3_q0 = SendPtr(d3_q0.as_mut_ptr());
+        let p_d4_q0 = SendPtr(d4_q0.as_mut_ptr());
+        let p_d1_q1 = SendPtr(d1_q1.as_mut_ptr());
+        let p_d2_q1 = SendPtr(d2_q1.as_mut_ptr());
+        let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
+        let p_d4_q1 = SendPtr(d4_q1.as_mut_ptr());
+        let p_d1_qdot1 = SendPtr(d1_qdot1.as_mut_ptr());
+        let p_d2_qdot1 = SendPtr(d2_qdot1.as_mut_ptr());
+        let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
+        let p_h_time_h1 = SendPtr(h_time_h1.as_mut_ptr());
+        let p_h_time_d = SendPtr(h_time_d.as_mut_ptr());
+        let p_d_h_h0 = SendPtr(d_h_h0.as_mut_ptr());
+        let p_d_h_h1 = SendPtr(d_h_h1.as_mut_ptr());
+        let p_d_h_d = SendPtr(d_h_d.as_mut_ptr());
+        let p_d2_h_h0 = SendPtr(d2_h_h0.as_mut_ptr());
+        let p_d2_h_h1 = SendPtr(d2_h_h1.as_mut_ptr());
+
+        (0..n).into_par_iter().try_for_each(|i| -> Result<(), String> {
+            let state = self.row_predictor_state(
+                dynamic.h_entry[i],
+                dynamic.h_exit[i],
+                dynamic.hdot_exit[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
+            );
+            let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
+                return Ok(());
             };
-            d1_q[i] = row.d1_q;
-            d2_q[i] = row.d2_q;
-            d3_q[i] = row.d3_q;
-            d1_q0[i] = row.d1_q0;
-            d2_q0[i] = row.d2_q0;
-            d3_q0[i] = row.d3_q0;
-            d4_q0[i] = row.d4_q0;
-            d1_q1[i] = row.d1_q1;
-            d2_q1[i] = row.d2_q1;
-            d3_q1[i] = row.d3_q1;
-            d4_q1[i] = row.d4_q1;
-            d1_qdot1[i] = row.d1_qdot1;
-            d2_qdot1[i] = row.d2_qdot1;
-            h_time_h0[i] = row.h_time_h0;
-            h_time_h1[i] = row.h_time_h1;
-            h_time_d[i] = row.h_time_d;
-            d_h_h0[i] = row.d_h_h0;
-            d_h_h1[i] = row.d_h_h1;
-            d_h_d[i] = row.d_h_d;
-            d2_h_h0[i] = row.d2_h_h0;
-            d2_h_h1[i] = row.d2_h_h1;
-        }
+            // SAFETY: `i` is unique across the parallel iter; each pointer
+            // targets a distinct preallocated buffer of length `n`.
+            unsafe {
+                *p_d1_q.0.add(i) = row.d1_q;
+                *p_d2_q.0.add(i) = row.d2_q;
+                *p_d3_q.0.add(i) = row.d3_q;
+                *p_d1_q0.0.add(i) = row.d1_q0;
+                *p_d2_q0.0.add(i) = row.d2_q0;
+                *p_d3_q0.0.add(i) = row.d3_q0;
+                *p_d4_q0.0.add(i) = row.d4_q0;
+                *p_d1_q1.0.add(i) = row.d1_q1;
+                *p_d2_q1.0.add(i) = row.d2_q1;
+                *p_d3_q1.0.add(i) = row.d3_q1;
+                *p_d4_q1.0.add(i) = row.d4_q1;
+                *p_d1_qdot1.0.add(i) = row.d1_qdot1;
+                *p_d2_qdot1.0.add(i) = row.d2_qdot1;
+                *p_h_time_h0.0.add(i) = row.h_time_h0;
+                *p_h_time_h1.0.add(i) = row.h_time_h1;
+                *p_h_time_d.0.add(i) = row.h_time_d;
+                *p_d_h_h0.0.add(i) = row.d_h_h0;
+                *p_d_h_h1.0.add(i) = row.d_h_h1;
+                *p_d_h_d.0.add(i) = row.d_h_d;
+                *p_d2_h_h0.0.add(i) = row.d2_h_h0;
+                *p_d2_h_h1.0.add(i) = row.d2_h_h1;
+            }
+            Ok(())
+        })?;
 
         Ok(SurvivalJointQuantities {
             d1_q,
