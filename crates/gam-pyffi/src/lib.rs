@@ -4363,7 +4363,9 @@ fn predict_table_impl(
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let model_class = model.predict_model_class();
-    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
     predict_dataset_impl(&model, model_class, dataset, options_json)
 }
 
@@ -4545,7 +4547,9 @@ fn design_matrix_table_impl(
     rows: Vec<Vec<String>>,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
     design_matrix_dataset_impl(&model, dataset)
 }
 
@@ -4666,7 +4670,9 @@ fn posterior_predict_table_impl(
                 .to_string(),
         );
     }
-    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
     let col_map = dataset.column_map();
     let training_headers = model.training_headers.as_ref();
     let spec = gam::survival_predict::resolve_termspec_for_prediction(
@@ -4720,7 +4726,9 @@ fn sample_table_impl(
     options_json: Option<&str>,
 ) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
-    let dataset = dataset_with_model_schema(&model, headers, rows)?;
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
     let options = parse_sample_options(options_json)?;
     let cfg = resolve_nuts_config(&model, options);
     let col_map = dataset.column_map();
@@ -4746,9 +4754,14 @@ fn paired_sample_table_impl(
 ) -> Result<String, String> {
     let target_model = load_model_impl(target_model_bytes)?;
     let competing_model = load_model_impl(competing_model_bytes)?;
-    let target_dataset = dataset_with_model_schema(&target_model, target_headers, target_rows)?;
+    let target_dataset =
+        dataset_with_model_schema(&target_model, &target_headers, &target_rows)?;
+    drop(target_rows);
+    drop(target_headers);
     let competing_dataset =
-        dataset_with_model_schema(&competing_model, competing_headers, competing_rows)?;
+        dataset_with_model_schema(&competing_model, &competing_headers, &competing_rows)?;
+    drop(competing_rows);
+    drop(competing_headers);
     let options = parse_sample_options(options_json)?;
     let (target_cfg, competing_cfg) =
         resolve_paired_nuts_configs(&target_model, &competing_model, options);
@@ -5604,7 +5617,7 @@ fn dataset_with_inferred_schema(
     let n_rows = rows.len();
     let n_cols = headers.len();
     let t_records = std::time::Instant::now();
-    let records = string_records_from_rows(&headers, rows)?;
+    let records = string_records_from_rows(&headers, &rows)?;
     let records_ms = t_records.elapsed().as_secs_f64() * 1000.0;
     if records_ms > 100.0 {
         log::info!(
@@ -5614,6 +5627,7 @@ fn dataset_with_inferred_schema(
             records_ms
         );
     }
+    drop(rows);
     let t_encode = std::time::Instant::now();
     let result = encode_recordswith_inferred_schema(headers, records)?;
     let encode_ms = t_encode.elapsed().as_secs_f64() * 1000.0;
@@ -5630,21 +5644,30 @@ fn dataset_with_inferred_schema(
 
 fn dataset_with_model_schema(
     model: &FittedModel,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    headers: &[String],
+    rows: &[Vec<String>],
 ) -> Result<EncodedDataset, String> {
-    let check = schema_check(model, &headers, &rows)?;
-    if !check.ok {
-        let messages = check
-            .issues
-            .iter()
-            .map(|issue| issue.message.clone())
-            .collect::<Vec<_>>();
-        return Err(messages.join(" "));
+    // Headers-only validation up-front (mirrors the missing-column path in
+    // schema_check). We deliberately skip the schema_check call here because
+    // schema_check would otherwise do a full encode internally, doubling the
+    // O(N·p) FFI ingest cost. Any encoding errors below surface directly.
+    let expected_names = required_prediction_columns(model)?;
+    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
+    let missing = expected_names
+        .difference(&present_names)
+        .map(|name| format!("missing required column '{name}'"))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(missing.join(" "));
     }
     let schema = model.require_data_schema()?;
-    let records = string_records_from_rows(&headers, rows)?;
-    encode_recordswith_schema(headers, records, schema, UnseenCategoryPolicy::Error)
+    let records = string_records_from_rows(headers, rows)?;
+    encode_recordswith_schema(
+        headers.to_vec(),
+        records,
+        schema,
+        UnseenCategoryPolicy::Error,
+    )
 }
 
 fn dataset_from_xy_arrays(
@@ -5868,7 +5891,7 @@ fn schema_check(
     }
 
     if issues.is_empty() {
-        let records = string_records_from_rows(headers, rows.to_vec())?;
+        let records = string_records_from_rows(headers, rows)?;
         if let Err(message) = encode_recordswith_schema(
             headers.to_vec(),
             records,
@@ -6016,7 +6039,7 @@ fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm
 
 fn string_records_from_rows(
     headers: &[String],
-    rows: Vec<Vec<String>>,
+    rows: &[Vec<String>],
 ) -> Result<Vec<StringRecord>, String> {
     if headers.is_empty() {
         return Err("table must have at least one column".to_string());
@@ -6030,7 +6053,7 @@ fn string_records_from_rows(
             return Err(format!("duplicate column name '{header}'"));
         }
     }
-    rows.into_iter()
+    rows.iter()
         .enumerate()
         .map(|(index, row)| {
             if row.len() != headers.len() {
@@ -6041,7 +6064,7 @@ fn string_records_from_rows(
                     headers.len()
                 ));
             }
-            Ok(StringRecord::from(row))
+            Ok(StringRecord::from(row.clone()))
         })
         .collect()
 }
@@ -7972,8 +7995,10 @@ fn paired_cumulative_incidence_table_impl(
     }
     let options = parse_paired_cif_options(options_json)?;
     let level = options.level.unwrap_or(0.95);
-    let target_dataset = dataset_with_model_schema(&target_model, headers.clone(), rows.clone())?;
-    let competing_dataset = dataset_with_model_schema(&competing_model, headers, rows)?;
+    let target_dataset = dataset_with_model_schema(&target_model, &headers, &rows)?;
+    let competing_dataset = dataset_with_model_schema(&competing_model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
     let eval_times = paired_cif_eval_times(&target_model, &target_dataset, &options.times)?;
     let predict_options = PyPredictOptions {
         interval: None,
