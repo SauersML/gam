@@ -85,8 +85,11 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     // builds — exactly the configuration shipped on cloud T4 images. A real
     // stream side-steps that whole class of failure and matches what the
     // production session path uses.
-    let stream = ctx.new_stream().map_err(|e| format!("new_stream: {e}"))?;
-    let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas_init: {e}"))?;
+    let stream = ctx
+        .new_stream()
+        .map_err(|e| driver_err(format!("new_stream: {e}")))?;
+    let blas = CudaBlas::new(stream.clone())
+        .map_err(|e| driver_err(format!("cublas_init: {e}")))?;
 
     // -- Shape constants ----------------------------------------------------
     // 1024^3 dgemm: 2.147 GFLOP, ~32 MiB working set. Big enough that the

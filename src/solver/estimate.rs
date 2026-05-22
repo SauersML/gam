@@ -2197,8 +2197,54 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         mut hyper_dirs: Vec<DirectionalHyperParam>,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
+        design_revision: Option<u64>,
     ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
         let p = x.ncols();
+        // Design-revision fast path: when the caller asserts that the
+        // realizer-side design (X + s_list) has not changed since the last
+        // `reset_surface`, we skip the canonical-penalty rebuild and the
+        // `reset_surface` work entirely. Hyper-direction conditioning still
+        // runs (hyper_dirs are freshly constructed per call) and the
+        // warm-start beta / penalty-shrinkage floor still need refreshing.
+        let fast_path = match (design_revision, self.last_canonical_revision) {
+            (Some(rev), Some(last)) => rev == last,
+            _ => false,
+        };
+
+        if fast_path {
+            validate_joint_hyper_direction_shapes(x, s_list.len(), theta, rho_dim, &hyper_dirs)?;
+
+            for dir in &mut hyper_dirs {
+                let mut x_tau = dir.x_tau_dense();
+                self.conditioning
+                    .transform_matrix_columnswith_a_inplace(&mut x_tau);
+                dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
+                if let Some(rows) = dir.x_tau_tau_original.as_mut() {
+                    for mat in rows.iter_mut().flatten() {
+                        let mut dense = mat.materialize();
+                        self.conditioning
+                            .transform_matrix_columnswith_a_inplace(&mut dense);
+                        *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
+                    }
+                }
+            }
+
+            let has_design_drift = hyper_dirs
+                .iter()
+                .any(|dir| dir.x_tau_original.any_nonzero());
+            ensure_exact_directional_hyper_supported(
+                self.config.link_function(),
+                self.config.firth_bias_reduction,
+                has_design_drift,
+                context,
+            )?;
+
+            self.reml_state
+                .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
+            self.reml_state.setwarm_start_original_beta(warm_start_beta);
+            return Ok(hyper_dirs);
+        }
+
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
         let (canonical, active_nullspace_dims) =
@@ -2248,6 +2294,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
+        self.last_canonical_revision = design_revision;
         Ok(hyper_dirs)
     }
 
