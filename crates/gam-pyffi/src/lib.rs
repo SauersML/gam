@@ -1515,7 +1515,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         optimize_sas: false,
         compute_inference: true,
         max_iter: 200,
-        tol: 1.0e-7,
+        tol: 1.0e-9,
         nullspace_dims: vec![0; s_list.len()],
         linear_constraints: None,
         firth_bias_reduction: false,
@@ -1669,7 +1669,7 @@ fn invert_spd_with_ridge(
     })
 }
 
-fn solve_spd_vector_with_ridge(
+fn solve_symmetric_vector_with_floor(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
     ridge_rel: f64,
@@ -1686,7 +1686,13 @@ fn solve_spd_vector_with_ridge(
     let projected = vecs.t().dot(rhs);
     let mut scaled = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let denom = eigs[i].max(floor);
+        let denom = if eigs[i].abs() >= floor {
+            eigs[i]
+        } else if eigs[i].is_sign_negative() {
+            -floor
+        } else {
+            floor
+        };
         scaled[i] = projected[i] / denom;
     }
     let out = vecs.dot(&scaled);
@@ -2087,9 +2093,9 @@ fn gaussian_reml_fit_blocks_backward_analytic(
                     - 0.5 * tau_q * b_values[k] * b_values[j];
             }
         }
-        // `outer_h` is the profiled REML score Hessian V_{rho rho}. It may be
-        // negative definite at the optimum; the spectral solve below preserves
-        // the sign of each curvature direction while flooring near-zero modes.
+        // `outer_h` is the Jacobian of the negative profiled REML estimating
+        // equation. Preserve signed curvature directions while flooring
+        // near-zero modes; flipping negative eigenvalues would change the VJP.
         symmetrize_in_place(&mut outer_h);
         if let Some(((row, col), value)) = outer_h
             .indexed_iter()
@@ -2099,7 +2105,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
                 "outer rho curvature entry ({row},{col}) is non-finite: {value}"
             )));
         }
-        let rho_adj = solve_spd_vector_with_ridge(&outer_h, &alpha, 1.0e-10)?;
+        let rho_adj = solve_symmetric_vector_with_floor(&outer_h, &alpha, 1.0e-10)?;
         if let Some((block, value)) = rho_adj
             .iter()
             .enumerate()
@@ -9947,6 +9953,22 @@ mod tests {
     use ndarray::{array, s};
 
     #[test]
+    fn symmetric_curvature_solve_preserves_negative_modes() {
+        let matrix = array![
+            [2.0, 0.0, 0.0],
+            [0.0, -4.0, 0.0],
+            [0.0, 0.0, -1.0e-15]
+        ];
+        let rhs = array![8.0, -8.0, 1.0];
+        let solved = solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
+            .expect("indefinite symmetric curvature solve");
+
+        assert!((solved[0] - 4.0).abs() <= 1.0e-12);
+        assert!((solved[1] - 2.0).abs() <= 1.0e-12);
+        assert!((solved[2] + 250.0).abs() <= 1.0e-9);
+    }
+
+    #[test]
     fn model_version_matches_canonical_payload_version() {
         assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
     }
@@ -9985,94 +10007,6 @@ mod tests {
         RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
-    }
-
-    fn gaussian_reml_fit_blocks_forward_native(
-        designs: &[Array2<f64>],
-        penalties: &[Array2<f64>],
-        y: ArrayView1<'_, f64>,
-        weights: ArrayView1<'_, f64>,
-        init_rhos: &[f64],
-    ) -> Result<
-        (
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            Array1<f64>,
-            f64,
-            Array1<f64>,
-        ),
-        EstimationError,
-    > {
-        let n_rows = designs[0].nrows();
-        let mut col_offsets = vec![0_usize];
-        for design in designs {
-            col_offsets.push(col_offsets.last().copied().unwrap() + design.ncols());
-        }
-        let p_total = *col_offsets.last().unwrap();
-        let mut joint_x = Array2::<f64>::zeros((n_rows, p_total));
-        for (block, design) in designs.iter().enumerate() {
-            joint_x
-                .slice_mut(s![.., col_offsets[block]..col_offsets[block + 1]])
-                .assign(design);
-        }
-
-        let mut s_list = Vec::with_capacity(penalties.len());
-        for (block, penalty) in penalties.iter().enumerate() {
-            s_list.push(gam::smooth::BlockwisePenalty::new(
-                col_offsets[block]..col_offsets[block + 1],
-                penalty.to_owned(),
-            ));
-        }
-
-        let opts = gam::estimate::FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
-            max_iter: 200,
-            tol: 1e-7,
-            nullspace_dims: vec![0; s_list.len()],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
-            penalty_shrinkage_floor: None,
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-        };
-        let heuristic_lambdas: Vec<f64> = init_rhos.iter().map(|rho| rho.exp()).collect();
-        let offset_zero = Array1::<f64>::zeros(n_rows);
-        let y_owned = y.to_owned();
-        let weights_owned = weights.to_owned();
-        let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
-            joint_x.clone(),
-            y_owned.view(),
-            weights_owned.view(),
-            offset_zero.view(),
-            &s_list,
-            Some(heuristic_lambdas.as_slice()),
-            gam::types::LikelihoodFamily::GaussianIdentity,
-            &opts,
-        )?;
-
-        let beta = fit.beta.clone();
-        let fitted = joint_x.dot(&beta);
-        let lambdas = fit.lambdas.clone();
-        let log_lambdas = lambdas.mapv(|value| value.max(1.0e-300).ln());
-        let edf_vec = fit
-            .inference
-            .as_ref()
-            .map(|inf| inf.edf_by_block.clone())
-            .unwrap_or_else(|| vec![0.0; lambdas.len()]);
-        let edf = if edf_vec.len() == lambdas.len() {
-            Array1::from_vec(edf_vec)
-        } else {
-            Array1::zeros(lambdas.len())
-        };
-        Ok((beta, fitted, lambdas, log_lambdas, fit.reml_score, edf))
     }
 
     fn by_gate_fd_design() -> Array2<f64> {
@@ -10349,11 +10283,16 @@ mod tests {
         let fitted = joint_x.dot(&beta);
         let lambdas = fit.lambdas.clone();
         let log_lambdas = lambdas.mapv(|lambda| lambda.max(1.0e-300).ln());
-        let edf = fit
+        let edf_vec = fit
             .inference
             .as_ref()
-            .map(|inference| Array1::from_vec(inference.edf_by_block.clone()))
-            .unwrap_or_else(|| Array1::zeros(lambdas.len()));
+            .map(|inference| inference.edf_by_block.clone())
+            .unwrap_or_else(|| vec![0.0; lambdas.len()]);
+        let edf = if edf_vec.len() == lambdas.len() {
+            Array1::from_vec(edf_vec)
+        } else {
+            Array1::zeros(lambdas.len())
+        };
         Ok((beta, fitted, lambdas, log_lambdas, fit.reml_score, edf))
     }
 
