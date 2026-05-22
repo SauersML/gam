@@ -9327,21 +9327,68 @@ fn compute_outer_hessian(
 
     // Precompute ext solve responses and total Hessian drifts. All ext
     // coordinates use canonical fixed-β stationarity derivatives, so
-    // β_i = -H^-1 g_i and the correction provider is called with +v_i.
-    let mut ext_v: Vec<Array1<f64>> = Vec::with_capacity(ext_dim);
+    // β_i = -K g_i and the correction provider is called with +v_i.
+    //
+    // INVARIANT: gradient and Hessian must use identical mode responses (same kernel K).
+    // Reuse satisfies this automatically; the standalone fallback must replicate it.
+    let ext_v_storage: Option<Vec<Array1<f64>>> = match workspace.and_then(|ws| ws.ext_v_is) {
+        Some(vs) => {
+            if vs.len() != ext_dim {
+                return Err(RemlError::DimensionMismatch {
+                    reason: format!(
+                        "outer Hessian ext mode-response count mismatch: got {}, expected {}",
+                        vs.len(),
+                        ext_dim
+                    ),
+                }
+                .into());
+            }
+            None
+        }
+        None => {
+            let subspace = solution.penalty_subspace_trace.as_deref();
+            if let Some(kernel) = subspace {
+                let constrained = solution
+                    .active_constraints
+                    .as_ref()
+                    .map(|block| kernel.with_active_constraints(block.a.view()));
+                Some(
+                    solution
+                        .ext_coords
+                        .iter()
+                        .map(|coord| match constrained.as_ref() {
+                            Some(ck) if ck.has_active_constraints() => {
+                                ck.apply_pseudo_inverse(&coord.g)
+                            }
+                            _ => kernel.apply_pseudo_inverse(&coord.g),
+                        })
+                        .collect(),
+                )
+            } else {
+                Some(
+                    solution
+                        .ext_coords
+                        .iter()
+                        .map(|coord| hop.solve(&coord.g))
+                        .collect(),
+                )
+            }
+        }
+    };
+    let ext_v: &[Array1<f64>] = match workspace.and_then(|ws| ws.ext_v_is) {
+        Some(vs) => vs,
+        None => ext_v_storage.as_deref().expect("ext_v_storage populated"),
+    };
     let mut ext_h_drifts: Vec<DriftDerivResult> = Vec::with_capacity(ext_dim);
 
-    for coord in solution.ext_coords.iter() {
-        let v_i = hop.solve(&coord.g);
-
+    for (coord, v_i) in solution.ext_coords.iter().zip(ext_v.iter()) {
         let correction = if effective_deriv.has_corrections() {
-            effective_deriv.hessian_derivative_correction_result(&v_i)?
+            effective_deriv.hessian_derivative_correction_result(v_i)?
         } else {
             None
         };
         let h_i = hyper_coord_total_drift_result(&coord.drift, correction.as_ref(), hop.dim());
 
-        ext_v.push(v_i);
         ext_h_drifts.push(h_i);
     }
 
