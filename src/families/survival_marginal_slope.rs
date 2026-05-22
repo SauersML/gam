@@ -3002,18 +3002,24 @@ pub fn survival_marginal_slope_vector_neglog(
     probit_scale: f64,
 ) -> Result<f64, String> {
     if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(format!(
-            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
-        ));
+        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+            reason: format!(
+                "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+            ),
+        }
+        .into());
     }
     let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
     let eta0 = survival_marginal_slope_vector_eta(q0, z, slopes, covariance, probit_scale)?;
     let eta1 = survival_marginal_slope_vector_eta(q1, z, slopes, covariance, probit_scale)?;
     let ad1 = qd1 * c;
     if !(ad1.is_finite() && ad1 > 0.0) {
-        return Err(format!(
-            "survival marginal-slope transformed derivative must be positive, got {ad1}"
-        ));
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "survival marginal-slope transformed derivative must be positive, got {ad1}"
+            ),
+        }
+        .into());
     }
 
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
@@ -3039,11 +3045,14 @@ fn marginal_slope_covariance_matvec(
 ) -> Result<Vec<f64>, String> {
     covariance.validate("survival marginal-slope covariance matvec")?;
     if vector.len() != covariance.dim() {
-        return Err(format!(
-            "survival marginal-slope covariance matvec dimension mismatch: vector={}, covariance={}",
-            vector.len(),
-            covariance.dim()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope covariance matvec dimension mismatch: vector={}, covariance={}",
+                vector.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
     }
     Ok(match covariance {
         MarginalSlopeCovariance::Diagonal(diag) => vector
@@ -3092,12 +3101,15 @@ fn row_primary_closed_form_vector(
 ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
     let k = slopes.len();
     if z.len() != k || covariance.dim() != k {
-        return Err(format!(
-            "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
-            k,
-            z.len(),
-            covariance.dim()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector row dimension mismatch: slopes={}, z={}, covariance={}",
+                k,
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
     }
     let c = survival_marginal_slope_vector_scale(slopes, covariance, probit_scale)?;
     let sigma_g = marginal_slope_covariance_matvec(covariance, slopes)?;
@@ -3140,14 +3152,20 @@ fn row_primary_closed_form_vector(
     let eta1 = q1 * c + linear;
     let ad1 = qd1 * c;
     if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(format!(
-            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
-        ));
+        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+            reason: format!(
+                "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+            ),
+        }
+        .into());
     }
     if !(ad1.is_finite() && ad1 > 0.0) {
-        return Err(format!(
-            "survival marginal-slope transformed derivative must be positive, got {ad1}"
-        ));
+        return Err(SurvivalMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "survival marginal-slope transformed derivative must be positive, got {ad1}"
+            ),
+        }
+        .into());
     }
 
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
@@ -3216,7 +3234,10 @@ fn standardize_latent_z_matrix_with_policy(
     policy: &LatentZPolicy,
 ) -> Result<(Array2<f64>, LatentZNormalization), String> {
     if z.ncols() == 0 {
-        return Err(format!("{context} requires at least one z column"));
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!("{context} requires at least one z column"),
+        }
+        .into());
     }
     let mut out = Array2::<f64>::zeros(z.raw_dim());
     let mut first_norm = LatentZNormalization { mean: 0.0, sd: 1.0 };
@@ -3285,9 +3306,12 @@ fn row_primary_closed_form(
     let ad1 = qd1 * c;
 
     if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(format!(
-            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
-        ));
+        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+            reason: format!(
+                "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+            ),
+        }
+        .into());
     }
 
     // ── NLL terms ──
@@ -3424,9 +3448,12 @@ fn row_primary_closed_form_shared_score(
     probit_scale: f64,
 ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
     if !(covariance_ones.is_finite() && covariance_ones >= 0.0) {
-        return Err(format!(
-            "survival marginal-slope shared-score covariance scale must be finite and non-negative, got {covariance_ones}"
-        ));
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "survival marginal-slope shared-score covariance scale must be finite and non-negative, got {covariance_ones}"
+            ),
+        }
+        .into());
     }
     let effective_scale = probit_scale * covariance_ones.sqrt();
     let (c, c1, c2, ..) = c_derivatives(g, effective_scale);
@@ -3438,9 +3465,12 @@ fn row_primary_closed_form_shared_score(
     let ad1 = qd1 * c;
 
     if survival_derivative_guard_violated(qd1, derivative_guard) {
-        return Err(format!(
-            "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
-        ));
+        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+            reason: format!(
+                "survival marginal-slope monotonicity violated: qd1={qd1:.3e} < guard={derivative_guard:.3e}"
+            ),
+        }
+        .into());
     }
 
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
@@ -3557,10 +3587,13 @@ impl SurvivalMarginalSlopeFamily {
         }
         let coord = local_idx / basis_dim;
         if coord >= self.score_dim() {
-            return Err(format!(
-                "survival score-warp local index {local_idx} exceeds K={} per-z blocks with basis dim {basis_dim}",
-                self.score_dim()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival score-warp local index {local_idx} exceeds K={} per-z blocks with basis dim {basis_dim}",
+                    self.score_dim()
+                ),
+            }
+            .into());
         }
         Ok((coord, local_idx % basis_dim))
     }
@@ -3721,11 +3754,14 @@ impl SurvivalMarginalSlopeFamily {
             let start = row * k;
             return Ok(logslope_eta.slice(s![start..start + k]).to_vec());
         }
-        Err(format!(
-            "survival marginal-slope logslope eta length {} is incompatible with n={} and score dim K={k}",
-            logslope_eta.len(),
-            self.n
-        ))
+        Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope logslope eta length {} is incompatible with n={} and score dim K={k}",
+                logslope_eta.len(),
+                self.n
+            ),
+        }
+        .into())
     }
 
     fn per_z_logslope_active(&self) -> bool {
@@ -3788,11 +3824,14 @@ impl SurvivalMarginalSlopeFamily {
         }
         let logslope_eta_len = block_states[2].eta.len();
         if logslope_eta_len != self.n {
-            return Err(format!(
-                "{context}: survival marginal-slope exact shared-slope calculus for K={k} requires one log-slope eta per row (n={}); got eta len {logslope_eta_len}. Per-z log-slope derivatives require a {}-primary row kernel.",
-                self.n,
-                3 + k
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "{context}: survival marginal-slope exact shared-slope calculus for K={k} requires one log-slope eta per row (n={}); got eta len {logslope_eta_len}. Per-z log-slope derivatives require a {}-primary row kernel.",
+                    self.n,
+                    3 + k
+                ),
+            }
+            .into());
         }
         Ok((
             self.z.row(row).sum(),
@@ -3825,12 +3864,15 @@ impl SurvivalMarginalSlopeFamily {
             );
         }
         if logslope_eta.len() != self.n {
-            return Err(format!(
-                "survival marginal-slope exact rigid row calculus for K={k} requires one shared log-slope surface (eta len n={}); got eta len {}. Per-z log-slope derivatives require a {}-primary row kernel.",
-                self.n,
-                logslope_eta.len(),
-                3 + k
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope exact rigid row calculus for K={k} requires one shared log-slope surface (eta len n={}); got eta len {}. Per-z log-slope derivatives require a {}-primary row kernel.",
+                    self.n,
+                    logslope_eta.len(),
+                    3 + k
+                ),
+            }
+            .into());
         }
         let (z_sum, covariance_ones) =
             self.exact_shared_score_summary(row, block_states, "row_primary_closed_form_rigid")?;
@@ -3852,10 +3894,13 @@ impl SurvivalMarginalSlopeFamily {
         if self.score_dim() == 1 {
             return Ok(());
         }
-        Err(format!(
-            "{context}: survival marginal-slope exact flexible row calculus is scalar-z only; K={} must use the rigid shared-slope vector kernel or a widened per-z primary kernel",
-            self.score_dim()
-        ))
+        Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: survival marginal-slope exact flexible row calculus is scalar-z only; K={} must use the rigid shared-slope vector kernel or a widened per-z primary kernel",
+                self.score_dim()
+            ),
+        }
+        .into())
     }
 
     fn row_neglog_rigid_vector_value(
@@ -4048,15 +4093,21 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
-            return Err(format!(
-                "survival marginal-slope sigma row directional expects 0..=4 directions, got {k}"
-            ));
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "survival marginal-slope sigma row directional expects 0..=4 directions, got {k}"
+                ),
+            }
+            .into());
         }
         if scale_jet.coeffs.len() != (1usize << k) {
-            return Err(format!(
-                "survival marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
-                scale_jet.coeffs.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
+                    scale_jet.coeffs.len()
+                ),
+            }
+            .into());
         }
         let wi = self.weights[row];
         let di = self.event[row];
@@ -4108,9 +4159,12 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_val = qd1_jet.coeff(0);
         let ad1_val = ad1_jet.coeff(0);
         if survival_derivative_guard_violated(qd1_val, qd1_lower) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+                ),
+            }
+            .into());
         }
         let time_deriv_term = if di > 0.0 {
             ad1_jet
@@ -4528,13 +4582,16 @@ impl SurvivalMarginalSlopeFamily {
             || basis_d1.ncols() != beta_w.len()
             || basis_d2.ncols() != beta_w.len()
         {
-            return Err(format!(
-                "survival marginal-slope timewiggle basis/beta mismatch: B..B''={},{},{} betaw={}",
-                basis.ncols(),
-                basis_d1.ncols(),
-                basis_d2.ncols(),
-                beta_w.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope timewiggle basis/beta mismatch: B..B''={},{},{} betaw={}",
+                    basis.ncols(),
+                    basis_d1.ncols(),
+                    basis_d2.ncols(),
+                    beta_w.len()
+                ),
+            }
+            .into());
         }
         let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
         let d2q_dq02 = fast_av(&basis_d2, &beta_w);
@@ -4568,13 +4625,16 @@ impl SurvivalMarginalSlopeFamily {
             || basis_d4.ncols() != beta_w.len()
             || basis_d5.ncols() != beta_w.len()
         {
-            return Err(format!(
-                "survival marginal-slope timewiggle high-order basis/beta mismatch: B'''..B'''''={},{},{} betaw={}",
-                basis_d3.ncols(),
-                basis_d4.ncols(),
-                basis_d5.ncols(),
-                beta_w.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope timewiggle high-order basis/beta mismatch: B'''..B'''''={},{},{} betaw={}",
+                    basis_d3.ncols(),
+                    basis_d4.ncols(),
+                    basis_d5.ncols(),
+                    beta_w.len()
+                ),
+            }
+            .into());
         }
         let d3q_dq03 = fast_av(&basis_d3, &beta_w);
         let d4q_dq04 = fast_av(&basis_d4, &beta_w);
@@ -6876,9 +6936,12 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_val = qd1_jet.coeff(0);
         let ad1_val = ad1_jet.coeff(0);
         if survival_derivative_guard_violated(qd1_val, qd1_lower) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+                ),
+            }
+            .into());
         }
         let time_deriv_term = if di > 0.0 {
             ad1_jet

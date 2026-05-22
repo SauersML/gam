@@ -63,6 +63,65 @@ use std::sync::Arc;
 const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
 const SURVIVAL_ROW_PARALLEL_CHUNK: usize = 64;
 
+/// Typed errors emitted by the survival location-scale family pipeline.
+///
+/// Each variant carries a pre-formatted `reason` string so `Display` is
+/// byte-equivalent to the original `format!(...)` outputs the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind without dragging the string apart.
+#[derive(Debug, Clone)]
+pub enum SurvivalLocationScaleError {
+    /// Row/column/length disagreement between vectors, matrices, designs,
+    /// penalty blocks, or coefficient/parameter dimensions.
+    DimensionMismatch { reason: String },
+    /// Spec-level validation: tolerances, iteration caps, knot-vector
+    /// lengths, time intervals, weight values, or missing/contradictory
+    /// configuration fields the user supplied.
+    InvalidConfiguration { reason: String },
+    /// Structural constraint violated at runtime: monotonicity guards,
+    /// lower bounds on coefficients, nonnegativity, derivative-basis
+    /// sign, or values outside an allowed semantic range.
+    ConstraintViolation { reason: String },
+    /// A numerical step produced a non-finite or out-of-domain value
+    /// downstream code cannot consume (NaN products, invalid pdf,
+    /// survival probability out of (0,1], etc.).
+    NumericalFailure { reason: String },
+    /// Internal invariant about pipeline state (empty block markers,
+    /// unexpected ranks, schema/state inconsistencies surfaced from
+    /// inner helpers).
+    InternalInvariant { reason: String },
+}
+
+impl std::fmt::Display for SurvivalLocationScaleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SurvivalLocationScaleError::DimensionMismatch { reason }
+            | SurvivalLocationScaleError::InvalidConfiguration { reason }
+            | SurvivalLocationScaleError::ConstraintViolation { reason }
+            | SurvivalLocationScaleError::NumericalFailure { reason }
+            | SurvivalLocationScaleError::InternalInvariant { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SurvivalLocationScaleError {}
+
+impl From<SurvivalLocationScaleError> for String {
+    fn from(err: SurvivalLocationScaleError) -> String {
+        err.to_string()
+    }
+}
+
+impl From<String> for SurvivalLocationScaleError {
+    /// Inbound conversion from the many `Result<_, String>` helpers this
+    /// module still calls into. The text is preserved verbatim; we only
+    /// pick a generic category so external messages flow through `?`
+    /// without per-callsite `.map_err`.
+    fn from(reason: String) -> SurvivalLocationScaleError {
+        SurvivalLocationScaleError::InternalInvariant { reason }
+    }
+}
+
 #[inline]
 fn softplus(x: f64) -> f64 {
     if x.is_nan() {
