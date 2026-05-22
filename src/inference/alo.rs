@@ -768,13 +768,15 @@ pub fn compute_alo_diagnostics_from_unified(
     link: LinkFunction,
     phi: f64,
 ) -> Result<AloDiagnostics, EstimationError> {
-    let geom = unified.geometry.as_ref().ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "UnifiedFitResult does not contain working-set geometry; \
+    let geom = unified
+        .geometry
+        .as_ref()
+        .ok_or_else(|| AloError::InvalidInput {
+            reason: "UnifiedFitResult does not contain working-set geometry; \
              ALO diagnostics require geometry at convergence"
                 .to_string(),
-        )
-    })?;
+        })
+        .map_err(EstimationError::from)?;
     let input = AloInput::from_geometry(geom, design, eta, offset, link, phi);
     compute_alo_from_input(&input)
 }
@@ -878,6 +880,12 @@ pub struct MultiBlockAloInput<'a> {
 pub fn compute_multiblock_alo(
     input: &MultiBlockAloInput,
 ) -> Result<MultiBlockAloDiagnostics, EstimationError> {
+    compute_multiblock_alo_inner(input).map_err(EstimationError::from)
+}
+
+fn compute_multiblock_alo_inner(
+    input: &MultiBlockAloInput,
+) -> Result<MultiBlockAloDiagnostics, AloError> {
     use rayon::prelude::*;
 
     let n = input.n_obs;
@@ -886,20 +894,24 @@ pub fn compute_multiblock_alo(
 
     // --- Validate dimensions ---
     if input.block_designs.len() != b {
-        return Err(EstimationError::InvalidInput(format!(
-            "MultiBlockAloInput: expected {} block designs, got {}",
-            b,
-            input.block_designs.len()
-        )));
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "MultiBlockAloInput: expected {} block designs, got {}",
+                b,
+                input.block_designs.len()
+            ),
+        });
     }
 
     // Verify total column count matches p_tot.
     let col_sum: usize = input.block_designs.iter().map(|d| d.ncols()).sum();
     if col_sum != p_tot {
-        return Err(EstimationError::InvalidInput(format!(
-            "MultiBlockAloInput: total design columns ({}) != penalized_hessian_inv size ({})",
-            col_sum, p_tot
-        )));
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "MultiBlockAloInput: total design columns ({}) != penalized_hessian_inv size ({})",
+                col_sum, p_tot
+            ),
+        });
     }
 
     let col_offsets = multiblock_col_offsets(input.block_designs);
@@ -911,10 +923,10 @@ pub fn compute_multiblock_alo(
     // allocations.  The much larger Q panels are bounded by the parallel chunk
     // size and by wave-level concurrency, so at most roughly one global memory
     // budget worth of p_total × chunk_len panels can be live across workers.
-    let mut chunk_results: Vec<Result<MultiBlockAloChunkDiagnostics, EstimationError>> =
+    let mut chunk_results: Vec<Result<MultiBlockAloChunkDiagnostics, AloError>> =
         Vec::with_capacity(chunk_starts.len());
     for chunk_wave in chunk_starts.chunks(max_concurrent_chunks) {
-        let mut wave_results: Vec<Result<MultiBlockAloChunkDiagnostics, EstimationError>> =
+        let mut wave_results: Vec<Result<MultiBlockAloChunkDiagnostics, AloError>> =
             chunk_wave
                 .par_iter()
                 .map_init(
@@ -1032,7 +1044,7 @@ fn compute_multiblock_alo_chunk(
     chunk_start: usize,
     chunk_end: usize,
     scratch: &mut MultiBlockAloScratch,
-) -> Result<MultiBlockAloChunkDiagnostics, EstimationError> {
+) -> Result<MultiBlockAloChunkDiagnostics, AloError> {
     let b = input.n_blocks;
     let chunk_len = chunk_end - chunk_start;
 

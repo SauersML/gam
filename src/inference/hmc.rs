@@ -880,9 +880,10 @@ fn joint_family_logp_and_grad(
         LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
         LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
         LikelihoodFamily::GammaLog => Ok(gamma_log_logp_and_grad(data, eta)),
-        LikelihoodFamily::RoystonParmar => {
-            Err("Joint HMC fallback is not implemented for RoystonParmar".to_string())
+        LikelihoodFamily::RoystonParmar => Err(HmcError::UnsupportedFamily {
+            reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
         }
+        .into()),
     }
 }
 
@@ -2783,17 +2784,23 @@ pub fn run_logit_polya_gamma_gibbs(
     let n = x.nrows();
     let p = x.ncols();
     if y.len() != n || weights.len() != n {
-        return Err("run_logit_polya_gamma_gibbs: input length mismatch".to_string());
+        return Err(HmcError::DimensionMismatch {
+            reason: "run_logit_polya_gamma_gibbs: input length mismatch".to_string(),
+        }
+        .into());
     }
     if mode.len() != p || penalty_matrix.nrows() != p || penalty_matrix.ncols() != p {
-        return Err(
-            "run_logit_polya_gamma_gibbs: coefficient/penalty dimension mismatch".to_string(),
-        );
+        return Err(HmcError::DimensionMismatch {
+            reason: "run_logit_polya_gamma_gibbs: coefficient/penalty dimension mismatch"
+                .to_string(),
+        }
+        .into());
     }
     if !weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
-        return Err(
-            "run_logit_polya_gamma_gibbs requires unit weights (PG(1,·)); use NUTS for non-unit weights".to_string(),
-        );
+        return Err(HmcError::InvalidConfig {
+            reason: "run_logit_polya_gamma_gibbs requires unit weights (PG(1,·)); use NUTS for non-unit weights".to_string(),
+        }
+        .into());
     }
 
     let n_iter = config.nwarmup + config.n_samples;
@@ -2937,21 +2944,30 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let n = x.nrows();
     let p = x.ncols();
     if y.len() != n || weights.len() != n {
-        return Err("estimate_logit_pg_rao_blackwell_terms: input length mismatch".to_string());
+        return Err(HmcError::DimensionMismatch {
+            reason: "estimate_logit_pg_rao_blackwell_terms: input length mismatch".to_string(),
+        }
+        .into());
     }
     if mode.len() != p || penalty_matrix.nrows() != p || penalty_matrix.ncols() != p {
-        return Err(
-            "estimate_logit_pg_rao_blackwell_terms: coefficient/penalty dimension mismatch"
+        return Err(HmcError::DimensionMismatch {
+            reason: "estimate_logit_pg_rao_blackwell_terms: coefficient/penalty dimension mismatch"
                 .to_string(),
-        );
+        }
+        .into());
     }
     if !weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
-        return Err(
-            "estimate_logit_pg_rao_blackwell_terms requires unit weights (PG(1,·))".to_string(),
-        );
+        return Err(HmcError::InvalidConfig {
+            reason: "estimate_logit_pg_rao_blackwell_terms requires unit weights (PG(1,·))"
+                .to_string(),
+        }
+        .into());
     }
     if penalty_roots.iter().any(|r| r.ncols() != p) {
-        return Err("estimate_logit_pg_rao_blackwell_terms: root width mismatch".to_string());
+        return Err(HmcError::DimensionMismatch {
+            reason: "estimate_logit_pg_rao_blackwell_terms: root width mismatch".to_string(),
+        }
+        .into());
     }
     // Precompute transposed root blocks once:
     //   R_k^T is the RHS used for batched solves Q X = R_k^T.
@@ -3055,11 +3071,17 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     }
 
     if kept == 0 {
-        return Err("estimate_logit_pg_rao_blackwell_terms: no retained samples".to_string());
+        return Err(HmcError::SamplingFailed {
+            reason: "estimate_logit_pg_rao_blackwell_terms: no retained samples".to_string(),
+        }
+        .into());
     }
     let out = rb_sum.mapv(|v| v / (kept as f64));
     if !out.iter().all(|v| v.is_finite()) {
-        return Err("estimate_logit_pg_rao_blackwell_terms: non-finite expectation".to_string());
+        return Err(HmcError::NonFiniteState {
+            reason: "estimate_logit_pg_rao_blackwell_terms: non-finite expectation".to_string(),
+        }
+        .into());
     }
     Ok(out)
 }
@@ -3258,11 +3280,14 @@ pub fn run_nuts_sampling_flattened_family(
 ) -> Result<NutsResult, String> {
     if let FamilyNutsInputs::Glm(glm) = &inputs {
         if glm.firth_bias_reduction && !family.supports_firth() {
-            return Err(format!(
-                "NUTS with Firth is only supported for {}; {} does not support it",
-                LikelihoodFamily::BinomialLogit.pretty_name(),
-                family.pretty_name()
-            ));
+            return Err(HmcError::FirthUnsupported {
+                reason: format!(
+                    "NUTS with Firth is only supported for {}; {} does not support it",
+                    LikelihoodFamily::BinomialLogit.pretty_name(),
+                    family.pretty_name()
+                ),
+            }
+            .into());
         }
     }
 
@@ -3497,13 +3522,16 @@ impl LinkWigglePosterior {
         let p_link = mode_theta.len();
         let dim = p_base + p_link;
         if hessian.nrows() != dim || hessian.ncols() != dim {
-            return Err(format!(
-                "LinkWigglePosterior: Hessian dim mismatch: {}x{} vs expected {}x{}",
-                hessian.nrows(),
-                hessian.ncols(),
-                dim,
-                dim,
-            ));
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "LinkWigglePosterior: Hessian dim mismatch: {}x{} vs expected {}x{}",
+                    hessian.nrows(),
+                    hessian.ncols(),
+                    dim,
+                    dim,
+                ),
+            }
+            .into());
         }
         let hessian_owned = hessian.to_owned();
         let chol_factor = hessian_owned
@@ -4266,73 +4294,99 @@ impl JointBetaRhoPosterior {
         let n_rho = penalty_canonical.len();
 
         if rho_mode.len() != n_rho {
-            return Err(format!(
-                "rho_mode length {} != penalty count {}",
-                rho_mode.len(),
-                n_rho
-            ));
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "rho_mode length {} != penalty count {}",
+                    rho_mode.len(),
+                    n_rho
+                ),
+            }
+            .into());
         }
 
         match likelihood_family {
             LikelihoodFamily::BinomialLogit => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
-                    return Err("Joint HMC BinomialLogit requires a logit inverse link".to_string());
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialLogit requires a logit inverse link".to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialProbit => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Probit)) {
-                    return Err(
-                        "Joint HMC BinomialProbit requires a probit inverse link".to_string()
-                    );
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialProbit requires a probit inverse link"
+                            .to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialCLogLog => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
-                    return Err(
-                        "Joint HMC BinomialCLogLog requires a cloglog inverse link".to_string()
-                    );
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialCLogLog requires a cloglog inverse link"
+                            .to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialLatentCLogLog => {
                 if !matches!(&inverse_link, InverseLink::LatentCLogLog(_)) {
-                    return Err(
-                        "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
                             .to_string(),
-                    );
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialSas => {
                 if !matches!(&inverse_link, InverseLink::Sas(_)) {
-                    return Err("Joint HMC BinomialSas requires SAS link state".to_string());
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialSas requires SAS link state".to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialBetaLogistic => {
                 if !matches!(&inverse_link, InverseLink::BetaLogistic(_)) {
-                    return Err(
-                        "Joint HMC BinomialBetaLogistic requires Beta-Logistic link state"
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialBetaLogistic requires Beta-Logistic link state"
                             .to_string(),
-                    );
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::BinomialMixture => {
                 if !matches!(&inverse_link, InverseLink::Mixture(_)) {
-                    return Err("Joint HMC BinomialMixture requires mixture link state".to_string());
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BinomialMixture requires mixture link state".to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::GaussianIdentity => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Identity)) {
-                    return Err(
-                        "Joint HMC GaussianIdentity requires an identity inverse link".to_string(),
-                    );
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC GaussianIdentity requires an identity inverse link"
+                            .to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
-                    return Err("Joint HMC log-link family requires a log inverse link".to_string());
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC log-link family requires a log inverse link".to_string(),
+                    }
+                    .into());
                 }
             }
             LikelihoodFamily::RoystonParmar => {
-                return Err("Joint HMC fallback is not implemented for RoystonParmar".to_string());
+                return Err(HmcError::UnsupportedFamily {
+                    reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
+                }
+                .into());
             }
         }
 
