@@ -5590,7 +5590,8 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         }
         FitRequest::SurvivalTransformation(request) => {
             let cause_count =
-                gam::survival::cause_count_from_event_codes(request.spec.event_target.view());
+                gam::survival::cause_count_from_event_codes(request.spec.event_target.view())
+                    .map_err(|err| py_value_error(err.to_string()))?;
             if cause_count > 1 {
                 ("Cause-specific survival", "competing risks survival", true)
             } else {
