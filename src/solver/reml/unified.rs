@@ -5550,6 +5550,11 @@ pub struct InnerSolution<'dp> {
     /// `None` is the legacy/unconstrained path (no active inequality
     /// constraints to project against).
     pub active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+
+    /// Monotone lower bound on stochastic Hutchinson probe count within this
+    /// fit. Shared by stochastic trace batches so CRN probe prefixes stay fixed
+    /// as the adaptive estimator tightens over the outer run.
+    pub monotone_probe_floor: Arc<Mutex<usize>>,
 }
 
 /// Active row block of the joint linear inequality constraint matrix at the
@@ -5768,6 +5773,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             barrier_config: self.barrier_config,
             kkt_residual: self.kkt_residual,
             active_constraints: self.active_constraints,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -7018,22 +7024,28 @@ pub fn reml_laml_evaluate(
         let implicit_ops: Vec<&ImplicitHyperOperator> =
             operators.iter().filter_map(|op| op.as_implicit()).collect();
         let raw_traces = if generic_ops.is_empty() {
-            stochastic_trace_hinv_products(hop, StochasticTraceTargets::Dense(&dense_refs))
+            stochastic_trace_hinv_products_with_floor(
+                hop,
+                StochasticTraceTargets::Dense(&dense_refs),
+                Some(Arc::clone(&solution.monotone_probe_floor)),
+            )
         } else if generic_ops.len() == implicit_ops.len() {
-            stochastic_trace_hinv_products(
+            stochastic_trace_hinv_products_with_floor(
                 hop,
                 StochasticTraceTargets::Structural {
                     dense_matrices: &dense_refs,
                     implicit_ops: &implicit_ops,
                 },
+                Some(Arc::clone(&solution.monotone_probe_floor)),
             )
         } else {
-            stochastic_trace_hinv_products(
+            stochastic_trace_hinv_products_with_floor(
                 hop,
                 StochasticTraceTargets::Mixed {
                     dense_matrices: &dense_refs,
                     operators: &generic_ops,
                 },
+                Some(Arc::clone(&solution.monotone_probe_floor)),
             )
         };
 
@@ -8283,6 +8295,7 @@ fn compute_base_h2_traces(
     hop: &dyn HessianOperator,
     pairs: &[&HyperCoordPair],
     subspace: Option<&PenaltySubspaceTrace>,
+    monotone_probe_floor: Option<Arc<Mutex<usize>>>,
 ) -> Vec<f64> {
     if pairs.is_empty() {
         return Vec::new();
@@ -8357,7 +8370,13 @@ fn compute_base_h2_traces(
             }
         }
         if !dense_refs.is_empty() || !op_refs.is_empty() {
-            let estimator = StochasticTraceEstimator::with_defaults();
+            let estimator = match monotone_probe_floor {
+                Some(floor) => StochasticTraceEstimator::with_shared_probe_floor(
+                    StochasticTraceConfig::default(),
+                    floor,
+                ),
+                None => StochasticTraceEstimator::with_defaults(),
+            };
             let values = estimator.estimate_traces_with_operators(hop, &dense_refs, &op_refs);
             for (local, &slot) in dense_slots.iter().enumerate() {
                 out[slot] = values[local];
@@ -8917,12 +8936,13 @@ fn compute_outer_hessian(
             .filter_map(|op| op.as_implicit())
             .collect();
 
-        Some(stochastic_trace_hinv_crosses(
+        Some(stochastic_trace_hinv_crosses_with_floor(
             hop,
             &dense_mats,
             &coord_has_operator,
             &generic_ops,
             &impl_ops,
+            Some(Arc::clone(&solution.monotone_probe_floor)),
         ))
     } else {
         None
@@ -10347,7 +10367,12 @@ fn build_outer_hessian_operator(
         // of one estimator per pair.  Projected subspace traces skip the
         // stochastic shortcut inside `compute_base_h2_traces`.
         let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
-        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, subspace);
+        let bases = compute_base_h2_traces(
+            hop.as_ref(),
+            &pair_refs,
+            subspace,
+            Some(Arc::clone(&solution.monotone_probe_floor)),
+        );
         for ((rho_idx, ext_idx, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = rho_idx;
             let col = k + ext_idx;
@@ -10375,7 +10400,12 @@ fn build_outer_hessian_operator(
             })
             .collect();
         let pair_refs: Vec<&HyperCoordPair> = entries.iter().map(|(_, _, pair)| pair).collect();
-        let bases = compute_base_h2_traces(hop.as_ref(), &pair_refs, subspace);
+        let bases = compute_base_h2_traces(
+            hop.as_ref(),
+            &pair_refs,
+            subspace,
+            Some(Arc::clone(&solution.monotone_probe_floor)),
+        );
         for ((ii, jj, pair), base) in entries.into_iter().zip(bases.into_iter()) {
             let row = k + ii;
             let col = k + jj;
@@ -10539,7 +10569,11 @@ fn build_outer_hessian_operator(
                 .collect();
             let op_refs: Vec<&dyn HyperOperator> =
                 bundled.iter().map(|op| op as &dyn HyperOperator).collect();
-            let estimator = StochasticTraceEstimator::for_outer_hessian(hop.dim(), total);
+            let estimator = StochasticTraceEstimator::for_outer_hessian_with_probe_floor(
+                hop.dim(),
+                total,
+                Arc::clone(&solution.monotone_probe_floor),
+            );
             let no_dense: [&Array2<f64>; 0] = [];
             let mut ct = estimator.estimate_second_order_traces_with_operators(
                 hop.as_ref(),
@@ -14407,6 +14441,7 @@ impl StochasticTraceConfig {
 /// Set δ_PCG small enough that this is below the Monte Carlo tolerance.
 pub struct StochasticTraceEstimator {
     config: StochasticTraceConfig,
+    monotone_probe_floor: Arc<Mutex<usize>>,
 }
 
 enum StochasticTraceTargets<'a> {
@@ -14440,7 +14475,21 @@ impl StochasticTraceTargets<'_> {
 impl StochasticTraceEstimator {
     /// Create a new estimator with the given configuration.
     pub fn new(config: StochasticTraceConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Create a new estimator sharing a fit-level monotone probe floor.
+    fn with_shared_probe_floor(
+        config: StochasticTraceConfig,
+        monotone_probe_floor: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self {
+            config,
+            monotone_probe_floor,
+        }
     }
 
     /// Create with default configuration.
@@ -14450,6 +14499,40 @@ impl StochasticTraceEstimator {
 
     fn for_outer_hessian(dim: usize, n_coords: usize) -> Self {
         Self::new(StochasticTraceConfig::outer_hessian(dim, n_coords))
+    }
+
+    fn for_outer_hessian_with_probe_floor(
+        dim: usize,
+        n_coords: usize,
+        monotone_probe_floor: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self::with_shared_probe_floor(
+            StochasticTraceConfig::outer_hessian(dim, n_coords),
+            monotone_probe_floor,
+        )
+    }
+
+    fn effective_probe_min(&self) -> usize {
+        let floor = match self.monotone_probe_floor.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        self.config
+            .n_probes_min
+            .max(floor)
+            .min(self.config.n_probes_max)
+    }
+
+    fn raise_probe_floor(&self, k_drawn: usize) {
+        let mut floor = match self.monotone_probe_floor.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if k_drawn > *floor {
+            let old = *floor;
+            *floor = k_drawn;
+            log::info!("[CRN-PIN] probe_floor raised {old}->{k_drawn} (k_drawn={k_drawn})");
+        }
     }
 
     fn estimate_from_probe_batch<F>(
@@ -14475,8 +14558,10 @@ impl StochasticTraceEstimator {
         let mut probe_values = vec![0.0_f64; n_coords];
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
         let check_interval = 4;
+        let effective_n_probes_min = self.effective_probe_min();
 
         let mut z = Array1::<f64>::zeros(p);
+        let mut n_drawn = 0usize;
         for m in 0..self.config.n_probes_max {
             rademacher_probe_into(z.view_mut(), &mut rng_state);
             let w = hop.stochastic_trace_solve(&z, self.config.solve_rel_tol);
@@ -14492,13 +14577,15 @@ impl StochasticTraceEstimator {
             }
 
             let n_done = m + 1;
-            if n_done >= self.config.n_probes_min && n_done % check_interval == 0 {
+            n_drawn = n_done;
+            if n_done >= effective_n_probes_min && n_done % check_interval == 0 {
                 if self.check_convergence(n_done, &means, &m2s) {
                     break;
                 }
             }
         }
 
+        self.raise_probe_floor(n_drawn);
         means
     }
 
@@ -14524,7 +14611,9 @@ impl StochasticTraceEstimator {
         let mut probe_values = Array2::<f64>::zeros((n_coords, n_coords));
         let mut rng_state = Xoshiro256SS::from_seed(self.config.seed);
         let check_interval = 4;
+        let effective_n_probes_min = self.effective_probe_min();
         let mut z = Array1::<f64>::zeros(p);
+        let mut n_drawn = 0usize;
 
         for m in 0..self.config.n_probes_max {
             rademacher_probe_into(z.view_mut(), &mut rng_state);
@@ -14543,7 +14632,8 @@ impl StochasticTraceEstimator {
             }
 
             let n_done = m + 1;
-            if n_done >= self.config.n_probes_min
+            n_drawn = n_done;
+            if n_done >= effective_n_probes_min
                 && n_done % check_interval == 0
                 && self.check_matrix_convergence(n_done, &means, &m2s)
             {
@@ -14551,6 +14641,7 @@ impl StochasticTraceEstimator {
             }
         }
 
+        self.raise_probe_floor(n_drawn);
         for d in 0..n_coords {
             for e in (d + 1)..n_coords {
                 let avg = 0.5 * (means[[d, e]] + means[[e, d]]);
@@ -15177,11 +15268,17 @@ impl StochasticTraceEstimator {
     }
 }
 
-fn stochastic_trace_hinv_products(
+fn stochastic_trace_hinv_products_with_floor(
     hop: &dyn HessianOperator,
     targets: StochasticTraceTargets<'_>,
+    monotone_probe_floor: Option<Arc<Mutex<usize>>>,
 ) -> Vec<f64> {
-    let estimator = StochasticTraceEstimator::with_defaults();
+    let estimator = match monotone_probe_floor {
+        Some(floor) => {
+            StochasticTraceEstimator::with_shared_probe_floor(StochasticTraceConfig::default(), floor)
+        }
+        None => StochasticTraceEstimator::with_defaults(),
+    };
     match targets {
         StochasticTraceTargets::Dense(matrices) if matrices.len() == 1 => {
             vec![estimator.estimate_single_trace(hop, matrices[0])]
@@ -15205,8 +15302,32 @@ fn stochastic_trace_hinv_crosses<'a>(
     generic_ops: &[&'a dyn HyperOperator],
     implicit_ops: &[&'a ImplicitHyperOperator],
 ) -> Array2<f64> {
-    let estimator =
-        StochasticTraceEstimator::for_outer_hessian(hop.dim(), coord_has_operator.len());
+    stochastic_trace_hinv_crosses_with_floor(
+        hop,
+        dense_matrices,
+        coord_has_operator,
+        generic_ops,
+        implicit_ops,
+        None,
+    )
+}
+
+fn stochastic_trace_hinv_crosses_with_floor<'a>(
+    hop: &dyn HessianOperator,
+    dense_matrices: &'a [Array2<f64>],
+    coord_has_operator: &[bool],
+    generic_ops: &[&'a dyn HyperOperator],
+    implicit_ops: &[&'a ImplicitHyperOperator],
+    monotone_probe_floor: Option<Arc<Mutex<usize>>>,
+) -> Array2<f64> {
+    let estimator = match monotone_probe_floor {
+        Some(floor) => StochasticTraceEstimator::for_outer_hessian_with_probe_floor(
+            hop.dim(),
+            coord_has_operator.len(),
+            floor,
+        ),
+        None => StochasticTraceEstimator::for_outer_hessian(hop.dim(), coord_has_operator.len()),
+    };
     let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
     let raw_cross = if generic_ops.len() == implicit_ops.len() {
         estimator.estimate_second_order_traces(hop, &dense_refs, implicit_ops)
@@ -17355,7 +17476,7 @@ mod tests {
         ];
         let pair_refs: Vec<&HyperCoordPair> = pairs.iter().collect();
 
-        let batched = compute_base_h2_traces(&hop, &pair_refs, Some(&kernel));
+        let batched = compute_base_h2_traces(&hop, &pair_refs, Some(&kernel), None);
         let scalar: Vec<f64> = pair_refs
             .iter()
             .map(|pair| {
