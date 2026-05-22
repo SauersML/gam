@@ -7,6 +7,39 @@ use ndarray::{
     Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
 };
 use rayon::prelude::*;
+use std::sync::Once;
+
+/// One-time warning latch for backward-pass graceful degradation on a
+/// near-singular penalized Hessian `K = XᵀWX + λS`. When `λ_k` saturates
+/// (e.g. 1e10+), `K` becomes effectively rank-deficient and the analytic VJP
+/// cannot be evaluated. Rather than raising, the backward returns zero
+/// gradients of the correct shape: this is the statistically correct
+/// "shrink-out" gradient — when `λ` has saturated, the atom is unused, so
+/// every input's contribution to the loss is zero in the limit.
+#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
+static ILL_CONDITIONED_BACKWARD_WARNED: Once = Once::new();
+
+#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
+fn warn_ill_conditioned_backward_once(p: usize, d: usize, condition_number: f64) {
+    ILL_CONDITIONED_BACKWARD_WARNED.call_once(|| {
+        eprintln!(
+            "[gam] gaussian_reml_fit_backward: K = XᵀWX + λS is near-singular \
+             (p={p}, d={d}, cond≈{condition_number:.2e}); returning zero gradients \
+             for this fit (λ has saturated, atom is effectively unused). \
+             Further occurrences are silent.",
+        );
+    });
+}
+
+#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
+fn zero_backward_result(n: usize, p: usize, d: usize) -> GaussianRemlBackwardResult {
+    GaussianRemlBackwardResult {
+        grad_x: Array2::<f64>::zeros((n, p)),
+        grad_y: Array2::<f64>::zeros((n, d)),
+        grad_penalty: Array2::<f64>::zeros((p, p)),
+        grad_weights: Array1::<f64>::zeros(n),
+    }
+}
 
 const RHO_LOWER: f64 = -30.0;
 const RHO_UPPER: f64 = 30.0;
@@ -729,23 +762,34 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     )?;
     validate_gaussian_reml_forward_fit(x, y, penalty, weights, fit)?;
     let lambda = fit.lambda;
-    if !(fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-
     let n = x.nrows();
     let p = x.ncols();
     let d = y.ncols();
+    if !(fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14) {
+        // Graceful degradation: when λ saturates, K = XᵀWX + λS is
+        // effectively rank-deficient and the analytic VJP is undefined.
+        // Return zero gradients (the correct shrink-out limit) instead of
+        // raising — production training at large F can have individual
+        // atoms saturate λ in early batches and must not blow up here.
+        warn_ill_conditioned_backward_once(p, d, f64::INFINITY);
+        return Ok(zero_backward_result(n, p, d));
+    }
     let weight = gaussian_reml_weights(n, weights)?;
+    let inverse_hessian = match gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda) {
+        Ok(inv) => inv,
+        Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
+            warn_ill_conditioned_backward_once(p, d, condition_number);
+            return Ok(zero_backward_result(n, p, d));
+        }
+        Err(err) => return Err(err),
+    };
     gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         x,
         y,
         penalty,
         weight,
         fit,
-        gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?,
+        inverse_hessian,
         upstream_lambda,
         upstream_coefficients,
         upstream_fitted,

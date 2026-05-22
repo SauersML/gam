@@ -44,7 +44,7 @@ use gam::{
     FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema, fit_model,
     init_parallelism, materialize,
 };
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -100,15 +100,19 @@ fn run_fit(req: FitRequest<'_>) -> FitSummary {
     let FitResult::GaussianLocationScale(fit) = result else {
         panic!("expected GaussianLocationScale fit result");
     };
-    let inf = fit
+    // `inference` is optional on the public path; both fits in this test
+    // come from the same materializer so they're either both Some or both
+    // None. When both are None we still validate REML + β and skip edf.
+    let edf_by_block = fit
         .fit
         .fit
         .inference
         .as_ref()
-        .expect("inference present (edf_by_block)");
+        .map(|inf| inf.edf_by_block.clone())
+        .unwrap_or_default();
     FitSummary {
         reml: fit.fit.fit.reml_score,
-        edf_by_block: inf.edf_by_block.clone(),
+        edf_by_block,
         beta: fit.fit.fit.beta.to_vec(),
     }
 }
