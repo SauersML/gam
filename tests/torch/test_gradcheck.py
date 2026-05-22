@@ -152,6 +152,7 @@ def test_gaussian_reml_fit_batched_gradcheck() -> None:
     )
 
 
+<<<<<<< Updated upstream
 def test_gaussian_reml_fit_blocks_gradcheck() -> None:
     """Analytic VJP for the multi-block per-smooth-λ Gaussian REML fit.
 
@@ -195,14 +196,106 @@ def test_gaussian_reml_fit_blocks_gradcheck() -> None:
         return (
             coef_sum
             + out.fitted.sum()
+=======
+def _reml_block_inputs(
+    n: int = 18, p_per: int = 3, seed: int = 20260522
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    x1 = rng.standard_normal((n, p_per))
+    x2 = rng.standard_normal((n, p_per))
+    beta_true = rng.standard_normal((2 * p_per,))
+    y = np.concatenate([x1, x2], axis=1) @ beta_true + 0.2 * rng.standard_normal(n)
+    s1 = (
+        np.eye(p_per)
+        + 0.05 * np.diag(np.ones(p_per - 1), 1)
+        + 0.05 * np.diag(np.ones(p_per - 1), -1)
+    )
+    s2 = (
+        np.eye(p_per)
+        + 0.03 * np.diag(np.ones(p_per - 1), 1)
+        + 0.03 * np.diag(np.ones(p_per - 1), -1)
+    )
+    weights = rng.uniform(0.6, 1.4, n)
+    return x1, x2, s1, s2, y, weights
+
+
+def _reml_block_tensors() -> tuple[torch.Tensor, ...]:
+    x1, x2, s1, s2, y, weights = _reml_block_inputs()
+    return (
+        torch.tensor(x1, dtype=torch.float64, requires_grad=True),
+        torch.tensor(x2, dtype=torch.float64, requires_grad=True),
+        torch.tensor(s1, dtype=torch.float64, requires_grad=True),
+        torch.tensor(s2, dtype=torch.float64, requires_grad=True),
+        torch.tensor(y[:, None], dtype=torch.float64, requires_grad=True),
+        torch.tensor(weights, dtype=torch.float64, requires_grad=True),
+    )
+
+
+def test_gaussian_reml_fit_blocks_reml_score_gradcheck() -> None:
+    """The negative REML score VJP has the same sign as profile perturbations."""
+    _require_ffi("gaussian_reml_fit_blocks_forward")
+    _require_ffi("gaussian_reml_fit_blocks_backward")
+    x1_t, x2_t, s1_t, s2_t, y_t, w_t = _reml_block_tensors()
+
+    def f(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        sa: torch.Tensor,
+        sb: torch.Tensor,
+        yy: torch.Tensor,
+        ww: torch.Tensor,
+    ) -> torch.Tensor:
+        return gt.gaussian_reml_fit_blocks([a, b], [sa, sb], yy, weights=ww).reml_score
+
+    assert torch.autograd.gradcheck(
+        f,
+        (x1_t, x2_t, s1_t, s2_t, y_t, w_t),
+        eps=1e-5,
+        atol=1e-4,
+        rtol=1e-3,
+        nondet_tol=1e-6,
+    )
+
+
+def test_gaussian_reml_fit_blocks_gradcheck() -> None:
+    """Multi-block per-smooth-λ Gaussian REML backward matches FD.
+
+    Drives ``gradcheck`` through the closed-form analytic VJP wired into the
+    pyffi ``gaussian_reml_fit_blocks_backward`` entrypoint. Two design blocks
+    plus their penalties, response, and row weights are all marked
+    ``requires_grad=True`` so every input-side leg of the analytic backward
+    (designs, penalties, y, weights) is exercised against central finite
+    differences taken through the warm-started outer optimum.
+    """
+    _require_ffi("gaussian_reml_fit_blocks_forward")
+    _require_ffi("gaussian_reml_fit_blocks_backward")
+    x1_t, x2_t, s1_t, s2_t, y_t, w_t = _reml_block_tensors()
+
+    def f(
+        a: torch.Tensor,
+        b: torch.Tensor,
+        sa: torch.Tensor,
+        sb: torch.Tensor,
+        yy: torch.Tensor,
+        ww: torch.Tensor,
+    ) -> torch.Tensor:
+        out = gt.gaussian_reml_fit_blocks([a, b], [sa, sb], yy, weights=ww)
+        return (
+            out.fitted.sum()
+>>>>>>> Stashed changes
             + out.lambdas.sum()
             + out.log_lambdas.sum()
             + out.reml_score
             + out.edf.sum()
+<<<<<<< Updated upstream
+=======
+            + sum(c.sum() for c in out.coefficients)
+>>>>>>> Stashed changes
         )
 
     assert torch.autograd.gradcheck(
         f,
+<<<<<<< Updated upstream
         (*designs, *penalties, y_t),
         eps=1e-6,
         atol=1e-4,
@@ -249,3 +342,11 @@ def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
     torch.testing.assert_close(grad_x_blocks, grad_x_single, rtol=2e-3, atol=2e-4)
 
 
+=======
+        (x1_t, x2_t, s1_t, s2_t, y_t, w_t),
+        eps=1e-5,
+        atol=1e-4,
+        rtol=1e-3,
+        nondet_tol=1e-6,
+    )
+>>>>>>> Stashed changes
