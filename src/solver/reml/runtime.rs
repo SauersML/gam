@@ -6736,17 +6736,21 @@ impl<'a> RemlState<'a> {
     /// where D_p is the penalized deviance, H = XᵀWX + S(ρ) is the penalized Hessian, S(ρ) is the total
     /// penalty matrix, and |S(ρ)|_+ is the pseudo-determinant.
     ///
-    /// The gradient ∇Cost(ρ) is computed term-by-term. A key simplification for the Gaussian case is the
-    /// **envelope theorem**: at the P-IRLS optimum for β̂, the derivative of the cost function with respect to β̂ is zero.
-    /// This means we only need the *partial* derivatives with respect to ρ, and the complex indirect derivatives
-    /// involving ∂β̂/∂ρ can be ignored.
+    /// The gradient ∇Cost(ρ) is computed term-by-term. For the penalized
+    /// likelihood part of the objective, the **envelope theorem** removes
+    /// the indirect beta-mode derivative at an exact inner optimum. This is
+    /// an objective-gradient statement only: a generic downstream VJP that
+    /// explicitly seeds β̂ or μ̂ still has to propagate those seeds through
+    /// the inner KKT system.
     ///
     /// # Mathematical Basis (Non-Gaussian/LAML Case)
     ///
-    /// For non-Gaussian models, the envelope theorem does not apply because the weight matrix W depends on β̂.
-    /// The gradient requires calculating the full derivative, including the indirect term (∂V/∂β̂)ᵀ(∂β̂/∂ρ).
-    /// This leads to a different final formula involving derivatives of the weight matrix, as detailed in
-    /// Wood (2011, Appendix D).
+    /// For non-Gaussian models, the envelope theorem still removes the
+    /// beta-mode derivative of the penalized likelihood part at stationarity,
+    /// but it does not remove the beta-dependence of the Laplace determinant.
+    /// Exact LAML therefore differentiates the observed IRLS Hessian
+    /// H_obs(β̂,ρ), including its curvature derivatives. Gaussian/identity
+    /// and frozen-quadratic PIRLS are the cases where those terms vanish.
     ///
     /// This method handles two distinct statistical criteria for marginal likelihood optimization:
     ///
@@ -6757,8 +6761,8 @@ impl<'a> RemlState<'a> {
     ///
     /// # Mathematical Theory
     ///
-    /// The gradient calculation requires careful application of the chain rule and envelope theorem
-    /// due to the nested optimization structure of GAMs:
+    /// The gradient calculation requires careful application of the chain rule
+    /// and envelope theorem due to the nested optimization structure of GAMs:
     ///
     /// - The inner loop (P-IRLS) finds coefficients β̂ that maximize the penalized log-likelihood
     ///   for a fixed set of smoothing parameters ρ.
@@ -6769,17 +6773,19 @@ impl<'a> RemlState<'a> {
     ///
     ///    dV_R/dρ_k = (∂V_R/∂β̂)ᵀ(∂β̂/∂ρ_k) + ∂V_R/∂ρ_k
     ///
-    /// By the envelope theorem, (∂V_R/∂β̂) = 0 at the optimum β̂, so the first term vanishes.
+    /// For the profiled penalized-likelihood terms, (∂V_R/∂β̂) = 0 at the
+    /// optimum β̂, so that part's indirect term vanishes. Determinant terms
+    /// and explicit downstream β̂/μ̂ losses are handled separately.
     ///
     /// # Key Distinction Between REML and LAML Gradients
     ///
-    /// - Gaussian (REML): by the envelope theorem the indirect β̂ terms vanish. The deviance
-    ///   contribution reduces to the penalty-only derivative, yielding the familiar
-    ///   (β̂ᵀS_kβ̂)/σ² piece in the gradient.
-    /// - Non-Gaussian (LAML): there is no cancellation of the penalty derivative within the
-    ///   deviance component. The derivative of the penalized deviance contains both
-    ///   d(D)/dρ_k and d(βᵀSβ)/dρ_k. Our implementation follows mgcv’s gdi1: we add the penalty
-    ///   derivative to the deviance derivative before applying the 1/2 factor.
+    /// - Gaussian (REML): the Hessian-side curvature is beta-independent, so
+    ///   the determinant drift is just λ_k S_k and the indirect β̂ terms
+    ///   vanish from the outer objective gradient.
+    /// - Non-Gaussian (LAML): the determinant differentiates
+    ///   H_obs(β̂,ρ). The implementation keeps the β̂-sensitivity term
+    ///   through c/d/e curvature arrays rather than pretending the logdet
+    ///   only sees λ_k S_k.
     // Stage: Start with the chain rule for any λₖ,
     //     dV/dλₖ = ∂V/∂λₖ  (holding β̂ fixed)  +  (∂V/∂β̂)ᵀ · (∂β̂/∂λₖ).
     //     The first summand is called the direct part, the second the indirect part.
@@ -6798,11 +6804,13 @@ impl<'a> RemlState<'a> {
     //          gradient[k] = 0.5 * λₖ * (beta_term / σ² − trace_term).
     //
     //     2.2  Non-Gaussian case, LAML.
-    //          The Laplace objective contains −½ log |H_p| with H_p = Xᵀ W(β̂) X + S_λ.  Because W
-    //          depends on β̂, the total derivative includes dW/dλₖ via β̂.  Differentiating the
-    //          optimality condition for β̂ gives
-    //          ∂β̂/∂λₖ = −λₖ H_p⁻¹ Sₖ β̂.  The penalized log-likelihood L(β̂, λ) still obeys the
-    //          envelope theorem, so dL/dλₖ = −½ β̂ᵀ Sₖ β̂ (no implicit term).
+    //          The minimized Laplace cost contains +½ log |H_p| with
+    //          H_p = Xᵀ W_obs(β̂) X + S_λ. Because W_obs depends on β̂,
+    //          the total derivative includes dW_obs/dλₖ via β̂.
+    //          Differentiating the optimality condition for β̂ gives
+    //          ∂β̂/∂λₖ = −H_p⁻¹ Sₖ β̂. The penalized log-likelihood part
+    //          still obeys the envelope theorem, so its direct λ derivative
+    //          is −½ β̂ᵀ Sₖ β̂ with no implicit beta term.
     //          The resulting cost gradient combines four pieces:
     //            +½ λₖ β̂ᵀ Sₖ β̂
     //            +½ λₖ tr(H_p⁻¹ Sₖ)
