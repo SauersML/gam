@@ -5620,6 +5620,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
                     max_iterations: 400,
                     convergence_tolerance: 1e-6,
+                    adaptive_kkt_tolerance: None,
                     max_step_halving: 40,
                     min_step_size: 1e-12,
                     firth_bias_reduction: false,
@@ -5671,6 +5672,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
+        adaptive_kkt_tolerance: None,
         max_step_halving: 40,
         min_step_size: 1e-12,
         firth_bias_reduction: false,
