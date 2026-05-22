@@ -1304,3 +1304,76 @@ def test_partial_dependence_and_variance_share() -> None:
     s_x1_share = model.variance_share(frame, term="s(x1)")
     assert isinstance(s_x1_share, float)
     assert 0.0 <= s_x1_share <= 1.0
+
+
+def test_gaussian_reml_fit_blocks_torch_backward_finite_gradients() -> None:
+    """Multi-block per-smooth-λ REML torch surface produces finite gradients.
+
+    Builds two random design blocks with ``requires_grad=True`` and a random
+    response, runs the autograd forward through
+    :class:`gamfit.torch._reml._GaussianRemlFitBlocksFn`, computes a squared
+    error on ``fitted``, calls ``.backward()``, and verifies the gradients
+    propagated to the design blocks and ``y`` are finite and not all zero.
+    """
+    torch = pytest.importorskip("torch")
+    from gamfit.torch import _reml as torch_reml
+
+    rng = np.random.default_rng(20260522)
+    n = 20
+    p_per = 4
+    x1 = torch.tensor(rng.standard_normal((n, p_per)), dtype=torch.float64, requires_grad=True)
+    x2 = torch.tensor(rng.standard_normal((n, p_per)), dtype=torch.float64, requires_grad=True)
+    s1 = torch.tensor(np.eye(p_per), dtype=torch.float64)
+    s2 = torch.tensor(np.eye(p_per), dtype=torch.float64)
+    y = torch.tensor(rng.standard_normal((n, 1)), dtype=torch.float64, requires_grad=True)
+
+    out = torch_reml.gaussian_reml_fit_blocks([x1, x2], [s1, s2], y)
+    assert out.lambdas.shape == (2,)
+    assert out.log_lambdas.shape == (2,)
+    assert out.fitted.shape == (n, 1)
+    assert len(out.coefficients) == 2
+    assert out.coefficients[0].shape == (p_per, 1)
+    assert out.edf.shape == (2,)
+
+    loss = (out.fitted - y).square().sum()
+    loss.backward()
+
+    assert x1.grad is not None and torch.isfinite(x1.grad).all()
+    assert x2.grad is not None and torch.isfinite(x2.grad).all()
+    assert y.grad is not None and torch.isfinite(y.grad).all()
+    # Some entries must be nonzero — perturbing a random design or response
+    # always shifts the fit.
+    assert float(x1.grad.abs().sum()) > 0.0
+    assert float(x2.grad.abs().sum()) > 0.0
+    assert float(y.grad.abs().sum()) > 0.0
+
+
+def test_gaussian_reml_fit_blocks_torch_roundtrip_lambdas_converge() -> None:
+    """Round-trip fit → predict → fit-again converges to the same λ.
+
+    A second fit warm-started from the converged log-λ\\* should produce
+    essentially the same per-smooth λ vector.
+    """
+    torch = pytest.importorskip("torch")
+    from gamfit.torch import _reml as torch_reml
+
+    rng = np.random.default_rng(202605221)
+    n = 40
+    p_per = 4
+    x1 = torch.tensor(rng.standard_normal((n, p_per)), dtype=torch.float64)
+    x2 = torch.tensor(rng.standard_normal((n, p_per)), dtype=torch.float64)
+    s1 = torch.tensor(np.eye(p_per), dtype=torch.float64)
+    s2 = torch.tensor(np.eye(p_per), dtype=torch.float64)
+    y = torch.tensor(rng.standard_normal((n, 1)), dtype=torch.float64)
+
+    first = torch_reml.gaussian_reml_fit_blocks([x1, x2], [s1, s2], y)
+    log_lam_star = first.log_lambdas.detach().clone()
+    second = torch_reml.gaussian_reml_fit_blocks(
+        [x1, x2], [s1, s2], y, init_log_lambdas=log_lam_star
+    )
+    np.testing.assert_allclose(
+        second.lambdas.detach().numpy(),
+        first.lambdas.detach().numpy(),
+        rtol=1.0e-4,
+        atol=1.0e-6,
+    )

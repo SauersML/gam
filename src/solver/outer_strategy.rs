@@ -26,7 +26,11 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+const TRUST_ENERGY_FACTOR: f64 = 10.0;
+const TRUST_ENERGY_SHRINK_FACTOR: f64 = 0.5;
 
 /// Bidirectional inner-PIRLS feedback channel.
 ///
@@ -2351,7 +2355,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // BFGS outer descent. Recorded as a trial; `OuterAcceptObserver`
         // promotes the latest trial into the accepted series when BFGS's
         // Wolfe line-search accepts the step. Cheap: throttled internally.
-        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
+        crate::solver::visualizer::record_outer_eval(value, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2962,7 +2966,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         // the eval_hessian site below; both run once per outer iter, so the
         // chart's x-coord progresses on every accepted-or-rejected eval and
         // the accepted line moves only on rho-acceptance.
-        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
+        crate::solver::visualizer::record_outer_eval(value, g_norm);
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -3114,12 +3118,20 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// like the optimizer accepting ascent steps, when in reality some
 /// are rejected and the iterate stays put.
 struct OuterAcceptObserver {
-    feedback: InnerProgressFeedback,
+    feedback: Option<InnerProgressFeedback>,
+    trust_energy_gate: Option<Arc<Mutex<TrustEnergyGateState>>>,
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
-        self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
+        if let Some(feedback) = self.feedback.as_ref() {
+            feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(gate) = self.trust_energy_gate.as_ref()
+            && let Ok(mut gate) = gate.lock()
+        {
+            gate.promote_latest_trial();
+        }
         // Promote the bridge-side trial sample into the visualizer's accepted
         // series. Paired with `record_outer_eval` calls inside the bridges so
         // the live chart shows trial scatter + accepted line. Pushed BEFORE
@@ -3135,6 +3147,11 @@ impl OptimizerObserver for OuterAcceptObserver {
         );
     }
     fn on_step_rejected(&mut self, info: &StepInfo) {
+        if let Some(gate) = self.trust_energy_gate.as_ref()
+            && let Ok(mut gate) = gate.lock()
+        {
+            gate.clear_latest_trial();
+        }
         // Rejected trials remain in the visualizer's trial-scatter series
         // (recorded by the bridges' `record_outer_eval` call). Nothing to
         // promote here; just log so the [OUTER step] line in the log stream
@@ -3193,6 +3210,121 @@ impl HessianOperator for OuterToOptHessianOperator {
     }
 }
 
+#[derive(Clone)]
+struct TrustEnergyModel {
+    point: Array1<f64>,
+    gradient: Array1<f64>,
+    hessian: HessianValue,
+    ift_residual_energy: Option<f64>,
+}
+
+impl TrustEnergyModel {
+    fn new(
+        point: Array1<f64>,
+        gradient: Array1<f64>,
+        hessian: HessianValue,
+        ift_residual_energy: Option<f64>,
+    ) -> Self {
+        Self {
+            point,
+            gradient,
+            hessian,
+            ift_residual_energy: ift_residual_energy
+                .filter(|energy| energy.is_finite() && *energy >= 0.0),
+        }
+    }
+
+    fn predicted_decrease_to(&self, trial_point: &Array1<f64>) -> Option<f64> {
+        if trial_point.len() != self.point.len() || self.gradient.len() != self.point.len() {
+            return None;
+        }
+        let step = trial_point - &self.point;
+        let step_norm_sq = step.dot(&step);
+        if !step_norm_sq.is_finite() || step_norm_sq <= 0.0 {
+            return None;
+        }
+        let mut h_step = Array1::<f64>::zeros(step.len());
+        match &self.hessian {
+            HessianValue::Dense(hessian) => {
+                if hessian.nrows() != step.len() || hessian.ncols() != step.len() {
+                    return None;
+                }
+                h_step.assign(&hessian.dot(&step));
+            }
+            HessianValue::Operator(op) => {
+                if op.dim() != step.len() || op.apply_into(&step, &mut h_step).is_err() {
+                    return None;
+                }
+            }
+            HessianValue::Unavailable => return None,
+        }
+        let predicted_decrease = -self.gradient.dot(&step) - 0.5 * step.dot(&h_step);
+        predicted_decrease.is_finite().then_some(predicted_decrease)
+    }
+}
+
+struct TrustEnergyGateState {
+    accepted: Option<TrustEnergyModel>,
+    latest_trial: Option<TrustEnergyModel>,
+}
+
+impl TrustEnergyGateState {
+    fn new(seed: TrustEnergyModel) -> Self {
+        Self {
+            accepted: Some(seed),
+            latest_trial: None,
+        }
+    }
+
+    fn promote_latest_trial(&mut self) {
+        if let Some(trial) = self.latest_trial.take() {
+            self.accepted = Some(trial);
+        }
+    }
+
+    fn clear_latest_trial(&mut self) {
+        self.latest_trial = None;
+    }
+
+    fn reject_if_contaminated(
+        &mut self,
+        trial: TrustEnergyModel,
+    ) -> Result<(), ObjectiveEvalError> {
+        let Some(accepted) = self.accepted.as_ref() else {
+            self.latest_trial = Some(trial);
+            return Ok(());
+        };
+        let Some(predicted_decrease) = accepted.predicted_decrease_to(&trial.point) else {
+            self.latest_trial = Some(trial);
+            return Ok(());
+        };
+        let energy_contamination = match (accepted.ift_residual_energy, predicted_decrease) {
+            (Some(e), p) if p.abs() > 0.0 && e > TRUST_ENERGY_FACTOR * p.abs() => true,
+            _ => false,
+        };
+        if energy_contamination {
+            let energy = accepted.ift_residual_energy.unwrap_or(f64::NAN);
+            let step_norm = (&trial.point - &accepted.point)
+                .dot(&(&trial.point - &accepted.point))
+                .sqrt();
+            log::info!(
+                "[TRUST-ENERGY] shrinking radius: energy={:.3e} predicted_decrease={:.3e} factor={:.3e} shrink_factor={:.3e} step_norm={:.3e}",
+                energy,
+                predicted_decrease,
+                TRUST_ENERGY_FACTOR,
+                TRUST_ENERGY_SHRINK_FACTOR,
+                step_norm,
+            );
+            self.latest_trial = None;
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "trust-energy gate rejected trial: energy={energy:.3e} predicted_decrease={predicted_decrease:.3e}"
+            )));
+        }
+        self.latest_trial = Some(trial);
+        Ok(())
+    }
+}
+
 /// Translate a gam `HessianResult` into an `opt::HessianValue` for
 /// consumption by `MatrixFreeTrustRegion`. `Analytic` becomes
 /// `Dense`; `Operator` is wrapped in the adapter; `Unavailable` is
@@ -3225,6 +3357,7 @@ struct OuterOperatorBridge<'a> {
     g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval.
     last_g_norm: Option<f64>,
+    trust_energy_gate: Option<Arc<Mutex<TrustEnergyGateState>>>,
 }
 
 impl OuterOperatorBridge<'_> {
@@ -3277,8 +3410,9 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
         // pushes are harmless — they just produce trial scatter at adjacent
         // x-coords if the same outer iter is sampled by both entry points.
         crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
+        let value = eval.cost;
         Ok(FirstOrderSample {
-            value: eval.cost,
+            value,
             gradient: eval.gradient,
         })
     }
@@ -3315,15 +3449,30 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             eval.cost,
             g_norm,
         );
+        let value = eval.cost;
+        let gradient = eval.gradient;
+        let hessian = hessian_result_to_value(eval.hessian);
+        if let Some(gate) = self.trust_energy_gate.as_ref()
+            && let Ok(mut gate) = gate.lock()
+        {
+            let ift_residual_energy =
+                crate::solver::reml::runtime::cached_ift_residual_energy_for_outer_theta(x);
+            gate.reject_if_contaminated(TrustEnergyModel::new(
+                x.clone(),
+                gradient.clone(),
+                hessian.clone(),
+                ift_residual_energy,
+            ))?;
+        }
         // Live-chart trial sample (matrix-free TR operator bridge). Each
         // accepted outer iter calls eval_value_grad_op exactly once — HVPs
         // inside the inner CG do not flow through here — so this push
         // matches one bridge eval per chart x-tick.
-        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
+        crate::solver::visualizer::record_outer_eval(value, g_norm);
         Ok(OperatorSample {
-            value: eval.cost,
-            gradient: eval.gradient,
-            hessian: hessian_result_to_value(eval.hessian),
+            value,
+            gradient,
+            hessian,
         })
     }
 }
@@ -5225,10 +5374,21 @@ fn run_outer_with_plan(
                         hessian: seed_hessian_result,
                         ..
                     } = seed_eval;
+                    let seed_hessian = hessian_result_to_value(seed_hessian_result);
+                    let trust_energy_gate = Arc::new(Mutex::new(TrustEnergyGateState::new(
+                        TrustEnergyModel::new(
+                            seed.clone(),
+                            seed_gradient.clone(),
+                            seed_hessian.clone(),
+                            crate::solver::reml::runtime::cached_ift_residual_energy_for_outer_theta(
+                                seed,
+                            ),
+                        ),
+                    )));
                     let initial_op_sample = OperatorSample {
                         value: seed_cost,
                         gradient: seed_gradient,
-                        hessian: hessian_result_to_value(seed_hessian_result),
+                        hessian: seed_hessian,
                     };
 
                     let bridge_obj = OuterOperatorBridge {
@@ -5238,6 +5398,7 @@ fn run_outer_with_plan(
                         eval_count: 0,
                         g_norm_initial: None,
                         last_g_norm: None,
+                        trust_energy_gate: Some(Arc::clone(&trust_energy_gate)),
                     };
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
@@ -5262,11 +5423,10 @@ fn run_outer_with_plan(
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.
                         .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
-                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
-                        solver = solver.with_observer(OuterAcceptObserver {
-                            feedback: feedback.clone(),
-                        });
-                    }
+                    solver = solver.with_observer(OuterAcceptObserver {
+                        feedback: config.outer_inner_cap.clone(),
+                        trust_energy_gate: Some(Arc::clone(&trust_energy_gate)),
+                    });
                     if let Some(r) = config.operator_initial_trust_radius {
                         solver = solver.with_initial_trust_radius(r);
                     }

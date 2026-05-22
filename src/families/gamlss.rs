@@ -11206,6 +11206,63 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         Ok(ll)
     }
 
+    /// Outer-only log-likelihood with optional row subsample.
+    ///
+    /// When `options.outer_score_subsample` is `Some`, only the sampled rows
+    /// contribute; each row's per-row log-likelihood term is multiplied by
+    /// `WeightedOuterRow.weight`, the Horvitz–Thompson inverse-inclusion
+    /// factor 1/π_i (uniform or stratified sampling both supported), so the
+    /// partial sum is an unbiased estimator of the full-data log-likelihood.
+    /// When `None`, this returns the full-data `log_likelihood_only`. Inner
+    /// PIRLS line searches never install the subsample option, so they
+    /// continue to score the exact full-data log-likelihood.
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        let Some(subsample) = options.outer_score_subsample.as_ref() else {
+            return self.log_likelihood_only(block_states);
+        };
+        if block_states.len() != 3 {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
+        }
+        let n = self.y.len();
+        let eta_mu = &block_states[Self::BLOCK_MU].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta_mu.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let ln2pi = (2.0 * std::f64::consts::PI).ln();
+        use rayon::iter::ParallelIterator;
+        let ll: f64 = subsample
+            .rows
+            .par_iter()
+            .map(|row| {
+                let i = row.index;
+                let wi = self.weights[i];
+                if wi == 0.0 {
+                    return 0.0;
+                }
+                let sigma_i = logb_sigma_from_eta_scalar(eta_ls[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
+                let r = self.y[i] - eta_mu[i] - etaw[i];
+                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+            })
+            .sum();
+        Ok(ll)
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
@@ -11469,6 +11526,83 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             x_ls.into_owned(),
         )?;
         Ok(Some(Arc::new(workspace)))
+    }
+
+    /// Outer-aware joint-Hessian workspace with optional row subsample.
+    ///
+    /// When `options.outer_score_subsample` is `None`, this is byte-identical
+    /// to `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
+    /// per-row coefficient arrays in `pieces` (`coeff_mm`, `coeff_ml`,
+    /// `coeff_ll`, `coeff_mw_b`, `coeff_mw_d`, `coeff_lw_b`, `coeff_ww`) —
+    /// which every downstream assembly (`hessian_dense`, `hessian_matvec`,
+    /// `hessian_diagonal`) consumes row-linearly via `Xᵀ diag(W) Y` — are
+    /// replaced by a Horvitz–Thompson mask: each sampled row's coefficient
+    /// is multiplied by `WeightedOuterRow.weight` (the inverse-inclusion
+    /// factor 1/π_i; uniform or stratified sampling both supported), and
+    /// non-sampled rows are zeroed. The `basis`/`basis_d1` matrices are
+    /// row-weight-independent and remain unchanged. Note that the Gaussian
+    /// wiggle has one fewer cross-coefficient than the binomial wiggle
+    /// (no `coeff_lw_d`) because the wiggle enters the Gaussian likelihood
+    /// only through `q = η_μ + η_w` (no σ-chain). The resulting joint Hessian
+    /// is an unbiased estimator of the full-data joint Hessian. Inner PIRLS
+    /// never installs the option, so the inner solve continues to consume
+    /// the exact full-data Hessian.
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let mut workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            xmu.into_owned(),
+            x_ls.into_owned(),
+        )?;
+        if let Some(subsample) = options.outer_score_subsample.as_ref() {
+            workspace.apply_outer_subsample(subsample.rows.as_ref());
+        }
+        Ok(Some(Arc::new(workspace)))
+    }
+
+    /// Outer-derivative policy: declare HT-subsample capability.
+    ///
+    /// GaussianLocationScaleWiggleFamily overrides
+    /// `log_likelihood_only_with_options` and
+    /// `exact_newton_joint_hessian_workspace_with_options` to consume
+    /// `options.outer_score_subsample` with per-row Horvitz–Thompson weights
+    /// (each sampled row's contribution is multiplied by
+    /// `WeightedOuterRow.weight = 1/π_i`; non-sampled rows are zeroed),
+    /// yielding unbiased estimators of the full-data log-likelihood and
+    /// joint Hessian. The ψ-workspace path is also subsample-aware via
+    /// `exact_newton_joint_psi_workspace_with_options`, which threads the
+    /// subsample down to per-row weight masking inside the joint-ψ second-
+    /// order and directional-derivative reductions. Inner-PIRLS and final-
+    /// covariance paths never install the option, so they continue to
+    /// consume the exact full-data quantities.
+    fn outer_derivative_policy(
+        &self,
+        specs: &[ParameterBlockSpec],
+        psi_dim: usize,
+        options: &BlockwiseFitOptions,
+    ) -> crate::families::custom_family::OuterDerivativePolicy {
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let grad_cost = self.coefficient_gradient_cost(specs);
+        let hess_cost = self.coefficient_hessian_cost(specs);
+        let (predicted_gradient_work, predicted_hessian_work) =
+            crate::families::custom_family::default_outer_derivative_policy_costs(
+                specs, psi_dim, grad_cost, hess_cost,
+            );
+        crate::families::custom_family::OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work,
+            predicted_hessian_work,
+            subsample_capable: true,
+        }
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {

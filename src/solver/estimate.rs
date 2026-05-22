@@ -36,7 +36,7 @@ use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,
     row_mismatch_message,
 };
-use crate::matrix::DesignMatrix;
+use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -6134,6 +6134,188 @@ where
     );
 
     reml_state.compute_gradient(rho)
+}
+
+fn gaussian_identity_inner_residual_norm(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    offset: ArrayView1<'_, f64>,
+    canonical_penalties: &[crate::construction::CanonicalPenalty],
+    rho: &Array1<f64>,
+    beta: &Array1<f64>,
+) -> Result<f64, EstimationError> {
+    if beta.len() != x.ncols() {
+        return Err(EstimationError::InvalidInput(format!(
+            "beta dimension mismatch: beta_dim={}, x_cols={}",
+            beta.len(),
+            x.ncols()
+        )));
+    }
+    if rho.len() != canonical_penalties.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho dimension mismatch: rho_dim={}, active_penalties={}",
+            rho.len(),
+            canonical_penalties.len()
+        )));
+    }
+
+    let mut residual = x.apply(beta);
+    residual += &offset;
+    residual -= &y;
+    residual *= &w;
+    let mut gradient = x.apply_transpose(&residual);
+
+    for (k, cp) in canonical_penalties.iter().enumerate() {
+        let lambda = rho[k].exp();
+        if lambda == 0.0 || cp.rank() == 0 {
+            continue;
+        }
+        let r = cp.col_range.clone();
+        let centered = &beta.slice(s![r.start..r.end]) - &cp.prior_mean;
+        let penalty_grad = cp.local.dot(&centered) * lambda;
+        gradient
+            .slice_mut(s![r.start..r.end])
+            .scaled_add(1.0, &penalty_grad);
+    }
+
+    Ok(gradient.iter().map(|v| v * v).sum::<f64>().sqrt())
+}
+
+/// Evaluate IFT and flat warm-start inner residuals at `rho + delta_rho`.
+pub fn evaluate_external_ift_residual_at_perturbed_rho<X>(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: X,
+    offset: ArrayView1<'_, f64>,
+    s_list: &[BlockwisePenalty],
+    opts: &ExternalOptimOptions,
+    rho: &Array1<f64>,
+    delta_rho: ArrayView1<'_, f64>,
+) -> Result<(f64, f64), EstimationError>
+where
+    X: Into<DesignMatrix>,
+{
+    if !matches!(opts.family, LikelihoodFamily::GaussianIdentity) {
+        return Err(EstimationError::InvalidInput(
+            "evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
+                .to_string(),
+        ));
+    }
+    if opts.linear_constraints.is_some() {
+        return Err(EstimationError::InvalidInput(
+            "evaluate_external_ift_residual_at_perturbed_rho does not support constrained fits"
+                .to_string(),
+        ));
+    }
+
+    let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
+    let x = x.into();
+    if let Some(message) = row_mismatch_message(y.len(), w.len(), x.nrows(), offset.len()) {
+        return Err(EstimationError::InvalidInput(message));
+    }
+
+    let p = x.ncols();
+    validate_penalty_specs(
+        &specs,
+        p,
+        "evaluate_external_ift_residual_at_perturbed_rho",
+    )?;
+    let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
+        &specs,
+        &opts.nullspace_dims,
+        p,
+        "evaluate_external_ift_residual_at_perturbed_rho",
+    )?;
+    if rho.len() != active_nullspace_dims.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho dimension mismatch: rho_dim={}, active_penalties={}",
+            rho.len(),
+            active_nullspace_dims.len()
+        )));
+    }
+    if delta_rho.len() != rho.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "delta_rho dimension mismatch: delta_dim={}, rho_dim={}",
+            delta_rho.len(),
+            rho.len()
+        )));
+    }
+
+    let mut tight_opts = opts.clone();
+    tight_opts.tol = 1e-12;
+    let (cfg, _) = resolved_external_config(&tight_opts)?;
+
+    let y_o = y.to_owned();
+    let w_o = w.to_owned();
+    let offset_o = offset.to_owned();
+    let conditioning = ParametricColumnConditioning::infer_from_penalty_specs(&x, &specs);
+    let x_fit = conditioning.apply_to_design(&x);
+    let fit_linear_constraints =
+        conditioning.transform_linear_constraints_to_internal(tight_opts.linear_constraints);
+
+    let mut reml_state = RemlState::newwith_offset(
+        y_o.view(),
+        x_fit.clone(),
+        w_o.view(),
+        offset_o.view(),
+        canonical.clone(),
+        p,
+        &cfg,
+        Some(active_nullspace_dims),
+        None,
+        fit_linear_constraints,
+    )?;
+    reml_state.set_penalty_shrinkage_floor(tight_opts.penalty_shrinkage_floor);
+    reml_state.set_rho_prior(tight_opts.rho_prior.clone());
+    reml_state.set_link_states(
+        cfg.link_kind.mixture_state().cloned(),
+        cfg.link_kind.sas_state().copied(),
+    );
+
+    let _ = reml_state.compute_gradient(rho)?;
+    let beta_hat = reml_state
+        .warm_start_beta
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|beta| beta.as_ref().clone())
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "PIRLS solve did not populate the warm-start beta cache".to_string(),
+            )
+        })?;
+
+    let rho_perturbed = rho + &delta_rho.to_owned();
+    let beta_pred = reml_state
+        .predict_warm_start_beta_ift_with_outcome(&rho_perturbed)
+        .map(|(beta, _)| beta.as_ref().clone())
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "IFT warm-start predictor rejected the perturbed rho".to_string(),
+            )
+        })?;
+
+    let ift_residual = gaussian_identity_inner_residual_norm(
+        y_o.view(),
+        w_o.view(),
+        &x_fit,
+        offset_o.view(),
+        &canonical,
+        &rho_perturbed,
+        &beta_pred,
+    )?;
+    let flat_residual = gaussian_identity_inner_residual_norm(
+        y_o.view(),
+        w_o.view(),
+        &x_fit,
+        offset_o.view(),
+        &canonical,
+        &rho_perturbed,
+        &beta_hat,
+    )?;
+
+    Ok((ift_residual, flat_residual))
 }
 
 /// Evaluate the external cost and report the stabilization ridge used.
