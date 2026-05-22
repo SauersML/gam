@@ -800,6 +800,10 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
 
     let mut lambda_adjoint = upstream_lambda;
     if upstream_beta.iter().any(|value| *value != 0.0) {
+        // A downstream loss that explicitly uses beta_hat or fitted = X beta_hat
+        // cannot use the REML envelope shortcut.  Route those seeds through
+        // the fixed-rho KKT adjoint M u = upstream_beta, then differentiate
+        // X, y, weights, and S through the ridge solve.
         lambda_adjoint += add_ridge_profile_vjp(
             1.0,
             x,

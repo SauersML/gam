@@ -7343,25 +7343,26 @@ pub fn reml_laml_evaluate(
         })
         .collect();
     let need_family_corrections = effective_deriv.has_corrections();
-    // Stack the K curvature-penalty RHS (when corrections are active) and the
-    // ext_dim outer-coordinate gradient RHS into a single (dim, total_cols)
-    // matrix and dispatch one `solve_multi` against the shared Hessian
-    // factorization. The dense-spectral backend turns that into one
-    // `Uᵀ·R`, one per-eigendirection scale, and one `U·projected` — a BLAS-3
-    // pass that has much better cache locality than 14 independent BLAS-2
-    // single-RHS solves and lets large-`dim` fits hit the cuSOLVER batched
-    // chol_solve route in `gpu/policy.rs` (the per-vector solves never
-    // crossed the threshold).
+    let need_rho_mode_responses =
+        need_family_corrections || mode == EvalMode::ValueGradientHessian;
+    // Stack the K curvature-penalty RHS whenever a later stage will need
+    // rho mode responses (family logdet corrections or outer Hessian
+    // assembly), plus all ext-coordinate gradient RHS, into one
+    // (dim, total_cols) solve. The dense-spectral backend turns that into
+    // one `Uᵀ·R`, one per-eigendirection scale, and one `U·projected` — a
+    // BLAS-3 pass with much better cache locality than independent BLAS-2
+    // single-RHS solves, and it lets large-`dim` fits hit the batched solve
+    // route in `gpu/policy.rs`.
     let dim = hop.dim();
     let ext_dim_local = solution.ext_coords.len();
-    let total_cols = if need_family_corrections {
+    let total_cols = if need_rho_mode_responses {
         k + ext_dim_local
     } else {
         ext_dim_local
     };
     let (rho_v_ks, ext_v_is): (Option<Vec<Array1<f64>>>, Vec<Array1<f64>>) = if total_cols == 0 {
         (
-            if need_family_corrections {
+            if need_rho_mode_responses {
                 Some(Vec::new())
             } else {
                 None
@@ -7406,7 +7407,7 @@ pub fn reml_laml_evaluate(
                     _ => kernel.apply_pseudo_inverse(v),
                 }
             };
-            let rho_v_ks = if need_family_corrections {
+            let rho_v_ks = if need_rho_mode_responses {
                 Some(
                     rho_curvature_a_k_betas
                         .iter()
@@ -7425,7 +7426,7 @@ pub fn reml_laml_evaluate(
         } else {
             let mut rhs_stack = Array2::<f64>::zeros((dim, total_cols));
             let mut col_idx = 0;
-            if need_family_corrections {
+            if need_rho_mode_responses {
                 for a_k_beta in rho_curvature_a_k_betas.iter() {
                     rhs_stack.column_mut(col_idx).assign(a_k_beta);
                     col_idx += 1;
@@ -7437,18 +7438,50 @@ pub fn reml_laml_evaluate(
             }
             debug_assert_eq!(col_idx, total_cols);
             let solved_stack = hop.solve_multi(&rhs_stack);
-            let rho_v_ks = if need_family_corrections {
+            let rho_v_ks = if need_rho_mode_responses {
                 Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
             } else {
                 None
             };
-            let ext_offset = if need_family_corrections { k } else { 0 };
+            let ext_offset = if need_rho_mode_responses { k } else { 0 };
             let ext_v_is: Vec<Array1<f64>> = (0..ext_dim_local)
                 .map(|i| solved_stack.column(ext_offset + i).to_owned())
                 .collect();
             (rho_v_ks, ext_v_is)
         }
     };
+    if let Some(rho_vs) = rho_v_ks.as_ref() {
+        for (coord_idx, response) in rho_vs.iter().enumerate() {
+            if let Some((entry_idx, value)) = response
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(RemlError::NonFiniteValue {
+                    reason: format!(
+                        "REML/LAML rho mode response contains non-finite entry: \
+                         coord={coord_idx} entry={entry_idx} value={value}"
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    for (coord_idx, response) in ext_v_is.iter().enumerate() {
+        if let Some((entry_idx, value)) = response
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(RemlError::NonFiniteValue {
+                reason: format!(
+                    "REML/LAML extended-coordinate mode response contains non-finite entry: \
+                     coord={coord_idx} entry={entry_idx} value={value}"
+                ),
+            }
+            .into());
+        }
+    }
     let rho_mode_response_cols = rho_v_ks
         .as_deref()
         .filter(|vectors| !vectors.is_empty())
@@ -10811,12 +10844,13 @@ fn build_outer_hessian_operator(
             )
         })
         .collect();
-    // Mode responses are fixed-β stationarity derivatives and always use
-    // the full Hessian solve.  Rank-deficient LAML changes only the logdet
-    // trace kernel, handled below through `subspace`; projecting these solves
-    // would change β_i/β_ij curvature semantics.
+    // Mode responses are fixed-β stationarity derivatives. The main
+    // evaluator passes precomputed responses so gradient and Hessian share
+    // the same solve kernel, including projected kernels in rank-deficient
+    // LAML. The standalone path below preserves the historical full-H solve
+    // semantics and batches all RHS columns into a single factorization
+    // application.
     let subspace = solution.penalty_subspace_trace.as_deref();
-    let dispatch_solve = |v: &Array1<f64>| -> Array1<f64> { hop.solve(v) };
     let coord_vs_storage;
     let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
         if precomputed.len() != total {
@@ -10831,20 +10865,41 @@ fn build_outer_hessian_operator(
         }
         precomputed
     } else {
-        let mut owned: Vec<Array1<f64>> = rho_curvature_a_k_betas
-            .par_iter()
-            .map(dispatch_solve)
-            .collect();
-        owned.extend(
-            solution
-                .ext_coords
-                .par_iter()
-                .map(|coord| dispatch_solve(&coord.g))
-                .collect::<Vec<_>>(),
-        );
+        let owned = if total == 0 {
+            Vec::new()
+        } else {
+            let mut rhs_stack = Array2::<f64>::zeros((hop.dim(), total));
+            for idx in 0..k {
+                rhs_stack
+                    .column_mut(idx)
+                    .assign(&rho_curvature_a_k_betas[idx]);
+            }
+            for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+                rhs_stack.column_mut(k + ext_idx).assign(&coord.g);
+            }
+            let solved_stack = hop.solve_multi(&rhs_stack);
+            (0..total)
+                .map(|idx| solved_stack.column(idx).to_owned())
+                .collect::<Vec<_>>()
+        };
         coord_vs_storage = owned;
         &coord_vs_storage
     };
+    for (coord_idx, response) in coord_vs.iter().enumerate() {
+        if let Some((entry_idx, value)) = response
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(RemlError::NonFiniteValue {
+                reason: format!(
+                    "outer Hessian mode response contains non-finite entry: \
+                     coord={coord_idx} entry={entry_idx} value={value}"
+                ),
+            }
+            .into());
+        }
+    }
 
     let coord_corrections_storage;
     let coord_corrections: &[Option<DriftDerivResult>] = if let Some(precomputed) =

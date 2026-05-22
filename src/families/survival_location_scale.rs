@@ -400,6 +400,22 @@ fn mxtwxd_with_parallelism(
     }
 }
 
+/// Multiply a per-row weight by the HT mask. The `None` branch returns the
+/// caller's array unmodified (zero-copy borrow), so any downstream
+/// `X.t().dot(&out)` / `out.sum()` / `out.dot(&other)` aggregate is
+/// byte-identical to the pre-refactor path. The `Some` branch produces an
+/// owned masked copy.
+#[inline]
+fn mask_row_vec<'a>(
+    weights: &'a Array1<f64>,
+    mask: Option<&Array1<f64>>,
+) -> std::borrow::Cow<'a, Array1<f64>> {
+    match mask {
+        Some(m) => std::borrow::Cow::Owned(weights * m),
+        None => std::borrow::Cow::Borrowed(weights),
+    }
+}
+
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
 /// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
 /// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
@@ -7759,13 +7775,13 @@ impl SurvivalLocationScaleFamily {
                          weights: &Array1<f64>,
                          right: &Array2<f64>|
          -> Result<(), String> {
-            *acc += &weighted_crossprod_dense(left, weights, right)?;
+            *acc += &mxtwx(left, weights, right, row_mask)?;
             Ok(())
         };
 
-        let h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.h_time_h0))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.h_time_h1))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &q.h_time_d);
+        let h_time = mxtwxd(&dynamic.time_jac_entry, &(-&q.h_time_h0), row_mask)
+            + mxtwxd(&dynamic.time_jac_exit, &(-&q.h_time_h1), row_mask)
+            + mxtwxd(&dynamic.time_jac_deriv, &q.h_time_d, row_mask);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
         if let Some(x_t_deriv) = x_threshold_deriv {
@@ -7777,10 +7793,10 @@ impl SurvivalLocationScaleFamily {
             let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
             let h_exit_deriv =
                 -(&q.d2_qdot1 * &(&q.dqdot_t * &q.dqdot_td) + &q.d1_qdot1 * &q.d2qdot_ttd);
-            let mut h_tt = weighted_crossprod_dense(x_threshold_exit, &h_exit, x_threshold_exit)?
-                + weighted_crossprod_dense(x_threshold_entry, &h_entry, x_threshold_entry)?
-                + weighted_crossprod_dense(x_t_deriv, &h_deriv, x_t_deriv)?;
-            let cross = weighted_crossprod_dense(x_threshold_exit, &h_exit_deriv, x_t_deriv)?;
+            let mut h_tt = mxtwx(x_threshold_exit, &h_exit, x_threshold_exit, row_mask)?
+                + mxtwx(x_threshold_entry, &h_entry, x_threshold_entry, row_mask)?
+                + mxtwx(x_t_deriv, &h_deriv, x_t_deriv, row_mask)?;
+            let cross = mxtwx(x_threshold_exit, &h_exit_deriv, x_t_deriv, row_mask)?;
             h_tt += &cross;
             h_tt += &cross.t().to_owned();
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
@@ -7789,7 +7805,7 @@ impl SurvivalLocationScaleFamily {
                 + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
                 + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
                 + &q.d1_qdot1 * &q.d2qdot_tt);
-            let h_tt = weighted_crossprod_dense(&x_threshold_exit, &h_t, &x_threshold_exit)?;
+            let h_tt = mxtwx(&x_threshold_exit, &h_t, &x_threshold_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &h_tt);
         }
 
@@ -7805,10 +7821,10 @@ impl SurvivalLocationScaleFamily {
             let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
             let h_exit_deriv =
                 -(&q.d2_qdot1 * &(&q.dqdot_ls * &q.dqdot_lsd) + &q.d1_qdot1 * &q.d2qdot_lslsd);
-            let mut h_ll = weighted_crossprod_dense(x_log_sigma_exit, &h_exit, x_log_sigma_exit)?
-                + weighted_crossprod_dense(x_log_sigma_entry, &h_entry, x_log_sigma_entry)?
-                + weighted_crossprod_dense(x_ls_deriv, &h_deriv, x_ls_deriv)?;
-            let cross = weighted_crossprod_dense(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv)?;
+            let mut h_ll = mxtwx(x_log_sigma_exit, &h_exit, x_log_sigma_exit, row_mask)?
+                + mxtwx(x_log_sigma_entry, &h_entry, x_log_sigma_entry, row_mask)?
+                + mxtwx(x_ls_deriv, &h_deriv, x_ls_deriv, row_mask)?;
+            let cross = mxtwx(x_log_sigma_exit, &h_exit_deriv, x_ls_deriv, row_mask)?;
             h_ll += &cross;
             h_ll += &cross.t().to_owned();
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
@@ -7819,7 +7835,7 @@ impl SurvivalLocationScaleFamily {
                 + &(&q.d1_q0 * q.d2q_ls_entry.as_ref().unwrap())
                 + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
                 + &(&q.d1_qdot1 * &q.d2qdot_ls));
-            let h_ll = weighted_crossprod_dense(&x_log_sigma_exit, &h_ls, &x_log_sigma_exit)?;
+            let h_ll = mxtwx(&x_log_sigma_exit, &h_ls, &x_log_sigma_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &h_ll);
         }
 
@@ -7851,46 +7867,54 @@ impl SurvivalLocationScaleFamily {
             assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
         }
 
-        let mut h_ht = weighted_crossprod_dense(
+        let mut h_ht = mxtwx(
             &self.x_time_entry,
             &(-&q.h_time_h0 * q.dq_t_entry.as_ref().unwrap()),
             x_threshold_entry,
-        )? + weighted_crossprod_dense(
+            row_mask,
+        )? + mxtwx(
             &self.x_time_exit,
             &(-&q.h_time_h1 * &q.dq_t),
             x_threshold_exit,
-        )? + weighted_crossprod_dense(
+            row_mask,
+        )? + mxtwx(
             &self.x_time_deriv,
             &(-&q.h_time_d * &q.dqdot_t),
             x_threshold_exit,
+            row_mask,
         )?;
         if let Some(x_t_deriv) = x_threshold_deriv {
-            h_ht += &weighted_crossprod_dense(
+            h_ht += &mxtwx(
                 &self.x_time_deriv,
                 &(-&q.h_time_d * &q.dqdot_td),
                 x_t_deriv,
+                row_mask,
             )?;
         }
         assign_symmetric_block(&mut joint, offsets[0], offsets[1], &h_ht);
 
-        let mut h_hl = weighted_crossprod_dense(
+        let mut h_hl = mxtwx(
             &self.x_time_entry,
             &(-&q.h_time_h0 * q.dq_ls_entry.as_ref().unwrap()),
             x_log_sigma_entry,
-        )? + weighted_crossprod_dense(
+            row_mask,
+        )? + mxtwx(
             &self.x_time_exit,
             &(-&q.h_time_h1 * &q.dq_ls),
             x_log_sigma_exit,
-        )? + weighted_crossprod_dense(
+            row_mask,
+        )? + mxtwx(
             &self.x_time_deriv,
             &(-&q.h_time_d * &q.dqdot_ls),
             x_log_sigma_exit,
+            row_mask,
         )?;
         if let Some(x_ls_deriv) = x_log_sigma_deriv {
-            h_hl += &weighted_crossprod_dense(
+            h_hl += &mxtwx(
                 &self.x_time_deriv,
                 &(-&q.h_time_d * &q.dqdot_lsd),
                 x_ls_deriv,
+                row_mask,
             )?;
         }
         assign_symmetric_block(&mut joint, offsets[0], offsets[2], &h_hl);
@@ -7912,9 +7936,9 @@ impl SurvivalLocationScaleFamily {
             dynamic.wiggle_basis_d2_exit.as_ref(),
             offsets.get(3).copied(),
         ) {
-            let hww = weighted_crossprod_dense(xw_exit, &(-&q.d2_q1), xw_exit)?
-                + weighted_crossprod_dense(xw_entry, &(-&q.d2_q0), xw_entry)?
-                + weighted_crossprod_dense(xw_qdot, &(-&q.d2_qdot1), xw_qdot)?;
+            let hww = mxtwx(xw_exit, &(-&q.d2_q1), xw_exit, row_mask)?
+                + mxtwx(xw_entry, &(-&q.d2_q0), xw_entry, row_mask)?
+                + mxtwx(xw_qdot, &(-&q.d2_qdot1), xw_qdot, row_mask)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &hww);
             let q0_t_entry = Array1::from_iter(dynamic.inv_sigma_entry.iter().map(|&r| -r));
             let q0_t_exit = Array1::from_iter(dynamic.inv_sigma_exit.iter().map(|&r| -r));
@@ -7961,65 +7985,72 @@ impl SurvivalLocationScaleFamily {
             let qdot_lsd_w = scale_dense_rows(xw_d1_exit, &q0_ls_exit)?;
 
             let mut h_tw = Array2::<f64>::zeros((offsets[2] - offsets[1], offsets[4] - offsets[3]));
-            h_tw += &weighted_crossprod_dense(x_threshold_exit, &(-&q.d2_q1 * &q.dq_t), xw_exit)?;
-            h_tw += &weighted_crossprod_dense(
+            h_tw += &mxtwx(x_threshold_exit, &(-&q.d2_q1 * &q.dq_t), xw_exit, row_mask)?;
+            h_tw += &mxtwx(
                 x_threshold_exit,
                 &(-&q.d1_q1 * &q0_t_exit),
                 &tw_exit_d2,
+                row_mask,
             )?;
-            h_tw += &weighted_crossprod_dense(
+            h_tw += &mxtwx(
                 x_threshold_entry,
                 &(-&q.d2_q0 * q.dq_t_entry.as_ref().unwrap()),
                 xw_entry,
+                row_mask,
             )?;
-            h_tw += &weighted_crossprod_dense(
+            h_tw += &mxtwx(
                 x_threshold_entry,
                 &(-&q.d1_q0 * &q0_t_entry),
                 &tw_entry_d2,
+                row_mask,
             )?;
             h_tw +=
-                &weighted_crossprod_dense(x_threshold_exit, &(-&q.d2_qdot1 * &q.dqdot_t), xw_qdot)?;
-            h_tw += &weighted_crossprod_dense(x_threshold_exit, &(-&q.d1_qdot1), &qdot_t_w)?;
+                &mxtwx(x_threshold_exit, &(-&q.d2_qdot1 * &q.dqdot_t), xw_qdot, row_mask)?;
+            h_tw += &mxtwx(x_threshold_exit, &(-&q.d1_qdot1), &qdot_t_w, row_mask)?;
             if let Some(x_t_deriv) = x_threshold_deriv {
                 h_tw +=
-                    &weighted_crossprod_dense(x_t_deriv, &(-&q.d2_qdot1 * &q.dqdot_td), xw_qdot)?;
-                h_tw += &weighted_crossprod_dense(x_t_deriv, &(-&q.d1_qdot1), &qdot_td_w)?;
+                    &mxtwx(x_t_deriv, &(-&q.d2_qdot1 * &q.dqdot_td), xw_qdot, row_mask)?;
+                h_tw += &mxtwx(x_t_deriv, &(-&q.d1_qdot1), &qdot_td_w, row_mask)?;
             }
             assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
 
             let mut h_lw = Array2::<f64>::zeros((offsets[3] - offsets[2], offsets[4] - offsets[3]));
-            h_lw += &weighted_crossprod_dense(x_log_sigma_exit, &(-&q.d2_q1 * &q.dq_ls), xw_exit)?;
-            h_lw += &weighted_crossprod_dense(
+            h_lw += &mxtwx(x_log_sigma_exit, &(-&q.d2_q1 * &q.dq_ls), xw_exit, row_mask)?;
+            h_lw += &mxtwx(
                 x_log_sigma_exit,
                 &(-(&q.d1_q1 * &q0_ls_exit)),
                 &lw_exit_d2,
+                row_mask,
             )?;
-            h_lw += &weighted_crossprod_dense(
+            h_lw += &mxtwx(
                 x_log_sigma_entry,
                 &(-&q.d2_q0 * q.dq_ls_entry.as_ref().unwrap()),
                 xw_entry,
+                row_mask,
             )?;
-            h_lw += &weighted_crossprod_dense(
+            h_lw += &mxtwx(
                 x_log_sigma_entry,
                 &(-(&q.d1_q0 * &q0_ls_entry)),
                 &lw_entry_d2,
+                row_mask,
             )?;
-            h_lw += &weighted_crossprod_dense(
+            h_lw += &mxtwx(
                 x_log_sigma_exit,
                 &(-&q.d2_qdot1 * &q.dqdot_ls),
                 xw_qdot,
+                row_mask,
             )?;
-            h_lw += &weighted_crossprod_dense(x_log_sigma_exit, &(-&q.d1_qdot1), &qdot_ls_w)?;
+            h_lw += &mxtwx(x_log_sigma_exit, &(-&q.d1_qdot1), &qdot_ls_w, row_mask)?;
             if let Some(x_ls_deriv) = x_log_sigma_deriv {
                 h_lw +=
-                    &weighted_crossprod_dense(x_ls_deriv, &(-&q.d2_qdot1 * &q.dqdot_lsd), xw_qdot)?;
-                h_lw += &weighted_crossprod_dense(x_ls_deriv, &(-&q.d1_qdot1), &qdot_lsd_w)?;
+                    &mxtwx(x_ls_deriv, &(-&q.d2_qdot1 * &q.dqdot_lsd), xw_qdot, row_mask)?;
+                h_lw += &mxtwx(x_ls_deriv, &(-&q.d1_qdot1), &qdot_lsd_w, row_mask)?;
             }
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
 
-            let h_hw = weighted_crossprod_dense(&self.x_time_entry, &(-&q.h_time_h0), xw_entry)?
-                + weighted_crossprod_dense(&self.x_time_exit, &(-&q.h_time_h1), xw_exit)?
-                + weighted_crossprod_dense(&self.x_time_deriv, &(-&q.h_time_d), xw_qdot)?;
+            let h_hw = mxtwx(&self.x_time_entry, &(-&q.h_time_h0), xw_entry, row_mask)?
+                + mxtwx(&self.x_time_exit, &(-&q.h_time_h1), xw_exit, row_mask)?
+                + mxtwx(&self.x_time_deriv, &(-&q.h_time_d), xw_qdot, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &h_hw);
         }
 
@@ -8102,6 +8133,28 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
+            block_states,
+            d_beta_flat,
+            q,
+            dynamic,
+            None,
+        )
+    }
+
+    /// HT-mask-aware variant of
+    /// [`Self::exact_newton_joint_hessian_directional_derivative_rescaled_from_parts`].
+    /// `None` is byte-identical to the pre-refactor expression at every site.
+    /// See [`Self::assemble_joint_hessian_from_quantities_masked`] for the
+    /// row-additivity argument.
+    fn exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+        q: &SurvivalJointQuantities,
+        dynamic: &SurvivalDynamicGeometry,
+        row_mask: Option<&Array1<f64>>,
     ) -> Result<Option<Array2<f64>>, String> {
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
@@ -8255,9 +8308,9 @@ impl SurvivalLocationScaleFamily {
         let dh_h0 = &q.d_h_h0 * &du0;
         let dh_h1 = &q.d_h_h1 * &du1;
         let dh_d = &q.d_h_d * &delta_d;
-        let d_h_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&dh_h0))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&dh_h1))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_deriv, &dh_d);
+        let d_h_time = mxtwxd(&dynamic.time_jac_entry, &(-&dh_h0), row_mask)
+            + mxtwxd(&dynamic.time_jac_exit, &(-&dh_h1), row_mask)
+            + mxtwxd(&dynamic.time_jac_deriv, &dh_d, row_mask);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
 
         if let Some(x_t_en) = x_threshold_entry.as_ref() {
@@ -8266,14 +8319,14 @@ impl SurvivalLocationScaleFamily {
                 + &(&q.d2_q1 * &(2.0 * &delta_q_t_exit * &q.dq_t)));
             let d_h_entry = -(&entry_deltas.d_d2_q * &dq_t_en.mapv(|v| safe_product(v, v))
                 + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t * dq_t_en)));
-            let d_h_tt = weighted_crossprod_dense(&x_threshold_exit, &d_h_exit, &x_threshold_exit)?
-                + weighted_crossprod_dense(x_t_en, &d_h_entry, x_t_en)?;
+            let d_h_tt = mxtwx(&x_threshold_exit, &d_h_exit, &x_threshold_exit, row_mask)?
+                + mxtwx(x_t_en, &d_h_entry, x_t_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
         } else {
             let d_d2_q_ti = &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
             let d_h_t = -(&d_d2_q_ti * &q.dq_t.mapv(|v| safe_product(v, v))
                 + &(&q.d2_q * &(2.0 * &delta_q_t_exit * &q.dq_t)));
-            let d_h_tt = weighted_crossprod_dense(&x_threshold_exit, &d_h_t, &x_threshold_exit)?;
+            let d_h_tt = mxtwx(&x_threshold_exit, &d_h_t, &x_threshold_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
         }
 
@@ -8297,8 +8350,8 @@ impl SurvivalLocationScaleFamily {
                     + &(&entry_deltas.d_d1_q * d2q_tls_en)
                     + &(&q.d1_q0 * &entry_deltas.delta_q_tls));
                 let d_h_tl =
-                    weighted_crossprod_dense(&x_threshold_exit, &w_exit, &x_log_sigma_exit)?
-                        + weighted_crossprod_dense(x_t_en, &w_entry, x_ls_en)?;
+                    mxtwx(&x_threshold_exit, &w_exit, &x_log_sigma_exit, row_mask)?
+                        + mxtwx(x_t_en, &w_entry, x_ls_en, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
             } else {
                 let d_d1_q =
@@ -8310,7 +8363,7 @@ impl SurvivalLocationScaleFamily {
                     + &(&d_d1_q * &q.d2q_tls)
                     + &(&q.d1_q * &delta_q_tls_exit));
                 let d_h_tl =
-                    weighted_crossprod_dense(&x_threshold_exit, &d_h_tlweights, &x_log_sigma_exit)?;
+                    mxtwx(&x_threshold_exit, &d_h_tlweights, &x_log_sigma_exit, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
             }
         }
@@ -8326,8 +8379,8 @@ impl SurvivalLocationScaleFamily {
                 + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls * dq_ls_en))
                 + &(&entry_deltas.d_d1_q * d2q_ls_en)
                 + &(&q.d1_q0 * &entry_deltas.delta_q_ls_ls));
-            let d_h_ll = weighted_crossprod_dense(&x_log_sigma_exit, &d_h_exit, &x_log_sigma_exit)?
-                + weighted_crossprod_dense(x_ls_en, &d_h_entry, x_ls_en)?;
+            let d_h_ll = mxtwx(&x_log_sigma_exit, &d_h_exit, &x_log_sigma_exit, row_mask)?
+                + mxtwx(x_ls_en, &d_h_entry, x_ls_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
         } else {
             let d_d1_q =
@@ -8337,33 +8390,37 @@ impl SurvivalLocationScaleFamily {
                 + &(&q.d2_q * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
                 + &(&d_d1_q * &q.d2q_ls)
                 + &(&q.d1_q * &delta_q_ls_ls_exit));
-            let d_h_ll = weighted_crossprod_dense(&x_log_sigma_exit, &d_h_l, &x_log_sigma_exit)?;
+            let d_h_ll = mxtwx(&x_log_sigma_exit, &d_h_l, &x_log_sigma_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
         }
 
         if let (Some(x_t_en), Some(dq_t_en)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
-            let d_h_h0_t = weighted_crossprod_dense(
+            let d_h_h0_t = mxtwx(
                 &self.x_time_entry,
                 &(-(&dh_h0 * dq_t_en + &q.h_time_h0 * &entry_deltas.delta_q_t)),
                 x_t_en,
+                row_mask,
             )?;
-            let d_h_h1_t = weighted_crossprod_dense(
+            let d_h_h1_t = mxtwx(
                 &self.x_time_exit,
                 &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t_exit)),
                 &x_threshold_exit,
+                row_mask,
             )?;
             assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
         } else {
             let delta_q_t = &delta_q_t_exit;
-            let d_h_h0_t = weighted_crossprod_dense(
+            let d_h_h0_t = mxtwx(
                 &self.x_time_entry,
                 &(-(&dh_h0 * &q.dq_t + &q.h_time_h0 * delta_q_t)),
                 &x_threshold_exit,
+                row_mask,
             )?;
-            let d_h_h1_t = weighted_crossprod_dense(
+            let d_h_h1_t = mxtwx(
                 &self.x_time_exit,
                 &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * delta_q_t)),
                 &x_threshold_exit,
+                row_mask,
             )?;
             assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
         }
@@ -8371,28 +8428,32 @@ impl SurvivalLocationScaleFamily {
         if let (Some(x_ls_en), Some(dq_ls_en)) =
             (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
         {
-            let d_h_h0_l = weighted_crossprod_dense(
+            let d_h_h0_l = mxtwx(
                 &self.x_time_entry,
                 &(-(&dh_h0 * dq_ls_en + &q.h_time_h0 * &entry_deltas.delta_q_ls)),
                 x_ls_en,
+                row_mask,
             )?;
-            let d_h_h1_l = weighted_crossprod_dense(
+            let d_h_h1_l = mxtwx(
                 &self.x_time_exit,
                 &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls_exit)),
                 &x_log_sigma_exit,
+                row_mask,
             )?;
             assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
         } else {
             let delta_q_ls = &delta_q_ls_exit;
-            let d_h_h0_l = weighted_crossprod_dense(
+            let d_h_h0_l = mxtwx(
                 &self.x_time_entry,
                 &(-(&dh_h0 * &q.dq_ls + &q.h_time_h0 * delta_q_ls)),
                 &x_log_sigma_exit,
+                row_mask,
             )?;
-            let d_h_h1_l = weighted_crossprod_dense(
+            let d_h_h1_l = mxtwx(
                 &self.x_time_exit,
                 &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * delta_q_ls)),
                 &x_log_sigma_exit,
+                row_mask,
             )?;
             assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
         }
@@ -8406,15 +8467,17 @@ impl SurvivalLocationScaleFamily {
             if let (Some(x_t_en), Some(dq_t_en)) =
                 (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
             {
-                let d_h_tw_exit = weighted_crossprod_dense(
+                let d_h_tw_exit = mxtwx(
                     &x_threshold_exit,
                     &(-(&d_d2_q_exit * &q.dq_t + &q.d2_q1 * &delta_q_t_exit)),
                     xw_dense,
+                    row_mask,
                 )?;
-                let d_h_tw_entry = weighted_crossprod_dense(
+                let d_h_tw_entry = mxtwx(
                     x_t_en,
                     &(-(&entry_deltas.d_d2_q * dq_t_en + &q.d2_q0 * &entry_deltas.delta_q_t)),
                     xw_dense,
+                    row_mask,
                 )?;
                 assign_symmetric_block(
                     &mut joint,
@@ -8423,10 +8486,11 @@ impl SurvivalLocationScaleFamily {
                     &(d_h_tw_exit + d_h_tw_entry),
                 );
             } else {
-                let d_h_tw = weighted_crossprod_dense(
+                let d_h_tw = mxtwx(
                     &x_threshold_exit,
                     &(-(&d_d2_q_combined * &q.dq_t + &q.d2_q * &delta_q_t_exit)),
                     xw_dense,
+                    row_mask,
                 )?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
             }
@@ -8434,15 +8498,17 @@ impl SurvivalLocationScaleFamily {
             if let (Some(x_ls_en), Some(dq_ls_en)) =
                 (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
             {
-                let d_h_lw_exit = weighted_crossprod_dense(
+                let d_h_lw_exit = mxtwx(
                     &x_log_sigma_exit,
                     &(-(&d_d2_q_exit * &q.dq_ls + &q.d2_q1 * &delta_q_ls_exit)),
                     xw_dense,
+                    row_mask,
                 )?;
-                let d_h_lw_entry = weighted_crossprod_dense(
+                let d_h_lw_entry = mxtwx(
                     x_ls_en,
                     &(-(&entry_deltas.d_d2_q * dq_ls_en + &q.d2_q0 * &entry_deltas.delta_q_ls)),
                     xw_dense,
+                    row_mask,
                 )?;
                 assign_symmetric_block(
                     &mut joint,
@@ -8451,19 +8517,20 @@ impl SurvivalLocationScaleFamily {
                     &(d_h_lw_exit + d_h_lw_entry),
                 );
             } else {
-                let d_h_lw = weighted_crossprod_dense(
+                let d_h_lw = mxtwx(
                     &x_log_sigma_exit,
                     &(-(&d_d2_q_combined * &q.dq_ls + &q.d2_q * &delta_q_ls_exit)),
                     xw_dense,
+                    row_mask,
                 )?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
             }
 
-            let d_hww = weighted_crossprod_dense(xw_dense, &(-&d_d2_q_combined), xw_dense)?;
+            let d_hww = mxtwx(xw_dense, &(-&d_d2_q_combined), xw_dense, row_mask)?;
             assign_symmetric_block(&mut joint, w_offset, w_offset, &d_hww);
 
-            let d_h_h0w = weighted_crossprod_dense(&self.x_time_entry, &(-&dh_h0), xw_dense)?;
-            let d_h_h1w = weighted_crossprod_dense(&self.x_time_exit, &(-&dh_h1), xw_dense)?;
+            let d_h_h0w = mxtwx(&self.x_time_entry, &(-&dh_h0), xw_dense, row_mask)?;
+            let d_h_h1w = mxtwx(&self.x_time_exit, &(-&dh_h1), xw_dense, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d_h_h0w + d_h_h1w));
         }
 
@@ -8477,6 +8544,27 @@ impl SurvivalLocationScaleFamily {
         q: &SurvivalJointQuantities,
         dir_i: &SurvivalJointPsiDirection,
         dir_j: &SurvivalJointPsiDirection,
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        self.exact_newton_joint_psisecond_order_terms_from_parts_masked(
+            block_states,
+            derivative_blocks,
+            q,
+            dir_i,
+            dir_j,
+            None,
+        )
+    }
+
+    /// HT-mask-aware variant of
+    /// [`Self::exact_newton_joint_psisecond_order_terms_from_parts`].
+    fn exact_newton_joint_psisecond_order_terms_from_parts_masked(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        q: &SurvivalJointQuantities,
+        dir_i: &SurvivalJointPsiDirection,
+        dir_j: &SurvivalJointPsiDirection,
+        row_mask: Option<&Array1<f64>>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -8734,12 +8822,14 @@ impl SurvivalLocationScaleFamily {
         }
 
         let mut hessian_psi_psi = Array2::<f64>::zeros((p_total, p_total));
-        let h_time_time = safe_fast_xt_diag_x(
+        let h_time_time = mxtwxd(
             &self.x_time_entry,
             &(-(&q.d3_q0 * &q0_ab) - &(&q.d2_h_h0 * &(&q0_i * &q0_j))),
-        ) + safe_fast_xt_diag_x(
+            row_mask,
+        ) + mxtwxd(
             &self.x_time_exit,
             &(-(&q.d3_q1 * &q1_ab) - &(&q.d2_h_h1 * &(&q1_i * &q1_j))),
+            row_mask,
         );
         assign_symmetric_block(&mut hessian_psi_psi, offsets[0], offsets[0], &h_time_time);
 
