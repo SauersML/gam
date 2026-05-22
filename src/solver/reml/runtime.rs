@@ -461,6 +461,220 @@ struct DerivativeContext {
 }
 
 impl<'a> RemlState<'a> {
+    fn hypergradient_owner_key(&self) -> usize {
+        self as *const _ as usize
+    }
+
+    fn reset_hypergradient_budget_controller(&self) {
+        let mut budgets = hypergradient_budgets().lock().unwrap();
+        budgets.remove(&self.hypergradient_owner_key());
+    }
+
+    fn hypergradient_trace_state(&self) -> Arc<Mutex<super::unified::StochasticTraceState>> {
+        let mut budgets = hypergradient_budgets().lock().unwrap();
+        let state = budgets
+            .entry(self.hypergradient_owner_key())
+            .or_insert_with(HyperGradientRuntimeState::new);
+        Arc::clone(&state.trace_state)
+    }
+
+    fn reset_hypergradient_trace_telemetry(
+        trace_state: &Arc<Mutex<super::unified::StochasticTraceState>>,
+    ) {
+        let mut trace = match trace_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        trace.last_linear_residual_norm = None;
+        trace.last_probe_sigma_sq = None;
+        trace.last_probe_count = 0;
+    }
+
+    fn hypergradient_adaptive_kkt_override(
+        &self,
+        pirls_config: &pirls::PirlsConfig,
+    ) -> Option<pirls::AdaptiveKktTolerance> {
+        let budgets = hypergradient_budgets().lock().unwrap();
+        let tau = budgets
+            .get(&self.hypergradient_owner_key())?
+            .adaptive_kkt_override?;
+        if !tau.is_finite() || tau <= 0.0 {
+            return None;
+        }
+        let ceiling = pirls_config.convergence_tolerance;
+        let floor = (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
+            .min(ceiling);
+        if !(floor > 0.0 && ceiling >= floor) {
+            return None;
+        }
+        let tau = tau.clamp(floor, ceiling);
+        Some(pirls::AdaptiveKktTolerance {
+            eta: 1.0,
+            floor: tau,
+            ceiling: tau,
+            outer_grad_norm: tau,
+        })
+    }
+
+    fn update_hypergradient_budget_after_outer_eval(
+        &self,
+        rho: &Array1<f64>,
+        gradient: &Array1<f64>,
+        ift_residual_energy: Option<f64>,
+    ) {
+        if rho.iter().any(|v| !v.is_finite()) || gradient.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+
+        let mut budgets = hypergradient_budgets().lock().unwrap();
+        let state = budgets
+            .entry(self.hypergradient_owner_key())
+            .or_insert_with(HyperGradientRuntimeState::new);
+        let (e_linear, sigma_sq, k, current_floor) = {
+            let trace = match state.trace_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (
+                trace.last_linear_residual_norm.unwrap_or(0.0).max(0.0),
+                trace.last_probe_sigma_sq.unwrap_or(0.0).max(0.0),
+                trace.last_probe_count,
+                trace.monotone_probe_floor,
+            )
+        };
+        let e_inner = ift_residual_energy.unwrap_or(0.0).max(0.0);
+        state.budget.push(HyperGradHistoryEntry {
+            rho: rho.clone(),
+            g_outer: gradient.clone(),
+            e_inner,
+            e_linear,
+            sigma_sq,
+            k,
+        });
+
+        if state.budget.history.len() <= HGB_WARMUP_ITERS {
+            state.adaptive_kkt_override = None;
+            if let Ok(mut trace) = state.trace_state.lock() {
+                trace.solve_rel_tol_override = None;
+            }
+            return;
+        }
+
+        if !state.budget.reestimate_sensitivities() {
+            log::warn!("[HGB] sensitivity_unavailable falling_back_to_per_channel");
+            state.budget.s_inner = S_INNER_INIT;
+            state.budget.s_linear = S_LINEAR_INIT;
+            state.budget.s_trace = S_TRACE_INIT;
+        }
+
+        let previous_grad_norm = state.budget.previous_gradient_norm().max(1e-12);
+        state.budget.target_mse = (HGB_TARGET_FRACTION * previous_grad_norm).powi(2);
+        let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state.budget.allocate();
+
+        let ceiling = self.config.convergence_tolerance;
+        let pirls_floor =
+            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
+                .min(ceiling);
+        let tau_inner = (eps2_inner.sqrt() / state.budget.s_inner)
+            .clamp(pirls_floor, ceiling)
+            .max(0.0);
+        state.adaptive_kkt_override = (tau_inner.is_finite() && tau_inner > 0.0).then_some(tau_inner);
+
+        let rel_tol = eps2_linear.sqrt() / state.budget.s_linear;
+        let k_target = if eps2_trace > 0.0 && sigma_sq.is_finite() && sigma_sq > 0.0 {
+            (sigma_sq / eps2_trace)
+                .ceil()
+                .clamp(0.0, usize::MAX as f64) as usize
+        } else {
+            current_floor
+        };
+        let raised_floor = current_floor.max(k_target);
+        {
+            let mut trace = match state.trace_state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            trace.solve_rel_tol_override =
+                (rel_tol.is_finite() && rel_tol > 0.0).then_some(rel_tol);
+            if raised_floor > trace.monotone_probe_floor {
+                trace.monotone_probe_floor = raised_floor;
+            }
+        }
+
+        let active = ["i", "l", "t"]
+            .iter()
+            .zip(floor_active.iter())
+            .filter_map(|(name, active)| active.then_some(*name))
+            .collect::<Vec<_>>()
+            .join(",");
+        log::info!(
+            "[HGB] target_mse={:.3e} s_i={:.3e} s_l={:.3e} s_t={:.3e} eps²_i={:.3e} eps²_l={:.3e} eps²_t={:.3e} τ={:.3e} rtol={:.3e} k={} floor_active=[{}]",
+            state.budget.target_mse,
+            state.budget.s_inner,
+            state.budget.s_linear,
+            state.budget.s_trace,
+            eps2_inner,
+            eps2_linear,
+            eps2_trace,
+            tau_inner,
+            rel_tol,
+            k_target,
+            active,
+        );
+    }
+
+    fn apply_inner_polish_step_to_warm_start(
+        &self,
+        bundle: &EvalShared,
+        solution_beta: &Array1<f64>,
+        polish_step: &Array1<f64>,
+    ) {
+        if !self.warm_start_enabled.load(Ordering::Relaxed)
+            || solution_beta.len() != polish_step.len()
+        {
+            return;
+        }
+        let polished_solution_beta = solution_beta - polish_step;
+        let pirls_result = bundle.pirls_result.as_ref();
+        let beta_original = match pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => polished_solution_beta,
+            pirls::PirlsCoordinateFrame::TransformedQs => {
+                if polished_solution_beta.len() != pirls_result.reparam_result.qs.ncols() {
+                    return;
+                }
+                pirls_result.reparam_result.qs.dot(&polished_solution_beta)
+            }
+        };
+        if beta_original.len() != self.p || beta_original.iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        // The unified evaluator already paid for w = H^{-1}r to form the IFT
+        // residual correction, so β - w is a free one-step inner polish. Store
+        // it as the next warm start and keep the IFT cache's β-dependent rhs
+        // precompute in sync with the polished coefficient vector.
+        self.warm_start_beta
+            .write()
+            .unwrap()
+            .replace(Coefficients::new(beta_original.clone()));
+        if let Some(cache) = self.ift_warm_start_cache.write().unwrap().as_mut() {
+            cache.beta_original = beta_original.clone();
+            cache.lambda_s_beta_blocks = {
+                use rayon::prelude::*;
+                let blocks: Vec<ndarray::Array1<f64>> = self
+                    .canonical_penalties
+                    .par_iter()
+                    .map(|cp| {
+                        let r = &cp.col_range;
+                        let beta_block = beta_original.slice(s![r.start..r.end]);
+                        let centered = &beta_block - &cp.prior_mean;
+                        cp.local.dot(&centered)
+                    })
+                    .collect();
+                (!blocks.is_empty()).then_some(blocks)
+            };
+        }
+    }
+
     #[inline]
     fn large_n_efs_single_loop_lane(&self) -> bool {
         (self.x.nrows() as f64) * (self.x.ncols() as f64) > LARGE_N_EFS_THRESHOLD
