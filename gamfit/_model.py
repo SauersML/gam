@@ -931,8 +931,12 @@ class Model:
         ``with_uncertainty`` (survival only): when ``True``, the returned
         :class:`SurvivalPrediction` also carries delta-method standard
         errors on the survival surface (``survival_se``) and the linear
-        predictor (``eta_se``).  Currently honored for the location-scale
-        survival likelihood mode.
+        predictor (``eta_se``).  Only honored for the location-scale
+        survival likelihood mode; requesting ``with_uncertainty=True``
+        with any other survival likelihood (``"transformation"``,
+        ``"weibull"``, ``"marginal-slope"``, ``"latent"``,
+        ``"latent-binary"``) or with competing-risks survival models
+        raises an error.
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = _extract_row_ids(headers, rows, id_column)

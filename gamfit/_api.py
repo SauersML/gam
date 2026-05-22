@@ -532,7 +532,8 @@ def fit(
         Corresponds to ``--transformation-normal``.
     survival_likelihood:
         Survival likelihood formulation. One of ``"transformation"``,
-        ``"marginal-slope"``, ``"location-scale"``, ``"weibull"``. Corresponds to
+        ``"weibull"``, ``"location-scale"``, ``"marginal-slope"``,
+        ``"latent"``, or ``"latent-binary"``. Corresponds to
         ``--survival-likelihood``.
     baseline_target:
         Parametric baseline target for survival models. One of ``"linear"``,
