@@ -5,6 +5,45 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2, ArrayView2};
 
+/// Typed errors emitted by the deviation runtime construction and evaluation
+/// helpers in this module.
+///
+/// Each variant carries a pre-formatted `reason` string so `Display` is
+/// byte-equivalent to the original `format!(...)` outputs the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind without parsing the message.
+#[derive(Debug, Clone)]
+pub enum DeviationRuntimeError {
+    /// A scalar configuration value, index, derivative order, runtime value,
+    /// or required metadata bundle did not satisfy the contract (out-of-range
+    /// index, non-finite value, missing support points, span width <= 0).
+    InvalidInput { reason: String },
+    /// A matrix / vector shape did not match an expected dimension while
+    /// composing transforms, validating anchors, or accepting beta vectors.
+    DimensionMismatch { reason: String },
+    /// A numerical kernel (eigendecomposition, I-spline construction,
+    /// monotonicity slack search) failed or produced no usable output.
+    NumericalFailure { reason: String },
+}
+
+impl std::fmt::Display for DeviationRuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeviationRuntimeError::InvalidInput { reason }
+            | DeviationRuntimeError::DimensionMismatch { reason }
+            | DeviationRuntimeError::NumericalFailure { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for DeviationRuntimeError {}
+
+impl From<DeviationRuntimeError> for String {
+    fn from(err: DeviationRuntimeError) -> String {
+        err.to_string()
+    }
+}
+
 /// Cross-block anchor residual stored on the runtime.
 ///
 /// After cross-block orthogonalisation against parametric anchors, the
@@ -135,7 +174,10 @@ fn raw_integrated_derivative_penalty(
         || raw_span_c2.ncols() != raw_dim
         || raw_span_c3.ncols() != raw_dim
     {
-        return Err("raw smoothness penalty: span coefficient column dimensions disagree".into());
+        return Err(DeviationRuntimeError::DimensionMismatch {
+            reason: "raw smoothness penalty: span coefficient column dimensions disagree".to_string(),
+        }
+        .into());
     }
     let mut penalty = Array2::<f64>::zeros((raw_dim, raw_dim));
     for span_idx in 0..n_spans {
@@ -143,9 +185,12 @@ fn raw_integrated_derivative_penalty(
         let right = endpoint_points[span_idx + 1];
         let width = right - left;
         if !width.is_finite() || width <= 0.0 {
-            return Err(format!(
-                "raw smoothness penalty span {span_idx} has invalid width {width}"
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "raw smoothness penalty span {span_idx} has invalid width {width}"
+                ),
+            }
+            .into());
         }
         for i in 0..raw_dim {
             let ci = raw_span_derivative_polynomial_coefficients(
@@ -221,14 +266,25 @@ fn smoothness_nullspace_orthogonal_complement(
 ) -> Result<Array2<f64>, String> {
     let n = raw_penalty.nrows();
     if raw_penalty.ncols() != n {
-        return Err("smoothness penalty matrix must be square for null-space drop".to_string());
+        return Err(DeviationRuntimeError::DimensionMismatch {
+            reason: "smoothness penalty matrix must be square for null-space drop".to_string(),
+        }
+        .into());
     }
     let (eigenvalues, eigenvectors) = raw_penalty
         .eigh(faer::Side::Lower)
-        .map_err(|e| format!("raw smoothness penalty eigendecomposition failed: {e}"))?;
+        .map_err(|e| {
+            String::from(DeviationRuntimeError::NumericalFailure {
+                reason: format!("raw smoothness penalty eigendecomposition failed: {e}"),
+            })
+        })?;
     let evals = eigenvalues
         .as_slice()
-        .ok_or_else(|| "raw smoothness penalty eigenvalues are not contiguous".to_string())?;
+        .ok_or_else(|| {
+            String::from(DeviationRuntimeError::NumericalFailure {
+                reason: "raw smoothness penalty eigenvalues are not contiguous".to_string(),
+            })
+        })?;
     let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals);
     let kept: Vec<usize> = evals
         .iter()
@@ -269,9 +325,12 @@ fn build_quadratic_derivative_bernstein_constraints(
     for span_idx in 0..n_spans {
         let width = endpoint_points[span_idx + 1] - endpoint_points[span_idx];
         if !width.is_finite() || width <= 0.0 {
-            return Err(format!(
-                "DeviationRuntime monotonicity span {span_idx} has invalid width {width}"
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "DeviationRuntime monotonicity span {span_idx} has invalid width {width}"
+                ),
+            }
+            .into());
         }
         let left_row = 3 * span_idx;
         let mid_row = left_row + 1;
@@ -327,23 +386,31 @@ impl DeviationRuntime {
         max_penalty_derivative_order: usize,
     ) -> Result<Self, String> {
         if !monotonicity_eps.is_finite() || monotonicity_eps < 0.0 {
-            return Err(format!(
-                "DeviationRuntime monotonicity_eps must be finite and non-negative, got {monotonicity_eps}"
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "DeviationRuntime monotonicity_eps must be finite and non-negative, got {monotonicity_eps}"
+                ),
+            }
+            .into());
         }
 
         let bkpts = breakpoints_from_knots(
             knots
                 .as_slice()
-                .ok_or_else(|| "DeviationRuntime knots are not contiguous".to_string())?,
+                .ok_or_else(|| {
+                    String::from(DeviationRuntimeError::InvalidInput {
+                        reason: "DeviationRuntime knots are not contiguous".to_string(),
+                    })
+                })?,
             "DeviationRuntime breakpoints",
         )?;
         let endpoint_points = Array1::from_vec(bkpts);
         if endpoint_points.len() < 3 {
-            return Err(
-                "DeviationRuntime requires at least two active knot spans and one interior node"
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: "DeviationRuntime requires at least two active knot spans and one interior node"
                     .to_string(),
-            );
+            }
+            .into());
         }
         let n_spans = endpoint_points.len() - 1;
         for span_idx in 0..n_spans {
@@ -351,9 +418,12 @@ impl DeviationRuntime {
             let right = endpoint_points[span_idx + 1];
             let width = right - left;
             if !width.is_finite() || width <= 0.0 {
-                return Err(format!(
-                    "DeviationRuntime requires strictly increasing span endpoints at span {span_idx}: left={left}, right={right}"
-                ));
+                return Err(DeviationRuntimeError::InvalidInput {
+                    reason: format!(
+                        "DeviationRuntime requires strictly increasing span endpoints at span {span_idx}: left={left}, right={right}"
+                    ),
+                }
+                .into());
             }
         }
         let span_lefts = Array1::from_iter((0..n_spans).map(|idx| endpoint_points[idx]));
@@ -364,22 +434,38 @@ impl DeviationRuntime {
         let internal_degree = 2usize;
         let raw_span_c0 =
             create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 0)
-                .map_err(|e| format!("DeviationRuntime cubic I-spline values failed: {e}"))?;
+                .map_err(|e| {
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: format!("DeviationRuntime cubic I-spline values failed: {e}"),
+                    })
+                })?;
         let raw_span_c1 =
             create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 1)
                 .map_err(|e| {
-                    format!("DeviationRuntime cubic I-spline first derivatives failed: {e}")
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: format!(
+                            "DeviationRuntime cubic I-spline first derivatives failed: {e}"
+                        ),
+                    })
                 })?;
         let raw_span_c2 =
             create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 2)
                 .map_err(|e| {
-                    format!("DeviationRuntime cubic I-spline second derivatives failed: {e}")
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: format!(
+                            "DeviationRuntime cubic I-spline second derivatives failed: {e}"
+                        ),
+                    })
                 })?
                 .mapv(|value| 0.5 * value);
         let raw_span_c3 =
             create_ispline_derivative_dense(span_midpoints.view(), &knots, internal_degree, 3)
                 .map_err(|e| {
-                    format!("DeviationRuntime cubic I-spline third derivatives failed: {e}")
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: format!(
+                            "DeviationRuntime cubic I-spline third derivatives failed: {e}"
+                        ),
+                    })
                 })?
                 .mapv(|value| value / 6.0);
         let raw_right_boundary_values =
@@ -398,10 +484,13 @@ impl DeviationRuntime {
             );
         }
         if max_penalty_derivative_order > 3 {
-            return Err(format!(
-                "DeviationRuntime cubic basis supports derivative orders up to 3; got max \
-                 penalty derivative order {max_penalty_derivative_order}"
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "DeviationRuntime cubic basis supports derivative orders up to 3; got max \
+                     penalty derivative order {max_penalty_derivative_order}"
+                ),
+            }
+            .into());
         }
         let raw_smoothness_penalty = raw_integrated_derivative_penalty(
             &endpoint_points,
@@ -506,27 +595,34 @@ impl DeviationRuntime {
     ) -> Result<(), String> {
         let old_dim = self.basis_dim;
         if right_selector.nrows() != old_dim {
-            return Err(format!(
-                "DeviationRuntime cross-block transform shape mismatch: \
-                 transform rows={}, expected basis_dim={}",
-                right_selector.nrows(),
-                old_dim,
-            ));
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: format!(
+                    "DeviationRuntime cross-block transform shape mismatch: \
+                     transform rows={}, expected basis_dim={}",
+                    right_selector.nrows(),
+                    old_dim,
+                ),
+            }
+            .into());
         }
         let new_dim = right_selector.ncols();
         if new_dim == 0 {
-            return Err(
-                "DeviationRuntime cross-block transform reduces basis dim to 0; \
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: "DeviationRuntime cross-block transform reduces basis dim to 0; \
                  the candidate's column span is fully aliased by the anchor block"
                     .to_string(),
-            );
+            }
+            .into());
         }
         if new_dim > old_dim {
-            return Err(format!(
-                "DeviationRuntime cross-block transform must not increase basis dim; \
-                 got new_dim={} from old_dim={}",
-                new_dim, old_dim,
-            ));
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: format!(
+                    "DeviationRuntime cross-block transform must not increase basis dim; \
+                     got new_dim={} from old_dim={}",
+                    new_dim, old_dim,
+                ),
+            }
+            .into());
         }
         if let Some(ref res) = residual {
             let d_expected: usize = match &res.null_basis_evaluator {
@@ -543,30 +639,39 @@ impl DeviationRuntime {
                     if orthonormalising_rotation.nrows() != sum
                         || orthonormalising_rotation.ncols() != sum
                     {
-                        return Err(format!(
-                            "DeviationRuntime anchor residual: rotation must be {}×{}, got {}×{}",
-                            sum,
-                            sum,
-                            orthonormalising_rotation.nrows(),
-                            orthonormalising_rotation.ncols(),
-                        ));
+                        return Err(DeviationRuntimeError::DimensionMismatch {
+                            reason: format!(
+                                "DeviationRuntime anchor residual: rotation must be {}×{}, got {}×{}",
+                                sum,
+                                sum,
+                                orthonormalising_rotation.nrows(),
+                                orthonormalising_rotation.ncols(),
+                            ),
+                        }
+                        .into());
                     }
                     sum
                 }
             };
             if res.residual_coefficients.nrows() != d_expected {
-                return Err(format!(
-                    "DeviationRuntime anchor residual: residual_coefficients rows={}, expected sum-of-component-ncols={}",
-                    res.residual_coefficients.nrows(),
-                    d_expected,
-                ));
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "DeviationRuntime anchor residual: residual_coefficients rows={}, expected sum-of-component-ncols={}",
+                        res.residual_coefficients.nrows(),
+                        d_expected,
+                    ),
+                }
+                .into());
             }
             if res.residual_coefficients.ncols() != new_dim {
-                return Err(format!(
-                    "DeviationRuntime anchor residual: residual_coefficients cols={}, expected new basis dim {}",
-                    res.residual_coefficients.ncols(),
-                    new_dim,
-                ));
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "DeviationRuntime anchor residual: residual_coefficients cols={}, expected new basis dim {}",
+                        res.residual_coefficients.ncols(),
+                        new_dim,
+                    ),
+                }
+                .into());
             }
         }
         self.span_c0 = fast_ab(&self.span_c0, right_selector);
@@ -625,28 +730,37 @@ impl DeviationRuntime {
         let mut out = self.evaluate_span_polynomial_design_raw(values, 0)?;
         if let Some(residual) = &self.anchor_residual {
             if anchor_rows.nrows() != values.len() {
-                return Err(format!(
-                    "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
-                    anchor_rows.nrows(),
-                    values.len(),
-                ));
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
+                        anchor_rows.nrows(),
+                        values.len(),
+                    ),
+                }
+                .into());
             }
             if anchor_rows.ncols() != residual.residual_coefficients.nrows() {
-                return Err(format!(
-                    "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
-                    anchor_rows.ncols(),
-                    residual.residual_coefficients.nrows(),
-                ));
+                return Err(DeviationRuntimeError::DimensionMismatch {
+                    reason: format!(
+                        "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                        anchor_rows.ncols(),
+                        residual.residual_coefficients.nrows(),
+                    ),
+                }
+                .into());
             }
             let subtract = anchor_rows.dot(&residual.residual_coefficients);
             out = out - subtract;
         } else if anchor_rows.ncols() != 0 {
             // Permit empty 0-col anchor rows without complaint; otherwise
             // hard-error so callers don't silently pass mismatched rows.
-            return Err(format!(
-                "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
-                anchor_rows.ncols(),
-            ));
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: format!(
+                    "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
+                    anchor_rows.ncols(),
+                ),
+            }
+            .into());
         }
         Ok(out)
     }
