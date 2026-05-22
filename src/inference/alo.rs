@@ -926,23 +926,22 @@ fn compute_multiblock_alo_inner(
     let mut chunk_results: Vec<Result<MultiBlockAloChunkDiagnostics, AloError>> =
         Vec::with_capacity(chunk_starts.len());
     for chunk_wave in chunk_starts.chunks(max_concurrent_chunks) {
-        let mut wave_results: Vec<Result<MultiBlockAloChunkDiagnostics, AloError>> =
-            chunk_wave
-                .par_iter()
-                .map_init(
-                    || MultiBlockAloScratch::new(b),
-                    |scratch, &chunk_start| {
-                        let chunk_end = (chunk_start + chunk_size).min(n);
-                        compute_multiblock_alo_chunk(
-                            input,
-                            &col_offsets,
-                            chunk_start,
-                            chunk_end,
-                            scratch,
-                        )
-                    },
-                )
-                .collect();
+        let mut wave_results: Vec<Result<MultiBlockAloChunkDiagnostics, AloError>> = chunk_wave
+            .par_iter()
+            .map_init(
+                || MultiBlockAloScratch::new(b),
+                |scratch, &chunk_start| {
+                    let chunk_end = (chunk_start + chunk_size).min(n);
+                    compute_multiblock_alo_chunk(
+                        input,
+                        &col_offsets,
+                        chunk_start,
+                        chunk_end,
+                        scratch,
+                    )
+                },
+            )
+            .collect();
         chunk_results.append(&mut wave_results);
     }
 

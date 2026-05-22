@@ -96,19 +96,25 @@ impl From<String> for SampleError {
 
 impl From<crate::families::survival_predict::SurvivalPredictError> for SampleError {
     fn from(err: crate::families::survival_predict::SurvivalPredictError) -> SampleError {
-        SampleError::SamplerSetupFailed { reason: String::from(err) }
+        SampleError::SamplerSetupFailed {
+            reason: String::from(err),
+        }
     }
 }
 
 impl From<crate::inference::model::FittedModelError> for SampleError {
     fn from(err: crate::inference::model::FittedModelError) -> SampleError {
-        SampleError::SamplerSetupFailed { reason: String::from(err) }
+        SampleError::SamplerSetupFailed {
+            reason: String::from(err),
+        }
     }
 }
 
 impl From<crate::inference::formula_dsl::FormulaDslError> for SampleError {
     fn from(err: crate::inference::formula_dsl::FormulaDslError) -> SampleError {
-        SampleError::SamplerSetupFailed { reason: String::from(err) }
+        SampleError::SamplerSetupFailed {
+            reason: String::from(err),
+        }
     }
 }
 
@@ -119,14 +125,17 @@ impl From<crate::inference::formula_dsl::FormulaDslError> for SampleError {
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, SampleError> {
-    model.saved_baseline_time_wiggle().map_err(SampleError::from).map(|runtime| {
-        runtime.map(|saved| LinkWiggleFormulaSpec {
-            degree: saved.degree,
-            num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
-            penalty_orders: saved.penalty_orders,
-            double_penalty: saved.double_penalty,
+    model
+        .saved_baseline_time_wiggle()
+        .map_err(SampleError::from)
+        .map(|runtime| {
+            runtime.map(|saved| LinkWiggleFormulaSpec {
+                degree: saved.degree,
+                num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
+                penalty_orders: saved.penalty_orders,
+                double_penalty: saved.double_penalty,
+            })
         })
-    })
 }
 
 fn weighted_penalty_matrix(
@@ -316,12 +325,14 @@ pub fn laplace_gaussian_fallback(
             reason: format!("{rationale}: cannot sample from an empty coefficient vector"),
         });
     }
-    let h = fit.penalized_hessian().ok_or_else(|| SampleError::SamplerSetupFailed {
-        reason: format!(
-            "{rationale}: posterior fallback requires the explicit penalised Hessian; \
+    let h = fit
+        .penalized_hessian()
+        .ok_or_else(|| SampleError::SamplerSetupFailed {
+            reason: format!(
+                "{rationale}: posterior fallback requires the explicit penalised Hessian; \
              refit with exact geometry export to enable posterior sampling for this class."
-        ),
-    })?;
+            ),
+        })?;
     if h.nrows() != p || h.ncols() != p {
         return Err(SampleError::SamplerSetupFailed {
             reason: format!(
@@ -333,9 +344,13 @@ pub fn laplace_gaussian_fallback(
             ),
         });
     }
-    let chol = h.cholesky(Side::Lower).map_err(|err| SampleError::SamplerSetupFailed {
-        reason: format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"),
-    })?;
+    let chol = h
+        .cholesky(Side::Lower)
+        .map_err(|err| SampleError::SamplerSetupFailed {
+            reason: format!(
+                "{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"
+            ),
+        })?;
     let l = chol.lower_triangular();
 
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
@@ -475,7 +490,9 @@ fn sample_standard(
         }),
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("NUTS sampling failed: {e}") })
+    .map_err(|e| SampleError::SamplerSetupFailed {
+        reason: format!("NUTS sampling failed: {e}"),
+    })
 }
 
 fn sample_standard_link_wiggle(
@@ -647,7 +664,9 @@ fn sample_standard_link_wiggle(
         scale,
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("link-wiggle NUTS sampling failed: {e}") })
+    .map_err(|e| SampleError::SamplerSetupFailed {
+        reason: format!("link-wiggle NUTS sampling failed: {e}"),
+    })
 }
 
 fn sample_survival(
@@ -964,5 +983,7 @@ fn sample_survival(
         hessian.view(),
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("survival NUTS sampling failed: {e}") })
+    .map_err(|e| SampleError::SamplerSetupFailed {
+        reason: format!("survival NUTS sampling failed: {e}"),
+    })
 }

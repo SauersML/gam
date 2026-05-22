@@ -240,7 +240,8 @@ pub struct InnerAssembly<'dp> {
     /// iterate. When `Some`, the unified evaluator builds the
     /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
     /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
-    pub active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+    pub active_constraints:
+        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,

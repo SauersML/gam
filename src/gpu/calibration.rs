@@ -91,8 +91,8 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
     let stream = ctx
         .new_stream()
         .map_err(|e| driver_err(format!("new_stream: {e}")))?;
-    let blas = CudaBlas::new(stream.clone())
-        .map_err(|e| driver_err(format!("cublas_init: {e}")))?;
+    let blas =
+        CudaBlas::new(stream.clone()).map_err(|e| driver_err(format!("cublas_init: {e}")))?;
 
     // -- Shape constants ----------------------------------------------------
     // 1024^3 dgemm: 2.147 GFLOP, ~32 MiB working set. Big enough that the
@@ -125,9 +125,12 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
     // exactly TRANSFER_BYTES wide. Contents are irrelevant; what matters
     // is that real pageable host pages flow over PCIe.
     let transfer_host: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
-    let mut transfer_dev = stream
-        .alloc_zeros::<f64>(TRANSFER_F64)
-        .map_err(|e| driver_err(format!("alloc transfer buffer {} bytes: {e}", TRANSFER_BYTES)))?;
+    let mut transfer_dev = stream.alloc_zeros::<f64>(TRANSFER_F64).map_err(|e| {
+        driver_err(format!(
+            "alloc transfer buffer {} bytes: {e}",
+            TRANSFER_BYTES
+        ))
+    })?;
 
     // Warm the path once so first-call driver overhead doesn't skew the GB/s.
     stream

@@ -355,9 +355,7 @@ impl LatentMeasureKind {
                 }
                 if centers.is_empty() {
                     return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
-                        reason: format!(
-                            "{context} local empirical latent measure needs centers"
-                        ),
+                        reason: format!("{context} local empirical latent measure needs centers"),
                     }
                     .into());
                 }
@@ -485,9 +483,7 @@ fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> R
     }
     if nodes.len() < 2 {
         return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
-            reason: format!(
-                "{context} empirical latent measure requires at least two nodes"
-            ),
+            reason: format!("{context} empirical latent measure requires at least two nodes"),
         }
         .into());
     }
@@ -733,9 +729,7 @@ impl LatentZRankIntCalibration {
         for (idx, value) in z.iter().enumerate() {
             if !value.is_finite() {
                 return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                    reason: format!(
-                        "rank-INT calibration: z[{idx}] = {value} not finite"
-                    ),
+                    reason: format!("rank-INT calibration: z[{idx}] = {value} not finite"),
                 }
                 .into());
             }
@@ -825,9 +819,7 @@ impl LatentZRankIntCalibration {
         for (idx, &zi) in z.iter().enumerate() {
             if !zi.is_finite() {
                 return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                    reason: format!(
-                        "rank-INT calibration apply: z[{idx}] = {zi} not finite"
-                    ),
+                    reason: format!("rank-INT calibration apply: z[{idx}] = {zi} not finite"),
                 }
                 .into());
             }
@@ -972,9 +964,8 @@ fn latent_z_is_standard_normal_enough(
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     if !(effective_n.is_finite() && effective_n > 1.0) {
         return Err(BernoulliMarginalSlopeError::InvalidInput {
-            reason:
-                "latent-measure auto-detection requires at least two effective observations"
-                    .to_string(),
+            reason: "latent-measure auto-detection requires at least two effective observations"
+                .to_string(),
         }
         .into());
     }
@@ -1122,9 +1113,7 @@ fn build_empirical_z_grid(
     for (idx, (&zi, &wi)) in z.iter().zip(weights.iter()).enumerate() {
         if !zi.is_finite() {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason: format!(
-                    "{context} z value at row {idx} is non-finite ({zi})"
-                ),
+                reason: format!("{context} z value at row {idx} is non-finite ({zi})"),
             }
             .into());
         }
@@ -1142,9 +1131,7 @@ fn build_empirical_z_grid(
     }
     if pairs.len() < 2 {
         return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
-            reason: format!(
-                "{context} requires at least two positive-weight rows"
-            ),
+            reason: format!("{context} requires at least two positive-weight rows"),
         }
         .into());
     }
@@ -1191,9 +1178,7 @@ fn build_empirical_z_grid(
     }
     if nodes.len() < 2 {
         return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
-            reason: format!(
-                "{context} compression produced fewer than two nodes"
-            ),
+            reason: format!("{context} compression produced fewer than two nodes"),
         }
         .into());
     }
@@ -1632,10 +1617,7 @@ pub(crate) fn bernoulli_marginal_link_map(
     let q1_q = q1_sq * q1_sq;
     let q2 = mu2 / phi_q + q * q1_sq;
     let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1_cu;
-    let q4 = mu4 / phi_q
-        + (q.powi(3) - 3.0 * q) * q1_q
-        + 4.0 * q * q1 * q3
-        + 3.0 * q * q2 * q2
+    let q4 = mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1_q + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
         - 6.0 * (q * q - 1.0) * q1_sq * q2;
     Ok(BernoulliMarginalLinkMap {
         mu,
@@ -2593,9 +2575,8 @@ fn pooled_probit_baseline(
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
         return Err(BernoulliMarginalSlopeError::InvalidInput {
-            reason:
-                "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
-                    .to_string(),
+            reason: "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
+                .to_string(),
         }
         .into());
     }
@@ -2628,7 +2609,11 @@ fn pooled_probit_baseline(
     let mut beta0 = standard_normal_quantile(prevalence).map_err(|e| {
         format!("failed to initialize pooled bernoulli-marginal-slope pilot intercept: {e}")
     })?;
-    let mut beta1 = if z_var > BMS_VARIANCE_FLOOR { yz_cov / z_var } else { 0.0 };
+    let mut beta1 = if z_var > BMS_VARIANCE_FLOOR {
+        yz_cov / z_var
+    } else {
+        0.0
+    };
 
     let objective_grad_hess =
         |intercept: f64, slope: f64| -> Result<(f64, f64, f64, f64, f64, f64), String> {
@@ -2688,8 +2673,8 @@ fn pooled_probit_baseline(
             ridge *= 10.0;
             if ridge > 1e6 {
                 return Err(BernoulliMarginalSlopeError::IntegrationFailed {
-                    reason:
-                        "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string(),
+                    reason: "pooled bernoulli-marginal-slope pilot Hessian solve failed"
+                        .to_string(),
                 }
                 .into());
             }
@@ -3213,9 +3198,7 @@ impl MarginalSlopeCovariance {
             Self::LowRank(factor) => {
                 if factor.nrows() == 0 {
                     return Err(BernoulliMarginalSlopeError::InvalidInput {
-                        reason: format!(
-                            "{context} low-rank covariance factor has zero rows"
-                        ),
+                        reason: format!("{context} low-rank covariance factor has zero rows"),
                     }
                     .into());
                 }
@@ -3367,9 +3350,7 @@ pub fn marginal_slope_covariance_from_scores(
             let score = scores[[i, j]];
             if !score.is_finite() {
                 return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                    reason: format!(
-                        "marginal-slope covariance score ({i},{j}) is non-finite"
-                    ),
+                    reason: format!("marginal-slope covariance score ({i},{j}) is non-finite"),
                 }
                 .into());
             }
@@ -3500,9 +3481,7 @@ pub fn marginal_slope_preserving_scale(
 ) -> Result<f64, String> {
     if !probit_scale.is_finite() {
         return Err(BernoulliMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "marginal-slope probit scale must be finite, got {probit_scale}"
-            ),
+            reason: format!("marginal-slope probit scale must be finite, got {probit_scale}"),
         }
         .into());
     }
@@ -3595,9 +3574,7 @@ fn empirical_rigid_calibration_eval(
 ) -> Result<(f64, f64, f64), String> {
     if !intercept.is_finite() {
         return Err(BernoulliMarginalSlopeError::NumericalFailure {
-            reason: format!(
-                "empirical latent calibration: non-finite intercept {intercept}"
-            ),
+            reason: format!("empirical latent calibration: non-finite intercept {intercept}"),
         }
         .into());
     }
@@ -4010,9 +3987,8 @@ fn rigid_transformed_third_full(
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
-    let f_etaetaeta = f_qqq * marginal.q1_cu
-        + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2
-        + grad_q * marginal.q3;
+    let f_etaetaeta =
+        f_qqq * marginal.q1_cu + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2 + grad_q * marginal.q3;
     let f_etaetag = f_qqg * marginal.q1_sq + h_q[0][1] * marginal.q2;
     let f_etagg = f_qgg * marginal.q1;
     third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
@@ -4088,9 +4064,8 @@ fn rigid_transformed_fourth_full(
         + 3.0 * h_q[0][0] * marginal.q2 * marginal.q2
         + 4.0 * h_q[0][0] * marginal.q1 * marginal.q3
         + grad_q * marginal.q4;
-    let f_eta3g = f_qqqg * marginal.q1_cu
-        + 3.0 * f_qqg * marginal.q1 * marginal.q2
-        + h_q[0][1] * marginal.q3;
+    let f_eta3g =
+        f_qqqg * marginal.q1_cu + 3.0 * f_qqg * marginal.q1 * marginal.q2 + h_q[0][1] * marginal.q3;
     let f_eta2g2 = f_qqgg * marginal.q1_sq + f_qgg * marginal.q2;
     let f_etag3 = f_qggg * marginal.q1;
     fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
@@ -4392,12 +4367,7 @@ impl BernoulliBlockHessianAccumulator {
         if h01 != 0.0 {
             family
                 .marginal_design
-                .row_outer_into_view(
-                    row,
-                    &family.logslope_design,
-                    h01,
-                    self.h_mg.view_mut(),
-                )
+                .row_outer_into_view(row, &family.logslope_design, h01, self.h_mg.view_mut())
                 .expect("marginal-logslope row_outer_into dimension mismatch");
         }
     }
@@ -5188,14 +5158,9 @@ impl BernoulliExactNewtonAccumulator {
         add_optional_matrix(&mut self.hess_h, &other.hess_h);
         add_optional_matrix(&mut self.hess_w, &other.hess_w);
     }
-
 }
 
-fn add_weighted_chunk_gradient(
-    chunk: &Array2<f64>,
-    weights: &[f64],
-    target: &mut Array1<f64>,
-) {
+fn add_weighted_chunk_gradient(chunk: &Array2<f64>, weights: &[f64], target: &mut Array1<f64>) {
     let weights_view = ndarray::ArrayView1::from(weights);
     *target += &crate::faer_ndarray::fast_atv(chunk, &weights_view);
 }
@@ -5865,9 +5830,7 @@ impl BernoulliMarginalSlopeFamily {
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
         if !logcdf.is_finite() {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason: format!(
-                    "empirical rigid neglog_only: non-finite log Φ at row {row}"
-                ),
+                reason: format!("empirical rigid neglog_only: non-finite log Φ at row {row}"),
             }
             .into());
         }
@@ -7599,15 +7562,15 @@ impl BernoulliMarginalSlopeFamily {
         let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
         for partition_cell in cells.into_iter() {
             let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-            let state: exact_kernel::CellDerivativeMomentState =
-                if let Some(existing) = dedup.get(&key) {
-                    existing.clone()
-                } else {
-                    let computed =
-                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                    dedup.insert(key, computed.clone());
-                    computed
-                };
+            let state: exact_kernel::CellDerivativeMomentState = if let Some(existing) =
+                dedup.get(&key)
+            {
+                existing.clone()
+            } else {
+                let computed = self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
+                dedup.insert(key, computed.clone());
+                computed
+            };
             out.push(CachedDenestedCellMoments {
                 partition_cell,
                 state,
@@ -9888,9 +9851,8 @@ impl BernoulliMarginalSlopeFamily {
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason:
-                    "non-finite flexible row context in third-order directional contraction"
-                        .to_string(),
+                reason: "non-finite flexible row context in third-order directional contraction"
+                    .to_string(),
             }
             .into());
         }
@@ -10629,9 +10591,8 @@ impl BernoulliMarginalSlopeFamily {
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason:
-                    "non-finite flexible row context in third-order trace-gradient contraction"
-                        .to_string(),
+                reason: "non-finite flexible row context in third-order trace-gradient contraction"
+                    .to_string(),
             }
             .into());
         }
@@ -11407,9 +11368,8 @@ impl BernoulliMarginalSlopeFamily {
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason:
-                    "non-finite flexible row context in batched third-order trace contraction"
-                        .to_string(),
+                reason: "non-finite flexible row context in batched third-order trace contraction"
+                    .to_string(),
             }
             .into());
         }
@@ -11973,9 +11933,8 @@ impl BernoulliMarginalSlopeFamily {
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
             return Err(BernoulliMarginalSlopeError::NumericalFailure {
-                reason:
-                    "non-finite flexible row context in fourth-order directional contraction"
-                        .to_string(),
+                reason: "non-finite flexible row context in fourth-order directional contraction"
+                    .to_string(),
             }
             .into());
         }
@@ -15371,44 +15330,45 @@ impl BernoulliMarginalSlopeFamily {
         // ever grab a chunk; each chunk reuses the worker's existing
         // dense buffers via in-place += accumulation.
         let pool: Mutex<Vec<BernoulliExactNewtonAccumulator>> = Mutex::new(Vec::new());
-        let result: Result<(), String> = (0..n_chunks).into_par_iter().try_for_each(
-            |chunk_idx| -> Result<(), String> {
-                let mut acc = pool
-                    .lock()
-                    .expect("bernoulli exact newton accumulator pool poisoned")
-                    .pop()
-                    .unwrap_or_else(|| BernoulliExactNewtonAccumulator::new(slices));
-                let start = chunk_idx * ROW_CHUNK_SIZE;
-                let end = (start + ROW_CHUNK_SIZE).min(n);
-                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-                let chunk_res: Result<(), String> = (|| {
-                    for row in start..end {
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let row_moments = cache
-                            .row_cell_moments
-                            .as_ref()
-                            .and_then(|bundle| bundle.row(row, 9));
-                        let row_neglog = self.compute_row_analytic_flex_into_with_moments(
-                            row,
-                            block_states,
-                            &primary,
-                            row_ctx,
-                            row_moments,
-                            true,
-                            &mut scratch,
-                        )?;
-                        acc.add_pullback_block_diagonals(
-                            self, row, &primary, row_neglog, &scratch,
-                        )?;
-                    }
-                    Ok(())
-                })();
-                pool.lock()
-                    .expect("bernoulli exact newton accumulator pool poisoned")
-                    .push(acc);
-                chunk_res
-            },
-        );
+        let result: Result<(), String> =
+            (0..n_chunks)
+                .into_par_iter()
+                .try_for_each(|chunk_idx| -> Result<(), String> {
+                    let mut acc = pool
+                        .lock()
+                        .expect("bernoulli exact newton accumulator pool poisoned")
+                        .pop()
+                        .unwrap_or_else(|| BernoulliExactNewtonAccumulator::new(slices));
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                    let chunk_res: Result<(), String> = (|| {
+                        for row in start..end {
+                            let row_ctx = Self::row_ctx(cache, row);
+                            let row_moments = cache
+                                .row_cell_moments
+                                .as_ref()
+                                .and_then(|bundle| bundle.row(row, 9));
+                            let row_neglog = self.compute_row_analytic_flex_into_with_moments(
+                                row,
+                                block_states,
+                                &primary,
+                                row_ctx,
+                                row_moments,
+                                true,
+                                &mut scratch,
+                            )?;
+                            acc.add_pullback_block_diagonals(
+                                self, row, &primary, row_neglog, &scratch,
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    pool.lock()
+                        .expect("bernoulli exact newton accumulator pool poisoned")
+                        .push(acc);
+                    chunk_res
+                });
         result?;
         let mut pooled = pool
             .into_inner()

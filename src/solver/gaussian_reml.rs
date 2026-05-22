@@ -2173,10 +2173,7 @@ fn fill_weighted_rhs_no_alloc(
     // over (n, p, d). For YᵀWY we only need the diagonal entries, but d is
     // small (typically 1–10) so computing the full d×d Gram is negligible.
     let (xtwy, ywy_full) = match weights {
-        Some(w) => (
-            fast_xt_diag_y(&x, &w, &y),
-            fast_xt_diag_y(&y, &w, &y),
-        ),
+        Some(w) => (fast_xt_diag_y(&x, &w, &y), fast_xt_diag_y(&y, &w, &y)),
         None => (fast_atb(&x, &y), fast_atb(&y, &y)),
     };
     workspace.xtwy.assign(&xtwy);

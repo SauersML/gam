@@ -273,11 +273,12 @@ struct ScaleDeviationOperator {
 
 impl ScaleDeviationOperator {
     fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, ScaleDesignError> {
-        let primary_chunk = self.primary_design.try_row_chunk(rows.clone()).map_err(
-            |e| ScaleDesignError::RowMaterializationFailed {
+        let primary_chunk = self
+            .primary_design
+            .try_row_chunk(rows.clone())
+            .map_err(|e| ScaleDesignError::RowMaterializationFailed {
                 reason: format!("scale deviation operator primary chunk: {e}"),
-            },
-        )?;
+            })?;
         let noise_chunk = self.rawnoise_design.try_row_chunk(rows).map_err(|e| {
             ScaleDesignError::RowMaterializationFailed {
                 reason: format!("scale deviation operator noise chunk: {e}"),
@@ -561,9 +562,10 @@ fn solve_scale_projection(
     // applied to the weighted noise RHS.  Tikhonov filter factors are the
     // smooth alternative to RRQR rank truncation + coefficient cap.
     let (u_opt, singular, vt_opt) =
-        wx.svd(true, true).map_err(|e| ScaleDesignError::SvdFailed {
-            reason: format!("scale projection SVD failed: {e:?}"),
-        })?;
+        wx.svd(true, true)
+            .map_err(|e| ScaleDesignError::SvdFailed {
+                reason: format!("scale projection SVD failed: {e:?}"),
+            })?;
     let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
         return Err(ScaleDesignError::SvdFailed {
             reason: "scale projection SVD did not return singular vectors".to_string(),

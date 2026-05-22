@@ -175,7 +175,8 @@ fn raw_integrated_derivative_penalty(
         || raw_span_c3.ncols() != raw_dim
     {
         return Err(DeviationRuntimeError::DimensionMismatch {
-            reason: "raw smoothness penalty: span coefficient column dimensions disagree".to_string(),
+            reason: "raw smoothness penalty: span coefficient column dimensions disagree"
+                .to_string(),
         }
         .into());
     }
@@ -186,9 +187,7 @@ fn raw_integrated_derivative_penalty(
         let width = right - left;
         if !width.is_finite() || width <= 0.0 {
             return Err(DeviationRuntimeError::InvalidInput {
-                reason: format!(
-                    "raw smoothness penalty span {span_idx} has invalid width {width}"
-                ),
+                reason: format!("raw smoothness penalty span {span_idx} has invalid width {width}"),
             }
             .into());
         }
@@ -271,20 +270,16 @@ fn smoothness_nullspace_orthogonal_complement(
         }
         .into());
     }
-    let (eigenvalues, eigenvectors) = raw_penalty
-        .eigh(faer::Side::Lower)
-        .map_err(|e| {
-            String::from(DeviationRuntimeError::NumericalFailure {
-                reason: format!("raw smoothness penalty eigendecomposition failed: {e}"),
-            })
-        })?;
-    let evals = eigenvalues
-        .as_slice()
-        .ok_or_else(|| {
-            String::from(DeviationRuntimeError::NumericalFailure {
-                reason: "raw smoothness penalty eigenvalues are not contiguous".to_string(),
-            })
-        })?;
+    let (eigenvalues, eigenvectors) = raw_penalty.eigh(faer::Side::Lower).map_err(|e| {
+        String::from(DeviationRuntimeError::NumericalFailure {
+            reason: format!("raw smoothness penalty eigendecomposition failed: {e}"),
+        })
+    })?;
+    let evals = eigenvalues.as_slice().ok_or_else(|| {
+        String::from(DeviationRuntimeError::NumericalFailure {
+            reason: "raw smoothness penalty eigenvalues are not contiguous".to_string(),
+        })
+    })?;
     let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals);
     let kept: Vec<usize> = evals
         .iter()
@@ -395,20 +390,19 @@ impl DeviationRuntime {
         }
 
         let bkpts = breakpoints_from_knots(
-            knots
-                .as_slice()
-                .ok_or_else(|| {
-                    String::from(DeviationRuntimeError::InvalidInput {
-                        reason: "DeviationRuntime knots are not contiguous".to_string(),
-                    })
-                })?,
+            knots.as_slice().ok_or_else(|| {
+                String::from(DeviationRuntimeError::InvalidInput {
+                    reason: "DeviationRuntime knots are not contiguous".to_string(),
+                })
+            })?,
             "DeviationRuntime breakpoints",
         )?;
         let endpoint_points = Array1::from_vec(bkpts);
         if endpoint_points.len() < 3 {
             return Err(DeviationRuntimeError::InvalidInput {
-                reason: "DeviationRuntime requires at least two active knot spans and one interior node"
-                    .to_string(),
+                reason:
+                    "DeviationRuntime requires at least two active knot spans and one interior node"
+                        .to_string(),
             }
             .into());
         }
@@ -481,10 +475,11 @@ impl DeviationRuntime {
 
         if max_penalty_derivative_order == 0 {
             return Err(DeviationRuntimeError::InvalidInput {
-                reason: "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
+                reason:
+                    "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
                  drop the corresponding smoothness null space; an order-0 (mass) penalty alone \
                  has no null space and would not require any drop"
-                    .to_string(),
+                        .to_string(),
             }
             .into());
         }
@@ -948,9 +943,7 @@ impl DeviationRuntime {
             let width = right - left;
             if !width.is_finite() || width <= 0.0 {
                 return Err(DeviationRuntimeError::InvalidInput {
-                    reason: format!(
-                        "deviation penalty span {span_idx} has invalid width {width}"
-                    ),
+                    reason: format!("deviation penalty span {span_idx} has invalid width {width}"),
                 }
                 .into());
             }
@@ -971,21 +964,17 @@ impl DeviationRuntime {
                 }
             }
         }
-        let (evals, _) = penalty
-            .eigh(faer::Side::Lower)
-            .map_err(|e| {
-                String::from(DeviationRuntimeError::NumericalFailure {
-                    reason: format!("deviation integrated penalty eigendecomposition failed: {e}"),
-                })
-            })?;
+        let (evals, _) = penalty.eigh(faer::Side::Lower).map_err(|e| {
+            String::from(DeviationRuntimeError::NumericalFailure {
+                reason: format!("deviation integrated penalty eigendecomposition failed: {e}"),
+            })
+        })?;
         let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
-            evals
-                .as_slice()
-                .ok_or_else(|| {
-                    String::from(DeviationRuntimeError::NumericalFailure {
-                        reason: "deviation penalty eigenvalues are not contiguous".to_string(),
-                    })
-                })?,
+            evals.as_slice().ok_or_else(|| {
+                String::from(DeviationRuntimeError::NumericalFailure {
+                    reason: "deviation penalty eigenvalues are not contiguous".to_string(),
+                })
+            })?,
         );
         let rank = evals.iter().filter(|&&value| value > threshold).count();
         let nullity = self.basis_dim.saturating_sub(rank);
@@ -1031,13 +1020,11 @@ impl DeviationRuntime {
 
     fn span_index_for(&self, value: f64) -> Result<usize, String> {
         span_index_for_breakpoints(
-            self.endpoint_points
-                .as_slice()
-                .ok_or_else(|| {
-                    String::from(DeviationRuntimeError::InvalidInput {
-                        reason: "deviation runtime breakpoints are not contiguous".to_string(),
-                    })
-                })?,
+            self.endpoint_points.as_slice().ok_or_else(|| {
+                String::from(DeviationRuntimeError::InvalidInput {
+                    reason: "deviation runtime breakpoints are not contiguous".to_string(),
+                })
+            })?,
             value,
             "deviation span lookup",
         )

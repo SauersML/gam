@@ -379,9 +379,12 @@ impl CoefficientGroupPrior {
             }
             Self::GammaPrecision { shape, rate } => {
                 if !shape.is_finite() || shape <= 0.0 {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "{context} Gamma precision prior requires shape > 0, got {shape}"
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "{context} Gamma precision prior requires shape > 0, got {shape}"
+                        ),
+                    }
+                    .into());
                 }
                 if !rate.is_finite() || rate < 0.0 {
                     return Err(format!(
@@ -491,9 +494,12 @@ fn validate_group_rho_prior_coordinate(
         }
         crate::types::RhoPrior::GammaPrecision { shape, rate } => {
             if !shape.is_finite() || *shape <= 0.0 {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "{context} Gamma precision prior requires shape > 0, got {shape}"
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{context} Gamma precision prior requires shape > 0, got {shape}"
+                    ),
+                }
+                .into());
             }
             if !rate.is_finite() || *rate < 0.0 {
                 return Err(format!(
@@ -502,9 +508,10 @@ fn validate_group_rho_prior_coordinate(
             }
             Ok(())
         }
-        crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation { reason: format!(
-            "{context} must be a scalar rho prior, not a nested Independent prior"
-        ) }.into()),
+        crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
+            reason: format!("{context} must be a scalar rho prior, not a nested Independent prior"),
+        }
+        .into()),
     }
 }
 
@@ -566,13 +573,16 @@ pub fn realize_coefficient_groups_for_custom_family(
     let mut seen = BTreeSet::<String>::new();
     for group in groups {
         if group.label.trim().is_empty() {
-            return Err(CustomFamilyError::ConstraintViolation { reason: "coefficient group label must not be empty".to_string() }.into());
+            return Err(CustomFamilyError::ConstraintViolation {
+                reason: "coefficient group label must not be empty".to_string(),
+            }
+            .into());
         }
         if !seen.insert(group.label.clone()) {
-            return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                "duplicate coefficient group label '{}'",
-                group.label
-            ) }.into());
+            return Err(CustomFamilyError::ConstraintViolation {
+                reason: format!("duplicate coefficient group label '{}'", group.label),
+            }
+            .into());
         }
         if group.coefficients.is_empty() {
             return Err(format!(
@@ -636,9 +646,12 @@ pub fn realize_coefficient_groups_for_custom_family(
         let mut cursor = Some(group.label.as_str());
         while let Some(label) = cursor {
             if !path.insert(label.to_string()) {
-                return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                    "coefficient group hierarchy contains a cycle involving '{label}'"
-                ) }.into());
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "coefficient group hierarchy contains a cycle involving '{label}'"
+                    ),
+                }
+                .into());
             }
             cursor = parent_by_label
                 .get(label)
@@ -658,10 +671,13 @@ pub fn realize_coefficient_groups_for_custom_family(
                 .get(&group.label)
                 .expect("realized group set should exist");
             if !child_set.is_subset(parent_set) {
-                return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                    "coefficient group '{}' is not a subset of parent group '{parent}'",
-                    group.label
-                ) }.into());
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "coefficient group '{}' is not a subset of parent group '{parent}'",
+                        group.label
+                    ),
+                }
+                .into());
             }
         }
         if let Some(children) = children_by_parent.get(&group.label) {
@@ -894,7 +910,6 @@ impl BlockWorkingSet {
             working_weights,
         })
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3127,11 +3142,14 @@ fn validate_lambda_pair_consistency(
     label: &str,
 ) -> Result<(), String> {
     if log_lambdas.len() != lambdas.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{label} length mismatch: log_lambdas={}, lambdas={}",
-            log_lambdas.len(),
-            lambdas.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{label} length mismatch: log_lambdas={}, lambdas={}",
+                log_lambdas.len(),
+                lambdas.len()
+            ),
+        }
+        .into());
     }
     for (idx, (&log_lambda, &lambda)) in log_lambdas.iter().zip(lambdas.iter()).enumerate() {
         let expected = log_lambda.exp();
@@ -3166,7 +3184,10 @@ pub fn blockwise_fit_from_parts(
     } = parts;
 
     if block_states.is_empty() {
-        return Err(CustomFamilyError::UnsupportedConfiguration { reason: "blockwise fit requires at least one block state".to_string() }.into());
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "blockwise fit requires at least one block state".to_string(),
+        }
+        .into());
     }
     ensure_finite_scalar_estimation("blockwise_fit.log_likelihood", log_likelihood)
         .map_err(|e| e.to_string())?;
@@ -3183,11 +3204,14 @@ pub fn blockwise_fit_from_parts(
         .map_err(|e| e.to_string())?;
 
     if block_states.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "blockwise_fit.block_states length ({}) does not match specs length ({})",
-            block_states.len(),
-            specs.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "blockwise_fit.block_states length ({}) does not match specs length ({})",
+                block_states.len(),
+                specs.len()
+            ),
+        }
+        .into());
     }
     let n = block_states[0].eta.len();
     let total_p = block_states
@@ -3214,10 +3238,13 @@ pub fn blockwise_fit_from_parts(
             .map_err(|e| e.to_string())?;
         let (rows, cols) = cov.dim();
         if rows != total_p || cols != total_p {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.covariance_conditional must be {}x{}, got {}x{}",
-                total_p, total_p, rows, cols
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "blockwise_fit.covariance_conditional must be {}x{}, got {}x{}",
+                    total_p, total_p, rows, cols
+                ),
+            }
+            .into());
         }
     }
 
@@ -3226,10 +3253,13 @@ pub fn blockwise_fit_from_parts(
             .map_err(|e| e.to_string())?;
         let (rows, cols) = geom.penalized_hessian.dim();
         if rows != total_p || cols != total_p {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
-                total_p, total_p, rows, cols
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "blockwise_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
+                    total_p, total_p, rows, cols
+                ),
+            }
+            .into());
         }
         let geom_len = geom.working_weights.len();
         if geom_len != geom.working_response.len() {
@@ -3328,11 +3358,14 @@ fn checked_penalizedobjective(
     if objective.is_finite() {
         Ok(objective)
     } else {
-        Err(CustomFamilyError::NumericalFailure { reason: format!(
-            "{context}: non-finite penalized objective \
+        Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "{context}: non-finite penalized objective \
              (log_likelihood={log_likelihood}, penalty_value={penalty_value}, \
              reml_term={reml_term}, objective={objective})"
-        ) }.into())
+            ),
+        }
+        .into())
     }
 }
 
@@ -3622,17 +3655,23 @@ impl EmbeddedImplicitPsiDerivativeOperator {
         total_p: usize,
     ) -> Result<Self, String> {
         if base.p_out() != global_range.len() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "embedded implicit psi operator width mismatch: got {}, expected {}",
-                base.p_out(),
-                global_range.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "embedded implicit psi operator width mismatch: got {}, expected {}",
+                    base.p_out(),
+                    global_range.len()
+                ),
+            }
+            .into());
         }
         if global_range.end > total_p {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "embedded implicit psi operator range {}..{} exceeds total width {total_p}",
-                global_range.start, global_range.end
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "embedded implicit psi operator range {}..{} exceeds total width {total_p}",
+                    global_range.start, global_range.end
+                ),
+            }
+            .into());
         }
         Ok(Self {
             base,
@@ -4751,10 +4790,13 @@ impl CustomFamilyPsiDesignAction {
         label: &str,
     ) -> Result<Self, String> {
         if row_range.end > total_rows {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "{label} row range {}..{} exceeds total rows {total_rows}",
-                row_range.start, row_range.end
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "{label} row range {}..{} exceeds total rows {total_rows}",
+                    row_range.start, row_range.end
+                ),
+            }
+            .into());
         }
         if let Some(op) = deriv.implicit_operator.as_ref() {
             if op.n_data() == total_rows && op.p_out() == p {
@@ -4785,12 +4827,15 @@ impl CustomFamilyPsiDesignAction {
 
     pub(crate) fn slice_rows(&self, row_range: Range<usize>) -> Result<Self, String> {
         if row_range.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi design row range {}..{} exceeds available rows {}",
-                row_range.start,
-                row_range.end,
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi design row range {}..{} exceeds available rows {}",
+                    row_range.start,
+                    row_range.end,
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         Ok(Self {
             operator: Arc::clone(&self.operator),
@@ -4833,12 +4878,15 @@ impl CustomFamilyPsiDesignAction {
 
     pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
         if rows.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi design row range {}..{} exceeds available rows {}",
-                rows.start,
-                rows.end,
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi design row range {}..{} exceeds available rows {}",
+                    rows.start,
+                    rows.end,
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         self.operator
             .row_chunk_first(self.axis, self.absolute_rows(rows))
@@ -4847,10 +4895,13 @@ impl CustomFamilyPsiDesignAction {
 
     pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
         if row >= self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi design row {row} exceeds available rows {}",
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi design row {row} exceeds available rows {}",
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         let absolute_row = self.row_range.start + row;
         let mut out = Array1::<f64>::zeros(self.p);
@@ -4885,19 +4936,25 @@ impl CustomFamilyPsiSecondDesignAction {
         label: &str,
     ) -> Result<Option<Self>, String> {
         if row_range.end > total_rows {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "{label} row range {}..{} exceeds total rows {total_rows}",
-                row_range.start, row_range.end
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "{label} row range {}..{} exceeds total rows {total_rows}",
+                    row_range.start, row_range.end
+                ),
+            }
+            .into());
         }
         let Some(op) = deriv_i.implicit_operator.as_ref() else {
             return Ok(None);
         };
         if op.n_data() != total_rows || op.p_out() != p {
-            return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                "{label} is missing an implicit x_psi_psi operator with shape {}x{}",
-                total_rows, p
-            ) }.into());
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!(
+                    "{label} is missing an implicit x_psi_psi operator with shape {}x{}",
+                    total_rows, p
+                ),
+            }
+            .into());
         }
         let same_group = deriv_i.implicit_group_id.is_some()
             && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
@@ -4923,12 +4980,15 @@ impl CustomFamilyPsiSecondDesignAction {
 
     pub(crate) fn slice_rows(&self, row_range: Range<usize>) -> Result<Self, String> {
         if row_range.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi second-design row range {}..{} exceeds available rows {}",
-                row_range.start,
-                row_range.end,
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi second-design row range {}..{} exceeds available rows {}",
+                    row_range.start,
+                    row_range.end,
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         Ok(Self {
             operator: Arc::clone(&self.operator),
@@ -4985,12 +5045,15 @@ impl CustomFamilyPsiSecondDesignAction {
 
     pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
         if rows.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi second-design row range {}..{} exceeds available rows {}",
-                rows.start,
-                rows.end,
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi second-design row range {}..{} exceeds available rows {}",
+                    rows.start,
+                    rows.end,
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         match self.level {
             CustomFamilyPsiSecondDesignLevel::Diag(axis) => self
@@ -5056,10 +5119,13 @@ impl CustomFamilyPsiLinearMapRef<'_> {
 
     pub(crate) fn row_vector(&self, row: usize) -> Result<Array1<f64>, String> {
         if row >= self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi linear-map row {row} out of bounds for {} rows",
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi linear-map row {row} out of bounds for {} rows",
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         Ok(match self {
             Self::Dense(mat) => mat.row(row).to_owned(),
@@ -5071,12 +5137,15 @@ impl CustomFamilyPsiLinearMapRef<'_> {
 
     pub(crate) fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
         if rows.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi linear-map row range {}..{} out of bounds for {} rows",
-                rows.start,
-                rows.end,
-                self.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi linear-map row range {}..{} out of bounds for {} rows",
+                    rows.start,
+                    rows.end,
+                    self.nrows()
+                ),
+            }
+            .into());
         }
         Ok(match self {
             Self::Dense(mat) => mat.slice(ndarray::s![rows, ..]).to_owned(),
@@ -5183,12 +5252,15 @@ pub(crate) fn weighted_crossprod_psi_maps(
     right: CustomFamilyPsiLinearMapRef<'_>,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "psi weighted crossprod row mismatch: left={}, weights={}, right={}",
-            left.nrows(),
-            weights.len(),
-            right.nrows()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "psi weighted crossprod row mismatch: left={}, weights={}, right={}",
+                left.nrows(),
+                weights.len(),
+                right.nrows()
+            ),
+        }
+        .into());
     }
     let p_left = left.ncols();
     let p_right = right.ncols();
@@ -5544,10 +5616,13 @@ pub(crate) fn resolve_custom_family_x_psi_map(
     policy: &ResourcePolicy,
 ) -> Result<PsiDesignMap, String> {
     if row_range.end > n {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{label}: row range {}..{} exceeds total rows {n}",
-            row_range.start, row_range.end
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{label}: row range {}..{} exceeds total rows {n}",
+                row_range.start, row_range.end
+            ),
+        }
+        .into());
     }
 
     // Prefer operator action when dimensions match.
@@ -5571,9 +5646,12 @@ pub(crate) fn resolve_custom_family_x_psi_map(
                         ncols: p,
                     });
                 }
-                return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                    "{label}: dense x_psi fallback disabled by AnalyticOperatorRequired"
-                ) }.into());
+                return Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: format!(
+                        "{label}: dense x_psi fallback disabled by AnalyticOperatorRequired"
+                    ),
+                }
+                .into());
             }
             DerivativeStorageMode::MaterializeIfSmall | DerivativeStorageMode::DiagnosticsOnly => {
                 let matrix = if row_range.start == 0 && row_range.end == n {
@@ -5599,10 +5677,13 @@ pub(crate) fn resolve_custom_family_x_psi_map(
         });
     }
 
-    Err(CustomFamilyError::DimensionMismatch { reason: format!(
-        "{label}: x_psi shape {:?} does not match ({n}, {p})",
-        deriv.x_psi.dim()
-    ) }.into())
+    Err(CustomFamilyError::DimensionMismatch {
+        reason: format!(
+            "{label}: x_psi shape {:?} does not match ({n}, {p})",
+            deriv.x_psi.dim()
+        ),
+    }
+    .into())
 }
 
 pub(crate) fn resolve_custom_family_x_psi_psi_map(
@@ -5616,10 +5697,13 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     policy: &ResourcePolicy,
 ) -> Result<PsiDesignMap, String> {
     if row_range.end > n {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{label}: row range {}..{} exceeds total rows {n}",
-            row_range.start, row_range.end
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{label}: row range {}..{} exceeds total rows {n}",
+                row_range.start, row_range.end
+            ),
+        }
+        .into());
     }
 
     // Prefer operator action when dimensions match.
@@ -5668,9 +5752,12 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
                             ncols: p,
                         });
                     }
-                    return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                        "{label}: dense x_psi_psi fallback disabled by AnalyticOperatorRequired"
-                    ) }.into());
+                    return Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: format!(
+                            "{label}: dense x_psi_psi fallback disabled by AnalyticOperatorRequired"
+                        ),
+                    }
+                    .into());
                 }
                 DerivativeStorageMode::MaterializeIfSmall
                 | DerivativeStorageMode::DiagnosticsOnly => {
@@ -5689,10 +5776,13 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
                 ncols: p,
             });
         }
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{label}: x_psi_psi shape {:?} does not match ({n}, {p})",
-            x_ab.dim()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{label}: x_psi_psi shape {:?} does not match ({n}, {p})",
+                x_ab.dim()
+            ),
+        }
+        .into());
     }
 
     // No operator, no dense slot: treat as zero.
@@ -5799,11 +5889,14 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         match self.hessian_matvec(v)? {
             Some(result) => {
                 if result.len() != out.len() {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "hessian_matvec_into: result length {} != out length {}",
-                        result.len(),
-                        out.len()
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "hessian_matvec_into: result length {} != out length {}",
+                            result.len(),
+                            out.len()
+                        ),
+                    }
+                    .into());
                 }
                 out.assign(&result);
                 Ok(true)
@@ -5945,10 +6038,13 @@ impl<T> ExactNewtonJointPsiDirectCache<T> {
         F: FnOnce() -> Result<Option<T>, String>,
     {
         let Some(entry) = self.entries.get(index) else {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "psi cache index {index} out of bounds for size {}",
-                self.entries.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "psi cache index {index} out of bounds for size {}",
+                    self.entries.len()
+                ),
+            }
+            .into());
         };
         {
             let guard = entry
@@ -6150,11 +6246,14 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
 
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
         if v.len() != self.matrix.ncols() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "batched dense outer Hessian matvec length mismatch: got {}, expected {}",
-                v.len(),
-                self.matrix.ncols()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "batched dense outer Hessian matvec length mismatch: got {}, expected {}",
+                    v.len(),
+                    self.matrix.ncols()
+                ),
+            }
+            .into());
         }
         Ok(self.matrix.dot(v))
     }
@@ -6325,40 +6424,53 @@ impl From<CustomFamilyError> for String {
 
 fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     if specs.is_empty() {
-        return Err(CustomFamilyError::UnsupportedConfiguration { reason: "fit_custom_family requires at least one parameter block".to_string() }.into());
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: "fit_custom_family requires at least one parameter block".to_string(),
+        }
+        .into());
     }
     let mut penalty_counts = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
         let n = spec.design.nrows();
         if spec.offset.len() != n {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {b} offset length mismatch: got {}, expected {}",
-                spec.offset.len(),
-                n
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {b} offset length mismatch: got {}, expected {}",
+                    spec.offset.len(),
+                    n
+                ),
+            }
+            .into());
         }
         let p = spec.design.ncols();
         if let Some(beta0) = &spec.initial_beta
             && beta0.len() != p
         {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {b} initial_beta length mismatch: got {}, expected {p}",
-                beta0.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {b} initial_beta length mismatch: got {}, expected {p}",
+                    beta0.len()
+                ),
+            }
+            .into());
         }
         if spec.initial_log_lambdas.len() != spec.penalties.len() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {b} initial_log_lambdas length {} does not match penalties {}",
-                spec.initial_log_lambdas.len(),
-                spec.penalties.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {b} initial_log_lambdas length {} does not match penalties {}",
+                    spec.initial_log_lambdas.len(),
+                    spec.penalties.len()
+                ),
+            }
+            .into());
         }
         for (k, s) in spec.penalties.iter().enumerate() {
             let (r, c) = s.shape();
             if r != p || c != p {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "block {b} penalty {k} must be {p}x{p}, got {r}x{c}"
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!("block {b} penalty {k} must be {p}x{p}, got {r}x{c}"),
+                }
+                .into());
             }
         }
         penalty_counts.push(spec.penalties.len());
@@ -6376,25 +6488,34 @@ fn with_block_geometry<F: CustomFamily + ?Sized, T>(
     if family.block_geometry_is_dynamic() {
         let (x_dyn, off_dyn) = family.block_geometry(block_states, spec)?;
         if x_dyn.nrows() != spec.design.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {block_idx} dynamic design row mismatch: got {}, expected {}",
-                x_dyn.nrows(),
-                spec.design.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic design row mismatch: got {}, expected {}",
+                    x_dyn.nrows(),
+                    spec.design.nrows()
+                ),
+            }
+            .into());
         }
         if x_dyn.ncols() != spec.design.ncols() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {block_idx} dynamic design col mismatch: got {}, expected {}",
-                x_dyn.ncols(),
-                spec.design.ncols()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic design col mismatch: got {}, expected {}",
+                    x_dyn.ncols(),
+                    spec.design.ncols()
+                ),
+            }
+            .into());
         }
         if off_dyn.len() != spec.design.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {block_idx} dynamic offset length mismatch: got {}, expected {}",
-                off_dyn.len(),
-                spec.design.nrows()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} dynamic offset length mismatch: got {}, expected {}",
+                    off_dyn.len(),
+                    spec.design.nrows()
+                ),
+            }
+            .into());
         }
         f(&x_dyn, &off_dyn)
     } else {
@@ -6482,11 +6603,14 @@ fn expand_labeled_log_lambdas(
     layout: &PenaltyLabelLayout,
 ) -> Result<Array1<f64>, String> {
     if rho.len() != layout.initial_rho.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "log-lambda label coordinate mismatch: got {}, expected {}",
-            rho.len(),
-            layout.initial_rho.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "log-lambda label coordinate mismatch: got {}, expected {}",
+                rho.len(),
+                layout.initial_rho.len()
+            ),
+        }
+        .into());
     }
     let mut expanded = Array1::<f64>::zeros(layout.physical_count());
     for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
@@ -6508,11 +6632,14 @@ fn aggregate_labeled_gradient(
     layout: &PenaltyLabelLayout,
 ) -> Result<Array1<f64>, String> {
     if gradient.len() != layout.physical_count() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "physical gradient length mismatch: got {}, expected {}",
-            gradient.len(),
-            layout.physical_count()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "physical gradient length mismatch: got {}, expected {}",
+                gradient.len(),
+                layout.physical_count()
+            ),
+        }
+        .into());
     }
     let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
     for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
@@ -6526,13 +6653,16 @@ fn aggregate_labeled_hessian(
     layout: &PenaltyLabelLayout,
 ) -> Result<Array2<f64>, String> {
     if hessian.nrows() != layout.physical_count() || hessian.ncols() != layout.physical_count() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "physical Hessian shape mismatch: got {}x{}, expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            layout.physical_count(),
-            layout.physical_count()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "physical Hessian shape mismatch: got {}x{}, expected {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+                layout.physical_count(),
+                layout.physical_count()
+            ),
+        }
+        .into());
     }
     let mut out = Array2::<f64>::zeros((layout.initial_rho.len(), layout.initial_rho.len()));
     for (i, &oi) in layout.physical_to_outer.iter().enumerate() {
@@ -6566,9 +6696,12 @@ fn rho_prior_cost_gradient_hessian(
             }
             crate::types::RhoPrior::GammaPrecision { shape, rate } => {
                 if !shape.is_finite() || *shape <= 0.0 || !rate.is_finite() || *rate < 0.0 {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "{context} Gamma precision prior requires shape > 0 and rate >= 0"
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "{context} Gamma precision prior requires shape > 0 and rate >= 0"
+                        ),
+                    }
+                    .into());
                 }
                 let lambda = r.exp();
                 Ok((
@@ -6577,9 +6710,12 @@ fn rho_prior_cost_gradient_hessian(
                     *rate * lambda,
                 ))
             }
-            crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                "{context} must be a scalar rho prior, not a nested Independent prior"
-            ) }.into()),
+            crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
+                reason: format!(
+                    "{context} must be a scalar rho prior, not a nested Independent prior"
+                ),
+            }
+            .into()),
         }
     }
 
@@ -6601,11 +6737,14 @@ fn rho_prior_cost_gradient_hessian(
         }
         crate::types::RhoPrior::Independent(priors) => {
             if priors.len() != rho.len() {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "Independent rho prior length mismatch: got {}, expected {}",
-                    priors.len(),
-                    rho.len()
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "Independent rho prior length mismatch: got {}, expected {}",
+                        priors.len(),
+                        rho.len()
+                    ),
+                }
+                .into());
             }
             let mut cost = 0.0;
             let mut gradient = Array1::<f64>::zeros(rho.len());
@@ -6648,11 +6787,14 @@ fn add_labeled_rho_prior_to_outer_eval(
     result.objective += cost;
     if eval_mode != EvalMode::ValueOnly {
         if result.gradient.len() != gradient.len() {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "rho prior gradient length mismatch: got {}, expected {}",
-                gradient.len(),
-                result.gradient.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "rho prior gradient length mismatch: got {}, expected {}",
+                    gradient.len(),
+                    result.gradient.len()
+                ),
+            }
+            .into());
         }
         result.gradient += &gradient;
     }
@@ -6661,13 +6803,16 @@ fn add_labeled_rho_prior_to_outer_eval(
             result.outer_hessian = match result.outer_hessian.materialize_dense()? {
                 Some(mut base_hessian) => {
                     if base_hessian.raw_dim() != prior_hessian.raw_dim() {
-                        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                            "rho prior Hessian shape mismatch: got {}x{}, expected {}x{}",
-                            prior_hessian.nrows(),
-                            prior_hessian.ncols(),
-                            base_hessian.nrows(),
-                            base_hessian.ncols()
-                        ) }.into());
+                        return Err(CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "rho prior Hessian shape mismatch: got {}x{}, expected {}x{}",
+                                prior_hessian.nrows(),
+                                prior_hessian.ncols(),
+                                base_hessian.nrows(),
+                                base_hessian.ncols()
+                            ),
+                        }
+                        .into());
                     }
                     base_hessian += &prior_hessian;
                     crate::solver::outer_strategy::HessianResult::Analytic(base_hessian)
@@ -6685,10 +6830,13 @@ fn split_log_lambdas(
 ) -> Result<Vec<Array1<f64>>, String> {
     let expected: usize = penalty_counts.iter().sum();
     if flat.len() != expected {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "log-lambda length mismatch: got {}, expected {expected}",
-            flat.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "log-lambda length mismatch: got {}, expected {expected}",
+                flat.len()
+            ),
+        }
+        .into());
     }
     let mut out = Vec::with_capacity(penalty_counts.len());
     let mut at = 0usize;
@@ -6807,12 +6955,18 @@ fn weighted_normal_equations(
 ) -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
     let n = x.nrows();
     if w.len() != n {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "weighted normal-equation dimension mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "weighted normal-equation dimension mismatch".to_string(),
+        }
+        .into());
     }
     if let Some(y) = y_star
         && y.len() != n
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "weighted RHS dimension mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "weighted RHS dimension mismatch".to_string(),
+        }
+        .into());
     }
 
     let xtwx = x.compute_xtwx(w)?;
@@ -6835,7 +6989,10 @@ fn solve_blockweighted_system(
 ) -> Result<Array1<f64>, String> {
     let n = x.nrows();
     if y_star.len() != n || w.len() != n {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "weighted-system dimension mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "weighted-system dimension mismatch".to_string(),
+        }
+        .into());
     }
     let xtwy = x.compute_xtwy(w, y_star)?;
     x.solve_systemwith_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
@@ -6850,7 +7007,10 @@ fn solve_spd_systemwith_policy(
 ) -> Result<Array1<f64>, String> {
     let p = lhs.nrows();
     if lhs.ncols() != p || rhs.len() != p {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "exact-newton system dimension mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "exact-newton system dimension mismatch".to_string(),
+        }
+        .into());
     }
     let baseridge = if ridge_policy.include_laplacehessian {
         effective_solverridge(ridge_floor)
@@ -6914,7 +7074,10 @@ fn shift_linear_constraints_to_delta(
     beta: &Array1<f64>,
 ) -> Result<LinearInequalityConstraints, String> {
     if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
-        return Err(CustomFamilyError::ConstraintViolation { reason: "linear constraints: shape mismatch".to_string() }.into());
+        return Err(CustomFamilyError::ConstraintViolation {
+            reason: "linear constraints: shape mismatch".to_string(),
+        }
+        .into());
     }
     Ok(LinearInequalityConstraints {
         a: constraints.a.clone(),
@@ -6940,11 +7103,14 @@ fn assemble_joint_linear_constraints(
     total_p: usize,
 ) -> Result<Option<LinearInequalityConstraints>, String> {
     if block_constraints.len() != ranges.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint linear constraint assembly mismatch: {} blocks but {} ranges",
-            block_constraints.len(),
-            ranges.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint linear constraint assembly mismatch: {} blocks but {} ranges",
+                block_constraints.len(),
+                ranges.len()
+            ),
+        }
+        .into());
     }
     let total_rows = block_constraints
         .iter()
@@ -7065,9 +7231,7 @@ fn assemble_active_constraint_block(
     ranges: &[(usize, usize)],
     total_p: usize,
 ) -> Option<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock> {
-    if block_constraints.len() != ranges.len()
-        || block_active_sets.len() != ranges.len()
-    {
+    if block_constraints.len() != ranges.len() || block_active_sets.len() != ranges.len() {
         return None;
     }
     let mut active_per_block: Vec<(usize, &[usize], &LinearInequalityConstraints)> = Vec::new();
@@ -7124,7 +7288,10 @@ fn extract_simple_lower_bounds(
     p: usize,
 ) -> Result<Option<SimpleLowerBounds>, String> {
     if constraints.a.ncols() != p || constraints.a.nrows() != constraints.b.len() {
-        return Err(CustomFamilyError::ConstraintViolation { reason: "linear constraints: shape mismatch".to_string() }.into());
+        return Err(CustomFamilyError::ConstraintViolation {
+            reason: "linear constraints: shape mismatch".to_string(),
+        }
+        .into());
     }
     let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
     let mut coeff_to_row = vec![None; p];
@@ -7310,10 +7477,13 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         if self.working_response.len() != ctx.spec.design.nrows()
             || self.working_weights.len() != ctx.spec.design.nrows()
         {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "family diagonal working-set size mismatch on block {} ({})",
-                ctx.block_idx, ctx.spec.name
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "family diagonal working-set size mismatch on block {} ({})",
+                    ctx.block_idx, ctx.spec.name
+                ),
+            }
+            .into());
         }
 
         // Zero-weight observations are semantically excluded and must stay inactive.
@@ -7405,21 +7575,27 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
     ) -> Result<BlockUpdateResult, String> {
         let p = ctx.spec.design.ncols();
         if self.gradient.len() != p {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {} exact-newton gradient length mismatch: got {}, expected {p}",
-                ctx.block_idx,
-                self.gradient.len()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {} exact-newton gradient length mismatch: got {}, expected {p}",
+                    ctx.block_idx,
+                    self.gradient.len()
+                ),
+            }
+            .into());
         }
         if self.hessian.nrows() != p || self.hessian.ncols() != p {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "block {} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
-                ctx.block_idx,
-                self.hessian.nrows(),
-                self.hessian.ncols(),
-                p,
-                p
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "block {} exact-newton Hessian shape mismatch: got {}x{}, expected {}x{}",
+                    ctx.block_idx,
+                    self.hessian.nrows(),
+                    self.hessian.ncols(),
+                    p,
+                    p
+                ),
+            }
+            .into());
         }
 
         let lhs = self.hessian.add_dense(ctx.s_lambda)?;
@@ -7581,7 +7757,10 @@ fn check_linear_feasibility(
     tol: f64,
 ) -> Result<(), String> {
     if constraints.a.ncols() != beta.len() || constraints.a.nrows() != constraints.b.len() {
-        return Err(CustomFamilyError::ConstraintViolation { reason: "linear constraints: shape mismatch".to_string() }.into());
+        return Err(CustomFamilyError::ConstraintViolation {
+            reason: "linear constraints: shape mismatch".to_string(),
+        }
+        .into());
     }
     let slack = constraints.a.dot(beta) - &constraints.b;
     let mut worst = 0.0_f64;
@@ -7594,9 +7773,12 @@ fn check_linear_feasibility(
         }
     }
     if worst > tol {
-        return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-            "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx}"
-        ) }.into());
+        return Err(CustomFamilyError::ConstraintViolation {
+            reason: format!(
+                "infeasible iterate: max(Aβ-b violation)={worst:.3e} at constraint row {worst_idx}"
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -7799,7 +7981,8 @@ fn stable_logdet_with_ridge_policy(
                         .as_slice()
                         .map(|sl| sl.to_vec())
                         .unwrap_or_else(|| evals.iter().copied().collect());
-                    let eps = spectral_epsilon(&eval_vec).max(ridge.max(CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR));
+                    let eps = spectral_epsilon(&eval_vec)
+                        .max(ridge.max(CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR));
                     let n_negative = eval_vec.iter().filter(|&&ev| ev < -eps).count();
                     if n_negative > 0 {
                         // Diagnostic only: indefiniteness is now handled
@@ -7816,9 +7999,12 @@ fn stable_logdet_with_ridge_policy(
                         .sum();
                     Ok(logdet)
                 }
-                Err(eigh_err) => Err(CustomFamilyError::BasisDecompositionFailed { reason: format!(
-                    "smooth-regularized logdet eigendecomposition failed: {eigh_err}"
-                ) }.into()),
+                Err(eigh_err) => Err(CustomFamilyError::BasisDecompositionFailed {
+                    reason: format!(
+                        "smooth-regularized logdet eigendecomposition failed: {eigh_err}"
+                    ),
+                }
+                .into()),
             }
         }
     }
@@ -7915,12 +8101,15 @@ fn penalty_logdet_cholesky_fallback(
     // Mirror the original message: report the ridge that *would* have been
     // applied on the (MAX_ATTEMPTS+1)-th attempt, i.e. initial_boost * 10^MAX_ATTEMPTS.
     let final_boost = initial_boost * 10.0_f64.powi(MAX_ATTEMPTS as i32);
-    Err(CustomFamilyError::BasisDecompositionFailed { reason: format!(
-        "penalty logdet eigendecomposition failed for block {block} ({eigh_err}) and \
+    Err(CustomFamilyError::BasisDecompositionFailed {
+        reason: format!(
+            "penalty logdet eigendecomposition failed for block {block} ({eigh_err}) and \
          Cholesky fallback also failed after {MAX_ATTEMPTS} attempts \
          (final ridge={:.2e}, p={p})",
-        final_boost + existing_ridge,
-    ) }.into())
+            final_boost + existing_ridge,
+        ),
+    }
+    .into())
 }
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
@@ -7965,7 +8154,10 @@ fn inverse_spdwith_retry(
         }
     }
 
-    Err(CustomFamilyError::BasisDecompositionFailed { reason: "failed to invert SPD system after Cholesky ridge retries".to_string() }.into())
+    Err(CustomFamilyError::BasisDecompositionFailed {
+        reason: "failed to invert SPD system after Cholesky ridge retries".to_string(),
+    }
+    .into())
 }
 
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
@@ -7985,10 +8177,13 @@ fn validate_flat_direction_length(
     context: &str,
 ) -> Result<(), String> {
     if direction.len() != expected {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{context}: direction length mismatch: got {}, expected {expected}",
-            direction.len()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{context}: direction length mismatch: got {}, expected {expected}",
+                direction.len()
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -8392,12 +8587,15 @@ fn exact_joint_hessian_dense_bytes(total: usize) -> Result<usize, String> {
 fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Result<(), String> {
     let bytes = exact_joint_hessian_dense_bytes(total)?;
     if bytes > EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES {
-        return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-            "{context}: exact dense joint Hessian requires {:.2} GiB for dim={total}, \
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "{context}: exact dense joint Hessian requires {:.2} GiB for dim={total}, \
              exceeding the {:.2} GiB cap; refusing approximate determinant algebra",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
-        ) }.into());
+                bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                EXACT_JOINT_HESSIAN_DENSE_MAX_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -8476,9 +8674,10 @@ fn materialize_joint_hessian_source(
                     ) }.into());
                 }
                 if matrix.iter().any(|value| !value.is_finite()) {
-                    return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                        "{context}: dense_forced returned non-finite values"
-                    ) }.into());
+                    return Err(CustomFamilyError::NumericalFailure {
+                        reason: format!("{context}: dense_forced returned non-finite values"),
+                    }
+                    .into());
                 }
                 symmetrize_dense_in_place(&mut matrix);
                 return Ok(matrix);
@@ -8490,16 +8689,20 @@ fn materialize_joint_hessian_source(
                 let applied = apply(&basis)?;
                 basis[col] = 0.0;
                 if applied.len() != total {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "{context}: operator matvec length mismatch: got {}, expected {}",
-                        applied.len(),
-                        total
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "{context}: operator matvec length mismatch: got {}, expected {}",
+                            applied.len(),
+                            total
+                        ),
+                    }
+                    .into());
                 }
                 if applied.iter().any(|value| !value.is_finite()) {
-                    return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                        "{context}: operator matvec returned non-finite values"
-                    ) }.into());
+                    return Err(CustomFamilyError::NumericalFailure {
+                        reason: format!("{context}: operator matvec returned non-finite values"),
+                    }
+                    .into());
                 }
                 matrix.column_mut(col).assign(&applied);
             }
@@ -8516,16 +8719,20 @@ fn exact_newton_joint_hessian_source_from_workspace(
 ) -> Result<Option<JointHessianSource>, String> {
     if let Some(mut hessian) = workspace.hessian_dense()? {
         if hessian.nrows() != total || hessian.ncols() != total {
-            return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "{context}: dense Hessian shape mismatch: got {}x{}, expected {total}x{total}",
-                hessian.nrows(),
-                hessian.ncols()
-            ) }.into());
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "{context}: dense Hessian shape mismatch: got {}x{}, expected {total}x{total}",
+                    hessian.nrows(),
+                    hessian.ncols()
+                ),
+            }
+            .into());
         }
         if hessian.iter().any(|value| !value.is_finite()) {
-            return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                "{context}: dense Hessian contains non-finite values"
-            ) }.into());
+            return Err(CustomFamilyError::NumericalFailure {
+                reason: format!("{context}: dense Hessian contains non-finite values"),
+            }
+            .into());
         }
         symmetrize_dense_in_place(&mut hessian);
         return Ok(Some(JointHessianSource::Dense(hessian)));
@@ -8535,16 +8742,20 @@ fn exact_newton_joint_hessian_source_from_workspace(
         return Ok(None);
     };
     if diagonal.len() != total {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{context}: operator diagonal length mismatch: got {}, expected {}",
-            diagonal.len(),
-            total
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{context}: operator diagonal length mismatch: got {}, expected {}",
+                diagonal.len(),
+                total
+            ),
+        }
+        .into());
     }
     if diagonal.iter().any(|value| !value.is_finite()) {
-        return Err(CustomFamilyError::NumericalFailure { reason: format!(
-            "{context}: operator diagonal contains non-finite values"
-        ) }.into());
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!("{context}: operator diagonal contains non-finite values"),
+        }
+        .into());
     }
 
     let zero = Array1::<f64>::zeros(total);
@@ -8552,16 +8763,20 @@ fn exact_newton_joint_hessian_source_from_workspace(
         return Ok(None);
     };
     if zero_image.len() != total {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "{context}: operator matvec length mismatch: got {}, expected {}",
-            zero_image.len(),
-            total
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "{context}: operator matvec length mismatch: got {}, expected {}",
+                zero_image.len(),
+                total
+            ),
+        }
+        .into());
     }
     if zero_image.iter().any(|value| !value.is_finite()) {
-        return Err(CustomFamilyError::NumericalFailure { reason: format!(
-            "{context}: operator matvec returned non-finite values"
-        ) }.into());
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!("{context}: operator matvec returned non-finite values"),
+        }
+        .into());
     }
 
     let workspace_apply = Arc::clone(workspace);
@@ -8573,47 +8788,68 @@ fn exact_newton_joint_hessian_source_from_workspace(
     Ok(Some(JointHessianSource::Operator {
         apply: Arc::new(move |v: &Array1<f64>| {
             if v.len() != total {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "{}: operator input length mismatch: got {}, expected {total}",
-                    &*context_apply,
-                    v.len()
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{}: operator input length mismatch: got {}, expected {total}",
+                        &*context_apply,
+                        v.len()
+                    ),
+                }
+                .into());
             }
             let Some(out) = workspace_apply.hessian_matvec(v)? else {
-                return Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton operator matvec unavailable".to_string() }.into());
+                return Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: "joint exact-newton operator matvec unavailable".to_string(),
+                }
+                .into());
             };
             if out.len() != total {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "{}: operator matvec length mismatch: got {}, expected {total}",
-                    &*context_apply,
-                    out.len()
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{}: operator matvec length mismatch: got {}, expected {total}",
+                        &*context_apply,
+                        out.len()
+                    ),
+                }
+                .into());
             }
             if out.iter().any(|value| !value.is_finite()) {
-                return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                    "{}: operator matvec returned non-finite values",
-                    &*context_apply
-                ) }.into());
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: format!(
+                        "{}: operator matvec returned non-finite values",
+                        &*context_apply
+                    ),
+                }
+                .into());
             }
             Ok(out)
         }),
         apply_into: Arc::new(move |v: &Array1<f64>, out: &mut Array1<f64>| {
             if v.len() != total || out.len() != total {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "{}: operator input/output length mismatch: v={} out={} expected={total}",
-                    &*context_apply_into,
-                    v.len(),
-                    out.len()
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{}: operator input/output length mismatch: v={} out={} expected={total}",
+                        &*context_apply_into,
+                        v.len(),
+                        out.len()
+                    ),
+                }
+                .into());
             }
             if !workspace_apply_into.hessian_matvec_into(v, out)? {
-                return Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton operator matvec unavailable".to_string() }.into());
+                return Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: "joint exact-newton operator matvec unavailable".to_string(),
+                }
+                .into());
             }
             if out.iter().any(|value| !value.is_finite()) {
-                return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                    "{}: operator matvec returned non-finite values",
-                    &*context_apply_into
-                ) }.into());
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: format!(
+                        "{}: operator matvec returned non-finite values",
+                        &*context_apply_into
+                    ),
+                }
+                .into());
             }
             Ok(())
         }),
@@ -8630,10 +8866,13 @@ fn exact_newton_joint_hessian_source_from_workspace(
                         ) }.into());
                     }
                     if matrix.iter().any(|value| !value.is_finite()) {
-                        return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                            "{}: hessian_dense_forced returned non-finite values",
-                            &*context_dense_forced
-                        ) }.into());
+                        return Err(CustomFamilyError::NumericalFailure {
+                            reason: format!(
+                                "{}: hessian_dense_forced returned non-finite values",
+                                &*context_dense_forced
+                            ),
+                        }
+                        .into());
                     }
                     symmetrize_dense_in_place(&mut matrix);
                     Ok(Some(matrix))
@@ -8659,7 +8898,10 @@ fn symmetrized_square_matrix(
         ));
     }
     if matrix.iter().any(|value| !value.is_finite()) {
-        return Err(CustomFamilyError::NumericalFailure { reason: format!("{context}: matrix contains non-finite values") }.into());
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!("{context}: matrix contains non-finite values"),
+        }
+        .into());
     }
     symmetrize_dense_in_place(&mut matrix);
     Ok(matrix)
@@ -8854,26 +9096,28 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
     {
         let beta_flat = flatten_state_betas(block_states, specs);
 
-        let compute_dh =
-            Box::new(
-                move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-                    let h_rho = family
-                        .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
-                            block_states,
-                            specs,
-                            v_k,
-                        )?;
-                    match h_rho {
-                        Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
-                            h,
-                            total,
-                            "joint surrogate dH shape mismatch",
-                        )?))),
-                        None => Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint surrogate dH unavailable for analytic outer gradient"
-                            .to_string() }.into()),
+        let compute_dh = Box::new(
+            move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                let h_rho = family
+                    .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                        block_states,
+                        specs,
+                        v_k,
+                    )?;
+                match h_rho {
+                    Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                        h,
+                        total,
+                        "joint surrogate dH shape mismatch",
+                    )?))),
+                    None => Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: "joint surrogate dH unavailable for analytic outer gradient"
+                            .to_string(),
                     }
-                },
-            );
+                    .into()),
+                }
+            },
+        );
         let compute_d2h = Box::new(
             move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
                 match family
@@ -8895,25 +9139,27 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         let family_owned = family.clone();
         let states_owned = block_states.to_vec();
         let specs_owned = specs.to_vec();
-        let owned_compute_dh =
-            Arc::new(
-                move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
-                    match family_owned
-                        .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
-                            &states_owned,
-                            &specs_owned,
-                            v_k,
-                        )? {
-                        Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
-                            h,
-                            total,
-                            "joint surrogate dH shape mismatch",
-                        )?))),
-                        None => Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint surrogate dH unavailable for analytic outer gradient"
-                            .to_string() }.into()),
+        let owned_compute_dh = Arc::new(
+            move |v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> {
+                match family_owned
+                    .joint_outer_hyper_surrogate_hessian_directional_derivative_with_specs(
+                        &states_owned,
+                        &specs_owned,
+                        v_k,
+                    )? {
+                    Some(h) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                        h,
+                        total,
+                        "joint surrogate dH shape mismatch",
+                    )?))),
+                    None => Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: "joint surrogate dH unavailable for analytic outer gradient"
+                            .to_string(),
                     }
-                },
-            );
+                    .into()),
+                }
+            },
+        );
         let family_owned = family.clone();
         let states_owned = block_states.to_vec();
         let specs_owned = specs.to_vec();
@@ -8975,7 +9221,10 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
             return match h_rho {
                 Some(h) => {
                     if h.iter().any(|v| !v.is_finite()) {
-                        Err(CustomFamilyError::NumericalFailure { reason: "joint exact-newton dH returned non-finite values".to_string() }.into())
+                        Err(CustomFamilyError::NumericalFailure {
+                            reason: "joint exact-newton dH returned non-finite values".to_string(),
+                        }
+                        .into())
                     } else {
                         let mut sym = symmetrized_square_matrix(
                             h,
@@ -8988,9 +9237,11 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
                         Ok(Some(DriftDerivResult::Dense(sym)))
                     }
                 }
-                None => {
-                    Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string() }.into())
+                None => Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: "joint exact-newton dH unavailable for analytic outer gradient"
+                        .to_string(),
                 }
+                .into()),
             };
         }
 
@@ -9010,7 +9261,10 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
         )? {
             Some(h) => {
                 if h.iter().any(|v| !v.is_finite()) {
-                    Err(CustomFamilyError::NumericalFailure { reason: "joint exact-newton dH returned non-finite values".to_string() }.into())
+                    Err(CustomFamilyError::NumericalFailure {
+                        reason: "joint exact-newton dH returned non-finite values".to_string(),
+                    }
+                    .into())
                 } else {
                     let mut sym = symmetrized_square_matrix(
                         h,
@@ -9023,9 +9277,10 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
                     Ok(Some(DriftDerivResult::Dense(sym)))
                 }
             }
-            None => {
-                Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string() }.into())
+            None => Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
             }
+            .into()),
         }
     }
 }
@@ -9138,9 +9393,11 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
                     }
                     Ok(Some(DriftDerivResult::Dense(sym)))
                 }
-                None => {
-                    Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string() }.into())
+                None => Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: "joint exact-newton dH unavailable for analytic outer gradient"
+                        .to_string(),
                 }
+                .into()),
             };
         }
 
@@ -9166,9 +9423,10 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
                 }
                 Ok(Some(DriftDerivResult::Dense(sym)))
             }
-            None => {
-                Err(CustomFamilyError::UnsupportedConfiguration { reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string() }.into())
+            None => Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: "joint exact-newton dH unavailable for analytic outer gradient".to_string(),
             }
+            .into()),
         }
     })
 }
@@ -10374,12 +10632,15 @@ fn joint_constrained_preconditioned_descent_delta(
     active_rows: Option<&[usize]>,
 ) -> Result<Option<(Array1<f64>, Vec<usize>)>, String> {
     if rhs.len() != beta_joint.len() || constraints.a.ncols() != beta_joint.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint constrained descent dimension mismatch: rhs={}, beta={}, A_cols={}",
-            rhs.len(),
-            beta_joint.len(),
-            constraints.a.ncols()
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint constrained descent dimension mismatch: rhs={}, beta={}, A_cols={}",
+                rhs.len(),
+                beta_joint.len(),
+                constraints.a.ncols()
+            ),
+        }
+        .into());
     }
     let base_diagonal = match source {
         JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),
@@ -10626,32 +10887,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // strictly serial because each accepted block update changes the state seen
     // by later blocks.
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let s_lambdas = (0..specs.len())
-        .into_par_iter()
-        .map(|b| {
-            let spec = &specs[b];
-            let Some(block_log_lambda) = block_log_lambdas.get(b) else {
-                return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                    "missing log-smoothing parameter vector for block {b}"
-                ) }.into());
-            };
-            if block_log_lambda.len() != spec.penalties.len() {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+    let s_lambdas =
+        (0..specs.len())
+            .into_par_iter()
+            .map(|b| {
+                let spec = &specs[b];
+                let Some(block_log_lambda) = block_log_lambdas.get(b) else {
+                    return Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: format!("missing log-smoothing parameter vector for block {b}"),
+                    }
+                    .into());
+                };
+                if block_log_lambda.len() != spec.penalties.len() {
+                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                     "block {b} log-smoothing parameter length {} does not match penalties {}",
                     block_log_lambda.len(),
                     spec.penalties.len()
                 ) }.into());
-            }
+                }
 
-            let p = spec.design.ncols();
-            let lambdas = block_log_lambda.mapv(f64::exp);
-            let mut s_lambda = Array2::<f64>::zeros((p, p));
-            for (k, s) in spec.penalties.iter().enumerate() {
-                s.add_scaled_to(lambdas[k], &mut s_lambda);
-            }
-            Ok(s_lambda)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+                let p = spec.design.ncols();
+                let lambdas = block_log_lambda.mapv(f64::exp);
+                let mut s_lambda = Array2::<f64>::zeros((p, p));
+                for (k, s) in spec.penalties.iter().enumerate() {
+                    s.add_scaled_to(lambdas[k], &mut s_lambda);
+                }
+                Ok(s_lambda)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     let ridge = effective_solverridge(options.ridge_floor);
     let mut cached_active_sets: Vec<Option<Vec<usize>>> = vec![None; specs.len()];
     if let Some(seed) = warm_start
@@ -10694,12 +10957,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             };
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
-                let local_total_p = local_ranges
-                    .last()
-                    .map(|(_, end)| *end)
-                    .unwrap_or(0);
-                let block_constraints =
-                    collect_block_linear_constraints(family, &states, specs)?;
+                let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 assemble_active_constraint_block(
                     &block_constraints,
                     &cached_active_sets,
@@ -12843,8 +13102,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // case the consumer-side `with_active_constraints` helper
             // degrades back to the bare penalty-projected pseudo-inverse.
             let active_constraints = {
-                let block_constraints =
-                    collect_block_linear_constraints(family, &states, specs)?;
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 assemble_active_constraint_block(
                     &block_constraints,
                     &cached_active_sets,
@@ -12979,10 +13237,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let active_constraints = {
                 let local_ranges = block_param_ranges(specs);
-                let local_total_p =
-                    local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
-                let block_constraints =
-                    collect_block_linear_constraints(family, &states, specs)?;
+                let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
                 assemble_active_constraint_block(
                     &block_constraints,
                     &cached_active_sets,
@@ -14881,31 +15137,46 @@ fn joint_outer_evaluate(
             include_logdet_s,
             rho_curvature_scale,
         );
-        return Err(CustomFamilyError::NumericalFailure { reason: "joint outer evaluation produced a non-finite objective".to_string() }.into());
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "joint outer evaluation produced a non-finite objective".to_string(),
+        }
+        .into());
     }
     if grad.iter().any(|value| !value.is_finite()) {
-        return Err(CustomFamilyError::NumericalFailure { reason: "joint outer evaluation produced a non-finite gradient".to_string() }.into());
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "joint outer evaluation produced a non-finite gradient".to_string(),
+        }
+        .into());
     }
     if grad.len() != expected_theta_dim {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint outer evaluation returned gradient length {}, expected {}",
-            grad.len(),
-            expected_theta_dim
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint outer evaluation returned gradient length {}, expected {}",
+                grad.len(),
+                expected_theta_dim
+            ),
+        }
+        .into());
     }
     match &outer_hessian {
         crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
-                return Err(CustomFamilyError::NumericalFailure { reason: "joint outer evaluation produced a non-finite Hessian".to_string() }.into());
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: "joint outer evaluation produced a non-finite Hessian".to_string(),
+                }
+                .into());
             }
             if hessian.nrows() != expected_theta_dim || hessian.ncols() != expected_theta_dim {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "joint outer evaluation returned Hessian shape {}x{}, expected {}x{}",
-                    hessian.nrows(),
-                    hessian.ncols(),
-                    expected_theta_dim,
-                    expected_theta_dim
-                ) }.into());
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "joint outer evaluation returned Hessian shape {}x{}, expected {}x{}",
+                        hessian.nrows(),
+                        hessian.ncols(),
+                        expected_theta_dim,
+                        expected_theta_dim
+                    ),
+                }
+                .into());
             }
         }
         crate::solver::outer_strategy::HessianResult::Operator(op) => {
@@ -16452,32 +16723,41 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper derivative block count mismatch: got {}, expected {}",
+                derivative_blocks.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
 
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper penalty-count block mismatch: got {}, expected {}",
-            penalty_counts.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper penalty-count block mismatch: got {}, expected {}",
+                penalty_counts.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
-            rho_current.len(),
-            rho_dim,
-            psi_dim
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+                rho_current.len(),
+                rho_dim,
+                psi_dim
+            )
+            .into(),
+        }
+        .into());
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
@@ -16488,16 +16768,19 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
-        return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-            "custom-family inner solve did not converge after {} cycle(s); \
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "custom-family inner solve did not converge after {} cycle(s); \
              refusing to expose profile objective derivatives for theta_dim={} \
              (rho_dim={}, psi_dim={}). The analytic outer gradient/Hessian \
              require the inner KKT equation F_beta(beta, theta)=0; returning \
              a value with zero or shape-only derivatives is mathematically \
              inconsistent.",
-            inner.cycles, theta_dim, rho_dim, psi_dim
-        )
-        .into() }.into());
+                inner.cycles, theta_dim, rho_dim, psi_dim
+            )
+            .into(),
+        }
+        .into());
     }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
@@ -17201,11 +17484,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         )
                     })?;
                 if dw.len() != n {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "block {b} diagonal dW length mismatch: got {}, expected {}",
-                        dw.len(),
-                        n
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "block {b} diagonal dW length mismatch: got {}, expected {}",
+                            dw.len(),
+                            n
+                        ),
+                    }
+                    .into());
                 }
                 let mut scaled_x = x_dense.clone();
                 ndarray::Zip::from(scaled_x.rows_mut())
@@ -17304,11 +17590,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         )
                     })?;
                 if d2w.len() != n {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "block {b} diagonal d2W length mismatch: got {}, expected {}",
-                        d2w.len(),
-                        n
-                    ) }.into());
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "block {b} diagonal d2W length mismatch: got {}, expected {}",
+                            d2w.len(),
+                            n
+                        ),
+                    }
+                    .into());
                 }
                 let mut scaled_x = x_dense.clone();
                 ndarray::Zip::from(scaled_x.rows_mut())
@@ -17533,20 +17822,26 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     CustomFamilyError,
 > {
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper derivative block count mismatch: got {}, expected {}",
+                derivative_blocks.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
     if penalty_counts.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper penalty-count block mismatch: got {}, expected {}",
-            penalty_counts.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper penalty-count block mismatch: got {}, expected {}",
+                penalty_counts.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -17557,13 +17852,16 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         ));
     }
     if rho_current.len() != rho_dim {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
-            rho_current.len(),
-            rho_dim,
-            psi_dim
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper rho dimension mismatch: got {}, expected {} (psi={})",
+                rho_current.len(),
+                rho_dim,
+                psi_dim
+            )
+            .into(),
+        }
+        .into());
     }
 
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
@@ -17871,12 +18169,15 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper derivative block count mismatch: got {}, expected {}",
+                derivative_blocks.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -17919,12 +18220,15 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
 ) -> Result<CustomFamilyJointHyperEfsResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
     if derivative_blocks.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "joint hyper derivative block count mismatch: got {}, expected {}",
-            derivative_blocks.len(),
-            specs.len()
-        )
-        .into() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "joint hyper derivative block count mismatch: got {}, expected {}",
+                derivative_blocks.len(),
+                specs.len()
+            )
+            .into(),
+        }
+        .into());
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -18224,11 +18528,14 @@ fn set_states_from_flat_beta(
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     if beta_flat.len() != total {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "flat beta length mismatch: got {}, expected {}",
-            beta_flat.len(),
-            total
-        ) }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "flat beta length mismatch: got {}, expected {}",
+                beta_flat.len(),
+                total
+            ),
+        }
+        .into());
     }
     for (b, (start, end)) in ranges.into_iter().enumerate() {
         states[b]
@@ -18473,10 +18780,16 @@ fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>(
     block_active_sets: Option<&[Option<Vec<usize>>]>,
 ) -> Result<Option<f64>, String> {
     if eval.blockworking_sets.len() != states.len() || states.len() != s_lambdas.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "exact-newton joint stationarity check: block dimension mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "exact-newton joint stationarity check: block dimension mismatch".to_string(),
+        }
+        .into());
     }
     if specs.len() != states.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: "exact-newton joint stationarity check: spec/state count mismatch".to_string() }.into());
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: "exact-newton joint stationarity check: spec/state count mismatch".to_string(),
+        }
+        .into());
     }
     if let Some(sets) = block_active_sets
         && sets.len() != states.len()

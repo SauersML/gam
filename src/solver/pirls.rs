@@ -5129,8 +5129,7 @@ where
                             last_deviance_change = 0.0;
                             last_step_size = 0.0;
                             last_step_halving = attempts;
-                            max_abs_eta =
-                                inf_norm(state.eta.iter().copied());
+                            max_abs_eta = inf_norm(state.eta.iter().copied());
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
                             final_state = Some(state);
@@ -9745,7 +9744,11 @@ mod tests {
         assert_eq!(sym_rebuilt.row_idx(), sym_mut.row_idx());
         assert_eq!(val_rebuilt.len(), val_mut.len());
         for (a, b) in val_rebuilt.iter().zip(val_mut.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits(), "value buffers must be bit-identical");
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "value buffers must be bit-identical"
+            );
         }
 
         // Successive deltas accumulate correctly (LM trajectory simulation).
@@ -9768,12 +9771,9 @@ mod tests {
 
         // Missing diagonal entries are reported as an error rather than
         // silently fixed up — callers must materialize diagonals first.
-        let off_only = SparseColMat::<usize, f64>::try_new_from_triplets(
-            2,
-            2,
-            &[Triplet::new(0, 1, 1.0)],
-        )
-        .unwrap();
+        let off_only =
+            SparseColMat::<usize, f64>::try_new_from_triplets(2, 2, &[Triplet::new(0, 1, 1.0)])
+                .unwrap();
         let mut missing = off_only.clone();
         assert!(super::update_sparse_diagonal_in_place(&mut missing, 1.0).is_err());
     }

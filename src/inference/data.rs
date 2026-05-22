@@ -530,11 +530,7 @@ fn infer_delimited_column(
                 row: row_idx + 1,
                 col,
                 error: DataError::EmptyInput {
-                    reason: format!(
-                        "empty field at row {}, column '{}'",
-                        row_idx + 1,
-                        header
-                    ),
+                    reason: format!("empty field at row {}, column '{}'", row_idx + 1, header),
                 },
             });
         }
@@ -971,10 +967,7 @@ fn parse_cell_with_schema(
     };
     if !val.is_finite() {
         return Err(DataError::InvalidValue {
-            reason: format!(
-                "non-finite value at row {}, column '{}'",
-                row, col_name
-            ),
+            reason: format!("non-finite value at row {}, column '{}'", row, col_name),
         });
     }
     Ok(val)
@@ -1040,19 +1033,15 @@ fn decode_parquet_batch_column(
         // Dictionary-encoded strings are not directly a StringArray. Cast only
         // those remaining string-like arrays rather than falling back for every
         // Utf8/LargeUtf8 column.
-        let casted = arrow::compute::cast(col, &DataType::Utf8).map_err(|e| {
-            DataError::ParseError {
+        let casted =
+            arrow::compute::cast(col, &DataType::Utf8).map_err(|e| DataError::ParseError {
                 reason: format!("failed to cast column '{}' to string: {e}", header),
-            }
-        })?;
+            })?;
         let arr = casted
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or_else(|| DataError::EncodingFailure {
-                reason: format!(
-                    "column '{}' could not be read as string after cast",
-                    header
-                ),
+                reason: format!("column '{}' could not be read as string after cast", header),
             })?;
         return Ok(ParquetBatchColumn::Strings(
             (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
@@ -1160,12 +1149,13 @@ fn load_parquet_inferred(
         .collect::<Vec<_>>();
     let projection =
         ProjectionMask::roots(builder.parquet_schema(), selected_indices.iter().copied());
-    let reader = builder
-        .with_projection(projection)
-        .build()
-        .map_err(|e| DataError::ParseError {
-            reason: format!("failed to build parquet reader: {e}"),
-        })?;
+    let reader =
+        builder
+            .with_projection(projection)
+            .build()
+            .map_err(|e| DataError::ParseError {
+                reason: format!("failed to build parquet reader: {e}"),
+            })?;
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     if open_ms > 100.0 {
@@ -1498,8 +1488,7 @@ pub fn encode_recordswith_schema(
         let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
             *s
         } else {
-            inferred_for_extra =
-                infer_schema_column(name, &records, j).map_err(String::from)?;
+            inferred_for_extra = infer_schema_column(name, &records, j).map_err(String::from)?;
             &inferred_for_extra
         };
         column_kinds.push(col_schema.kind);
@@ -1594,11 +1583,7 @@ pub fn encode_recordswith_schema(
             };
             if !val.is_finite() {
                 return Err(DataError::InvalidValue {
-                    reason: format!(
-                        "non-finite value at row {}, column '{}'",
-                        i + 1,
-                        name
-                    ),
+                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
                 }
                 .into());
             }
@@ -1638,11 +1623,7 @@ fn infer_schema_column(
         if let Ok(v) = raw.parse::<f64>() {
             if !v.is_finite() {
                 return Err(DataError::InvalidValue {
-                    reason: format!(
-                        "non-finite value at row {}, column '{}'",
-                        i + 1,
-                        name
-                    ),
+                    reason: format!("non-finite value at row {}, column '{}'", i + 1, name),
                 });
             }
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {

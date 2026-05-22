@@ -7,9 +7,9 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
 use crate::estimate::{BlockRole, PredictInput};
-use crate::linalg::utils::inf_norm;
 use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
+use crate::families::survival_predict::SurvivalPredictError;
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
@@ -17,10 +17,10 @@ use crate::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
     transformation_normal_pit_score,
 };
-use crate::families::survival_predict::SurvivalPredictError;
 use crate::inference::model::{
     FittedModel, FittedModelError, PredictModelClass, append_deployment_extension_columns,
 };
+use crate::linalg::utils::inf_norm;
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
 use crate::term_builder::resolve_role_col;
@@ -81,7 +81,9 @@ impl From<SurvivalPredictError> for PredictInputError {
     /// `fit_result_from_saved_model_for_prediction`) emit their own typed
     /// errors; flatten them to `InvalidInput` preserving the rendered text.
     fn from(err: SurvivalPredictError) -> PredictInputError {
-        PredictInputError::InvalidInput { reason: err.to_string() }
+        PredictInputError::InvalidInput {
+            reason: err.to_string(),
+        }
     }
 }
 
@@ -91,7 +93,9 @@ impl From<FittedModelError> for PredictInputError {
     /// predict-input boundary forwards as `InvalidInput` with the original
     /// rendered text.
     fn from(err: FittedModelError) -> PredictInputError {
-        PredictInputError::InvalidInput { reason: err.to_string() }
+        PredictInputError::InvalidInput {
+            reason: err.to_string(),
+        }
     }
 }
 
@@ -175,10 +179,11 @@ fn build_predict_input_for_model_inner(
     )?;
     let clipped = model.axis_clip_to_training_ranges(data, col_map);
     let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
-    let design = build_term_collection_design(design_input, &spec)
-        .map_err(|e| PredictInputError::InvalidInput {
+    let design = build_term_collection_design(design_input, &spec).map_err(|e| {
+        PredictInputError::InvalidInput {
             reason: format!("failed to build prediction design: {e}"),
-        })?;
+        }
+    })?;
     let n = data.nrows();
     if offset.len() != n || offset_noise.len() != n {
         return Err(PredictInputError::DimensionMismatch {
@@ -279,12 +284,13 @@ fn build_predict_input_for_model_inner(
             })
         }
         PredictModelClass::BernoulliMarginalSlope => {
-            let z_name = model
-                .z_column
-                .as_ref()
-                .ok_or_else(|| PredictInputError::MissingMetadata {
-                    reason: "marginal-slope model is missing z_column".to_string(),
-                })?;
+            let z_name =
+                model
+                    .z_column
+                    .as_ref()
+                    .ok_or_else(|| PredictInputError::MissingMetadata {
+                        reason: "marginal-slope model is missing z_column".to_string(),
+                    })?;
             let z_col = resolve_role_col(col_map, z_name, "z")?;
             let z = data.column(z_col).to_owned();
             let spec_logslope = resolve_termspec_for_prediction(
@@ -321,12 +327,14 @@ fn build_predict_input_for_model_inner(
                 });
             }
             let payload = model.payload();
-            let response_knots = payload
-                .transformation_response_knots
-                .as_ref()
-                .ok_or_else(|| PredictInputError::MissingMetadata {
-                    reason: "saved transformation-normal model missing response_knots".to_string(),
-                })?;
+            let response_knots =
+                payload
+                    .transformation_response_knots
+                    .as_ref()
+                    .ok_or_else(|| PredictInputError::MissingMetadata {
+                        reason: "saved transformation-normal model missing response_knots"
+                            .to_string(),
+                    })?;
             let response_transform_vecs = payload
                 .transformation_response_transform
                 .as_ref()
@@ -334,16 +342,16 @@ fn build_predict_input_for_model_inner(
                     reason: "saved transformation-normal model missing response_transform"
                         .to_string(),
                 })?;
-            let response_degree = payload
-                .transformation_response_degree
-                .ok_or_else(|| PredictInputError::MissingMetadata {
+            let response_degree = payload.transformation_response_degree.ok_or_else(|| {
+                PredictInputError::MissingMetadata {
                     reason: "saved transformation-normal model missing response_degree".to_string(),
-                })?;
-            let response_median = payload
-                .transformation_response_median
-                .ok_or_else(|| PredictInputError::MissingMetadata {
+                }
+            })?;
+            let response_median = payload.transformation_response_median.ok_or_else(|| {
+                PredictInputError::MissingMetadata {
                     reason: "saved transformation-normal model missing response_median".to_string(),
-                })?;
+                }
+            })?;
 
             let t_rows = response_transform_vecs.len();
             let t_cols = if t_rows > 0 {
@@ -385,7 +393,9 @@ fn build_predict_input_for_model_inner(
                 response_degree,
                 BasisOptions::i_spline(),
             )
-            .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
+            .map_err(|e| PredictInputError::InvalidInput {
+                reason: e.to_string(),
+            })?;
             let raw_val = raw_val_basis.as_ref().clone();
             if raw_val.ncols() != resp_transform.nrows() {
                 return Err(PredictInputError::DimensionMismatch {
@@ -409,7 +419,9 @@ fn build_predict_input_for_model_inner(
                 response_degree,
                 1,
             )
-            .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
+            .map_err(|e| PredictInputError::InvalidInput {
+                reason: e.to_string(),
+            })?;
             if raw_deriv.ncols() != resp_transform.nrows() {
                 return Err(PredictInputError::DimensionMismatch {
                     reason: format!(
@@ -448,10 +460,13 @@ fn build_predict_input_for_model_inner(
                 .map_err(|e| PredictInputError::DimensionMismatch {
                     reason: format!("beta reshape failed: {e}"),
                 })?;
-            let cov_mat = design
-                .design
-                .try_row_chunk(0..n)
-                .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
+            let cov_mat =
+                design
+                    .design
+                    .try_row_chunk(0..n)
+                    .map_err(|e| PredictInputError::InvalidInput {
+                        reason: e.to_string(),
+                    })?;
             let calibration = payload
                 .transformation_score_calibration
                 .as_ref()
