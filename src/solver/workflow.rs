@@ -57,6 +57,57 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+/// Typed error category for the `solver::workflow` materialization and
+/// fitting pipeline.
+///
+/// Every variant's `Display` impl is byte-equivalent to the original
+/// `format!(...)`/`.to_string()` text the module emitted before the typed
+/// migration. The category split lets internal callers reason about the
+/// failure kind without parsing strings; public entry points keep their
+/// `Result<_, String>` signatures and rely on `From<WorkflowError> for
+/// String` at the boundary.
+#[derive(Debug, Clone)]
+pub enum WorkflowError {
+    /// Fit configuration is internally inconsistent or selects an
+    /// unsupported combination (conflicting `family`/`link`, unsupported
+    /// `linkwiggle(...)`/`link(...)` placement, `frailty` requested for a
+    /// family that does not implement it, duplicate or out-of-range
+    /// hyperpriors, etc.).
+    InvalidConfig { reason: String },
+    /// Saved-model or runtime block dimensions disagree with what the
+    /// rebuilt designs / penalties expect (initial beta length, penalty
+    /// block shape vs range width, time-basis column count, response
+    /// support mismatch).
+    SchemaMismatch { reason: String },
+    /// A required input column, frailty parameter, baseline target, or
+    /// cause count is missing for the requested mode (e.g. cause-specific
+    /// fit with one cause, latent-cloglog without a fixed sigma).
+    MissingDependency { reason: String },
+    /// An underlying numerical step (PIRLS / smoothing-parameter
+    /// optimizer / profile-cost evaluation) failed to converge or
+    /// produced a non-finite value that downstream code cannot consume.
+    IntegrationFailed { reason: String },
+}
+
+impl std::fmt::Display for WorkflowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkflowError::InvalidConfig { reason }
+            | WorkflowError::SchemaMismatch { reason }
+            | WorkflowError::MissingDependency { reason }
+            | WorkflowError::IntegrationFailed { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for WorkflowError {}
+
+impl From<WorkflowError> for String {
+    fn from(err: WorkflowError) -> String {
+        err.to_string()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LinkWiggleConfig {
     pub degree: usize,
@@ -158,12 +209,15 @@ where
     R: FnOnce(&Array1<f64>) -> Option<InverseLink>,
 {
     if !result.converged {
-        return Err(format!(
-            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        ));
+        return Err(WorkflowError::IntegrationFailed {
+            reason: format!(
+                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            ),
+        }
+        .into());
     }
     recover(&result.rho).ok_or_else(|| {
         format!(
@@ -649,12 +703,14 @@ fn fixed_gaussian_shift_frailty_from_spec(
         } => Ok(FrailtySpec::GaussianShift {
             sigma_fixed: Some(*sigma),
         }),
-        FrailtySpec::GaussianShift { sigma_fixed: None } => Err(format!(
-            "{context} currently requires a fixed GaussianShift sigma"
-        )),
-        FrailtySpec::HazardMultiplier { .. } => Err(format!(
-            "{context} requires FrailtySpec::GaussianShift or no frailty"
-        )),
+        FrailtySpec::GaussianShift { sigma_fixed: None } => Err(WorkflowError::MissingDependency {
+            reason: format!("{context} currently requires a fixed GaussianShift sigma"),
+        }
+        .into()),
+        FrailtySpec::HazardMultiplier { .. } => Err(WorkflowError::MissingDependency {
+            reason: format!("{context} requires FrailtySpec::GaussianShift or no frailty"),
+        }
+        .into()),
     }
 }
 
@@ -979,18 +1035,24 @@ fn fit_cause_specific_survival_transformation_custom(
 ) -> Result<SurvivalTransformationFitResult, String> {
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view());
     if cause_count <= 1 {
-        return Err("cause-specific custom survival fit requires at least two causes".to_string());
+        return Err(WorkflowError::MissingDependency {
+            reason: "cause-specific custom survival fit requires at least two causes".to_string(),
+        }
+        .into());
     }
     let n = spec.event_target.len();
     let p_time_total = prepared.time_design_exit.ncols();
     let p_cov = dense_cov_design.ncols();
     let p = p_time_total + p_cov;
     if beta0_flat.len() != p * cause_count {
-        return Err(format!(
-            "cause-specific survival initial beta length mismatch: got {}, expected {}",
-            beta0_flat.len(),
-            p * cause_count
-        ));
+        return Err(WorkflowError::SchemaMismatch {
+            reason: format!(
+                "cause-specific survival initial beta length mismatch: got {}, expected {}",
+                beta0_flat.len(),
+                p * cause_count
+            ),
+        }
+        .into());
     }
 
     let dense_time_entry = prepared.time_design_entry.to_dense();
@@ -1045,15 +1107,21 @@ fn fit_cause_specific_survival_transformation_custom(
         let mut initial_log_lambdas = Array1::<f64>::zeros(penalty_blocks.len());
         for (penalty_idx, block) in penalty_blocks.iter().enumerate() {
             if block.range.end > p || block.range.start > block.range.end {
-                return Err("cause-specific survival penalty range is out of bounds".to_string());
+                return Err(WorkflowError::SchemaMismatch {
+                    reason: "cause-specific survival penalty range is out of bounds".to_string(),
+                }
+                .into());
             }
             let block_dim = block.range.end - block.range.start;
             if block.matrix.nrows() != block_dim || block.matrix.ncols() != block_dim {
-                return Err(format!(
-                    "cause-specific survival penalty {penalty_idx} has shape {}x{} but range has width {block_dim}",
-                    block.matrix.nrows(),
-                    block.matrix.ncols()
-                ));
+                return Err(WorkflowError::SchemaMismatch {
+                    reason: format!(
+                        "cause-specific survival penalty {penalty_idx} has shape {}x{} but range has width {block_dim}",
+                        block.matrix.nrows(),
+                        block.matrix.ncols()
+                    ),
+                }
+                .into());
             }
             penalties.push(
                 PenaltyMatrix::Blockwise {
@@ -1117,19 +1185,28 @@ fn cause_specific_survival_rho_prior(
     let mut keyed = BTreeMap::<String, (f64, f64)>::new();
     for (label, shape, rate) in penalty_block_gamma_priors {
         if keyed.insert(label.clone(), (*shape, *rate)).is_some() {
-            return Err(format!(
-                "duplicate Gamma precision hyperprior for penalty block label '{label}'"
-            ));
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "duplicate Gamma precision hyperprior for penalty block label '{label}'"
+                ),
+            }
+            .into());
         }
         if !shape.is_finite() || *shape <= 0.0 {
-            return Err(format!(
-                "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
-            ));
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "Gamma precision hyperprior for penalty block '{label}' requires shape > 0, got {shape}"
+                ),
+            }
+            .into());
         }
         if !rate.is_finite() || *rate < 0.0 {
-            return Err(format!(
-                "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
-            ));
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
+                ),
+            }
+            .into());
         }
     }
     let mut consumed = Vec::<String>::new();
@@ -1156,10 +1233,13 @@ fn cause_specific_survival_rho_prior(
             .map(|idx| format!("cause_specific_survival_penalty_{idx}"))
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!(
-            "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
-            unknown.join(", ")
-        ));
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "unknown Gamma precision hyperprior penalty block label(s): {}; available labels: {available}",
+                unknown.join(", ")
+            ),
+        }
+        .into());
     }
     Ok(crate::types::RhoPrior::Independent(priors))
 }
@@ -1558,9 +1638,12 @@ fn fit_survival_transformation_model(
                     .weibull_seed
                     .ok_or_else(|| "weibull survival fit missing scale/shape seed".to_string())?;
                 if p_time_total < 2 {
-                    return Err(format!(
-                        "weibull built-in time basis has {p_time_total} columns but needs 2 to seed scale/shape"
-                    ));
+                    return Err(WorkflowError::SchemaMismatch {
+                        reason: format!(
+                            "weibull built-in time basis has {p_time_total} columns but needs 2 to seed scale/shape"
+                        ),
+                    }
+                    .into());
                 }
                 for cause in 0..cause_count {
                     let offset = cause * p;
@@ -1683,10 +1766,13 @@ fn fit_survival_transformation_model(
         crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum => {
         }
         ref other => {
-            return Err(format!(
-                "survival PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
-                summary.lastgradient_norm, summary.iterations, summary.state.deviance
-            ));
+            return Err(WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "survival PIRLS did not converge: status={other:?}, grad_norm={:.3e}, iterations={}, deviance={:.6e}",
+                    summary.lastgradient_norm, summary.iterations, summary.state.deviance
+                ),
+            }
+            .into());
         }
     }
     let beta = summary.beta.as_ref().to_owned();
@@ -2140,15 +2226,18 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
                         || (e.contains("block_states") && e.contains("got 0"))
                         || e.contains("blockwise fit requires at least one block state") =>
                 {
-                    Err(format!(
-                        "survival location-scale fit failed: the smoothing-parameter optimizer \
-                         landed at a degenerate iterate where the inner solver's block state \
-                         was empty. This is the symptom of an under-identified smooth driven \
-                         to a numerically pathological λ (e.g. exp(20+)) on a small-data \
-                         subsample. Try: (1) reducing covariate count, (2) increasing n_train, \
-                         (3) `baseline_target=\"linear\"` to drop the parametric baseline, or \
-                         (4) `noise_formula=\"1\"` to drop the noise GAM. Underlying error: {e}"
-                    ))
+                    Err(WorkflowError::IntegrationFailed {
+                        reason: format!(
+                            "survival location-scale fit failed: the smoothing-parameter optimizer \
+                             landed at a degenerate iterate where the inner solver's block state \
+                             was empty. This is the symptom of an under-identified smooth driven \
+                             to a numerically pathological λ (e.g. exp(20+)) on a small-data \
+                             subsample. Try: (1) reducing covariate count, (2) increasing n_train, \
+                             (3) `baseline_target=\"linear\"` to drop the parametric baseline, or \
+                             (4) `noise_formula=\"1\"` to drop the noise GAM. Underlying error: {e}"
+                        ),
+                    }
+                    .into())
                 }
                 Err(e) => Err(e),
             }
@@ -2401,16 +2490,21 @@ pub fn materialize<'a>(
 
     if let Some((entry_col, exit_col, event_col)) = parse_surv_response(&parsed.response)? {
         if config.transformation_normal {
-            return Err(
-                "transformation_normal cannot be combined with a Surv(...) response".to_string(),
-            );
+            return Err(WorkflowError::InvalidConfig {
+                reason: "transformation_normal cannot be combined with a Surv(...) response"
+                    .to_string(),
+            }
+            .into());
         }
         materialize_survival(
             &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
         )
     } else if config.transformation_normal {
         if config.noise_formula.is_some() {
-            return Err("transformation_normal cannot be combined with noise_formula".to_string());
+            return Err(WorkflowError::InvalidConfig {
+                reason: "transformation_normal cannot be combined with noise_formula".to_string(),
+            }
+            .into());
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
     } else if config.logslope_formula.is_some() || config.z_column.is_some() {
@@ -2472,10 +2566,13 @@ pub fn resolve_family(
         };
         if let Some(explicit_family) = explicit {
             if explicit_family != from_link {
-                return Err(format!(
-                    "family '{}' conflicts with link",
-                    explicit_family.name()
-                ));
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "family '{}' conflicts with link",
+                        explicit_family.name()
+                    ),
+                }
+                .into());
             }
         }
         return Ok(from_link);
@@ -2532,15 +2629,20 @@ fn resolve_survival_marginal_slope_base_link(
     let choice = parse_link_choice(Some(&linkspec.link), false)?
         .ok_or_else(|| "invalid survival marginal-slope link".to_string())?;
     if choice.mixture_components.is_some() {
-        return Err(
-            "survival marginal-slope currently supports only link(type=probit)".to_string(),
-        );
+        return Err(WorkflowError::InvalidConfig {
+            reason: "survival marginal-slope currently supports only link(type=probit)"
+                .to_string(),
+        }
+        .into());
     }
     match choice.link {
         LinkFunction::Probit => Ok(InverseLink::Standard(LinkFunction::Probit)),
-        other => Err(format!(
-            "survival marginal-slope currently supports only link(type=probit), got {other:?}"
-        )),
+        other => Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "survival marginal-slope currently supports only link(type=probit), got {other:?}"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -2684,9 +2786,12 @@ fn resolve_continuous_column(
     let values = data.values.column(col_idx).to_owned();
     for (row_idx, value) in values.iter().enumerate() {
         if !value.is_finite() {
-            return Err(format!(
-                "{role} column '{column_name}' contains non-finite value at row {row_idx}: {value}"
-            ));
+            return Err(WorkflowError::SchemaMismatch {
+                reason: format!(
+                    "{role} column '{column_name}' contains non-finite value at row {row_idx}: {value}"
+                ),
+            }
+            .into());
         }
     }
     Ok(values)
@@ -2714,9 +2819,12 @@ pub fn resolve_weight_column(
     let values = resolve_continuous_column(data, col_map, column_name, "weights")?;
     for (row_idx, value) in values.iter().enumerate() {
         if *value < 0.0 {
-            return Err(format!(
-                "weights column '{column_name}' must be non-negative; found {value} at row {row_idx}"
-            ));
+            return Err(WorkflowError::SchemaMismatch {
+                reason: format!(
+                    "weights column '{column_name}' must be non-negative; found {value} at row {row_idx}"
+                ),
+            }
+            .into());
         }
     }
     Ok(values)
