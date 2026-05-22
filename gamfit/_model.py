@@ -54,6 +54,23 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
 
 
 @dataclass(frozen=True)
+class TermBlock:
+    """Per-term coefficient column range, exposed by :attr:`Model.term_blocks`.
+
+    ``[start, end)`` indexes into the joint coefficient vector / design
+    matrix in the same order as Rust's ``coefficient_state_json`` payload.
+    ``kind`` is one of ``"intercept"``, ``"linear"``, ``"random_effect"``,
+    ``"smooth_bspline1d"``, ``"tensor"``, ``"thin_plate"``, ``"sphere"``,
+    ``"matern"``, ``"duchon"``, ``"factor_smooth"``, or ``"by_smooth"``.
+    """
+
+    name: str
+    kind: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
 class CompetingRisksPrediction:
     """Rust-computed joint cause-specific competing-risks prediction."""
 

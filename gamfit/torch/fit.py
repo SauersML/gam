@@ -379,12 +379,17 @@ def fit(
         bys.append(_to_tensor(s.by, design).reshape(-1) if s.by is not None else None)
 
     init_lam = float(init_lambdas[0]) if init_lambdas is not None else None
+    # Multi-output (D > 1) still falls back to the single-λ closed-form
+    # because the multi-block REML driver is single-response; surface that
+    # to the user when it matters. The scalar/single-column case now uses
+    # the multi-block per-smooth-λ Rust path automatically.
     if len(smooths_list) > 1 and response_f64.shape[1] > 1:
         warnings.warn(
-            "gamfit.torch.fit: multi-smooth additive fit uses a single shared λ "
-            "across all smooths (closed-form Gaussian REML kernel is single-λ); "
-            "for per-smooth λ (mgcv default) use the formula API "
-            "gamfit.fit(df, 'y ~ s(x1) + s(x2) + ...').",
+            "gamfit.torch.fit: multi-smooth additive fit with multi-output (D>1) "
+            "response falls back to the single shared λ closed-form path because "
+            "the multi-block REML driver is single-response. For per-smooth λ on "
+            "a scalar response use response of shape (N,) or (N, 1); for multi-output "
+            "fits with per-smooth λ use the formula API gamfit.fit(df, 'y ~ s(x1) + ...').",
             UserWarning,
             stacklevel=2,
         )

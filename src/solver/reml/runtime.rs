@@ -291,6 +291,21 @@ fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>
     IFT_QUALITY_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone)]
+#[allow(dead_code)]
+struct IftModeResponseRuntimeCache {
+    rho: Array1<f64>,
+    rho_mode_response_cols: Option<Array2<f64>>,
+    ext_mode_response_cols: Option<Array2<f64>>,
+}
+
+static IFT_MODE_RESPONSE_CACHES: OnceLock<Mutex<HashMap<usize, IftModeResponseRuntimeCache>>> =
+    OnceLock::new();
+
+fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRuntimeCache>> {
+    IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -2427,6 +2442,7 @@ impl<'a> RemlState<'a> {
         );
     }
 
+    #[allow(dead_code)]
     fn cached_ift_rho_mode_response_cols(
         &self,
         cache: &super::IftWarmStartCache,
@@ -4172,6 +4188,28 @@ impl<'a> RemlState<'a> {
                 );
                 return None;
             }
+        }
+        if let Some(rho_mode_response_cols) = self.cached_ift_rho_mode_response_cols(cache) {
+            if let Some(prediction) = predict_warm_start_beta_ift_from_mode_response_cols(
+                cache,
+                new_rho,
+                self.p,
+                last_residual,
+                Some(current_ift_step_cap),
+                &rho_mode_response_cols,
+            ) {
+                log::info!(
+                    "[IFT-CACHE] outcome=mode_response_hit drho_dim={} p={}",
+                    new_rho.len(),
+                    self.p,
+                );
+                return Some(prediction);
+            }
+            log::debug!(
+                "[IFT-CACHE] outcome=mode_response_fallback drho_dim={} p={}",
+                new_rho.len(),
+                self.p,
+            );
         }
         // Get the cached factor or lazily compute it. Holding the
         // ift_warm_start_cache read lock while we acquire the factor's
