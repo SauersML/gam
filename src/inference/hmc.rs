@@ -41,7 +41,7 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Typed error variants for the HMC / NUTS sampling module.
 ///
@@ -4258,6 +4258,14 @@ struct JointBetaRhoPosterior {
     /// Whether to add the identifiable-subspace Jeffreys/Firth term to the
     /// target
     firth_enabled: bool,
+    /// One-deep cache for the structural penalty pseudo-logdet and its
+    /// ρ-gradient. NUTS tree-doubling and U-turn checks repeatedly evaluate
+    /// the joint log-posterior at the same `rho` bytes, so a single-slot
+    /// cache keyed on the exact f64 bit pattern of `rho` avoids redundant
+    /// SVD/eigendecompositions inside `PenaltyPseudologdet::from_penalties`.
+    /// `Mutex` (not `RefCell`) because chains share the target via
+    /// `Arc<Target>` and run in parallel via rayon.
+    penalty_logdet_cache: Mutex<Option<(u64, f64, Array1<f64>)>>,
 }
 
 impl JointBetaRhoPosterior {
@@ -4411,7 +4419,23 @@ impl JointBetaRhoPosterior {
             rho_prior,
             rho_mode: rho_mode.to_owned(),
             firth_enabled,
+            penalty_logdet_cache: Mutex::new(None),
         })
+    }
+
+    /// FNV-1a hash over the raw f64 bit pattern of `rho`.
+    ///
+    /// NUTS leapfrog / tree-doubling / U-turn checks revisit identical
+    /// position vectors byte-for-byte, so exact-equality on `to_bits()`
+    /// captures the dominant repetition pattern without any tolerance.
+    #[inline]
+    fn hash_rho(rho: ndarray::ArrayView1<f64>) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &x in rho.iter() {
+            h ^= x.to_bits();
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
     }
 
     /// Compute the joint log-posterior and gradient.
@@ -4518,28 +4542,56 @@ impl JointBetaRhoPosterior {
         }
 
         // ---- Structural penalty log-determinant: +0.5 log|S(ρ)|₊ and ρ-derivatives ----
+        //
+        // One-deep cache keyed on the exact f64 bits of `rho`: NUTS tree
+        // doubling revisits identical positions byte-for-byte, so an
+        // exact-equality cache eliminates the dominant SVD/eigendecomp
+        // cost in `PenaltyPseudologdet::from_penalties` across leapfrog
+        // half-steps.
         let (log_det_s, logdet_grad) = if self.penalty_canonical.is_empty() {
             (0.0, Array1::zeros(n_rho))
         } else {
-            match PenaltyPseudologdet::from_penalties(
-                &self.penalty_canonical,
-                lambdas.as_slice().unwrap_or(&[]),
-                0.0,
-                n_beta,
-            ) {
-                Ok(pld) => {
-                    let (det1, _) = pld.rho_derivatives_from_penalties(
-                        &self.penalty_canonical,
-                        lambdas.as_slice().unwrap_or(&[]),
-                    );
-                    (pld.value(), det1)
-                }
-                Err(err) => {
-                    log::warn!(
-                        "[Joint HMC] structural penalty logdet became invalid at the current state: {}",
-                        err
-                    );
-                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+            let rho_hash = Self::hash_rho(rho);
+            let cached = self
+                .penalty_logdet_cache
+                .lock()
+                .ok()
+                .and_then(|guard| {
+                    guard.as_ref().and_then(|(h, v, g)| {
+                        if *h == rho_hash && g.len() == n_rho {
+                            Some((*v, g.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                });
+            if let Some(hit) = cached {
+                hit
+            } else {
+                match PenaltyPseudologdet::from_penalties(
+                    &self.penalty_canonical,
+                    lambdas.as_slice().unwrap_or(&[]),
+                    0.0,
+                    n_beta,
+                ) {
+                    Ok(pld) => {
+                        let (det1, _) = pld.rho_derivatives_from_penalties(
+                            &self.penalty_canonical,
+                            lambdas.as_slice().unwrap_or(&[]),
+                        );
+                        let value = pld.value();
+                        if let Ok(mut guard) = self.penalty_logdet_cache.lock() {
+                            *guard = Some((rho_hash, value, det1.clone()));
+                        }
+                        (value, det1)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "[Joint HMC] structural penalty logdet became invalid at the current state: {}",
+                            err
+                        );
+                        return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                    }
                 }
             }
         };
