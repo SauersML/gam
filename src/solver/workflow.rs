@@ -57,6 +57,22 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+trait WorkflowCauseCountResult {
+    fn into_workflow_result(self) -> Result<usize, String>;
+}
+
+impl WorkflowCauseCountResult for usize {
+    fn into_workflow_result(self) -> Result<usize, String> {
+        Ok(self)
+    }
+}
+
+impl<E: ToString> WorkflowCauseCountResult for Result<usize, E> {
+    fn into_workflow_result(self) -> Result<usize, String> {
+        self.map_err(|err| err.to_string())
+    }
+}
+
 /// Typed error category for the `solver::workflow` materialization and
 /// fitting pipeline.
 ///
@@ -1046,7 +1062,7 @@ fn fit_cause_specific_survival_transformation_custom(
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
-        .map_err(|err| err.to_string())?;
+        .into_workflow_result()?;
     if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
             reason: "cause-specific custom survival fit requires at least one cause".to_string(),
@@ -1488,7 +1504,7 @@ fn fit_survival_transformation_model(
     let dense_cov_design = covariate_design.design.to_dense();
     let p_cov = dense_cov_design.ncols();
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view())
-        .map_err(|err| err.to_string())?;
+        .into_workflow_result()?;
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
@@ -3164,8 +3180,8 @@ fn materialize_survival<'a>(
     }
 
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    let cause_count = crate::survival::cause_count_from_event_codes(event_codes.view())
-        .map_err(|err| err.to_string())?;
+    let cause_count =
+        crate::survival::cause_count_from_event_codes(event_codes.view()).into_workflow_result()?;
     if cause_count > 1
         && !matches!(
             survival_mode,
