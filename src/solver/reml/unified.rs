@@ -1231,16 +1231,46 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
 #[derive(Clone)]
 pub struct ExactJeffreysTerm {
     operator: std::sync::Arc<super::FirthDenseOperator>,
+    /// Tangent-projected value override. When `Some`, `value()` returns
+    /// this scalar instead of the operator's full-space `½ log|J|`. This
+    /// is used by `try_tangent_projected_evaluate` to substitute
+    /// `½ log|ZᵀJZ|` while reusing the rest of the evaluator pipeline.
+    /// The same `Arc<FirthDenseOperator>` is retained so any downstream
+    /// consumer that accesses the operator (e.g. for β-gradient terms)
+    /// sees the unmodified operator; only the scalar contribution to the
+    /// outer LAML cost changes.
+    value_override: Option<f64>,
 }
 
 impl ExactJeffreysTerm {
     pub(crate) fn new(operator: std::sync::Arc<super::FirthDenseOperator>) -> Self {
-        Self { operator }
+        Self {
+            operator,
+            value_override: None,
+        }
+    }
+
+    /// Construct a tangent-projected variant: wraps the same operator but
+    /// returns `½ log|ZᵀJZ|` from `value()`.
+    pub(crate) fn with_projected_value(
+        operator: std::sync::Arc<super::FirthDenseOperator>,
+        projected_value: f64,
+    ) -> Self {
+        Self {
+            operator,
+            value_override: Some(projected_value),
+        }
     }
 
     #[inline]
     pub(crate) fn value(&self) -> f64 {
-        self.operator.jeffreys_logdet()
+        self.value_override
+            .unwrap_or_else(|| self.operator.jeffreys_logdet())
+    }
+
+    #[inline]
+    pub(crate) fn operator_arc(&self) -> std::sync::Arc<super::FirthDenseOperator> {
+        std::sync::Arc::clone(&self.operator)
     }
 }
 
