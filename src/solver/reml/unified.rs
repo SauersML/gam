@@ -10943,6 +10943,102 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     steps
 }
 
+/// Diagnostics for the bam-style single-loop EFS route.
+///
+/// `gradient_residual` is the normalized difference between the full
+/// REML/LAML gradient available at this evaluation and the gradient implied
+/// by the EFS multiplicative surrogate after step clipping/pathological
+/// denominators. `inner_residual` is the PIRLS relative gradient residual
+/// from the deliberately partial inner sweep. The guard uses
+/// `bias_proxy = max(gradient_residual, inner_residual)` as a drift detector;
+/// it does not feed back into the EFS step.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EfsSingleLoopDiagnostics {
+    pub(crate) bias_proxy: f64,
+    pub(crate) gradient_residual: f64,
+    pub(crate) inner_residual: f64,
+    pub(crate) gradient_norm: f64,
+    pub(crate) step_inf_norm: f64,
+}
+
+/// Estimate how far the single-loop EFS surrogate has drifted from the
+/// current outer-gradient geometry.
+pub(crate) fn efs_single_loop_diagnostics(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    gradient: &[f64],
+    steps: &[f64],
+    inner_residual: f64,
+) -> EfsSingleLoopDiagnostics {
+    let k = rho.len();
+    let ext_dim = solution.ext_coords.len();
+    let total = k + ext_dim;
+    debug_assert_eq!(gradient.len(), total);
+    debug_assert_eq!(steps.len(), total);
+
+    let (profiled_scale, dp_cgrad) = efs_profiling(solution);
+    let mut grad_sq = 0.0_f64;
+    let mut residual_sq = 0.0_f64;
+    let mut step_inf_norm = 0.0_f64;
+
+    for idx in 0..k {
+        let g = gradient[idx];
+        grad_sq += g * g;
+        step_inf_norm = step_inf_norm.max(steps[idx].abs());
+        let coord = &solution.penalty_coords[idx];
+        let lambda = rho[idx].exp();
+        let a_i = 0.5 * penalty_a_k_quadratic(coord, &solution.beta, lambda);
+        let q_eff = efs_q_eff_with_gamma_rate(
+            efs_q_eff(a_i, &solution.dispersion, dp_cgrad, profiled_scale),
+            lambda,
+            &solution.rho_prior,
+            idx,
+        );
+        if q_eff.is_finite() && q_eff > 0.0 && steps[idx].is_finite() {
+            let g_efs = 0.5 * q_eff * (1.0 - steps[idx].exp());
+            let d = g - g_efs;
+            residual_sq += d * d;
+        } else {
+            residual_sq += g * g;
+        }
+    }
+
+    for (ext_idx, coord) in solution.ext_coords.iter().enumerate() {
+        let idx = k + ext_idx;
+        let g = gradient[idx];
+        grad_sq += g * g;
+        step_inf_norm = step_inf_norm.max(steps[idx].abs());
+        if !coord.is_penalty_like {
+            continue;
+        }
+        let q_eff = efs_q_eff(coord.a, &solution.dispersion, dp_cgrad, profiled_scale);
+        if q_eff.is_finite() && q_eff > 0.0 && steps[idx].is_finite() {
+            let g_efs = 0.5 * q_eff * (1.0 - steps[idx].exp());
+            let d = g - g_efs;
+            residual_sq += d * d;
+        } else {
+            residual_sq += g * g;
+        }
+    }
+
+    let gradient_norm = grad_sq.sqrt();
+    let gradient_residual = residual_sq.sqrt() / (1.0 + gradient_norm);
+    let inner_residual = if inner_residual.is_finite() && inner_residual >= 0.0 {
+        inner_residual
+    } else {
+        f64::INFINITY
+    };
+    let bias_proxy = gradient_residual.max(inner_residual);
+
+    EfsSingleLoopDiagnostics {
+        bias_proxy,
+        gradient_residual,
+        inner_residual,
+        gradient_norm,
+        step_inf_norm,
+    }
+}
+
 /// Regularization threshold for pseudoinverse of the trace Gram matrix.
 ///
 /// Eigenvalues below `PSI_GRAM_PINV_TOL * max_eigenvalue` are treated as
