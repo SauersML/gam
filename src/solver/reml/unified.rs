@@ -17499,7 +17499,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17633,7 +17633,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: Some(ProjectedKktResidual::from_projected(array![0.0, 0.0])),
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17815,7 +17815,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let err = match reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17874,7 +17874,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -18211,7 +18211,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18504,7 +18504,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18646,7 +18646,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18789,7 +18789,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho = vec![0.0_f64; k];
         let result =
@@ -18965,7 +18965,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -19066,7 +19066,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
         let rho = [lambda.ln()];
 
@@ -19230,7 +19230,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let rho = [0.0]; // λ = 1
@@ -19291,7 +19291,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
@@ -19398,7 +19398,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         };
 
         let result =
@@ -19477,7 +19477,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         }
     }
 
@@ -19680,7 +19680,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         }
     }
 
@@ -19734,7 +19734,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         }
     }
 
@@ -21457,7 +21457,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         }
     }
 
@@ -21780,7 +21780,7 @@ mod tests {
             barrier_config: None,
             kkt_residual,
             active_constraints: None,
-            monotone_probe_floor: Arc::new(Mutex::new(0)),
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
         }
     }
 
