@@ -7492,8 +7492,19 @@ pub fn reml_laml_evaluate(
     // the same gradient the correction was supposed to have repaired,
     // and when `‖r_proj‖∞ ≈ 0` (the cert-exit contract) the correction
     // `-aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r ≡ 0` is identically zero
-    // (see `compute_kkt_residual_rho_corrections`). Suppress
-    // unconditionally so the outer optimizer never consumes that derivative.
+    // (see `compute_kkt_residual_rho_corrections`).
+    //
+    // FIXME (BUG-3, tangent-space projection): the math review (codex
+    // CLI, captured in `envelope_gradient_uses_constraint_tangent_projection`
+    // test docstring; refs Wood 2011, Wood–Pya–Säfken 2016) confirms that
+    // under an active inequality constraint the principled outer cost is
+    // `½ log|ZᵀHZ| − ½ log|ZᵀSZ|_+` with gradient trace
+    // `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)`, where `Z = null(A_act)`. Suppression
+    // here is a *safety valve*, not the LAML objective. When
+    // `solution.active_constraints.is_some()` the evaluator should route
+    // through that tangent projection and emit a bounded gradient.
+    // Suppress unconditionally for now so the outer optimizer never
+    // consumes a divergent derivative until that wiring lands.
     let envelope_suppresses_outputs = envelope_inconsistent.is_some();
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
@@ -16495,19 +16506,44 @@ mod tests {
         );
     }
 
-    /// BUG-3 (hard failing): envelope analytic gradient on near-singular H
-    /// disagrees with FD on a re-solved cost. Pinpoints `½ tr(H⁻¹·∂H/∂ρ)`
-    /// blowing up by 1/σ_min(H) when `penalty_subspace_trace = None`.
+    /// BUG-3 (hard failing): with an active linear inequality constraint
+    /// pinning a parameter at its bound, the principled REML/LAML outer
+    /// cost lives on the *constraint tangent space* `T = null(A_act)`. The
+    /// correct formulas use a basis `Z ∈ ℝ^{p × (p−k_act)}` for T:
+    ///
+    ///   cost   = … + ½ log|Zᵀ H Z|  − ½ log|Zᵀ S(λ) Z|_+
+    ///   grad_k = … + ½ tr((Zᵀ H Z)⁻¹ Zᵀ (λ_k S_k) Z) − ½ ∂_k log|Zᵀ S Z|_+
+    ///
+    /// (see Wood 2011, Wood–Pya–Säfken 2016 §3 for the smooth-models
+    /// derivation; Marra–Wood 2012 §2 for the active-constraint quotient).
+    ///
+    /// The current implementation evaluates the full-space `log|H|` and
+    /// `tr(H⁻¹ ∂H/∂ρ)`. When `eᵀ S_k e > 0` for the active-constraint
+    /// normal `e` (the generic case for a bound on a coefficient that the
+    /// penalty does not annihilate), the trace inflates as O(1/σ_min(H))
+    /// while the tangent-projected trace stays bounded. The IFT correction
+    /// `−aᵀ_k q + ½ qᵀA_k q` is r-only and cannot repair this — confirmed
+    /// in `ift_gradient_correction_with_zero_projected_residual_is_zero`.
+    ///
+    /// This test FAILS until the unified evaluator routes through
+    /// `ZᵀHZ` and `ZᵀSZ` when `solution.active_constraints.is_some()`.
+    /// It is the math statement of the AoU |g|∞ = 9.669e16 vs |cost| =
+    /// 3.480e5 outer divergence.
     #[test]
-    fn envelope_gradient_matches_fd_at_near_singular_h() {
-        // H = X'X + λ₁S₁ + λ₂S₂. We pick X'X with one tiny eigenvalue so
-        // σ_min(H) ≈ 1e-10 at ρ = 0. λ_k·S_k DO act on the same span as
-        // X'X (so H stays near-singular) — this mirrors the production case
-        // where the inner Hessian is near-singular AT the cert point.
-        let xtx = array![[1.0, 0.0, 0.0], [0.0, 1.0e-10, 0.0], [0.0, 0.0, 1.0],];
-        let s1 = array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+    fn envelope_gradient_uses_constraint_tangent_projection() {
+        use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
+
+        // Three-parameter Gaussian REML. Choose data so the optimum places
+        // β₂ at its lower bound β₂ ≥ 0.5 — the active constraint
+        // a = [0, 0, 1], b = 0.5. Picking λ_k so that S_k has nonzero
+        // mass along the constraint normal e = [0, 0, 1] makes
+        // eᵀ S_k e > 0, which per codex is the condition under which the
+        // unprojected trace tr(H⁻¹·λ_k S_k) inflates while the projected
+        // trace tr((ZᵀHZ)⁻¹·Zᵀ λ_k S_k Z) stays O(1).
+        let xtx = array![[2.0, 0.1, 0.0], [0.1, 2.0, 0.0], [0.0, 0.0, 1.0e-10]];
+        let s1 = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
         let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
-        let _xty = array![0.5, 1.0e-6, 0.5];
+        let xty = array![1.0, 0.5, 0.0];
 
         let rho = vec![0.0_f64, 0.0_f64];
         let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
@@ -16515,65 +16551,64 @@ mod tests {
         h_mat.scaled_add(lambdas[0], &s1);
         h_mat.scaled_add(lambdas[1], &s2);
         let op = DenseSpectralOperator::from_symmetric(&h_mat).unwrap();
-        let beta_star = op.solve(&_xty);
+        let beta_unconstrained = op.solve(&xty);
+        // Force β₂ = 0.5 (active bound) and recover β₀, β₁ minimising the
+        // remaining quadratic — i.e. β̂ is the *constrained* solution.
+        let _ = beta_unconstrained;
+        let beta_hat = array![xty[0] / h_mat[[0, 0]], xty[1] / h_mat[[1, 1]], 0.5];
 
-        let cost_at = |rho_eval: &[f64]| -> f64 {
-            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|r| r.exp()).collect();
-            let mut h_e = xtx.clone();
-            h_e.scaled_add(lambdas_eval[0], &s1);
-            h_e.scaled_add(lambdas_eval[1], &s2);
-            let op_e = DenseSpectralOperator::from_symmetric(&h_e).unwrap();
-            let beta_e = op_e.solve(&_xty);
-            let mut sol_e = build_gaussian_solution_at_beta(rho_eval, beta_e, false);
-            sol_e.dispersion = DispersionHandling::Fixed {
-                phi: 1.0,
-                include_logdet_h: true,
-                include_logdet_s: true,
-            };
-            reml_laml_evaluate(&sol_e, rho_eval, EvalMode::ValueOnly, None)
-                .unwrap()
-                .cost
+        let a_act = array![[0.0, 0.0, 1.0]];
+        let b_act = array![0.5];
+        let active = ActiveLinearConstraintBlock {
+            a: a_act,
+            b: b_act,
         };
-        let fd_eps = 1e-4;
-        let mut fd_grad = Array1::<f64>::zeros(rho.len());
-        for k in 0..rho.len() {
-            let mut rp = rho.clone();
-            rp[k] += fd_eps;
-            let mut rm = rho.clone();
-            rm[k] -= fd_eps;
-            fd_grad[k] = (cost_at(&rp) - cost_at(&rm)) / (2.0 * fd_eps);
-        }
 
-        let mut sol = build_gaussian_solution_at_beta(&rho, beta_star.clone(), false);
+        let mut sol = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true);
         sol.dispersion = DispersionHandling::Fixed {
             phi: 1.0,
             include_logdet_h: true,
             include_logdet_s: true,
         };
-        let result = reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None).unwrap();
-        let analytic = result
-            .gradient
-            .expect("gradient at exact β* must be available");
+        sol.active_constraints = Some(Arc::new(active));
 
-        for k in 0..rho.len() {
-            let err = (analytic[k] - fd_grad[k]).abs();
-            let scale = analytic[k].abs().max(fd_grad[k].abs()).max(1.0);
-            let rel = err / scale;
-            assert!(
-                rel < 1e-2 && analytic[k].is_finite(),
-                "BUG-3 PINPOINTED at coord {}: analytic gradient = {:+.6e}, FD = {:+.6e}, \
-                 rel err = {:.3e}. The LAML envelope `½ tr(H⁻¹·∂H/∂ρ_k)` inflates by \
-                 ~1/σ_min(H) when H is near-singular and `penalty_subspace_trace = None`. \
-                 FD on the re-solved cost surface gives a bounded reference; the analytic \
-                 formula disagrees because the trace's full H⁻¹ amplifies floating-point \
-                 noise in directions where the cost surface itself has no slope. This is \
-                 the math source of |g|∞ = 9.669e16 while the cost is only O(3.48e5) in \
-                 the AoU log.",
-                k,
-                analytic[k],
-                fd_grad[k],
-                rel
-            );
+        let result = reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None);
+
+        // Until the principled tangent-projection is wired through the
+        // cost/gradient/trace path, the evaluator either (a) returns an
+        // inflated O(1/σ_min) gradient that trips the suppression — gradient =
+        // None — or (b) returns a finite but mathematically wrong gradient
+        // computed in the full p-space. Both outcomes are bugs. The
+        // principled contract is: under an active constraint set, the
+        // evaluator must produce a gradient whose magnitude is bounded
+        // independently of σ_min(H) (it should be bounded by
+        // O(σ_min(ZᵀHZ)⁻¹) which is O(1) by construction here).
+        match result {
+            Ok(r) => {
+                let grad = r.gradient.expect(
+                    "BUG-3: under active constraints the evaluator must emit a tangent-\
+                     projected gradient (Wood et al. 2016, eq. for projected LAML), not \
+                     suppress. Current implementation suppresses because the unprojected \
+                     trace blows up — which is the bug.",
+                );
+                let max_abs = grad.iter().map(|g| g.abs()).fold(0.0_f64, f64::max);
+                assert!(
+                    max_abs.is_finite() && max_abs < 1.0e6,
+                    "BUG-3 PINPOINTED: active-constraint gradient |grad|∞ = {:.3e}, must be \
+                     O(1) under tangent projection. The current full-space \
+                     `½ tr(H⁻¹·∂H/∂ρ_k)` with σ_min(H) ≈ 1e-10 inflates by 1/σ_min while \
+                     the principled tangent-projected formula \
+                     `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is bounded. \
+                     Principled fix (Wood 2011, Wood–Pya–Säfken 2016): route the evaluator \
+                     through `solution.active_constraints` Z-basis when computing `log|H|`, \
+                     `log|S|_+`, and the trace term.",
+                    max_abs,
+                );
+            }
+            Err(err) => panic!(
+                "BUG-3: evaluator failed under active constraints — {err}. The principled \
+                 fix is to compute on the tangent space `null(A_act)`, not to error out."
+            ),
         }
     }
 
