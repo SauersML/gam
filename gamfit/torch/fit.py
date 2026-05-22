@@ -154,15 +154,15 @@ def _build_design_penalty(
             points.squeeze(1), knots, degree=smooth.degree, periodic=smooth.periodic,
         )
         from .._api import smoothness_penalty as _smoothness_penalty
-        knots_np = (
-            knots.detach().cpu().numpy()
-            if knots is not None
-            else None
-        )
-        if knots_np is None:
+        if knots is not None:
+            knots_np = knots.detach().cpu().to(torch.float64).numpy()
+        else:
             from .._api import _resolve_knots
-            knots_np = _resolve_knots(None, points.squeeze(1).detach().cpu().numpy(),
-                                      label="knots", degree=smooth.degree)
+            knots_np = _resolve_knots(
+                None,
+                points.squeeze(1).detach().cpu().to(torch.float64).numpy(),
+                label="knots", degree=smooth.degree,
+            )
         penalty_np, _null_basis = _smoothness_penalty(
             knots_np, degree=smooth.degree, order=smooth.penalty_order,
         )

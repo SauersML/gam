@@ -56,6 +56,15 @@ from ._api import (
 )
 from ._binding import RustExtensionUnavailableError
 from ._diagnostics import Diagnostics
+from .smooth import (
+    BSpline,
+    Categorical,
+    Duchon,
+    Matern,
+    Smooth,
+    Sphere,
+    TensorBSpline,
+)
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import (
     CompetingRisksCIF,
@@ -146,6 +155,13 @@ __all__ = [
     "competing_risks_cif",
     "cross_fit_shared_precision_groups",
     "cuda_diagnostics",
+    "BSpline",
+    "Categorical",
+    "Duchon",
+    "Matern",
+    "Smooth",
+    "Sphere",
+    "TensorBSpline",
     "duchon_basis",
     "duchon_function_norm_penalty",
     "explain_error",

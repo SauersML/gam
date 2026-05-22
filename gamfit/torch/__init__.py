@@ -60,6 +60,18 @@ try:
         sphere_log_map,
     )
     from .modules import from_fitted
+    # New unified Smooth/fit API — the recommended user-facing surface.
+    from ..smooth import (
+        BSpline,
+        Categorical,
+        Duchon,
+        Matern,
+        Smooth,
+        Sphere,
+        TensorBSpline,
+    )
+    from .fit import FitResult, fit
+    from .module import GAM
 except ImportError as _exc:  # pragma: no cover - import-time guard
     if _exc.name == "torch":
         raise ImportError(
@@ -69,6 +81,18 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
     raise
 
 __all__ = [
+    # Recommended user-facing API
+    "fit",
+    "FitResult",
+    "GAM",
+    "Smooth",
+    "Duchon",
+    "BSpline",
+    "TensorBSpline",
+    "Matern",
+    "Sphere",
+    "Categorical",
+    # Lower-level primitives (advanced use cases)
     "AdditiveRemlOutput",
     "GaussianRemlOutput",
     "alr",
