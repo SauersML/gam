@@ -6537,16 +6537,22 @@ fn outer_hessian_entry(
 fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2<f64>> {
     let k_act = a_act.nrows();
     let p = a_act.ncols();
-    if k_act == 0 || k_act >= p {
+    if k_act == 0 {
         return None;
     }
+    // `null(A_act) = null(A_actᵀ A_act)`; eigendecompose the symmetric PSD
+    // `p × p` matrix and pull the eigenvectors with σ ≤ threshold as the
+    // null basis. This gives `m = p − rank(A_act)`, the correct tangent
+    // dimension regardless of whether `A_act` has linearly dependent rows.
     let ata = a_act.t().dot(a_act);
     let (evals, evecs) = ata.eigh(faer::Side::Lower).ok()?;
     let evals_slice = evals.as_slice()?;
     let threshold = positive_eigenvalue_threshold(evals_slice);
-    // Eigenvalues are ascending; null basis = eigenvectors with σ ≤ threshold.
     let null_count = evals_slice.iter().filter(|&&s| s <= threshold).count();
-    if null_count == 0 || null_count >= p {
+    if null_count == 0 || null_count == p {
+        // `null_count == p` means A_act has no effective constraint (every
+        // row is in the noise floor). Returning `None` skips the projection
+        // and lets the full p-space evaluator run unmodified.
         return None;
     }
     Some(evecs.slice(ndarray::s![.., 0..null_count]).to_owned())
@@ -6569,16 +6575,36 @@ fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array
     out
 }
 
-/// Reconstruct the regularized Hessian `H_reg = V · diag(r_ε(σ)) · Vᵀ`
-/// from a `DenseSpectralOperator`. Eigenpairs flagged inactive under
-/// `HardPseudo` are excluded (their `w_factor` columns are zero in the
-/// operator's own kernels, so excluding them here preserves consistency).
-fn assemble_h_reg_dense(op: &DenseSpectralOperator) -> Array2<f64> {
+/// Reconstruct the *raw* Hessian `H = V · diag(σ) · Vᵀ` (pre-regularization)
+/// from a `DenseSpectralOperator`. The operator stores
+/// `r_ε(σ) = ½(σ + √(σ² + 4ε²))`; invert via `σ = r − ε²/r` so the tangent
+/// projection `ZᵀHZ` sees the un-regularized data. The `from_symmetric`
+/// call applied to that projection then performs a *single* tangent-space
+/// regularization, matching `log|ZᵀHZ|` with one consistent `r_ε` instead
+/// of double-regularizing (`r_ε(ZᵀV·r_ε(σ)·VᵀZ)`).
+///
+/// Per the math review (codex), projecting an already-regularized H_reg
+/// and re-regularizing in tangent space is not exactly `log|ZᵀHZ|`; it is
+/// a modified smoothed objective. Inverting `r_ε` first restores the
+/// principled single-regularization identity.
+fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
     let p = op.dim();
+    // `ε = √ε_mach · p`. Same `spectral_epsilon` formula as the operator's
+    // own construction; depends only on dim.
+    let epsilon = f64::EPSILON.sqrt() * (p as f64).max(1.0);
+    let eps_sq = epsilon * epsilon;
     let mut h = Array2::<f64>::zeros((p, p));
     for j in 0..p {
+        if !op.eigenpair_active(j) {
+            continue;
+        }
         let r = op.reg_eigenvalue(j);
-        if !op.eigenpair_active(j) || r == 0.0 {
+        if r == 0.0 {
+            continue;
+        }
+        // Invert r_ε: σ = r − ε²/r (since r_ε(σ) · (r_ε(σ) − σ) = ε²).
+        let sigma = r - eps_sq / r;
+        if sigma == 0.0 {
             continue;
         }
         for col in 0..p {
@@ -6586,7 +6612,7 @@ fn assemble_h_reg_dense(op: &DenseSpectralOperator) -> Array2<f64> {
             if v_col_j == 0.0 {
                 continue;
             }
-            let scaled = r * v_col_j;
+            let scaled = sigma * v_col_j;
             for row in 0..p {
                 h[[row, col]] += op.eigenvector_entry(row, j) * scaled;
             }
@@ -6850,7 +6876,7 @@ fn try_tangent_projected_evaluate(
              other backends do not yet expose the raw H needed to form ZᵀHZ"
                 .to_string()
         })?;
-    let h_full = assemble_h_reg_dense(ds);
+    let h_full = assemble_h_raw_dense(ds);
     let h_t = z.t().dot(&h_full).dot(&z);
     let h_t_op = DenseSpectralOperator::from_symmetric(&h_t)
         .map_err(|e| format!("tangent H eigendecomposition failed: {e}"))?;
@@ -8140,6 +8166,7 @@ pub fn reml_laml_evaluate(
                 rho_penalty_a_k_betas: &rho_penalty_a_k_betas,
                 rho_curvature_a_k_betas: &rho_curvature_a_k_betas,
                 rho_v_ks: rho_v_ks.as_deref(),
+                ext_v_is: Some(ext_v_is.as_slice()),
                 coord_corrections: &coord_corrections,
             };
             match compute_outer_hessian(
@@ -8928,6 +8955,7 @@ pub(crate) struct RemlDerivativeWorkspace<'a> {
     pub rho_penalty_a_k_betas: &'a [Array1<f64>],
     pub rho_curvature_a_k_betas: &'a [Array1<f64>],
     pub rho_v_ks: Option<&'a [Array1<f64>]>,
+    pub ext_v_is: Option<&'a [Array1<f64>]>,
     pub coord_corrections: &'a [Option<DriftDerivResult>],
 }
 
