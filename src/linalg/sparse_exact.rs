@@ -971,128 +971,6 @@ pub struct SimplicialFactor {
     pub logdet: f64,
 }
 
-/// Compute log|H| for a symmetric-positive-definite sparse matrix via a
-/// simplicial LLᵀ factorization, returning only the log-determinant.
-///
-/// The input must already be canonicalized to symmetric-upper storage (the
-/// callers in this module canonicalize before invoking this helper).
-///
-/// This replaces a previous code path that materialized a dense copy of `h`
-/// and called dense Cholesky purely to extract the diagonal. The simplicial
-/// path uses AMD ordering plus faer's `factorize_simplicial_numeric_llt` and
-/// runs in O(nnz(L)) after the symbolic phase, instead of O(n³).
-fn sparse_spd_logdet_via_simplicial(
-    h_upper: &SparseColMat<usize, f64>,
-) -> Result<f64, EstimationError> {
-    let n = h_upper.ncols();
-    if n == 0 {
-        return Ok(0.0);
-    }
-    let a_nnz = h_upper.compute_nnz();
-
-    // 1. AMD ordering on the symbolic structure.
-    let mut perm_fwd = vec![0usize; n];
-    let mut perm_inv = vec![0usize; n];
-    {
-        let mut mem = MemBuffer::new(amd::order_scratch::<usize>(n, a_nnz));
-        amd::order(
-            &mut perm_fwd,
-            &mut perm_inv,
-            h_upper.symbolic(),
-            amd::Control::default(),
-            MemStack::new(&mut mem),
-        )
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?;
-    }
-    let perm = unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
-
-    // 2. Permute to P A Pᵀ (upper-triangular, unsorted).
-    let a_perm_upper = {
-        let mut col_ptrs = vec![0usize; n + 1];
-        let mut row_indices = vec![0usize; a_nnz];
-        let mut values = vec![0.0f64; a_nnz];
-        let mut mem = MemBuffer::new(faer::sparse::utils::permute_self_adjoint_scratch::<usize>(
-            n,
-        ));
-        faer::sparse::utils::permute_self_adjoint_to_unsorted(
-            &mut values,
-            &mut col_ptrs,
-            &mut row_indices,
-            h_upper.as_ref(),
-            perm,
-            Side::Upper,
-            Side::Upper,
-            MemStack::new(&mut mem),
-        );
-        SparseColMat::<usize, f64>::new(
-            unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
-            values,
-        )
-    };
-
-    // 3. Symbolic analysis.
-    let symbolic = {
-        let mut mem = MemBuffer::new(StackReq::any_of(&[
-            simplicial::prefactorize_symbolic_cholesky_scratch::<usize>(n, a_nnz),
-            simplicial::factorize_simplicial_symbolic_cholesky_scratch::<usize>(n),
-        ]));
-        let stack = MemStack::new(&mut mem);
-        let mut etree = vec![0isize; n];
-        let mut col_counts = vec![0usize; n];
-        simplicial::prefactorize_symbolic_cholesky(
-            &mut etree,
-            &mut col_counts,
-            a_perm_upper.symbolic(),
-            stack,
-        );
-        simplicial::factorize_simplicial_symbolic_cholesky(
-            a_perm_upper.symbolic(),
-            unsafe { simplicial::EliminationTreeRef::from_inner(&etree) },
-            &col_counts,
-            stack,
-        )
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })?
-    };
-
-    // 4. Numeric LLᵀ factorization.
-    let mut l_values = vec![0.0f64; symbolic.len_val()];
-    {
-        let mut mem = MemBuffer::new(simplicial::factorize_simplicial_numeric_llt_scratch::<
-            usize,
-            f64,
-        >(n));
-        simplicial::factorize_simplicial_numeric_llt::<usize, f64>(
-            &mut l_values,
-            a_perm_upper.as_ref(),
-            LltRegularization::default(),
-            &symbolic,
-            MemStack::new(&mut mem),
-        )
-        .map_err(|_| EstimationError::HessianNotPositiveDefinite {
-            min_eigenvalue: f64::NAN,
-        })?;
-    }
-
-    // 5. logdet(H) = 2 * sum_j ln(L_jj). The diagonal of L lives at the
-    //    first stored entry of each column in CSC.
-    let l_col_ptr = symbolic.col_ptr();
-    let mut logdet = 0.0f64;
-    for j in 0..n {
-        let diag = l_values[l_col_ptr[j]];
-        if diag <= 0.0 {
-            return Err(EstimationError::HessianNotPositiveDefinite {
-                min_eigenvalue: f64::NAN,
-            });
-        }
-        logdet += diag.ln();
-    }
-    Ok(2.0 * logdet)
-}
-
 /// Build a [`SimplicialFactor`] from a symmetric CSC matrix (upper, lower, or
 /// full storage – it is canonicalized to symmetric-upper internally).
 ///
@@ -1102,6 +980,12 @@ pub fn factorize_simplicial(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SimplicialFactor, EstimationError> {
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
+    factorize_simplicial_canonical_upper(&h_upper)
+}
+
+fn factorize_simplicial_canonical_upper(
+    h_upper: &SparseColMat<usize, f64>,
+) -> Result<SimplicialFactor, EstimationError> {
     let n = h_upper.ncols();
     if n == 0 {
         return Ok(SimplicialFactor {
@@ -1229,6 +1113,70 @@ pub fn factorize_simplicial(
         n,
         logdet,
     })
+}
+
+impl SimplicialFactor {
+    /// Reconstruct the original-order dense SPD matrix represented by this
+    /// permuted sparse Cholesky factor.
+    ///
+    /// The simplicial factor stores `L` for `P H Pᵀ = L Lᵀ`, with
+    /// `perm_inv[original] = permuted`. We first assemble the dense permuted
+    /// product and then map rows/columns back to the caller's coordinate order.
+    fn assemble_h_dense_original_order(&self) -> Result<Array2<f64>, EstimationError> {
+        if self.perm_inv.len() != self.n {
+            return Err(EstimationError::InvalidInput(format!(
+                "simplicial factor permutation length {} does not match dimension {}",
+                self.perm_inv.len(),
+                self.n
+            )));
+        }
+        let mut h_permuted = Array2::<f64>::zeros((self.n, self.n));
+        for col in 0..self.n {
+            let start = self.l_col_ptr[col];
+            let end = self.l_col_ptr[col + 1];
+            for left_idx in start..end {
+                let left_row = self.l_row_idx[left_idx];
+                let left_value = self.l_values[left_idx];
+                if !left_value.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "simplicial factor has non-finite L entry at value index {left_idx}"
+                    )));
+                }
+                for right_idx in start..end {
+                    let right_row = self.l_row_idx[right_idx];
+                    let right_value = self.l_values[right_idx];
+                    h_permuted[[left_row, right_row]] += left_value * right_value;
+                }
+            }
+        }
+
+        let mut h_original = Array2::<f64>::zeros((self.n, self.n));
+        for i in 0..self.n {
+            let pi = self.perm_inv[i];
+            if pi >= self.n {
+                return Err(EstimationError::InvalidInput(format!(
+                    "simplicial factor permutation maps row {i} to out-of-bounds index {pi}"
+                )));
+            }
+            for j in 0..self.n {
+                let pj = self.perm_inv[j];
+                if pj >= self.n {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "simplicial factor permutation maps column {j} to out-of-bounds index {pj}"
+                    )));
+                }
+                let value = h_permuted[[pi, pj]];
+                if !value.is_finite() {
+                    return Err(EstimationError::InvalidInput(
+                        "dense reconstruction from sparse Cholesky produced non-finite values"
+                            .to_string(),
+                    ));
+                }
+                h_original[[i, j]] = value;
+            }
+        }
+        Ok(h_original)
+    }
 }
 
 /// Result of the Takahashi selected inversion.
