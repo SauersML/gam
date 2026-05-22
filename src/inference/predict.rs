@@ -3251,6 +3251,18 @@ impl BinomialLocationScalePredictor {
 
     /// Apply the saved wiggle (if present) and then the inverse link to q0.
     fn apply_link(&self, q0: &Array1<f64>) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+        let (eta, prob, _) = self.apply_link_with_d1(q0)?;
+        Ok((eta, prob))
+    }
+
+    /// Apply the saved wiggle (if present) and then the inverse link to q0,
+    /// returning the inverse-link first derivative `dmu/deta` alongside `mu`.
+    /// The jet (mu, d1) is computed once per row; reuse it instead of calling
+    /// `inverse_link_jet_for_inverse_link` again on the same `eta[i]`.
+    fn apply_link_with_d1(
+        &self,
+        q0: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
             runtime.apply(q0).map_err(EstimationError::from)?
         } else {
@@ -3258,18 +3270,24 @@ impl BinomialLocationScalePredictor {
         };
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let n = eta.len();
-        let prob_vec: Result<Vec<f64>, EstimationError> = (0..n)
+        let pairs: Result<Vec<(f64, f64)>, EstimationError> = (0..n)
             .into_par_iter()
             .map(|i| {
                 let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
                     &self.inverse_link,
                     eta[i],
                 )?;
-                Ok(jet.mu.clamp(0.0, 1.0))
+                Ok((jet.mu.clamp(0.0, 1.0), jet.d1))
             })
             .collect();
-        let prob = Array1::from_vec(prob_vec?);
-        Ok((eta, prob))
+        let pairs = pairs?;
+        let mut prob = Array1::<f64>::zeros(n);
+        let mut d1 = Array1::<f64>::zeros(n);
+        for (i, (mu, d1_i)) in pairs.into_iter().enumerate() {
+            prob[i] = mu;
+            d1[i] = d1_i;
+        }
+        Ok((eta, prob, d1))
     }
 }
 
@@ -3288,7 +3306,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
         let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let (eta, prob) = self.apply_link(&q0_base)?;
+        let (eta, prob, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
 
         let mean_se = if let Some(ref cov) = self.covariance {
             let n = eta_t.len();
@@ -3313,10 +3331,10 @@ impl PredictableModel for BinomialLocationScalePredictor {
             Some(linear_predictor_se_from_backend(&backend, n, |rows| {
                 let x_t = design_row_chunk(&input.design, rows.clone())?;
                 let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let eta_chunk = eta.slice(ndarray::s![rows.clone()]);
                 let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
                 let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
                 let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
+                let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]);
                 let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                     Some(runtime.design(&q0_chunk)?)
                 } else {
@@ -3330,12 +3348,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                 let rows_in_chunk = q0_chunk.len();
                 let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
                 for i in 0..rows_in_chunk {
-                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                        &self.inverse_link,
-                        eta_chunk[i],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let dphi = jet.d1;
+                    let dphi = dmu_chunk[i];
                     let scale = dq_dq0[i];
                     let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
                     // dq/dη_ls = eta_t / σ for the exact exp link.
@@ -3436,7 +3449,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
             .as_ref()
             .map_or_else(|| Array1::zeros(design_noise.nrows()), |o| o.clone());
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
-        let (eta, _) = self.apply_link(&q0_base)?;
+        let (eta, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
         let p_t = self.beta_threshold.len();
         let p_s = self.beta_noise.len();
         let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
