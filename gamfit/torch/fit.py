@@ -18,7 +18,16 @@ engine's analytic VJP.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Literal, Sequence
+
+# F-threshold below which mode="auto" uses joint additive REML and above
+# which it falls back to per-atom independent REML. Joint scales as
+# O((F * M_k)^3) for the inner Cholesky; independent scales as
+# O(F * M_k^3). At F ≈ 64 with typical M_k ≈ 8-16, joint is still
+# comfortable; at F ≈ 1024+ (typical SAE) it becomes infeasible.
+_AUTO_MODE_F_THRESHOLD = 64
+
+FitMode = Literal["joint", "independent", "auto"]
 
 import torch
 
@@ -388,6 +397,85 @@ def _fit_single_constrained(
 # ---------------------------------------------------------------------------
 
 
+def _fit_independent(
+    points_list: list[torch.Tensor],
+    response_f64: torch.Tensor,
+    smooths_list: list[Smooth],
+    *,
+    weights_f64: torch.Tensor | None,
+    init_lambdas: torch.Tensor | None,
+) -> FitResult:
+    """Per-atom independent REML — F separate single-smooth REML fits.
+
+    For each smooth k: build (design_k, penalty_k) and call the single-smooth
+    REML primitive. Each atom gets its own λ_k chosen independently. Per-atom
+    fitted contributions are summed into the joint ``fitted``. Lambdas and
+    EDFs are stacked per smooth.
+
+    Complexity: ``O(F · M_k³)`` for the inner Cholesky vs ``O((F · M_k)³)``
+    for the joint additive path. This is the production path for
+    SAE-scale work where F ≫ 64.
+
+    Multi-output ``response`` shape ``(N, D)`` is supported natively because
+    the single-smooth primitive supports it; D > 1 in mode="joint" is
+    currently rejected by the multi-block backward (use independent mode
+    if you need D > 1 + F > 1).
+
+    Mathematical caveat: per-atom independent fits treat λ_k as
+    independent. Under TopK sparse gating in an SAE (where most atoms are
+    zero per row, so per-atom designs are effectively orthogonal in
+    expectation), this is the right algorithm. For genuinely overlapping
+    smooths over the same predictor space, the joint additive fit is
+    statistically more efficient — but only computable at moderate F.
+    """
+    F = len(smooths_list)
+    coefficients: list[torch.Tensor] = []
+    fitted_total: torch.Tensor | None = None
+    lambdas: list[torch.Tensor] = []
+    edfs: list[torch.Tensor] = []
+    reml_total: torch.Tensor | None = None
+
+    init_lam_seq: Sequence[float] | None = None
+    if init_lambdas is not None:
+        init_lam_arr = init_lambdas.detach().reshape(-1)
+        if init_lam_arr.numel() != F:
+            raise ValueError(
+                f"init_lambdas must have length F={F}; got {init_lam_arr.numel()}"
+            )
+        init_lam_seq = [float(v) for v in init_lam_arr]
+
+    for k, (smooth, pts) in enumerate(zip(smooths_list, points_list)):
+        design, penalty = _build_design_penalty(smooth, pts)
+        design = design.to(torch.float64)
+        penalty = penalty.to(torch.float64)
+        by_t = (
+            _to_tensor(smooth.by, design).reshape(-1)
+            if smooth.by is not None else None
+        )
+        init_lam_k = init_lam_seq[k] if init_lam_seq is not None else None
+        out_k: GaussianRemlOutput = gaussian_reml_fit(
+            design, response_f64, penalty,
+            weights=weights_f64, by=by_t, init_lambda=init_lam_k,
+        )
+        coefficients.append(out_k.coefficients)
+        fitted_k = out_k.fitted
+        fitted_total = fitted_k if fitted_total is None else fitted_total + fitted_k
+        lambdas.append(out_k.lam.reshape(()))
+        edfs.append(out_k.edf.reshape(()))
+        score_k = out_k.reml_score.reshape(())
+        reml_total = score_k if reml_total is None else reml_total + score_k
+
+    assert fitted_total is not None and reml_total is not None
+    return FitResult(
+        coefficients=coefficients,
+        fitted=fitted_total,
+        lambdas=torch.stack(lambdas),
+        reml_score=reml_total,
+        edf=torch.stack(edfs),
+        smooths=smooths_list,
+    )
+
+
 def fit(
     points: torch.Tensor | Sequence[torch.Tensor],
     response: torch.Tensor,
@@ -395,6 +483,7 @@ def fit(
     *,
     weights: torch.Tensor | None = None,
     init_lambdas: torch.Tensor | None = None,
+    mode: FitMode = "auto",
 ) -> FitResult:
     """Fit one or more smooths against a multi-dimensional response.
 
@@ -413,6 +502,27 @@ def fit(
         weighted REML.
     init_lambdas : optional initial λ values. Scalar for single smooth,
         ``(F,)`` for additive. Defaults to gamfit's automatic init.
+    mode : ``"joint" | "independent" | "auto"`` (default ``"auto"``).
+        Selects the additive-fit algorithm:
+
+        * ``"joint"`` — joint additive REML via the multi-block Rust
+          driver. Per-smooth λ jointly selected against a single joint
+          design ``Z = [Z_1 | ... | Z_F]``. Inner Cholesky cost is
+          ``O((F · M_k)³)`` — feasible for F ≲ 64, infeasible at
+          F ≳ 1000. Currently single-output only (D = 1).
+        * ``"independent"`` — F separate single-smooth REML fits.
+          Per-atom λ chosen independently. Cost is ``O(F · M_k³)`` —
+          scales linearly in F, the production path for SAE-scale work.
+          Supports multi-output D > 1 natively.
+        * ``"auto"`` (default) — routes to ``"joint"`` if
+          ``F ≤ 64`` and ``D == 1``, else to ``"independent"``.
+
+        Mathematical caveat for ``"independent"``: per-atom λ_k are
+        treated as independent. Under TopK gating in an SAE (where most
+        atoms are zero per row), this is the right algorithm. For
+        genuinely overlapping smooths on the same predictor, joint
+        additive is statistically more efficient — but only computable
+        at moderate F.
 
     Returns
     -------
@@ -546,6 +656,31 @@ def fit(
         # Same points for every smooth.
         points_list = [points] * len(smooths_list)
 
+    # Mode dispatch — F=100K SAEs route through `independent`; small-F
+    # diagnostics route through `joint`. ``auto`` thresholds at
+    # _AUTO_MODE_F_THRESHOLD; multi-output (D > 1) forces independent
+    # because the multi-block joint backward is currently single-output.
+    F = len(smooths_list)
+    D = response_f64.shape[1]
+    if mode == "auto":
+        effective_mode: FitMode = (
+            "joint" if (F <= _AUTO_MODE_F_THRESHOLD and D == 1) else "independent"
+        )
+    else:
+        effective_mode = mode
+    if effective_mode == "joint" and D > 1:
+        raise NotImplementedError(
+            "mode='joint' currently requires single-output response (D=1); "
+            f"got D={D}. Use mode='independent' or 'auto' for multi-output."
+        )
+
+    if effective_mode == "independent":
+        return _fit_independent(
+            points_list, response_f64, smooths_list,
+            weights_f64=weights_f64, init_lambdas=init_lambdas,
+        )
+
+    # mode == "joint" — proceed with the block-joint additive REML below.
     designs: list[torch.Tensor] = []
     penalties: list[torch.Tensor] = []
     bys: list[torch.Tensor | None] = []
