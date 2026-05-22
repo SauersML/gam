@@ -779,10 +779,32 @@ fn duchon_function_norm_penalty<'py>(
     // factory was a single Primary candidate. Look up the stiffness slot
     // by source so the FFI returns the correct object regardless of the
     // factory's candidate ordering.
+    // Find the function-norm penalty. The non-periodic builder emits an
+    // operator triplet (mass/tension/stiffness); the function-norm
+    // seminorm `∫|∇^(p+s) f|²` is the stiffness block.
+    //
+    // The PERIODIC builder takes a different code path
+    // (`build_periodic_duchon_basis_1d`): it constructs a single Primary
+    // candidate from the Bernoulli Green's function Gram
+    // (`omega = z' K_centers z`), which IS the function-norm penalty in
+    // the periodic basis — there is no separate operator triplet. So when
+    // the spec is periodic and no OperatorStiffness slot exists, fall
+    // back to the Primary block. This was previously a hard error that
+    // made `ManifoldSAE(periodic=True)` unusable.
     let stiffness_idx = built
         .penaltyinfo
         .iter()
         .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
+        .or_else(|| {
+            if periodic {
+                built
+                    .penaltyinfo
+                    .iter()
+                    .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| {
             py_value_error(
                 "Duchon function-norm penalty (stiffness) was not built; \

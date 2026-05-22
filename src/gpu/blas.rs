@@ -1064,8 +1064,8 @@ impl CublasRuntime {
 
         let a_host = to_col_major(a);
         let b_host = to_col_major(b);
-        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&a_host).ok()?;
-        let b_dev: CudaSlice<f64> = self.stream.clone_htod(&b_host).ok()?;
+        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&*a_host).ok()?;
+        let b_dev: CudaSlice<f64> = self.stream.clone_htod(&*b_host).ok()?;
         let mut c_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(m.checked_mul(n)?).ok()?;
 
         let cfg = GemmConfig::<f64> {
@@ -1099,7 +1099,7 @@ impl CublasRuntime {
 
         let a_host = to_col_major(a);
         let x_host: Vec<f64> = v.iter().copied().collect();
-        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&a_host).ok()?;
+        let a_dev: CudaSlice<f64> = self.stream.clone_htod(&*a_host).ok()?;
         let x_dev: CudaSlice<f64> = self.stream.clone_htod(&x_host).ok()?;
         let mut y_dev: CudaSlice<f64> = self.stream.alloc_zeros::<f64>(out_len).ok()?;
 
@@ -1137,8 +1137,8 @@ impl CublasRuntime {
         let x_host = to_col_major(x);
         let y_host = to_col_major(y);
         let w_host: Vec<f64> = w.iter().copied().collect();
-        let x_dev: CudaSlice<f64> = self.stream.clone_htod(&x_host).ok()?;
-        let y_dev: CudaSlice<f64> = self.stream.clone_htod(&y_host).ok()?;
+        let x_dev: CudaSlice<f64> = self.stream.clone_htod(&*x_host).ok()?;
+        let y_dev: CudaSlice<f64> = self.stream.clone_htod(&*y_host).ok()?;
         let w_dev: CudaSlice<f64> = self.stream.clone_htod(&w_host).ok()?;
         let mut wy_dev: CudaSlice<f64> = self
             .stream
@@ -1210,8 +1210,8 @@ impl CublasRuntime {
 
         let tri_host = to_col_major(triangular);
         let rhs_host = to_col_major(rhs);
-        let tri_dev: CudaSlice<f64> = self.stream.clone_htod(&tri_host).ok()?;
-        let mut rhs_dev: CudaSlice<f64> = self.stream.clone_htod(&rhs_host).ok()?;
+        let tri_dev: CudaSlice<f64> = self.stream.clone_htod(&*tri_host).ok()?;
+        let mut rhs_dev: CudaSlice<f64> = self.stream.clone_htod(&*rhs_host).ok()?;
 
         let p_i = to_i32(p)?;
         let rhs_cols_i = to_i32(rhs_cols)?;

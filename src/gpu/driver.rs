@@ -13,6 +13,7 @@
 
 use libloading::Library;
 use ndarray::{Array2, ArrayBase, Data, Ix2};
+use std::borrow::Cow;
 
 use super::error::GpuError;
 
@@ -207,13 +208,29 @@ pub fn to_i64(value: usize) -> Option<i64> {
 /// and extends into a pre-sized `Vec`. On biobank-shape inputs (n≈3×10⁵,
 /// p≈35) this replaces a per-element `a[[row, col]]` indexing loop that
 /// dominated the host side of every GPU dispatch.
-pub fn to_col_major<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Vec<f64> {
+///
+/// Fast path: if the input is already F-order (column-major, contiguous in
+/// memory-order), borrow its raw buffer directly — no allocation, no copy.
+/// Standard row-major ndarrays still go through the permutation path.
+pub fn to_col_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a, [f64]> {
     let (rows, cols) = a.dim();
+    let strides = a.strides();
+    // F-order contiguous: column stride == 1, row stride == rows.
+    // `as_slice_memory_order` confirms the buffer is contiguous in memory.
+    if rows > 0
+        && cols > 0
+        && strides[0] == 1
+        && strides[1] == rows as isize
+    {
+        if let Some(slice) = a.as_slice_memory_order() {
+            return Cow::Borrowed(slice);
+        }
+    }
     let mut out: Vec<f64> = Vec::with_capacity(rows.saturating_mul(cols));
     for col in 0..cols {
         out.extend(a.column(col).iter().copied());
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Convert a column-major flat buffer back into row-major `Array2<f64>`.
