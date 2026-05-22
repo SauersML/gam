@@ -42,6 +42,55 @@ const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
 pub use crate::linalg::utils::PcgSolveInfo;
 
+/// Typed error for `src/linalg/matrix.rs` operations.  All error sites in this
+/// module construct a `MatrixError` variant; trait method bodies that still
+/// return `Result<_, String>` convert via `From<MatrixError> for String` (which
+/// is byte-equivalent to the prior `format!` / `to_string` payloads).
+#[derive(Debug, Clone)]
+pub enum MatrixError {
+    /// Operand shapes (rows, columns, lengths) do not satisfy the operation's
+    /// dimension contract.  Also covers integer-overflow in dimension products.
+    DimensionMismatch { reason: String },
+    /// Refused to materialize an operator-backed or sparse design to a dense
+    /// `Array2<f64>` because the active `ResourcePolicy` (size cap or strict
+    /// operator-only mode) forbids it.
+    DensificationRefused { reason: String },
+    /// A constructor that requires at least one block / channel / marginal was
+    /// called with an empty vector.
+    EmptyInput { reason: String },
+    /// A value that must be finite (e.g. a fully-materialized symmetric matrix
+    /// entry) was `NaN` or `±inf`.
+    NonFiniteEntry { reason: String },
+    /// The requested operation is not supported for the given operator kind
+    /// (e.g. matrix-free PCG only runs for eligible operators).
+    Unsupported { reason: String },
+    /// A numerical procedure failed to produce a usable answer (e.g. PCG
+    /// exhausted its ridge-retry budget).
+    NumericalFailure { reason: String },
+}
+
+impl std::fmt::Display for MatrixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatrixError::DimensionMismatch { reason }
+            | MatrixError::DensificationRefused { reason }
+            | MatrixError::EmptyInput { reason }
+            | MatrixError::NonFiniteEntry { reason }
+            | MatrixError::Unsupported { reason }
+            | MatrixError::NumericalFailure { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
+
+impl From<MatrixError> for String {
+    #[inline]
+    fn from(err: MatrixError) -> String {
+        err.to_string()
+    }
+}
+
 #[inline]
 fn dense_materialization_chunk_rows(nrows: usize, ncols: usize) -> usize {
     rows_for_target_bytes(CHUNKED_DENSE_MATERIALIZATION_BYTES, ncols)
@@ -68,7 +117,12 @@ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usi
     nrows
         .checked_mul(ncols)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
-        .ok_or_else(|| format!("{context}: dense size overflow for {nrows}x{ncols}"))
+        .ok_or_else(|| {
+            MatrixError::DimensionMismatch {
+                reason: format!("{context}: dense size overflow for {nrows}x{ncols}"),
+            }
+            .into()
+        })
 }
 
 pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
@@ -86,18 +140,24 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
         policy.derivative_storage_mode,
         crate::resource::DerivativeStorageMode::AnalyticOperatorRequired
     ) {
-        return Err(format!(
-            "{context}: refusing to densify operator-backed design {n}x{p} under \
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify operator-backed design {n}x{p} under \
              AnalyticOperatorRequired policy; provide an operator-form path"
-        ));
+            ),
+        }
+        .into());
     }
     let dense_bytes = checked_dense_nbytes(n, p, context)?;
     let limit = policy.max_single_materialization_bytes;
     if dense_bytes > limit {
         let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        return Err(format!(
-            "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
-        ));
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -108,12 +168,15 @@ fn weighted_crossprod_dense(
     right: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
-        return Err(format!(
-            "weighted_crossprod_dense row mismatch: left={}, weights={}, right={}",
-            left.nrows(),
-            weights.len(),
-            right.nrows()
-        ));
+        return Err(MatrixError::DimensionMismatch {
+            reason: format!(
+                "weighted_crossprod_dense row mismatch: left={}, weights={}, right={}",
+                left.nrows(),
+                weights.len(),
+                right.nrows()
+            ),
+        }
+        .into());
     }
     Ok(weighted_crossprod_dense_view(left, weights.view(), right))
 }
@@ -838,11 +901,14 @@ impl SparseDesignMatrix {
         let dense_bytes = self.dense_nbytes()?;
         if dense_bytes > MAX_SPARSE_TO_DENSE_BYTES {
             let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-            return Err(format!(
-                "{context}: refusing to densify sparse design {}x{} (~{gib:.2} GiB); use sparse or matrix-free code",
-                self.matrix.nrows(),
-                self.matrix.ncols(),
-            ));
+            return Err(MatrixError::DensificationRefused {
+                reason: format!(
+                    "{context}: refusing to densify sparse design {}x{} (~{gib:.2} GiB); use sparse or matrix-free code",
+                    self.matrix.nrows(),
+                    self.matrix.ncols(),
+                ),
+            }
+            .into());
         }
         if dense_bytes <= MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES {
             Ok(self
