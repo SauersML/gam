@@ -5865,6 +5865,19 @@ impl DesignMatrix {
         }
     }
 
+    /// Borrow-only row-chunk accessor: writes the requested rows into an
+    /// existing `(rows.len(), ncols())` buffer instead of allocating a fresh
+    /// `Array2<f64>` like [`Self::try_row_chunk`]. Used by hot per-row loops
+    /// (e.g. latent-survival evaluate) that want to reuse a single 1-row
+    /// scratch buffer across iterations.
+    pub fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        <Self as LinearOperator>::row_chunk_into(self, rows, out)
+    }
+
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
         let n = self.nrows();
         let p = self.ncols();
