@@ -16398,9 +16398,8 @@ mod tests {
             active_constraints: None,
         };
 
-        let result =
-            reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
-                .expect("constrained-stationary cert evaluation");
+        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+            .expect("constrained-stationary cert evaluation");
 
         // Hard contract: with `kkt_residual = Some(..)` and dispersion `Fixed`,
         // the envelope tripwire's `kkt_residual_was_applied` branch keeps the
@@ -16415,6 +16414,83 @@ mod tests {
              kkt_residual contract is broken — either the projected residual was not handed \
              over, or `kkt_residual_correction_active` failed to gate on Fixed dispersion. \
              This is the precise AoU biobank marginal-slope failure mechanism."
+        );
+    }
+
+    /// Hard failing reproducer for the AoU error path:
+    ///
+    /// ```text
+    /// [reml_laml envelope-gradient consistency] ... marking analytic gradient unavailable
+    /// [OUTER] custom family: rejecting seed ... custom-family outer objective/derivatives became non-finite
+    /// ```
+    ///
+    /// This is the same optimizer-visible state as the passing
+    /// `constrained_stationary_cert_with_projected_residual_keeps_gradient`
+    /// test, except it deliberately omits `InnerSolution::kkt_residual`.
+    /// Current behavior suppresses the analytic gradient (`gradient=None`),
+    /// which is exactly how the outer seed startup path turns an inner
+    /// certificate into "outer objective/derivatives became non-finite".
+    ///
+    /// The assertion below describes the desired contract and therefore must
+    /// fail until the inner convergent path reliably populates the projected
+    /// KKT residual before calling the unified REML/LAML evaluator.
+    #[test]
+    fn aou_missing_projected_kkt_residual_suppresses_outer_gradient_reproducer() {
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: array![[42.0]],
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0e20],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            // This missing residual is the reproduced bug. It models the
+            // convergent custom-family inner path forgetting to populate
+            // BlockwiseInnerResult::kkt_residual before the outer evaluator
+            // computes derivatives.
+            kkt_residual: None,
+            active_constraints: None,
+        };
+
+        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+            .expect("AoU missing-residual reproducer should reach the envelope gate");
+
+        assert!(
+            result.gradient.is_some(),
+            "BUG REPRODUCED: missing projected KKT residual made the REML/LAML envelope gate \
+             suppress the analytic gradient. The outer seed validator sees this as \
+             custom-family outer objective/derivatives became non-finite."
         );
     }
 
