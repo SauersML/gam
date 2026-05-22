@@ -5788,8 +5788,10 @@ pub struct RemlLamlResult {
     /// The REML/LAML objective value (to be minimized).
     pub cost: f64,
     /// Newton-decrement energy `½ rᵀH⁻¹r` for the cost-side IFT residual correction.
+    #[expect(dead_code, reason = "published for runtime consumption in a follow-up")]
     pub ift_residual_energy: Option<f64>,
     /// Full-H one-step inner polish vector `H⁻¹r`, when already computed.
+    #[expect(dead_code, reason = "published for runtime consumption in a follow-up")]
     pub inner_polish_step: Option<Array1<f64>>,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
