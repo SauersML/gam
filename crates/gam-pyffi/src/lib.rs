@@ -8,7 +8,9 @@ use gam::estimate::{
     BlockRole, EstimationError, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
     saved_sas_state_from_fit,
 };
-use gam::faer_ndarray::{array2_to_matmut, factorize_symmetricwith_fallback};
+use gam::faer_ndarray::{
+    FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback,
+};
 use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
