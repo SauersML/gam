@@ -5900,8 +5900,7 @@ fn sas_log_delta_edge_barrierweight() -> f64 {
 
 #[inline]
 fn sas_log_delta_bound() -> f64 {
-    // Must match mixture_link::SAS_LOG_DELTA_BOUND.
-    12.0
+    crate::mixture_link::SAS_LOG_DELTA_BOUND
 }
 
 #[inline]
