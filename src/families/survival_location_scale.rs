@@ -2770,10 +2770,7 @@ impl SurvivalLocationScaleFamily {
     fn clglog_exit_pair(
         u1: f64,
         deriv_log_scale: f64,
-    ) -> (
-        (f64, f64, f64, f64, f64),
-        (f64, f64, f64, f64, f64),
-    ) {
+    ) -> ((f64, f64, f64, f64, f64), (f64, f64, f64, f64, f64)) {
         let t_val = u1.exp();
         let t_deriv = (u1 - deriv_log_scale).exp();
         let deriv_scale = (-deriv_log_scale).exp();
@@ -2879,31 +2876,32 @@ impl SurvivalLocationScaleFamily {
         // Fast path: for CLogLog the survival and log-pdf evaluators each
         // compute `exp(u1)` and `exp(u1 - deriv_log_scale)`.  Share that work
         // when both are called back-to-back on the exit row.
-        let (
-            (log_s1, r1, dr1, ddr1, dddr1),
-            (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1),
-        ) = if matches!(&self.inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
-            Self::clglog_exit_pair(u1, deriv_log_scale)
-        } else {
-            let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
+        let ((log_s1, r1, dr1, ddr1, dddr1), (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1)) =
+            if matches!(
                 &self.inverse_link,
-                u1,
-                deriv_log_scale,
-            )
-            .map_err(|e| {
-                format!("inverse-link survival evaluation failed at row {row} exit: {e}")
-            })?;
+                InverseLink::Standard(LinkFunction::CLogLog)
+            ) {
+                Self::clglog_exit_pair(u1, deriv_log_scale)
+            } else {
+                let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
+                    &self.inverse_link,
+                    u1,
+                    deriv_log_scale,
+                )
+                .map_err(|e| {
+                    format!("inverse-link survival evaluation failed at row {row} exit: {e}")
+                })?;
 
-            let pdf = Self::exact_log_pdf_derivatives_rescaled(
-                &self.inverse_link,
-                u1,
-                deriv_log_scale,
-            )
-            .map_err(|e| {
-                format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
-            })?;
-            (surv, pdf)
-        };
+                let pdf = Self::exact_log_pdf_derivatives_rescaled(
+                    &self.inverse_link,
+                    u1,
+                    deriv_log_scale,
+                )
+                .map_err(|e| {
+                    format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
+                })?;
+                (surv, pdf)
+            };
 
         // Row degeneracy guard: when any hazard/pdf derivative is non-finite
         // (e.g. CLogLog with u > ~709 where exp(u) overflows), the row's
@@ -8063,7 +8061,9 @@ impl SurvivalLocationScaleFamily {
         };
 
         let mut delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit;
-        if let Some(dw) = &deltaw { delta_q_exit += dw; }
+        if let Some(dw) = &deltaw {
+            delta_q_exit += dw;
+        }
         let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
         let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
         let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
@@ -8117,7 +8117,9 @@ impl SurvivalLocationScaleFamily {
             let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
             let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
             let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
-            if let Some(dw) = &deltaw { dq_en += dw; }
+            if let Some(dw) = &deltaw {
+                dq_en += dw;
+            }
             EntryDeltas {
                 delta_q_t: d2q_tls_en * &dls_en,
                 delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
@@ -9141,7 +9143,9 @@ impl SurvivalLocationScaleFamily {
         };
 
         let mut delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit;
-        if let Some(dw) = &deltaw { delta_q_exit += dw; }
+        if let Some(dw) = &deltaw {
+            delta_q_exit += dw;
+        }
         let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
         let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
         let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
@@ -9174,7 +9178,9 @@ impl SurvivalLocationScaleFamily {
             let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
             let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
             let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
-            if let Some(dw) = &deltaw { dq_en += dw; }
+            if let Some(dw) = &deltaw {
+                dq_en += dw;
+            }
             EntryDeltas {
                 delta_q_t: d2q_tls_en * &dls_en,
                 delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
@@ -9691,14 +9697,18 @@ impl SurvivalLocationScaleFamily {
 
         // Exit-side chain-rule deltas for u and v.
         let mut delta_q_exit_u = &q.dq_t * &delta_t_exit_u + &q.dq_ls * &delta_ls_exit_u;
-        if let Some(dw) = &deltaw_u { delta_q_exit_u += dw; }
+        if let Some(dw) = &deltaw_u {
+            delta_q_exit_u += dw;
+        }
         let delta_q_t_exit_u = &q.d2q_tls * &delta_ls_exit_u;
         let delta_q_ls_exit_u = &q.d2q_tls * &delta_t_exit_u + &q.d2q_ls * &delta_ls_exit_u;
         let delta_q_tls_exit_u = &q.d3q_tls_ls * &delta_ls_exit_u;
         let delta_q_ls_ls_exit_u = &q.d3q_tls_ls * &delta_t_exit_u + &q.d3q_ls * &delta_ls_exit_u;
 
         let mut delta_q_exit_v = &q.dq_t * &delta_t_exit_v + &q.dq_ls * &delta_ls_exit_v;
-        if let Some(dw) = &deltaw_v { delta_q_exit_v += dw; }
+        if let Some(dw) = &deltaw_v {
+            delta_q_exit_v += dw;
+        }
         let delta_q_t_exit_v = &q.d2q_tls * &delta_ls_exit_v;
         let delta_q_ls_exit_v = &q.d2q_tls * &delta_t_exit_v + &q.d2q_ls * &delta_ls_exit_v;
         let delta_q_tls_exit_v = &q.d3q_tls_ls * &delta_ls_exit_v;
@@ -9784,7 +9794,9 @@ impl SurvivalLocationScaleFamily {
                 let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
                 let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
                 let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
-                if let Some(dw) = deltaw { dq_en += dw; }
+                if let Some(dw) = deltaw {
+                    dq_en += dw;
+                }
                 let dq_t = d2q_tls_en * &dls_en;
                 let dq_ls = d2q_tls_en * &dt_en + d2q_ls_en * &dls_en;
                 let dq_tls = d3q_tls_ls_en * &dls_en;
@@ -9795,10 +9807,18 @@ impl SurvivalLocationScaleFamily {
                     dt_en, dls_en, dq_en, dq_t, dq_ls, dq_tls, dq_ls_ls, d_d1_q, d_d2_q,
                 )
             };
-            let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
-                compute_entry(&threshold_dir_u, &log_sigma_dir_u, deltaw_u.as_ref(), &delta_h0_u);
-            let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
-                compute_entry(&threshold_dir_v, &log_sigma_dir_v, deltaw_v.as_ref(), &delta_h0_v);
+            let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) = compute_entry(
+                &threshold_dir_u,
+                &log_sigma_dir_u,
+                deltaw_u.as_ref(),
+                &delta_h0_u,
+            );
+            let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) = compute_entry(
+                &threshold_dir_v,
+                &log_sigma_dir_v,
+                deltaw_v.as_ref(),
+                &delta_h0_v,
+            );
             EntryDeltas2 {
                 delta_t_u: dt_u,
                 delta_ls_u: dls_u,
