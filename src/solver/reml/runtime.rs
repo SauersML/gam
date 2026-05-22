@@ -668,8 +668,10 @@ impl<'a> RemlState<'a> {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let linear_residual_norm = trace.last_linear_residual_norm.unwrap_or(0.0).max(0.0);
             (
-                trace.last_linear_residual_norm.unwrap_or(0.0).max(0.0),
+                // Convert CG residual norm to 1/2*norm^2 so the channel is an energy like e_inner.
+                0.5 * linear_residual_norm * linear_residual_norm,
                 trace.last_probe_sigma_sq.unwrap_or(0.0).max(0.0),
                 trace.last_probe_count,
                 trace.monotone_probe_floor,
