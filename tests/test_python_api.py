@@ -86,6 +86,7 @@ def test_build_info_reports_real_extension() -> None:
         "standard",
         "transformation-normal",
         "survival",
+        "competing-risks-survival",
         "bernoulli-marginal-slope",
         "survival-marginal-slope",
         "survival-location-scale",
