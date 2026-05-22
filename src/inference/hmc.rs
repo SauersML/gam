@@ -1046,8 +1046,8 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
 }
 
 fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    let mut residual = Array1::<f64>::zeros(n);
     let shape = data.gamma_shape.max(1e-10);
     // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
     // shape · ln(shape) are independent of i, so previously each sample paid
@@ -1056,11 +1056,13 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
     let shape_ln_shape = shape * shape.ln();
     let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);
     let shape_minus_one = shape - 1.0;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let n = data.n_samples;
-    let pairs: Vec<(f64, f64)> = (0..n)
-        .into_par_iter()
-        .map(|i| {
+    let mut residual = Array1::<f64>::zeros(n);
+    let ll: f64 = residual
+        .as_slice_mut()
+        .unwrap()
+        .par_iter_mut()
+        .enumerate()
+        .map(|(i, slot)| {
             let eta_i = eta[i].clamp(-700.0, 700.0);
             let mu_i = eta_i.exp();
             let y_i = data.y[i];
@@ -1069,15 +1071,10 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
                 * (shape_ln_shape - log_gamma_shape - shape * eta_i
                     + shape_minus_one * y_i.max(1e-12).ln()
                     - shape * y_i / mu_i);
-            let r_i = w_i * shape * (y_i / mu_i - 1.0);
-            (ll_i, r_i)
+            *slot = w_i * shape * (y_i / mu_i - 1.0);
+            ll_i
         })
-        .collect();
-    let mut ll = 0.0_f64;
-    for (i, (ll_i, r_i)) in pairs.into_iter().enumerate() {
-        ll += ll_i;
-        residual[i] = r_i;
-    }
+        .sum();
 
     let grad_ll = fast_atv(&data.x, &residual);
     (ll, grad_ll)
@@ -4430,9 +4427,10 @@ impl JointBetaRhoPosterior {
         let n_beta = self.n_beta;
         let n_rho = self.n_rho;
 
-        // Split parameter vector
-        let z = params.slice(ndarray::s![..n_beta]).to_owned();
-        let rho = params.slice(ndarray::s![n_beta..]).to_owned();
+        // Split parameter vector — keep as views to avoid two per-step
+        // `to_owned()` allocations of size n_beta and n_rho.
+        let z = params.slice(ndarray::s![..n_beta]);
+        let rho = params.slice(ndarray::s![n_beta..]);
         let lambdas: Array1<f64> = rho.mapv(f64::exp);
 
         // Un-whiten: β = μ + L z
@@ -4482,17 +4480,34 @@ impl JointBetaRhoPosterior {
         let mut s_beta = Array1::<f64>::zeros(n_beta);
         let mut grad_rho = Array1::<f64>::zeros(n_rho);
 
+        // Reuse one max-rank scratch buffer for r_beta = R_k · β_block across
+        // all penalty blocks instead of allocating a fresh Array1 per block
+        // per HMC step.
+        let max_rank = self
+            .penalty_canonical
+            .iter()
+            .map(|cp| cp.rank())
+            .max()
+            .unwrap_or(0);
+        let mut r_beta_scratch = Array1::<f64>::zeros(max_rank);
+
         for (k, cp) in self.penalty_canonical.iter().enumerate() {
             // Block-local quadratic: β'S_k β via root
             let r = &cp.col_range;
             let beta_block = beta.slice(ndarray::s![r.start..r.end]);
-            let r_beta: Array1<f64> = cp.root.dot(&beta_block);
+            let rank_k = cp.rank();
+            crate::faer_ndarray::fast_av_view_into(
+                &cp.root,
+                &beta_block,
+                r_beta_scratch.slice_mut(ndarray::s![..rank_k]),
+            );
+            let r_beta = r_beta_scratch.slice(ndarray::s![..rank_k]);
             let quad_k = r_beta.dot(&r_beta);
             penalty_val += 0.5 * lambdas[k] * quad_k;
 
             // Accumulate S(ρ)β for β-gradient — block-local
             for a in 0..cp.block_dim() {
-                let val: f64 = (0..cp.rank())
+                let val: f64 = (0..rank_k)
                     .map(|row| cp.root[[row, a]] * r_beta[row])
                     .sum();
                 s_beta[r.start + a] += lambdas[k] * val;

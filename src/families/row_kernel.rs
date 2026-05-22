@@ -1182,6 +1182,13 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         if n_rows == 0 || rank == 0 {
             return jf;
         }
+        // BLAS-3 fast path mirrors the first-derivative variant: when the
+        // kernel exposes `jacobian_action_matrix`, `J · F` collapses to a
+        // fixed set of dense GEMMs that bypass the per-row rayon loop.
+        if let Some(jf_fast) = self.kern.jacobian_action_matrix(factor.view()) {
+            debug_assert_eq!(jf_fast.dim(), (n_rows, stride));
+            return jf_fast;
+        }
         let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
         jf.as_slice_mut()
             .expect("row-major JF matrix must be contiguous")
