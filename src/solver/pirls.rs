@@ -4257,6 +4257,109 @@ where
     const LM_MAX_LAMBDA: f64 = 1e12;
     const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
 
+    // ── Anderson acceleration of depth 1 (AA(1)) for the Fisher fixed-point ──
+    // PIRLS normally uses observed-information Newton (already super-linear, no
+    // help available from AA). When `force_fisher_for_rest` engages, the inner
+    // iteration becomes the linearly-convergent Fisher contraction — exactly
+    // the regime where AA(1) provably improves the rate. State is local to
+    // this PIRLS call; costs nothing while `force_fisher_for_rest` stays
+    // false because the mixing branch is never entered.
+    const AA1_DAMPING_FLOOR: f64 = 1e-12;
+    const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
+
+    struct AndersonOneState {
+        prev_beta: Option<Array1<f64>>,
+        prev_residual: Option<Array1<f64>>,
+        consecutive_accepts: usize,
+        consecutive_rejects: usize,
+        disabled: bool,
+        engaged_logged: bool,
+    }
+
+    impl AndersonOneState {
+        fn new() -> Self {
+            Self {
+                prev_beta: None,
+                prev_residual: None,
+                consecutive_accepts: 0,
+                consecutive_rejects: 0,
+                disabled: false,
+                engaged_logged: false,
+            }
+        }
+
+        /// Try to produce an accelerated candidate from the plain Fisher
+        /// fixed-point step `beta_new = beta_old + direction`. The fixed-point
+        /// residual at this iteration is `r_k = beta_new - beta_old`.
+        ///
+        /// Returns `Some(beta_accel)` when a finite acceleration is available,
+        /// `None` when AA should be skipped (no history yet, disabled, or
+        /// numerical floor hit).
+        fn aa1_mix(
+            &self,
+            beta_old: &Array1<f64>,
+            beta_new: &Array1<f64>,
+        ) -> Option<Array1<f64>> {
+            if self.disabled {
+                return None;
+            }
+            let prev_beta = self.prev_beta.as_ref()?;
+            let prev_residual = self.prev_residual.as_ref()?;
+            if prev_beta.len() != beta_old.len() || prev_residual.len() != beta_old.len() {
+                return None;
+            }
+            // r_k = beta_new - beta_old
+            let r_k: Array1<f64> = beta_new - beta_old;
+            // dr = r_k - prev_residual
+            let dr: Array1<f64> = &r_k - prev_residual;
+            // dx = beta_old - prev_beta
+            let dx: Array1<f64> = beta_old - prev_beta;
+            let den = dr.dot(&dr);
+            if !den.is_finite() || den < AA1_DAMPING_FLOOR {
+                return None;
+            }
+            let alpha = (dr.dot(&r_k) / den).clamp(-1.0, 1.0);
+            // beta_accel = beta_new - alpha * (dx + dr)
+            let mut beta_accel = beta_new.clone();
+            for i in 0..beta_accel.len() {
+                beta_accel[i] -= alpha * (dx[i] + dr[i]);
+            }
+            if !array1_is_finite(&beta_accel) {
+                return None;
+            }
+            Some(beta_accel)
+        }
+
+        fn note_accept(&mut self, iter: usize) {
+            self.consecutive_accepts = self.consecutive_accepts.saturating_add(1);
+            self.consecutive_rejects = 0;
+            if !self.engaged_logged {
+                log::info!("[PIRLS-AA1] engaged at iter={}", iter);
+                self.engaged_logged = true;
+            }
+        }
+
+        fn note_reject(&mut self, iter: usize) {
+            self.consecutive_rejects = self.consecutive_rejects.saturating_add(1);
+            self.consecutive_accepts = 0;
+            if !self.disabled
+                && self.consecutive_rejects >= AA1_DISABLE_REJECT_THRESHOLD
+                && self.consecutive_accepts < 1
+            {
+                self.disabled = true;
+                log::info!(
+                    "[PIRLS-AA1] disabled at iter={} reason=consecutive_rejects",
+                    iter
+                );
+            }
+        }
+
+        fn update_history(&mut self, beta_old: &Array1<f64>, residual: &Array1<f64>) {
+            self.prev_beta = Some(beta_old.clone());
+            self.prev_residual = Some(residual.clone());
+        }
+    }
+
     fn is_lm_retriable_candidate_error(err: &EstimationError) -> bool {
         match err {
             EstimationError::LinearSystemSolveFailed(_)
@@ -4344,6 +4447,11 @@ where
         .as_ref()
         .map(|_| Vec::new());
     let mut consecutive_fisher_fallbacks = 0usize;
+    // AA(1) state — engages only while `force_fisher_for_rest == true`. The
+    // initial allocations stay None until the first Fisher-regime iteration,
+    // so this is free when PIRLS stays on the observed-information Newton
+    // path the whole way through.
+    let mut aa_state = AndersonOneState::new();
     let mut force_fisher_for_rest = false;
     let kkt_tolerance = effective_kkt_tolerance(options);
     if let Some(adaptive) = options.adaptive_kkt_tolerance {
@@ -4774,6 +4882,44 @@ where
             {
                 project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
             }
+            // ── AA(1) Anderson acceleration ──────────────────────────────────
+            // Active only in the Fisher fixed-point regime (linearly
+            // convergent contraction). Treats the LM attempt as a fixed-point
+            // step F(beta_old) = beta_old + direction; mixes against the
+            // previous iteration's residual to produce an accelerated
+            // candidate. If the existing bound-projection / finiteness checks
+            // reject the accelerated candidate, fall back to the plain Fisher
+            // candidate transparently — no change to the rest of the loop.
+            let mut aa_attempt = false;
+            // Snapshot beta and the plain Fisher residual r_k = direction at
+            // this attempt so that — on acceptance — we can refresh the AA
+            // history with the *plain* fixed-point step regardless of
+            // whether the accelerated or plain candidate ended up accepted.
+            let beta_old_snapshot: Option<Array1<f64>> =
+                if force_fisher_for_rest { Some(beta.as_ref().clone()) } else { None };
+            let plain_residual_snapshot: Option<Array1<f64>> =
+                if force_fisher_for_rest { Some(direction.clone()) } else { None };
+            if force_fisher_for_rest && !aa_state.disabled {
+                let beta_old_ref: &Array1<f64> = beta.as_ref();
+                if let Some(mut beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
+                    // Apply the same bound projection the loop already runs on
+                    // the plain candidate. Treat this as the "existing
+                    // validity check": if projection moves the accelerated
+                    // candidate (i.e. it would have left the feasible region)
+                    // we keep the projected version; finiteness was already
+                    // validated inside aa1_mix. No new gates are introduced
+                    // here.
+                    if options.linear_constraints.is_none()
+                        && let Some(lb) = options.coefficient_lower_bounds.as_ref()
+                    {
+                        project_coefficients_to_lower_bounds(&mut beta_accel, lb);
+                    }
+                    if array1_is_finite(&beta_accel) {
+                        candidate_buf = beta_accel;
+                        aa_attempt = true;
+                    }
+                }
+            }
             let candidate_beta = Coefficients::new(std::mem::take(&mut candidate_buf));
             let candidate_eval_start = std::time::Instant::now();
             let candidate_eval_result = model.screen_candidate(
@@ -4902,6 +5048,9 @@ where
                             -1.0
                         };
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
+                            if aa_attempt {
+                                aa_state.note_reject(iter);
+                            }
                             loop_lambda *= madsen_reject_factor;
                             madsen_reject_factor *= 2.0;
                             continue;
@@ -4912,6 +5061,21 @@ where
                             {
                                 consecutive_fisher_fallbacks = 0;
                             }
+                        }
+                        if aa_attempt {
+                            aa_state.note_accept(iter);
+                        }
+                        // Refresh AA(1) history with the plain Fisher
+                        // fixed-point step from THIS iteration. We always
+                        // mix against the plain residual `r_k = direction`,
+                        // not the accelerated step, so the next iter's AA
+                        // formula stays faithful to the underlying
+                        // contraction map regardless of whether AA was used
+                        // or which candidate was finally accepted.
+                        if let (Some(b_old), Some(r_plain)) =
+                            (beta_old_snapshot.as_ref(), plain_residual_snapshot.as_ref())
+                        {
+                            aa_state.update_history(b_old, r_plain);
                         }
                         // Accept Step.
                         // Stash the accepted gain ratio for the
@@ -5110,6 +5274,9 @@ where
 
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
+                        if aa_attempt {
+                            aa_state.note_reject(iter);
+                        }
                         if state.hessian_curvature == HessianCurvatureKind::Observed
                             && !used_fisher_fallback_this_iter
                         {
