@@ -1642,6 +1642,7 @@ impl HessianDerivativeProvider for BarrierDerivativeProvider<'_> {
 /// - Differentiating W (weight drift, terms 3-5)
 /// - Cross terms between the two differentiations (terms 2, 3, 4)
 /// - The curvature of W itself through w'' (term 5)
+#[derive(Clone)]
 pub struct HyperCoord {
     /// ∂_i F|_β — fixed-β cost derivative (scalar).
     pub a: f64,
@@ -3089,6 +3090,7 @@ impl HyperOperator for BlockLocalDrift {
     }
 }
 
+#[derive(Clone)]
 pub struct HyperCoordDrift {
     /// Full p×p dense matrix (forces dense fallback when present).
     pub dense: Option<Array2<f64>>,
@@ -5831,10 +5833,8 @@ pub struct RemlLamlResult {
     /// The REML/LAML objective value (to be minimized).
     pub cost: f64,
     /// Newton-decrement energy `½ rᵀH⁻¹r` for the cost-side IFT residual correction.
-    #[expect(dead_code, reason = "published for runtime consumption in a follow-up")]
     pub ift_residual_energy: Option<f64>,
     /// Full-H one-step inner polish vector `H⁻¹r`, when already computed.
-    #[expect(dead_code, reason = "published for runtime consumption in a follow-up")]
     pub inner_polish_step: Option<Array1<f64>>,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
@@ -6610,6 +6610,10 @@ struct TangentProjectedHessianOperator {
 }
 
 impl HessianOperator for TangentProjectedHessianOperator {
+    fn active_rank(&self) -> usize {
+        self.h_t_op.active_rank()
+    }
+
     fn dim(&self) -> usize {
         self.z.nrows()
     }
@@ -6732,14 +6736,43 @@ impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
     fn hessian_derivative_correction_result(
         &self,
         v: &Array1<f64>,
-    ) -> Result<DriftDerivResult, String> {
+    ) -> Result<Option<DriftDerivResult>, String> {
         self.0.hessian_derivative_correction_result(v)
     }
     fn hessian_derivative_corrections_result(
         &self,
         vs: &[Array1<f64>],
-    ) -> Result<Vec<DriftDerivResult>, String> {
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
         self.0.hessian_derivative_corrections_result(vs)
+    }
+    fn has_batched_hessian_derivative_corrections(&self) -> bool {
+        self.0.has_batched_hessian_derivative_corrections()
+    }
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.0.hessian_second_derivative_correction(v_k, v_l, u_kl)
+    }
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        self.0
+            .hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+    }
+    fn hessian_second_derivative_corrections_result(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        self.0.hessian_second_derivative_corrections_result(triples)
+    }
+    fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
+        self.0.has_batched_hessian_second_derivative_corrections()
     }
     fn has_corrections(&self) -> bool {
         self.0.has_corrections()
@@ -6791,7 +6824,7 @@ fn try_tangent_projected_evaluate(
             // to surface the situation.
             return Err(format!(
                 "active constraint matrix has rank {} on {}-dim space; \
-                 tangent manifold is a single point ({β̂}), no outer \
+                 tangent manifold is a single point ({{β̂}}), no outer \
                  derivative is defined",
                 block.a.nrows(),
                 p
@@ -7924,19 +7957,10 @@ pub fn reml_laml_evaluate(
     // the same gradient the correction was supposed to have repaired,
     // and when `‖r_proj‖∞ ≈ 0` (the cert-exit contract) the correction
     // `-aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r ≡ 0` is identically zero
-    // (see `compute_kkt_residual_rho_corrections`).
-    //
-    // FIXME (BUG-3, tangent-space projection): the math review (codex
-    // CLI, captured in `envelope_gradient_uses_constraint_tangent_projection`
-    // test docstring; refs Wood 2011, Wood–Pya–Säfken 2016) confirms that
-    // under an active inequality constraint the principled outer cost is
-    // `½ log|ZᵀHZ| − ½ log|ZᵀSZ|_+` with gradient trace
-    // `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)`, where `Z = null(A_act)`. Suppression
-    // here is a *safety valve*, not the LAML objective. When
-    // `solution.active_constraints.is_some()` the evaluator should route
-    // through that tangent projection and emit a bounded gradient.
-    // Suppress unconditionally for now so the outer optimizer never
-    // consumes a divergent derivative until that wiring lands.
+    // (see `compute_kkt_residual_rho_corrections`). Active-constraint
+    // cases are handled before reaching here by the tangent-space
+    // dispatch at the top of this function (`try_tangent_projected_evaluate`,
+    // refs Wood 2011 §4; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2).
     let envelope_suppresses_outputs = envelope_inconsistent.is_some();
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
@@ -12804,6 +12828,12 @@ impl DenseSpectralOperator {
     }
     pub fn eigenvector_entry(&self, i: usize, k: usize) -> f64 {
         self.eigenvectors[[i, k]]
+    }
+    /// Whether eigenpair `k` is active in the operator's logdet, traces,
+    /// and solves. Under `PseudoLogdetMode::Smooth` this is always `true`;
+    /// under `HardPseudo` it is `false` when `σ_k ≤ ε`.
+    pub fn eigenpair_active(&self, k: usize) -> bool {
+        self.active_mask[k]
     }
 
     /// Create from a symmetric matrix (may be indefinite or singular).
