@@ -16,6 +16,7 @@ const PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD: usize = 64;
 #[derive(Clone)]
 pub struct SparseExactFactor {
     factor: SparseLlt<usize, f64>,
+    simplicial: Arc<SimplicialFactor>,
     n: usize,
     logdet: f64,
 }
@@ -453,15 +454,12 @@ pub fn factorize_sparse_spd(
         }
     })?;
     PROF_FAC_CHOL_NS.fetch_add(chol_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    // Compute logdet via a sparse-native simplicial LLᵀ on the same upper-
-    // triangular matrix. Previously we densified `h_upper` and ran a dense
-    // Cholesky purely to read its diagonal — an O(n_input³) detour that
-    // became the dominant cost for biobank-scale penalized Hessians. The
-    // simplicial path uses the same AMD ordering + LLᵀ machinery as the
-    // sp_cholesky factor and runs in O(nnz(L)) once the symbolic structure
-    // is built.
+    // Keep an explicit simplicial LLᵀ factor in addition to faer's solver
+    // object. The raw L is needed by callers that must reconstruct H in a
+    // changed basis, such as active-constraint tangent projection.
     let logdet_t = std::time::Instant::now();
-    let logdet = sparse_spd_logdet_via_simplicial(&h_upper)?;
+    let simplicial = factorize_simplicial_canonical_upper(&h_upper)?;
+    let logdet = simplicial.logdet;
     PROF_FAC_LOGDET_NS.fetch_add(logdet_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
     PROF_FAC_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -475,6 +473,7 @@ pub fn factorize_sparse_spd(
     }
     Ok(SparseExactFactor {
         factor,
+        simplicial: Arc::new(simplicial),
         n: h_upper.ncols(),
         logdet,
     })
@@ -739,6 +738,12 @@ where
 
 pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
     Ok(factor.logdet)
+}
+
+pub fn assemble_sparse_factor_h_dense(
+    factor: &SparseExactFactor,
+) -> Result<Array2<f64>, EstimationError> {
+    factor.simplicial.assemble_h_dense_original_order()
 }
 
 pub fn assemble_and_factor_sparse_penalized_system(
