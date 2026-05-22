@@ -8572,47 +8572,24 @@ impl CustomFamily for TransformationNormalFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        // WS4a-CTN structural blocker: CTN's outer-score reductions are mathematically
-        // per-row sums (the log-likelihood is `Σ_i row_ll_i` accumulated in
-        // `build_transformation_row_derived` near line 532; the joint Hessian
-        // is assembled by `scop_gradient_and_negative_hessian`, `scop_hessian_
-        // matvec_into`, and `scop_hessian_diagonal` as row-streaming Khatri-Rao
-        // contractions; the ψ first-order block is the per-row reduction in
-        // `TransformationNormalPsiWorkspace::compute_all_axes` near line 13916;
-        // the ψ-ψ pair block is the per-row reduction in `compute_pair_cache`
-        // near line 14263), so in principle Horvitz-Thompson row-mask
-        // reweighting (`w_i ← w_i · 1/π_i` for sampled rows, `0` elsewhere)
-        // is a valid unbiased estimator across every component.
-        //
-        // What blocks wiring `subsample_capable: true` today is that NONE of
-        // those row-streaming SCOP kernels take a row-mask / per-row weight
-        // override argument — every one of them reads `self.weights[i]`
-        // directly from the immutable shared `Arc<TransformationNormalFamily>`.
-        // The persistent dense-Hessian cache (`persistent_dense_hessian`) and
-        // the workspace's `row_quantity_cache` are also keyed on `beta` alone
-        // with no subsample identity, so installing a subsampled Hessian
-        // would corrupt later full-data probes that share `β`. There is no
-        // `apply_outer_subsample` analogue to the Gaussian-LS workspace
-        // (`coeff_mm`/`coeff_ml`/`coeff_ll`) because the CTN workspace does
-        // not precompute per-row coefficient arrays — its matvec streams rows
-        // through the chain rule on every call.
-        //
-        // Making CTN subsample-capable would require (at minimum) plumbing an
-        // `Option<&[WeightedOuterRow]>` (or an effective `Cow<Array1<f64>>`
-        // row weight view) through `scop_gradient_and_negative_hessian`,
-        // `scop_hessian_matvec_into`, `scop_hessian_diagonal`,
-        // `scop_psi_terms`, `scop_psi_psi_value_score_hvp_from_cov`,
-        // `scop_psi_hessian_directional_derivative`,
-        // `TransformationNormalPsiWorkspace::{compute_all_axes,
-        // compute_pair_cache}`, and a subsample-identity tag on
-        // `CtnDenseHessianKey` / the row-quantity cache. Until that refactor
-        // lands, the `_with_options` variant must forward to the full-data
-        // constructor, and `outer_derivative_policy.subsample_capable` stays
-        // `false` so the κ pilot/polish schedule never installs a row mask
-        // that the CTN kernels would silently ignore (which would violate
-        // `E[score_subsample] = score_full`).
+        // Route through a mask-aware family clone when an outer-score
+        // subsample is active. Every CTN ψ assembly site — including the
+        // workspace's `compute_all_axes` (per-row reduction near line ~13916)
+        // and `compute_pair_cache` (per-row reduction near line ~14263) —
+        // reads its row weight via `self.family.effective_weights()`, which
+        // on the cloned family returns `wᵢ · mᵢ`. Because each per-row
+        // contribution is linear in `wᵢ`, the workspace's per-axis ψ and
+        // per-axis-pair ψ-ψ outputs are exact Horvitz-Thompson estimators
+        // of the full-data quantities. The persistent dense-Hessian cache
+        // and `row_quantity_cache` on the cloned family are fresh, so
+        // subsampled builds cannot alias a later full-data probe at the
+        // same β.
+        let family = match self.maybe_with_outer_subsample_from_options(options)? {
+            Some(masked) => masked,
+            None => self.clone(),
+        };
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
-            self.clone(),
+            family,
             block_states.to_vec(),
             derivative_blocks.to_vec(),
         ))))

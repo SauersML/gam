@@ -7690,6 +7690,25 @@ impl SurvivalLocationScaleFamily {
         q: &SurvivalJointQuantities,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        self.assemble_joint_hessian_from_quantities_masked(q, block_states, None)
+    }
+
+    /// HT-mask-aware variant of [`assemble_joint_hessian_from_quantities`].
+    ///
+    /// When `row_mask` is `None`, the function is byte-identical to the
+    /// pre-refactor implementation (every weight argument is unchanged).
+    /// When `row_mask` is `Some(m)`, every row-additive assembly site
+    /// replaces the per-row weight `w[i]` with `w[i] * m[i]`. This is the
+    /// outer-score Horvitz-Thompson subsample plumbing
+    /// (WS4a-survival-LS): every survival-LS assembly site is of the form
+    /// `Σ_i x_i y_iᵀ · w_i` (row-additive), so per-row mask multiplication
+    /// is unbiased for `Σ_i w_i · x_i y_iᵀ` under HT weighting.
+    fn assemble_joint_hessian_from_quantities_masked(
+        &self,
+        q: &SurvivalJointQuantities,
+        block_states: &[ParameterBlockState],
+        #[allow(unused_variables)] row_mask: Option<&Array1<f64>>,
+    ) -> Result<Option<Array2<f64>>, String> {
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let joint_states = self.validate_joint_states(block_states)?;
         let eta_t_exit = joint_states.3;
