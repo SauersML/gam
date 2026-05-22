@@ -8322,16 +8322,7 @@ impl BernoulliMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
-        self.build_row_exact_context_with_stats(row, block_states, None)
-    }
-
-    fn build_row_exact_context_with_stats(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        stats: Option<&BernoulliInterceptSolveStats>,
-    ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
-        self.build_row_exact_context_with_stats_and_cell_cache(row, block_states, stats, true)
+        self.build_row_exact_context_with_stats_and_cell_cache(row, block_states, None, true)
     }
 
     fn build_row_exact_context_with_stats_and_cell_cache(
