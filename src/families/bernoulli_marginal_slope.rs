@@ -5236,6 +5236,17 @@ struct BernoulliRigidRowKernel {
     /// and may be entered concurrently from inside an outer par_iter — see
     /// `feedback_oncelock_rayon_deadlock` and `RayonSafeOnce`'s doc.
     third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
+    /// Per-row marginal-link jet at `block_states[0].eta[row]`. The η-axis is
+    /// constant across this kernel's lifetime (a `BernoulliRigidRowKernel`
+    /// holds a fixed `block_states` snapshot), so the inverse-link jet —
+    /// invoked at least once per row by `row_kernel`, again by every probe
+    /// of `third_full_cache` and `fourth_full_cache` — can be precomputed
+    /// once and shared by every consumer. The values stored here are
+    /// bit-identical to a per-call `marginal_link_map(eta)` because that
+    /// function is a pure function of `eta` and the family link kind, and
+    /// the cache uses the same `eta`/link combination used by the original
+    /// callers.
+    marginal_link_cache: crate::resource::RayonSafeOnce<Vec<BernoulliMarginalLinkMap>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
@@ -5255,7 +5266,32 @@ impl BernoulliRigidRowKernel {
             slices,
             third_full_cache: crate::resource::RayonSafeOnce::new(),
             fourth_full_cache: crate::resource::RayonSafeOnce::new(),
+            marginal_link_cache: crate::resource::RayonSafeOnce::new(),
         }
+    }
+
+    /// Lazy-build the per-row marginal-link jet at `block_states[0].eta[row]`.
+    /// `BernoulliRigidRowKernel` holds a fixed `block_states` snapshot for its
+    /// entire lifetime, so the inverse-link jet — invoked by `row_kernel`,
+    /// the third-full cache build, and the fourth-full cache build — is
+    /// constant per row across every consumer. Cache once, look up
+    /// thereafter. `RayonSafeOnce` mirrors the other `*_full_cache` builders
+    /// to stay reentrant-safe under outer rayon parallelism. The values
+    /// returned here are bit-identical to a per-call
+    /// `family.marginal_link_map(eta)` because that function is a pure
+    /// function of `eta` and the family's link kind.
+    fn marginal_link_jet(&self, row: usize) -> BernoulliMarginalLinkMap {
+        let cache = self.marginal_link_cache.get_or_init(|| {
+            (0..self.family.y.len())
+                .into_par_iter()
+                .map(|r| self.family.marginal_link_map(self.block_states[0].eta[r]))
+                .collect::<Result<Vec<_>, String>>()
+                .expect(
+                    "BernoulliRigidRowKernel marginal-link cache build failed; \
+                     per-row inverse-link jet should not error at the converged β snapshot",
+                )
+        });
+        cache[row]
     }
 
     /// Lazy-build the per-row uncontracted third-derivative tensor cache. The
@@ -5273,7 +5309,7 @@ impl BernoulliRigidRowKernel {
                     .into_par_iter()
                     .map(|row| {
                         let marginal_eta = self.block_states[0].eta[row];
-                        let marginal = self.family.marginal_link_map(marginal_eta)?;
+                        let marginal = self.marginal_link_jet(row);
                         let slope = self.block_states[1].eta[row];
                         self.family
                             .rigid_row_third_full(row, marginal_eta, marginal, slope)
@@ -5301,7 +5337,7 @@ impl BernoulliRigidRowKernel {
                     .into_par_iter()
                     .map(|row| {
                         let marginal_eta = self.block_states[0].eta[row];
-                        let marginal = self.family.marginal_link_map(marginal_eta)?;
+                        let marginal = self.marginal_link_jet(row);
                         let slope = self.block_states[1].eta[row];
                         self.family
                             .rigid_row_fourth_full(row, marginal_eta, marginal, slope)
@@ -5326,7 +5362,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
         let marginal_eta = self.block_states[0].eta[row];
-        let marginal = self.family.marginal_link_map(marginal_eta)?;
+        let marginal = self.marginal_link_jet(row);
         let g = self.block_states[1].eta[row];
         self.family
             .rigid_row_kernel_eval(row, marginal_eta, marginal, g)
@@ -7461,6 +7497,54 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
+    /// Build per-row degree-9 cached cell moments (denested partition +
+    /// per-cell intra-row dedup + LRU lookup). Shared by
+    /// `build_row_exact_context_with_stats_and_cell_cache` and the
+    /// row-cell-moments-bundle fallback inside
+    /// `build_exact_eval_cache_with_options`, so the partition + dedup +
+    /// LRU pipeline is expressed once and the two call sites stay
+    /// bit-identical.
+    fn compute_row_degree9_cells(
+        &self,
+        intercept: f64,
+        slope: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<Vec<CachedDenestedCellMoments>, String> {
+        let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
+        // Per-row dedup: within ONE row's denested-partition output, the
+        // score-warp and link-wiggle bases occasionally produce cells
+        // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
+        // moments once and cloning the result into the other slots is
+        // numerically identical to evaluating each cell independently
+        // (`evaluate_cell_moments_lru` is a pure function of the cell), and
+        // skips redundant work. The dedup is purely intra-row, so it is
+        // orthogonal to the per-family LRU (which is keyed across rows)
+        // and the affine tail-cell memo (a separate mechanism).
+        let mut dedup: HashMap<
+            exact_kernel::CellFingerprint,
+            exact_kernel::CellDerivativeMomentState,
+        > = HashMap::new();
+        let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
+        for partition_cell in cells.into_iter() {
+            let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
+            let state: exact_kernel::CellDerivativeMomentState =
+                if let Some(existing) = dedup.get(&key) {
+                    existing.clone()
+                } else {
+                    let computed =
+                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
+                    dedup.insert(key, computed.clone());
+                    computed
+                };
+            out.push(CachedDenestedCellMoments {
+                partition_cell,
+                state,
+            });
+        }
+        Ok(out)
+    }
+
     fn denested_partition_cells(
         &self,
         a: f64,
@@ -8343,11 +8427,29 @@ impl BernoulliMarginalSlopeFamily {
         }
         let stats = BernoulliInterceptSolveStats::default();
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
+        // Suppress per-row `degree9_cells` caching during the parallel context
+        // build: when flex is active *and* the latent measure is StandardNormal
+        // (i.e. exactly when `degree9_cells` would be populated), the top-of-
+        // cycle `build_row_cell_moments_bundle` invocation below also calls
+        // `denested_partition_cells` for every row. Suppressing the per-row
+        // cache here avoids the duplicate partition computation and the
+        // unused degree-9 moment evaluations whenever the bundle succeeds.
+        // When the bundle returns `None` (budget exceeded), the per-row
+        // `degree9_cells` cache is reconstructed below so the row-evaluation
+        // fast path that consults `row_ctx.degree9_cells` still has its
+        // cache. Numerical results are unchanged either way.
         let row_contexts: Result<Vec<_>, String> = (0..n)
             .into_par_iter()
-            .map(|row| self.build_row_exact_context_with_stats(row, block_states, Some(&stats)))
+            .map(|row| {
+                self.build_row_exact_context_with_stats_and_cell_cache(
+                    row,
+                    block_states,
+                    Some(&stats),
+                    false,
+                )
+            })
             .collect();
-        let row_contexts = row_contexts?;
+        let mut row_contexts = row_contexts?;
         let fast_path_rows = row_contexts
             .iter()
             .filter(|ctx| ctx.intercept_fast_path)
@@ -8421,6 +8523,32 @@ impl BernoulliMarginalSlopeFamily {
         // safe at biobank scale.
         let row_cell_moments =
             self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, row_cell_mask)?;
+        // Bundle-absent fallback: the parallel row-context pass above was
+        // built with `cache_degree9_cells=false` to avoid double-computing
+        // `denested_partition_cells`. When the bundle is unavailable (budget
+        // exceeded, or one of the bundle's short-circuits fired) the
+        // downstream row-eval consults `row_ctx.degree9_cells`, so populate
+        // it now in parallel — only one `denested_partition_cells` call per
+        // row total across the cache lifetime.
+        if row_cell_moments.is_none()
+            && flex_active
+            && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
+        {
+            let beta_h = self.score_beta(block_states)?;
+            let beta_w = self.link_beta(block_states)?;
+            let slope_block = &block_states[1].eta;
+            let computed: Result<Vec<Vec<CachedDenestedCellMoments>>, String> = row_contexts
+                .par_iter()
+                .enumerate()
+                .map(|(row, ctx)| {
+                    self.compute_row_degree9_cells(ctx.intercept, slope_block[row], beta_h, beta_w)
+                })
+                .collect();
+            let computed = computed?;
+            for (ctx, cells) in row_contexts.iter_mut().zip(computed.into_iter()) {
+                ctx.degree9_cells = Some(cells);
+            }
+        }
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,

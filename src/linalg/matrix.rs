@@ -5875,7 +5875,7 @@ impl DesignMatrix {
         rows: Range<usize>,
         out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
-        <Self as LinearOperator>::row_chunk_into(self, rows, out)
+        <Self as DenseDesignOperator>::row_chunk_into(self, rows, out)
     }
 
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
