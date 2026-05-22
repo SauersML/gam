@@ -73,6 +73,57 @@ pub struct SchemaColumn {
     pub levels: Vec<String>,
 }
 
+/// Typed error surface for `src/inference/model.rs` saved-model code.
+///
+/// Every variant carries a free-form `reason: String` payload; `Display`
+/// emits exactly that payload, so converting a `FittedModelError` into
+/// `String` (via the `From` impl below) is byte-equivalent to the pre-
+/// refactor `Err(format!(...))` / `Err("...".to_string())` strings that
+/// the same call sites produced. This lets external callers keep using
+/// `?` against `Result<_, String>` without source changes — the typed
+/// enum is purely an in-module discipline gain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FittedModelError {
+    /// Saved payload structure / shape / version disagrees with what the
+    /// current binary expects (e.g. covariance shape, block ordering,
+    /// schema version, C2 continuity, out-of-range span/basis indices).
+    SchemaMismatch { reason: String },
+    /// Saved payload bytes / numeric content are corrupt or unreadable
+    /// (non-finite scalars, invalid JSON, IO failure, malformed stateful
+    /// link state).
+    PayloadCorrupt { reason: String },
+    /// A required field that the current code path needs is absent from
+    /// the payload (typically `..; refit` errors).
+    MissingField { reason: String },
+    /// A combination of saved-model options is not supported by the
+    /// current binary (unsupported deployment-extension kind, unsupported
+    /// kernel marker, unsupported survival_time_basis variant, etc.).
+    IncompatibleConfig { reason: String },
+    /// An input value rejected by a save-time sanity gate (e.g. negative
+    /// ridge alpha).
+    InvalidInput { reason: String },
+}
+
+impl std::fmt::Display for FittedModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaMismatch { reason }
+            | Self::PayloadCorrupt { reason }
+            | Self::MissingField { reason }
+            | Self::IncompatibleConfig { reason }
+            | Self::InvalidInput { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for FittedModelError {}
+
+impl From<FittedModelError> for String {
+    fn from(err: FittedModelError) -> String {
+        err.to_string()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedLatentZNormalization {
     pub mean: f64,
@@ -80,23 +131,29 @@ pub struct SavedLatentZNormalization {
 }
 
 impl SavedLatentZNormalization {
-    pub fn validate(&self, context: &str) -> Result<(), String> {
+    pub fn validate(&self, context: &str) -> Result<(), FittedModelError> {
         if !self.mean.is_finite() {
-            return Err(format!("{context} latent z mean must be finite"));
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!("{context} latent z mean must be finite"),
+            });
         }
         if !(self.sd.is_finite() && self.sd > 1e-12) {
-            return Err(format!(
-                "{context} latent z sd must be finite and > 1e-12; got {}",
-                self.sd
-            ));
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "{context} latent z sd must be finite and > 1e-12; got {}",
+                    self.sd
+                ),
+            });
         }
         Ok(())
     }
 
-    pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
+    pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, FittedModelError> {
         self.validate(context)?;
         if z.iter().any(|value| !value.is_finite()) {
-            return Err(format!("{context} requires finite z values"));
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!("{context} requires finite z values"),
+            });
         }
         Ok(z.mapv(|zi| (zi - self.mean) / self.sd))
     }
@@ -136,17 +193,21 @@ impl TransformationScoreCalibration {
         }
     }
 
-    pub fn validate(&self, context: &str) -> Result<(), String> {
+    pub fn validate(&self, context: &str) -> Result<(), FittedModelError> {
         if self.score_kind != TransformationScoreKind::FiniteSupportPit {
-            return Err(format!(
-                "{context} supports only finite-support CTN PIT score semantics"
-            ));
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: format!(
+                    "{context} supports only finite-support CTN PIT score semantics"
+                ),
+            });
         }
         if !(self.clip_eps.is_finite() && self.clip_eps > 0.0 && self.clip_eps < 0.5) {
-            return Err(format!(
-                "{context} requires PIT clip_eps in (0, 0.5), got {}",
-                self.clip_eps
-            ));
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: format!(
+                    "{context} requires PIT clip_eps in (0, 0.5), got {}",
+                    self.clip_eps
+                ),
+            });
         }
         Ok(())
     }
@@ -404,19 +465,24 @@ pub fn append_deployment_extension_columns(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     base_design: Array2<f64>,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, FittedModelError> {
     if model.deployment_extensions.is_empty() {
         return Ok(base_design);
     }
     if base_design.nrows() != data.nrows() {
-        return Err(format!(
-            "deployment extension design row mismatch: base design has {} rows but data has {}",
-            base_design.nrows(),
-            data.nrows()
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "deployment extension design row mismatch: base design has {} rows but data has {}",
+                base_design.nrows(),
+                data.nrows()
+            ),
+        });
     }
     let spec = model.resolved_termspec.as_ref().ok_or_else(|| {
-        "deployment extension prediction requires saved resolved_termspec; refit".to_string()
+        FittedModelError::MissingField {
+            reason: "deployment extension prediction requires saved resolved_termspec; refit"
+                .to_string(),
+        }
     })?;
     let n = base_design.nrows();
     let p_old = base_design.ncols();
@@ -426,10 +492,12 @@ pub fn append_deployment_extension_columns(
     for (tail_idx, extension) in extensions.iter().enumerate() {
         let expected = p_old + tail_idx;
         if extension.coefficient_index != expected {
-            return Err(format!(
-                "deployment extension '{}' has coefficient index {}, expected append-only index {}",
-                extension.name, extension.coefficient_index, expected
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "deployment extension '{}' has coefficient index {}, expected append-only index {}",
+                    extension.name, extension.coefficient_index, expected
+                ),
+            });
         }
     }
 
@@ -437,20 +505,22 @@ pub fn append_deployment_extension_columns(
     out.slice_mut(ndarray::s![.., ..p_old]).assign(&base_design);
     for (tail_idx, extension) in extensions.into_iter().enumerate() {
         if extension.kind != "random-effect-level" {
-            return Err(format!(
-                "unsupported deployment extension kind '{}' for '{}'",
-                extension.kind, extension.name
-            ));
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: format!(
+                    "unsupported deployment extension kind '{}' for '{}'",
+                    extension.kind, extension.name
+                ),
+            });
         }
         let term = spec
             .random_effect_terms
             .iter()
             .find(|term| term.name == extension.term)
-            .ok_or_else(|| {
-                format!(
+            .ok_or_else(|| FittedModelError::MissingField {
+                reason: format!(
                     "deployment extension '{}' references unknown random-effect term '{}'",
                     extension.name, extension.term
-                )
+                ),
             })?;
         let prediction_col = training_headers
             .and_then(|headers| headers.get(term.feature_col))
@@ -458,12 +528,14 @@ pub fn append_deployment_extension_columns(
             .copied()
             .unwrap_or(term.feature_col);
         if prediction_col >= data.ncols() {
-            return Err(format!(
-                "deployment extension '{}' feature column {} out of bounds for {} prediction columns",
-                extension.name,
-                prediction_col,
-                data.ncols()
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "deployment extension '{}' feature column {} out of bounds for {} prediction columns",
+                    extension.name,
+                    prediction_col,
+                    data.ncols()
+                ),
+            });
         }
         let col = p_old + tail_idx;
         for row in 0..n {
@@ -610,15 +682,17 @@ impl FittedModelPayload {
         self.survival_time_anchor = Some(snapshot.anchor);
     }
 
-    fn validate_payload_version(&self) -> Result<(), String> {
+    fn validate_payload_version(&self) -> Result<(), FittedModelError> {
         if self.version != MODEL_PAYLOAD_VERSION {
-            return Err(format!(
-                "saved model payload schema mismatch: file has version={}, \
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved model payload schema mismatch: file has version={}, \
                  this binary expects MODEL_PAYLOAD_VERSION={}. \
                  Refit with the current CLI, or rebuild the reader at the same \
                  version the model was written with.",
-                self.version, MODEL_PAYLOAD_VERSION
-            ));
+                    self.version, MODEL_PAYLOAD_VERSION
+                ),
+            });
         }
         Ok(())
     }
@@ -810,48 +884,55 @@ fn validate_location_scale_saved_fit(
     fit: &UnifiedFitResult,
     model_class: PredictModelClass,
     link_wiggle: Option<&SavedLinkWiggleRuntime>,
-) -> Result<(), String> {
+) -> Result<(), FittedModelError> {
     let primary = match model_class {
         PredictModelClass::GaussianLocationScale => gaussian_location_scale_mean_beta(fit),
         PredictModelClass::BinomialLocationScale => binomial_location_scale_threshold_beta(fit),
         _ => None,
     }
-    .ok_or_else(|| match model_class {
-        PredictModelClass::GaussianLocationScale => {
-            "gaussian-location-scale saved fit is missing mean/location block".to_string()
-        }
-        PredictModelClass::BinomialLocationScale => {
-            "binomial-location-scale saved fit is missing threshold/location block".to_string()
-        }
-        _ => "location-scale saved fit is missing primary block".to_string(),
+    .ok_or_else(|| FittedModelError::MissingField {
+        reason: match model_class {
+            PredictModelClass::GaussianLocationScale => {
+                "gaussian-location-scale saved fit is missing mean/location block".to_string()
+            }
+            PredictModelClass::BinomialLocationScale => {
+                "binomial-location-scale saved fit is missing threshold/location block".to_string()
+            }
+            _ => "location-scale saved fit is missing primary block".to_string(),
+        },
     })?;
 
-    let scale = location_scale_noise_beta(fit)
-        .ok_or_else(|| "location-scale saved fit is missing scale block".to_string())?;
+    let scale = location_scale_noise_beta(fit).ok_or_else(|| FittedModelError::MissingField {
+        reason: "location-scale saved fit is missing scale block".to_string(),
+    })?;
     let expected =
         primary.len() + scale.len() + link_wiggle.map_or(0, |runtime| runtime.beta.len());
 
     if let Some(cov) = fit.beta_covariance()
         && (cov.nrows() != expected || cov.ncols() != expected)
     {
-        return Err(format!(
-            "location-scale saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
-            cov.nrows(),
-            cov.ncols(),
-            expected,
-            expected
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                expected,
+                expected
+            ),
+        });
     }
     if let Some(cov) = fit.beta_covariance_corrected()
         && (cov.nrows() != expected || cov.ncols() != expected)
     {
-        return Err(format!(
-            "location-scale saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
-            cov.nrows(),
-            cov.ncols(),
-            expected,
-            expected
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                expected,
+                expected
+            ),
+        });
     }
     Ok(())
 }
@@ -861,16 +942,20 @@ fn validate_survival_saved_block_matches_payload(
     role: BlockRole,
     payload_beta: Option<&Vec<f64>>,
     label: &str,
-) -> Result<usize, String> {
+) -> Result<usize, FittedModelError> {
     let block = fit
         .block_by_role(role)
-        .ok_or_else(|| format!("location-scale survival saved fit is missing {label} block"))?;
+        .ok_or_else(|| FittedModelError::MissingField {
+            reason: format!("location-scale survival saved fit is missing {label} block"),
+        })?;
     if let Some(saved) = payload_beta
         && block.beta.to_vec() != *saved
     {
-        return Err(format!(
-            "location-scale survival saved {label} coefficients disagree with fit_result"
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival saved {label} coefficients disagree with fit_result"
+            ),
+        });
     }
     Ok(block.beta.len())
 }
@@ -878,10 +963,14 @@ fn validate_survival_saved_block_matches_payload(
 fn validate_survival_location_scale_saved_fit(
     payload: &FittedModelPayload,
     link_wiggle: Option<&SavedLinkWiggleRuntime>,
-) -> Result<(), String> {
-    let fit = payload.fit_result.as_ref().ok_or_else(|| {
-        "location-scale survival model is missing canonical fit_result payload".to_string()
-    })?;
+) -> Result<(), FittedModelError> {
+    let fit = payload
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| FittedModelError::MissingField {
+            reason: "location-scale survival model is missing canonical fit_result payload"
+                .to_string(),
+        })?;
     let p_time = validate_survival_saved_block_matches_payload(
         fit,
         BlockRole::Time,
@@ -903,22 +992,27 @@ fn validate_survival_location_scale_saved_fit(
     let p_wiggle = match link_wiggle {
         Some(runtime) => {
             let block = fit.block_by_role(BlockRole::LinkWiggle).ok_or_else(|| {
-                "location-scale survival saved fit is missing link-wiggle block".to_string()
+                FittedModelError::MissingField {
+                    reason: "location-scale survival saved fit is missing link-wiggle block"
+                        .to_string(),
+                }
             })?;
             if block.beta.to_vec() != runtime.beta {
-                return Err(
-                    "location-scale survival saved link-wiggle coefficients disagree with fit_result"
-                        .to_string(),
-                );
+                return Err(FittedModelError::SchemaMismatch {
+                    reason:
+                        "location-scale survival saved link-wiggle coefficients disagree with fit_result"
+                            .to_string(),
+                });
             }
             runtime.beta.len()
         }
         None => {
             if fit.block_by_role(BlockRole::LinkWiggle).is_some() {
-                return Err(
-                    "location-scale survival saved fit has a LinkWiggle block without payload metadata"
-                        .to_string(),
-                );
+                return Err(FittedModelError::SchemaMismatch {
+                    reason:
+                        "location-scale survival saved fit has a LinkWiggle block without payload metadata"
+                            .to_string(),
+                });
             }
             0
         }
@@ -928,24 +1022,28 @@ fn validate_survival_location_scale_saved_fit(
     if let Some(cov) = fit.beta_covariance()
         && (cov.nrows() != expected || cov.ncols() != expected)
     {
-        return Err(format!(
-            "location-scale survival saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
-            cov.nrows(),
-            cov.ncols(),
-            expected,
-            expected
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival saved conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                expected,
+                expected
+            ),
+        });
     }
     if let Some(cov) = fit.beta_covariance_corrected()
         && (cov.nrows() != expected || cov.ncols() != expected)
     {
-        return Err(format!(
-            "location-scale survival saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
-            cov.nrows(),
-            cov.ncols(),
-            expected,
-            expected
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "location-scale survival saved corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                expected,
+                expected
+            ),
+        });
     }
     Ok(())
 }
@@ -955,7 +1053,7 @@ fn validate_marginal_slope_saved_fit(
     score_warp: Option<&SavedAnchoredDeviationRuntime>,
     link_deviation: Option<&SavedAnchoredDeviationRuntime>,
     fit_label: &str,
-) -> Result<(), String> {
+) -> Result<(), FittedModelError> {
     validate_marginal_slope_saved_fit_impl(
         fit,
         score_warp,
@@ -972,7 +1070,7 @@ fn validate_survival_marginal_slope_saved_fit(
     score_warp: Option<&SavedAnchoredDeviationRuntime>,
     link_deviation: Option<&SavedAnchoredDeviationRuntime>,
     fit_label: &str,
-) -> Result<(), String> {
+) -> Result<(), FittedModelError> {
     validate_marginal_slope_saved_fit_impl(
         fit,
         score_warp,
@@ -999,7 +1097,7 @@ fn validate_marginal_slope_saved_fit_impl(
     family_kind: &str,
     base_block_count: usize,
     base_block_role_list: &str,
-) -> Result<(), String> {
+) -> Result<(), FittedModelError> {
     let expected_blocks = base_block_count
         + usize::from(score_warp.is_some())
         + usize::from(link_deviation.is_some());
@@ -1014,41 +1112,47 @@ fn validate_marginal_slope_saved_fit_impl(
         } else {
             ""
         };
-        return Err(format!(
-            "{family_kind} marginal-slope saved {fit_label} requires {expected_blocks} blocks [{base_block_role_list}{score_warp_suffix}{link_deviation_suffix}], got {}",
-            fit.blocks.len(),
-        ));
+        return Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "{family_kind} marginal-slope saved {fit_label} requires {expected_blocks} blocks [{base_block_role_list}{score_warp_suffix}{link_deviation_suffix}], got {}",
+                fit.blocks.len(),
+            ),
+        });
     }
     if let Some(runtime) = score_warp {
         let beta = &fit.blocks[base_block_count].beta;
         if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "{family_kind} marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{family_kind} marginal-slope saved {fit_label} score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ),
+            });
         }
     }
     if let Some(runtime) = link_deviation {
         let idx = base_block_count + usize::from(score_warp.is_some());
         let beta = &fit.blocks[idx].beta;
         if beta.len() != runtime.basis_dim {
-            return Err(format!(
-                "{family_kind} marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "{family_kind} marginal-slope saved {fit_label} link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ),
+            });
         }
     }
     Ok(())
 }
 
 impl SavedLinkWiggleRuntime {
-    fn validate_global_monotonicity(&self) -> Result<(), String> {
+    fn validate_global_monotonicity(&self) -> Result<(), FittedModelError> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved link-wiggle")
     }
 
-    fn validate_monotone_derivative(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+    fn validate_monotone_derivative(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_global_monotonicity()?;
         let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
@@ -1065,7 +1169,7 @@ impl SavedLinkWiggleRuntime {
         &self,
         q0: &Array1<f64>,
         basis_options: BasisOptions,
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<Array2<f64>, FittedModelError> {
         let knot_arr = Array1::from_vec(self.knots.clone());
         let constrained = monotone_wiggle_basis_with_derivative_order(
             q0.view(),
@@ -1083,12 +1187,12 @@ impl SavedLinkWiggleRuntime {
         Ok(constrained)
     }
 
-    pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn design(&self, q0: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.validate_global_monotonicity()?;
         self.constrained_basis(q0, BasisOptions::value())
     }
 
-    pub fn basis_row_scalar(&self, q0: f64) -> Result<Array1<f64>, String> {
+    pub fn basis_row_scalar(&self, q0: f64) -> Result<Array1<f64>, FittedModelError> {
         let q = Array1::from_vec(vec![q0]);
         let x = self.design(&q)?;
         if x.nrows() != 1 {
@@ -1100,26 +1204,26 @@ impl SavedLinkWiggleRuntime {
         Ok(x.row(0).to_owned())
     }
 
-    pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+    pub fn apply(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(q0)?;
         let xwiggle = self.constrained_basis(q0, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
         Ok(q0 + &xwiggle.dot(&beta_link_wiggle))
     }
 
-    pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, String> {
+    pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(q0)
     }
 }
 
 impl SavedBaselineTimeWiggleRuntime {
-    pub fn validate_global_monotonicity(&self) -> Result<(), String> {
+    pub fn validate_global_monotonicity(&self) -> Result<(), FittedModelError> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved baseline-timewiggle")
     }
 }
 
 impl SavedAnchoredDeviationRuntime {
-    pub(crate) fn validate_exact_replay_contract(&self) -> Result<(), String> {
+    pub(crate) fn validate_exact_replay_contract(&self) -> Result<(), FittedModelError> {
         if self.kernel.is_empty() {
             return Err(
                 "saved anchored deviation runtime is missing the exact kernel marker".to_string(),
@@ -1165,7 +1269,7 @@ impl SavedAnchoredDeviationRuntime {
         Ok(())
     }
 
-    fn validate_anchor_residual_shape(&self) -> Result<(), String> {
+    fn validate_anchor_residual_shape(&self) -> Result<(), FittedModelError> {
         let coeffs = match self.anchor_residual_coefficients.as_ref() {
             Some(c) => c,
             None => {
@@ -1244,7 +1348,7 @@ impl SavedAnchoredDeviationRuntime {
         Ok(())
     }
 
-    fn validate_c2_span_continuity(&self) -> Result<(), String> {
+    fn validate_c2_span_continuity(&self) -> Result<(), FittedModelError> {
         const TOL: f64 = 1e-8;
         for span_idx in 1..self.breakpoints.len() - 1 {
             let left_span = span_idx - 1;
@@ -1284,7 +1388,7 @@ impl SavedAnchoredDeviationRuntime {
         matrix: &[Vec<f64>],
         label: &str,
         expected_rows: usize,
-    ) -> Result<(), String> {
+    ) -> Result<(), FittedModelError> {
         if matrix.len() != expected_rows {
             return Err(format!(
                 "saved anchored deviation runtime {label} row count mismatch: got {}, expected {}",
@@ -1325,7 +1429,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         values: &Array1<f64>,
         derivative_order: usize,
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.validate_exact_replay_contract()?;
         let (left_ep, right_ep) = self.support_interval()?;
         let mut out = Array2::<f64>::zeros((values.len(), self.basis_dim));
@@ -1375,21 +1479,21 @@ impl SavedAnchoredDeviationRuntime {
         Ok(out)
     }
 
-    pub fn breakpoints(&self) -> Result<Vec<f64>, String> {
+    pub fn breakpoints(&self) -> Result<Vec<f64>, FittedModelError> {
         self.validate_exact_replay_contract()?;
         Ok(self.breakpoints.clone())
     }
 
-    pub fn span_count(&self) -> Result<usize, String> {
+    pub fn span_count(&self) -> Result<usize, FittedModelError> {
         Ok(self.breakpoints()?.windows(2).count())
     }
 
-    pub fn span_index_for(&self, value: f64) -> Result<usize, String> {
+    pub fn span_index_for(&self, value: f64) -> Result<usize, FittedModelError> {
         let points = self.breakpoints()?;
         span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")
     }
 
-    fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
+    fn left_biased_span_index_for(&self, value: f64) -> Result<usize, FittedModelError> {
         let mut span_idx = span_index_for_breakpoints(
             &self.breakpoints,
             value,
@@ -1407,7 +1511,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
@@ -1424,7 +1528,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
@@ -1468,7 +1572,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
@@ -1484,7 +1588,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
@@ -1510,7 +1614,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
@@ -1552,7 +1656,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, String>
+    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
     {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
@@ -1599,7 +1703,7 @@ impl SavedAnchoredDeviationRuntime {
         self.local_cubic_on_span_validated(beta, span_idx)
     }
 
-    fn support_interval(&self) -> Result<(f64, f64), String> {
+    fn support_interval(&self) -> Result<(f64, f64), FittedModelError> {
         let points = self.breakpoints()?;
         match (points.first(), points.last()) {
             (Some(&left), Some(&right)) => Ok((left, right)),
@@ -1607,7 +1711,7 @@ impl SavedAnchoredDeviationRuntime {
         }
     }
 
-    pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         // Note: when the saved runtime carries an anchor residual
         // (cross-block orthogonalisation), the value `design()` returns
         // is the raw cubic span output *without* the per-row `n_row · M`
@@ -1626,7 +1730,7 @@ impl SavedAnchoredDeviationRuntime {
     /// `correction.dot(beta)` scalar from the linear-predictor contribution
     /// rather than building a full anchor-row matrix). Equivalent to
     /// `design()` when no residual is present.
-    pub fn design_uncorrected(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn design_uncorrected(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
     }
 
@@ -1642,7 +1746,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         values: &Array1<f64>,
         anchor_rows: ndarray::ArrayView2<f64>,
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<Array2<f64>, FittedModelError> {
         let mut out =
             self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)?;
         if let Some(m_rows) = self.anchor_residual_coefficients.as_ref() {
@@ -1704,7 +1808,7 @@ impl SavedAnchoredDeviationRuntime {
     pub fn anchor_correction_matrix(
         &self,
         n_anchor_rows: ndarray::ArrayView2<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<Array2<f64>>, FittedModelError> {
         let Some(m_rows) = self.anchor_residual_coefficients.as_ref() else {
             return Ok(None);
         };
@@ -1746,7 +1850,7 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         n_anchor_rows: ndarray::ArrayView2<f64>,
         d: usize,
-    ) -> Result<Array2<f64>, String> {
+    ) -> Result<Array2<f64>, FittedModelError> {
         let Some(rot_rows) = self.anchor_residual_rotation.as_ref() else {
             return Ok(n_anchor_rows.to_owned());
         };
@@ -1774,25 +1878,25 @@ impl SavedAnchoredDeviationRuntime {
         Ok(n_anchor_rows.dot(&rotation))
     }
 
-    pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(
             values,
             BasisOptions::first_derivative().derivative_order,
         )
     }
 
-    pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(
             values,
             BasisOptions::second_derivative().derivative_order,
         )
     }
 
-    pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, 3)
     }
 
-    pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
+    pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, 4)
     }
 }
@@ -2092,7 +2196,7 @@ impl FittedModel {
         }
     }
 
-    pub fn saved_link_wiggle(&self) -> Result<Option<SavedLinkWiggleRuntime>, String> {
+    pub fn saved_link_wiggle(&self) -> Result<Option<SavedLinkWiggleRuntime>, FittedModelError> {
         let payload = self.payload();
         let (knots, degree) = match (
             payload.linkwiggle_knots.as_ref(),
@@ -2160,7 +2264,7 @@ impl FittedModel {
 
     pub fn saved_baseline_time_wiggle(
         &self,
-    ) -> Result<Option<SavedBaselineTimeWiggleRuntime>, String> {
+    ) -> Result<Option<SavedBaselineTimeWiggleRuntime>, FittedModelError> {
         let payload = self.payload();
         if payload
             .survival_cause_count
@@ -2224,7 +2328,7 @@ impl FittedModel {
             .unwrap_or(false)
     }
 
-    pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, String> {
+    pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, FittedModelError> {
         self.payload().validate_payload_version()?;
         if matches!(
             self.predict_model_class(),
@@ -2307,7 +2411,7 @@ impl FittedModel {
         Ok(runtime)
     }
 
-    pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, String> {
+    pub fn saved_sas_state(&self) -> Result<Option<SasLinkState>, FittedModelError> {
         let payload = self.payload();
         let raw = match &payload.family_state {
             FittedFamily::Standard {
@@ -2339,7 +2443,7 @@ impl FittedModel {
         .map_err(|e| format!("invalid saved SAS link state: {e}"))
     }
 
-    pub fn saved_beta_logistic_state(&self) -> Result<Option<SasLinkState>, String> {
+    pub fn saved_beta_logistic_state(&self) -> Result<Option<SasLinkState>, FittedModelError> {
         let payload = self.payload();
         let raw = match &payload.family_state {
             FittedFamily::Standard {
@@ -2372,7 +2476,7 @@ impl FittedModel {
         .map_err(|e| format!("invalid saved Beta-Logistic link state: {e}"))
     }
 
-    pub fn saved_mixture_state(&self) -> Result<Option<MixtureLinkState>, String> {
+    pub fn saved_mixture_state(&self) -> Result<Option<MixtureLinkState>, FittedModelError> {
         let payload = self.payload();
         match &payload.family_state {
             FittedFamily::Standard {
@@ -2400,7 +2504,7 @@ impl FittedModel {
         }
     }
 
-    pub fn saved_latent_cloglog_state(&self) -> Result<Option<LatentCLogLogState>, String> {
+    pub fn saved_latent_cloglog_state(&self) -> Result<Option<LatentCLogLogState>, FittedModelError> {
         let payload = self.payload();
         match &payload.family_state {
             FittedFamily::Standard {
@@ -2417,7 +2521,7 @@ impl FittedModel {
         }
     }
 
-    pub fn resolved_inverse_link(&self) -> Result<Option<InverseLink>, String> {
+    pub fn resolved_inverse_link(&self) -> Result<Option<InverseLink>, FittedModelError> {
         let stateful = if let Some(state) = self.saved_mixture_state()? {
             Some(InverseLink::Mixture(state))
         } else if let Some(state) = self.saved_latent_cloglog_state()? {
@@ -2570,7 +2674,7 @@ impl FittedModel {
         self.payload().unified.as_ref()
     }
 
-    pub fn load_from_path(path: &Path) -> Result<Self, String> {
+    pub fn load_from_path(path: &Path) -> Result<Self, FittedModelError> {
         let payload = fs::read_to_string(path)
             .map_err(|e| format!("failed to read model '{}': {e}", path.display()))?;
         let model: Self = serde_json::from_str(&payload)
@@ -2581,7 +2685,7 @@ impl FittedModel {
         Ok(model)
     }
 
-    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+    pub fn save_to_path(&self, path: &Path) -> Result<(), FittedModelError> {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
@@ -2595,13 +2699,13 @@ impl FittedModel {
         Ok(())
     }
 
-    pub fn require_data_schema(&self) -> Result<&DataSchema, String> {
+    pub fn require_data_schema(&self) -> Result<&DataSchema, FittedModelError> {
         self.data_schema
             .as_ref()
             .ok_or_else(|| "model is missing data_schema; refit".to_string())
     }
 
-    pub fn validate_for_persistence(&self) -> Result<(), String> {
+    pub fn validate_for_persistence(&self) -> Result<(), FittedModelError> {
         // Hard version gate. The struct's ~40 Option<T> fields carry
         // `#[serde(default)]`, which is by design forward-compatible: old
         // payloads missing a new optional field decode with `None`. BUT:
@@ -3043,7 +3147,7 @@ impl FittedModel {
         Ok(())
     }
 
-    pub fn validate_numeric_finiteness(&self) -> Result<(), String> {
+    pub fn validate_numeric_finiteness(&self) -> Result<(), FittedModelError> {
         if let Some(fit) = self.fit_result.as_ref() {
             fit.validate_numeric_finiteness()
                 .map_err(|e| e.to_string())?;
@@ -3152,7 +3256,7 @@ use crate::solver::estimate::{ensure_finite_scalar, validate_all_finite};
 fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
     label: &str,
-) -> Result<(), String> {
+) -> Result<(), FittedModelError> {
     spec.validate_frozen(label)
 }
 
@@ -3176,7 +3280,7 @@ impl DerefMut for FittedModel {
 
 pub fn survival_baseline_config_from_model(
     model: &FittedModel,
-) -> Result<SurvivalBaselineConfig, String> {
+) -> Result<SurvivalBaselineConfig, FittedModelError> {
     parse_survival_baseline_config(
         model
             .survival_baseline_target
@@ -3191,7 +3295,7 @@ pub fn survival_baseline_config_from_model(
 
 pub fn load_survival_time_basis_config_from_model(
     model: &FittedModel,
-) -> Result<SurvivalTimeBasisConfig, String> {
+) -> Result<SurvivalTimeBasisConfig, FittedModelError> {
     match model
         .survival_time_basis
         .as_deref()
