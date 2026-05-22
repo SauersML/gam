@@ -176,12 +176,25 @@ impl WarmStartStore {
         // chosen meta file's mtime is unchanged, return the cached entry
         // without re-reading any JSON or re-checksumming the .bin payload.
         // A separate writer (this process or another) bumps mtime on
-        // rename → mismatch → we fall through to the slow path.
+        // rename → mismatch → we fall through to the slow path. The TTL
+        // cutoff is also re-checked here against `nanos_now()` so a hot
+        // poll loop cannot keep returning an expired entry between eviction
+        // sweeps (eviction is throttled via `EVICT_EVERY_N_SAVES`).
         let cache_key = LookupCacheKey { fp: *key, mode };
+        let now_nanos = nanos_now();
         if let Some(hit) = lookup_cache_get(&cache_key) {
             if let Ok(md) = fs::metadata(&hit.meta_path) {
                 if md.modified().ok() == Some(hit.meta_mtime) {
-                    return Ok(Some(hit.entry));
+                    let expired = self.opts.ttl.as_nanos() > 0
+                        && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
+                    if !expired {
+                        return Ok(Some(hit.entry));
+                    }
+                    lookup_cache_invalidate(&cache_key);
+                    let bin = hit.meta_path.with_extension("bin");
+                    let _ = fs::remove_file(&hit.meta_path);
+                    let _ = fs::remove_file(&bin);
+                    return Ok(None);
                 }
             }
             lookup_cache_invalidate(&cache_key);
@@ -221,6 +234,21 @@ impl WarmStartStore {
                 let _ = fs::remove_file(&path);
                 continue;
             }
+            // Drop entries past TTL on the lookup path itself, not only in
+            // the throttled `evict_overflow` sweep. Otherwise an expired
+            // entry can survive arbitrarily long when `save_overwrite` does
+            // not happen to trigger a sweep on the current save (see
+            // `EVICT_EVERY_N_SAVES`).
+            if meta_expired(
+                meta.written_unix_secs,
+                meta.written_nanos,
+                self.opts.ttl,
+                now_nanos,
+            ) {
+                let _ = fs::remove_file(&path);
+                let _ = fs::remove_file(&bin);
+                continue;
+            }
             let take = match best {
                 None => true,
                 Some((ref cur, _)) => mode.better(&meta, cur),
@@ -256,14 +284,19 @@ impl WarmStartStore {
             kind: meta.kind,
         };
         // Record (meta_path, mtime) → entry so subsequent identical lookups
-        // short-circuit until the meta file's mtime changes.
+        // short-circuit until the meta file's mtime changes. The full
+        // nanosecond write timestamp is cached alongside so the fast path
+        // can re-apply the TTL cutoff without re-reading the JSON.
         if let Ok(md) = fs::metadata(&meta_path) {
             if let Ok(mtime) = md.modified() {
+                let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
+                    + meta.written_nanos as u128;
                 lookup_cache_insert(
                     cache_key,
                     CachedLookup {
                         meta_path: meta_path.clone(),
                         meta_mtime: mtime,
+                        write_nanos,
                         entry: entry.clone(),
                     },
                 );
@@ -399,7 +432,6 @@ impl WarmStartStore {
         // Collect (meta_path, bin_path, total_bytes, write_nanos_since_epoch).
         let mut all: Vec<(PathBuf, PathBuf, u64, u128)> = Vec::new();
         let now_nanos = nanos_now();
-        let ttl_nanos = self.opts.ttl.as_nanos();
         for key_dir_entry in read_dir {
             let key_dir = match key_dir_entry {
                 Ok(e) => e.path(),
@@ -457,7 +489,12 @@ impl WarmStartStore {
                 };
                 let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
                     + meta.written_nanos as u128;
-                if ttl_nanos > 0 && now_nanos.saturating_sub(write_nanos) >= ttl_nanos {
+                if meta_expired(
+                    meta.written_unix_secs,
+                    meta.written_nanos,
+                    self.opts.ttl,
+                    now_nanos,
+                ) {
                     let _ = fs::remove_file(&p);
                     let _ = fs::remove_file(&bin);
                     continue;
@@ -527,7 +564,24 @@ struct LookupCacheKey {
 struct CachedLookup {
     meta_path: PathBuf,
     meta_mtime: SystemTime,
+    /// Full-precision nanosecond write timestamp from the on-disk meta,
+    /// kept alongside `entry.written_unix_secs` so the fast path can apply
+    /// the same TTL cutoff as `evict_overflow` without re-reading the JSON.
+    write_nanos: u128,
     entry: CachedEntry,
+}
+
+/// True iff a meta with the given (`secs`, `nanos`) write timestamp is older
+/// than `ttl` relative to `now_nanos`. Mirrors the cutoff in
+/// [`WarmStartStore::evict_overflow`] so `lookup_with` cannot return an entry
+/// that the eviction sweep would have dropped.
+fn meta_expired(secs: u64, nanos: u32, ttl: Duration, now_nanos: u128) -> bool {
+    let ttl_nanos = ttl.as_nanos();
+    if ttl_nanos == 0 {
+        return false;
+    }
+    let write_nanos = (secs as u128) * 1_000_000_000u128 + nanos as u128;
+    now_nanos.saturating_sub(write_nanos) >= ttl_nanos
 }
 
 /// Process-wide in-memory cache for [`WarmStartStore::lookup_with`]. Hot poll
