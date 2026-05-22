@@ -675,7 +675,7 @@ impl FirthDenseOperator {
         let z_owned = z.to_owned();
         let xz = fast_ab(&self.x_dense, &z_owned);
         let xtz = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
-            crate::solver::reml::RemlState::row_scale(&xz, scale)
+            RemlState::row_scale(&xz, scale)
         } else {
             xz
         };
@@ -690,9 +690,8 @@ impl FirthDenseOperator {
             Some(s) => s,
             None => return f64::NEG_INFINITY,
         };
-        let threshold =
-            crate::solver::reml::unified::positive_eigenvalue_threshold(evals_slice);
-        0.5 * crate::solver::reml::unified::exact_pseudo_logdet(evals_slice, threshold)
+        let threshold = super::unified::positive_eigenvalue_threshold(evals_slice);
+        0.5 * super::unified::exact_pseudo_logdet(evals_slice, threshold)
     }
 
     #[inline]

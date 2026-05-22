@@ -1384,3 +1384,497 @@ def test_gaussian_reml_fit_blocks_torch_roundtrip_lambdas_converge() -> None:
         rtol=1.0e-4,
         atol=1.0e-6,
     )
+
+
+# ---------------------------------------------------------------------------
+# Newly authored coverage for session bindings.
+# Tests below this banner were added to cover the Python-facing surface
+# enumerated in the task brief; existing tests above this banner are
+# unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _assert_symmetric_psd(matrix: np.ndarray, label: str, slack: float = 1e-8) -> None:
+    """Helper: assert ``matrix`` is symmetric and approximately PSD."""
+    assert matrix.ndim == 2 and matrix.shape[0] == matrix.shape[1], (
+        f"{label}: expected square 2D matrix; got shape {matrix.shape}"
+    )
+    assert np.allclose(matrix, matrix.T, atol=1e-9), f"{label} must be symmetric"
+    w = np.linalg.eigvalsh(0.5 * (matrix + matrix.T))
+    assert w.min() > -slack, (
+        f"{label} not PSD; min eigenvalue {w.min():.3e}"
+    )
+
+
+def test_duchon_function_norm_penalty_3d_non_periodic_psd() -> None:
+    """3D centers, no periodic axis — penalty must build and be SPD-like."""
+    rng = np.random.default_rng(2)
+    centers = rng.uniform(-1.0, 1.0, size=(7, 3))
+    s = gamfit.duchon_function_norm_penalty(
+        centers=centers,
+        m=2,
+        periodic_per_axis=(False, False, False),
+    )
+    s = np.asarray(s, dtype=float)
+    assert s.shape == (7, 7), f"expected (7, 7) penalty, got {s.shape}"
+    _assert_symmetric_psd(s, "3D Duchon penalty")
+
+
+def test_sphere_basis_each_kernel_shapes_and_psd() -> None:
+    """`gamfit.sphere_basis` returns (N, K) basis and (K, K) PSD penalty."""
+    rng = np.random.default_rng(11)
+    n = 50
+    lat = np.degrees(np.arcsin(rng.uniform(-1.0, 1.0, size=n)))
+    lon = rng.uniform(-180.0, 180.0, size=n)
+    points = np.stack([lat, lon], axis=1)
+
+    for kernel in ("sobolev", "pseudo", "harmonic"):
+        n_centers = 10 if kernel != "harmonic" else 4
+        design, penalty = gamfit.sphere_basis(
+            points,
+            n_centers=n_centers,
+            penalty_order=2,
+            kernel=kernel,
+            radians=False,
+        )
+        design = np.asarray(design, dtype=float)
+        penalty = np.asarray(penalty, dtype=float)
+        assert design.ndim == 2 and design.shape[0] == n, (
+            f"kernel={kernel}: design rows {design.shape[0]} != n {n}"
+        )
+        k_expected = (
+            n_centers * (n_centers + 2) if kernel == "harmonic" else n_centers
+        )
+        assert design.shape[1] == k_expected, (
+            f"kernel={kernel}: design cols {design.shape[1]} != {k_expected}"
+        )
+        assert penalty.shape == (k_expected, k_expected), (
+            f"kernel={kernel}: penalty shape {penalty.shape}"
+        )
+        assert np.all(np.isfinite(design)) and np.all(np.isfinite(penalty)), (
+            f"kernel={kernel}: NaN/Inf in basis/penalty"
+        )
+        _assert_symmetric_psd(penalty, f"sphere_basis penalty ({kernel})")
+
+
+def test_periodic_spline_curve_basis_constant_nullspace_and_shapes() -> None:
+    """Cyclic spline returns matching shapes and constant null-space penalty.
+
+    Complements the existing endpoint-equality / partition-of-unity test by
+    inspecting penalty shape and nullspace directly on a smaller knot count.
+    """
+    t = np.linspace(0.0, 1.0, 32, endpoint=False)
+    basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=8, degree=3)
+    basis = np.asarray(basis, dtype=float)
+    penalty = np.asarray(penalty, dtype=float)
+    assert basis.shape == (32, 8)
+    assert penalty.shape == (8, 8)
+    # PSD on the penalty (after symmetrising).
+    _assert_symmetric_psd(penalty, "periodic_spline_curve_basis penalty")
+    # Constant vector is in the null-space of the cyclic difference penalty.
+    ones = np.ones((8, 1))
+    np.testing.assert_allclose(penalty @ ones, 0.0, atol=1e-10)
+
+
+def test_gaussian_reml_fit_blocks_forward_recovers_per_smooth_lambda_numpy() -> None:
+    """Direct (numpy) call to gaussian_reml_fit_blocks_forward — λ vector
+    has matching length, λ > 0, EDFs finite, fitted matches design shape."""
+    rng = np.random.default_rng(20260522)
+    n = 60
+    p_per = 5
+    x1 = rng.standard_normal((n, p_per))
+    x2 = rng.standard_normal((n, p_per))
+    s1 = np.eye(p_per)
+    s2 = np.eye(p_per)
+    y = rng.standard_normal((n, 1))
+
+    out = gamfit.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
+    assert "lambdas" in out and out["lambdas"].shape == (2,)
+    assert np.all(np.isfinite(out["lambdas"]))
+    assert np.all(out["lambdas"] > 0.0)
+    assert "edf" in out and out["edf"].shape == (2,)
+    assert "fitted" in out and out["fitted"].shape == (n, 1)
+    assert "coefficients" in out and out["coefficients"].shape[0] == 2 * p_per
+
+
+def test_gaussian_reml_fit_blocks_backward_returns_finite_grads_numpy() -> None:
+    """Direct (numpy) call to gaussian_reml_fit_blocks_backward — gradients
+    have correct shapes and are finite given a unit grad_fitted seed."""
+    rng = np.random.default_rng(2026052200)
+    n = 24
+    p_per = 4
+    x1 = rng.standard_normal((n, p_per))
+    x2 = rng.standard_normal((n, p_per))
+    s1 = np.eye(p_per)
+    s2 = np.eye(p_per)
+    y = rng.standard_normal((n, 1))
+    fwd = gamfit.gaussian_reml_fit_blocks_forward([x1, x2], [s1, s2], y)
+    log_lam = np.log(np.maximum(fwd["lambdas"], 1e-12))
+    grad_fitted = np.ones((n, 1), dtype=float)
+    back = gamfit.gaussian_reml_fit_blocks_backward(
+        [x1, x2], [s1, s2], y, log_lam,
+        grad_fitted=grad_fitted,
+    )
+    for k in ("grad_designs", "grad_penalties", "grad_y"):
+        assert k in back, f"missing key {k!r} in backward result"
+    assert len(back["grad_designs"]) == 2
+    assert len(back["grad_penalties"]) == 2
+    assert back["grad_designs"][0].shape == (n, p_per)
+    assert back["grad_designs"][1].shape == (n, p_per)
+    assert back["grad_penalties"][0].shape == (p_per, p_per)
+    assert back["grad_y"].shape == (n, 1)
+    for arr in (*back["grad_designs"], *back["grad_penalties"], back["grad_y"]):
+        assert np.all(np.isfinite(arr)), "non-finite entries in backward result"
+
+
+def test_gaussian_reml_fit_with_constraints_forward_monotone_on_x_squared() -> None:
+    """Constrained REML forward with monotone-increasing A row pairs on the
+    fitted values must yield a non-decreasing fit on ``y = x²`` over [0, 1]."""
+    rng = np.random.default_rng(202605221)
+    n = 120
+    x = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y = (x ** 2 + 0.02 * rng.standard_normal(n)).reshape(-1, 1)
+
+    # Build a B-spline design + smoothness penalty via the existing gamfit
+    # primitives (no torch dependency required here).
+    basis = np.asarray(gamfit.bspline_basis(x, knots=None, degree=3), dtype=float)
+    # The smoothness_penalty wants a knot vector; reuse the same auto-knot
+    # derivation by sampling a coarse grid over the data range.
+    knots = np.linspace(0.0, 1.0, basis.shape[1] + 4)
+    penalty, _ = gamfit.smoothness_penalty(knots, degree=3, order=2)
+
+    # Build A·β ≤ 0 enforcing monotone non-decreasing on a dense grid via
+    # forward differences of the design. Note the API expects ``A·β ≤ b``,
+    # so we want -(B[i+1] - B[i])·β ≤ 0.
+    grid = np.linspace(0.0, 1.0, 96)
+    b_grid = np.asarray(gamfit.bspline_basis(grid, knots=None, degree=3), dtype=float)
+    a_rows = -(b_grid[1:] - b_grid[:-1])
+    b_rhs = np.zeros(a_rows.shape[0], dtype=float)
+
+    out = gamfit.gaussian_reml_fit_with_constraints_forward(
+        basis, y, penalty,
+        a_inequality=a_rows,
+        b_inequality=b_rhs,
+    )
+    fitted = np.asarray(out["fitted"], dtype=float).reshape(-1)
+    assert fitted.shape == (n,)
+    diffs = np.diff(fitted)
+    assert (diffs >= -1e-6).all(), (
+        f"monotone-constrained fit violates non-decreasing; min diff={diffs.min()}"
+    )
+
+
+def test_gaussian_reml_fit_with_constraints_forward_no_constraints_matches_unconstrained() -> None:
+    """With no inequality system (``a_inequality=None``), the constrained
+    REML forward must reproduce the unconstrained Gaussian REML fit."""
+    rng = np.random.default_rng(2026052299)
+    n = 50
+    p = 6
+    x = rng.standard_normal((n, p))
+    y = rng.standard_normal((n, 1))
+    s = np.eye(p)
+
+    a = gamfit.gaussian_reml_fit_with_constraints_forward(x, y, s)
+    b = gamfit.gaussian_reml_fit(x, y, s)
+    fit_a = np.asarray(a["fitted"], dtype=float).reshape(-1)
+    fit_b = np.asarray(b["fitted"], dtype=float).reshape(-1)
+    np.testing.assert_allclose(fit_a, fit_b, rtol=1e-6, atol=1e-8)
+
+
+# Backward for `gaussian_reml_fit_with_constraints_*` is DEFERRED: the
+# constrained backward binding has not been added to the gamfit Python
+# surface (no `gaussian_reml_fit_with_constraints_backward` exists in
+# gamfit._api or gamfit.__init__ as of this session; the torch path raises
+# NotImplementedError on backward — see
+# `test_torch_monotone_smooth_backward_finite_gradient` above).
+
+
+def test_model_term_blocks_sorted_and_typed() -> None:
+    """``model.term_blocks`` returns sorted tuple of TermBlock dataclasses."""
+    rng = np.random.default_rng(2026052201)
+    n = 120
+    x1 = rng.uniform(0.0, 1.0, n)
+    x2 = rng.uniform(0.0, 1.0, n)
+    y = np.sin(2.0 * np.pi * x1) + 0.4 * x2 + 0.1 * rng.standard_normal(n)
+    frame = pd.DataFrame({"y": y, "x1": x1, "x2": x2})
+
+    model = gamfit.fit(frame, "y ~ s(x1) + s(x2)")
+    blocks = model.term_blocks
+    assert isinstance(blocks, tuple)
+    assert len(blocks) >= 2
+    for blk in blocks:
+        assert isinstance(blk, gamfit.TermBlock), (
+            f"term_blocks entries must be TermBlock; got {type(blk).__name__}"
+        )
+        assert isinstance(blk.name, str)
+        assert isinstance(blk.kind, str)
+        assert blk.start <= blk.end
+    # Sorted by .start (ascending, non-overlapping or contiguous).
+    starts = [blk.start for blk in blocks]
+    assert starts == sorted(starts), f"term_blocks not sorted by start; got {starts}"
+
+
+def test_model_partial_dependence_1d_shapes_and_finiteness() -> None:
+    """1D partial_dependence returns grid/predicted/standard_error of length n_points."""
+    rng = np.random.default_rng(2026052202)
+    n = 120
+    x1 = rng.uniform(0.0, 1.0, n)
+    y = np.sin(2.0 * np.pi * x1) + 0.1 * rng.standard_normal(n)
+    frame = pd.DataFrame({"y": y, "x1": x1})
+    model = gamfit.fit(frame, "y ~ s(x1)")
+    pd_out = model.partial_dependence("s(x1)", frame, n_points=25)
+    assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
+    assert np.asarray(pd_out["grid"]).shape == (25,)
+    assert np.asarray(pd_out["predicted"]).shape == (25,)
+    assert np.asarray(pd_out["standard_error"]).shape == (25,)
+    assert np.all(np.isfinite(np.asarray(pd_out["predicted"], dtype=float)))
+    assert np.all(np.asarray(pd_out["standard_error"], dtype=float) >= 0.0)
+
+
+def test_model_variance_share_sums_to_at_most_one_plus_slack() -> None:
+    """variance_share returns dict of [0,1]-valued shares summing ~≤ 1."""
+    rng = np.random.default_rng(2026052203)
+    n = 150
+    x1 = rng.uniform(0.0, 1.0, n)
+    x2 = rng.uniform(0.0, 1.0, n)
+    y = np.sin(2.0 * np.pi * x1) + 0.5 * x2 + 0.1 * rng.standard_normal(n)
+    frame = pd.DataFrame({"y": y, "x1": x1, "x2": x2})
+    model = gamfit.fit(frame, "y ~ s(x1) + s(x2)")
+    shares = model.variance_share(frame)
+    assert isinstance(shares, dict)
+    for name, val in shares.items():
+        assert isinstance(name, str)
+        v = float(val)
+        assert 0.0 <= v <= 1.0, f"variance share {name}={v} outside [0,1]"
+    assert sum(float(v) for v in shares.values()) <= 1.1
+
+
+# ---------------------------------------------------------------------------
+# Smooth dataclass construction smoke tests.
+#
+# Construct each subclass with minimal valid arguments. Verify the
+# `shape_constraint` field accepts each Literal value via attribute set —
+# the dataclasses themselves do not perform runtime Literal validation
+# (mypy / pyright catch invalid strings statically), but the field must
+# at least round-trip through construction and assignment without raising.
+# ---------------------------------------------------------------------------
+
+
+def test_smooth_dataclass_subclasses_construct_with_shape_constraint() -> None:
+    """Every Smooth subclass constructs with each ShapeConstraintLiteral value."""
+    from gamfit import (
+        BSpline,
+        Categorical,
+        Duchon,
+        Matern,
+        PeriodicSplineCurve,
+        Sphere,
+        TensorBSpline,
+    )
+
+    centers_1d = np.linspace(0.0, 1.0, 10).reshape(-1, 1)
+    centers_2d = np.column_stack(
+        [np.linspace(0.0, 1.0, 10), np.linspace(0.0, 1.0, 10)]
+    )
+
+    constraint_values = (
+        None,
+        "none",
+        "monotone_increasing",
+        "monotone_decreasing",
+        "convex",
+        "concave",
+    )
+
+    factories = [
+        ("Duchon", lambda sc: Duchon(centers=centers_1d, m=2, shape_constraint=sc)),
+        ("BSpline", lambda sc: BSpline(degree=3, shape_constraint=sc)),
+        ("TensorBSpline", lambda sc: TensorBSpline(
+            marginals=[BSpline(degree=3), BSpline(degree=3)],
+            shape_constraint=sc,
+        )),
+        ("Matern", lambda sc: Matern(
+            centers=centers_2d, nu=1.5, length_scale=1.0, shape_constraint=sc,
+        )),
+        ("Sphere", lambda sc: Sphere(
+            n_centers=8, kernel="sobolev", shape_constraint=sc,
+        )),
+        ("PeriodicSplineCurve", lambda sc: PeriodicSplineCurve(
+            n_knots=10, degree=3, output_dim=2, shape_constraint=sc,
+        )),
+        ("Categorical", lambda sc: Categorical(
+            levels=np.zeros(5, dtype=int), n_levels=3, shape_constraint=sc,
+        )),
+    ]
+    for label, factory in factories:
+        for sc in constraint_values:
+            obj = factory(sc)
+            # Round-trip — field must survive construction.
+            assert obj.shape_constraint == sc, (
+                f"{label}.shape_constraint mismatch: stored {obj.shape_constraint!r} "
+                f"vs requested {sc!r}"
+            )
+            # Common base-class fields must default sanely.
+            assert obj.by is None
+            assert obj.double_penalty is False
+            assert obj.name is None
+
+
+def test_smooth_dataclass_arbitrary_string_shape_constraint_not_runtime_rejected() -> None:
+    """`shape_constraint` is a typing.Literal — runtime construction does
+    not actively reject arbitrary strings (the type system enforces it at
+    static-check time). Verify that the field stores whatever is passed,
+    so downstream code can decide how strict to be.
+
+    (If runtime validation is added later, this test should be inverted to
+    expect a ValueError or TypeError.)
+    """
+    from gamfit import BSpline
+
+    obj = BSpline(degree=3, shape_constraint=typing.cast(typing.Any, "not-a-constraint"))
+    assert obj.shape_constraint == "not-a-constraint"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end torch.fit with each supported Smooth kind.
+#
+# Tests below need torch; they importorskip up-front.
+# ---------------------------------------------------------------------------
+
+
+def test_torch_fit_single_bspline_recovers_quadratic() -> None:
+    """`fit(x, y, BSpline(...))` returns finite fitted values + coefficients."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2026052204)
+    n = 150
+    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y_np = x_np ** 2 + 0.05 * rng.standard_normal(n)
+
+    x = torch.as_tensor(x_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    knots = np.linspace(0.0, 1.0, 12)
+    spec = BSpline(knots=knots, degree=3)
+    result = torch_fit(x, y, spec)
+    fitted = result.fitted.detach().cpu().numpy().reshape(-1)
+    assert fitted.shape == (n,)
+    assert np.all(np.isfinite(fitted))
+    rmse = float(np.sqrt(np.mean((fitted - y_np) ** 2)))
+    assert rmse < 0.2, f"BSpline fit too poor; rmse={rmse:.3g}"
+
+
+def test_torch_fit_additive_duchon_plus_bspline() -> None:
+    """Additive fit through `gamfit.torch.fit` with a Duchon + a BSpline."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline, Duchon
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2026052205)
+    n = 200
+    x1 = rng.uniform(0.0, 1.0, size=n)
+    x2 = rng.uniform(0.0, 1.0, size=n)
+    y_np = np.sin(2.0 * np.pi * x1) + 0.5 * x2 + 0.05 * rng.standard_normal(n)
+
+    pts1 = torch.as_tensor(x1, dtype=torch.float64).reshape(-1, 1)
+    pts2 = torch.as_tensor(x2, dtype=torch.float64).reshape(-1, 1)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    centers_d = torch.linspace(0.0, 1.0, 15, dtype=torch.float64).reshape(-1, 1)
+    knots = np.linspace(0.0, 1.0, 10)
+
+    result = torch_fit(
+        points=[pts1, pts2],
+        response=y,
+        smooths=[Duchon(centers=centers_d, m=2), BSpline(knots=knots, degree=3)],
+    )
+    fitted = result.fitted.detach().cpu().numpy().reshape(-1)
+    assert fitted.shape == (n,)
+    assert np.all(np.isfinite(fitted))
+    # λ vector must be length F=2.
+    lambdas = result.lambdas.detach().cpu().numpy().reshape(-1)
+    assert lambdas.shape == (2,)
+    assert np.all(np.isfinite(lambdas))
+
+
+def test_torch_fit_periodic_spline_curve_multi_output_coefficients_shape() -> None:
+    """PeriodicSplineCurve fit through `torch.fit` returns (K, D) coefficients."""
+    torch = pytest.importorskip("torch")
+    from gamfit import PeriodicSplineCurve
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2026052206)
+    n = 128
+    t_np = np.linspace(0.0, 1.0, n, endpoint=False)
+    y_np = np.stack(
+        [
+            np.cos(2.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
+            np.sin(2.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
+            np.cos(4.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
+        ],
+        axis=1,
+    )
+    t = torch.as_tensor(t_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    spec = PeriodicSplineCurve(n_knots=12, degree=3, output_dim=3)
+    result = torch_fit(t, y, spec)
+    assert isinstance(result.coefficients, torch.Tensor)
+    coef = result.coefficients.detach().cpu().numpy()
+    assert coef.ndim == 2 and coef.shape[1] == 3
+    fitted = result.fitted.detach().cpu().numpy()
+    assert fitted.shape == (n, 3)
+    assert np.all(np.isfinite(fitted))
+
+
+def test_torch_fit_sphere_each_kernel_basic_fit() -> None:
+    """`fit(latlon, y, Sphere(...))` runs end-to-end for every kernel.
+
+    Complements the existing multi-output smoke test by checking the
+    single-output (D=1) code path for every kernel.
+    """
+    torch = pytest.importorskip("torch")
+    from gamfit import Sphere
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2026052207)
+    n = 120
+    lat = np.degrees(np.arcsin(rng.uniform(-1.0, 1.0, size=n)))
+    lon = rng.uniform(-180.0, 180.0, size=n)
+    points_np = np.stack([lat, lon], axis=1)
+    cap = np.cos(np.radians(lat)) * np.cos(np.radians(lon))
+    y_np = cap + 0.05 * rng.standard_normal(n)
+
+    points = torch.as_tensor(points_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    for kernel in ("sobolev", "pseudo", "harmonic"):
+        n_centers = 15 if kernel != "harmonic" else 4
+        spec = Sphere(
+            n_centers=n_centers, penalty_order=2, kernel=kernel, radians=False,
+        )
+        result = torch_fit(points, y, spec)
+        fitted = result.fitted.detach().cpu().numpy().reshape(-1)
+        assert fitted.shape == (n,), f"kernel={kernel}: fitted shape {fitted.shape}"
+        assert np.all(np.isfinite(fitted)), f"kernel={kernel}: NaN/Inf in fitted"
+
+
+def test_torch_fit_rejects_shape_constraint_with_multi_smooth_list() -> None:
+    """`shape_constraint` on the torch fit path is single-smooth only;
+    a list of smooths with any non-None constraint must raise."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2026052208)
+    n = 60
+    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y_np = x_np ** 2 + 0.05 * rng.standard_normal(n)
+    x = torch.as_tensor(x_np, dtype=torch.float64).reshape(-1, 1)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    # Two smooths, one of them carries a shape_constraint.
+    knots = np.linspace(0.0, 1.0, 10)
+    smooths = [
+        BSpline(knots=knots, degree=3, shape_constraint="monotone_increasing"),
+        BSpline(knots=knots, degree=3),
+    ]
+    with pytest.raises(NotImplementedError):
+        torch_fit(points=[x, x], response=y, smooths=smooths)
