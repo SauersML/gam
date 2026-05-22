@@ -113,8 +113,11 @@ class Duchon(Smooth):
         which is closer to a Matérn for finite kernels at high d.
     periodic_per_axis : optional sequence of bool of length d. Each
         axis can be periodic independently (cylinder = d=2 with
-        ``(True, False)``, torus = d=2 with ``(True, True)``).
-        Currently only d=1 periodicity is exposed by the Rust binding.
+        ``(True, False)``, torus = d=2 with ``(True, True)``). The d=1
+        case uses the Bernoulli-Green builder; d ≥ 2 routes through the
+        mixed-periodicity radial polyharmonic kernel on cylinder/torus
+        chord distance. Per-axis periods are auto-derived from the
+        ``centers``' span along each periodic axis.
     """
 
     centers: Any = None
