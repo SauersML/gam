@@ -9,6 +9,74 @@ use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
 use faer::{Accum, Par};
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder, s};
+use std::fmt;
+
+/// Typed error variants for the ALO (approximate leave-one-out) diagnostics
+/// module.
+///
+/// Public entry points continue to return `Result<_, EstimationError>`; this
+/// enum is materialized at leaf sites and converted at the boundary via
+/// `From<AloError> for EstimationError` so error text remains byte-identical
+/// to the previous `EstimationError::InvalidInput(format!(...))` /
+/// `ModelIsIllConditioned { ... }` output.
+#[derive(Debug, Clone)]
+pub enum AloError {
+    /// Caller-supplied configuration is structurally invalid: dimension
+    /// mismatch, non-finite inputs that are not weights/response, missing
+    /// PIRLS / geometry artifacts, or out-of-range scalar parameters.
+    InvalidInput { reason: String },
+    /// IRLS weights or working response contain a non-finite entry, or the
+    /// working response itself is invalid.
+    WeightInvalid { reason: String },
+    /// The dense design matrix required for ALO could not be materialized
+    /// from the underlying PIRLS artifact (e.g. sparse-only export).
+    DesignDegenerate { reason: String },
+    /// The penalized Hessian factorization failed, or downstream diagnostics
+    /// produced NaN values that indicate the influence matrix is unusable.
+    InfluenceMatrixFailed { condition_number: f64 },
+    /// Per-observation ALO computation produced a non-finite value (variance,
+    /// denominator, or corrected η̃) at convergence.
+    LooComputationFailed { reason: String },
+}
+
+impl fmt::Display for AloError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AloError::InvalidInput { reason }
+            | AloError::WeightInvalid { reason }
+            | AloError::DesignDegenerate { reason }
+            | AloError::LooComputationFailed { reason } => f.write_str(reason),
+            AloError::InfluenceMatrixFailed { condition_number } => {
+                write!(
+                    f,
+                    "ALO influence matrix failed (condition number {condition_number:.3e})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for AloError {}
+
+impl From<AloError> for EstimationError {
+    fn from(err: AloError) -> EstimationError {
+        match err {
+            AloError::InvalidInput { reason }
+            | AloError::WeightInvalid { reason }
+            | AloError::DesignDegenerate { reason }
+            | AloError::LooComputationFailed { reason } => EstimationError::InvalidInput(reason),
+            AloError::InfluenceMatrixFailed { condition_number } => {
+                EstimationError::ModelIsIllConditioned { condition_number }
+            }
+        }
+    }
+}
+
+impl From<AloError> for String {
+    fn from(err: AloError) -> String {
+        err.to_string()
+    }
+}
 
 /// Approximate leave-one-out diagnostics derived from a fitted model.
 #[derive(Debug, Clone)]
@@ -128,10 +196,18 @@ fn compute_alo_diagnostics_from_pirls_impl(
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_diagnostics_from_pirls_inner(base, y, link).map_err(EstimationError::from)
+}
+
+fn compute_alo_diagnostics_from_pirls_inner(
+    base: &pirls::PirlsResult,
+    y: ArrayView1<f64>,
+    link: LinkFunction,
+) -> Result<AloDiagnostics, AloError> {
     let x_dense_arc = base
         .x_transformed
         .try_to_dense_arc("ALO diagnostics require dense transformed design")
-        .map_err(EstimationError::InvalidInput)?;
+        .map_err(|reason| AloError::DesignDegenerate { reason })?;
     let x_dense = x_dense_arc.as_ref();
     let n = x_dense.nrows();
 
@@ -164,9 +240,16 @@ fn compute_alo_diagnostics_from_pirls_impl(
     // ALO needs the exact penalized Hessian materialized densely for chunked
     // column solves via StableSolver.  The PIRLS export path validates the
     // matrix instead of falling back to a numerical Hessian approximation.
-    let h_dense_for_alo = base.dense_stabilizedhessian_transformed(
-        "ALO diagnostics require exact dense stabilized penalized Hessian",
-    )?;
+    let h_dense_for_alo = base
+        .dense_stabilizedhessian_transformed(
+            "ALO diagnostics require exact dense stabilized penalized Hessian",
+        )
+        .map_err(|e| match e {
+            EstimationError::InvalidInput(reason) => AloError::InvalidInput { reason },
+            other => AloError::InvalidInput {
+                reason: format!("{other:?}"),
+            },
+        })?;
 
     // Build model-agnostic AloInput from PIRLS geometry, then delegate.
     let input = AloInput {
@@ -183,7 +266,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
         ridge,
     };
 
-    let result = compute_alo_from_input(&input)?;
+    let result = compute_alo_from_input_inner(&input)?;
 
     // PIRLS-specific post-hoc leverage diagnostics logging.
     log_leverage_diagnostics(&result.leverage, phi);
@@ -212,7 +295,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
             "[GAM ALO] leverage: {} NaN values",
             result.leverage.iter().filter(|&&x| x.is_nan()).count()
         );
-        return Err(EstimationError::ModelIsIllConditioned {
+        return Err(AloError::InfluenceMatrixFailed {
             condition_number: f64::INFINITY,
         });
     }
@@ -359,6 +442,10 @@ impl<'a> AloInput<'a> {
 /// For standard single-block GAMs, prefer `compute_alo_diagnostics_from_fit`
 /// which automatically extracts the PIRLS geometry (including sandwich SE).
 pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, EstimationError> {
+    compute_alo_from_input_inner(input).map_err(EstimationError::from)
+}
+
+fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloError> {
     let x_dense = input.design;
     let n = x_dense.nrows();
     let p = x_dense.ncols();
@@ -369,7 +456,7 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
 
     let factor = StableSolver::new("alo penalized hessian")
         .factorize(input.penalized_hessian)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
+        .map_err(|_| AloError::InfluenceMatrixFailed {
             condition_number: f64::INFINITY,
         })?;
 
@@ -471,24 +558,30 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
             };
 
             if !var_bayes.is_finite() || !var_sandwich.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
-                )));
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO variance is not finite at row {obs}: bayes={var_bayes:.6e}, sandwich={var_sandwich:.6e}"
+                    ),
+                });
             }
             let bayes_tol = variance_negative_tolerance(phi * x_hinv_x.abs());
             if var_bayes < -bayes_tol {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
-                )));
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO Bayesian variance is materially negative at row {obs}: var={var_bayes:.6e}, tol={bayes_tol:.6e}"
+                    ),
+                });
             }
             if e_rank > 0 {
                 let sandwich_scale =
                     phi * (x_hinv_x.abs() + es_norm2.abs() + (ridge * s_norm2).abs());
                 let sandwich_tol = variance_negative_tolerance(sandwich_scale);
                 if var_sandwich < -sandwich_tol {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
-                    )));
+                    return Err(AloError::LooComputationFailed {
+                        reason: format!(
+                            "ALO sandwich variance is materially negative at row {obs}: var={var_sandwich:.6e}, tol={sandwich_tol:.6e}"
+                        ),
+                    });
                 }
             }
 
@@ -507,10 +600,12 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
         .map(|i| {
             let denom_raw = 1.0 - aii[i];
             if denom_raw <= 0.0 || !denom_raw.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
-                    aii[i], denom_raw
-                )));
+                return Err(AloError::LooComputationFailed {
+                    reason: format!(
+                        "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
+                        aii[i], denom_raw
+                    ),
+                });
             }
             let v = alo_eta_updatewith_offset(
                 eta_hat[i],
@@ -521,9 +616,9 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
                 w_s[i],
             );
             if !v.is_finite() {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO eta_tilde is not finite at row {i}: eta_tilde={v}"
-                )));
+                return Err(AloError::LooComputationFailed {
+                    reason: format!("ALO eta_tilde is not finite at row {i}: eta_tilde={v}"),
+                });
             }
             Ok(v)
         })
@@ -540,19 +635,21 @@ pub fn compute_alo_from_input(input: &AloInput) -> Result<AloDiagnostics, Estima
     })
 }
 
-fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), EstimationError> {
+fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), AloError> {
     let h = input.penalized_hessian;
     if h.nrows() != p || h.ncols() != p {
-        return Err(EstimationError::InvalidInput(format!(
-            "ALO diagnostics require a dense exact penalized Hessian with shape {p}x{p}; got {}x{}",
-            h.nrows(),
-            h.ncols()
-        )));
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "ALO diagnostics require a dense exact penalized Hessian with shape {p}x{p}; got {}x{}",
+                h.nrows(),
+                h.ncols()
+            ),
+        });
     }
     if h.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
-        ));
+        return Err(AloError::InvalidInput {
+            reason: "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
+        });
     }
     let sym_tol = 1e-8;
     for i in 0..p {
@@ -561,10 +658,12 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
             let b = h[[j, i]];
             let scale = a.abs().max(b.abs()).max(1.0);
             if (a - b).abs() > sym_tol * scale {
-                return Err(EstimationError::InvalidInput(format!(
-                    "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
-                    (a - b).abs()
-                )));
+                return Err(AloError::InvalidInput {
+                    reason: format!(
+                        "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
+                        (a - b).abs()
+                    ),
+                });
             }
         }
     }
@@ -578,54 +677,60 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
     ];
     for (name, len) in vector_lengths {
         if len != n {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO diagnostics require {name} length {n}; got {len}"
-            )));
+            return Err(AloError::InvalidInput {
+                reason: format!("ALO diagnostics require {name} length {n}; got {len}"),
+            });
         }
     }
     if input.hessian_weights.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "ALO diagnostics require finite Hessian-side weights".to_string(),
-        ));
+        return Err(AloError::WeightInvalid {
+            reason: "ALO diagnostics require finite Hessian-side weights".to_string(),
+        });
     }
     if input.score_weights.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "ALO diagnostics require finite score-side weights".to_string(),
-        ));
+        return Err(AloError::WeightInvalid {
+            reason: "ALO diagnostics require finite score-side weights".to_string(),
+        });
     }
     if input.working_response.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "ALO diagnostics require finite working responses".to_string(),
-        ));
+        return Err(AloError::WeightInvalid {
+            reason: "ALO diagnostics require finite working responses".to_string(),
+        });
     }
     if input.eta.iter().any(|v| !v.is_finite()) || input.offset.iter().any(|v| !v.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "ALO diagnostics require finite linear predictors and offsets".to_string(),
-        ));
+        return Err(AloError::InvalidInput {
+            reason: "ALO diagnostics require finite linear predictors and offsets".to_string(),
+        });
     }
     if !input.phi.is_finite() || input.phi <= 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "ALO diagnostics require positive finite dispersion phi; got {}",
-            input.phi
-        )));
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "ALO diagnostics require positive finite dispersion phi; got {}",
+                input.phi
+            ),
+        });
     }
     if !input.ridge.is_finite() || input.ridge < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "ALO diagnostics require a finite non-negative Hessian ridge; got {}",
-            input.ridge
-        )));
+        return Err(AloError::InvalidInput {
+            reason: format!(
+                "ALO diagnostics require a finite non-negative Hessian ridge; got {}",
+                input.ridge
+            ),
+        });
     }
     if let Some(e) = input.penalty_root {
         if e.ncols() != p {
-            return Err(EstimationError::InvalidInput(format!(
-                "ALO diagnostics require penalty root to have {p} columns; got {}",
-                e.ncols()
-            )));
+            return Err(AloError::InvalidInput {
+                reason: format!(
+                    "ALO diagnostics require penalty root to have {p} columns; got {}",
+                    e.ncols()
+                ),
+            });
         }
         if e.iter().any(|v| !v.is_finite()) {
-            return Err(EstimationError::InvalidInput(
-                "ALO diagnostics require finite penalty-root entries".to_string(),
-            ));
+            return Err(AloError::InvalidInput {
+                reason: "ALO diagnostics require finite penalty-root entries".to_string(),
+            });
         }
     }
     Ok(())
@@ -637,12 +742,16 @@ pub fn compute_alo_diagnostics_from_fit(
     y: ArrayView1<f64>,
     link: LinkFunction,
 ) -> Result<AloDiagnostics, EstimationError> {
-    let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
-        EstimationError::InvalidInput(
-            "ALO diagnostics require a PIRLS-backed fit; this fit does not expose PIRLS geometry"
-                .to_string(),
-        )
-    })?;
+    let pirls = fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .ok_or_else(|| AloError::InvalidInput {
+            reason:
+                "ALO diagnostics require a PIRLS-backed fit; this fit does not expose PIRLS geometry"
+                    .to_string(),
+        })
+        .map_err(EstimationError::from)?;
     compute_alo_diagnostics_from_pirls_impl(pirls, y, link)
 }
 

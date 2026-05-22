@@ -40,7 +40,57 @@ use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatr
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::Arc;
+
+/// Typed error variants for the HMC / NUTS sampling module.
+///
+/// External-facing helpers in this module continue to return
+/// `Result<_, String>`; this enum is materialized internally and converted
+/// at the public boundary via `.map_err(String::from)` so that the error
+/// text remains byte-identical to the previous `format!` output.
+#[derive(Debug, Clone)]
+pub enum HmcError {
+    /// Sampler state (penalty / Hessian / mode / posterior values) contains
+    /// NaN or Inf where finiteness is required.
+    NonFiniteState { reason: String },
+    /// Configuration value (e.g. `target_accept`, unit-weight requirement)
+    /// is out of range or otherwise invalid.
+    InvalidConfig { reason: String },
+    /// Dimensions of the supplied matrices / vectors are inconsistent.
+    DimensionMismatch { reason: String },
+    /// Firth/Jeffreys correction was requested for a family that does not
+    /// support it.
+    FirthUnsupported { reason: String },
+    /// Inverse-link state does not match the requested likelihood family in
+    /// the joint (β, ρ) sampler.
+    LinkMismatch { reason: String },
+    /// Likelihood family is not implemented in the current sampling path.
+    UnsupportedFamily { reason: String },
+    /// Sampling produced no usable output (empty kept set, non-finite
+    /// summary statistic, etc.).
+    SamplingFailed { reason: String },
+}
+
+impl fmt::Display for HmcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HmcError::NonFiniteState { reason }
+            | HmcError::InvalidConfig { reason }
+            | HmcError::DimensionMismatch { reason }
+            | HmcError::FirthUnsupported { reason }
+            | HmcError::LinkMismatch { reason }
+            | HmcError::UnsupportedFamily { reason }
+            | HmcError::SamplingFailed { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl From<HmcError> for String {
+    fn from(err: HmcError) -> String {
+        err.to_string()
+    }
+}
 
 struct SamplingVisualizer {
     session: VisualizerSession,
@@ -496,16 +546,25 @@ impl NutsPosterior {
 
         // Validate inputs are finite
         if !penalty_matrix.iter().all(|x| x.is_finite()) {
-            return Err("Penalty matrix contains NaN or Inf values".to_string());
+            return Err(HmcError::NonFiniteState {
+                reason: "Penalty matrix contains NaN or Inf values".to_string(),
+            }
+            .into());
         }
         if !hessian.iter().all(|x| x.is_finite()) {
-            return Err("Hessian matrix contains NaN or Inf values".to_string());
+            return Err(HmcError::NonFiniteState {
+                reason: "Hessian matrix contains NaN or Inf values".to_string(),
+            }
+            .into());
         }
         if !mode.iter().all(|x| x.is_finite()) {
-            return Err("Mode vector contains NaN or Inf values".to_string());
+            return Err(HmcError::NonFiniteState {
+                reason: "Mode vector contains NaN or Inf values".to_string(),
+            }
+            .into());
         }
 
-        validate_firth_support(nuts_family, firth_enabled)?;
+        validate_firth_support(nuts_family, firth_enabled).map_err(String::from)?;
 
         // Use faer for numerically stable Cholesky decomposition of H
         // H = L_H L_H^T where L_H is lower triangular
@@ -665,13 +724,15 @@ fn log_ndtr(x: f64) -> f64 {
 }
 
 #[inline]
-fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(), String> {
+fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(), HmcError> {
     if firth_enabled && !family.likelihood_family().supports_firth() {
-        return Err(format!(
-            "NUTS with Firth is only supported for {}; {} does not support it",
-            LikelihoodFamily::BinomialLogit.pretty_name(),
-            family.likelihood_family().pretty_name()
-        ));
+        return Err(HmcError::FirthUnsupported {
+            reason: format!(
+                "NUTS with Firth is only supported for {}; {} does not support it",
+                LikelihoodFamily::BinomialLogit.pretty_name(),
+                family.likelihood_family().pretty_name()
+            ),
+        });
     }
     Ok(())
 }
@@ -680,13 +741,15 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
 fn validate_firth_likelihood_support(
     family: LikelihoodFamily,
     firth_enabled: bool,
-) -> Result<(), String> {
+) -> Result<(), HmcError> {
     if firth_enabled && !family.supports_firth() {
-        return Err(format!(
-            "Joint HMC with Firth is only supported for {}; {} does not support it",
-            LikelihoodFamily::BinomialLogit.pretty_name(),
-            family.pretty_name()
-        ));
+        return Err(HmcError::FirthUnsupported {
+            reason: format!(
+                "Joint HMC with Firth is only supported for {}; {} does not support it",
+                LikelihoodFamily::BinomialLogit.pretty_name(),
+                family.pretty_name()
+            ),
+        });
     }
     Ok(())
 }
@@ -701,13 +764,15 @@ fn firth_jeffreys_logp_and_grad(
     family: NutsFamily,
     data: &SharedData,
     eta: &Array1<f64>,
-) -> Result<(f64, Array1<f64>), String> {
+) -> Result<(f64, Array1<f64>), HmcError> {
     if eta.len() != data.n_samples {
-        return Err(format!(
-            "Firth Jeffreys term eta length {} != number of samples {}",
-            eta.len(),
-            data.n_samples
-        ));
+        return Err(HmcError::DimensionMismatch {
+            reason: format!(
+                "Firth Jeffreys term eta length {} != number of samples {}",
+                eta.len(),
+                data.n_samples
+            ),
+        });
     }
     if data.dim == 0 || data.n_samples == 0 {
         return Ok((0.0, Array1::zeros(data.dim)));
@@ -726,7 +791,9 @@ fn firth_jeffreys_logp_and_grad(
             data.weights.view(),
         )
     }
-    .map_err(|e| format!("Firth Jeffreys operator failed: {e}"))?;
+    .map_err(|e| HmcError::SamplingFailed {
+        reason: format!("Firth Jeffreys operator failed: {e}"),
+    })?;
     Ok(op.jeffreys_logdet_and_beta_gradient())
 }
 
@@ -2513,13 +2580,15 @@ fn default_nuts_seed() -> u64 {
     42
 }
 
-fn validate_nuts_target_accept(target_accept: f64) -> Result<(), String> {
+fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
     if target_accept.is_finite() && target_accept > 0.0 && target_accept < 1.0 {
         Ok(())
     } else {
-        Err(format!(
-            "NUTS target_accept must be finite and lie in (0, 1), got {target_accept}"
-        ))
+        Err(HmcError::InvalidConfig {
+            reason: format!(
+                "NUTS target_accept must be finite and lie in (0, 1), got {target_accept}"
+            ),
+        })
     }
 }
 
@@ -3019,8 +3088,8 @@ pub(crate) fn run_nuts_sampling(
     firth_bias_reduction: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    validate_firth_support(nuts_family, firth_bias_reduction)?;
-    validate_nuts_target_accept(config.target_accept)?;
+    validate_firth_support(nuts_family, firth_bias_reduction).map_err(String::from)?;
+    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
     let dim = mode.len();
 
     // Create posterior target with analytical gradients. When Firth is enabled,
@@ -3704,7 +3773,7 @@ pub fn run_link_wiggle_nuts_sampling(
     scale: f64,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    validate_nuts_target_accept(config.target_accept)?;
+    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
     let dim = mode_beta.len() + mode_theta.len();
     let target = LinkWigglePosterior::new(
         x,
@@ -4267,7 +4336,7 @@ impl JointBetaRhoPosterior {
             }
         }
 
-        validate_firth_likelihood_support(likelihood_family, firth_enabled)?;
+        validate_firth_likelihood_support(likelihood_family, firth_enabled).map_err(String::from)?;
 
         // Cholesky of H for β-whitening (same as NutsPosterior)
         let hessian_owned = hessian.to_owned();
@@ -4519,8 +4588,9 @@ pub fn run_joint_beta_rho_sampling(
     inputs: &JointBetaRhoInputs<'_>,
     config: &NutsConfig,
 ) -> Result<JointBetaRhoResult, String> {
-    validate_firth_likelihood_support(inputs.likelihood_family, inputs.firth_bias_reduction)?;
-    validate_nuts_target_accept(config.target_accept)?;
+    validate_firth_likelihood_support(inputs.likelihood_family, inputs.firth_bias_reduction)
+        .map_err(String::from)?;
+    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
     let total_dim = n_beta + n_rho;
@@ -4820,7 +4890,7 @@ mod survival_hmc {
         hessian: ArrayView2<f64>,
         config: &NutsConfig,
     ) -> Result<NutsResult, String> {
-        validate_nuts_target_accept(config.target_accept)?;
+        validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
         // Create posterior target
         let target = SurvivalPosterior::new(
             age_entry,
