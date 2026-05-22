@@ -10,9 +10,13 @@
 use crate::cache::key::Fingerprint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// On-disk schema version. Bump on incompatible format changes; old entries
@@ -82,17 +86,43 @@ impl Default for StoreOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WarmStartStore {
     root: PathBuf,
     opts: StoreOptions,
+    /// Approximate sum of bytes written under `root` by this `WarmStartStore`
+    /// instance. Used to throttle the full directory-scanning eviction in
+    /// [`Self::save_overwrite`] — see `EVICT_EVERY_N_SAVES`. The counter
+    /// resyncs to ground truth after every triggered sweep.
+    byte_total: AtomicU64,
+    /// Monotonically increasing per-instance save counter. Used together
+    /// with `byte_total` to throttle the eviction directory walk.
+    save_counter: AtomicU64,
+}
+
+impl Clone for WarmStartStore {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            opts: self.opts.clone(),
+            // Independent throttle counters per clone are fine: each clone
+            // will sweep once on its first save and resync from disk.
+            byte_total: AtomicU64::new(self.byte_total.load(Ordering::Relaxed)),
+            save_counter: AtomicU64::new(0),
+        }
+    }
 }
 
 impl WarmStartStore {
     /// Open (or create) a store rooted at `root`.
     pub fn open(root: PathBuf, opts: StoreOptions) -> Result<Self, StoreError> {
         fs::create_dir_all(&root)?;
-        Ok(Self { root, opts })
+        Ok(Self {
+            root,
+            opts,
+            byte_total: AtomicU64::new(0),
+            save_counter: AtomicU64::new(0),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -318,17 +348,21 @@ impl WarmStartStore {
             let _ = fs::remove_file(&meta_tmp);
             return Err(StoreError::Io(e));
         }
-        // 5. Best-effort eviction; failure here is non-fatal. Skip the
-        // full directory scan on most saves — a per-store save counter
-        // triggers eviction only every `EVICT_EVERY_N_SAVES` writes plus
-        // on the first save of a process, and whenever a single payload
-        // is large enough that it alone could push us over budget. That
-        // bounds the eviction's amortized cost without losing correctness:
-        // the budget can briefly overshoot by up to K-1 payloads, which
-        // the next sweep reclaims.
-        let oversize_trigger = (payload.len() as u64) * 2 >= self.opts.size_budget_bytes;
-        let n = save_counter().fetch_add(1, Ordering::Relaxed);
-        if oversize_trigger || n % EVICT_EVERY_N_SAVES == 0 {
+        // 5. Best-effort eviction; failure here is non-fatal. Throttle the
+        // full directory scan: maintain a process-wide approximate byte
+        // total and only run eviction when the total may have exceeded the
+        // budget, when the per-save counter wraps `EVICT_EVERY_N_SAVES` as
+        // a drift-resync fallback, or on the very first save (so a fresh
+        // process inheriting a populated cache root sweeps once). The
+        // counter is best-effort: it can drift relative to disk truth
+        // because other processes may write/evict, but every triggered
+        // sweep resyncs it to ground truth.
+        let approx_added = payload.len() as u64 + APPROX_META_BYTES;
+        let prev_total = self.byte_total.fetch_add(approx_added, Ordering::Relaxed);
+        let new_total = prev_total + approx_added;
+        let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
+        let over_budget = new_total > self.opts.size_budget_bytes;
+        if n == 0 || over_budget || n % EVICT_EVERY_N_SAVES == 0 {
             let _ = self.evict_overflow();
         }
         Ok(())
@@ -439,9 +473,18 @@ impl WarmStartStore {
             let _ = fs::remove_file(&bin);
             remaining = remaining.saturating_sub(bytes);
         }
+        // Resync the approximate byte counter to ground truth. Subsequent
+        // saves increment from here until the next sweep.
+        self.byte_total.store(remaining, Ordering::Relaxed);
         Ok(())
     }
 }
+
+/// Conservative meta-JSON size used by the throttled save counter. Real
+/// meta files run ~250-400 bytes after pretty-printing; overestimating
+/// just means the throttle fires slightly earlier, never later.
+const APPROX_META_BYTES: u64 = 512;
+
 
 /// How [`WarmStartStore::lookup_with`] ranks candidate entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -507,11 +550,6 @@ fn lookup_cache_invalidate(key: &LookupCacheKey) {
 /// reclaims. K=32 keeps the amortized cost negligible on hot checkpoint
 /// paths while still bounding worst-case disk drift.
 const EVICT_EVERY_N_SAVES: u64 = 32;
-
-fn save_counter() -> &'static AtomicU64 {
-    static COUNTER: OnceLock<AtomicU64> = OnceLock::new();
-    COUNTER.get_or_init(|| AtomicU64::new(0))
-}
 
 fn parse_tmp_pid(name: &str) -> Option<u32> {
     // Names look like "<runid>.bin.tmp.<pid>.<nonce>" or
