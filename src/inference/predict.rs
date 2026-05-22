@@ -659,7 +659,21 @@ impl PredictableModel for StandardPredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        let result = self.predict_plugin_response(input)?;
+        // Compute eta once; if a covariance is available, jointly compute the
+        // inverse-link mean and `dmu/deta` so the delta-method SE below can
+        // reuse the d1 array instead of re-evaluating the (often nonlinear)
+        // jet a second time.
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
+        let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
+            runtime.apply(&eta_base).map_err(EstimationError::from)?
+        } else {
+            eta_base
+        };
+        let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
+        // Cache d1 from the same jet that produces mean so we do not recompute it
+        // in `delta_method_mean_se` below.
+        let (mean, dmu_deta) = inverse_link_mean_and_d1(&strategy, eta.view())?;
+        let result = PredictResult { eta, mean };
         let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
             let se = if let Some(runtime) = self.link_wiggle.as_ref() {
@@ -718,8 +732,7 @@ impl PredictableModel for StandardPredictor {
             } else {
                 eta_standard_errors_from_backend(&input.design, &backend)?
             };
-            let strategy = strategy_for_family(self.family, self.link_kind.as_ref());
-            let mean_se = delta_method_mean_se(&result.eta, &se, &strategy)?;
+            let mean_se = delta_method_mean_se_from_d1(&dmu_deta, &se);
             (Some(se), Some(mean_se))
         } else {
             (None, None)
@@ -2128,36 +2141,83 @@ impl BernoulliMarginalSlopePredictor {
         };
 
         // Solve intercepts and (when gradient needed) IFT scalars in chunk-parallel passes.
+        // Outputs are preallocated and each parallel worker writes directly into
+        // its exclusive `axis_chunks_iter_mut` slice; no per-chunk owned buffer
+        // and no serial copy pass over the result chunks.
         let score_warp_beta_owned = beta_score_warp.as_ref().map(|v| v.to_owned());
         let link_dev_beta_owned = beta_link_dev.as_ref().map(|v| v.to_owned());
-        struct FlexSolveChunk {
-            start: usize,
-            end: usize,
-            intercepts: Array1<f64>,
-            a_q: Option<Array1<f64>>,
-            a_b: Option<Array1<f64>>,
-            a_h: Option<Array2<f64>>,
-            a_w: Option<Array2<f64>>,
-        }
-        let solve_chunks = (0..num_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| -> Result<FlexSolveChunk, EstimationError> {
+        let mut intercepts = Array1::<f64>::zeros(n);
+        let mut a_q_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
+        let mut a_b_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
+        let mut a_h_rows = if need_gradient && score_warp_dim > 0 {
+            Some(Array2::<f64>::zeros((n, score_warp_dim)))
+        } else {
+            None
+        };
+        let mut a_w_rows = if need_gradient && link_dev_dim > 0 {
+            Some(Array2::<f64>::zeros((n, link_dev_dim)))
+        } else {
+            None
+        };
+        let solve_result: Result<(), EstimationError> = {
+            use ndarray::Axis;
+            let intercepts_chunks: Vec<ndarray::ArrayViewMut1<f64>> = intercepts
+                .axis_chunks_iter_mut(Axis(0), chunk_size)
+                .collect();
+            let a_q_chunks: Option<Vec<ndarray::ArrayViewMut1<f64>>> = a_q_vec
+                .as_mut()
+                .map(|a| a.axis_chunks_iter_mut(Axis(0), chunk_size).collect());
+            let a_b_chunks: Option<Vec<ndarray::ArrayViewMut1<f64>>> = a_b_vec
+                .as_mut()
+                .map(|a| a.axis_chunks_iter_mut(Axis(0), chunk_size).collect());
+            let a_h_chunks: Option<Vec<ndarray::ArrayViewMut2<f64>>> = a_h_rows
+                .as_mut()
+                .map(|a| a.axis_chunks_iter_mut(Axis(0), chunk_size).collect());
+            let a_w_chunks: Option<Vec<ndarray::ArrayViewMut2<f64>>> = a_w_rows
+                .as_mut()
+                .map(|a| a.axis_chunks_iter_mut(Axis(0), chunk_size).collect());
+
+            // Bundle per-chunk sinks so each parallel worker owns disjoint mutable
+            // views into the shared output arrays.
+            struct FlexSolveSink<'a> {
+                intercepts: ndarray::ArrayViewMut1<'a, f64>,
+                a_q: Option<ndarray::ArrayViewMut1<'a, f64>>,
+                a_b: Option<ndarray::ArrayViewMut1<'a, f64>>,
+                a_h: Option<ndarray::ArrayViewMut2<'a, f64>>,
+                a_w: Option<ndarray::ArrayViewMut2<'a, f64>>,
+            }
+            let mut sinks: Vec<FlexSolveSink<'_>> = Vec::with_capacity(num_chunks);
+            // Move each Option<Vec> into iterators so we can zip them.
+            let mut intercepts_iter = intercepts_chunks.into_iter();
+            let mut a_q_iter = a_q_chunks.map(|v| v.into_iter());
+            let mut a_b_iter = a_b_chunks.map(|v| v.into_iter());
+            let mut a_h_iter = a_h_chunks.map(|v| v.into_iter());
+            let mut a_w_iter = a_w_chunks.map(|v| v.into_iter());
+            for _ in 0..num_chunks {
+                sinks.push(FlexSolveSink {
+                    intercepts: intercepts_iter.next().expect("chunk count matches"),
+                    a_q: a_q_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
+                    a_b: a_b_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
+                    a_h: a_h_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
+                    a_w: a_w_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
+                });
+            }
+
+            sinks
+                .into_par_iter()
+                .enumerate()
+                .try_for_each(|(chunk_idx, mut sink)| -> Result<(), EstimationError> {
                 let start = chunk_idx * chunk_size;
                 let end = (start + chunk_size).min(n);
                 let rows = end - start;
-                let mut intercepts = Array1::<f64>::zeros(rows);
-                let mut a_q = need_gradient.then(|| Array1::<f64>::zeros(rows));
-                let mut a_b = need_gradient.then(|| Array1::<f64>::zeros(rows));
-                let mut a_h = if need_gradient && score_warp_dim > 0 {
-                    Some(Array2::<f64>::zeros((rows, score_warp_dim)))
-                } else {
-                    None
-                };
-                let mut a_w = if need_gradient && link_dev_dim > 0 {
-                    Some(Array2::<f64>::zeros((rows, link_dev_dim)))
-                } else {
-                    None
-                };
+                // Destructure the sink into independent `&mut` references so we
+                // can borrow them disjointly across iterations of the inner row
+                // loop without further reborrowing through `Option::as_mut`.
+                let intercepts_view = &mut sink.intercepts;
+                let mut a_q = sink.a_q.as_mut();
+                let mut a_b = sink.a_b.as_mut();
+                let mut a_h = sink.a_h.as_mut();
+                let mut a_w = sink.a_w.as_mut();
                 let mut warm_start_buf = Array1::<f64>::zeros(1);
                 let mut f_h_row = vec![0.0; score_warp_dim];
                 let mut f_w_row = vec![0.0; link_dev_dim];
@@ -2169,7 +2229,7 @@ impl BernoulliMarginalSlopePredictor {
                     let empirical_grid = self.empirical_grid_for_prediction_row(input, i)?;
                     let score_corr_row = anchor_corrections.score_warp_row(i);
                     let link_corr_row = anchor_corrections.link_dev_row(i);
-                    intercepts[local_row] = self.solve_intercept_scalar(
+                    intercepts_view[local_row] = self.solve_intercept_scalar(
                         q,
                         slope,
                         link_dev_beta_owned.as_ref(),
@@ -3464,10 +3524,10 @@ impl PredictableModel for BinomialLocationScalePredictor {
         let eta_se = linear_predictor_se_from_backend(&backend, eta_t.len(), |rows| {
             let x_t = design_row_chunk(&input.design, rows.clone())?;
             let x_s = design_row_chunk(design_noise, rows.clone())?;
-            let eta_chunk = eta.slice(ndarray::s![rows.clone()]);
             let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
             let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
             let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
+            let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]).to_owned();
             let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                 Some(runtime.design(&q0_chunk)?)
             } else {
@@ -3482,12 +3542,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
             let row_gradients: Result<Vec<Vec<f64>>, String> = (0..rows_in_chunk)
                 .into_par_iter()
                 .map(|i| {
-                    let jet = crate::solver::mixture_link::inverse_link_jet_for_inverse_link(
-                        &self.inverse_link,
-                        eta_chunk[i],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    let dphi = jet.d1;
+                    let dphi = dmu_chunk[i];
                     let scale = dq_dq0[i];
                     let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
                     let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
@@ -4192,22 +4247,44 @@ fn eta_standard_errors_from_backend(
     Ok(vars.mapv(|v| v.max(0.0).sqrt()))
 }
 
-/// Delta-method standard errors on the mean scale.
-fn delta_method_mean_se(
-    eta: &Array1<f64>,
-    eta_se: &Array1<f64>,
+/// Jointly compute `mu = g^{-1}(eta)` and `dmu/deta` across all rows in
+/// parallel from a single `inverse_link_jet` evaluation per row. Used by
+/// `predict_with_uncertainty` so the delta-method SE downstream can reuse
+/// the cached `d1` array instead of re-evaluating the (often nonlinear)
+/// inverse-link jet a second time.
+fn inverse_link_mean_and_d1(
     strategy: &(dyn FamilyStrategy + Sync),
-) -> Result<Array1<f64>, EstimationError> {
+    eta: ndarray::ArrayView1<'_, f64>,
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = eta.len();
-    let values: Result<Vec<f64>, EstimationError> = (0..n)
+    let pairs: Result<Vec<(f64, f64)>, EstimationError> = (0..n)
         .into_par_iter()
         .map(|i| {
             let jet = strategy.inverse_link_jet(eta[i])?;
-            Ok((jet.d1 * eta_se[i]).abs())
+            Ok((jet.mu, jet.d1))
         })
         .collect();
-    Ok(Array1::from_vec(values?))
+    let pairs = pairs?;
+    let mut mean = Array1::<f64>::zeros(n);
+    let mut d1 = Array1::<f64>::zeros(n);
+    for (i, (mu, d1_i)) in pairs.into_iter().enumerate() {
+        mean[i] = mu;
+        d1[i] = d1_i;
+    }
+    Ok((mean, d1))
+}
+
+/// Delta-method standard errors on the mean scale, given a precomputed
+/// `dmu/deta` (i.e. `jet.d1`) array. Pair with [`inverse_link_mean_and_d1`]
+/// to avoid recomputing the inverse-link jet.
+fn delta_method_mean_se_from_d1(dmu_deta: &Array1<f64>, eta_se: &Array1<f64>) -> Array1<f64> {
+    let n = dmu_deta.len();
+    let mut out = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        out[i] = (dmu_deta[i] * eta_se[i]).abs();
+    }
+    out
 }
 
 pub struct PredictPosteriorMeanResult {
