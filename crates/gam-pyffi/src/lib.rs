@@ -2201,7 +2201,6 @@ fn gaussian_reml_fit_blocks_backward_analytic(
                 .slice(s![.., offsets[block]..offsets[block + 1]])
                 .to_owned(),
         );
-        symmetrize_in_place(&mut grad_penalties[block]);
     }
 
     Ok(GaussianRemlBlocksBackwardAnalytic {
@@ -2218,7 +2217,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
 /// edf) back to (design_blocks, penalty_blocks, y, weights). The VJP is
 /// assembled at the converged log-λ vector: fixed-ρ β/fitted/profiled-REML/EDF
 /// terms are accumulated first, then the smoothing-parameter sensitivity is
-/// routed through the F×F negative-score Jacobian from the implicit optimum.
+/// routed through the F×F profiled REML score Hessian from the implicit optimum.
 #[pyfunction(signature = (
     designs,
     penalties,
