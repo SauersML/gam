@@ -1,7 +1,7 @@
 # Exceptions
 
 `gamfit` raises a small set of dedicated exception types. They share a
-common base so you can catch them generically.
+common base.
 
 ## Hierarchy
 
@@ -16,36 +16,47 @@ ImportError
 └── RustExtensionUnavailableError
 ```
 
+`map_exception` (in `gamfit._exceptions`) inspects the message of an
+exception raised by the Rust binding and returns the most specific class.
+The classification rules are keyword-based on the lower-cased message:
+
+| Keyword in message | Mapped class |
+| --- | --- |
+| `formula` or `parse` | `FormulaError` |
+| `schema`, `missing required column`, `unknown column` | `SchemaMismatchError` |
+| `prediction` or `predict` | `PredictionError` |
+| (any other Rust error) | `GamError` |
+
+`RustExtensionUnavailableError` is returned unchanged.
+
 ## When each is raised
 
 ### `GamError`
 
-Base class. Raised when the Rust engine returns an error that doesn't map
-to one of the more specific types below. Catch this for a single
-`except` covering "something gamfit-side went wrong".
+Base class. Raised for engine errors that do not match a more specific
+keyword. Catch this to handle any gamfit-side failure.
 
 ### `FormulaError`
 
 The formula is invalid or unsupported. Common causes:
 
-- Syntax error (missing `~`, bad parentheses).
-- An identifier that isn't in the data.
-- A smooth option that doesn't exist (e.g. `s(x, kk=10)`).
-- A combination the engine can't fit (e.g. `linkwiggle` on `sas`).
+- Syntax error (missing `~`, unbalanced parentheses).
+- Identifier not present in the data.
+- An unknown smooth option (e.g. `s(x, kk=10)`).
+- A combination the engine cannot fit.
 
 ```python
 try:
     gamfit.fit(df, "y ~ s(x, kk=10)")
 except gamfit.FormulaError as e:
     print(gamfit.explain_error(e))
-    # "Check the formula syntax and confirm every referenced column exists."
 ```
 
 ### `SchemaMismatchError`
 
-You called `predict()` (or similar) with data missing a column the model
-needs, or with incompatible types. Use `Model.check(data)` to surface the
-exact issues without raising:
+The data passed to `predict()` (or similar) is missing a column the model
+needs, has incompatible dtypes, or introduces unknown categorical levels.
+`Model.check(data)` reports the exact issues without raising:
 
 ```python
 check = model.check(test_df)
@@ -56,28 +67,25 @@ if not check.ok:
 
 ### `PredictionError`
 
-Prediction failed for a reason that isn't a schema mismatch — for example,
-the fitted model class isn't supported by the Python predict path. The
-error message names what's supported.
+Prediction failed for a reason other than a schema mismatch — numerical
+issues, an unsupported prediction mode for the fitted model class, etc.
 
 ### `RustExtensionUnavailableError`
 
-The compiled extension `gamfit._rust` failed to load. Rare on the
-prebuilt wheels; happens if you installed from source without a Rust
-toolchain.
+The compiled extension `gamfit._rust` failed to load. Occurs when
+installing from source without a Rust toolchain.
 
 ```python
 try:
     gamfit.build_info()
 except gamfit.RustExtensionUnavailableError as e:
     print(gamfit.explain_error(e))
-    # "Build the extension with maturin before calling Rust-backed APIs."
 ```
 
-## explain_error
+## `explain_error`
 
-`gamfit.explain_error(exc)` takes any exception and returns a short
-human-readable hint:
+`gamfit.explain_error(exc)` returns a short human-readable hint for any
+exception:
 
 | Exception | Hint |
 | --- | --- |
@@ -97,7 +105,7 @@ except Exception as e:
     raise SystemExit(f"{type(e).__name__}: {gamfit.explain_error(e)}")
 ```
 
-## Practical patterns
+## Patterns
 
 ### Defensive predict
 
@@ -109,7 +117,7 @@ def safe_predict(model, data):
     return model.predict(data)
 ```
 
-### Catch everything gamfit-side
+### Catch every gamfit-side error
 
 ```python
 try:

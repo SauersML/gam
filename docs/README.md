@@ -1,82 +1,71 @@
-<div class="gamfit-hero" markdown>
+# gamfit
 
-# gamfit { .gamfit-hero-title }
+Formula-based generalized additive models for Python, backed by a Rust
+engine. REML / LAML smoothing, NUTS or Gaussian Laplace posteriors,
+survival, location-scale, and flexible links in one API.
 
-<p class="gamfit-tagline" markdown>
-Formula-first generalized additive models for Python, backed by a Rust
-engine. REML/LAML smoothing, NUTS or Gaussian Laplace posteriors, survival,
-location-scale, and flexible links in one API.
-</p>
+`gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
+Poisson, and Gamma GLMs with smooth terms, random effects,
+bounded/constrained coefficients, location-scale extensions, survival
+likelihoods, and flexible/learnable links. Smoothing parameters are
+selected by REML or LAML. Posterior sampling uses NUTS where supported,
+and a Gaussian Laplace approximation otherwise.
 
-<div class="gamfit-cta" markdown>
-[Get started](getting-started.md){ .md-button .md-button--primary }
-[API reference](api-reference.md){ .md-button }
-[GitHub](https://github.com/SauersML/gam){ .md-button }
-</div>
-
-</div>
-
-`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth terms,
-random effects, bounded/constrained coefficients, location-scale extensions,
-survival likelihoods, and flexible/learnable links. Smoothing parameters are
-selected by REML or LAML. Posterior sampling uses NUTS where supported, and
-Gaussian Laplace for model classes without an exact NUTS path.
-
-This site is the Python documentation. For a short overview, see the
-[PyPI page](https://pypi.org/project/gamfit/).
+This site is the Python documentation. The source repository is at
+<https://github.com/SauersML/gam>; the PyPI page is at
+<https://pypi.org/project/gamfit/>.
 
 ## Table of contents
 
-**Starting out**
+Starting out
 
-- [Getting started](getting-started.md) — install, fit your first model,
+- [Getting started](getting-started.md) — install, fit a first model,
   understand the return value.
-- [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy, dict
-  of columns, list of records. How `gamfit` decides what to return.
+- [Data input formats](data-input.md) — pandas, polars, pyarrow, numpy,
+  dict of columns, list of records.
 
-**Building a model**
+Building a model
 
-- [Formula DSL reference](formulas.md) — every term type, every option, every
-  link, every family.
-- [Difference smooths](difference-smooths.md) — pointwise and simultaneous
-  contrasts between smooths.
-- [Manifold smooths gallery](manifold-smooths.md) — visual tour of the
-  periodic, cylinder, torus, sphere, Möbius-double-cover, and
-  boundary-conditioned smooths recovered from noisy 3-D point clouds.
-- [Families and link functions](families-and-links.md) — when to use which,
-  including `flexible(...)`, `blended(...)`, `sas`, `beta-logistic`.
-- [Survival models](survival.md) — `Surv(...)` syntax, the four likelihood
-  modes, parametric baselines, frailty.
-- [Marginal-slope models](marginal-slope.md) — Bernoulli marginal-slope with
-  a calibrated risk score; the two-stage transformation-normal pipeline.
-- [Location-scale models](location-scale.md) — jointly modelling mean and
-  variance.
-- [Response geometry](response-geometry.md) — spherical and compositional
-  responses via Fréchet-mean tangent-space GAMs.
+- [Formula DSL reference](formulas.md) — term types, options, links,
+  families.
+- [Difference smooths](difference-smooths.md) — pointwise and
+  simultaneous contrasts between smooths.
+- [Manifold smooths gallery](manifold-smooths.md) — periodic, cylinder,
+  torus, sphere, Möbius double-cover, and boundary-conditioned smooths.
+- [Families and link functions](families-and-links.md) — including
+  `flexible(...)`, `blended(...)`, `sas`, `beta-logistic`.
+- [Survival models](survival.md) — `Surv(...)` syntax, the four
+  likelihood modes, parametric baselines, frailty.
+- [Marginal-slope models](marginal-slope.md) — Bernoulli marginal-slope
+  with a calibrated risk score.
+- [Location-scale models](location-scale.md) — joint mean and variance.
+- [Response geometry](response-geometry.md) — spherical and
+  compositional responses via Fréchet-mean tangent-space GAMs.
 
-**Using a fitted model**
+Using a fitted model
 
 - [Predictions](predictions.md) — `predict()`, intervals, `id_column`,
-  `return_type`; the `SurvivalPrediction` object and chunked surface
-  evaluation.
+  `return_type`; `SurvivalPrediction` and chunked surface evaluation.
 - [Posterior sampling](posterior-sampling.md) — NUTS, `SamplingConfig`,
   `PosteriorSamples`, `PosteriorPredictive`; convergence diagnostics.
 - [Diagnostics, summary, plots, reports](diagnostics.md) — `summary()`,
   `diagnose()`, `check()`, `plot()`, `report()`.
-- [scikit-learn integration](sklearn.md) — `GAMRegressor`, `GAMClassifier`,
-  pipelines, cross-validation.
+- [scikit-learn integration](sklearn.md) — `GAMRegressor`,
+  `GAMClassifier`, pipelines, cross-validation.
 - [PyTorch integration](torch.md) — differentiable REML primitives,
-  response-geometry transforms, and frozen fitted-model modules.
-- [Save and load](persistence.md) — `.gam` model files and `.npz` posteriors.
+  response-geometry transforms, frozen fitted-model modules.
+- [Save and load](persistence.md) — `.gam` model files and `.npz`
+  posteriors.
 
-**Reference**
+Reference
 
-- [Full API reference](api-reference.md) — every public symbol in one place.
-- [Exceptions](exceptions.md) — the exception hierarchy and `explain_error()`.
-- [Cookbook](cookbook.md) — runnable recipes, verified against the test
+- [Full API reference](api-reference.md) — every public symbol.
+- [Exceptions](exceptions.md) — exception hierarchy and
+  `explain_error()`.
+- [Cookbook](cookbook.md) — runnable recipes verified against the test
   suite.
 
-## A complete tour in 30 lines
+## Example
 
 ```python
 import gamfit
@@ -102,7 +91,7 @@ print(model.predict(test, interval=0.95))
 print(model.summary())
 print(model.diagnose(train).metrics)
 
-# 5. Posterior draws + bands.
+# 5. Posterior draws and bands.
 posterior = model.sample(train, seed=42)
 print(posterior)                              # convergence summary
 print(posterior.predict(test, level=0.95))    # posterior mean bands

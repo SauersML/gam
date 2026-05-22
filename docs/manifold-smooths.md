@@ -1,22 +1,17 @@
 # Manifold and geometric smooths
 
-`gamfit` ships a family of smooths whose **predictor space is a manifold
-other than flat Euclidean ℝᵈ**: a circle, a cylinder, a torus, a sphere,
-or a tensor product with periodic margins. The visual demo also includes
-a 4π-periodic double-cover parameterization whose embedding traces a
-Möbius strip; the smoother sees an orientable cylinder, not a true
-Möbius predictor manifold.
+`gamfit` supports smooths whose predictor space is a manifold other than
+flat Euclidean space: a circle, a cylinder, a torus, a sphere, or a
+tensor product with periodic margins. Boundary-conditioned 1-D smooths
+(clamped and anchored) are also available. Reference for formula
+options is in the [Formula DSL reference](formulas.md).
 
-This page is the visual tour. The full reference for the underlying
-formula options lives in the [Formula DSL reference](formulas.md).
-
-## Recovering six geometric examples from noisy point clouds
+## Demo: six geometric examples
 
 The image below is the output of
 [`scripts/geometric_shapes_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/geometric_shapes_demo.py).
-For each of six geometric examples, we sample noisy 3-D points
-`(x, y, z)` along the manifold and fit **one geometric smooth per
-output coordinate**:
+For each shape, noisy 3-D points `(x, y, z)` are sampled along the
+manifold and one geometric smooth is fit per output coordinate:
 
 ```python
 gamfit.fit(df, "x ~ <geometric-smooth>(latent_params)")
@@ -24,85 +19,72 @@ gamfit.fit(df, "y ~ <geometric-smooth>(latent_params)")
 gamfit.fit(df, "z ~ <geometric-smooth>(latent_params)")
 ```
 
-Predicting all three coordinates on a dense grid in the latent space and
-stitching them together gives the recovered shape. Left panel of each
-pair: noisy observations (color encodes camera-relative depth). Right
-panel: the smooth manifold the fits recover.
+Predicting all three coordinates on a dense grid in the latent space
+gives the reconstructed surface. Left panel of each pair: noisy
+observations. Right panel: the fitted surface.
 
 ![rotating-shape demo of six geometric smooths recovered from noisy 3-D
 point clouds](images/geometric_shapes_demo.gif){ width="100%" }
 
-A slower MP4 (first half of the loop, played at 2/3 speed) for
-closer inspection:
+Slower MP4 (first half of the loop, 2/3 speed):
 
 <video controls autoplay loop muted playsinline width="100%">
   <source src="../images/geometric_shapes_demo_slow.mp4" type="video/mp4">
 </video>
 
-The script regenerates a full-length, full-speed MP4 alongside the
-GIF and PNG — run the [reproduction recipe](#reproducing-the-demo)
-below to get it locally. Source browsers can also open
-[the MP4 asset](images/geometric_shapes_demo_slow.mp4) directly.
+The script writes a full-length MP4 alongside the GIF and PNG. See
+[reproduction recipe](#reproducing-the-demo) below.
 
-## The six shapes and the formulas behind them
+## Shapes and formulas
 
-| Shape | Latent params | Formula used in the demo |
+| Shape | Latent params | Formula |
 | --- | --- | --- |
-| **Trefoil knot** (closed curve in ℝ³) | `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=24)` |
-| **Latent-free loop** (closed curve, `t` inferred from the points themselves via PCA + atan2) | inferred `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=18)` |
-| **Wobbly cylinder** (one periodic axis, one open axis) | `θ` ∈ [0, 2π), `h` ∈ [0, 1] | `x ~ te(theta, h, periodic=[0], period=[2*pi, None], k=[26,12])` |
-| **Lumpy sphere** (intrinsic S² with multiple bulges + a deep crater) | `lat`, `lon` (radians) | `x ~ sphere(lat, lon, radians=true, k=100)` |
-| **Bumpy torus** (two periodic axes, period 2π in each) | `u`, `v` ∈ [0, 2π) | `x ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi], k=[20,16])` |
-| **Möbius embedding (4π double-cover)** — the smoother sees an orientable cylinder `S¹ × [−v,v]` with period **4π** in `u`; the embedding in ℝ³ traces a Möbius strip because `F(u+2π,v) = F(u,−v)` in the data. The smoother does *not* enforce the twisted identification `(u,v) ∼ (u+2π,−v)`. | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
+| Trefoil knot (closed curve in ℝ³) | `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=24)` |
+| Latent-free loop (closed curve, `t` inferred from PCA + atan2) | inferred `t` ∈ [0, 2π) | `x ~ s(t, periodic=true, period=2*pi, k=18)` |
+| Wobbly cylinder (one periodic axis, one open axis) | `θ` ∈ [0, 2π), `h` ∈ [0, 1] | `x ~ te(theta, h, periodic=[0], period=[2*pi, None], k=[26,12])` |
+| Lumpy sphere (intrinsic S²) | `lat`, `lon` (radians) | `x ~ sphere(lat, lon, radians=true, k=100)` |
+| Bumpy torus (two periodic axes) | `u`, `v` ∈ [0, 2π) | `x ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi], k=[20,16])` |
+| Möbius embedding (4π double-cover) | `u` ∈ [0, 4π), `v` ∈ [−0.8, 0.8] | `x ~ te(u, v, periodic=[0], period=[4*pi, None], k=[32,10])` |
 
-The three coordinate fits per shape are independent — there is no shared
-parameter and no joint loss. The fact that the reassembled surfaces are
-seam-continuous and singularity-free is entirely a property of the basis
-+ penalty choice on the latent manifold.
+The three coordinate fits per shape are independent: there is no shared
+parameter and no joint loss. Surface continuity at the seams is a
+consequence of the basis and penalty on the latent manifold.
 
-### Notes on the harder cases
+### Notes
 
-- **Latent-free loop.** When the latent parameter is not observed, the
-  demo estimates `t` from the noisy points via the angle of the first
-  two principal components — no special API, just preprocessing. The
-  cyclic boundary removes the seam, but the chosen parameterisation still
-  sets the metric used by the spline basis and penalty.
-- **Sphere.** The intrinsic `sphere(lat, lon)` smooth uses Wahba's
-  reproducing kernel on S², which is rotation-invariant and free of
-  pole artefacts. A spherical-harmonic alternative is also available
-  (`method=harmonic, max_degree=L`); both are documented in
-  [the formula reference](formulas.md#intrinsic-s2-sphere-smooth).
-- **Möbius embedding (4π double-cover).** The demo uses the standard
-  embedding `F(u, v) = ((1 + ½v cos(u/2)) cos u, (1 + ½v cos(u/2)) sin u,
+- Latent-free loop. When the latent parameter is not observed, the demo
+  estimates `t` from the noisy points via the angle of the first two
+  principal components. This is preprocessing, not a special API. The
+  cyclic boundary removes the seam.
+- Sphere. The intrinsic `sphere(lat, lon)` smooth uses Wahba's
+  reproducing kernel on S² (rotation-invariant, no pole artefacts). A
+  spherical-harmonic alternative is available as
+  `method=harmonic, max_degree=L`. Both are documented in the
+  [formula reference](formulas.md#intrinsic-s2-sphere-smooth).
+- Möbius embedding (4π double-cover). The demo uses
+  `F(u, v) = ((1 + ½v cos(u/2)) cos u, (1 + ½v cos(u/2)) sin u,
   ½v sin(u/2))`, which satisfies `F(u+2π, v) = F(u, −v)` and
-  `F(u+4π, v) = F(u, v)`. We give the smoother the latter, ordinary
-  periodicity (period `4π` in `u`), so the *predictor manifold* the
-  smoother sees is the orientable cylinder `S¹ × [−v, v]` — not a true
-  one-sided Möbius strip. The fitted surface in ℝ³ still looks Möbius
-  because the embedding is Möbius; the basis/penalty themselves do not
-  encode the twisted identification `(u, v) ∼ (u+2π, −v)`. A true Möbius
-  basis (twisted boundary condition) is a separate construction not
-  exposed by the formula DSL today.
+  `F(u+4π, v) = F(u, v)`. The smoother is given the latter, ordinary
+  periodicity (period `4π` in `u`), so the predictor manifold is the
+  orientable cylinder `S¹ × [−v, v]`. The fitted surface in ℝ³ looks
+  Möbius because the embedding is Möbius; the basis and penalty do not
+  encode the twisted identification `(u, v) ∼ (u+2π, −v)`. A true
+  Möbius basis is not exposed by the formula DSL.
 
-## Why use a geometric smooth over an ordinary smooth?
+## Why use a geometric smooth
 
-If you fit `te(theta, h)` on a cylinder without `periodic=[0]`, the
-recovered surface will have a visible seam at `θ = 0`. Same for a torus
-(two seams) or sphere (a longitude seam, plus pole crowding). The
-geometric smooths bake the wrap topology into both the basis and the
-penalty so:
+`te(theta, h)` on a cylinder without `periodic=[0]` produces a visible
+seam at `θ = 0`. Same for a torus (two seams) or sphere (a longitude
+seam plus pole crowding). The geometric smooths build the wrap topology
+into both basis and penalty:
 
-- Predictions at `θ = 0` and `θ = 2π` agree; values near the seam vary
-  continuously around the loop.
-- The penalty integrates the squared derivative *around* the loop, not
-  just over the observed sample, so the wiggliness budget is spent
-  honestly.
-- For the sphere, isotropy means the same kernel applies near the poles
-  as at the equator — no special handling required.
+- Predictions at `θ = 0` and `θ = 2π` agree.
+- The penalty integrates the squared derivative around the loop, so
+  the wiggliness budget is allocated correctly.
+- For the sphere, the kernel is isotropic and applies uniformly at
+  the poles and the equator.
 
 ## Reproducing the demo
-
-Build the release binary, then run the script:
 
 ```bash
 cargo build --release
@@ -113,22 +95,18 @@ uv run --with numpy --with pyvista --with matplotlib \
 
 The first run generates noisy CSVs under
 `scripts/geometric_shapes_demo_data/`, fits 18 small models via the
-`gam` CLI (≈ 15 s on a laptop), and writes PNG + MP4 + GIF outputs
-alongside the script. Re-runs reuse the cache; pass `--regen` to start
-fresh, or `--still / --mp4 / --gif` to render only one output.
+`gam` CLI (about 15 s on a laptop), and writes PNG, MP4, and GIF
+outputs. Re-runs reuse the cache; `--regen` starts fresh, and
+`--still / --mp4 / --gif` selects a single output.
 
-For a smaller, Python-only entry point — a single tilted 3-D circle
-with a localized radial spike, fit via `gamfit.fit` directly without
-the CLI — see [`scripts/circle_3d_cyclic_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/circle_3d_cyclic_demo.py)
-(120 lines, no PyVista, no rendering dependencies beyond matplotlib).
+A smaller Python-only entry point (a tilted 3-D circle with a localized
+radial spike, fit via `gamfit.fit` directly) is in
+[`scripts/circle_3d_cyclic_demo.py`](https://github.com/SauersML/gam/blob/main/scripts/circle_3d_cyclic_demo.py).
 
 ## Related reading
 
 - [Formula DSL — periodic / cyclic smooths](formulas.md#periodic-cyclic-smooths)
 - [Formula DSL — boundary-conditioned 1-D smooths](formulas.md#boundary-conditioned-1d-smooths)
 - [Formula DSL — intrinsic S² (sphere) smooth](formulas.md#intrinsic-s2-sphere-smooth)
-- [Response geometry](response-geometry.md) — the **response-side**
-  manifold story (compositional and unit-sphere outputs), which is a
-  different concept: there the response lives on a manifold and the
-  predictors are ordinary; here the predictors live on a manifold and
-  the response is ordinary.
+- [Response geometry](response-geometry.md) — manifold-valued
+  responses (the predictor side is ordinary).
