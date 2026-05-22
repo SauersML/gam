@@ -362,11 +362,7 @@ fn mxtwx(
 }
 
 #[inline]
-fn mxtwxd(
-    x: &Array2<f64>,
-    weights: &Array1<f64>,
-    mask: Option<&Array1<f64>>,
-) -> Array2<f64> {
+fn mxtwxd(x: &Array2<f64>, weights: &Array1<f64>, mask: Option<&Array1<f64>>) -> Array2<f64> {
     match mask {
         Some(m) => safe_fast_xt_diag_x(x, &(weights * m)),
         None => safe_fast_xt_diag_x(x, weights),
@@ -7998,12 +7994,15 @@ impl SurvivalLocationScaleFamily {
                 &tw_entry_d2,
                 row_mask,
             )?;
-            h_tw +=
-                &mxtwx(x_threshold_exit, &(-&q.d2_qdot1 * &q.dqdot_t), xw_qdot, row_mask)?;
+            h_tw += &mxtwx(
+                x_threshold_exit,
+                &(-&q.d2_qdot1 * &q.dqdot_t),
+                xw_qdot,
+                row_mask,
+            )?;
             h_tw += &mxtwx(x_threshold_exit, &(-&q.d1_qdot1), &qdot_t_w, row_mask)?;
             if let Some(x_t_deriv) = x_threshold_deriv {
-                h_tw +=
-                    &mxtwx(x_t_deriv, &(-&q.d2_qdot1 * &q.dqdot_td), xw_qdot, row_mask)?;
+                h_tw += &mxtwx(x_t_deriv, &(-&q.d2_qdot1 * &q.dqdot_td), xw_qdot, row_mask)?;
                 h_tw += &mxtwx(x_t_deriv, &(-&q.d1_qdot1), &qdot_td_w, row_mask)?;
             }
             assign_symmetric_block(&mut joint, offsets[1], w_offset, &h_tw);
@@ -8036,8 +8035,12 @@ impl SurvivalLocationScaleFamily {
             )?;
             h_lw += &mxtwx(x_log_sigma_exit, &(-&q.d1_qdot1), &qdot_ls_w, row_mask)?;
             if let Some(x_ls_deriv) = x_log_sigma_deriv {
-                h_lw +=
-                    &mxtwx(x_ls_deriv, &(-&q.d2_qdot1 * &q.dqdot_lsd), xw_qdot, row_mask)?;
+                h_lw += &mxtwx(
+                    x_ls_deriv,
+                    &(-&q.d2_qdot1 * &q.dqdot_lsd),
+                    xw_qdot,
+                    row_mask,
+                )?;
                 h_lw += &mxtwx(x_ls_deriv, &(-&q.d1_qdot1), &qdot_lsd_w, row_mask)?;
             }
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
@@ -8343,9 +8346,8 @@ impl SurvivalLocationScaleFamily {
                             + dq_t_en * &entry_deltas.delta_q_ls))
                     + &(&entry_deltas.d_d1_q * d2q_tls_en)
                     + &(&q.d1_q0 * &entry_deltas.delta_q_tls));
-                let d_h_tl =
-                    mxtwx(&x_threshold_exit, &w_exit, &x_log_sigma_exit, row_mask)?
-                        + mxtwx(x_t_en, &w_entry, x_ls_en, row_mask)?;
+                let d_h_tl = mxtwx(&x_threshold_exit, &w_exit, &x_log_sigma_exit, row_mask)?
+                    + mxtwx(x_t_en, &w_entry, x_ls_en, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
             } else {
                 let d_d1_q =
@@ -8356,8 +8358,12 @@ impl SurvivalLocationScaleFamily {
                     + &(&q.d2_q * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
                     + &(&d_d1_q * &q.d2q_tls)
                     + &(&q.d1_q * &delta_q_tls_exit));
-                let d_h_tl =
-                    mxtwx(&x_threshold_exit, &d_h_tlweights, &x_log_sigma_exit, row_mask)?;
+                let d_h_tl = mxtwx(
+                    &x_threshold_exit,
+                    &d_h_tlweights,
+                    &x_log_sigma_exit,
+                    row_mask,
+                )?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
             }
         }
@@ -9377,7 +9383,10 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         self.exact_newton_joint_psihessian_directional_derivative_from_parts_masked(
-            q, dir, d_beta_flat, None,
+            q,
+            dir,
+            d_beta_flat,
+            None,
         )
     }
 
@@ -9761,9 +9770,7 @@ impl SurvivalLocationScaleFamily {
         // HT mask lookup: returns m[i] if mask is Some(m) else 1.0. For
         // f64 multiplication, `x * 1.0 == x` exactly (IEEE 754), so the
         // None path is byte-identical to the pre-refactor expression.
-        let mask_at = |i: usize| -> f64 {
-            row_mask.map_or(1.0, |m| m[i])
-        };
+        let mask_at = |i: usize| -> f64 { row_mask.map_or(1.0, |m| m[i]) };
         if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
             const CHUNK: usize = 1024;
             let d1_q0_s = d1_q0
@@ -10290,9 +10297,12 @@ impl SurvivalLocationScaleFamily {
                 + &(2.0 * &entry_deltas.d_d2_q_v * dq_t_en * &entry_deltas.delta_q_t_u)
                 + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v)
                 + &(2.0 * &q.d2_q0 * dq_t_en * &delta_q_t_uv_entry);
-            let d2_h_tt =
-                mxtwx(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit, row_mask)?
-                    + mxtwx(x_t_en, &(-&d2_w_entry), x_t_en, row_mask)?;
+            let d2_h_tt = mxtwx(
+                &x_threshold_exit,
+                &(-&d2_w_exit),
+                &x_threshold_exit,
+                row_mask,
+            )? + mxtwx(x_t_en, &(-&d2_w_entry), x_t_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         } else {
             let d2_w = &d2_d2_q_combined_exact * &q.dq_t.mapv(|v| safe_product(v, v))
@@ -10300,8 +10310,7 @@ impl SurvivalLocationScaleFamily {
                 + &(2.0 * &d_d2_q_combined_v * &q.dq_t * &delta_q_t_exit_u)
                 + &(2.0 * &q.d2_q * &delta_q_t_exit_u * &delta_q_t_exit_v)
                 + &(2.0 * &q.d2_q * &q.dq_t * &delta_q_t_uv_exit);
-            let d2_h_tt =
-                mxtwx(&x_threshold_exit, &(-&d2_w), &x_threshold_exit, row_mask)?;
+            let d2_h_tt = mxtwx(&x_threshold_exit, &(-&d2_w), &x_threshold_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         }
 
@@ -10326,9 +10335,12 @@ impl SurvivalLocationScaleFamily {
                 + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
                 + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u
                 + &(&q.d1_q0 * &delta_q_ls_ls_uv_entry);
-            let d2_h_ll =
-                mxtwx(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?
-                    + mxtwx(x_ls_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
+            let d2_h_ll = mxtwx(
+                &x_log_sigma_exit,
+                &(-&d2_w_exit),
+                &x_log_sigma_exit,
+                row_mask,
+            )? + mxtwx(x_ls_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
         } else {
             let d2_w = &d2_d2_q_combined_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
@@ -10340,8 +10352,7 @@ impl SurvivalLocationScaleFamily {
                 + &d_d1_q_combined_u * &delta_q_ls_ls_exit_v
                 + &d_d1_q_combined_v * &delta_q_ls_ls_exit_u
                 + &(&q.d1_q * &delta_q_ls_ls_uv_exit);
-            let d2_h_ll =
-                mxtwx(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
+            let d2_h_ll = mxtwx(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
         }
 
@@ -10384,9 +10395,12 @@ impl SurvivalLocationScaleFamily {
                     + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_tls_v
                     + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u
                     + &(&q.d1_q0 * &delta_q_tls_uv_entry);
-                let d2_h_tl =
-                    mxtwx(&x_threshold_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?
-                        + mxtwx(x_t_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
+                let d2_h_tl = mxtwx(
+                    &x_threshold_exit,
+                    &(-&d2_w_exit),
+                    &x_log_sigma_exit,
+                    row_mask,
+                )? + mxtwx(x_t_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             } else {
                 let d2_w = &d2_d2_q_combined_exact * &(&q.dq_t * &q.dq_ls)
@@ -10403,8 +10417,7 @@ impl SurvivalLocationScaleFamily {
                     + &d_d1_q_combined_u * &delta_q_tls_exit_v
                     + &d_d1_q_combined_v * &delta_q_tls_exit_u
                     + &(&q.d1_q * &delta_q_tls_uv_exit);
-                let d2_h_tl =
-                    mxtwx(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
+                let d2_h_tl = mxtwx(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             }
         }
@@ -10424,10 +10437,13 @@ impl SurvivalLocationScaleFamily {
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_t_u * &xi_h0_v
                             + &entry_deltas.delta_q_t_v * &xi_h0_u);
-                let d2_h_ht_exit =
-                    mxtwx(&self.x_time_exit, &(-&d2_w_exit), &x_threshold_exit, row_mask)?;
-                let d2_h_ht_entry =
-                    mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_t_en, row_mask)?;
+                let d2_h_ht_exit = mxtwx(
+                    &self.x_time_exit,
+                    &(-&d2_w_exit),
+                    &x_threshold_exit,
+                    row_mask,
+                )?;
+                let d2_h_ht_entry = mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_t_en, row_mask)?;
                 assign_symmetric_block(
                     &mut joint,
                     offsets[0],
@@ -10478,10 +10494,13 @@ impl SurvivalLocationScaleFamily {
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_ls_u * &xi_h0_v
                             + &entry_deltas.delta_q_ls_v * &xi_h0_u);
-                let d2_h_hl_exit =
-                    mxtwx(&self.x_time_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?;
-                let d2_h_hl_entry =
-                    mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_ls_en, row_mask)?;
+                let d2_h_hl_exit = mxtwx(
+                    &self.x_time_exit,
+                    &(-&d2_w_exit),
+                    &x_log_sigma_exit,
+                    row_mask,
+                )?;
+                let d2_h_hl_entry = mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_ls_en, row_mask)?;
                 assign_symmetric_block(
                     &mut joint,
                     offsets[0],
@@ -10540,9 +10559,8 @@ impl SurvivalLocationScaleFamily {
                     + &q.d2_q0
                         * &(&entry_deltas.delta_q_t_u * deltaw_v
                             + &entry_deltas.delta_q_t_v * deltaw_u);
-                let d2_h_tw =
-                    mxtwx(&x_threshold_exit, &(-&d2_tw_exit), xw_dense, row_mask)?
-                        + mxtwx(x_t_en, &(-&d2_tw_entry), xw_dense, row_mask)?;
+                let d2_h_tw = mxtwx(&x_threshold_exit, &(-&d2_tw_exit), xw_dense, row_mask)?
+                    + mxtwx(x_t_en, &(-&d2_tw_entry), xw_dense, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             } else {
                 let d2_tw = &d2_d2_q_combined * &q.dq_t
@@ -10561,9 +10579,8 @@ impl SurvivalLocationScaleFamily {
                     + &q.d2_q0
                         * &(&entry_deltas.delta_q_ls_u * deltaw_v
                             + &entry_deltas.delta_q_ls_v * deltaw_u);
-                let d2_h_lw =
-                    mxtwx(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense, row_mask)?
-                        + mxtwx(x_ls_en, &(-&d2_lw_entry), xw_dense, row_mask)?;
+                let d2_h_lw = mxtwx(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense, row_mask)?
+                    + mxtwx(x_ls_en, &(-&d2_lw_entry), xw_dense, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             } else {
                 let d2_lw = &d2_d2_q_combined * &q.dq_ls
@@ -10637,7 +10654,10 @@ impl SurvivalExactNewtonJointPsiWorkspace {
 }
 
 impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
-    fn first_order_terms(&self, psi_index: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         self.family.exact_newton_joint_psi_terms_masked(
             &self.block_states,
             &self.specs,
@@ -10834,7 +10854,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut ll = 0.0;
-        for row in &subsample.rows {
+        for row in subsample.rows.as_ref() {
             let i = row.index;
             if i >= n {
                 return Err(SurvivalLocationScaleError::DimensionMismatch {
@@ -11150,7 +11170,8 @@ impl SurvivalLocationScaleFamily {
             + x_threshold_exit
                 .t()
                 .dot(&*mask_row_vec(&d_threshold_score_row_exit, row_mask))
-            + x_t_entry_map.transpose_mul(mask_row_vec(&threshold_score_row_entry, row_mask).view())
+            + x_t_entry_map
+                .transpose_mul(mask_row_vec(&threshold_score_row_entry, row_mask).view())
             + x_threshold_entry
                 .t()
                 .dot(&*mask_row_vec(&d_threshold_score_row_entry, row_mask));
@@ -11286,91 +11307,111 @@ impl SurvivalLocationScaleFamily {
             let mut pairs = vec![
                 CustomFamilyJointDesignPairContribution::new(
                     0,
-                    0, mw(
-                    Array1::zeros(self.x_time_entry.nrows())), mw(
-                    -&q.d3_q0 * &q0_psi),
+                    0,
+                    mw(Array1::zeros(self.x_time_entry.nrows())),
+                    mw(-&q.d3_q0 * &q0_psi),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     1,
-                    1, mw(
-                    Array1::zeros(self.x_time_exit.nrows())), mw(
-                    -&q.d3_q1 * &q1_psi),
+                    1,
+                    mw(Array1::zeros(self.x_time_exit.nrows())),
+                    mw(-&q.d3_q1 * &q1_psi),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     2,
-                    2, mw(
-                    h_tt_exit.clone()), mw(
-                    dh_tt_exit.clone()),
+                    2,
+                    mw(h_tt_exit.clone()),
+                    mw(dh_tt_exit.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     3,
-                    3, mw(
-                    h_tt_entry.clone()), mw(
-                    dh_tt_entry.clone()),
+                    3,
+                    mw(h_tt_entry.clone()),
+                    mw(dh_tt_entry.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     4,
-                    4, mw(
-                    h_ll_exit.clone()), mw(
-                    dh_ll_exit.clone()),
+                    4,
+                    mw(h_ll_exit.clone()),
+                    mw(dh_ll_exit.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     5,
-                    5, mw(
-                    h_ll_entry.clone()), mw(
-                    dh_ll_entry.clone()),
+                    5,
+                    mw(h_ll_entry.clone()),
+                    mw(dh_ll_entry.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     2,
-                    4, mw(
-                    h_tl_exit.clone()), mw(
-                    dh_tl_exit.clone()),
+                    4,
+                    mw(h_tl_exit.clone()),
+                    mw(dh_tl_exit.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     4,
-                    2, mw(
-                    h_tl_exit.clone()), mw(
-                    dh_tl_exit.clone()),
+                    2,
+                    mw(h_tl_exit.clone()),
+                    mw(dh_tl_exit.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     3,
-                    5, mw(
-                    h_tl_entry.clone()), mw(
-                    dh_tl_entry.clone()),
+                    5,
+                    mw(h_tl_entry.clone()),
+                    mw(dh_tl_entry.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     5,
-                    3, mw(
-                    h_tl_entry.clone()), mw(
-                    dh_tl_entry.clone()),
+                    3,
+                    mw(h_tl_entry.clone()),
+                    mw(dh_tl_entry.clone()),
                 ),
-                CustomFamilyJointDesignPairContribution::new(0, 3, mw(h_h0_t.clone()), mw(dh_h0_t.clone())),
-                CustomFamilyJointDesignPairContribution::new(3, 0, mw(h_h0_t.clone()), mw(dh_h0_t.clone())),
-                CustomFamilyJointDesignPairContribution::new(1, 2, mw(h_h1_t.clone()), mw(dh_h1_t.clone())),
-                CustomFamilyJointDesignPairContribution::new(2, 1, mw(h_h1_t.clone()), mw(dh_h1_t.clone())),
                 CustomFamilyJointDesignPairContribution::new(
                     0,
-                    5, mw(
-                    h_h0_ls.clone()), mw(
-                    dh_h0_ls.clone()),
+                    3,
+                    mw(h_h0_t.clone()),
+                    mw(dh_h0_t.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
-                    5,
-                    0, mw(
-                    h_h0_ls.clone()), mw(
-                    dh_h0_ls.clone()),
+                    3,
+                    0,
+                    mw(h_h0_t.clone()),
+                    mw(dh_h0_t.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     1,
-                    4, mw(
-                    h_h1_ls.clone()), mw(
-                    dh_h1_ls.clone()),
+                    2,
+                    mw(h_h1_t.clone()),
+                    mw(dh_h1_t.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    2,
+                    1,
+                    mw(h_h1_t.clone()),
+                    mw(dh_h1_t.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    0,
+                    5,
+                    mw(h_h0_ls.clone()),
+                    mw(dh_h0_ls.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    5,
+                    0,
+                    mw(h_h0_ls.clone()),
+                    mw(dh_h0_ls.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    1,
+                    4,
+                    mw(h_h1_ls.clone()),
+                    mw(dh_h1_ls.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     4,
-                    1, mw(
-                    h_h1_ls.clone()), mw(
-                    dh_h1_ls.clone()),
+                    1,
+                    mw(h_h1_ls.clone()),
+                    mw(dh_h1_ls.clone()),
                 ),
             ];
             if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
@@ -11383,81 +11424,81 @@ impl SurvivalLocationScaleFamily {
                 let zero_w = Array1::zeros(xw_dense.nrows());
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    w_idx, mw(
-                    zero_w.clone()), mw(
-                    -&q.d3_q0 * &q0_psi - &q.d3_q1 * &q1_psi),
+                    w_idx,
+                    mw(zero_w.clone()),
+                    mw(-&q.d3_q0 * &q0_psi - &q.d3_q1 * &q1_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     2,
-                    w_idx, mw(
-                    h_tw_exit.clone()), mw(
-                    dh_tw_exit.clone()),
+                    w_idx,
+                    mw(h_tw_exit.clone()),
+                    mw(dh_tw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    2, mw(
-                    h_tw_exit.clone()), mw(
-                    dh_tw_exit.clone()),
+                    2,
+                    mw(h_tw_exit.clone()),
+                    mw(dh_tw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     3,
-                    w_idx, mw(
-                    h_tw_entry.clone()), mw(
-                    dh_tw_entry.clone()),
+                    w_idx,
+                    mw(h_tw_entry.clone()),
+                    mw(dh_tw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    3, mw(
-                    h_tw_entry.clone()), mw(
-                    dh_tw_entry.clone()),
+                    3,
+                    mw(h_tw_entry.clone()),
+                    mw(dh_tw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     4,
-                    w_idx, mw(
-                    h_lw_exit.clone()), mw(
-                    dh_lw_exit.clone()),
+                    w_idx,
+                    mw(h_lw_exit.clone()),
+                    mw(dh_lw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    4, mw(
-                    h_lw_exit.clone()), mw(
-                    dh_lw_exit.clone()),
+                    4,
+                    mw(h_lw_exit.clone()),
+                    mw(dh_lw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     5,
-                    w_idx, mw(
-                    h_lw_entry.clone()), mw(
-                    dh_lw_entry.clone()),
+                    w_idx,
+                    mw(h_lw_entry.clone()),
+                    mw(dh_lw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    5, mw(
-                    h_lw_entry.clone()), mw(
-                    dh_lw_entry.clone()),
+                    5,
+                    mw(h_lw_entry.clone()),
+                    mw(dh_lw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     0,
-                    w_idx, mw(
-                    zero_w.clone()), mw(
-                    &q.d3_q0 * &q0_psi),
+                    w_idx,
+                    mw(zero_w.clone()),
+                    mw(&q.d3_q0 * &q0_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    0, mw(
-                    zero_w.clone()), mw(
-                    &q.d3_q0 * &q0_psi),
+                    0,
+                    mw(zero_w.clone()),
+                    mw(&q.d3_q0 * &q0_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     1,
-                    w_idx, mw(
-                    zero_w.clone()), mw(
-                    &q.d3_q1 * &q1_psi),
+                    w_idx,
+                    mw(zero_w.clone()),
+                    mw(&q.d3_q1 * &q1_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    1, mw(
-                    zero_w), mw(
-                    &q.d3_q1 * &q1_psi),
+                    1,
+                    mw(zero_w),
+                    mw(&q.d3_q1 * &q1_psi),
                 ));
             }
             return Ok(Some(ExactNewtonJointPsiTerms {
@@ -11564,37 +11605,35 @@ impl SurvivalLocationScaleFamily {
             offsets[2],
             &h_threshold_log_sigma,
         );
-        let h_time_threshold =
-            mxtwx(&self.x_time_entry, &dh_h0_t, x_threshold_entry, row_mask)?
-                + mxtwx_psi(
-                    CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
-                    h_h0_t.view(),
-                    x_t_entry_map,
-                    row_mask,
-                )?
-                + mxtwx(&self.x_time_exit, &dh_h1_t, &x_threshold_exit, row_mask)?
-                + mxtwx_psi(
-                    CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                    h_h1_t.view(),
-                    x_t_exit_map,
-                    row_mask,
-                )?;
+        let h_time_threshold = mxtwx(&self.x_time_entry, &dh_h0_t, x_threshold_entry, row_mask)?
+            + mxtwx_psi(
+                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
+                h_h0_t.view(),
+                x_t_entry_map,
+                row_mask,
+            )?
+            + mxtwx(&self.x_time_exit, &dh_h1_t, &x_threshold_exit, row_mask)?
+            + mxtwx_psi(
+                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+                h_h1_t.view(),
+                x_t_exit_map,
+                row_mask,
+            )?;
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[1], &h_time_threshold);
-        let h_time_log_sigma =
-            mxtwx(&self.x_time_entry, &dh_h0_ls, x_log_sigma_entry, row_mask)?
-                + mxtwx_psi(
-                    CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
-                    h_h0_ls.view(),
-                    x_ls_entry_map,
-                    row_mask,
-                )?
-                + mxtwx(&self.x_time_exit, &dh_h1_ls, &x_log_sigma_exit, row_mask)?
-                + mxtwx_psi(
-                    CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
-                    h_h1_ls.view(),
-                    x_ls_exit_map,
-                    row_mask,
-                )?;
+        let h_time_log_sigma = mxtwx(&self.x_time_entry, &dh_h0_ls, x_log_sigma_entry, row_mask)?
+            + mxtwx_psi(
+                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
+                h_h0_ls.view(),
+                x_ls_entry_map,
+                row_mask,
+            )?
+            + mxtwx(&self.x_time_exit, &dh_h1_ls, &x_log_sigma_exit, row_mask)?
+            + mxtwx_psi(
+                CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
+                h_h1_ls.view(),
+                x_ls_exit_map,
+                row_mask,
+            )?;
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[2], &h_time_log_sigma);
 
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
@@ -11632,8 +11671,12 @@ impl SurvivalLocationScaleFamily {
                     + mxtwx(x_log_sigma_entry, &dh_lw_entry, xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, offsets[2], w_offset, &h_log_sigma_wiggle);
             let h_time_wiggle =
-                mxtwx(&self.x_time_entry, &(&q.d3_q0 * &q0_psi), xw_dense, row_mask)?
-                    + mxtwx(&self.x_time_exit, &(&q.d3_q1 * &q1_psi), xw_dense, row_mask)?;
+                mxtwx(
+                    &self.x_time_entry,
+                    &(&q.d3_q0 * &q0_psi),
+                    xw_dense,
+                    row_mask,
+                )? + mxtwx(&self.x_time_exit, &(&q.d3_q1 * &q1_psi), xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, offsets[0], w_offset, &h_time_wiggle);
         }
 
@@ -11645,444 +11688,6 @@ impl SurvivalLocationScaleFamily {
         }))
     }
 
-    fn exact_newton_joint_psisecond_order_terms(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi second-order terms expect {} specs and derivative blocks, got {} and {}",
-                self.expected_blocks(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let Some(dir_i) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_i)?
-        else {
-            return Ok(None);
-        };
-        let Some(dir_j) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_j)?
-        else {
-            return Ok(None);
-        };
-        let q = self.collect_joint_quantities(block_states)?;
-        Ok(Some(
-            self.exact_newton_joint_psisecond_order_terms_from_parts(
-                block_states,
-                derivative_blocks,
-                &q,
-                &dir_i,
-                &dir_j,
-            )?,
-        ))
-    }
-
-    fn exact_newton_joint_psi_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        if block_states.len() != self.expected_blocks()
-            || specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi workspace expects {} states, specs, and derivative blocks, got {} / {} / {}",
-                self.expected_blocks(),
-                block_states.len(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        Ok(Some(Arc::new(SurvivalExactNewtonJointPsiWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-            specs.to_vec(),
-            derivative_blocks.to_vec(),
-        )?)))
-    }
-
-    fn exact_newton_joint_psi_workspace_with_options(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        if block_states.len() != self.expected_blocks()
-            || specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi workspace expects {} states, specs, and derivative blocks, got {} / {} / {}",
-                self.expected_blocks(),
-                block_states.len(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let mut workspace = SurvivalExactNewtonJointPsiWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-            specs.to_vec(),
-            derivative_blocks.to_vec(),
-        )?;
-        if let Some(subsample) = options.outer_score_subsample.as_ref() {
-            workspace.apply_outer_subsample(subsample.rows.as_ref());
-        }
-        Ok(Some(Arc::new(workspace)))
-    }
-
-    fn exact_newton_joint_psihessian_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        if specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi hessian directional derivative expects {} specs and derivative blocks, got {} and {}",
-                self.expected_blocks(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let Some(dir) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index)?
-        else {
-            return Ok(None);
-        };
-        let q = self.collect_joint_quantities(block_states)?;
-        Ok(Some(
-            self.exact_newton_joint_psihessian_directional_derivative_from_parts(
-                &q,
-                &dir,
-                d_beta_flat,
-            )?,
-        ))
-    }
-
-    fn exact_newton_joint_hessiansecond_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities_rescaled(
-            block_states,
-            self.hessian_deriv_log_rescale(block_states),
-        )?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
-            block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-            &q,
-            &dynamic,
-        )
-    }
-
-    fn block_linear_constraints(
-        &self,
-        _: &[ParameterBlockState],
-        block_idx: usize,
-        spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, String> {
-        if block_idx == Self::BLOCK_LINK_WIGGLE {
-            return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
-        }
-        if block_idx != Self::BLOCK_TIME {
-            return Ok(None);
-        }
-        Ok(self
-            .time_coefficient_lower_bounds
-            .as_ref()
-            .and_then(lower_bound_constraints))
-    }
-
-    fn max_feasible_step_size(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        delta: &Array1<f64>,
-    ) -> Result<Option<f64>, String> {
-        if block_idx == Self::BLOCK_TIME {
-            return self.max_feasible_time_step(&block_states[Self::BLOCK_TIME].beta, delta);
-        }
-        if block_idx == Self::BLOCK_LINK_WIGGLE {
-            return self
-                .max_feasible_link_wiggle_step(&block_states[Self::BLOCK_LINK_WIGGLE].beta, delta);
-        }
-        Ok(None)
-    }
-
-    fn post_update_block_beta(
-        &self,
-        _: &[ParameterBlockState],
-        block_idx: usize,
-        _: &ParameterBlockSpec,
-        mut beta: Array1<f64>,
-    ) -> Result<Array1<f64>, String> {
-        // Accepted line-search trials are not guaranteed to satisfy the
-        // structural lower bounds at zero tolerance: the QP solver's internal
-        // `project_to_lower_bounds` runs only inside the constrained solve,
-        // but the joint-Newton line search computes
-        // `trial = old + alpha * delta` and assigns it directly. Over
-        // iterations, floating-point drift pushes the binding coefficient a
-        // few ulp below its bound (the active-set classifier tolerates
-        // 1e-6, so intermediate iterates can land well into the negative),
-        // which the next iteration's `max_feasible_time_step` guard rejects
-        // at -1e-10. Project back to the feasible set here so every accepted
-        // beta is feasible at zero tolerance — a single source of truth.
-        if block_idx == Self::BLOCK_TIME
-            && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
-        {
-            // Dim mismatch here means the caller and the structural bound
-            // vector disagree about the block's coefficient count — the
-            // projection has no consistent interpretation in that state.
-            // Silently skipping would turn the structural lower-bound
-            // guarantee into a no-op and let β drift below the bound on
-            // the very next line-search step, which downstream
-            // `max_feasible_time_step` then rejects with an opaque
-            // "current time coefficient violates structural lower bound"
-            // error.  Fail fast with a precise, actionable message.
-            if beta.len() != lower_bounds.len() {
-                return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                    "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
-                    beta.len(),
-                    lower_bounds.len()
-                ) }.into());
-            }
-            for j in 0..beta.len() {
-                let lb = lower_bounds[j];
-                if lb.is_finite() && beta[j] < lb {
-                    beta[j] = lb;
-                }
-            }
-        } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
-            // Link-wiggle coefficients are structurally non-negative (see
-            // max_feasible_link_wiggle_step, which checks beta[j] >= 0).
-            for j in 0..beta.len() {
-                if beta[j] < 0.0 {
-                    beta[j] = 0.0;
-                }
-            }
-        }
-        Ok(beta)
-    }
-
-    /// Build a workspace that caches the direction-independent quantities
-    /// (`SurvivalJointQuantities` and `SurvivalDynamicGeometry`) used by the
-    /// joint-Hessian directional derivative paths.
-    ///
-    /// The outer joint-Hessian pair loop in the unified REML evaluator calls
-    /// `directional_derivative_operator` and `second_directional_derivative_operator`
-    /// ~`k(k+1)/2 + k` times per outer Hessian evaluation (≈ 323 times at
-    /// `k = 17`). Without the workspace, every call re-runs
-    /// `collect_joint_quantities_rescaled` + `build_dynamic_geometry`, two
-    /// O(n) row sweeps whose outputs depend only on `block_states`. The
-    /// workspace builds both once at top-level and routes every directional
-    /// derivative through the `_from_parts` variants that consume the cached
-    /// arrays.
-    fn exact_newton_joint_hessian_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        Ok(Some(Arc::new(
-            SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
-                self.clone(),
-                block_states.to_vec(),
-            )?,
-        )))
-    }
-
-    fn exact_newton_joint_hessian_workspace_with_options(
-        &self,
-        block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-        )?;
-        if let Some(subsample) = options.outer_score_subsample.as_ref() {
-            workspace.apply_outer_subsample(subsample.rows.as_ref());
-        }
-        Ok(Some(Arc::new(workspace)))
-    }
-
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
-    }
-}
-
-/// Workspace caching the direction-independent state used by the survival
-/// location-scale joint-Hessian directional derivative operators.
-///
-/// The unified outer evaluator invokes `directional_derivative_operator` and
-/// `second_directional_derivative_operator` hundreds of times per outer
-/// Hessian evaluation (k first-pass `compute_dh(v_k)` calls + 2·k(k+1)/2
-/// `compute_dh`/`compute_d2h` calls in the pair loop). Each of those calls,
-/// when routed through the family's generic methods, restarts from
-/// `collect_joint_quantities_rescaled` and `build_dynamic_geometry` — two
-/// parallel O(n) row sweeps whose outputs depend solely on `block_states`,
-/// which is fixed across the entire Hessian evaluation. Caching these on the
-/// workspace and dispatching through the `_from_parts` variants eliminates
-/// the redundant sweeps.
-struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
-    family: SurvivalLocationScaleFamily,
-    block_states: Vec<ParameterBlockState>,
-    /// Cached `SurvivalJointQuantities` at the rescale used by the
-    /// directional-derivative entry points (`hessian_deriv_log_rescale`).
-    /// `collect_joint_quantities_rescaled` reads only `block_states` and the
-    /// scalar rescale; reusing it across all `directional_derivative_*` calls
-    /// is mathematically identical to recomputing it per call (modulo
-    /// floating-point reordering, which the family already accepts).
-    q: SurvivalJointQuantities,
-    /// Cached `SurvivalDynamicGeometry`. `build_dynamic_geometry` depends only
-    /// on `block_states`.
-    dynamic: SurvivalDynamicGeometry,
-    /// Optional Horvitz-Thompson row mask. `None` means full-data evaluation
-    /// (byte-identical to the pre-refactor workspace). `Some(m)` causes every
-    /// row-additive assembly site in the directional / second-directional
-    /// derivative paths to multiply the per-row weight by `m[i]` before the
-    /// final cross product / dot-product reduction, yielding an unbiased
-    /// outer-Hessian estimate for the configured subsample.
-    row_mask: Option<Arc<Array1<f64>>>,
-}
-
-impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
-    fn new(
-        family: SurvivalLocationScaleFamily,
-        block_states: Vec<ParameterBlockState>,
-    ) -> Result<Self, String> {
-        let log_rescale = family.hessian_deriv_log_rescale(&block_states);
-        let q = family.collect_joint_quantities_rescaled(&block_states, log_rescale)?;
-        let dynamic = family.build_dynamic_geometry(&block_states)?;
-        Ok(Self {
-            family,
-            block_states,
-            q,
-            dynamic,
-            row_mask: None,
-        })
-    }
-
-    /// Install a Horvitz-Thompson row mask: for each `WeightedOuterRow {
-    /// index, weight, .. }`, set `mask[index] = weight`; all other entries are
-    /// `0.0`. The mask is consumed by every `*_masked` assembly site reached
-    /// via the workspace methods.
-    fn apply_outer_subsample(
-        &mut self,
-        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
-    ) {
-        let n = self.family.n;
-        let mut mask = Array1::<f64>::zeros(n);
-        for r in rows {
-            if r.index < n {
-                mask[r.index] = r.weight;
-            }
-        }
-        self.row_mask = Some(Arc::new(mask));
-    }
-}
-
-impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointHessianWorkspace {
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
-                &self.block_states,
-                d_beta_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )
-    }
-
-    fn directional_derivative_operator(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        Ok(self
-            .family
-            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
-                &self.block_states,
-                d_beta_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )?
-            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
-    }
-
-    fn second_directional_derivative(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )
-    }
-
-    fn second_directional_derivative_operator(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        Ok(self
-            .family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )?
-            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
-    }
 }
 
 /// Variant that also returns the offset-channel residuals + curvatures at the
