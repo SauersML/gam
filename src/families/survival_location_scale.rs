@@ -11207,6 +11207,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             || dir.x_ls_exit_action.is_some()
             || dir.x_ls_entry_action.is_some()
         {
+            // HT-mask helper. Each per-row pair weight (h_*, dh_*, ±d3·q_psi)
+            // is multiplied by the mask before being moved into the deferred
+            // operator. `None` is a zero-cost passthrough.
+            let mw = |arr: Array1<f64>| -> Array1<f64> {
+                match row_mask {
+                    Some(m) => &arr * m,
+                    None => arr,
+                }
+            };
             let mut channels = vec![
                 CustomFamilyJointDesignChannel::new(
                     offsets[0]..offsets[1],
@@ -11242,91 +11251,91 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             let mut pairs = vec![
                 CustomFamilyJointDesignPairContribution::new(
                     0,
+                    0, mw(
+                    Array1::zeros(self.x_time_entry.nrows())), mw(
+                    -&q.d3_q0 * &q0_psi),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    1,
+                    1, mw(
+                    Array1::zeros(self.x_time_exit.nrows())), mw(
+                    -&q.d3_q1 * &q1_psi),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    2,
+                    2, mw(
+                    h_tt_exit.clone()), mw(
+                    dh_tt_exit.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    3,
+                    3, mw(
+                    h_tt_entry.clone()), mw(
+                    dh_tt_entry.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    4,
+                    4, mw(
+                    h_ll_exit.clone()), mw(
+                    dh_ll_exit.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    5,
+                    5, mw(
+                    h_ll_entry.clone()), mw(
+                    dh_ll_entry.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    2,
+                    4, mw(
+                    h_tl_exit.clone()), mw(
+                    dh_tl_exit.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    4,
+                    2, mw(
+                    h_tl_exit.clone()), mw(
+                    dh_tl_exit.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    3,
+                    5, mw(
+                    h_tl_entry.clone()), mw(
+                    dh_tl_entry.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    5,
+                    3, mw(
+                    h_tl_entry.clone()), mw(
+                    dh_tl_entry.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(0, 3, mw(h_h0_t.clone()), mw(dh_h0_t.clone())),
+                CustomFamilyJointDesignPairContribution::new(3, 0, mw(h_h0_t.clone()), mw(dh_h0_t.clone())),
+                CustomFamilyJointDesignPairContribution::new(1, 2, mw(h_h1_t.clone()), mw(dh_h1_t.clone())),
+                CustomFamilyJointDesignPairContribution::new(2, 1, mw(h_h1_t.clone()), mw(dh_h1_t.clone())),
+                CustomFamilyJointDesignPairContribution::new(
                     0,
-                    Array1::zeros(self.x_time_entry.nrows()),
-                    -&q.d3_q0 * &q0_psi,
+                    5, mw(
+                    h_h0_ls.clone()), mw(
+                    dh_h0_ls.clone()),
+                ),
+                CustomFamilyJointDesignPairContribution::new(
+                    5,
+                    0, mw(
+                    h_h0_ls.clone()), mw(
+                    dh_h0_ls.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     1,
-                    1,
-                    Array1::zeros(self.x_time_exit.nrows()),
-                    -&q.d3_q1 * &q1_psi,
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    2,
-                    2,
-                    h_tt_exit.clone(),
-                    dh_tt_exit.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    3,
-                    3,
-                    h_tt_entry.clone(),
-                    dh_tt_entry.clone(),
+                    4, mw(
+                    h_h1_ls.clone()), mw(
+                    dh_h1_ls.clone()),
                 ),
                 CustomFamilyJointDesignPairContribution::new(
                     4,
-                    4,
-                    h_ll_exit.clone(),
-                    dh_ll_exit.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    5,
-                    5,
-                    h_ll_entry.clone(),
-                    dh_ll_entry.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    2,
-                    4,
-                    h_tl_exit.clone(),
-                    dh_tl_exit.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    4,
-                    2,
-                    h_tl_exit.clone(),
-                    dh_tl_exit.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    3,
-                    5,
-                    h_tl_entry.clone(),
-                    dh_tl_entry.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    5,
-                    3,
-                    h_tl_entry.clone(),
-                    dh_tl_entry.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(0, 3, h_h0_t.clone(), dh_h0_t.clone()),
-                CustomFamilyJointDesignPairContribution::new(3, 0, h_h0_t.clone(), dh_h0_t.clone()),
-                CustomFamilyJointDesignPairContribution::new(1, 2, h_h1_t.clone(), dh_h1_t.clone()),
-                CustomFamilyJointDesignPairContribution::new(2, 1, h_h1_t.clone(), dh_h1_t.clone()),
-                CustomFamilyJointDesignPairContribution::new(
-                    0,
-                    5,
-                    h_h0_ls.clone(),
-                    dh_h0_ls.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    5,
-                    0,
-                    h_h0_ls.clone(),
-                    dh_h0_ls.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    1,
-                    4,
-                    h_h1_ls.clone(),
-                    dh_h1_ls.clone(),
-                ),
-                CustomFamilyJointDesignPairContribution::new(
-                    4,
-                    1,
-                    h_h1_ls.clone(),
-                    dh_h1_ls.clone(),
+                    1, mw(
+                    h_h1_ls.clone()), mw(
+                    dh_h1_ls.clone()),
                 ),
             ];
             if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
@@ -11339,81 +11348,81 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 let zero_w = Array1::zeros(xw_dense.nrows());
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    w_idx,
-                    zero_w.clone(),
-                    -&q.d3_q0 * &q0_psi - &q.d3_q1 * &q1_psi,
+                    w_idx, mw(
+                    zero_w.clone()), mw(
+                    -&q.d3_q0 * &q0_psi - &q.d3_q1 * &q1_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     2,
-                    w_idx,
-                    h_tw_exit.clone(),
-                    dh_tw_exit.clone(),
+                    w_idx, mw(
+                    h_tw_exit.clone()), mw(
+                    dh_tw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    2,
-                    h_tw_exit.clone(),
-                    dh_tw_exit.clone(),
+                    2, mw(
+                    h_tw_exit.clone()), mw(
+                    dh_tw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     3,
-                    w_idx,
-                    h_tw_entry.clone(),
-                    dh_tw_entry.clone(),
+                    w_idx, mw(
+                    h_tw_entry.clone()), mw(
+                    dh_tw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    3,
-                    h_tw_entry.clone(),
-                    dh_tw_entry.clone(),
+                    3, mw(
+                    h_tw_entry.clone()), mw(
+                    dh_tw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     4,
-                    w_idx,
-                    h_lw_exit.clone(),
-                    dh_lw_exit.clone(),
+                    w_idx, mw(
+                    h_lw_exit.clone()), mw(
+                    dh_lw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    4,
-                    h_lw_exit.clone(),
-                    dh_lw_exit.clone(),
+                    4, mw(
+                    h_lw_exit.clone()), mw(
+                    dh_lw_exit.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     5,
-                    w_idx,
-                    h_lw_entry.clone(),
-                    dh_lw_entry.clone(),
+                    w_idx, mw(
+                    h_lw_entry.clone()), mw(
+                    dh_lw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    5,
-                    h_lw_entry.clone(),
-                    dh_lw_entry.clone(),
+                    5, mw(
+                    h_lw_entry.clone()), mw(
+                    dh_lw_entry.clone()),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     0,
-                    w_idx,
-                    zero_w.clone(),
-                    &q.d3_q0 * &q0_psi,
+                    w_idx, mw(
+                    zero_w.clone()), mw(
+                    &q.d3_q0 * &q0_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    0,
-                    zero_w.clone(),
-                    &q.d3_q0 * &q0_psi,
+                    0, mw(
+                    zero_w.clone()), mw(
+                    &q.d3_q0 * &q0_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     1,
-                    w_idx,
-                    zero_w.clone(),
-                    &q.d3_q1 * &q1_psi,
+                    w_idx, mw(
+                    zero_w.clone()), mw(
+                    &q.d3_q1 * &q1_psi),
                 ));
                 pairs.push(CustomFamilyJointDesignPairContribution::new(
                     w_idx,
-                    1,
-                    zero_w,
-                    &q.d3_q1 * &q1_psi,
+                    1, mw(
+                    zero_w), mw(
+                    &q.d3_q1 * &q1_psi),
                 ));
             }
             return Ok(Some(ExactNewtonJointPsiTerms {
@@ -11428,26 +11437,30 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let mut hessian_psi = Array2::<f64>::zeros((p_total, p_total));
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[0], &h_time_time);
         let h_threshold_threshold =
-            weighted_crossprod_psi_maps(
+            mxtwx_psi(
                 x_t_exit_map,
                 h_tt_exit.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_threshold_exit),
-            )? + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx_psi(
                 CustomFamilyPsiLinearMapRef::Dense(x_threshold_exit),
                 h_tt_exit.view(),
                 x_t_exit_map,
-            )? + weighted_crossprod_dense(&x_threshold_exit, &dh_tt_exit, &x_threshold_exit)?
-                + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx(&x_threshold_exit, &dh_tt_exit, &x_threshold_exit, row_mask)?
+                + mxtwx_psi(
                     x_t_entry_map,
                     h_tt_entry.view(),
                     CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
+                    row_mask,
                 )?
-                + weighted_crossprod_psi_maps(
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
                     h_tt_entry.view(),
                     x_t_entry_map,
+                    row_mask,
                 )?
-                + weighted_crossprod_dense(x_threshold_entry, &dh_tt_entry, x_threshold_entry)?;
+                + mxtwx(x_threshold_entry, &dh_tt_entry, x_threshold_entry, row_mask)?;
         assign_symmetric_block(
             &mut hessian_psi,
             offsets[1],
@@ -11455,26 +11468,30 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             &h_threshold_threshold,
         );
         let h_log_sigma_log_sigma =
-            weighted_crossprod_psi_maps(
+            mxtwx_psi(
                 x_ls_exit_map,
                 h_ll_exit.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_exit),
-            )? + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx_psi(
                 CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_exit),
                 h_ll_exit.view(),
                 x_ls_exit_map,
-            )? + weighted_crossprod_dense(&x_log_sigma_exit, &dh_ll_exit, &x_log_sigma_exit)?
-                + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx(&x_log_sigma_exit, &dh_ll_exit, &x_log_sigma_exit, row_mask)?
+                + mxtwx_psi(
                     x_ls_entry_map,
                     h_ll_entry.view(),
                     CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+                    row_mask,
                 )?
-                + weighted_crossprod_psi_maps(
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
                     h_ll_entry.view(),
                     x_ls_entry_map,
+                    row_mask,
                 )?
-                + weighted_crossprod_dense(x_log_sigma_entry, &dh_ll_entry, x_log_sigma_entry)?;
+                + mxtwx(x_log_sigma_entry, &dh_ll_entry, x_log_sigma_entry, row_mask)?;
         assign_symmetric_block(
             &mut hessian_psi,
             offsets[2],
@@ -11482,26 +11499,30 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             &h_log_sigma_log_sigma,
         );
         let h_threshold_log_sigma =
-            weighted_crossprod_psi_maps(
+            mxtwx_psi(
                 x_t_exit_map,
                 h_tl_exit.view(),
                 CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_exit),
-            )? + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx_psi(
                 CustomFamilyPsiLinearMapRef::Dense(x_threshold_exit),
                 h_tl_exit.view(),
                 x_ls_exit_map,
-            )? + weighted_crossprod_dense(&x_threshold_exit, &dh_tl_exit, &x_log_sigma_exit)?
-                + weighted_crossprod_psi_maps(
+                row_mask,
+            )? + mxtwx(&x_threshold_exit, &dh_tl_exit, &x_log_sigma_exit, row_mask)?
+                + mxtwx_psi(
                     x_t_entry_map,
                     h_tl_entry.view(),
                     CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
+                    row_mask,
                 )?
-                + weighted_crossprod_psi_maps(
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
                     h_tl_entry.view(),
                     x_ls_entry_map,
+                    row_mask,
                 )?
-                + weighted_crossprod_dense(x_threshold_entry, &dh_tl_entry, x_log_sigma_entry)?;
+                + mxtwx(x_threshold_entry, &dh_tl_entry, x_log_sigma_entry, row_mask)?;
         assign_symmetric_block(
             &mut hessian_psi,
             offsets[1],
@@ -11509,67 +11530,75 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             &h_threshold_log_sigma,
         );
         let h_time_threshold =
-            weighted_crossprod_dense(&self.x_time_entry, &dh_h0_t, x_threshold_entry)?
-                + weighted_crossprod_psi_maps(
+            mxtwx(&self.x_time_entry, &dh_h0_t, x_threshold_entry, row_mask)?
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
                     h_h0_t.view(),
                     x_t_entry_map,
+                    row_mask,
                 )?
-                + weighted_crossprod_dense(&self.x_time_exit, &dh_h1_t, &x_threshold_exit)?
-                + weighted_crossprod_psi_maps(
+                + mxtwx(&self.x_time_exit, &dh_h1_t, &x_threshold_exit, row_mask)?
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
                     h_h1_t.view(),
                     x_t_exit_map,
+                    row_mask,
                 )?;
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[1], &h_time_threshold);
         let h_time_log_sigma =
-            weighted_crossprod_dense(&self.x_time_entry, &dh_h0_ls, x_log_sigma_entry)?
-                + weighted_crossprod_psi_maps(
+            mxtwx(&self.x_time_entry, &dh_h0_ls, x_log_sigma_entry, row_mask)?
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
                     h_h0_ls.view(),
                     x_ls_entry_map,
+                    row_mask,
                 )?
-                + weighted_crossprod_dense(&self.x_time_exit, &dh_h1_ls, &x_log_sigma_exit)?
-                + weighted_crossprod_psi_maps(
+                + mxtwx(&self.x_time_exit, &dh_h1_ls, &x_log_sigma_exit, row_mask)?
+                + mxtwx_psi(
                     CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
                     h_h1_ls.view(),
                     x_ls_exit_map,
+                    row_mask,
                 )?;
         assign_symmetric_block(&mut hessian_psi, offsets[0], offsets[2], &h_time_log_sigma);
 
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
             let h_ww = -(&q.d3_q0 * &q0_psi + &q.d3_q1 * &q1_psi);
-            let h_wiggle_wiggle = weighted_crossprod_dense(xw_dense, &h_ww, xw_dense)?;
+            let h_wiggle_wiggle = mxtwx(xw_dense, &h_ww, xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, w_offset, w_offset, &h_wiggle_wiggle);
             let h_threshold_wiggle =
-                weighted_crossprod_psi_maps(
+                mxtwx_psi(
                     x_t_exit_map,
                     h_tw_exit.view(),
                     CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )? + weighted_crossprod_dense(&x_threshold_exit, &dh_tw_exit, xw_dense)?
-                    + weighted_crossprod_psi_maps(
+                    row_mask,
+                )? + mxtwx(&x_threshold_exit, &dh_tw_exit, xw_dense, row_mask)?
+                    + mxtwx_psi(
                         x_t_entry_map,
                         h_tw_entry.view(),
                         CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+                        row_mask,
                     )?
-                    + weighted_crossprod_dense(x_threshold_entry, &dh_tw_entry, xw_dense)?;
+                    + mxtwx(x_threshold_entry, &dh_tw_entry, xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, offsets[1], w_offset, &h_threshold_wiggle);
             let h_log_sigma_wiggle =
-                weighted_crossprod_psi_maps(
+                mxtwx_psi(
                     x_ls_exit_map,
                     h_lw_exit.view(),
                     CustomFamilyPsiLinearMapRef::Dense(xw_dense),
-                )? + weighted_crossprod_dense(&x_log_sigma_exit, &dh_lw_exit, xw_dense)?
-                    + weighted_crossprod_psi_maps(
+                    row_mask,
+                )? + mxtwx(&x_log_sigma_exit, &dh_lw_exit, xw_dense, row_mask)?
+                    + mxtwx_psi(
                         x_ls_entry_map,
                         h_lw_entry.view(),
                         CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+                        row_mask,
                     )?
-                    + weighted_crossprod_dense(x_log_sigma_entry, &dh_lw_entry, xw_dense)?;
+                    + mxtwx(x_log_sigma_entry, &dh_lw_entry, xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, offsets[2], w_offset, &h_log_sigma_wiggle);
             let h_time_wiggle =
-                weighted_crossprod_dense(&self.x_time_entry, &(&q.d3_q0 * &q0_psi), xw_dense)?
-                    + weighted_crossprod_dense(&self.x_time_exit, &(&q.d3_q1 * &q1_psi), xw_dense)?;
+                mxtwx(&self.x_time_entry, &(&q.d3_q0 * &q0_psi), xw_dense, row_mask)?
+                    + mxtwx(&self.x_time_exit, &(&q.d3_q1 * &q1_psi), xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi, offsets[0], w_offset, &h_time_wiggle);
         }
 
