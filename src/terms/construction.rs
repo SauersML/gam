@@ -2,8 +2,6 @@ use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
 use crate::linalg::utils::KahanSum;
-#[cfg(test)]
-use crate::linalg::utils::inf_norm;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -2756,6 +2754,7 @@ mod tests {
     use crate::construction::kronecker_product;
     use crate::estimate::EstimationError;
     use crate::linalg::faer_ndarray::FaerEigh;
+    use crate::linalg::utils::inf_norm;
     use faer::Mat;
     use ndarray::{Array1, Array2, array};
 
