@@ -1386,6 +1386,13 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                 n_rows,
             )));
         }
+        if let Some(((row, col), value)) =
+            view.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(py_value_error(format!(
+                "designs[{i}][{row},{col}] must be finite; got {value}"
+            )));
+        }
         col_offsets.push(col_offsets[i] + view.ncols());
     }
     let p_total = *col_offsets.last().unwrap();
@@ -1412,6 +1419,13 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                 k,
             )));
         }
+        if let Some(((row, col), value)) =
+            pv.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(py_value_error(format!(
+                "penalties[{i}][{row},{col}] must be finite; got {value}"
+            )));
+        }
         s_list.push(gam::smooth::BlockwisePenalty::new(
             col_offsets[i]..col_offsets[i + 1],
             pv.to_owned(),
@@ -1432,6 +1446,12 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             y_arr.ncols(),
         )));
     }
+    if let Some(((row, col), value)) = y_arr.indexed_iter().find(|(_, value)| !value.is_finite())
+    {
+        return Err(py_value_error(format!(
+            "y[{row},{col}] must be finite; got {value}"
+        )));
+    }
     let y_col: ndarray::Array1<f64> = y_arr.column(0).to_owned();
 
     let weights_owned: ndarray::Array1<f64> = match weights.as_ref() {
@@ -1442,6 +1462,15 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                     "weights.len={} does not match N={}",
                     wa.len(),
                     n_rows,
+                )));
+            }
+            if let Some((row, value)) = wa
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite() || **value < 0.0)
+            {
+                return Err(py_value_error(format!(
+                    "weights[{row}] must be finite and non-negative; got {value}"
                 )));
             }
             wa.to_owned()
@@ -1462,7 +1491,24 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                     designs.len(),
                 )));
             }
-            Some(rv.iter().map(|v| v.exp()).collect())
+            if let Some((block, value)) =
+                rv.iter().enumerate().find(|(_, value)| !value.is_finite())
+            {
+                return Err(py_value_error(format!(
+                    "init_rhos[{block}] must be finite; got {value}"
+                )));
+            }
+            let lambdas: Vec<f64> = rv.iter().map(|v| v.exp()).collect();
+            if let Some((block, value)) = lambdas
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite() || **value <= 0.0)
+            {
+                return Err(py_value_error(format!(
+                    "exp(init_rhos[{block}]) must be finite and positive; got {value}"
+                )));
+            }
+            Some(lambdas)
         }
         None => None,
     };
@@ -1664,97 +1710,6 @@ fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
     value
 }
 
-fn build_joint_design_and_offsets(designs: &[Array2<f64>]) -> (Array2<f64>, Vec<usize>) {
-    let n = designs[0].nrows();
-    let mut offsets = Vec::with_capacity(designs.len() + 1);
-    offsets.push(0_usize);
-    for design in designs {
-        offsets.push(offsets.last().copied().unwrap() + design.ncols());
-    }
-    let p_total = *offsets.last().unwrap();
-    let mut z = Array2::<f64>::zeros((n, p_total));
-    for block in 0..designs.len() {
-        z.slice_mut(s![.., offsets[block]..offsets[block + 1]])
-            .assign(&designs[block]);
-    }
-    (z, offsets)
-}
-
-fn gaussian_reml_blocks_state(
-    z: &Array2<f64>,
-    offsets: &[usize],
-    penalties: &[Array2<f64>],
-    ranks: &[usize],
-    penalty_logdets: &[f64],
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    rhos: &Array1<f64>,
-) -> Result<
-    (
-        Array2<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        Array1<f64>,
-        f64,
-        Array1<f64>,
-        Array2<f64>,
-    ),
-    EstimationError,
-> {
-    let n = y.len();
-    let f_blocks = penalties.len();
-    let p_total = z.ncols();
-    let lambdas = rhos.mapv(f64::exp);
-    let mut k_matrix = gam::faer_ndarray::fast_xt_diag_x(&z.view(), &weights);
-    for block in 0..f_blocks {
-        for local_i in 0..penalties[block].nrows() {
-            let global_i = offsets[block] + local_i;
-            for local_j in 0..penalties[block].ncols() {
-                let global_j = offsets[block] + local_j;
-                k_matrix[[global_i, global_j]] +=
-                    lambdas[block] * penalties[block][[local_i, local_j]];
-            }
-        }
-    }
-    let a = invert_spd_with_ridge(&k_matrix, 0.0)?;
-    let mut xtwy = Array1::<f64>::zeros(p_total);
-    for row in 0..n {
-        let wy = weights[row] * y[row];
-        for col in 0..p_total {
-            xtwy[col] += z[[row, col]] * wy;
-        }
-    }
-    let beta = a.dot(&xtwy);
-    let fitted = z.dot(&beta);
-    let residual = &y.to_owned() - &fitted;
-
-    let mut rss = 0.0_f64;
-    for row in 0..n {
-        rss += weights[row] * residual[row] * residual[row];
-    }
-    let mut beta_p_beta = 0.0_f64;
-    let mut logdet_p = 0.0_f64;
-    let mut score = Array1::<f64>::zeros(f_blocks);
-    let mut edf = Array1::<f64>::zeros(f_blocks);
-    for block in 0..f_blocks {
-        let start = offsets[block];
-        let end = offsets[block + 1];
-        let beta_k = beta.slice(s![start..end]).to_owned();
-        let s_beta = penalties[block].dot(&beta_k);
-        let a_kk = a.slice(s![start..end, start..end]);
-        let trace_a_s = trace_product(a_kk, penalties[block].view());
-        let beta_s_beta = beta_k.dot(&s_beta);
-        beta_p_beta += lambdas[block] * beta_s_beta;
-        logdet_p += ranks[block] as f64 * rhos[block] + penalty_logdets[block];
-        score[block] = 0.5 * (ranks[block] as f64 - lambdas[block] * (beta_s_beta + trace_a_s));
-        edf[block] = (ranks[block] as f64 - lambdas[block] * trace_a_s)
-            .clamp(0.0, ranks[block] as f64);
-    }
-    let reml_score =
-        0.5 * rss + 0.5 * beta_p_beta + 0.5 * logdet_spd(&k_matrix)? - 0.5 * logdet_p;
-    Ok((a, beta, fitted, score, reml_score, edf, k_matrix))
-}
-
 fn gaussian_reml_optimize_blocks(
     designs: &[Array2<f64>],
     penalties_raw: &[Array2<f64>],
@@ -1836,8 +1791,23 @@ fn gaussian_reml_optimize_blocks(
                 }
             }
         }
-        let step = solve_spd_vector_with_ridge(&(-j_outer), score, 1.0e-8)?;
+        let mut outer_h = j_outer.mapv(|value| -value);
+        symmetrize_in_place(&mut outer_h);
+        if let Some(((row, col), value)) = outer_h
+            .indexed_iter()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "Gaussian REML rho curvature entry ({row},{col}) is non-finite: {value}"
+            )));
+        }
+        let step = solve_spd_vector_with_ridge(&outer_h, score, 1.0e-8)?;
         let max_step = step.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        if !max_step.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "Gaussian REML rho Newton step is non-finite".to_string(),
+            ));
+        }
         let scale = if max_step > 4.0 { 4.0 / max_step } else { 1.0 };
 
         let mut accepted = false;
@@ -2093,12 +2063,13 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         .zip(weights.iter())
         .map(|(&yi, &wi)| wi * yi * yi)
         .sum::<f64>();
-    let q = (ywy - xtwy.dot(&beta)).max(1.0e-300);
-    if !q.is_finite() {
+    let q_raw = ywy - xtwy.dot(&beta);
+    if !q_raw.is_finite() {
         return Err(EstimationError::InvalidInput(format!(
-            "Gaussian REML residual quadratic form must be finite; got {q}"
+            "Gaussian REML residual quadratic form must be finite; got {q_raw}"
         )));
     }
+    let q = q_raw.max(1.0e-300);
     let nullity = penalties
         .iter()
         .zip(ranks.iter())
@@ -2258,10 +2229,10 @@ fn gaussian_reml_fit_blocks_backward_analytic(
                     - 0.5 * tau_q * b_values[k] * b_values[j];
             }
         }
-        // This is the Gaussian/identity closed-form rho curvature used in
-        // H^T alpha = c. The analytic Hessian is symmetric; enforce that
-        // identity before factorization so one-sided trace roundoff cannot
-        // perturb the outer IFT solve.
+        // The optimizer's estimating equation is the negative profiled REML
+        // score, 0.5 * (rank_k - tr(A P_k) - tau * beta' P_k beta).
+        // `outer_h` is its rho-Jacobian. Symmetrize before factorization so
+        // one-sided trace roundoff cannot perturb the outer IFT solve.
         symmetrize_in_place(&mut outer_h);
         if let Some(((row, col), value)) = outer_h
             .indexed_iter()
@@ -2382,9 +2353,9 @@ fn gaussian_reml_fit_blocks_backward_analytic(
 ///
 /// Computes VJPs of (coefficients, fitted, lambdas, log_lambdas, reml_score,
 /// edf) back to (design_blocks, penalty_blocks, y, weights). The VJP is
-/// assembled at the converged log-λ vector: fixed-ρ β/fitted/negative-REML/EDF
+/// assembled at the converged log-λ vector: fixed-ρ β/fitted/profiled-REML/EDF
 /// terms are accumulated first, then the smoothing-parameter sensitivity is
-/// routed through the F×F REML score Hessian from the implicit optimum.
+/// routed through the F×F negative-score Jacobian from the implicit optimum.
 #[pyfunction(signature = (
     designs,
     penalties,
@@ -10358,6 +10329,87 @@ mod tests {
             0.9 + 0.16 * (1.7 * t).cos()
         });
         (vec![x1, x2], vec![s1, s2], y, weights)
+    }
+
+    fn gaussian_reml_fit_blocks_forward_native(
+        designs: &[Array2<f64>],
+        penalties: &[Array2<f64>],
+        y: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        init_rhos: &[f64],
+    ) -> Result<
+        (
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            Array1<f64>,
+            f64,
+            Array1<f64>,
+        ),
+        EstimationError,
+    > {
+        let n_rows = designs[0].nrows();
+        let mut col_offsets = vec![0usize];
+        for design in designs {
+            col_offsets.push(col_offsets.last().copied().unwrap() + design.ncols());
+        }
+        let p_total = *col_offsets.last().unwrap();
+        let mut joint_x = Array2::<f64>::zeros((n_rows, p_total));
+        for (block, design) in designs.iter().enumerate() {
+            joint_x
+                .slice_mut(s![.., col_offsets[block]..col_offsets[block + 1]])
+                .assign(design);
+        }
+        let s_list = penalties
+            .iter()
+            .enumerate()
+            .map(|(block, penalty)| {
+                gam::smooth::BlockwisePenalty::new(
+                    col_offsets[block]..col_offsets[block + 1],
+                    penalty.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let heuristic_lambdas = init_rhos.iter().map(|rho| rho.exp()).collect::<Vec<_>>();
+        let opts = gam::estimate::FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            max_iter: 200,
+            tol: 1.0e-9,
+            nullspace_dims: vec![0; s_list.len()],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        };
+        let offset = Array1::<f64>::zeros(n_rows);
+        let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+            joint_x.clone(),
+            y,
+            weights,
+            offset.view(),
+            &s_list,
+            Some(heuristic_lambdas.as_slice()),
+            gam::types::LikelihoodFamily::GaussianIdentity,
+            &opts,
+        )?;
+        let beta = fit.beta.clone();
+        let fitted = joint_x.dot(&beta);
+        let lambdas = fit.lambdas.clone();
+        let log_lambdas = lambdas.mapv(|lambda| lambda.max(1.0e-300).ln());
+        let edf = fit
+            .inference
+            .as_ref()
+            .map(|inference| Array1::from_vec(inference.edf_by_block.clone()))
+            .unwrap_or_else(|| Array1::zeros(lambdas.len()));
+        Ok((beta, fitted, lambdas, log_lambdas, fit.reml_score, edf))
     }
 
     fn blocks_profile_reml_score(
