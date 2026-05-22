@@ -1,13 +1,16 @@
 # API reference
 
-This page is auto-generated from the docstrings and type hints in the
-`gamfit` source. To change it, edit the docstring.
-
-For narrative explanations, see the topical guides in the sidebar.
+Generated from docstrings and type hints in the `gamfit` source. See the
+topical guides for narrative explanations.
 
 ## Top-level functions
 
 ::: gamfit.fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.fit_array
     options:
       show_root_heading: true
       heading_level: 3
@@ -32,12 +35,27 @@ For narrative explanations, see the topical guides in the sidebar.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.cross_fit_shared_precision_groups
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.validate_formula
     options:
       show_root_heading: true
       heading_level: 3
 
 ::: gamfit.build_info
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.cuda_diagnostics
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.format_cuda_diagnostics
     options:
       show_root_heading: true
       heading_level: 3
@@ -65,6 +83,12 @@ For narrative explanations, see the topical guides in the sidebar.
       heading_level: 3
       members_order: source
 
+::: gamfit.CompetingRisksPrediction
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
 ::: gamfit.CompetingRisksCIF
     options:
       show_root_heading: true
@@ -84,13 +108,25 @@ For narrative explanations, see the topical guides in the sidebar.
       heading_level: 3
       members_order: source
 
+::: gamfit.PairedPosteriorSamples
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
 ::: gamfit.PosteriorPredictive
     options:
       show_root_heading: true
       heading_level: 3
       members_order: source
 
-## Diagnostics and metadata objects
+::: gamfit.CumulativeIncidenceDraws
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+
+## Diagnostics and metadata
 
 ::: gamfit.Summary
     options:
@@ -113,6 +149,95 @@ For narrative explanations, see the topical guides in the sidebar.
       heading_level: 3
 
 ::: gamfit.FormulaValidation
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.SharedPrecisionGroup
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+## Basis and ridge primitives
+
+::: gamfit.bspline_basis
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.bspline_basis_derivative
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.duchon_basis_1d
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.duchon_basis_1d_derivative
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smoothness_penalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_weighted_ridge
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_weighted_ridge_batch
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+## Gaussian REML primitives
+
+::: gamfit.gaussian_reml_fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_batched
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_batched_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_positions
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_positions_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_positions_batched
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_positions_batched_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_formula
     options:
       show_root_heading: true
       heading_level: 3
@@ -158,7 +283,7 @@ For narrative explanations, see the topical guides in the sidebar.
       show_root_heading: true
       heading_level: 3
 
-## Response geometry (manifold-valued responses)
+## Response geometry
 
 ::: gamfit.ResponseGeometryModel
     options:
