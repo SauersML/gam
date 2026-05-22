@@ -2560,6 +2560,19 @@ impl<'a> RemlState<'a> {
         Ok(bundle.h_total.as_ref().clone())
     }
 
+    fn previous_outer_gradient_norm(&self, current_key: &Option<Vec<u64>>) -> Option<f64> {
+        let guard = self.cache_manager.current_outer_eval.read().unwrap();
+        let (cached_key, eval) = guard.as_ref()?;
+        if current_key
+            .as_ref()
+            .is_some_and(|current_key| current_key == cached_key)
+        {
+            return None;
+        }
+        let norm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
+        (norm.is_finite() && norm >= 0.0).then_some(norm)
+    }
+
     /// Debug-only: return `log|U_Sᵀ H U_S|_+` — the *projected* Hessian
     /// log-determinant on the identified `range(S_+)` subspace, evaluated
     /// at the PIRLS state driven to convergence at this `rho`.
@@ -4305,6 +4318,22 @@ impl<'a> RemlState<'a> {
                 pirls_config.initial_lm_lambda =
                     adaptive_lm_lambda_hint(cached_lambda, last_iters, last_converged);
             }
+            let adaptive_kkt_tolerance = if !in_screening
+                && let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt)
+            {
+                let ceiling = pirls_config.convergence_tolerance;
+                let floor = (self.config.reml_convergence_tolerance
+                    / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
+                    .min(ceiling);
+                (floor > 0.0 && ceiling >= floor).then_some(pirls::AdaptiveKktTolerance {
+                    eta: ADAPTIVE_KKT_ETA,
+                    floor,
+                    ceiling,
+                    outer_grad_norm,
+                })
+            } else {
+                None
+            };
             // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
             // XᵀW(y − offset) across every inner solve; for other families /
             // links this returns None and the inner solver falls back to the
@@ -4329,12 +4358,13 @@ impl<'a> RemlState<'a> {
                 kronecker_factored: self.kronecker_factored.as_ref(),
             };
             let pirls_start = std::time::Instant::now();
-            let result = pirls::fit_model_for_fixed_rho(
+            let result = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
                 LogSmoothingParamsView::new(rho.view()),
                 problem,
                 penalty,
                 &pirls_config,
                 warm_start_ref,
+                adaptive_kkt_tolerance,
             );
             let pirls_elapsed = pirls_start.elapsed();
             if let Ok((ref res, ref wm)) = result {

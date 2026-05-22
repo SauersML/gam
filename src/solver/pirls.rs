@@ -3281,6 +3281,7 @@ fn pirls_soft_acceptance(
     kkt_tol: f64,
 ) -> Option<PirlsSoftAccept> {
     let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
+    // Progress tests stay on the fixed PIRLS tolerance; only KKT stationarity uses kkt_tol.
     let scaled_dev_tol = progress_tol * objective_scale;
 
     // Near-stationary plateau is eligible in every context. The only
@@ -5018,8 +5019,7 @@ where
                         // Newton decrement is an independent additional
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
-                        if final_state_ref
-                            .certifies_kkt(convergence_grad_norm, kkt_tolerance)
+                        if final_state_ref.certifies_kkt(convergence_grad_norm, kkt_tolerance)
                             || nd_pass
                         {
                             status = PirlsStatus::Converged;
@@ -5183,8 +5183,8 @@ where
                             options.convergence_tolerance,
                             kkt_tolerance,
                         );
-                        let near_stationary_pass = state
-                            .near_stationary_kkt(projected_grad, kkt_tolerance);
+                        let near_stationary_pass =
+                            state.near_stationary_kkt(projected_grad, kkt_tolerance);
 
                         if let Some(reason) = lm_rejection_soft {
                             log::debug!(
@@ -7057,6 +7057,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // the second pass.
     let stalled_at_valid_minimum = |summary: &WorkingModelPirlsResult| -> bool {
         let dev_scale = summary.state.deviance.abs().max(1.0);
+        // Progress plateau uses the fixed solver tolerance; only the KKT band below adapts.
         let dev_tol = options.convergence_tolerance * dev_scale;
         let step_floor = options.min_step_size * 2.0;
         let progress_stopped =

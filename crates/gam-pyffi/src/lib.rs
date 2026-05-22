@@ -5121,11 +5121,11 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let cov = fit
         .beta_covariance()
         .ok_or_else(|| "model does not contain coefficient covariance; refit with covariance-saving inference enabled".to_string())?;
-    let (covariance_corrected_flat, covariance_corrected_n) =
-        match fit.beta_covariance_corrected() {
-            Some(c) => (Some(c.iter().copied().collect()), Some(c.nrows())),
-            None => (None, None),
-        };
+    let (covariance_corrected_flat, covariance_corrected_n) = match fit.beta_covariance_corrected()
+    {
+        Some(c) => (Some(c.iter().copied().collect()), Some(c.nrows())),
+        None => (None, None),
+    };
     let mut random_ranges = Vec::<(usize, usize)>::new();
     if let Some(spec) = payload.resolved_termspec.as_ref() {
         let mut col = 1 + spec.linear_terms.len();
