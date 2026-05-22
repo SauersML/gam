@@ -1691,10 +1691,12 @@ impl TransformationNormalFamily {
                 direction.len()
             ) }.into());
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP Hessian directional derivative received row quantities for a different beta"
+                    .to_string(),
+            );
+        }
         let dir_mat = direction
             .view()
             .into_shape_with_order((p_resp, p_cov))
@@ -1704,6 +1706,16 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
+                "SCOP Hessian directional derivative gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ) }.into());
+        }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
@@ -1718,6 +1730,19 @@ impl TransformationNormalFamily {
                 let end = (start + chunk_size).min(n);
                 let mut chunk_out = Array2::<f64>::zeros((p_total, p_total));
 
+                // Hoist per-row scratch buffers above the row loop; each iteration
+                // overwrites them after a `.fill(0.0)` of the slots whose `k=0`
+                // entry stays at zero (the k>=1 entries are fully overwritten).
+                let mut gamma_dir = vec![0.0; p_resp];
+                let mut h_factor = vec![0.0; p_resp];
+                let mut hp_factor = vec![0.0; p_resp];
+                let mut h_factor_dir = vec![0.0; p_resp];
+                let mut hp_factor_dir = vec![0.0; p_resp];
+                let mut endpoint_factor_0 = vec![0.0; p_resp];
+                let mut endpoint_factor_1 = vec![0.0; p_resp];
+                let mut endpoint_factor_dir_0 = vec![0.0; p_resp];
+                let mut endpoint_factor_dir_1 = vec![0.0; p_resp];
+
                 for i in start..end {
                     let cov_row = cov.row(i);
                     let rv = self.response_val_basis.row(i);
@@ -1728,10 +1753,8 @@ impl TransformationNormalFamily {
                     let inv_hp_sq = inv_hp * inv_hp;
                     let inv_hp_cu = inv_hp_sq * inv_hp;
 
-                    let mut gamma = vec![0.0; p_resp];
-                    let mut gamma_dir = vec![0.0; p_resp];
+                    let gamma = gamma_rows.row(i);
                     for k in 0..p_resp {
-                        gamma[k] = beta_mat.row(k).dot(&cov_row);
                         gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                     }
 
@@ -1751,28 +1774,32 @@ impl TransformationNormalFamily {
                     }
                     let q = row_quantities.endpoint_q[i];
 
-                    let mut h_factor = vec![0.0; p_resp];
-                    let mut hp_factor = vec![0.0; p_resp];
-                    let mut h_factor_dir = vec![0.0; p_resp];
-                    let mut hp_factor_dir = vec![0.0; p_resp];
-                    let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
-                    let mut endpoint_factor_dir = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    // Reset the per-row scratch arrays. k=0 is set explicitly below;
+                    // the *_dir factors only ever store k>=1 values so their k=0 slot
+                    // must stay zero.
+                    h_factor_dir[0] = 0.0;
+                    hp_factor_dir[0] = 0.0;
+                    endpoint_factor_dir_0[0] = 0.0;
+                    endpoint_factor_dir_1[0] = 0.0;
                     h_factor[0] = rv[0];
                     hp_factor[0] = rd[0];
-                    endpoint_factor[0][0] = self.response_upper_basis[0];
-                    endpoint_factor[1][0] = self.response_lower_basis[0];
+                    endpoint_factor_0[0] = self.response_upper_basis[0];
+                    endpoint_factor_1[0] = self.response_lower_basis[0];
                     for k in 1..p_resp {
                         h_factor[k] = 2.0 * rv[k] * gamma[k];
                         hp_factor[k] = 2.0 * rd[k] * gamma[k];
                         h_factor_dir[k] = 2.0 * rv[k] * gamma_dir[k];
                         hp_factor_dir[k] = 2.0 * rd[k] * gamma_dir[k];
-                        endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-                        endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                        endpoint_factor_dir[0][k] =
+                        endpoint_factor_0[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                        endpoint_factor_1[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                        endpoint_factor_dir_0[k] =
                             2.0 * self.response_upper_basis[k] * gamma_dir[k];
-                        endpoint_factor_dir[1][k] =
+                        endpoint_factor_dir_1[k] =
                             2.0 * self.response_lower_basis[k] * gamma_dir[k];
                     }
+                    let endpoint_factor = [&endpoint_factor_0[..], &endpoint_factor_1[..]];
+                    let endpoint_factor_dir =
+                        [&endpoint_factor_dir_0[..], &endpoint_factor_dir_1[..]];
 
                     for k in 0..p_resp {
                         for l in 0..p_resp {
@@ -1841,7 +1868,7 @@ impl TransformationNormalFamily {
 
         let mut out = Array2::<f64>::zeros((p_total, p_total));
         for chunk in chunk_outputs {
-            out += &chunk;
+            out.scaled_add(1.0, &chunk);
         }
 
         Ok(0.5 * (&out + &out.t()))
@@ -1891,10 +1918,12 @@ impl TransformationNormalFamily {
                 direction_v.len()
             ) }.into());
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP Hessian second directional derivative received row quantities for a different beta"
+                    .to_string(),
+            );
+        }
         let dir_u_mat = direction_u
             .view()
             .into_shape_with_order((p_resp, p_cov))
@@ -1910,6 +1939,16 @@ impl TransformationNormalFamily {
         })?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
+                "SCOP Hessian second directional derivative gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ) }.into());
+        }
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         const TARGET_CHUNK_COUNT: usize = 32;
         let chunk_size = n.div_ceil(TARGET_CHUNK_COUNT).max(1);
@@ -1924,6 +1963,24 @@ impl TransformationNormalFamily {
                 let end = (start + chunk_size).min(n);
                 let mut chunk_out = Array2::<f64>::zeros((p_total, p_total));
 
+                // Hoist per-row scratch buffers above the row loop; each iteration
+                // fully overwrites the entries it reads (k>=1 entries reset by
+                // arithmetic, k=0 entries reassigned below).
+                let mut gamma_u = vec![0.0; p_resp];
+                let mut gamma_v = vec![0.0; p_resp];
+                let mut h_factor = vec![0.0; p_resp];
+                let mut hp_factor = vec![0.0; p_resp];
+                let mut h_factor_u = vec![0.0; p_resp];
+                let mut hp_factor_u = vec![0.0; p_resp];
+                let mut h_factor_v = vec![0.0; p_resp];
+                let mut hp_factor_v = vec![0.0; p_resp];
+                let mut endpoint_factor_0 = vec![0.0; p_resp];
+                let mut endpoint_factor_1 = vec![0.0; p_resp];
+                let mut endpoint_factor_u_0 = vec![0.0; p_resp];
+                let mut endpoint_factor_u_1 = vec![0.0; p_resp];
+                let mut endpoint_factor_v_0 = vec![0.0; p_resp];
+                let mut endpoint_factor_v_1 = vec![0.0; p_resp];
+
                 for i in start..end {
                     let cov_row = cov.row(i);
                     let rv = self.response_val_basis.row(i);
@@ -1935,11 +1992,8 @@ impl TransformationNormalFamily {
                     let inv_hp_cu = inv_hp_sq * inv_hp;
                     let inv_hp_qu = inv_hp_sq * inv_hp_sq;
 
-                    let mut gamma = vec![0.0; p_resp];
-                    let mut gamma_u = vec![0.0; p_resp];
-                    let mut gamma_v = vec![0.0; p_resp];
+                    let gamma = gamma_rows.row(i);
                     for k in 0..p_resp {
-                        gamma[k] = beta_mat.row(k).dot(&cov_row);
                         gamma_u[k] = dir_u_mat.row(k).dot(&cov_row);
                         gamma_v[k] = dir_v_mat.row(k).dot(&cov_row);
                     }
@@ -1973,19 +2027,21 @@ impl TransformationNormalFamily {
                     }
                     let q = row_quantities.endpoint_q[i];
 
-                    let mut h_factor = vec![0.0; p_resp];
-                    let mut hp_factor = vec![0.0; p_resp];
-                    let mut h_factor_u = vec![0.0; p_resp];
-                    let mut hp_factor_u = vec![0.0; p_resp];
-                    let mut h_factor_v = vec![0.0; p_resp];
-                    let mut hp_factor_v = vec![0.0; p_resp];
-                    let mut endpoint_factor = [vec![0.0; p_resp], vec![0.0; p_resp]];
-                    let mut endpoint_factor_u = [vec![0.0; p_resp], vec![0.0; p_resp]];
-                    let mut endpoint_factor_v = [vec![0.0; p_resp], vec![0.0; p_resp]];
+                    // Reset the per-row scratch arrays. k=0 entries are reassigned
+                    // below; the *_u / *_v factors only ever hold k>=1 contributions,
+                    // so their k=0 slot must be zeroed.
+                    h_factor_u[0] = 0.0;
+                    hp_factor_u[0] = 0.0;
+                    h_factor_v[0] = 0.0;
+                    hp_factor_v[0] = 0.0;
+                    endpoint_factor_u_0[0] = 0.0;
+                    endpoint_factor_u_1[0] = 0.0;
+                    endpoint_factor_v_0[0] = 0.0;
+                    endpoint_factor_v_1[0] = 0.0;
                     h_factor[0] = rv[0];
                     hp_factor[0] = rd[0];
-                    endpoint_factor[0][0] = self.response_upper_basis[0];
-                    endpoint_factor[1][0] = self.response_lower_basis[0];
+                    endpoint_factor_0[0] = self.response_upper_basis[0];
+                    endpoint_factor_1[0] = self.response_lower_basis[0];
                     for k in 1..p_resp {
                         h_factor[k] = 2.0 * rv[k] * gamma[k];
                         hp_factor[k] = 2.0 * rd[k] * gamma[k];
@@ -1993,13 +2049,18 @@ impl TransformationNormalFamily {
                         hp_factor_u[k] = 2.0 * rd[k] * gamma_u[k];
                         h_factor_v[k] = 2.0 * rv[k] * gamma_v[k];
                         hp_factor_v[k] = 2.0 * rd[k] * gamma_v[k];
-                        endpoint_factor[0][k] = 2.0 * self.response_upper_basis[k] * gamma[k];
-                        endpoint_factor[1][k] = 2.0 * self.response_lower_basis[k] * gamma[k];
-                        endpoint_factor_u[0][k] = 2.0 * self.response_upper_basis[k] * gamma_u[k];
-                        endpoint_factor_u[1][k] = 2.0 * self.response_lower_basis[k] * gamma_u[k];
-                        endpoint_factor_v[0][k] = 2.0 * self.response_upper_basis[k] * gamma_v[k];
-                        endpoint_factor_v[1][k] = 2.0 * self.response_lower_basis[k] * gamma_v[k];
+                        endpoint_factor_0[k] = 2.0 * self.response_upper_basis[k] * gamma[k];
+                        endpoint_factor_1[k] = 2.0 * self.response_lower_basis[k] * gamma[k];
+                        endpoint_factor_u_0[k] = 2.0 * self.response_upper_basis[k] * gamma_u[k];
+                        endpoint_factor_u_1[k] = 2.0 * self.response_lower_basis[k] * gamma_u[k];
+                        endpoint_factor_v_0[k] = 2.0 * self.response_upper_basis[k] * gamma_v[k];
+                        endpoint_factor_v_1[k] = 2.0 * self.response_lower_basis[k] * gamma_v[k];
                     }
+                    let endpoint_factor = [&endpoint_factor_0[..], &endpoint_factor_1[..]];
+                    let endpoint_factor_u =
+                        [&endpoint_factor_u_0[..], &endpoint_factor_u_1[..]];
+                    let endpoint_factor_v =
+                        [&endpoint_factor_v_0[..], &endpoint_factor_v_1[..]];
 
                     for k in 0..p_resp {
                         for l in 0..p_resp {
@@ -2103,7 +2164,7 @@ impl TransformationNormalFamily {
 
         let mut out = Array2::<f64>::zeros((p_total, p_total));
         for chunk in chunk_outputs {
-            out += &chunk;
+            out.scaled_add(1.0, &chunk);
         }
 
         Ok(0.5 * (&out + &out.t()))
