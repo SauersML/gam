@@ -11651,7 +11651,9 @@ impl SurvivalLocationScaleFamily {
             hessian_psi_operator: None,
         }))
     }
+}
 
+impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
