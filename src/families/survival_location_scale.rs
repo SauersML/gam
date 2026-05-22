@@ -449,16 +449,16 @@ fn probit_log_survival_and_ratio_derivatives(eta: f64) -> (f64, f64, f64, f64, f
         return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
     let x = eta / std::f64::consts::SQRT_2;
-    let survival = probit_survival_value(eta);
-    let log_survival = if eta >= 0.0 {
-        -0.5 * eta * eta + (0.5 * erfcx_nonnegative(x)).ln()
+    let (log_survival, ratio) = if eta >= 0.0 {
+        // erfcx(x) = exp(x²)·erfc(x); compute once and reuse for both
+        // log-survival and the hazard ratio.
+        let erfcx_val = erfcx_nonnegative(x);
+        let log_surv = -0.5 * eta * eta + (0.5 * erfcx_val).ln();
+        let r = std::f64::consts::FRAC_2_SQRT_PI / (std::f64::consts::SQRT_2 * erfcx_val);
+        (log_surv, r)
     } else {
-        survival.ln()
-    };
-    let ratio = if eta >= 0.0 {
-        std::f64::consts::FRAC_2_SQRT_PI / (std::f64::consts::SQRT_2 * erfcx_nonnegative(x))
-    } else {
-        normal_pdf(eta) / survival
+        let survival = probit_survival_value(eta);
+        (survival.ln(), normal_pdf(eta) / survival)
     };
     let dr = ratio * (ratio - eta);
     let ddr = 2.0 * ratio.powi(3) - 3.0 * eta * ratio.powi(2) + (eta * eta - 1.0) * ratio;
@@ -2760,6 +2760,34 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    /// Fused CLogLog evaluator for the exit-row pair: returns the
+    /// `(log_s, r, dr, ddr, dddr)` survival tuple and the
+    /// `(logphi, d1, d2, d3, d4)` log-pdf tuple while computing the two
+    /// expensive `exp` calls once.  This duplicates the CLogLog branches of
+    /// `exact_survival_neglog_derivatives_fourth_rescaled` and
+    /// `exact_log_pdf_derivatives_rescaled` to share their work.
+    #[inline]
+    fn clglog_exit_pair(
+        u1: f64,
+        deriv_log_scale: f64,
+    ) -> (
+        (f64, f64, f64, f64, f64),
+        (f64, f64, f64, f64, f64),
+    ) {
+        let t_val = u1.exp();
+        let t_deriv = (u1 - deriv_log_scale).exp();
+        let deriv_scale = (-deriv_log_scale).exp();
+        let surv = (-t_val, t_deriv, t_deriv, t_deriv, t_deriv);
+        let logpdf = (
+            u1 - t_val,
+            deriv_scale - t_deriv,
+            -t_deriv,
+            -t_deriv,
+            -t_deriv,
+        );
+        (surv, logpdf)
+    }
+
     /// Exact `log(x)` value and first four derivatives on the positive domain.
     fn logwith_derivatives_positive(x: f64) -> (f64, f64, f64, f64, f64) {
         assert!(x.is_finite() && x > 0.0);
@@ -2848,8 +2876,16 @@ impl SurvivalLocationScaleFamily {
                 format!("inverse-link survival evaluation failed at row {row} entry: {e}")
             })?;
 
-        let (log_s1, r1, dr1, ddr1, dddr1) =
-            Self::exact_survival_neglog_derivatives_fourth_rescaled(
+        // Fast path: for CLogLog the survival and log-pdf evaluators each
+        // compute `exp(u1)` and `exp(u1 - deriv_log_scale)`.  Share that work
+        // when both are called back-to-back on the exit row.
+        let (
+            (log_s1, r1, dr1, ddr1, dddr1),
+            (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1),
+        ) = if matches!(&self.inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
+            Self::clglog_exit_pair(u1, deriv_log_scale)
+        } else {
+            let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
                 &self.inverse_link,
                 u1,
                 deriv_log_scale,
@@ -2858,11 +2894,16 @@ impl SurvivalLocationScaleFamily {
                 format!("inverse-link survival evaluation failed at row {row} exit: {e}")
             })?;
 
-        let (logphi1, dlogphi1, d2logphi1, d3logphi1, d4logphi1) =
-            Self::exact_log_pdf_derivatives_rescaled(&self.inverse_link, u1, deriv_log_scale)
-                .map_err(|e| {
-                    format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
-                })?;
+            let pdf = Self::exact_log_pdf_derivatives_rescaled(
+                &self.inverse_link,
+                u1,
+                deriv_log_scale,
+            )
+            .map_err(|e| {
+                format!("inverse-link log-pdf evaluation failed at row {row} exit: {e}")
+            })?;
+            (surv, pdf)
+        };
 
         // Row degeneracy guard: when any hazard/pdf derivative is non-finite
         // (e.g. CLogLog with u > ~709 where exp(u) overflows), the row's
@@ -7226,6 +7267,32 @@ fn exact_survival_response_moments(
     let x_log_sigma_dense = input.x_log_sigma.to_dense_arc();
     let mut first = Array1::<f64>::zeros(n);
     let mut second = Array1::<f64>::zeros(n);
+    // Build a single QuadratureContext up front and share it across all
+    // chunks.  Per-chunk construction wastes work (each chunk's first call
+    // re-derives the Gauss-Hermite rule from scratch via OnceLock) and risks
+    // the OnceLock-inside-rayon deadlock pattern (see repo memory) if the
+    // rule init were ever to spawn nested parallel work.  Warm the rule sizes
+    // that the per-row evaluator actually uses (15 for the projected 3D
+    // path, 21 for the 1D wiggle fallback) so the worker threads only hit
+    // the cached rule lookup.
+    let quadctx = crate::quadrature::QuadratureContext::new();
+    {
+        // Warm GH rule caches on the calling thread with cheap probes.
+        let _ = crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+            &quadctx,
+            [0.0_f64],
+            [[1.0_f64]],
+            21,
+            |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
+        );
+        let _ = crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+            &quadctx,
+            [0.0_f64],
+            [[1.0_f64]],
+            15,
+            |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
+        );
+    }
     if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
         let first_slice = first
             .as_slice_mut()
@@ -7233,6 +7300,7 @@ fn exact_survival_response_moments(
         let second_slice = second
             .as_slice_mut()
             .expect("fresh Array1 response moments are contiguous");
+        let quadctx_ref = &quadctx;
         first_slice
             .par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK)
             .zip(second_slice.par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK))
@@ -7240,7 +7308,6 @@ fn exact_survival_response_moments(
             .try_for_each(
                 |(chunk_idx, (first_chunk, second_chunk))| -> Result<(), String> {
                     let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
-                    let quadctx = crate::quadrature::QuadratureContext::new();
                     for offset in 0..first_chunk.len() {
                         let row = row_start + offset;
                         let (m1, m2) = exact_survival_response_moments_row(
@@ -7250,7 +7317,7 @@ fn exact_survival_response_moments(
                             &x_threshold_dense,
                             &x_log_sigma_dense,
                             row,
-                            &quadctx,
+                            quadctx_ref,
                         )?;
                         first_chunk[offset] = m1;
                         second_chunk[offset] = m2;
@@ -7259,7 +7326,6 @@ fn exact_survival_response_moments(
                 },
             )?;
     } else {
-        let quadctx = crate::quadrature::QuadratureContext::new();
         for row in 0..n {
             let (m1, m2) = exact_survival_response_moments_row(
                 input,
@@ -7992,11 +8058,12 @@ impl SurvivalLocationScaleFamily {
         let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
         let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
         let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
-            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
-            _ => Array1::zeros(self.n),
+            (Some(xw), Some(dir)) => Some(xw.matrixvectormultiply(dir)),
+            _ => None,
         };
 
-        let delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit + &deltaw;
+        let mut delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit;
+        if let Some(dw) = &deltaw { delta_q_exit += dw; }
         let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
         let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
         let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
@@ -8049,7 +8116,8 @@ impl SurvivalLocationScaleFamily {
             let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
             let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
             let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-            let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + &deltaw;
+            let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
+            if let Some(dw) = &deltaw { dq_en += dw; }
             EntryDeltas {
                 delta_q_t: d2q_tls_en * &dls_en,
                 delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
@@ -9068,11 +9136,12 @@ impl SurvivalLocationScaleFamily {
         let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
         let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
         let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
-            (Some(xw), Some(dir_w)) => xw.matrixvectormultiply(dir_w),
-            _ => Array1::zeros(self.n),
+            (Some(xw), Some(dir_w)) => Some(xw.matrixvectormultiply(dir_w)),
+            _ => None,
         };
 
-        let delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit + &deltaw;
+        let mut delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit;
+        if let Some(dw) = &deltaw { delta_q_exit += dw; }
         let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
         let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
         let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
@@ -9104,7 +9173,8 @@ impl SurvivalLocationScaleFamily {
             let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
             let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
             let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-            let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + &deltaw;
+            let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
+            if let Some(dw) = &deltaw { dq_en += dw; }
             EntryDeltas {
                 delta_q_t: d2q_tls_en * &dls_en,
                 delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
@@ -9604,8 +9674,8 @@ impl SurvivalLocationScaleFamily {
         let delta_t_exit_u = self.x_threshold.matrixvectormultiply(&threshold_dir_u);
         let delta_ls_exit_u = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_u);
         let deltaw_u = match (self.x_link_wiggle.as_ref(), wiggle_dir_u.as_ref()) {
-            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
-            _ => Array1::zeros(self.n),
+            (Some(xw), Some(dir)) => Some(xw.matrixvectormultiply(dir)),
+            _ => None,
         };
 
         // -- Predictor-space deltas for direction v --
@@ -9615,18 +9685,20 @@ impl SurvivalLocationScaleFamily {
         let delta_t_exit_v = self.x_threshold.matrixvectormultiply(&threshold_dir_v);
         let delta_ls_exit_v = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir_v);
         let deltaw_v = match (self.x_link_wiggle.as_ref(), wiggle_dir_v.as_ref()) {
-            (Some(xw), Some(dir)) => xw.matrixvectormultiply(dir),
-            _ => Array1::zeros(self.n),
+            (Some(xw), Some(dir)) => Some(xw.matrixvectormultiply(dir)),
+            _ => None,
         };
 
         // Exit-side chain-rule deltas for u and v.
-        let delta_q_exit_u = &q.dq_t * &delta_t_exit_u + &q.dq_ls * &delta_ls_exit_u + &deltaw_u;
+        let mut delta_q_exit_u = &q.dq_t * &delta_t_exit_u + &q.dq_ls * &delta_ls_exit_u;
+        if let Some(dw) = &deltaw_u { delta_q_exit_u += dw; }
         let delta_q_t_exit_u = &q.d2q_tls * &delta_ls_exit_u;
         let delta_q_ls_exit_u = &q.d2q_tls * &delta_t_exit_u + &q.d2q_ls * &delta_ls_exit_u;
         let delta_q_tls_exit_u = &q.d3q_tls_ls * &delta_ls_exit_u;
         let delta_q_ls_ls_exit_u = &q.d3q_tls_ls * &delta_t_exit_u + &q.d3q_ls * &delta_ls_exit_u;
 
-        let delta_q_exit_v = &q.dq_t * &delta_t_exit_v + &q.dq_ls * &delta_ls_exit_v + &deltaw_v;
+        let mut delta_q_exit_v = &q.dq_t * &delta_t_exit_v + &q.dq_ls * &delta_ls_exit_v;
+        if let Some(dw) = &deltaw_v { delta_q_exit_v += dw; }
         let delta_q_t_exit_v = &q.d2q_tls * &delta_ls_exit_v;
         let delta_q_ls_exit_v = &q.d2q_tls * &delta_t_exit_v + &q.d2q_ls * &delta_ls_exit_v;
         let delta_q_tls_exit_v = &q.d3q_tls_ls * &delta_ls_exit_v;
@@ -9682,7 +9754,7 @@ impl SurvivalLocationScaleFamily {
             // Compute entry-side deltas for both u and v directions.
             let compute_entry = |threshold_dir: &Array1<f64>,
                                  log_sigma_dir: &Array1<f64>,
-                                 deltaw: &Array1<f64>,
+                                 deltaw: Option<&Array1<f64>>,
                                  delta_h0: &Array1<f64>|
              -> (
                 Array1<f64>,
@@ -9711,7 +9783,8 @@ impl SurvivalLocationScaleFamily {
                 let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
                 let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
                 let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-                let dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en + deltaw;
+                let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
+                if let Some(dw) = deltaw { dq_en += dw; }
                 let dq_t = d2q_tls_en * &dls_en;
                 let dq_ls = d2q_tls_en * &dt_en + d2q_ls_en * &dls_en;
                 let dq_tls = d3q_tls_ls_en * &dls_en;
@@ -9723,9 +9796,9 @@ impl SurvivalLocationScaleFamily {
                 )
             };
             let (dt_u, dls_u, dq_u, dqt_u, dqls_u, dqtls_u, dqlsls_u, dd1_u, dd2_u) =
-                compute_entry(&threshold_dir_u, &log_sigma_dir_u, &deltaw_u, &delta_h0_u);
+                compute_entry(&threshold_dir_u, &log_sigma_dir_u, deltaw_u.as_ref(), &delta_h0_u);
             let (dt_v, dls_v, dq_v, dqt_v, dqls_v, dqtls_v, dqlsls_v, dd1_v, dd2_v) =
-                compute_entry(&threshold_dir_v, &log_sigma_dir_v, &deltaw_v, &delta_h0_v);
+                compute_entry(&threshold_dir_v, &log_sigma_dir_v, deltaw_v.as_ref(), &delta_h0_v);
             EntryDeltas2 {
                 delta_t_u: dt_u,
                 delta_ls_u: dls_u,
@@ -10077,24 +10150,34 @@ impl SurvivalLocationScaleFamily {
         // --- Wiggle cross-blocks D²H[u,v] ---
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
             let d2_d2_q_combined = d2_d2_q_combined_exact.clone();
+            // Inside this branch x_link_wiggle is Some, so deltaw_u/deltaw_v
+            // were populated above from the matching wiggle slices.
+            let deltaw_u_ref: &Array1<f64> = deltaw_u
+                .as_ref()
+                .expect("wiggle direction u required when x_link_wiggle present");
+            let deltaw_v_ref: &Array1<f64> = deltaw_v
+                .as_ref()
+                .expect("wiggle direction v required when x_link_wiggle present");
+            let deltaw_u = deltaw_u_ref;
+            let deltaw_v = deltaw_v_ref;
 
             // Threshold-wiggle D²H[u,v].
             if let (Some(x_t_en), Some(dq_t_en)) =
                 (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
             {
                 let d2_tw_exit = &d2_d2_q_exit_exact * &q.dq_t
-                    + &q.d2_q1 * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
+                    + &q.d2_q1 * &(&delta_q_t_exit_u * deltaw_v + &delta_q_t_exit_v * deltaw_u);
                 let d2_tw_entry = &d2_d2_q_entry_exact * dq_t_en
                     + &q.d2_q0
-                        * &(&entry_deltas.delta_q_t_u * &deltaw_v
-                            + &entry_deltas.delta_q_t_v * &deltaw_u);
+                        * &(&entry_deltas.delta_q_t_u * deltaw_v
+                            + &entry_deltas.delta_q_t_v * deltaw_u);
                 let d2_h_tw =
                     weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw_exit), xw_dense)?
                         + weighted_crossprod_dense(x_t_en, &(-&d2_tw_entry), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             } else {
                 let d2_tw = &d2_d2_q_combined * &q.dq_t
-                    + &q.d2_q * &(&delta_q_t_exit_u * &deltaw_v + &delta_q_t_exit_v * &deltaw_u);
+                    + &q.d2_q * &(&delta_q_t_exit_u * deltaw_v + &delta_q_t_exit_v * deltaw_u);
                 let d2_h_tw = weighted_crossprod_dense(&x_threshold_exit, &(-&d2_tw), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             }
@@ -10104,18 +10187,18 @@ impl SurvivalLocationScaleFamily {
                 (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
             {
                 let d2_lw_exit = &d2_d2_q_exit_exact * &q.dq_ls
-                    + &q.d2_q1 * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
+                    + &q.d2_q1 * &(&delta_q_ls_exit_u * deltaw_v + &delta_q_ls_exit_v * deltaw_u);
                 let d2_lw_entry = &d2_d2_q_entry_exact * dq_ls_en
                     + &q.d2_q0
-                        * &(&entry_deltas.delta_q_ls_u * &deltaw_v
-                            + &entry_deltas.delta_q_ls_v * &deltaw_u);
+                        * &(&entry_deltas.delta_q_ls_u * deltaw_v
+                            + &entry_deltas.delta_q_ls_v * deltaw_u);
                 let d2_h_lw =
                     weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense)?
                         + weighted_crossprod_dense(x_ls_en, &(-&d2_lw_entry), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             } else {
                 let d2_lw = &d2_d2_q_combined * &q.dq_ls
-                    + &q.d2_q * &(&delta_q_ls_exit_u * &deltaw_v + &delta_q_ls_exit_v * &deltaw_u);
+                    + &q.d2_q * &(&delta_q_ls_exit_u * deltaw_v + &delta_q_ls_exit_v * deltaw_u);
                 let d2_h_lw = weighted_crossprod_dense(&x_log_sigma_exit, &(-&d2_lw), xw_dense)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             }
