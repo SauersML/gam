@@ -9205,9 +9205,8 @@ mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
-        ResidualDistribution,
-        LinkMode, MODEL_VERSION, ModelKind, SavedFitSummary, SavedModel, SurvivalArgs,
-        SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
+        LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, SavedFitSummary, SavedModel,
+        SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
@@ -9892,7 +9891,10 @@ mod tests {
         })
         .expect_err("survival Firth should be rejected");
 
-        assert_eq!(err.to_string(), "--firth is not supported for survival models");
+        assert_eq!(
+            err.to_string(),
+            "--firth is not supported for survival models"
+        );
     }
 
     #[test]

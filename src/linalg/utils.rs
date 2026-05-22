@@ -24,9 +24,7 @@ where
 /// and `terms/construction.rs`. Returns `0.0` for an empty iterator.
 #[inline]
 pub(crate) fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
-    values
-        .into_iter()
-        .fold(0.0_f64, |acc, x| acc.max(x.abs()))
+    values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;

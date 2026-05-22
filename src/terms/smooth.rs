@@ -14791,18 +14791,14 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let geometry_slot = self
             .spatial_realization_geometry
             .get(term_idx)
-            .ok_or_else(|| {
-                format!("incremental realizer geometry slot {term_idx} out of range")
-            })?;
+            .ok_or_else(|| format!("incremental realizer geometry slot {term_idx} out of range"))?;
         let mut build_spec = match geometry_slot {
             Some(cached) => cached.clone(),
             None => self
                 .spec
                 .smooth_terms
                 .get(term_idx)
-                .ok_or_else(|| {
-                    format!("incremental realizer smooth term {term_idx} out of range")
-                })?
+                .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
                 .clone(),
         };
         if let Some(length_scale) = next_length_scale {

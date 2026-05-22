@@ -19,10 +19,9 @@ use crate::families::survival_construction::{
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config,
-    parse_survival_likelihood_mode, require_structural_survival_time_basis,
-    resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
-    survival_likelihood_modename,
+    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_likelihood_mode,
+    require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
+    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use crate::families::survival_location_scale::residual_distribution_inverse_link;
 use crate::gamlss::buildwiggle_block_input_from_knots;
@@ -160,7 +159,9 @@ pub struct CompetingRisksPredictResult {
 /// Pure library function: no progress bars, no file I/O, no uncertainty
 /// bounds. The CLI wraps this with progress updates + CSV writes; the
 /// FFI wraps it with JSON serialization.
-pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+pub fn predict_survival(
+    req: SurvivalPredictRequest<'_>,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
     let SurvivalPredictRequest {
         model,
         data,
@@ -201,11 +202,13 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
 
     let n = data.nrows();
     if primary_offset.len() != n || noise_offset.len() != n {
-        return Err(SurvivalPredictError::InvalidInput { reason: format!(
-            "survival prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
-            primary_offset.len(),
-            noise_offset.len()
-        ) });
+        return Err(SurvivalPredictError::InvalidInput {
+            reason: format!(
+                "survival prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+                primary_offset.len(),
+                noise_offset.len()
+            ),
+        });
     }
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -230,12 +233,14 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         saved_likelihood_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
     ) {
-        return Err(SurvivalPredictError::UnsupportedConfiguration { reason: format!(
-            "survival prediction via predict_survival does not support likelihood_mode={} yet; \
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "survival prediction via predict_survival does not support likelihood_mode={} yet; \
              latent window prediction lives in the CLI's run_predict_saved_latent_window_impl \
              pipeline and has not yet been ported to the library. Use the CLI predict command.",
-            survival_likelihood_modename(saved_likelihood_mode)
-        ) });
+                survival_likelihood_modename(saved_likelihood_mode)
+            ),
+        });
     }
     // Location-scale: handled via a dedicated batch path that calls
     // `predict_survival_location_scale` directly.
@@ -255,11 +260,13 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
         );
     }
     if with_uncertainty {
-        return Err(SurvivalPredictError::UnsupportedConfiguration { reason: format!(
-            "predict_survival: with_uncertainty is currently supported only for the \
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "predict_survival: with_uncertainty is currently supported only for the \
              location-scale likelihood mode; got {}",
-            survival_likelihood_modename(saved_likelihood_mode)
-        ) });
+                survival_likelihood_modename(saved_likelihood_mode)
+            ),
+        });
     }
 
     // Ambient time basis: built once with (age_entry, age_exit) so that
@@ -303,13 +310,17 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
     let eval_times: Vec<f64> = match time_grid {
         Some(grid) => {
             if grid.is_empty() {
-                return Err(SurvivalPredictError::InvalidInput { reason: "survival time_grid must contain at least one time".to_string() });
+                return Err(SurvivalPredictError::InvalidInput {
+                    reason: "survival time_grid must contain at least one time".to_string(),
+                });
             }
             for (idx, &t) in grid.iter().enumerate() {
                 if !t.is_finite() || t < 0.0 {
-                    return Err(SurvivalPredictError::InvalidInput { reason: format!(
-                        "survival time_grid requires finite non-negative times (index {idx})",
-                    ) });
+                    return Err(SurvivalPredictError::InvalidInput {
+                        reason: format!(
+                            "survival time_grid requires finite non-negative times (index {idx})",
+                        ),
+                    });
                 }
             }
             grid.to_vec()
@@ -461,7 +472,10 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
                     SurvivalLikelihoodMode::Latent
                     | SurvivalLikelihoodMode::LatentBinary
                     | SurvivalLikelihoodMode::LocationScale => {
-                        Err(SurvivalPredictError::NumericalFailure { reason: "unreachable: unsupported likelihood_mode filtered earlier".to_string() })
+                        Err(SurvivalPredictError::NumericalFailure {
+                            reason: "unreachable: unsupported likelihood_mode filtered earlier"
+                                .to_string(),
+                        })
                     }
                 }
             };
@@ -540,9 +554,10 @@ pub fn predict_competing_risks_survival(
     } = req;
 
     if with_uncertainty {
-        return Err(SurvivalPredictError::UnsupportedConfiguration { reason: 
-            "competing-risks survival prediction does not yet support with_uncertainty".to_string(),
-         });
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: "competing-risks survival prediction does not yet support with_uncertainty"
+                .to_string(),
+        });
     }
 
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
@@ -550,10 +565,12 @@ pub fn predict_competing_risks_survival(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
     ) {
-        return Err(SurvivalPredictError::UnsupportedConfiguration { reason: format!(
-            "joint cause-specific prediction supports transformation/weibull survival only; got {}",
-            survival_likelihood_modename(saved_likelihood_mode)
-        ) });
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: format!(
+                "joint cause-specific prediction supports transformation/weibull survival only; got {}",
+                survival_likelihood_modename(saved_likelihood_mode)
+            ),
+        });
     }
 
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -562,16 +579,18 @@ pub fn predict_competing_risks_survival(
         .unwrap_or(fit.blocks.len())
         .max(1);
     if cause_count <= 1 {
-        return Err(SurvivalPredictError::MissingFitMetadata { reason: 
-            "competing-risks survival prediction requires a saved model with at least two causes"
+        return Err(SurvivalPredictError::MissingFitMetadata {
+            reason: "competing-risks survival prediction requires a saved model with at least two causes"
                 .to_string(),
-         });
+        });
     }
     if fit.blocks.len() != cause_count {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved competing-risks survival fit has {} coefficient blocks but metadata says {cause_count} causes",
-            fit.blocks.len()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved competing-risks survival fit has {} coefficient blocks but metadata says {cause_count} causes",
+                fit.blocks.len()
+            ),
+        });
     }
     let endpoint_names = model.survival_endpoint_names.clone().unwrap_or_else(|| {
         (1..=cause_count)
@@ -579,10 +598,12 @@ pub fn predict_competing_risks_survival(
             .collect()
     });
     if endpoint_names.len() != cause_count {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved competing-risks survival endpoint_names has length {}, expected {cause_count}",
-            endpoint_names.len()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved competing-risks survival endpoint_names has length {}, expected {cause_count}",
+                endpoint_names.len()
+            ),
+        });
     }
 
     let entryname = model
@@ -609,11 +630,13 @@ pub fn predict_competing_risks_survival(
 
     let n = data.nrows();
     if primary_offset.len() != n || noise_offset.len() != n {
-        return Err(SurvivalPredictError::InvalidInput { reason: format!(
-            "competing-risks prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
-            primary_offset.len(),
-            noise_offset.len()
-        ) });
+        return Err(SurvivalPredictError::InvalidInput {
+            reason: format!(
+                "competing-risks prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+                primary_offset.len(),
+                noise_offset.len()
+            ),
+        });
     }
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -644,13 +667,17 @@ pub fn predict_competing_risks_survival(
     let eval_times: Vec<f64> = match time_grid {
         Some(grid) => {
             if grid.is_empty() {
-                return Err(SurvivalPredictError::InvalidInput { reason: "survival time_grid must contain at least one time".to_string() });
+                return Err(SurvivalPredictError::InvalidInput {
+                    reason: "survival time_grid must contain at least one time".to_string(),
+                });
             }
             for (idx, &t) in grid.iter().enumerate() {
                 if !t.is_finite() || t < 0.0 {
-                    return Err(SurvivalPredictError::InvalidInput { reason: format!(
-                        "survival time_grid requires finite non-negative times (index {idx})",
-                    ) });
+                    return Err(SurvivalPredictError::InvalidInput {
+                        reason: format!(
+                            "survival time_grid requires finite non-negative times (index {idx})",
+                        ),
+                    });
                 }
             }
             grid.to_vec()
@@ -823,19 +850,23 @@ fn saved_cause_specific_timewiggles(
             "joint cause-specific survival missing beta_baseline_timewiggle_by_cause".to_string()
         })?;
     if by_cause.len() != cause_count {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "joint cause-specific survival has {} timewiggle coefficient blocks, expected {cause_count}",
-            by_cause.len()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "joint cause-specific survival has {} timewiggle coefficient blocks, expected {cause_count}",
+                by_cause.len()
+            ),
+        });
     }
     for (cause, (block, beta_w)) in fit.blocks.iter().zip(by_cause).enumerate() {
         if beta_w.len() > block.beta.len() {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "joint cause-specific survival cause {} timewiggle beta has length {}, but endpoint beta has {} coefficients",
-                cause + 1,
-                beta_w.len(),
-                block.beta.len()
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "joint cause-specific survival cause {} timewiggle beta has length {}, but endpoint beta has {} coefficients",
+                    cause + 1,
+                    beta_w.len(),
+                    block.beta.len()
+                ),
+            });
         }
     }
     Ok(by_cause
@@ -941,10 +972,12 @@ fn build_marginal_slope_predict_context(
 
     let blocks = &fit_saved.blocks;
     if blocks.len() < 3 {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope model requires at least 3 blocks [time, marginal, slope], got {}",
-            blocks.len()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope model requires at least 3 blocks [time, marginal, slope], got {}",
+                blocks.len()
+            ),
+        });
     }
     let beta_time = blocks[0].beta.clone();
     let beta_marginal = blocks[1].beta.clone();
@@ -993,12 +1026,14 @@ fn evaluate_marginal_slope_row(
         .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
-            beta_time.len(),
-            p_time_base,
-            p_timewiggle
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
+                beta_time.len(),
+                p_time_base,
+                p_timewiggle
+            ),
+        });
     }
     let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
 
@@ -1032,7 +1067,9 @@ fn evaluate_marginal_slope_row(
         {
             DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
             _ => {
-                return Err(SurvivalPredictError::IncompatibleSchema { reason: "saved baseline-timewiggle exit design must be dense".to_string() });
+                return Err(SurvivalPredictError::IncompatibleSchema {
+                    reason: "saved baseline-timewiggle exit design must be dense".to_string(),
+                });
             }
         };
         let derivative_design = build_survival_timewiggle_derivative_design(
@@ -1119,11 +1156,16 @@ fn evaluate_marginal_slope_row(
 }
 
 #[inline]
-fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f64, f64), SurvivalPredictError> {
+fn probit_survival_hazard_components(
+    eta: f64,
+    eta_derivative: f64,
+) -> Result<(f64, f64), SurvivalPredictError> {
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-            "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
-        ) });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: format!(
+                "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
+            ),
+        });
     }
 
     // Survival marginal-slope defines S(t) = Phi(-eta(t)). The event density
@@ -1144,9 +1186,11 @@ fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f
     // handles it cleanly. Rejecting +∞ would force the predictor to fail on
     // models that the inner solver has already certified as a valid fit.
     if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-            "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
-        ) });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: format!(
+                "saved survival marginal-slope prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, log_survival={log_survival}, hazard={hazard}"
+            ),
+        });
     }
     Ok((cumulative_hazard, hazard))
 }
@@ -1186,11 +1230,13 @@ fn evaluate_rp_row_with_beta(
     let p_cov = cov_row.len();
     let p = p_time + p_timewiggle + p_cov;
     if beta.len() != p {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
-            beta.len(),
-            p
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "survival RP coefficient mismatch: beta has {} entries but design has {} columns",
+                beta.len(),
+                p
+            ),
+        });
     }
     let mut x_exit = Array2::<f64>::zeros((1, p));
     if p_time > 0 {
@@ -1219,14 +1265,20 @@ fn evaluate_rp_row_with_beta(
         .design
         {
             DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-            _ => return Err(SurvivalPredictError::IncompatibleSchema { reason: "saved baseline-timewiggle exit design must be dense".to_string() }),
+            _ => {
+                return Err(SurvivalPredictError::IncompatibleSchema {
+                    reason: "saved baseline-timewiggle exit design must be dense".to_string(),
+                });
+            }
         };
         if exit_design.ncols() != p_timewiggle {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "survival RP timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
-                exit_design.ncols(),
-                p_timewiggle
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "survival RP timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
+                    exit_design.ncols(),
+                    p_timewiggle
+                ),
+            });
         }
         x_exit
             .slice_mut(s![.., p_time..p_time + p_timewiggle])
@@ -1267,9 +1319,11 @@ fn royston_parmar_survival_hazard_components(
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-            "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
-        ) });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: format!(
+                "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
+            ),
+        });
     }
     let cumulative_hazard = eta.exp();
     let hazard = cumulative_hazard * eta_derivative;
@@ -1282,9 +1336,11 @@ fn royston_parmar_survival_hazard_components(
     // [0, +∞] range. The consumer materializes survival via
     // `survival = exp(-cum).clamp(0, 1)`, which collapses cleanly at saturation.
     if !(cumulative_hazard >= 0.0 && hazard >= 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-            "saved Royston-Parmar survival prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, cumulative_hazard={cumulative_hazard}, hazard={hazard}"
-        ) });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: format!(
+                "saved Royston-Parmar survival prediction produced invalid survival components: eta={eta}, eta_t={eta_derivative}, cumulative_hazard={cumulative_hazard}, hazard={hazard}"
+            ),
+        });
     }
     Ok((cumulative_hazard, hazard))
 }
@@ -1325,13 +1381,17 @@ fn predict_survival_location_scale_batch(
     let eval_times: Vec<f64> = match time_grid {
         Some(grid) => {
             if grid.is_empty() {
-                return Err(SurvivalPredictError::InvalidInput { reason: "survival time_grid must contain at least one time".to_string() });
+                return Err(SurvivalPredictError::InvalidInput {
+                    reason: "survival time_grid must contain at least one time".to_string(),
+                });
             }
             for (idx, &t) in grid.iter().enumerate() {
                 if !t.is_finite() || t < 0.0 {
-                    return Err(SurvivalPredictError::InvalidInput { reason: format!(
-                        "survival time_grid requires finite non-negative times (index {idx})",
-                    ) });
+                    return Err(SurvivalPredictError::InvalidInput {
+                        reason: format!(
+                            "survival time_grid requires finite non-negative times (index {idx})",
+                        ),
+                    });
                 }
             }
             grid.to_vec()
@@ -1459,24 +1519,25 @@ fn predict_survival_location_scale_batch(
         x_time_exit_dense
     };
 
-    let repeat_rows = |matrix: &DesignMatrix, label: &str| -> Result<DesignMatrix, SurvivalPredictError> {
-        if per_row_eval {
-            return Ok(matrix.clone());
-        }
-        let dense = matrix.try_to_dense_by_chunks(label)?;
-        let mut repeated = Array2::<f64>::zeros((total_rows, dense.ncols()));
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let rows: Vec<Vec<f64>> = (0..total_rows)
-            .into_par_iter()
-            .map(|k| dense.row(k / eval_width).to_vec())
-            .collect();
-        for (k, row) in rows.into_iter().enumerate() {
-            for (j, value) in row.into_iter().enumerate() {
-                repeated[[k, j]] = value;
+    let repeat_rows =
+        |matrix: &DesignMatrix, label: &str| -> Result<DesignMatrix, SurvivalPredictError> {
+            if per_row_eval {
+                return Ok(matrix.clone());
             }
-        }
-        Ok(DesignMatrix::from(repeated))
-    };
+            let dense = matrix.try_to_dense_by_chunks(label)?;
+            let mut repeated = Array2::<f64>::zeros((total_rows, dense.ncols()));
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let rows: Vec<Vec<f64>> = (0..total_rows)
+                .into_par_iter()
+                .map(|k| dense.row(k / eval_width).to_vec())
+                .collect();
+            for (k, row) in rows.into_iter().enumerate() {
+                for (j, value) in row.into_iter().enumerate() {
+                    repeated[[k, j]] = value;
+                }
+            }
+            Ok(DesignMatrix::from(repeated))
+        };
     let threshold_matrix = repeat_rows(
         &threshold_design.design,
         "survival location-scale prediction threshold design",
@@ -1692,22 +1753,25 @@ fn location_scale_eta_derivative_components(
         || derivative_offset_exit.len() != n
         || eta_time_offset_exit.len() != n
     {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: 
-            "survival location-scale hazard derivative row mismatch across inputs".to_string(),
-         });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: "survival location-scale hazard derivative row mismatch across inputs"
+                .to_string(),
+        });
     }
     let beta_time = fit.beta_time();
     let p_time_total = beta_time.len();
     let p_wiggle = time_wiggle_ncols.min(p_time_total);
     let p_base = p_time_total - p_wiggle;
     if x_time_exit.ncols() != p_time_total || x_time_derivative.ncols() != p_base {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "survival location-scale hazard derivative design mismatch: x_exit={} beta_time={} x_derivative={} base={}",
-            x_time_exit.ncols(),
-            p_time_total,
-            x_time_derivative.ncols(),
-            p_base
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "survival location-scale hazard derivative design mismatch: x_exit={} beta_time={} x_derivative={} base={}",
+                x_time_exit.ncols(),
+                p_time_total,
+                x_time_derivative.ncols(),
+                p_base
+            ),
+        });
     }
 
     let beta_base = beta_time.slice(s![..p_base]).to_owned();
@@ -1738,11 +1802,13 @@ fn location_scale_eta_derivative_components(
             1,
         )?;
         if basis_d1.ncols() != p_wiggle {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "survival location-scale hazard derivative timewiggle mismatch: derivative basis has {} columns but beta has {}",
-                basis_d1.ncols(),
-                p_wiggle
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "survival location-scale hazard derivative timewiggle mismatch: derivative basis has {} columns but beta has {}",
+                    basis_d1.ncols(),
+                    p_wiggle
+                ),
+            });
         }
         eta_derivative *= &(basis_d1.dot(&beta_w) + 1.0);
     }
@@ -1750,9 +1816,10 @@ fn location_scale_eta_derivative_components(
         .iter()
         .any(|value| !(value.is_finite() && *value > 0.0))
     {
-        return Err(SurvivalPredictError::NumericalFailure { reason: 
-            "survival location-scale hazard derivative must be finite and positive".to_string(),
-         });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: "survival location-scale hazard derivative must be finite and positive"
+                .to_string(),
+        });
     }
     Ok(eta_derivative)
 }
@@ -1763,11 +1830,13 @@ fn location_scale_hazard_from_eta_derivative(
     inverse_link: &InverseLink,
 ) -> Result<Array1<f64>, SurvivalPredictError> {
     if eta.len() != eta_derivative.len() {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "survival location-scale hazard row mismatch: eta={} eta_derivative={}",
-            eta.len(),
-            eta_derivative.len()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "survival location-scale hazard row mismatch: eta={} eta_derivative={}",
+                eta.len(),
+                eta_derivative.len()
+            ),
+        });
     }
     let values = eta
         .iter()
@@ -1783,9 +1852,11 @@ fn location_scale_hazard_component(
     inverse_link: &InverseLink,
 ) -> Result<f64, SurvivalPredictError> {
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-            "survival location-scale hazard requires finite eta and positive eta_t, got eta={eta}, eta_t={eta_derivative}"
-        ) });
+        return Err(SurvivalPredictError::NumericalFailure {
+            reason: format!(
+                "survival location-scale hazard requires finite eta and positive eta_t, got eta={eta}, eta_t={eta_derivative}"
+            ),
+        });
     }
     match inverse_link {
         InverseLink::Standard(LinkFunction::Probit) => {
@@ -1808,9 +1879,11 @@ fn location_scale_hazard_component(
         InverseLink::Standard(LinkFunction::Identity) => {
             let survival = 1.0 - eta;
             if !(survival.is_finite() && survival > 0.0) {
-                return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-                    "survival location-scale identity link produced invalid survival={survival} at eta={eta}"
-                ) });
+                return Err(SurvivalPredictError::NumericalFailure {
+                    reason: format!(
+                        "survival location-scale identity link produced invalid survival={survival} at eta={eta}"
+                    ),
+                });
             }
             Ok(eta_derivative / survival)
         }
@@ -1820,10 +1893,12 @@ fn location_scale_hazard_component(
             let survival = 1.0 - jet.mu;
             let hazard = jet.d1 * eta_derivative / survival;
             if !(survival.is_finite() && survival > 0.0 && hazard.is_finite() && hazard >= 0.0) {
-                return Err(SurvivalPredictError::NumericalFailure { reason: format!(
-                    "survival location-scale inverse link produced invalid hazard components: eta={eta}, eta_t={eta_derivative}, failure={}, d_failure={}, survival={survival}, hazard={hazard}",
-                    jet.mu, jet.d1
-                ) });
+                return Err(SurvivalPredictError::NumericalFailure {
+                    reason: format!(
+                        "survival location-scale inverse link produced invalid hazard components: eta={eta}, eta_t={eta_derivative}, failure={}, d_failure={}, survival={survival}, hazard={hazard}",
+                        jet.mu, jet.d1
+                    ),
+                });
             }
             Ok(hazard)
         }
@@ -1844,10 +1919,11 @@ pub fn require_saved_survival_likelihood_mode(
             Some(other) => Err(SurvivalPredictError::MissingFitMetadata { reason: format!(
                 "saved latent survival model has contradictory survival_likelihood metadata: expected 'latent', got '{other}'"
             ) }),
-            None => Err(SurvivalPredictError::MissingFitMetadata { reason: 
-                "saved latent survival model is missing survival_likelihood=latent metadata; refit"
-                    .to_string(),
-             }),
+            None => Err(SurvivalPredictError::MissingFitMetadata {
+                reason:
+                    "saved latent survival model is missing survival_likelihood=latent metadata; refit"
+                        .to_string(),
+            }),
         };
     }
     if matches!(&model.family_state, FittedFamily::LatentBinary { .. }) {
@@ -1856,10 +1932,11 @@ pub fn require_saved_survival_likelihood_mode(
             Some(other) => Err(SurvivalPredictError::MissingFitMetadata { reason: format!(
                 "saved latent binary model has contradictory survival_likelihood metadata: expected 'latent-binary', got '{other}'"
             ) }),
-            None => Err(SurvivalPredictError::MissingFitMetadata { reason: 
-                "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit"
-                    .to_string(),
-             }),
+            None => Err(SurvivalPredictError::MissingFitMetadata {
+                reason:
+                    "saved latent binary model is missing survival_likelihood=latent-binary metadata; refit"
+                        .to_string(),
+            }),
         };
     }
     let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
@@ -1916,7 +1993,8 @@ fn remap_term_collectionspec_columns(
         let name = training_headers
             .get(index)
             .ok_or_else(|| format!("saved training column index {index} is out of bounds"))?;
-        resolve_role_col(prediction_column_map, name, "prediction").map_err(SurvivalPredictError::from)
+        resolve_role_col(prediction_column_map, name, "prediction")
+            .map_err(SurvivalPredictError::from)
     };
     for linear_term in &mut remapped.linear_terms {
         linear_term.feature_col = resolve_training_index(linear_term.feature_col)?;
@@ -1982,11 +2060,12 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, SurvivalPredictError> {
-    model.fit_result.clone().ok_or_else(|| {
-        SurvivalPredictError::MissingFitMetadata {
+    model
+        .fit_result
+        .clone()
+        .ok_or_else(|| SurvivalPredictError::MissingFitMetadata {
             reason: "model is missing canonical fit_result payload; refit".to_string(),
-        }
-    })
+        })
 }
 
 /// Resolve the saved survival location-scale fit result.
@@ -2030,7 +2109,9 @@ pub fn apply_inverse_link_state_to_fit_result(
 
 /// Resolve the saved survival inverse-link from saved link metadata and fitted
 /// state.
-pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<InverseLink, SurvivalPredictError> {
+pub fn resolve_survival_inverse_link_from_saved(
+    model: &SavedModel,
+) -> Result<InverseLink, SurvivalPredictError> {
     if let Some(link) = model.link.as_ref() {
         return Ok(link.clone());
     }
@@ -2043,7 +2124,9 @@ pub fn resolve_survival_inverse_link_from_saved(model: &SavedModel) -> Result<In
     if let Some(dist) = model.survival_distribution {
         return Ok(residual_distribution_inverse_link(dist));
     }
-    Err(SurvivalPredictError::MissingFitMetadata { reason: "saved survival model is missing link/distribution metadata".to_string() })
+    Err(SurvivalPredictError::MissingFitMetadata {
+        reason: "saved survival model is missing link/distribution metadata".to_string(),
+    })
 }
 
 /// Concatenate referenced 1-D arrays into a single owned `Array1<f64>`.
@@ -2089,7 +2172,11 @@ pub fn saved_baseline_timewiggle_components(
             .design
             {
                 DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-                _ => return Err(SurvivalPredictError::IncompatibleSchema { reason: "saved baseline-timewiggle entry design must be dense".to_string() }),
+                _ => {
+                    return Err(SurvivalPredictError::IncompatibleSchema {
+                        reason: "saved baseline-timewiggle entry design must be dense".to_string(),
+                    });
+                }
             };
             let exit = match buildwiggle_block_input_from_knots(
                 eta_exit.view(),
@@ -2101,16 +2188,22 @@ pub fn saved_baseline_timewiggle_components(
             .design
             {
                 DesignMatrix::Dense(m) => m.to_dense_arc().as_ref().clone(),
-                _ => return Err(SurvivalPredictError::IncompatibleSchema { reason: "saved baseline-timewiggle exit design must be dense".to_string() }),
+                _ => {
+                    return Err(SurvivalPredictError::IncompatibleSchema {
+                        reason: "saved baseline-timewiggle exit design must be dense".to_string(),
+                    });
+                }
             };
             let betaw = beta;
             if entry.ncols() != betaw.len() || exit.ncols() != betaw.len() {
-                return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                    "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
-                    betaw.len(),
-                    entry.ncols(),
-                    exit.ncols()
-                ) });
+                return Err(SurvivalPredictError::IncompatibleSchema {
+                    reason: format!(
+                        "saved baseline-timewiggle dimension mismatch: coefficients have {} entries but basis has entry={} exit={}",
+                        betaw.len(),
+                        entry.ncols(),
+                        exit.ncols()
+                    ),
+                });
             }
             let derivative = build_survival_timewiggle_derivative_design(
                 eta_exit,
@@ -2125,11 +2218,13 @@ pub fn saved_baseline_timewiggle_components(
                 )
             })?;
             if derivative.ncols() != betaw.len() {
-                return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                    "saved baseline-timewiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
-                    betaw.len(),
-                    derivative.ncols()
-                ) });
+                return Err(SurvivalPredictError::IncompatibleSchema {
+                    reason: format!(
+                        "saved baseline-timewiggle derivative dimension mismatch: coefficients have {} entries but derivative basis has {} columns",
+                        betaw.len(),
+                        derivative.ncols()
+                    ),
+                });
             }
             Ok(Some((entry, exit, derivative)))
         }
@@ -2167,10 +2262,11 @@ pub fn build_saved_survival_marginal_slope_predictor(
 > {
     let saved_runtime = model.saved_prediction_runtime()?;
     if saved_runtime.link_wiggle.is_some() {
-        return Err(SurvivalPredictError::MissingFitMetadata { reason: 
-            "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
-                .to_string(),
-         });
+        return Err(SurvivalPredictError::MissingFitMetadata {
+            reason:
+                "saved survival marginal-slope model contains legacy linkwiggle metadata; refit with the anchored link-deviation runtime"
+                    .to_string(),
+        });
     }
 
     let saved_score_runtime = saved_runtime.score_warp;
@@ -2179,21 +2275,23 @@ pub fn build_saved_survival_marginal_slope_predictor(
     let expected_blocks =
         3 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some());
     if blocks.len() != expected_blocks {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
-            expected_blocks,
-            if saved_score_runtime.is_some() {
-                ", score-warp"
-            } else {
-                ""
-            },
-            if saved_link_runtime.is_some() {
-                ", link-deviation"
-            } else {
-                ""
-            },
-            blocks.len(),
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
+                expected_blocks,
+                if saved_score_runtime.is_some() {
+                    ", score-warp"
+                } else {
+                    ""
+                },
+                if saved_link_runtime.is_some() {
+                    ", link-deviation"
+                } else {
+                    ""
+                },
+                blocks.len(),
+            ),
+        });
     }
 
     let beta_time = &blocks[0].beta;
@@ -2202,38 +2300,46 @@ pub fn build_saved_survival_marginal_slope_predictor(
     if let Some(runtime) = saved_score_runtime.as_ref() {
         let beta = &blocks[3].beta;
         if beta.len() != runtime.basis_dim {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "saved survival marginal-slope score-warp coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ),
+            });
         }
     }
     if let Some(runtime) = saved_link_runtime.as_ref() {
         let idx = 3 + usize::from(saved_score_runtime.is_some());
         let beta = &blocks[idx].beta;
         if beta.len() != runtime.basis_dim {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
-                beta.len(),
-                runtime.basis_dim
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "saved survival marginal-slope link-deviation coefficient mismatch: beta has {} entries but runtime expects {}",
+                    beta.len(),
+                    runtime.basis_dim
+                ),
+            });
         }
     }
 
     if beta_marginal.len() != cov_design.ncols() {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
-            beta_marginal.len(),
-            cov_design.ncols()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope marginal coefficient mismatch: beta has {} entries but baseline design has {} columns",
+                beta_marginal.len(),
+                cov_design.ncols()
+            ),
+        });
     }
     if beta_logslope.len() != logslope_design.ncols() {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
-            beta_logslope.len(),
-            logslope_design.ncols()
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope slope coefficient mismatch: beta has {} entries but slope design has {} columns",
+                beta_logslope.len(),
+                logslope_design.ncols()
+            ),
+        });
     }
 
     let p_time_base = time_build.x_exit_time.ncols();
@@ -2242,12 +2348,14 @@ pub fn build_saved_survival_marginal_slope_predictor(
         .as_ref()
         .map_or(0, |runtime| runtime.beta.len());
     if beta_time.len() != p_time_base + p_timewiggle {
-        return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-            "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
-            beta_time.len(),
-            p_time_base,
-            p_timewiggle
-        ) });
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "saved survival marginal-slope time coefficient mismatch: beta has {} entries but expected base={} plus timewiggle={}",
+                beta_time.len(),
+                p_time_base,
+                p_timewiggle
+            ),
+        });
     }
 
     let beta_time_base = beta_time.slice(s![..p_time_base]).to_owned();
@@ -2274,11 +2382,13 @@ pub fn build_saved_survival_marginal_slope_predictor(
                 .to_string()
         })?;
         if exit_w.ncols() != p_timewiggle {
-            return Err(SurvivalPredictError::IncompatibleSchema { reason: format!(
-                "saved survival marginal-slope timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
-                exit_w.ncols(),
-                p_timewiggle
-            ) });
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "saved survival marginal-slope timewiggle design mismatch: rebuilt {} columns but runtime expects {}",
+                    exit_w.ncols(),
+                    p_timewiggle
+                ),
+            });
         }
         q_design_parts.push(DesignMatrix::from(exit_w));
     }
@@ -2413,7 +2523,10 @@ mod tests {
     fn probit_survival_hazard_rejects_infinite_time_derivative() {
         let err = probit_survival_hazard_components(1.0, f64::INFINITY)
             .expect_err("infinite derivative should be invalid");
-        assert!(err.to_string().contains("invalid survival index derivative"));
+        assert!(
+            err.to_string()
+                .contains("invalid survival index derivative")
+        );
     }
 
     #[test]
@@ -2425,10 +2538,18 @@ mod tests {
         // zero). Pin both NaN slots so the input gate cannot regress.
         let err_eta =
             probit_survival_hazard_components(f64::NAN, 0.5).expect_err("NaN eta must be rejected");
-        assert!(err_eta.to_string().contains("invalid survival index derivative"));
+        assert!(
+            err_eta
+                .to_string()
+                .contains("invalid survival index derivative")
+        );
         let err_dt = probit_survival_hazard_components(1.0, f64::NAN)
             .expect_err("NaN eta_derivative must be rejected");
-        assert!(err_dt.to_string().contains("invalid survival index derivative"));
+        assert!(
+            err_dt
+                .to_string()
+                .contains("invalid survival index derivative")
+        );
     }
 
     #[test]
@@ -2438,7 +2559,10 @@ mod tests {
         // not a valid survival function.
         let err = probit_survival_hazard_components(1.0, -0.5)
             .expect_err("negative derivative should be invalid");
-        assert!(err.to_string().contains("invalid survival index derivative"));
+        assert!(
+            err.to_string()
+                .contains("invalid survival index derivative")
+        );
     }
 
     #[test]
@@ -2458,7 +2582,10 @@ mod tests {
     fn royston_parmar_hazard_rejects_nonpositive_log_hazard_derivative() {
         let err = royston_parmar_survival_hazard_components(0.0, 0.0)
             .expect_err("zero derivative should be invalid");
-        assert!(err.to_string().contains("invalid log-cumulative-hazard derivative"));
+        assert!(
+            err.to_string()
+                .contains("invalid log-cumulative-hazard derivative")
+        );
     }
 
     #[test]
@@ -2488,7 +2615,10 @@ mod tests {
     fn royston_parmar_hazard_rejects_nan_eta() {
         let err = royston_parmar_survival_hazard_components(f64::NAN, 0.5)
             .expect_err("NaN eta should be invalid");
-        assert!(err.to_string().contains("invalid log-cumulative-hazard derivative"));
+        assert!(
+            err.to_string()
+                .contains("invalid log-cumulative-hazard derivative")
+        );
     }
 
     #[test]

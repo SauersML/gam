@@ -295,10 +295,13 @@ fn dense_locscale_block_designs_fromspecs<'a>(
     material_policy: &crate::resource::MaterializationPolicy,
 ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
     if specs.len() != expected_count {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{family_name} expects {expected_count} specs, got {}",
-            specs.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{family_name} expects {expected_count} specs, got {}",
+                specs.len()
+            ),
+        }
+        .into());
     }
     let primary = dense_block_from_spec(
         &specs[primary_block_idx],
@@ -349,9 +352,12 @@ fn psi_psi_map_to_drift_slots(
         crate::custom_family::PsiDesignMap::Second { action } => Ok((Some(action), None)),
         crate::custom_family::PsiDesignMap::Dense { matrix } => Ok((None, Some((*matrix).clone()))),
         crate::custom_family::PsiDesignMap::Zero { .. } => Ok((None, None)),
-        crate::custom_family::PsiDesignMap::First { .. } => Err(GamlssError::UnsupportedConfiguration { reason: format!(
-            "{label}: unexpected First variant from _psi_psi_map"
-        ) }.into()),
+        crate::custom_family::PsiDesignMap::First { .. } => {
+            Err(GamlssError::UnsupportedConfiguration {
+                reason: format!("{label}: unexpected First variant from _psi_psi_map"),
+            }
+            .into())
+        }
     }
 }
 
@@ -417,11 +423,14 @@ fn design_weighted_column_squares(
     let n = design.nrows();
     let p = design.ncols();
     if weights.len() != n {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "design weighted column squares dimension mismatch: weights={}, rows={}",
-            weights.len(),
-            n
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "design weighted column squares dimension mismatch: weights={}, rows={}",
+                weights.len(),
+                n
+            ),
+        }
+        .into());
     }
     let mut out = Array1::<f64>::zeros(p);
     for rows in exact_design_row_chunks(n, p) {
@@ -610,10 +619,13 @@ impl GamlssLambdaLayout {
     fn validate_theta_len(self, theta_len: usize, context: &str) -> Result<(), String> {
         let needed = self.total();
         if theta_len < needed {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "{context} theta too short: got {}, need at least {}",
-                theta_len, needed
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{context} theta too short: got {}, need at least {}",
+                    theta_len, needed
+                ),
+            }
+            .into());
         }
         Ok(())
     }
@@ -657,11 +669,14 @@ impl GamlssBetaLayout {
         context: &str,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
         if flat.len() != self.total() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "{context} length mismatch: got {}, expected {}",
-                flat.len(),
-                self.total()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{context} length mismatch: got {}, expected {}",
+                    flat.len(),
+                    self.total()
+                ),
+            }
+            .into());
         }
         Ok((
             flat.slice(s![0..self.pt]).to_owned(),
@@ -711,18 +726,24 @@ impl ParameterBlockInput {
         let p = self.design.ncols();
         let n = self.design.nrows();
         if self.offset.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "block '{name}' offset length mismatch: got {}, expected {n}",
-                self.offset.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "block '{name}' offset length mismatch: got {}, expected {n}",
+                    self.offset.len()
+                ),
+            }
+            .into());
         }
         if let Some(beta0) = &self.initial_beta
             && beta0.len() != p
         {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "block '{name}' initial_beta length mismatch: got {}, expected {p}",
-                beta0.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "block '{name}' initial_beta length mismatch: got {}, expected {p}",
+                    beta0.len()
+                ),
+            }
+            .into());
         }
         for (k, s) in self.penalties.iter().enumerate() {
             match s {
@@ -746,9 +767,12 @@ impl ParameterBlockInput {
                 | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                     let (r, c) = m.dim();
                     if r != p || c != p {
-                        return Err(GamlssError::DimensionMismatch { reason: format!(
-                            "block '{name}' penalty {k} must be {p}x{p}, got {r}x{c}"
-                        ) }.into());
+                        return Err(GamlssError::DimensionMismatch {
+                            reason: format!(
+                                "block '{name}' penalty {k} must be {p}x{p}, got {r}x{c}"
+                            ),
+                        }
+                        .into());
                     }
                 }
             }
@@ -758,10 +782,13 @@ impl ParameterBlockInput {
             .initial_log_lambdas
             .unwrap_or_else(|| Array1::<f64>::zeros(k));
         if initial_log_lambdas.len() != k {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "block '{name}' initial_log_lambdas length mismatch: got {}, expected {k}",
-                initial_log_lambdas.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "block '{name}' initial_log_lambdas length mismatch: got {}, expected {k}",
+                    initial_log_lambdas.len()
+                ),
+            }
+            .into());
         }
         Ok(ParameterBlockSpec {
             name: name.to_string(),
@@ -794,9 +821,10 @@ impl ParameterBlockInput {
 
 fn validate_len_match(name: &str, expected: usize, found: usize) -> Result<(), String> {
     if expected != found {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{name} length mismatch: expected {expected}, found {found}"
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!("{name} length mismatch: expected {expected}, found {found}"),
+        }
+        .into());
     }
     Ok(())
 }
@@ -804,9 +832,12 @@ fn validate_len_match(name: &str, expected: usize, found: usize) -> Result<(), S
 fn validateweights(weights: &Array1<f64>, context: &str) -> Result<(), String> {
     for (i, &w) in weights.iter().enumerate() {
         if !w.is_finite() || w < 0.0 {
-            return Err(GamlssError::NonFinite { reason: format!(
-                "{context}: weights must be finite and non-negative; found weights[{i}]={w}"
-            ) }.into());
+            return Err(GamlssError::NonFinite {
+                reason: format!(
+                    "{context}: weights must be finite and non-negative; found weights[{i}]={w}"
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -815,9 +846,12 @@ fn validateweights(weights: &Array1<f64>, context: &str) -> Result<(), String> {
 fn validate_binomial_response(y: &Array1<f64>, context: &str) -> Result<(), String> {
     for (i, &yi) in y.iter().enumerate() {
         if !yi.is_finite() || !(0.0..=1.0).contains(&yi) {
-            return Err(GamlssError::NonFinite { reason: format!(
-                "{context}: binomial response must be finite in [0,1]; found y[{i}]={yi}"
-            ) }.into());
+            return Err(GamlssError::NonFinite {
+                reason: format!(
+                    "{context}: binomial response must be finite in [0,1]; found y[{i}]={yi}"
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -834,7 +868,10 @@ pub(crate) fn initializewiggle_knots_from_seed(
     let mut seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
     let mut seed_max = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !seed_min.is_finite() || !seed_max.is_finite() {
-        return Err(GamlssError::NonFinite { reason: "non-finite seed for wiggle knot initialization".to_string() }.into());
+        return Err(GamlssError::NonFinite {
+            reason: "non-finite seed for wiggle knot initialization".to_string(),
+        }
+        .into());
     }
     if (seed_max - seed_min).abs() < MIN_WIGGLE_SEED_SPAN {
         let center = 0.5 * (seed_min + seed_max);
@@ -892,7 +929,10 @@ pub fn buildwiggle_block_input_from_knots(
     let design = monotone_wiggle_basis_from_knots(seed, knots, degree)?;
     let p = design.ncols();
     if p == 0 {
-        return Err(GamlssError::UnsupportedConfiguration { reason: "wiggle basis has no free monotone columns".to_string() }.into());
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: "wiggle basis has no free monotone columns".to_string(),
+        }
+        .into());
     }
     let mut penalties: Vec<crate::solver::estimate::PenaltySpec> = Vec::new();
     let mut nullspace_dims = Vec::new();
@@ -1001,7 +1041,10 @@ pub(crate) fn validate_monotone_wiggle_beta_nonnegative(
 ) -> Result<(), String> {
     for (idx, &value) in beta.iter().enumerate() {
         if !value.is_finite() {
-            return Err(GamlssError::NonFinite { reason: format!("{context} coefficient {idx} is non-finite") }.into());
+            return Err(GamlssError::NonFinite {
+                reason: format!("{context} coefficient {idx} is non-finite"),
+            }
+            .into());
         }
         if value < -1e-12 {
             return Err(GamlssError::ConstraintViolation { reason: format!(
@@ -1126,9 +1169,10 @@ fn validate_term_offset(y_len: usize, offset: &Array1<f64>, label: &str) -> Resu
     validate_len_match(&format!("{label} vs y"), y_len, offset.len())?;
     for (row_idx, value) in offset.iter().enumerate() {
         if !value.is_finite() {
-            return Err(GamlssError::NonFinite { reason: format!(
-                "{label} contains non-finite value at row {row_idx}: {value}"
-            ) }.into());
+            return Err(GamlssError::NonFinite {
+                reason: format!("{label} contains non-finite value at row {row_idx}: {value}"),
+            }
+            .into());
         }
     }
     Ok(())
@@ -1155,19 +1199,25 @@ fn validate_gaussian_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     if spec.wiggle_degree < 2 {
-        return Err(GamlssError::ConstraintViolation { reason: format!(
-            "{context}: wiggle_degree must be >= 2, got {}",
-            spec.wiggle_degree
-        ) }.into());
+        return Err(GamlssError::ConstraintViolation {
+            reason: format!(
+                "{context}: wiggle_degree must be >= 2, got {}",
+                spec.wiggle_degree
+            ),
+        }
+        .into());
     }
     let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
     if spec.wiggle_knots.len() < minimum_knots {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-            minimum_knots,
-            spec.wiggle_degree,
-            spec.wiggle_knots.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
+                minimum_knots,
+                spec.wiggle_degree,
+                spec.wiggle_knots.len()
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -1200,19 +1250,25 @@ fn validate_binomial_location_scalewiggle_termspec(
         context,
     )?;
     if spec.wiggle_degree < 2 {
-        return Err(GamlssError::ConstraintViolation { reason: format!(
-            "{context}: wiggle_degree must be >= 2, got {}",
-            spec.wiggle_degree
-        ) }.into());
+        return Err(GamlssError::ConstraintViolation {
+            reason: format!(
+                "{context}: wiggle_degree must be >= 2, got {}",
+                spec.wiggle_degree
+            ),
+        }
+        .into());
     }
     let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
     if spec.wiggle_knots.len() < minimum_knots {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-            minimum_knots,
-            spec.wiggle_degree,
-            spec.wiggle_knots.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
+                minimum_knots,
+                spec.wiggle_degree,
+                spec.wiggle_knots.len()
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -1224,11 +1280,14 @@ fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64
         .clone()
         .unwrap_or_else(|| Array1::<f64>::zeros(k));
     if lambdas.len() != k {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "initial_log_lambdas length mismatch: got {}, expected {}",
-            lambdas.len(),
-            k
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "initial_log_lambdas length mismatch: got {}, expected {}",
+                lambdas.len(),
+                k
+            ),
+        }
+        .into());
     }
     Ok(lambdas)
 }
@@ -1340,14 +1399,20 @@ pub(crate) fn solve_penalizedweighted_projection(
     let n = design.nrows();
     let p = design.ncols();
     if offset.len() != n || target_eta.len() != n || weights.len() != n {
-        return Err(GamlssError::DimensionMismatch { reason: "solve_penalizedweighted_projection dimension mismatch".to_string() }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: "solve_penalizedweighted_projection dimension mismatch".to_string(),
+        }
+        .into());
     }
     if penalties.len() != log_lambdas.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "solve_penalizedweighted_projection lambda mismatch: penalties={}, log_lambdas={}",
-            penalties.len(),
-            log_lambdas.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "solve_penalizedweighted_projection lambda mismatch: penalties={}, log_lambdas={}",
+                penalties.len(),
+                log_lambdas.len()
+            ),
+        }
+        .into());
     }
 
     let y_star = target_eta - offset;
@@ -1366,13 +1431,16 @@ pub(crate) fn solve_penalizedweighted_projection(
             ) }.into());
         }
         if s.nrows() != p || s.ncols() != p {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "solve_penalizedweighted_projection penalty shape mismatch at index {k}: \
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "solve_penalizedweighted_projection penalty shape mismatch at index {k}: \
                  penalty is {}x{} but design has {} columns",
-                s.nrows(),
-                s.ncols(),
-                p
-            ) }.into());
+                    s.nrows(),
+                    s.ncols(),
+                    p
+                ),
+            }
+            .into());
         }
         if let Some(system) = penalty_system.as_mut() {
             s.add_scaled_to(lambda, system);
@@ -1461,11 +1529,14 @@ fn prepared_gaussian_log_sigma_design(
     log_sigma_design: &DesignMatrix,
 ) -> Result<DesignMatrix, String> {
     if mu_design.nrows() != log_sigma_design.nrows() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
-            mu_design.nrows(),
-            log_sigma_design.nrows()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
+                mu_design.nrows(),
+                log_sigma_design.nrows()
+            ),
+        }
+        .into());
     }
     // Gaussian location-scale remains identifiable even when μ and log σ use
     // the same covariate basis:
@@ -1561,9 +1632,12 @@ fn weighted_binomial_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> Resul
     let mut success_sum = 0.0;
     for (&yi, &wi) in y.iter().zip(weights.iter()) {
         if !yi.is_finite() {
-            return Err(GamlssError::NonFinite { reason: format!(
-                "binomial location-scale warm start encountered non-finite response {yi}"
-            ) }.into());
+            return Err(GamlssError::NonFinite {
+                reason: format!(
+                    "binomial location-scale warm start encountered non-finite response {yi}"
+                ),
+            }
+            .into());
         }
         let weight = floor_positiveweight(wi, MIN_WEIGHT);
         if weight > 0.0 {
@@ -1738,18 +1812,24 @@ fn validate_term_collection_design(
             .map_err(|e| e.to_string())?;
     }
     if design.nullspace_dims.len() != design.penalties.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{label}.nullspace_dims length mismatch: got {}, expected {}",
-            design.nullspace_dims.len(),
-            design.penalties.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{label}.nullspace_dims length mismatch: got {}, expected {}",
+                design.nullspace_dims.len(),
+                design.penalties.len()
+            ),
+        }
+        .into());
     }
     if design.penaltyinfo.len() != design.penalties.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{label}.penaltyinfo length mismatch: got {}, expected {}",
-            design.penaltyinfo.len(),
-            design.penalties.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{label}.penaltyinfo length mismatch: got {}, expected {}",
+                design.penaltyinfo.len(),
+                design.penalties.len()
+            ),
+        }
+        .into());
     }
     for (idx, bp) in design.penalties.iter().enumerate() {
         validate_all_finite_estimation(
@@ -1758,18 +1838,24 @@ fn validate_term_collection_design(
         )
         .map_err(|e| e.to_string())?;
         if bp.col_range.end > p {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "{label}.penalties[{idx}] col_range {}..{} exceeds design width {}",
-                bp.col_range.start, bp.col_range.end, p
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{label}.penalties[{idx}] col_range {}..{} exceeds design width {}",
+                    bp.col_range.start, bp.col_range.end, p
+                ),
+            }
+            .into());
         }
     }
     if let Some(bounds) = design.coefficient_lower_bounds.as_ref() {
         if bounds.len() != p {
-            return Err(GamlssError::ConstraintViolation { reason: format!(
-                "{label}.coefficient_lower_bounds length mismatch: got {}, expected {p}",
-                bounds.len()
-            ) }.into());
+            return Err(GamlssError::ConstraintViolation {
+                reason: format!(
+                    "{label}.coefficient_lower_bounds length mismatch: got {}, expected {p}",
+                    bounds.len()
+                ),
+            }
+            .into());
         }
         for (idx, &bound) in bounds.iter().enumerate() {
             if !(bound.is_finite() || bound == f64::NEG_INFINITY) {
@@ -1791,24 +1877,33 @@ fn validate_term_collection_design(
         )
         .map_err(|e| e.to_string())?;
         if constraints.a.ncols() != p {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "{label}.linear_constraints.a column mismatch: got {}, expected {p}",
-                constraints.a.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{label}.linear_constraints.a column mismatch: got {}, expected {p}",
+                    constraints.a.ncols()
+                ),
+            }
+            .into());
         }
         if constraints.a.nrows() != constraints.b.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "{label}.linear_constraints row mismatch: a has {}, b has {}",
-                constraints.a.nrows(),
-                constraints.b.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "{label}.linear_constraints row mismatch: a has {}, b has {}",
+                    constraints.a.nrows(),
+                    constraints.b.len()
+                ),
+            }
+            .into());
         }
     }
     if design.intercept_range.start > design.intercept_range.end || design.intercept_range.end > p {
-        return Err(GamlssError::ConstraintViolation { reason: format!(
-            "{label}.intercept_range out of bounds: {:?} for {} columns",
-            design.intercept_range, p
-        ) }.into());
+        return Err(GamlssError::ConstraintViolation {
+            reason: format!(
+                "{label}.intercept_range out of bounds: {:?} for {} columns",
+                design.intercept_range, p
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -1826,47 +1921,65 @@ impl BlockwiseTermFitResult {
         fit.validate_numeric_finiteness()
             .map_err(|e| format!("{e}"))?;
         if fit.block_states.len() < 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult requires at least 2 block states, got {}",
-                fit.block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult requires at least 2 block states, got {}",
+                    fit.block_states.len()
+                ),
+            }
+            .into());
         }
         validate_term_collection_design("blockwise_term.mean_design", &mean_design)?;
         validate_term_collection_design("blockwise_term.noise_design", &noise_design)?;
         if mean_design.design.nrows() != noise_design.design.nrows() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult row mismatch: mean_design={}, noise_design={}",
-                mean_design.design.nrows(),
-                noise_design.design.nrows()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult row mismatch: mean_design={}, noise_design={}",
+                    mean_design.design.nrows(),
+                    noise_design.design.nrows()
+                ),
+            }
+            .into());
         }
         if fit.block_states[0].beta.len() != mean_design.design.ncols() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult mean beta length mismatch: got {}, expected {}",
-                fit.block_states[0].beta.len(),
-                mean_design.design.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult mean beta length mismatch: got {}, expected {}",
+                    fit.block_states[0].beta.len(),
+                    mean_design.design.ncols()
+                ),
+            }
+            .into());
         }
         if fit.block_states[1].beta.len() != noise_design.design.ncols() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult noise beta length mismatch: got {}, expected {}",
-                fit.block_states[1].beta.len(),
-                noise_design.design.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult noise beta length mismatch: got {}, expected {}",
+                    fit.block_states[1].beta.len(),
+                    noise_design.design.ncols()
+                ),
+            }
+            .into());
         }
         if fit.block_states[0].eta.len() != mean_design.design.nrows() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult mean eta length mismatch: got {}, expected {}",
-                fit.block_states[0].eta.len(),
-                mean_design.design.nrows()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult mean eta length mismatch: got {}, expected {}",
+                    fit.block_states[0].eta.len(),
+                    mean_design.design.nrows()
+                ),
+            }
+            .into());
         }
         if fit.block_states[1].eta.len() != noise_design.design.nrows() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermFitResult noise eta length mismatch: got {}, expected {}",
-                fit.block_states[1].eta.len(),
-                noise_design.design.nrows()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermFitResult noise eta length mismatch: got {}, expected {}",
+                    fit.block_states[1].eta.len(),
+                    noise_design.design.nrows()
+                ),
+            }
+            .into());
         }
 
         Ok(Self {
@@ -1901,13 +2014,19 @@ impl BlockwiseTermWiggleFitResult {
         fit.validate_numeric_finiteness()
             .map_err(|e| format!("{e}"))?;
         if fit.fit.block_states.len() < 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BlockwiseTermWiggleFitResult requires at least 3 block states, got {}",
-                fit.fit.block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BlockwiseTermWiggleFitResult requires at least 3 block states, got {}",
+                    fit.fit.block_states.len()
+                ),
+            }
+            .into());
         }
         if wiggle_knots.is_empty() {
-            return Err(GamlssError::UnsupportedConfiguration { reason: "BlockwiseTermWiggleFitResult requires non-empty wiggle_knots".to_string() }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: "BlockwiseTermWiggleFitResult requires non-empty wiggle_knots".to_string(),
+            }
+            .into());
         }
         validate_all_finite_estimation(
             "blockwise_term_wiggle.wiggle_knots",
@@ -1951,17 +2070,23 @@ fn fit_binomial_mean_wiggle(
         spec.link_kind,
         InverseLink::Standard(LinkFunction::Identity)
     ) {
-        return Err(GamlssError::UnsupportedConfiguration { reason: "fit_binomial_mean_wiggle does not support identity link".to_string() }.into());
+        return Err(GamlssError::UnsupportedConfiguration {
+            reason: "fit_binomial_mean_wiggle does not support identity link".to_string(),
+        }
+        .into());
     }
     crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         "fit_binomial_mean_wiggle",
     )?;
     if spec.wiggle_degree < 2 {
-        return Err(GamlssError::ConstraintViolation { reason: format!(
-            "fit_binomial_mean_wiggle: wiggle_degree must be >= 2, got {}",
-            spec.wiggle_degree
-        ) }.into());
+        return Err(GamlssError::ConstraintViolation {
+            reason: format!(
+                "fit_binomial_mean_wiggle: wiggle_degree must be >= 2, got {}",
+                spec.wiggle_degree
+            ),
+        }
+        .into());
     }
     let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
     if spec.wiggle_knots.len() < minimum_knots {
@@ -2048,7 +2173,11 @@ trait LocationScaleFamilyBuilder {
         _: &TermCollectionDesign,
         _: &TermCollectionDesign,
     ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-        Err(GamlssError::UnsupportedConfiguration { reason: "spatial psi derivatives are unavailable for this location-scale family".to_string() }.into())
+        Err(GamlssError::UnsupportedConfiguration {
+            reason: "spatial psi derivatives are unavailable for this location-scale family"
+                .to_string(),
+        }
+        .into())
     }
 }
 
@@ -3498,10 +3627,13 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     )?;
     let baseline_log_lambdas = baseline_fit.lambdas.mapv(|v| v.max(1e-12).ln());
     if baseline_log_lambdas.len() != rho_dim {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "baseline binomial mean-wiggle fit returned {} log-lambdas, expected {rho_dim}",
-            baseline_log_lambdas.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "baseline binomial mean-wiggle fit returned {} log-lambdas, expected {rho_dim}",
+                baseline_log_lambdas.len()
+            ),
+        }
+        .into());
     }
     let baseline_eta_beta = baseline_fit
         .block_states
@@ -4392,11 +4524,14 @@ fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
 
 fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
     if design.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_x_dense row mismatch: design has {} rows but diag has {} entries",
-            design.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_x_dense row mismatch: design has {} rows but diag has {} entries",
+                design.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     Ok(fast_xt_diag_x(design, diag))
 }
@@ -4407,29 +4542,38 @@ fn xt_diag_y_dense(
     right: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_y_dense row mismatch: left has {} rows but diag has {} entries",
-            left.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_y_dense row mismatch: left has {} rows but diag has {} entries",
+                left.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     if right.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_y_dense row mismatch: right has {} rows but diag has {} entries",
-            right.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_y_dense row mismatch: right has {} rows but diag has {} entries",
+                right.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     Ok(fast_xt_diag_y(left, diag, right))
 }
 
 fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
     if design.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
-            design.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
+                design.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     design.compute_xtwx(diag)
 }
@@ -4440,18 +4584,24 @@ fn xt_diag_y_design(
     right: &DesignMatrix,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
-            left.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
+                left.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     if right.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
-            right.nrows(),
-            diag.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
+                right.nrows(),
+                diag.len()
+            ),
+        }
+        .into());
     }
     if let (Some(left_dense), Some(right_dense)) = (left.as_dense_ref(), right.as_dense_ref()) {
         return xt_diag_y_dense(left_dense, diag, right_dense);
@@ -4717,9 +4867,12 @@ fn bernoulli_log_likelihood_from_probability(y: f64, weight: f64, mu: f64) -> Re
         return Ok(0.0);
     }
     if !mu.is_finite() || !(0.0..=1.0).contains(&mu) {
-        return Err(GamlssError::NumericalFailure { reason: format!(
-            "binomial location-scale inverse link returned invalid probability {mu}"
-        ) }.into());
+        return Err(GamlssError::NumericalFailure {
+            reason: format!(
+                "binomial location-scale inverse link returned invalid probability {mu}"
+            ),
+        }
+        .into());
     }
     let log_mu = if mu == 0.0 {
         if y == 0.0 { 0.0 } else { f64::NEG_INFINITY }
@@ -4735,9 +4888,12 @@ fn bernoulli_log_likelihood_from_probability(y: f64, weight: f64, mu: f64) -> Re
     if ll.is_finite() {
         Ok(ll)
     } else {
-        Err(GamlssError::NonFinite { reason: format!(
-            "binomial location-scale log likelihood is non-finite at y={y}, mu={mu}"
-        ) }.into())
+        Err(GamlssError::NonFinite {
+            reason: format!(
+                "binomial location-scale log likelihood is non-finite at y={y}, mu={mu}"
+            ),
+        }
+        .into())
     }
 }
 
@@ -4875,12 +5031,18 @@ fn binomial_location_scale_core(
 ) -> Result<BinomialLocationScaleCore, String> {
     let n = y.len();
     if weights.len() != n || eta_t.len() != n || eta_ls.len() != n {
-        return Err(GamlssError::DimensionMismatch { reason: "binomial location-scale core size mismatch".to_string() }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: "binomial location-scale core size mismatch".to_string(),
+        }
+        .into());
     }
     if let Some(w) = etawiggle
         && w.len() != n
     {
-        return Err(GamlssError::DimensionMismatch { reason: "binomial location-scale core wiggle size mismatch".to_string() }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: "binomial location-scale core wiggle size mismatch".to_string(),
+        }
+        .into());
     }
 
     // Parallel per-row probit/inverse-link evaluation. At biobank scale
@@ -5393,10 +5555,13 @@ impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorksp
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let Some((xmu, x_ls)) = family.ws_exact_joint_dense_block_designs(Some(specs))? else {
-            return Err(GamlssError::UnsupportedConfiguration { reason: format!(
-                "{} exact joint psi workspace requires dense block designs",
-                F::LABEL,
-            ) }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: format!(
+                    "{} exact joint psi workspace requires dense block designs",
+                    F::LABEL,
+                ),
+            }
+            .into());
         };
         let xmu = xmu.into_owned();
         let x_ls = x_ls.into_owned();
@@ -5539,7 +5704,10 @@ fn gaussian_jointrow_scalars(
 ) -> Result<GaussianJointRowScalars, String> {
     let nobs = y.len();
     if etamu.len() != nobs || eta_ls.len() != nobs || weights.len() != nobs {
-        return Err(GamlssError::DimensionMismatch { reason: "Gaussian joint row scalar input size mismatch".to_string() }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: "Gaussian joint row scalar input size mismatch".to_string(),
+        }
+        .into());
     }
     let mut obs_weight = Array1::<f64>::uninit(nobs);
     let mut w = Array1::<f64>::uninit(nobs);
@@ -6349,10 +6517,13 @@ impl GaussianLocationScaleFamily {
         specs: &'a [ParameterBlockSpec],
     ) -> Result<(DenseOrOperator<'a>, DenseOrOperator<'a>), String> {
         if specs.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
-                specs.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
+                    specs.len()
+                ),
+            }
+            .into());
         }
         let mu_design = &specs[Self::BLOCK_MU].design;
         let log_sigma_design = &specs[Self::BLOCK_LOG_SIGMA].design;
@@ -6533,16 +6704,22 @@ impl GaussianLocationScaleFamily {
         x_ls: &DenseOrOperator<'_>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if etamu.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
@@ -6564,27 +6741,36 @@ impl GaussianLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if etamu.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
         let total = pmu + p_ls;
         if d_beta_flat.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+                    d_beta_flat.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let ximu = xmu.dot(d_beta_flat.slice(s![0..pmu]));
         let xi_ls = x_ls.dot(d_beta_flat.slice(s![pmu..pmu + p_ls]));
@@ -6606,16 +6792,22 @@ impl GaussianLocationScaleFamily {
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if etamu.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let pmu = xmu.ncols();
@@ -6801,10 +6993,13 @@ impl GaussianLocationScaleFamily {
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         if specs.len() != 2 || derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
@@ -7197,16 +7392,22 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         // Diagonal IRLS weights for the inner solver.
@@ -7261,9 +7462,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
                     let mut local_ll = 0.0;
                     for local in 0..zmu_c.len() {
                         let i = start + local;
-                        let row = gaussian_diagonal_row_kernel(
-                            y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi,
-                        );
+                        let row =
+                            gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
                         zmu_c[local] = mu_s[i] + row.location_working_shift;
                         wmu_c[local] = row.location_working_weight;
                         zls_c[local] = row.log_sigma_working_response;
@@ -7280,10 +7480,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
             let w_view = self.weights.view();
             let mu_view = etamu.view();
             let ls_view = eta_log_sigma.view();
-            let zmu_s = zmu.as_slice_memory_order_mut().expect("zeros is contiguous");
-            let wmu_s = wmu.as_slice_memory_order_mut().expect("zeros is contiguous");
-            let zls_s = z_ls.as_slice_memory_order_mut().expect("zeros is contiguous");
-            let wls_s = w_ls.as_slice_memory_order_mut().expect("zeros is contiguous");
+            let zmu_s = zmu
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let wmu_s = wmu
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let zls_s = z_ls
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let wls_s = w_ls
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
             ll += zmu_s
                 .par_chunks_mut(CHUNK)
                 .zip(wmu_s.par_chunks_mut(CHUNK))
@@ -7320,16 +7528,22 @@ impl CustomFamily for GaussianLocationScaleFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         // logb noise link: σ(η_ls) = LOGB_SIGMA_FLOOR + exp(η_ls). σ ≥ b > 0
         // bounds the loglik below (−Σlog σ ≥ −n log b) and bounds 1/σ² by 1/b²,
@@ -7419,16 +7633,22 @@ impl CustomFamily for GaussianLocationScaleFamily {
         d_eta: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n || d_eta.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let sigma = eta_ls.mapv(logb_sigma_from_eta_scalar);
@@ -7631,10 +7851,13 @@ impl CustomFamilyGenerative for GaussianLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let mu = block_states[Self::BLOCK_MU].eta.clone();
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -8305,11 +8528,14 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let p_ls = self.x_ls.ncols();
         let total = pmu + p_ls;
         if v.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScale matvec dimension mismatch: got {}, expected {}",
-                v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScale matvec dimension mismatch: got {}, expected {}",
+                    v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let u_mu = fast_av(self.xmu.as_ref(), &v.slice(s![0..pmu]));
         let u_ls = fast_av(self.x_ls.as_ref(), &v.slice(s![pmu..total]));
@@ -8382,11 +8608,14 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pmu + pls;
         if d_beta_flat.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "GaussianLocationScale dH operator: d_beta length {} != {}",
-                d_beta_flat.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "GaussianLocationScale dH operator: d_beta length {} != {}",
+                    d_beta_flat.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
         let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
@@ -8430,12 +8659,15 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pmu + pls;
         if d_beta_u.len() != total || d_beta_v.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "GaussianLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
-                d_beta_u.len(),
-                d_beta_v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "GaussianLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+                    d_beta_u.len(),
+                    d_beta_v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
         let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
@@ -8556,11 +8788,14 @@ impl GaussianLocationScaleWiggleHessianRowPieces {
 
 fn scale_matrix_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f64>, String> {
     if mat.nrows() != coeffs.len() {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
-            mat.nrows(),
-            coeffs.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
+                mat.nrows(),
+                coeffs.len()
+            ),
+        }
+        .into());
     }
     Ok(Array2::from_shape_fn(mat.dim(), |(i, j)| {
         mat[[i, j]] * coeffs[i]
@@ -9075,10 +9310,13 @@ impl GaussianLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GaussianLocationScaleWiggleHessianRowPieces, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let q0 = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -9086,7 +9324,10 @@ impl GaussianLocationScaleWiggleFamily {
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if q0.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
@@ -9141,10 +9382,13 @@ impl GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
@@ -9159,7 +9403,10 @@ impl GaussianLocationScaleWiggleFamily {
             "GaussianLocationScaleWiggleFamily exact joint directional Hessian",
         )?;
         if q0.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
@@ -9230,10 +9477,13 @@ impl GaussianLocationScaleWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let pmu = xmu_arc.ncols();
         let p_ls = x_ls_arc.ncols();
@@ -9246,7 +9496,10 @@ impl GaussianLocationScaleWiggleFamily {
         let (umu, u_ls, uw) =
             layout.split_three(d_beta_flat, "GLS Wiggle joint dH operator d_beta")?;
         if q0_eta.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = q0_eta + etaw;
         let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
@@ -9350,10 +9603,13 @@ impl GaussianLocationScaleWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let pmu = xmu_arc.ncols();
         let p_ls = x_ls_arc.ncols();
@@ -9366,7 +9622,10 @@ impl GaussianLocationScaleWiggleFamily {
         let (umu, u_ls, uw) = layout.split_three(d_beta_u, "GLS Wiggle d2H operator (u)")?;
         let (vmu, v_ls, vw) = layout.split_three(d_beta_v, "GLS Wiggle d2H operator (v)")?;
         if q0_eta.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = q0_eta + etaw;
         let geom = self.wiggle_geometry(q0_eta.view(), betaw.view())?;
@@ -9549,10 +9808,13 @@ impl GaussianLocationScaleWiggleFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
@@ -9571,7 +9833,10 @@ impl GaussianLocationScaleWiggleFamily {
             "GaussianLocationScaleWiggleFamily exact joint second directional Hessian (v)",
         )?;
         if q0.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
@@ -10650,17 +10915,23 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_mu.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         // Per-row kernel emits 6 working values into pre-allocated outputs;
@@ -10676,10 +10947,18 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut zw = Array1::<f64>::zeros(n);
         let mut ww = Array1::<f64>::zeros(n);
         const CHUNK: usize = 1024;
-        let zmu_s = zmu.as_slice_memory_order_mut().expect("zeros is contiguous");
-        let wmu_s = wmu.as_slice_memory_order_mut().expect("zeros is contiguous");
-        let zls_s = zls.as_slice_memory_order_mut().expect("zeros is contiguous");
-        let wls_s = wls.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let zmu_s = zmu
+            .as_slice_memory_order_mut()
+            .expect("zeros is contiguous");
+        let wmu_s = wmu
+            .as_slice_memory_order_mut()
+            .expect("zeros is contiguous");
+        let zls_s = zls
+            .as_slice_memory_order_mut()
+            .expect("zeros is contiguous");
+        let wls_s = wls
+            .as_slice_memory_order_mut()
+            .expect("zeros is contiguous");
         let zw_s = zw.as_slice_memory_order_mut().expect("zeros is contiguous");
         let ww_s = ww.as_slice_memory_order_mut().expect("zeros is contiguous");
         let y_view = self.y.view();
@@ -10695,31 +10974,33 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             .zip(zw_s.par_chunks_mut(CHUNK))
             .zip(ww_s.par_chunks_mut(CHUNK))
             .enumerate()
-            .map(|(chunk_idx, (((((zmu_c, wmu_c), zls_c), wls_c), zw_c), ww_c))| {
-                let start = chunk_idx * CHUNK;
-                let mut local_ll = 0.0;
-                for local in 0..zmu_c.len() {
-                    let i = start + local;
-                    let q_i = eta_mu_view[i] + etaw_view[i];
-                    let row = gaussian_diagonal_row_kernel(
-                        y_view[i],
-                        q_i,
-                        eta_ls_view[i],
-                        w_view[i],
-                        ln2pi,
-                    );
-                    let w_i = row.location_working_weight;
-                    let shift = row.location_working_shift;
-                    zmu_c[local] = eta_mu_view[i] + shift;
-                    wmu_c[local] = w_i;
-                    zw_c[local] = etaw_view[i] + shift;
-                    ww_c[local] = w_i;
-                    zls_c[local] = row.log_sigma_working_response;
-                    wls_c[local] = row.log_sigma_working_weight;
-                    local_ll += row.log_likelihood;
-                }
-                local_ll
-            })
+            .map(
+                |(chunk_idx, (((((zmu_c, wmu_c), zls_c), wls_c), zw_c), ww_c))| {
+                    let start = chunk_idx * CHUNK;
+                    let mut local_ll = 0.0;
+                    for local in 0..zmu_c.len() {
+                        let i = start + local;
+                        let q_i = eta_mu_view[i] + etaw_view[i];
+                        let row = gaussian_diagonal_row_kernel(
+                            y_view[i],
+                            q_i,
+                            eta_ls_view[i],
+                            w_view[i],
+                            ln2pi,
+                        );
+                        let w_i = row.location_working_weight;
+                        let shift = row.location_working_shift;
+                        zmu_c[local] = eta_mu_view[i] + shift;
+                        wmu_c[local] = w_i;
+                        zw_c[local] = etaw_view[i] + shift;
+                        ww_c[local] = w_i;
+                        zls_c[local] = row.log_sigma_working_response;
+                        wls_c[local] = row.log_sigma_working_weight;
+                        local_ll += row.log_likelihood;
+                    }
+                    local_ll
+                },
+            )
             .sum();
 
         Ok(FamilyEvaluation {
@@ -10734,10 +11015,13 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -10747,7 +11031,10 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             || etaw.len() != self.y.len()
             || self.weights.len() != self.y.len()
         {
-            return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let q = eta_mu + etaw;
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
@@ -10772,10 +11059,13 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let pmu = self
             .mu_design
@@ -10971,19 +11261,28 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
         if block_states.len() < 1 {
-            return Err(GamlssError::UnsupportedConfiguration { reason: "Gaussian wiggle geometry requires mean block".to_string() }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: "Gaussian wiggle geometry requires mean block".to_string(),
+            }
+            .into());
         }
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         if eta_mu.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch { reason: "Gaussian wiggle geometry input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "Gaussian wiggle geometry input size mismatch".to_string(),
+            }
+            .into());
         }
         let x = self.wiggle_design(eta_mu.view())?;
         if x.ncols() != spec.design.ncols() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "Gaussian dynamic wiggle design col mismatch: got {}, expected {}",
-                x.ncols(),
-                spec.design.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "Gaussian dynamic wiggle design col mismatch: got {}, expected {}",
+                    x.ncols(),
+                    spec.design.ncols()
+                ),
+            }
+            .into());
         }
         let nrows = x.nrows();
         Ok((
@@ -11085,11 +11384,14 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         let pw = self.pieces.basis.ncols();
         let total = pmu + p_ls + pw;
         if v.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
-                v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
+                    v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let v_mu = v.slice(s![0..pmu]);
         let v_ls = v.slice(s![pmu..pmu + p_ls]);
@@ -11236,10 +11538,13 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta_mu = &block_states[Self::BLOCK_MU].eta;
         let eta_wiggle = &block_states[Self::BLOCK_WIGGLE].eta;
@@ -11259,10 +11564,10 @@ fn expect_single_block<'a>(
     family_name: &str,
 ) -> Result<&'a ParameterBlockState, String> {
     if block_states.len() != 1 {
-        return Err(GamlssError::DimensionMismatch { reason: format!(
-            "{family_name} expects 1 block, got {}",
-            block_states.len()
-        ) }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!("{family_name} expects 1 block, got {}", block_states.len()),
+        }
+        .into());
     }
     Ok(&block_states[0])
 }
@@ -11485,10 +11790,13 @@ impl BinomialMeanWiggleFamily {
         specs: &'a [ParameterBlockSpec],
     ) -> Result<Cow<'a, Array2<f64>>, String> {
         if specs.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 specs, got {}",
-                specs.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 specs, got {}",
+                    specs.len()
+                ),
+            }
+            .into());
         }
         Ok(match specs[Self::BLOCK_ETA].design.as_dense_ref() {
             Some(d) => Cow::Borrowed(d),
@@ -11599,17 +11907,23 @@ impl BinomialMeanWiggleFamily {
         x_eta_arc: Arc<Array2<f64>>,
     ) -> Result<Arc<RowCoeffOperator>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta_arc.ncols();
@@ -11653,28 +11967,37 @@ impl BinomialMeanWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta_arc.ncols();
         let pw = geom.basis.ncols();
         let total = p_eta + pw;
         if d_beta_flat.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
+                    d_beta_flat.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
         let uw = d_beta_flat.slice(s![p_eta..total]).to_owned();
@@ -11736,17 +12059,23 @@ impl BinomialMeanWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta_arc.ncols();
@@ -11902,25 +12231,34 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let dq_dq0 = self.wiggle_dq_dq0(eta.view(), betaw.view())?;
         if dq_dq0.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily dq/dq0 length mismatch: got {}, expected {}",
-                dq_dq0.len(),
-                n
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily dq/dq0 length mismatch: got {}, expected {}",
+                    dq_dq0.len(),
+                    n
+                ),
+            }
+            .into());
         }
 
         let mut ll = 0.0;
@@ -11979,19 +12317,28 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
         if block_states.len() < 1 {
-            return Err(GamlssError::UnsupportedConfiguration { reason: "wiggle geometry requires eta block".to_string() }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: "wiggle geometry requires eta block".to_string(),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         if eta.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily eta size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily eta size mismatch".to_string(),
+            }
+            .into());
         }
         let x = self.wiggle_design(eta.view())?;
         if x.ncols() != spec.design.ncols() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "dynamic wiggle design col mismatch: got {}, expected {}",
-                x.ncols(),
-                spec.design.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "dynamic wiggle design col mismatch: got {}, expected {}",
+                    x.ncols(),
+                    spec.design.ncols()
+                ),
+            }
+            .into());
         }
         let nrows = x.nrows();
         Ok((
@@ -12025,10 +12372,13 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
@@ -12036,7 +12386,10 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
@@ -12073,10 +12426,13 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
@@ -12084,17 +12440,23 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
         let pw = geom.basis.ncols();
         if d_beta_flat.len() != p_eta + pw {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                p_eta + pw
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily joint d_beta length mismatch: got {}, expected {}",
+                    d_beta_flat.len(),
+                    p_eta + pw
+                ),
+            }
+            .into());
         }
         let u_eta = d_beta_flat.slice(s![0..p_eta]).to_owned();
         let uw = d_beta_flat.slice(s![p_eta..p_eta + pw]).to_owned();
@@ -12206,10 +12568,13 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let x_eta = self.dense_eta_design_fromspecs(specs)?;
         let eta = &block_states[Self::BLOCK_ETA].eta;
@@ -12217,7 +12582,10 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
@@ -12470,7 +12838,10 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let betaw = &block_states[Self::BLOCK_WIGGLE].beta;
         let n = self.y.len();
         if eta.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let geom = self.wiggle_geometry(eta.view(), betaw.view())?;
         let p_eta = x_eta.ncols();
@@ -12756,15 +13127,21 @@ impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialMeanWiggleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta = &block_states[Self::BLOCK_ETA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta.len() != self.y.len() || etaw.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialMeanWiggleFamily generative size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialMeanWiggleFamily generative size mismatch".to_string(),
+            }
+            .into());
         }
         let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
@@ -12864,7 +13241,10 @@ fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
     let prior_weights = family.prior_weights();
     let n = y.len();
     if eta.len() != n || prior_weights.len() != n {
-        return Err(GamlssError::DimensionMismatch { reason: format!("{label} input size mismatch") }.into());
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!("{label} input size mismatch"),
+        }
+        .into());
     }
     family.validate_self()?;
 
@@ -12909,9 +13289,12 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
     }
     fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
         if !yi.is_finite() || yi < 0.0 {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "PoissonLogFamily requires non-negative finite y; found y[{idx}]={yi}"
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "PoissonLogFamily requires non-negative finite y; found y[{idx}]={yi}"
+                ),
+            }
+            .into());
         }
         Ok(())
     }
@@ -12990,15 +13373,19 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
     }
     fn validate_self(&self) -> Result<(), String> {
         if !self.shape.is_finite() || self.shape <= 0.0 {
-            return Err(GamlssError::NonFinite { reason: "GammaLogFamily shape must be finite and > 0".to_string() }.into());
+            return Err(GamlssError::NonFinite {
+                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+            }
+            .into());
         }
         Ok(())
     }
     fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
         if !yi.is_finite() || yi <= 0.0 {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "GammaLogFamily requires positive finite y; found y[{idx}]={yi}"
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!("GammaLogFamily requires positive finite y; found y[{idx}]={yi}"),
+            }
+            .into());
         }
         Ok(())
     }
@@ -13044,19 +13431,26 @@ impl CustomFamily for GammaLogFamily {
         let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
         let n = self.y.len();
         if eta.len() != n || self.weights.len() != n || d_eta.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "GammaLogFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GammaLogFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         if !self.shape.is_finite() || self.shape <= 0.0 {
-            return Err(GamlssError::NonFinite { reason: "GammaLogFamily shape must be finite and > 0".to_string() }.into());
+            return Err(GamlssError::NonFinite {
+                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+            }
+            .into());
         }
 
         let mut dw = Array1::<f64>::zeros(n);
         for i in 0..n {
             let yi = self.y[i];
             if !yi.is_finite() || yi <= 0.0 {
-                return Err(GamlssError::InvalidInput { reason: format!(
-                    "GammaLogFamily requires positive finite y; found y[{i}]={yi}"
-                ) }.into());
+                return Err(GamlssError::InvalidInput {
+                    reason: format!("GammaLogFamily requires positive finite y; found y[{i}]={yi}"),
+                }
+                .into());
             }
             let e_raw = eta[i];
             let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
@@ -13345,10 +13739,13 @@ impl<F: BinomialLocationScaleJointPsiFamily> BinomialLocationScaleJointPsiWorksp
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let Some((x_t, x_ls)) = family.ws_exact_joint_dense_block_designs(Some(specs))? else {
-            return Err(GamlssError::UnsupportedConfiguration { reason: format!(
-                "{} exact joint psi workspace requires dense block designs",
-                F::LABEL,
-            ) }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: format!(
+                    "{} exact joint psi workspace requires dense block designs",
+                    F::LABEL,
+                ),
+            }
+            .into());
         };
         let x_t = shared_dense_arc(x_t.as_ref());
         let x_ls = shared_dense_arc(x_ls.as_ref());
@@ -13581,10 +13978,13 @@ impl BinomialLocationScaleFamily {
         x_ls: &DesignMatrix,
     ) -> Result<ExactNewtonJointGradientEvaluation, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
@@ -13775,16 +14175,22 @@ impl BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let core = binomial_location_scale_core(
@@ -14020,26 +14426,35 @@ impl BinomialLocationScaleFamily {
         //     + 0.5 tr(H^{-1} dot H_k)
         //     - 0.5 tr(S^+ A_k).
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         if d_beta_flat.len() != pt + pls {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                pt + pls
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+                    d_beta_flat.len(),
+                    pt + pls
+                ),
+            }
+            .into());
         }
         let d_eta_t = fast_av(x_t, &d_beta_flat.slice(s![0..pt]));
         let d_eta_ls = fast_av(x_ls, &d_beta_flat.slice(s![pt..pt + pls]));
@@ -14125,16 +14540,22 @@ impl BinomialLocationScaleFamily {
         // fourth-order beta-curvature contraction needed to make the joint
         // rho-Hessian path consistent with the first-order joint solve.
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let pt = x_t.ncols();
@@ -14355,10 +14776,13 @@ impl BinomialLocationScaleFamily {
         x_ls: &Array2<f64>,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         if specs.len() != 2 || derivative_blocks.len() != 2 {
             return Err(GamlssError::DimensionMismatch { reason: format!(
@@ -14371,7 +14795,10 @@ impl BinomialLocationScaleFamily {
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         // Joint fixed-beta psi terms for the coupled 2-block probit model.
@@ -15423,16 +15850,22 @@ impl CustomFamily for BinomialLocationScaleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let core = binomial_location_scale_core(
@@ -15529,16 +15962,22 @@ impl CustomFamily for BinomialLocationScaleFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != n || eta_ls.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         // Zero-allocation O(n) scalar loop — no working sets, no n-vector intermediates.
         binomial_location_scale_ll_only(
@@ -16251,15 +16690,21 @@ impl CustomFamilyGenerative for BinomialLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily expects 2 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleFamily generative size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleFamily generative size mismatch".to_string(),
+            }
+            .into());
         }
         let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
@@ -16495,11 +16940,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pt + pls;
         if v.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScale matvec dimension mismatch: got {}, expected {}",
-                v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScale matvec dimension mismatch: got {}, expected {}",
+                    v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         // u_t = X_t v_t, u_ls = X_ls v_ls
         let u_t = self
@@ -16548,11 +16996,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pt + pls;
         if d_beta_flat.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "BinomialLocationScale dH operator: d_beta length {} != {}",
-                d_beta_flat.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "BinomialLocationScale dH operator: d_beta length {} != {}",
+                    d_beta_flat.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let key = BinomialDirectionKey::from_array(d_beta_flat);
         let eta = self.direction_eta(&key, d_beta_flat, pt, total);
@@ -16584,12 +17035,15 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         let pls = self.x_ls.ncols();
         let total = pt + pls;
         if d_beta_u.len() != total || d_beta_v.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "BinomialLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
-                d_beta_u.len(),
-                d_beta_v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "BinomialLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+                    d_beta_u.len(),
+                    d_beta_v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let key_u = BinomialDirectionKey::from_array(d_beta_u);
         let key_v = BinomialDirectionKey::from_array(d_beta_v);
@@ -16689,11 +17143,14 @@ impl BinomialLocationScaleWiggleFamily {
     ) -> Result<Array1<f64>, String> {
         let d_constrained = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
         if d_constrained.ncols() != beta_link_wiggle.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle derivative col mismatch: got {}, expected {}",
-                d_constrained.ncols(),
-                beta_link_wiggle.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle derivative col mismatch: got {}, expected {}",
+                    d_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
         }
         Ok(d_constrained.dot(&beta_link_wiggle) + 1.0)
     }
@@ -16706,11 +17163,14 @@ impl BinomialLocationScaleWiggleFamily {
         let d2_constrained =
             self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
         if d2_constrained.ncols() != beta_link_wiggle.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle second-derivative col mismatch: got {}, expected {}",
-                d2_constrained.ncols(),
-                beta_link_wiggle.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle second-derivative col mismatch: got {}, expected {}",
+                    d2_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
         }
         Ok(d2_constrained.dot(&beta_link_wiggle))
     }
@@ -16722,11 +17182,14 @@ impl BinomialLocationScaleWiggleFamily {
     ) -> Result<Array1<f64>, String> {
         let d3_constrained = self.wiggle_d3basis_constrained(q0)?;
         if d3_constrained.ncols() != beta_link_wiggle.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle third-derivative col mismatch: got {}, expected {}",
-                d3_constrained.ncols(),
-                beta_link_wiggle.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle third-derivative col mismatch: got {}, expected {}",
+                    d3_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
         }
         Ok(d3_constrained.dot(&beta_link_wiggle))
     }
@@ -16747,11 +17210,14 @@ impl BinomialLocationScaleWiggleFamily {
             4,
         )?;
         if d4.ncols() != beta_link_wiggle.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle fourth-derivative col mismatch: got {}, expected {}",
-                d4.ncols(),
-                beta_link_wiggle.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle fourth-derivative col mismatch: got {}, expected {}",
+                    d4.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
         }
         Ok(d4.dot(&beta_link_wiggle))
     }
@@ -18915,17 +19381,23 @@ impl BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<BinomialLocationScaleWiggleHessianRowPieces, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let betaw0 = block_states[Self::BLOCK_WIGGLE].beta.clone();
@@ -18943,13 +19415,16 @@ impl BinomialLocationScaleWiggleFamily {
         let dd0 =
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
         if b0.ncols() != betaw0.len() || d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle basis/beta mismatch in exact joint Hessian: B={} B'={} B''={} betaw={}",
-                b0.ncols(),
-                d0.ncols(),
-                dd0.ncols(),
-                betaw0.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle basis/beta mismatch in exact joint Hessian: B={} B'={} B''={} betaw={}",
+                    b0.ncols(),
+                    d0.ncols(),
+                    dd0.ncols(),
+                    betaw0.len()
+                ),
+            }
+            .into());
         }
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
@@ -19141,17 +19616,23 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let core = binomial_location_scale_core(
@@ -19235,17 +19716,23 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         binomial_location_scale_ll_only(
             &self.y,
@@ -19268,10 +19755,13 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let (x_t, x_ls) = self.dense_block_designs()?;
         let pt = x_t.ncols();
@@ -19297,11 +19787,14 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             _ => return Ok(None),
         };
         if d_beta.len() != (range_end - range_start) {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "block {block_idx} d_beta length mismatch: got {}, expected {}",
-                d_beta.len(),
-                range_end - range_start
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "block {block_idx} d_beta length mismatch: got {}, expected {}",
+                    d_beta.len(),
+                    range_end - range_start
+                ),
+            }
+            .into());
         }
 
         // Block-local exact Newton directional derivative is extracted from the
@@ -19428,17 +19921,23 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //
         // Implementation below follows these formulas exactly block-by-block.
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
@@ -19469,12 +19968,15 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
         let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
         if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle derivative/beta mismatch in exact joint dH: B'={} B''={} betaw={}",
-                d0.ncols(),
-                dd0.ncols(),
-                betaw0.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle derivative/beta mismatch in exact joint dH: B'={} B''={} betaw={}",
+                    d0.ncols(),
+                    dd0.ncols(),
+                    betaw0.len()
+                ),
+            }
+            .into());
         }
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
@@ -19606,17 +20108,23 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
 
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
@@ -20063,12 +20571,18 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
         if block_states.len() < 2 {
-            return Err(GamlssError::UnsupportedConfiguration { reason: "wiggle geometry requires threshold and log-sigma blocks".to_string() }.into());
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: "wiggle geometry requires threshold and log-sigma blocks".to_string(),
+            }
+            .into());
         }
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() {
-            return Err(GamlssError::DimensionMismatch { reason: "wiggle geometry input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "wiggle geometry input size mismatch".to_string(),
+            }
+            .into());
         }
         let mut q0 = Array1::<f64>::zeros(eta_t.len());
         for i in 0..q0.len() {
@@ -20077,11 +20591,14 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
         let x = self.wiggle_design(q0.view())?;
         if x.ncols() != spec.design.ncols() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "dynamic wiggle design col mismatch: got {}, expected {}",
-                x.ncols(),
-                spec.design.ncols()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "dynamic wiggle design col mismatch: got {}, expected {}",
+                    x.ncols(),
+                    spec.design.ncols()
+                ),
+            }
+            .into());
         }
         let nrows = x.nrows();
         Ok((
@@ -20136,17 +20653,23 @@ impl BinomialLocationScaleWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
@@ -20164,11 +20687,14 @@ impl BinomialLocationScaleWiggleFamily {
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
         if d_beta_flat.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "BLS wiggle dH operator: d_beta length {} != {}",
-                d_beta_flat.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "BLS wiggle dH operator: d_beta length {} != {}",
+                    d_beta_flat.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let (u_t, u_ls, uw) =
             beta_layout.split_three(d_beta_flat, "wiggle joint dH operator d_beta")?;
@@ -20181,12 +20707,15 @@ impl BinomialLocationScaleWiggleFamily {
             self.wiggle_basiswith_options(core0.q0.view(), BasisOptions::second_derivative())?;
         let d3q = self.wiggle_d3q_dq03(core0.q0.view(), betaw0.view())?;
         if d0.ncols() != betaw0.len() || dd0.ncols() != betaw0.len() {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "wiggle derivative/beta mismatch in dH operator: B'={} B''={} betaw={}",
-                d0.ncols(),
-                dd0.ncols(),
-                betaw0.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle derivative/beta mismatch in dH operator: B'={} B''={} betaw={}",
+                    d0.ncols(),
+                    dd0.ncols(),
+                    betaw0.len()
+                ),
+            }
+            .into());
         }
         let m = d0.dot(&betaw0) + 1.0;
         let g2 = dd0.dot(&betaw0);
@@ -20334,17 +20863,23 @@ impl BinomialLocationScaleWiggleFamily {
     ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
     {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
         }
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
@@ -20369,12 +20904,15 @@ impl BinomialLocationScaleWiggleFamily {
         let beta_layout = GamlssBetaLayout::withwiggle(pt, pls, pw);
         let total = beta_layout.total();
         if d_beta_u.len() != total || d_beta_v.len() != total {
-            return Err(GamlssError::InvalidInput { reason: format!(
-                "BLS wiggle d2H operator: d_beta_{{u,v}} length {}/{} != {}",
-                d_beta_u.len(),
-                d_beta_v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::InvalidInput {
+                reason: format!(
+                    "BLS wiggle d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+                    d_beta_u.len(),
+                    d_beta_v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         if d0.ncols() != betaw0.len()
             || dd0.ncols() != betaw0.len()
@@ -20778,11 +21316,14 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         let pw = self.pieces.b0.ncols();
         let total = pt + pls + pw;
         if v.len() != total {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
-                v.len(),
-                total
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
+                    v.len(),
+                    total
+                ),
+            }
+            .into());
         }
         let v_t = v.slice(s![0..pt]);
         let v_ls = v.slice(s![pt..pt + pls]);
@@ -20910,17 +21451,23 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<GenerativeSpec, String> {
         if block_states.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
-                block_states.len()
-            ) }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "BinomialLocationScaleWiggleFamily expects 3 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let eta_t = &block_states[Self::BLOCK_T].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
         if eta_t.len() != self.y.len() || eta_ls.len() != self.y.len() || etaw.len() != self.y.len()
         {
-            return Err(GamlssError::DimensionMismatch { reason: "BinomialLocationScaleWiggleFamily generative size mismatch".to_string() }.into());
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily generative size mismatch".to_string(),
+            }
+            .into());
         }
         let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
             let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);

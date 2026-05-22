@@ -96,7 +96,6 @@ pub struct MixtureLinkState {
     pub pi: Array1<f64>,
 }
 
-
 /// User-facing configuration for the continuous sinh-arcsinh inverse link.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SasLinkSpec {
@@ -179,7 +178,6 @@ impl InverseLink {
             _ => None,
         }
     }
-
 }
 
 /// Fixed prior family for smoothing parameters in joint HMC refinement.
@@ -450,9 +448,7 @@ impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
             (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
                 Ok(Self::PoissonLog)
             }
-            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => {
-                Ok(Self::GammaLog)
-            }
+            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
             (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
                 Ok(Self::RoystonParmar)
             }

@@ -951,10 +951,7 @@ fn component_inverse_link_mu_d1(component: LinkComponent, eta: f64) -> (f64, f64
             } else {
                 0.0
             };
-            (
-                0.5 + eta.atan() / std::f64::consts::PI,
-                canonicalzero(d1),
-            )
+            (0.5 + eta.atan() / std::f64::consts::PI, canonicalzero(d1))
         }
     }
 }

@@ -4207,12 +4207,7 @@ impl SurvivalMarginalSlopeFamily {
                 &scale_obj,
             )?
         } else {
-            self.row_neglog_directional_with_scale_jet(
-                row,
-                block_states,
-                &[zero],
-                &scale_obj,
-            )?
+            self.row_neglog_directional_with_scale_jet(row, block_states, &[zero], &scale_obj)?
         };
 
         let mut grad = Array1::<f64>::zeros(primary_dim);
@@ -17213,8 +17208,9 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         let derived_ncols = time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree)?;
         if derived_ncols == 0 {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
-                reason: "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
-                    .to_string(),
+                reason:
+                    "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
+                        .to_string(),
             }
             .into());
         }

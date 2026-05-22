@@ -125,10 +125,7 @@ impl std::fmt::Display for MonotoneRootError {
                 )
             }
             MonotoneRootError::BracketingExhausted {
-                label,
-                a_lo,
-                a_hi,
-                ..
+                label, a_lo, a_hi, ..
             } => {
                 if let Some(real_label) = label.strip_prefix("__ANALYTIC_INVALID__") {
                     write!(
@@ -243,8 +240,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
     max_refine_iters: usize,
     analytic_bracket: Option<(f64, f64)>,
 ) -> Result<MonotoneRootSolution, MonotoneRootError> {
-    let (f_init, f_deriv_init, _) =
-        eval(a_init).map_err(|e| map_eval_err(label, a_init, e))?;
+    let (f_init, f_deriv_init, _) = eval(a_init).map_err(|e| map_eval_err(label, a_init, e))?;
 
     // Exact root — rare but handle correctly.
     if f_init.abs() <= convergence_tol {
@@ -303,8 +299,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
         }
 
         let cand = a + step;
-        let (f_cand, fp_cand, _) =
-            eval(cand).map_err(|e| map_eval_err(label, cand, e))?;
+        let (f_cand, fp_cand, _) = eval(cand).map_err(|e| map_eval_err(label, cand, e))?;
         if f_cand.abs() <= convergence_tol {
             let abs_d = fp_cand.abs();
             if !abs_d.is_finite() || abs_d == 0.0 {
@@ -374,8 +369,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
         for _ in 0..max_bracket_iters {
             let probe = same_side + step_mag * step_sign;
-            let (f_probe, _, _) =
-                eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
+            let (f_probe, _, _) = eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
             let crossed = if f_init_negative {
                 f_probe >= 0.0
             } else {
@@ -436,8 +430,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
             (pos_pt, neg_pt)
         };
         let mid = 0.5 * (lo + hi);
-        let (f_mid, f_a_mid, f_aa_mid) =
-            eval(mid).map_err(|e| map_eval_err(label, mid, e))?;
+        let (f_mid, f_a_mid, f_aa_mid) = eval(mid).map_err(|e| map_eval_err(label, mid, e))?;
         update_best(
             &mut best_a,
             &mut best_f,
@@ -484,8 +477,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
         // Evaluate probe if it differs from midpoint.
         let (bracket_pt, f_bracket) = if (probe - mid).abs() > 0.0 {
-            let (f_p, f_a_p, _) =
-                eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
+            let (f_p, f_a_p, _) = eval(probe).map_err(|e| map_eval_err(label, probe, e))?;
             update_best(
                 &mut best_a,
                 &mut best_f,
@@ -517,8 +509,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
     // Final validation: re-evaluate at best_a if the derivative is suspect.
     if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
-        let (_, f_a_best, _) =
-            eval(best_a).map_err(|e| map_eval_err(label, best_a, e))?;
+        let (_, f_a_best, _) = eval(best_a).map_err(|e| map_eval_err(label, best_a, e))?;
         best_abs_deriv = f_a_best.abs();
     }
     if !best_abs_deriv.is_finite() || best_abs_deriv == 0.0 {
