@@ -12944,6 +12944,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
+            let active_constraints = {
+                let local_ranges = block_param_ranges(specs);
+                let local_total_p =
+                    local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+                let block_constraints =
+                    collect_block_linear_constraints(family, &states, specs)?;
+                assemble_active_constraint_block(
+                    &block_constraints,
+                    &cached_active_sets,
+                    &local_ranges,
+                    local_total_p,
+                )
+                .map(std::sync::Arc::new)
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -12956,7 +12970,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
                 kkt_residual: None,
-                active_constraints: None,
+                active_constraints,
             });
         }
         if coupled_exact_joint_required {
@@ -13721,6 +13735,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         None
     };
 
+    let active_constraints = {
+        let local_ranges = block_param_ranges(specs);
+        let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
+        let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
+        assemble_active_constraint_block(
+            &block_constraints,
+            &cached_active_sets,
+            &local_ranges,
+            local_total_p,
+        )
+        .map(std::sync::Arc::new)
+    };
     Ok(BlockwiseInnerResult {
         block_states: states,
         active_sets: normalize_active_sets(cached_active_sets),
@@ -13733,7 +13759,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         s_lambdas,
         joint_workspace: None,
         kkt_residual,
-        active_constraints: None,
+        active_constraints,
     })
 }
 
