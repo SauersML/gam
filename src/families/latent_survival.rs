@@ -3522,6 +3522,9 @@ impl CustomFamily for LatentBinaryFamily {
         let mut hess_time = Array2::<f64>::zeros((p_time, p_time));
         let mut grad_mean = Array1::<f64>::zeros(p_mean);
         let mut hess_mean = Array2::<f64>::zeros((p_mean, p_mean));
+        // Reusable 1-row buffer for x_mean so we avoid allocating a fresh
+        // Array2<f64> on every iteration via try_row_chunk(i..i+1).
+        let mut mean_row_buf = Array2::<f64>::zeros((1, p_mean));
 
         for i in 0..n {
             let wi = self.weights[i];
@@ -3551,11 +3554,10 @@ impl CustomFamily for LatentBinaryFamily {
             let binary = binary_from_log_survival(survival_jet.log_lik, self.event_target[i])?;
             ll += wi * binary.log_lik;
 
-            let mean_row = self
-                .x_mean
-                .try_row_chunk(i..i + 1)
+            self.x_mean
+                .row_chunk_into(i..i + 1, mean_row_buf.view_mut())
                 .map_err(|e| format!("LatentBinaryFamily row {i} mean row_chunk: {e}"))?;
-            let mean_vec = mean_row.row(0);
+            let mean_vec = mean_row_buf.row(0);
             let mean_grad_scale = wi * binary.grad_scale * survival_jet.score;
             for j in 0..p_mean {
                 grad_mean[j] += mean_grad_scale * mean_vec[j];
