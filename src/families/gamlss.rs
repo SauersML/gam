@@ -5381,6 +5381,7 @@ trait GaussianLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String>;
 
     fn ws_psi_hessian_directional_from_parts(
@@ -5390,6 +5391,7 @@ trait GaussianLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String>;
 }
 
@@ -5434,6 +5436,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         self.exact_newton_joint_psisecond_order_terms_from_parts(
             block_states,
@@ -5442,6 +5445,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
             psi_b,
             xmu,
             x_ls,
+            subsample,
         )
     }
 
@@ -5452,6 +5456,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         self.exact_newton_joint_psihessian_directional_derivative_from_parts(
             block_states,
@@ -5459,6 +5464,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
             d_beta_flat,
             xmu,
             x_ls,
+            subsample,
         )
     }
 }
@@ -5504,6 +5510,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         self.exact_newton_joint_psisecond_order_terms_from_parts(
             block_states,
@@ -5512,6 +5519,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
             psi_b,
             xmu,
             x_ls,
+            subsample,
         )
     }
 
@@ -5522,6 +5530,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         self.exact_newton_joint_psihessian_directional_derivative_from_parts(
             block_states,
@@ -5529,6 +5538,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
             d_beta_flat,
             xmu,
             x_ls,
+            subsample,
         )
     }
 }
@@ -5545,6 +5555,19 @@ struct GaussianLocationScaleJointPsiWorkspace<F: GaussianLocationScaleJointPsiFa
     xmu: Array2<f64>,
     x_ls: Array2<f64>,
     psi_directions: ExactNewtonJointPsiDirectCache<GaussianLocationScaleJointPsiDirection>,
+    /// Optional Horvitz–Thompson outer-row subsample. When `Some`, every
+    /// per-row weight array produced inside the second-order ψ Hessian and
+    /// the ψ-Hessian directional-derivative computations is masked: each
+    /// sampled row's contribution is scaled by `WeightedOuterRow.weight =
+    /// 1/π_i` and non-sampled rows are zeroed. Because every assembly that
+    /// consumes these arrays (`gaussian_joint_psi*_fromweights`,
+    /// `weighted_crossprod_psi_maps`, `xt_diag_*_dense`,
+    /// `build_two_block_custom_family_joint_psi_operator_from_actions`) is
+    /// row-linear in them, the resulting ψ score and ψ Hessian remain
+    /// unbiased estimators of the full-data quantities. Built by
+    /// `CustomFamily::exact_newton_joint_psi_workspace_with_options`.
+    outer_score_subsample:
+        Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorkspace<F> {
@@ -5553,6 +5576,18 @@ impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorksp
         block_states: Vec<ParameterBlockState>,
         specs: &[ParameterBlockSpec],
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        Self::new_with_subsample(family, block_states, specs, derivative_blocks, None)
+    }
+
+    fn new_with_subsample(
+        family: F,
+        block_states: Vec<ParameterBlockState>,
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+        outer_score_subsample: Option<
+            Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>,
+        >,
     ) -> Result<Self, String> {
         let Some((xmu, x_ls)) = family.ws_exact_joint_dense_block_designs(Some(specs))? else {
             return Err(GamlssError::UnsupportedConfiguration {
@@ -5573,6 +5608,7 @@ impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorksp
             xmu,
             x_ls,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
+            outer_score_subsample,
         })
     }
 
@@ -5608,6 +5644,10 @@ where
         let Some(dir_j) = self.psi_direction(psi_j)? else {
             return Ok(None);
         };
+        let subsample_rows = self
+            .outer_score_subsample
+            .as_ref()
+            .map(|s| s.rows.as_ref().as_slice());
         Ok(Some(self.family.ws_psi_second_order_terms_from_parts(
             &self.block_states,
             &self.derivative_blocks,
@@ -5615,6 +5655,7 @@ where
             dir_j.as_ref(),
             &self.xmu,
             &self.x_ls,
+            subsample_rows,
         )?))
     }
 
@@ -5626,6 +5667,10 @@ where
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
+        let subsample_rows = self
+            .outer_score_subsample
+            .as_ref()
+            .map(|s| s.rows.as_ref().as_slice());
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
                 self.family.ws_psi_hessian_directional_from_parts(
@@ -5634,6 +5679,7 @@ where
                     d_beta_flat,
                     &self.xmu,
                     &self.x_ls,
+                    subsample_rows,
                 )?,
             ),
         ))
@@ -5694,6 +5740,125 @@ struct GaussianJointPsiMixedDriftWeights {
     d2hmumu: Array1<f64>,
     d2hmu_ls: Array1<f64>,
     d2h_ls_ls: Array1<f64>,
+}
+
+/// Apply a Horvitz–Thompson outer-row subsample mask to every per-row array
+/// of a `GaussianJointPsiFirstWeights` in place: each sampled row's
+/// contribution is multiplied by `WeightedOuterRow.weight = 1/π_i` and all
+/// non-sampled rows are zeroed. Every downstream assembly
+/// (`gaussian_joint_psi*_fromweights`,
+/// `build_two_block_custom_family_joint_psi_operator_from_actions`) consumes
+/// these arrays row-linearly via `Xᵀ diag(W) Y` and `weighted_crossprod_psi_maps`,
+/// so the resulting first-order ψ score and Hessian remain unbiased estimators
+/// of the full-data quantities.
+fn apply_ht_mask_first(
+    weights: &mut GaussianJointPsiFirstWeights,
+    rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+) {
+    let n = weights.objective_psirow.len();
+    let mut obj = Array1::<f64>::zeros(n);
+    let mut smu = Array1::<f64>::zeros(n);
+    let mut sls = Array1::<f64>::zeros(n);
+    let mut dsmu = Array1::<f64>::zeros(n);
+    let mut dsls = Array1::<f64>::zeros(n);
+    let mut hmm = Array1::<f64>::zeros(n);
+    let mut hml = Array1::<f64>::zeros(n);
+    let mut hll = Array1::<f64>::zeros(n);
+    let mut dhmm = Array1::<f64>::zeros(n);
+    let mut dhml = Array1::<f64>::zeros(n);
+    let mut dhll = Array1::<f64>::zeros(n);
+    for r in rows {
+        let i = r.index;
+        let w = r.weight;
+        obj[i] = weights.objective_psirow[i] * w;
+        smu[i] = weights.scoremu[i] * w;
+        sls[i] = weights.score_ls[i] * w;
+        dsmu[i] = weights.dscoremu[i] * w;
+        dsls[i] = weights.dscore_ls[i] * w;
+        hmm[i] = weights.hmumu[i] * w;
+        hml[i] = weights.hmu_ls[i] * w;
+        hll[i] = weights.h_ls_ls[i] * w;
+        dhmm[i] = weights.dhmumu[i] * w;
+        dhml[i] = weights.dhmu_ls[i] * w;
+        dhll[i] = weights.dh_ls_ls[i] * w;
+    }
+    weights.objective_psirow = obj;
+    weights.scoremu = smu;
+    weights.score_ls = sls;
+    weights.dscoremu = dsmu;
+    weights.dscore_ls = dsls;
+    weights.hmumu = hmm;
+    weights.hmu_ls = hml;
+    weights.h_ls_ls = hll;
+    weights.dhmumu = dhmm;
+    weights.dhmu_ls = dhml;
+    weights.dh_ls_ls = dhll;
+}
+
+/// HT mask for `GaussianJointPsiSecondWeights`. Same semantics as
+/// `apply_ht_mask_first`: each per-row contribution is scaled by 1/π_i and
+/// non-sampled rows are zeroed. Consumed row-linearly by
+/// `gaussian_joint_psisecondhessian_fromweights` and the `score_psi_psi`
+/// `fast_atv(_, d2score_*)` reductions.
+fn apply_ht_mask_second(
+    weights: &mut GaussianJointPsiSecondWeights,
+    rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+) {
+    let n = weights.objective_psi_psirow.len();
+    let mut obj = Array1::<f64>::zeros(n);
+    let mut d2smu = Array1::<f64>::zeros(n);
+    let mut d2sls = Array1::<f64>::zeros(n);
+    let mut d2hmm = Array1::<f64>::zeros(n);
+    let mut d2hml = Array1::<f64>::zeros(n);
+    let mut d2hll = Array1::<f64>::zeros(n);
+    for r in rows {
+        let i = r.index;
+        let w = r.weight;
+        obj[i] = weights.objective_psi_psirow[i] * w;
+        d2smu[i] = weights.d2scoremu[i] * w;
+        d2sls[i] = weights.d2score_ls[i] * w;
+        d2hmm[i] = weights.d2hmumu[i] * w;
+        d2hml[i] = weights.d2hmu_ls[i] * w;
+        d2hll[i] = weights.d2h_ls_ls[i] * w;
+    }
+    weights.objective_psi_psirow = obj;
+    weights.d2scoremu = d2smu;
+    weights.d2score_ls = d2sls;
+    weights.d2hmumu = d2hmm;
+    weights.d2hmu_ls = d2hml;
+    weights.d2h_ls_ls = d2hll;
+}
+
+/// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
+/// other `apply_ht_mask_*` helpers; consumed row-linearly by
+/// `gaussian_joint_psi_mixedhessian_drift_fromweights`.
+fn apply_ht_mask_mixed(
+    weights: &mut GaussianJointPsiMixedDriftWeights,
+    rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+) {
+    let n = weights.dhmumu_u.len();
+    let mut dhmm_u = Array1::<f64>::zeros(n);
+    let mut dhml_u = Array1::<f64>::zeros(n);
+    let mut dhll_u = Array1::<f64>::zeros(n);
+    let mut d2hmm = Array1::<f64>::zeros(n);
+    let mut d2hml = Array1::<f64>::zeros(n);
+    let mut d2hll = Array1::<f64>::zeros(n);
+    for r in rows {
+        let i = r.index;
+        let w = r.weight;
+        dhmm_u[i] = weights.dhmumu_u[i] * w;
+        dhml_u[i] = weights.dhmu_ls_u[i] * w;
+        dhll_u[i] = weights.dh_ls_ls_u[i] * w;
+        d2hmm[i] = weights.d2hmumu[i] * w;
+        d2hml[i] = weights.d2hmu_ls[i] * w;
+        d2hll[i] = weights.d2h_ls_ls[i] * w;
+    }
+    weights.dhmumu_u = dhmm_u;
+    weights.dhmu_ls_u = dhml_u;
+    weights.dh_ls_ls_u = dhll_u;
+    weights.d2hmumu = d2hmm;
+    weights.d2hmu_ls = d2hml;
+    weights.d2h_ls_ls = d2hll;
 }
 
 fn gaussian_jointrow_scalars(
@@ -7129,6 +7294,7 @@ impl GaussianLocationScaleFamily {
                 &dir_j,
                 xmu,
                 x_ls,
+                None,
             )?,
         ))
     }
@@ -7141,6 +7307,7 @@ impl GaussianLocationScaleFamily {
         dir_j: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -7193,9 +7360,11 @@ impl GaussianLocationScaleFamily {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let weights_i = gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
-        let weights_j = gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
-        let secondweights = gaussian_joint_psisecondweights(
+        let mut weights_i =
+            gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
+        let mut weights_j =
+            gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
+        let mut secondweights = gaussian_joint_psisecondweights(
             &rows,
             &dir_i.zmu_psi,
             &dir_i.z_ls_psi,
@@ -7204,6 +7373,16 @@ impl GaussianLocationScaleFamily {
             &second_drifts.zmu_ab,
             &second_drifts.z_ls_ab,
         );
+        if let Some(sub_rows) = subsample {
+            // HT mask: every downstream consumer (gaussian_joint_psisecondhessian_fromweights,
+            // weighted_crossprod_psi_maps with weights_*.{hmumu,hmu_ls,h_ls_ls},
+            // fast_atv on d2score_* and dscore_*) is row-linear in these arrays, so
+            // scaling sampled rows by 1/π_i and zeroing the rest yields an unbiased
+            // estimator of the full-data second-order ψ Hessian and ψ score.
+            apply_ht_mask_first(&mut weights_i, sub_rows);
+            apply_ht_mask_first(&mut weights_j, sub_rows);
+            apply_ht_mask_second(&mut secondweights, sub_rows);
+        }
         let objective_psi_psi = secondweights.objective_psi_psirow.sum();
 
         let score_psi_psi = gaussian_pack_joint_score(
