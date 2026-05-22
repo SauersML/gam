@@ -4790,12 +4790,11 @@ where
                         // Check convergence in the current PIRLS coefficient frame.
                         // For active inequality constraints, valid KKT multipliers
                         // must be projected out rather than counted as defects.
-                        let convergence_grad_norm = constrained_stationarity_norm(
-                            &accepted_state.gradient,
-                            beta.as_ref(),
-                            options.coefficient_lower_bounds.as_ref(),
-                            options.linear_constraints.as_ref(),
-                        );
+                        // The inputs (`accepted_state.gradient`, `beta`, the two
+                        // constraint slots) are byte-identical to the call above
+                        // that produced `candidategrad_norm` — reuse to avoid a
+                        // duplicate active-set projection per accepted LM step.
+                        let convergence_grad_norm = candidategrad_norm;
 
                         // Preserve the structural ridge computed by the model.
                         // LM damping is a transient solver detail and must not
@@ -5025,7 +5024,9 @@ where
                             last_step_halving = attempts;
                             max_abs_eta =
                                 state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
-                            final_state = Some(state.clone());
+                            // `state` is unused after `break 'pirls_loop` — move it
+                            // instead of cloning to avoid an n+p² full-state copy.
+                            final_state = Some(state);
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
                         }
@@ -5072,7 +5073,9 @@ where
                                 status = PirlsStatus::LmStepSearchExhausted;
                             }
                             // Preserve the structural ridge from the model state.
-                            final_state = Some(state.clone());
+                            // `state` is unused after `break 'pirls_loop` — move it
+                            // instead of cloning to avoid an n+p² full-state copy.
+                            final_state = Some(state);
                             break 'pirls_loop;
                         }
                         loop_lambda *= madsen_reject_factor;
