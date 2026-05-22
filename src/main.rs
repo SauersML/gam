@@ -1381,6 +1381,10 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 None
             },
             coefficient_groups: Vec::new(),
+            // Gamma precision hyperpriors on penalty blocks are only reachable via the
+            // Python FFI (`PyFitConfig.precision_hyperpriors`). The CLI exposes no flag,
+            // config file, or formula-DSL syntax for them, and the magic-by-default
+            // policy forbids inventing one here, so an empty prior list is correct.
             penalty_block_gamma_priors: Vec::new(),
         })) {
             Ok(FitResult::Standard(result)) => {
@@ -5401,6 +5405,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     timewiggle: effective_timewiggle.clone(),
                     weibull_seed,
                     ridge_lambda: effective_args.ridge_lambda,
+                    // Gamma precision hyperpriors on penalty blocks are only reachable via the
+                    // Python FFI (`PyFitConfig.precision_hyperpriors`). The CLI exposes no flag,
+                    // config file, or formula-DSL syntax for them, and the magic-by-default
+                    // policy forbids inventing one here, so an empty prior list is correct.
                     penalty_block_gamma_priors: Vec::new(),
                 },
                 cache_session: None,
