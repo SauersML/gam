@@ -52,7 +52,7 @@ use crate::types::LikelihoodFamily;
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, String> {
-    model.saved_baseline_time_wiggle().map(|runtime| {
+    model.saved_baseline_time_wiggle().map_err(String::from).map(|runtime| {
         runtime.map(|saved| LinkWiggleFormulaSpec {
             degree: saved.degree,
             num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
