@@ -523,7 +523,7 @@ pub struct LatentZNormalization {
 
 impl LatentZNormalization {
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
-        if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > 1e-12) {
+        if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > BMS_VARIANCE_FLOOR) {
             return Err(format!(
                 "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
                 self.mean, self.sd
@@ -1066,7 +1066,7 @@ fn recenter_rescale_empirical_grid(nodes: &mut [f64], weights: &[f64]) {
         .sum::<f64>()
         / total;
     let sd = var.sqrt();
-    if sd.is_finite() && sd > 1e-12 {
+    if sd.is_finite() && sd > BMS_VARIANCE_FLOOR {
         for node in nodes {
             *node = (*node - mean) / sd;
         }
@@ -1361,6 +1361,23 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
 }
 
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
+
+/// Positivity floor on a sample / weighted standard deviation (or variance)
+/// before it is used as a divisor for z-normalization or as a closed-form
+/// slope denominator. Strictly a numerical-safety threshold: an `sd` (or
+/// `var`) at or below this magnitude is treated as "effectively zero" and
+/// the dependent computation either fails fast with a context-tagged error
+/// or falls back to a safe default (e.g. slope = 0). Distinct from
+/// `BERNOULLI_LINK_PROBABILITY_EPS` (which clamps a probability, not a
+/// scale) and from any convergence / derivative tolerance.
+const BMS_VARIANCE_FLOOR: f64 = 1e-12;
+
+/// Lower magnitude on a first-derivative / gradient quantity below which
+/// the value is treated as numerically zero. Used both as a 2-D pilot
+/// gradient-norm convergence threshold and as an observed-logslope
+/// denominator guard in the marginal-slope row kernel. Hoisted so all
+/// "is this derivative effectively zero?" sites share one tolerance.
+const BMS_DERIV_TOL: f64 = 1e-8;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliMarginalLinkMap {
@@ -2212,7 +2229,7 @@ pub(crate) fn standardize_latent_z_with_policy(
         .sum::<f64>()
         / weight_sum;
     let sd = var.sqrt();
-    if !(sd.is_finite() && sd > 1e-12) {
+    if !(sd.is_finite() && sd > BMS_VARIANCE_FLOOR) {
         return Err(format!(
             "{context} requires z with positive finite weighted standard deviation"
         ));
@@ -2345,7 +2362,7 @@ fn pooled_probit_baseline(
     let mut beta0 = standard_normal_quantile(prevalence).map_err(|e| {
         format!("failed to initialize pooled bernoulli-marginal-slope pilot intercept: {e}")
     })?;
-    let mut beta1 = if z_var > 1e-12 { yz_cov / z_var } else { 0.0 };
+    let mut beta1 = if z_var > BMS_VARIANCE_FLOOR { yz_cov / z_var } else { 0.0 };
 
     let objective_grad_hess =
         |intercept: f64, slope: f64| -> Result<(f64, f64, f64, f64, f64, f64), String> {
@@ -2385,7 +2402,7 @@ fn pooled_probit_baseline(
             );
         }
         let grad_max = g0.abs().max(g1.abs());
-        if grad_max < 1e-8 {
+        if grad_max < BMS_DERIV_TOL {
             break;
         }
         let mut ridge = 1e-8;
@@ -7279,7 +7296,7 @@ impl BernoulliMarginalSlopeFamily {
             rigid_intercept_from_marginal(marginal.q, slope, probit_scale) / probit_scale;
         if beta_w.is_some() {
             let (l_val, l_d1) = self.link_terms_value_d1_at_row(row, a_rigid_pre_scale, beta_w)?;
-            if l_d1 > 1e-8 {
+            if l_d1 > BMS_DERIV_TOL {
                 let ell0 = l_val - l_d1 * a_rigid_pre_scale;
                 let observed_logslope = probit_scale * l_d1 * slope;
                 return Ok(
@@ -7372,7 +7389,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|row| {
                 let a = a_pre_scale_vec[row];
                 let ell1 = l_d1_vec[row];
-                if ell1 > 1e-8 {
+                if ell1 > BMS_DERIV_TOL {
                     let ell0 = l_val_vec[row] - ell1 * a;
                     let observed_logslope = probit_scale * ell1 * slope_eta[row];
                     (marginals[row].q * (1.0 + observed_logslope * observed_logslope).sqrt()
