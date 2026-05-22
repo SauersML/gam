@@ -10845,6 +10845,10 @@ impl JointNewtonMathDiagnostic {
             / self.predicted_reduction.abs().max(1.0)
     }
 
+    fn linearized_rel(&self) -> f64 {
+        self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
+    }
+
     fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
         new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
     }
@@ -10858,7 +10862,7 @@ fn constrained_stationary_certificate_decision(
     residual: f64,
     residual_tol: f64,
 ) -> ConstrainedStationaryCertificate {
-    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+    let linearized_rel = math.linearized_rel();
     let scalar_model_relerr = math.scalar_model_relative_error();
     let objective_exhausted = objective_change <= objective_tol
         || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
@@ -12669,8 +12673,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Newton equation.
                 let quadratic_defect = math_diag.quadratic_defect_ratio(residual);
                 let scalar_model_relerr = math_diag.scalar_model_relative_error();
-                let linearized_rel =
-                    math_diag.linearized_next_kkt_inf / (1.0 + math_diag.old_kkt_inf);
+                let linearized_rel = math_diag.linearized_rel();
                 last_joint_math = Some(math_diag.clone());
                 if verbose_cycle || residual > 100.0 * residual_tol || scalar_model_relerr > 1e-3 {
                     log::info!(
@@ -12850,7 +12853,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // have already failed the trust-region's scalar model test
             // and been rejected upstream.
             if let Some(math) = last_joint_math.as_ref() {
-                let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+                let linearized_rel = math.linearized_rel();
                 let scalar_model_relerr = math.scalar_model_relative_error();
                 let geometric_tail_bound = if geometric_tail_history.len() == GEOMETRIC_TAIL_WINDOW
                 {
@@ -13085,7 +13088,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // not an attempt-level intermediate that the trust-region loop
             // may have rejected.
             if let Some(math) = last_joint_math.as_ref() {
-                let linearized_rel_now = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+                let linearized_rel_now = math.linearized_rel();
                 if joint_linearized_rate_stall_candidate(linearized_rel_now, residual, residual_tol)
                 {
                     linearized_stall_streak = linearized_stall_streak.saturating_add(1);
