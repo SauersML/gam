@@ -2348,6 +2348,109 @@ impl<'a> RemlState<'a> {
         self.prev_warm_start_rho.write().unwrap().take();
         self.ift_warm_start_cache.write().unwrap().take();
         self.ift_cached_factor.write().unwrap().take();
+        self.clear_ift_mode_response_cache();
+    }
+
+    fn ift_mode_response_cache_key(&self) -> usize {
+        self as *const Self as usize
+    }
+
+    fn clear_ift_mode_response_cache(&self) {
+        if let Some(caches) = IFT_MODE_RESPONSE_CACHES.get() {
+            caches
+                .lock()
+                .unwrap()
+                .remove(&self.ift_mode_response_cache_key());
+        }
+    }
+
+    fn mode_response_cols_for_warm_start(
+        &self,
+        bundle: &EvalShared,
+        cols: &Array2<f64>,
+    ) -> Option<Array2<f64>> {
+        if cols.ncols() == 0 || cols.nrows() != self.p {
+            return None;
+        }
+        if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+            return Some(cols.clone());
+        }
+        match bundle.pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => Some(cols.clone()),
+            pirls::PirlsCoordinateFrame::TransformedQs
+                if self
+                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                    .is_none() =>
+            {
+                // `build_auto_assembly` routes this case through
+                // `build_dense_original_assembly`, so evaluator columns are
+                // already in the same original basis as the warm-start β.
+                Some(cols.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn store_ift_mode_response_cache_from_result(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        result: &super::unified::RemlLamlResult,
+    ) {
+        let rho_cols = result
+            .rho_mode_response_cols
+            .as_ref()
+            .and_then(|cols| self.mode_response_cols_for_warm_start(bundle, cols));
+        let ext_cols = result
+            .ext_mode_response_cols
+            .as_ref()
+            .and_then(|cols| self.mode_response_cols_for_warm_start(bundle, cols));
+        if rho_cols.is_none() && ext_cols.is_none() {
+            self.clear_ift_mode_response_cache();
+            return;
+        }
+        let rho_col_count = rho_cols.as_ref().map_or(0, Array2::ncols);
+        let ext_col_count = ext_cols.as_ref().map_or(0, Array2::ncols);
+        ift_mode_response_caches().lock().unwrap().insert(
+            self.ift_mode_response_cache_key(),
+            IftModeResponseRuntimeCache {
+                rho: rho.clone(),
+                rho_mode_response_cols: rho_cols,
+                ext_mode_response_cols: ext_cols,
+            },
+        );
+        log::debug!(
+            "[IFT-CACHE] outcome=mode_response_store rho_cols={} ext_cols={} p={}",
+            rho_col_count,
+            ext_col_count,
+            self.p,
+        );
+    }
+
+    fn cached_ift_rho_mode_response_cols(
+        &self,
+        cache: &super::IftWarmStartCache,
+    ) -> Option<Array2<f64>> {
+        let guard = ift_mode_response_caches().lock().unwrap();
+        let cached = guard.get(&self.ift_mode_response_cache_key())?;
+        if cached.rho.len() != cache.rho.len()
+            || cached
+                .rho
+                .iter()
+                .zip(cache.rho.iter())
+                .any(|(&a, &b)| a.to_bits() != b.to_bits())
+        {
+            return None;
+        }
+        let _ext_col_count = cached
+            .ext_mode_response_cols
+            .as_ref()
+            .map_or(0, Array2::ncols);
+        let cols = cached.rho_mode_response_cols.as_ref()?;
+        if cols.nrows() != self.p || cols.ncols() != cache.rho.len() {
+            return None;
+        }
+        Some(cols.clone())
     }
 
     /// Wipe every atomic-bit-packed signal used by the adaptive
@@ -3747,6 +3850,7 @@ impl<'a> RemlState<'a> {
                 // here so the next predict call lazily refactors the
                 // new H_pen and stashes the new factor.
                 self.ift_cached_factor.write().unwrap().take();
+                self.clear_ift_mode_response_cache();
             }
             _ => {
                 // On a failed solve, drop both the current pair AND the
@@ -5826,6 +5930,104 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     ))
 }
 
+fn predict_warm_start_beta_ift_from_mode_response_cols(
+    cache: &super::IftWarmStartCache,
+    new_rho: &Array1<f64>,
+    p: usize,
+    last_ift_residual: Option<f64>,
+    max_drho_cap_override: Option<f64>,
+    rho_mode_response_cols: &Array2<f64>,
+) -> Option<(Coefficients, IftPredictionOutcome)> {
+    if cache.rho.is_empty() {
+        return None;
+    }
+    let k = cache.rho.len();
+    if new_rho.len() != k {
+        log::info!(
+            "[IFT-REJECTED] reason=rho_dim_mismatch new_rho_dim={} cache_rho_dim={}",
+            new_rho.len(),
+            k,
+        );
+        return None;
+    }
+    if cache.beta_original.len() != p {
+        log::info!(
+            "[IFT-REJECTED] reason=beta_dim_mismatch cache_beta_dim={} expected_p={}",
+            cache.beta_original.len(),
+            p,
+        );
+        return None;
+    }
+    if rho_mode_response_cols.nrows() != p || rho_mode_response_cols.ncols() != k {
+        return None;
+    }
+
+    let mut max_abs_drho = 0.0_f64;
+    let drho: Array1<f64> = (0..k)
+        .map(|i| {
+            let d = new_rho[i] - cache.rho[i];
+            if !d.is_finite() {
+                return f64::INFINITY;
+            }
+            if d.abs() > max_abs_drho {
+                max_abs_drho = d.abs();
+            }
+            d
+        })
+        .collect();
+    let max_drho_cap = max_drho_cap_override
+        .filter(|cap| cap.is_finite() && *cap > 0.0)
+        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
+    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+        log::info!(
+            "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
+            max_abs_drho,
+            max_drho_cap,
+            k,
+        );
+        return None;
+    }
+
+    if drho.iter().all(|d| d.abs() <= IFT_WARM_START_DRHO_EPS) {
+        log::info!(
+            "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
+        return Some((
+            Coefficients::new(cache.beta_original.clone()),
+            IftPredictionOutcome::Noop,
+        ));
+    }
+
+    let solution_original = rho_mode_response_cols.dot(&drho);
+    if !solution_original.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    let mut predicted = cache.beta_original.clone();
+    for (target, &correction) in predicted.iter_mut().zip(solution_original.iter()) {
+        *target -= correction;
+    }
+    if !predicted.iter().all(|v| v.is_finite()) {
+        log::info!(
+            "[IFT-REJECTED] reason=non_finite_predicted max_drho={:.3e} drho_dim={}",
+            max_abs_drho,
+            k,
+        );
+        return None;
+    }
+    log::debug!(
+        "[warm-start] IFT prediction reused mode responses: max|Δρ|={:.3e}, ‖Δβ‖={:.3e}",
+        max_abs_drho,
+        solution_original.dot(&solution_original).sqrt(),
+    );
+    Some((
+        Coefficients::new(predicted),
+        IftPredictionOutcome::Predicted,
+    ))
+}
+
 impl<'a> RemlState<'a> {
     /// Compute the scalar outer objective value used by the planner-selected
     /// outer optimizer.
@@ -7213,6 +7415,7 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let result = self.apply_tk_to_result(result, tk_terms)?;
+        self.store_ift_mode_response_cache_from_result(rho, bundle, &result);
         if let Some(polish_step) = result.inner_polish_step.as_ref() {
             self.apply_inner_polish_step_to_warm_start(bundle, &solution_beta, polish_step);
         }
@@ -7253,6 +7456,7 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
+        self.store_ift_mode_response_cache_from_result(rho, bundle, &cost_result);
         let gradient = cost_result
             .gradient
             .as_ref()

@@ -955,6 +955,62 @@ def test_duchon_function_norm_penalty_2d_periodic_per_axis() -> None:
     )
 
 
+def test_periodic_spline_curve_basis_is_periodic_and_partitions_unity() -> None:
+    """Cyclic B-spline basis wraps cleanly and rows sum to one."""
+    t = np.array([0.0, 0.07, 0.5, 0.999_999, 1.0, 1.07, -0.93], dtype=float)
+    basis, penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
+    assert basis.shape == (t.size, 12)
+    assert penalty.shape == (12, 12)
+    # partition of unity
+    assert np.allclose(basis.sum(axis=1), 1.0, atol=1e-12)
+    # endpoints match (t=0 and t=1)
+    assert np.allclose(basis[0], basis[4], atol=1e-12)
+    # cyclic penalty has constant nullspace
+    ones = np.ones((12, 1))
+    assert np.allclose(penalty @ ones, 0.0, atol=1e-10)
+
+
+def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
+    """End-to-end PeriodicSplineCurve fit through gamfit.torch.fit on a circle."""
+    torch = pytest.importorskip("torch")
+    from gamfit import PeriodicSplineCurve
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(0)
+    n = 128
+    t_np = np.linspace(0.0, 1.0, n, endpoint=False)
+    y_np = np.stack(
+        [
+            np.cos(2.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
+            np.sin(2.0 * np.pi * t_np) + 0.02 * rng.standard_normal(n),
+        ],
+        axis=1,
+    )
+
+    t = torch.as_tensor(t_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    spec = PeriodicSplineCurve(n_knots=10, degree=3, output_dim=2)
+
+    result = torch_fit(t, y, spec)
+    fitted = result.fitted.detach().cpu().numpy()
+    assert fitted.shape == (n, 2)
+    # residuals should be small (noise std ~0.02)
+    resid = fitted - y_np
+    assert np.sqrt((resid ** 2).mean()) < 0.1
+
+    # periodicity: predict at t=0 and t=1 via fresh basis on each
+    basis0, _ = gamfit.periodic_spline_curve_basis(
+        np.array([0.0]), n_knots=10, degree=3
+    )
+    basis1, _ = gamfit.periodic_spline_curve_basis(
+        np.array([1.0]), n_knots=10, degree=3
+    )
+    coef = result.coefficients.detach().cpu().numpy()  # shape (K, D)
+    f0 = basis0 @ coef
+    f1 = basis1 @ coef
+    assert np.allclose(f0, f1, atol=1e-10)
+
+
 def test_per_smooth_lambda_not_in_torch_additive_pending_rust_refactor() -> None:
     # The torch additive REML path is structurally single-λ because the
     # closed-form Gaussian REML kernel in
