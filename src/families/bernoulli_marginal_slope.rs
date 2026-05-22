@@ -7495,11 +7495,14 @@ impl BernoulliMarginalSlopeFamily {
         F: FnMut(usize, usize, exact_kernel::LocalSpanCubic) -> Result<(), String>,
     {
         if primary_range.len() != runtime.basis_dim() {
-            return Err(format!(
-                "{label} primary range length {} does not match deviation basis dimension {}",
-                primary_range.len(),
-                runtime.basis_dim()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "{label} primary range length {} does not match deviation basis dimension {}",
+                    primary_range.len(),
+                    runtime.basis_dim()
+                ),
+            }
+            .into());
         }
         runtime.for_each_basis_cubic_at(value, |local_idx, basis_span| {
             visit(local_idx, primary_range.start + local_idx, basis_span)
@@ -7580,9 +7583,12 @@ impl BernoulliMarginalSlopeFamily {
             f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
         }
         if !(f.is_finite() && f_a.is_finite() && f_a > 0.0 && f_aa.is_finite()) {
-            return Err(format!(
-                "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
+                ),
+            }
+            .into());
         }
         Ok((f, f_a, f_aa))
     }
@@ -7620,10 +7626,16 @@ impl BernoulliMarginalSlopeFamily {
     /// live so derivatives with respect to those coefficients remain available.
     fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
         if self.score_warp.is_some() && self.score_beta(block_states)?.is_none() {
-            return Err("missing bernoulli score-warp block state".to_string());
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: "missing bernoulli score-warp block state".to_string(),
+            }
+            .into());
         }
         if self.link_dev.is_some() && self.link_beta(block_states)?.is_none() {
-            return Err("missing bernoulli link-deviation block state".to_string());
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: "missing bernoulli link-deviation block state".to_string(),
+            }
+            .into());
         }
         Ok(self.flex_active())
     }
@@ -7678,10 +7690,13 @@ impl BernoulliMarginalSlopeFamily {
         let values = Array1::from_vec(vec![eta0]);
         let basis = if let Some(anchor_rows) = runtime.anchor_rows_at_training() {
             if row >= anchor_rows.nrows() {
-                return Err(format!(
-                    "link_terms_value_d1_at_row: row {row} out of bounds for {} cached training anchor rows",
-                    anchor_rows.nrows()
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "link_terms_value_d1_at_row: row {row} out of bounds for {} cached training anchor rows",
+                        anchor_rows.nrows()
+                    ),
+                }
+                .into());
             }
             let anchor_view = anchor_rows.slice(ndarray::s![row..row + 1, ..]);
             runtime.design_with_anchor_rows(&values, anchor_view)?
@@ -8178,10 +8193,13 @@ impl BernoulliMarginalSlopeFamily {
         );
 
         if f_best.abs() > abs_tol {
-            return Err(format!(
-                "bernoulli marginal-slope intercept solve failed: \
-                 residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
-            ));
+            return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                reason: format!(
+                    "bernoulli marginal-slope intercept solve failed: \
+                     residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
+                ),
+            }
+            .into());
         }
 
         // Cache the converged intercept for the next PIRLS iter.
@@ -8653,11 +8671,14 @@ impl BernoulliMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         if d_beta_flat.len() != slices.total {
-            return Err(format!(
-                "bernoulli marginal-slope d_beta length mismatch: got {}, expected {}",
-                d_beta_flat.len(),
-                slices.total
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope d_beta length mismatch: got {}, expected {}",
+                    d_beta_flat.len(),
+                    slices.total
+                ),
+            }
+            .into());
         }
         let mut out = Array1::<f64>::zeros(primary.total);
         out[primary.q] = self
@@ -8815,9 +8836,12 @@ impl BernoulliMarginalSlopeFamily {
                 out[primary.logslope] = x_row.dot(&block_states[1].beta);
             }
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi direction only supports spatial marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi direction only supports spatial marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         }
         Ok(out)
@@ -8849,9 +8873,12 @@ impl BernoulliMarginalSlopeFamily {
                     x_row.dot(&d_beta_flat.slice(s![slices.logslope.clone()]).to_owned())
             }
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi action only supports marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi action only supports marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         }
         Ok(out)
@@ -8920,9 +8947,12 @@ impl BernoulliMarginalSlopeFamily {
                 slices.logslope.clone(),
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         };
         Ok(BlockPsiRow {
@@ -9663,10 +9693,12 @@ impl BernoulliMarginalSlopeFamily {
             )));
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in third-order directional contraction"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason:
+                    "non-finite flexible row context in third-order directional contraction"
+                        .to_string(),
+            }
+            .into());
         }
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
@@ -10270,10 +10302,13 @@ impl BernoulliMarginalSlopeFamily {
         second_adjoint: &mut [f64; 4],
     ) -> Result<(), String> {
         if moments.len() < 10 {
-            return Err(format!(
-                "insufficient reduced moments for second-derivative adjoint: need 10, have {}",
-                moments.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "insufficient reduced moments for second-derivative adjoint: need 10, have {}",
+                    moments.len()
+                ),
+            }
+            .into());
         }
         let scale = scalar_adjoint / std::f64::consts::TAU;
         let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
@@ -10305,10 +10340,13 @@ impl BernoulliMarginalSlopeFamily {
         third_rst_adjoint: &mut [f64; 4],
     ) -> Result<(), String> {
         if moments.len() < 16 {
-            return Err(format!(
-                "insufficient reduced moments for third-derivative adjoint: need 16, have {}",
-                moments.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "insufficient reduced moments for third-derivative adjoint: need 16, have {}",
+                    moments.len()
+                ),
+            }
+            .into());
         }
         let scale = scalar_adjoint / std::f64::consts::TAU;
         let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
@@ -10372,11 +10410,14 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let r = primary.total;
         if gram.len() != r * r {
-            return Err(format!(
-                "bernoulli marginal-slope row trace gram length {} != {}",
-                gram.len(),
-                r * r
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope row trace gram length {} != {}",
+                    gram.len(),
+                    r * r
+                ),
+            }
+            .into());
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -10393,10 +10434,12 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(grad);
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in third-order trace-gradient contraction"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason:
+                    "non-finite flexible row context in third-order trace-gradient contraction"
+                        .to_string(),
+            }
+            .into());
         }
 
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
@@ -11122,17 +11165,23 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Vec::new());
         }
         if gram.len() != r * r {
-            return Err(format!(
-                "bernoulli marginal-slope row trace gram length {} != {}",
-                gram.len(),
-                r * r
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope row trace gram length {} != {}",
+                    gram.len(),
+                    r * r
+                ),
+            }
+            .into());
         }
         if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
-            return Err(format!(
-                "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
-                dir.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
+                    dir.len()
+                ),
+            }
+            .into());
         }
 
         if row_dirs.len() > 1 {
@@ -11163,10 +11212,12 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(traces);
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in batched third-order trace contraction"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason:
+                    "non-finite flexible row context in batched third-order trace contraction"
+                        .to_string(),
+            }
+            .into());
         }
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
@@ -11692,11 +11743,14 @@ impl BernoulliMarginalSlopeFamily {
         let flex_active = self.effective_flex_active(block_states)?;
         let expected_dir_len = if flex_active { cache.primary.total } else { 2 };
         if dir_u.len() != expected_dir_len || dir_v.len() != expected_dir_len {
-            return Err(format!(
-                "bernoulli fourth contracted row {row}: direction lengths ({},{}) != {expected_dir_len}",
-                dir_u.len(),
-                dir_v.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli fourth contracted row {row}: direction lengths ({},{}) != {expected_dir_len}",
+                    dir_u.len(),
+                    dir_v.len()
+                ),
+            }
+            .into());
         }
 
         // Keep this row-local helper serial. All expensive callers parallelize
@@ -11724,10 +11778,12 @@ impl BernoulliMarginalSlopeFamily {
             )));
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in fourth-order directional contraction"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason:
+                    "non-finite flexible row context in fourth-order directional contraction"
+                        .to_string(),
+            }
+            .into());
         }
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
