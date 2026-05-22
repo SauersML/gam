@@ -5841,7 +5841,8 @@ pub struct RemlLamlResult {
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
     pub hessian: crate::solver::outer_strategy::HessianResult,
     /// Rho-coordinate mode responses, one `K · g_j` vector per column, when
-    /// they were already built for derivative corrections.
+    /// they were already built for derivative corrections. Consumed by the
+    /// runtime IFT mode-response cache for joint-IFT warm starts.
     pub rho_mode_response_cols: Option<Array2<f64>>,
     /// Extended-coordinate mode responses, one `K · g_j` vector per column,
     /// when extended derivative coordinates required them.

@@ -4938,7 +4938,7 @@ where
             if force_fisher_for_rest && !aa_state.disabled {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
-                    candidate_buf.assign(beta_accel);
+                    candidate_buf.assign(&beta_accel);
                     // Apply the same bound projection the loop already runs on
                     // the plain candidate. Treat this as the "existing
                     // validity check": if projection moves the accelerated
