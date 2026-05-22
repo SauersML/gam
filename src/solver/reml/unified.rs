@@ -7473,8 +7473,21 @@ pub fn reml_laml_evaluate(
                 None
             }
         });
-    let kkt_residual_was_applied = kkt_residual_correction_active;
-    let envelope_suppresses_outputs = envelope_inconsistent.is_some() && !kkt_residual_was_applied;
+    // Principled rule: `envelope_inconsistent` is evaluated on the
+    // *post-correction* gradient (the `kkt_rho_corrections.gradient`
+    // additive block above has already been folded into `grad`). If the
+    // predicted √ε-step cost change still exceeds 4·|cost| after that
+    // fold, the gradient is invalid as a descent direction. A previous
+    // exception kept the gradient when `kkt_residual_correction_active`
+    // was true, but that was self-contradictory: the tripwire fires on
+    // the same gradient the correction was supposed to have repaired,
+    // and when `‖r_proj‖∞ ≈ 0` (the cert-exit contract) the correction
+    // `-aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r ≡ 0` is identically zero
+    // (see `compute_kkt_residual_rho_corrections`). Suppress
+    // unconditionally and let the outer optimizer fall back to FD or
+    // reject the seed.
+    let envelope_suppresses_outputs = envelope_inconsistent.is_some();
+    let _ = kkt_residual_correction_active; // cost-side IFT identity logged earlier
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
         && solution.kkt_residual.is_none()
@@ -7681,25 +7694,16 @@ pub fn reml_laml_evaluate(
 
     // Envelope-gradient sanity tripwire — last line of defense.
     //
-    // The verdict (`envelope_inconsistent` + `kkt_residual_was_applied`)
-    // was already computed before the outer-Hessian assembly so that an
-    // unsalvageable gradient short-circuits the (potentially 20+ minute)
-    // Hessian build. Translate the verdict into the final gradient output
-    // and emit the user-facing log line at most once per evaluation:
-    //
-    // * IFT correction not applied + envelope inconsistent → suppress
-    //   gradient and Hessian; the outer wrapper falls back to FD or
-    //   aborts cleanly instead of grinding TR to floor on a wrong
-    //   descent direction.
-    // * IFT correction applied + envelope inconsistent → keep gradient
-    //   (it's the principled total derivative); just log the unusual
-    //   magnitude at debug.
-    // * Envelope consistent → keep gradient silently.
-    //
-    // Threshold ratio > 4 keeps healthy near-stationary gradients
-    // (|g|∞ ≈ √ε · |cost|, ratio ≈ 1) from tripping.
+    // The post-IFT-correction gradient is what `envelope_inconsistent` is
+    // computed on (the `kkt_rho_corrections.gradient` block was folded in
+    // earlier in this function). If the predicted √ε-step cost change
+    // still exceeds 4·|cost| after that fold, the gradient is invalid as
+    // a descent direction. Suppress and let the outer optimizer fall
+    // back to FD or reject the seed. Threshold ratio > 4 keeps healthy
+    // near-stationary gradients (|g|∞ ≈ √ε·|cost|, ratio ≈ 1) from
+    // tripping.
     let gradient_out = match envelope_inconsistent {
-        Some((max_idx, max_abs, predicted_change)) if !kkt_residual_was_applied => {
+        Some((max_idx, max_abs, predicted_change)) => {
             // Self-diagnosing warning. The three gates that control whether
             // the IFT correction can run all map to observable booleans, so
             // the next failing run pinpoints the cause without another
@@ -7740,19 +7744,6 @@ pub fn reml_laml_evaluate(
                 kernel_present,
             );
             None
-        }
-        Some((max_idx, max_abs, predicted_change)) => {
-            // IFT correction was applied; gradient is principled.  Surface the
-            // unusual magnitude in case downstream optimizers want it, but do
-            // not suppress.
-            log::debug!(
-                "[reml_laml envelope-gradient post-IFT] |g|∞ = {:.3e} at coord {} (ratio {:.2e} vs \
-                 √ε·|cost|); IFT correction applied — gradient is the principled total derivative.",
-                max_abs,
-                max_idx,
-                predicted_change / cost_scale,
-            );
-            Some(grad)
         }
         None => Some(grad),
     };
