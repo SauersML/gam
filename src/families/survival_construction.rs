@@ -1622,7 +1622,10 @@ pub fn evaluate_survival_time_basis_row(
                 return Ok(row.to_owned());
             }
             if keep_cols.iter().any(|&j| j >= row.len()) {
-                return Err("survival ISpline anchor keep_cols exceed basis width".to_string());
+                return Err(SurvivalConstructionError::MissingColumn {
+                    reason: "survival ISpline anchor keep_cols exceed basis width".to_string(),
+                }
+                .into());
             }
             Ok(Array1::from_iter(keep_cols.iter().map(|&j| row[j])))
         }
@@ -1714,7 +1717,10 @@ pub fn baseline_offset_theta_partials(
                 .shape
                 .ok_or_else(|| "weibull missing shape".to_string())?;
             if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
-                return Err("weibull baseline requires finite positive scale and shape".to_string());
+                return Err(SurvivalConstructionError::InvalidConfig {
+                    reason: "weibull baseline requires finite positive scale and shape".to_string(),
+                }
+                .into());
             }
             let eta = shape * (age.ln() - scale.ln());
             let o_d = shape / age;
@@ -1785,7 +1791,10 @@ pub fn baseline_offset_theta_partials(
             let (cum_g, inst_g) = gompertz_hazard_components(age, rate, shape);
             let cum_total = makeham * age + cum_g;
             if cum_total <= 0.0 || !cum_total.is_finite() {
-                return Err("gm baseline produced non-positive cumulative hazard".to_string());
+                return Err(SurvivalConstructionError::DataValidationFailed {
+                    reason: "gm baseline produced non-positive cumulative hazard".to_string(),
+                }
+                .into());
             }
             let inst_total = makeham + inst_g;
             let o_d = inst_total / cum_total;
@@ -2100,7 +2109,10 @@ fn survival_hazard_theta_partials(
                 .shape
                 .ok_or_else(|| "weibull missing shape".to_string())?;
             if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
-                return Err("weibull baseline requires finite positive scale and shape".to_string());
+                return Err(SurvivalConstructionError::InvalidConfig {
+                    reason: "weibull baseline requires finite positive scale and shape".to_string(),
+                }
+                .into());
             }
             let log_time_ratio = age.ln() - scale.ln();
             let cumulative_hazard = (age / scale).powf(shape);
@@ -2180,7 +2192,10 @@ fn survival_cumulative_and_instant_hazard(
                 .shape
                 .ok_or_else(|| "weibull missing shape".to_string())?;
             if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
-                return Err("weibull baseline requires finite positive scale and shape".to_string());
+                return Err(SurvivalConstructionError::InvalidConfig {
+                    reason: "weibull baseline requires finite positive scale and shape".to_string(),
+                }
+                .into());
             }
             let cumulative_hazard = (age / scale).powf(shape);
             let instant_hazard = shape * cumulative_hazard / age;
@@ -2616,7 +2631,10 @@ pub fn build_survival_baseline_offsets(
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     if age_entry.len() != age_exit.len() {
-        return Err("survival baseline offsets require matching entry/exit lengths".to_string());
+        return Err(SurvivalConstructionError::IncompatibleDimensions {
+            reason: "survival baseline offsets require matching entry/exit lengths".to_string(),
+        }
+        .into());
     }
     let n = age_entry.len();
     let mut eta_entry = Array1::<f64>::zeros(n);
@@ -2626,7 +2644,10 @@ pub fn build_survival_baseline_offsets(
         let (e0, _) = evaluate_survival_baseline(age_entry[i], cfg)?;
         let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
         if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-            return Err("non-finite survival baseline offsets computed".to_string());
+            return Err(SurvivalConstructionError::DataValidationFailed {
+                reason: "non-finite survival baseline offsets computed".to_string(),
+            }
+            .into());
         }
         eta_entry[i] = e0;
         eta_exit[i] = e1;
@@ -2655,7 +2676,10 @@ pub fn build_survival_marginal_slope_baseline_offsets(
         let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
         let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
         if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-            return Err("non-finite survival probit baseline offsets computed".to_string());
+            return Err(SurvivalConstructionError::DataValidationFailed {
+                reason: "non-finite survival probit baseline offsets computed".to_string(),
+            }
+            .into());
         }
         eta_entry[i] = e0;
         eta_exit[i] = e1;
@@ -2722,7 +2746,10 @@ pub fn add_survival_time_derivative_guard_offset(
         || eta_offset_exit.len() != n
         || derivative_offset_exit.len() != n
     {
-        return Err("survival derivative-guard offset lengths must match".to_string());
+        return Err(SurvivalConstructionError::IncompatibleDimensions {
+            reason: "survival derivative-guard offset lengths must match".to_string(),
+        }
+        .into());
     }
     for i in 0..n {
         eta_offset_entry[i] += derivative_guard * (age_entry[i] - anchor_time);
