@@ -1,8 +1,53 @@
 use crate::faer_ndarray::{FaerSvd, fast_ab};
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
+use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Typed error variants for the scale-deviation design module.
+///
+/// External-facing helpers continue to return `Result<_, String>`; this enum
+/// is materialized internally and converted at the boundary so that error
+/// text remains byte-identical to the previous `format!` output.
+#[derive(Debug, Clone)]
+pub enum ScaleDesignError {
+    /// Weight vector contains an invalid entry (NaN/inf, negative, or sums
+    /// to a non-positive / non-finite total).
+    InvalidWeights { reason: String },
+    /// Dimensions of the supplied matrices/vectors are inconsistent.
+    IncompatibleDimensions { reason: String },
+    /// Input value is not finite where finiteness is required (e.g. saved
+    /// projection ridge alpha).
+    NonFiniteInput { reason: String },
+    /// Saved payload is partially populated or the projection is degenerate
+    /// (e.g. zero rows with non-empty columns).
+    DegenerateDesign { reason: String },
+    /// Row materialization from an underlying `DesignMatrix` failed.
+    RowMaterializationFailed { reason: String },
+    /// Thin SVD of the weighted primary design failed or produced no
+    /// singular vectors.
+    SvdFailed { reason: String },
+}
+
+impl fmt::Display for ScaleDesignError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScaleDesignError::InvalidWeights { reason }
+            | ScaleDesignError::IncompatibleDimensions { reason }
+            | ScaleDesignError::NonFiniteInput { reason }
+            | ScaleDesignError::DegenerateDesign { reason }
+            | ScaleDesignError::RowMaterializationFailed { reason }
+            | ScaleDesignError::SvdFailed { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl From<ScaleDesignError> for String {
+    fn from(err: ScaleDesignError) -> String {
+        err.to_string()
+    }
+}
 
 const COLUMN_TOL: f64 = 1e-12;
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -47,21 +92,44 @@ pub fn scale_transform_from_payload(
     non_intercept_start: Option<usize>,
     projection_ridge_alpha: Option<f64>,
 ) -> Result<Option<ScaleDeviationTransform>, String> {
+    scale_transform_from_payload_typed(
+        projection,
+        center,
+        scale,
+        non_intercept_start,
+        projection_ridge_alpha,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn scale_transform_from_payload_typed(
+    projection: &Option<Vec<Vec<f64>>>,
+    center: &Option<Vec<f64>>,
+    scale: &Option<Vec<f64>>,
+    non_intercept_start: Option<usize>,
+    projection_ridge_alpha: Option<f64>,
+) -> Result<Option<ScaleDeviationTransform>, ScaleDesignError> {
     match (projection, center, scale, non_intercept_start) {
         (None, None, None, None) => Ok(None),
         (Some(projection), Some(center), Some(scale), Some(non_intercept_start)) => {
             let rows = projection.len();
             let cols = center.len();
             if cols != scale.len() {
-                return Err("saved scale transform center/scale length mismatch".to_string());
+                return Err(ScaleDesignError::IncompatibleDimensions {
+                    reason: "saved scale transform center/scale length mismatch".to_string(),
+                });
             }
             if rows == 0 && cols > 0 {
-                return Err("saved scale transform projection has zero rows".to_string());
+                return Err(ScaleDesignError::DegenerateDesign {
+                    reason: "saved scale transform projection has zero rows".to_string(),
+                });
             }
             let mut projection_coef = Array2::<f64>::zeros((rows, cols));
             for (i, row) in projection.iter().enumerate() {
                 if row.len() != cols {
-                    return Err("saved scale transform projection width mismatch".to_string());
+                    return Err(ScaleDesignError::IncompatibleDimensions {
+                        reason: "saved scale transform projection width mismatch".to_string(),
+                    });
                 }
                 for (j, &value) in row.iter().enumerate() {
                     projection_coef[[i, j]] = value;
@@ -72,9 +140,11 @@ pub fn scale_transform_from_payload(
             // coefficients exactly, which is the previous behavior.
             let projection_ridge_alpha = projection_ridge_alpha.unwrap_or(0.0);
             if !projection_ridge_alpha.is_finite() || projection_ridge_alpha < 0.0 {
-                return Err(format!(
-                    "saved scale transform projection_ridge_alpha must be finite and non-negative, got {projection_ridge_alpha}"
-                ));
+                return Err(ScaleDesignError::NonFiniteInput {
+                    reason: format!(
+                        "saved scale transform projection_ridge_alpha must be finite and non-negative, got {projection_ridge_alpha}"
+                    ),
+                });
             }
             Ok(Some(ScaleDeviationTransform {
                 projection_coef,
@@ -84,7 +154,9 @@ pub fn scale_transform_from_payload(
                 projection_ridge_alpha,
             }))
         }
-        _ => Err("saved scale transform payload is only partially populated; refit".to_string()),
+        _ => Err(ScaleDesignError::DegenerateDesign {
+            reason: "saved scale transform payload is only partially populated; refit".to_string(),
+        }),
     }
 }
 
@@ -109,12 +181,16 @@ impl ScaleDesignMatrixRef<'_> {
         }
     }
 
-    fn row_chunk(self, rows: Range<usize>) -> Result<Array2<f64>, String> {
+    fn row_chunk(self, rows: Range<usize>) -> Result<Array2<f64>, ScaleDesignError> {
         match self {
             Self::Dense(matrix) => Ok(matrix.slice(s![rows, ..]).to_owned()),
-            Self::Design(matrix) => matrix
-                .try_row_chunk(rows)
-                .map_err(|e| format!("scale deviation row materialization failed: {e}")),
+            Self::Design(matrix) => {
+                matrix
+                    .try_row_chunk(rows)
+                    .map_err(|e| ScaleDesignError::RowMaterializationFailed {
+                        reason: format!("scale deviation row materialization failed: {e}"),
+                    })
+            }
         }
     }
 }
@@ -126,6 +202,12 @@ pub fn infer_non_intercept_start(design: &Array2<f64>, weights: &Array1<f64>) ->
         "weighted column stats row mismatch".to_string(),
     )
     .unwrap_or(0)
+}
+
+fn dim_err(reason: impl Into<String>) -> ScaleDesignError {
+    ScaleDesignError::IncompatibleDimensions {
+        reason: reason.into(),
+    }
 }
 
 pub fn build_scale_deviation_transform(
@@ -141,6 +223,7 @@ pub fn build_scale_deviation_transform(
         non_intercept_start,
         "scale deviation transform row mismatch",
     )
+    .map_err(|e| e.to_string())
 }
 
 pub fn apply_scale_deviation_transform(
@@ -148,13 +231,22 @@ pub fn apply_scale_deviation_transform(
     rawnoise_design: &Array2<f64>,
     transform: &ScaleDeviationTransform,
 ) -> Result<Array2<f64>, String> {
+    apply_scale_deviation_transform_typed(primary_design, rawnoise_design, transform)
+        .map_err(|e| e.to_string())
+}
+
+fn apply_scale_deviation_transform_typed(
+    primary_design: &Array2<f64>,
+    rawnoise_design: &Array2<f64>,
+    transform: &ScaleDeviationTransform,
+) -> Result<Array2<f64>, ScaleDesignError> {
     if primary_design.nrows() != rawnoise_design.nrows() {
-        return Err("scale deviation apply row mismatch".to_string());
+        return Err(dim_err("scale deviation apply row mismatch"));
     }
     if primary_design.ncols() != transform.projection_coef.nrows()
         || rawnoise_design.ncols() != transform.projection_coef.ncols()
     {
-        return Err("scale deviation apply column mismatch".to_string());
+        return Err(dim_err("scale deviation apply column mismatch"));
     }
     let n = rawnoise_design.nrows();
     let p_primary = primary_design.ncols();
@@ -180,15 +272,17 @@ struct ScaleDeviationOperator {
 }
 
 impl ScaleDeviationOperator {
-    fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, String> {
-        let primary_chunk = self
-            .primary_design
-            .try_row_chunk(rows.clone())
-            .map_err(|e| format!("scale deviation operator primary chunk: {e}"))?;
-        let noise_chunk = self
-            .rawnoise_design
-            .try_row_chunk(rows)
-            .map_err(|e| format!("scale deviation operator noise chunk: {e}"))?;
+    fn row_chunk(&self, rows: Range<usize>) -> Result<Array2<f64>, ScaleDesignError> {
+        let primary_chunk = self.primary_design.try_row_chunk(rows.clone()).map_err(
+            |e| ScaleDesignError::RowMaterializationFailed {
+                reason: format!("scale deviation operator primary chunk: {e}"),
+            },
+        )?;
+        let noise_chunk = self.rawnoise_design.try_row_chunk(rows).map_err(|e| {
+            ScaleDesignError::RowMaterializationFailed {
+                reason: format!("scale deviation operator noise chunk: {e}"),
+            }
+        })?;
         Ok(apply_scale_deviation_reparam_chunk(
             &primary_chunk,
             &noise_chunk,
@@ -237,18 +331,19 @@ impl LinearOperator for ScaleDeviationOperator {
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
-            return Err(format!(
+            return Err(dim_err(format!(
                 "scale deviation operator XtWX weight mismatch: weights={}, rows={}",
                 weights.len(),
                 self.nrows()
-            ));
+            ))
+            .to_string());
         }
         let n = self.nrows();
         let p = self.ncols();
         let mut out = Array2::<f64>::zeros((p, p));
         for start in (0..n).step_by(self.chunk_rows) {
             let end = (start + self.chunk_rows).min(n);
-            let chunk = self.row_chunk(start..end)?;
+            let chunk = self.row_chunk(start..end).map_err(|e| e.to_string())?;
             for local in 0..chunk.nrows() {
                 let w = weights[start + local].max(0.0);
                 if w == 0.0 {
@@ -314,21 +409,27 @@ struct WeightedColumnStats {
     total_weight: f64,
 }
 
-fn validate_scale_weights(weights: &Array1<f64>) -> Result<f64, String> {
+fn validate_scale_weights(weights: &Array1<f64>) -> Result<f64, ScaleDesignError> {
     let mut total_weight = 0.0;
     for (idx, &w) in weights.iter().enumerate() {
         if !w.is_finite() {
-            return Err(format!("scale deviation weight {idx} is not finite"));
+            return Err(ScaleDesignError::NonFiniteInput {
+                reason: format!("scale deviation weight {idx} is not finite"),
+            });
         }
         if w < 0.0 {
-            return Err(format!(
-                "scale deviation requires non-negative weights, got {w} at index {idx}"
-            ));
+            return Err(ScaleDesignError::InvalidWeights {
+                reason: format!(
+                    "scale deviation requires non-negative weights, got {w} at index {idx}"
+                ),
+            });
         }
         total_weight += w;
     }
     if !total_weight.is_finite() || total_weight <= 0.0 {
-        return Err("scale deviation requires positive finite total weight".to_string());
+        return Err(ScaleDesignError::InvalidWeights {
+            reason: "scale deviation requires positive finite total weight".to_string(),
+        });
     }
     Ok(total_weight)
 }
@@ -343,9 +444,9 @@ fn weighted_column_stats(
     design: ScaleDesignMatrixRef<'_>,
     weights: &Array1<f64>,
     row_mismatch_error: String,
-) -> Result<WeightedColumnStats, String> {
+) -> Result<WeightedColumnStats, ScaleDesignError> {
     if design.nrows() != weights.len() {
-        return Err(row_mismatch_error);
+        return Err(dim_err(row_mismatch_error));
     }
     let total_weight = validate_scale_weights(weights)?;
     let p = design.ncols();
@@ -378,7 +479,7 @@ fn infer_non_intercept_start_impl(
     design: ScaleDesignMatrixRef<'_>,
     weights: &Array1<f64>,
     row_mismatch_error: String,
-) -> Result<usize, String> {
+) -> Result<usize, ScaleDesignError> {
     let stats = weighted_column_stats(design, weights, row_mismatch_error)?;
     let mut end = 0;
     for j in 0..stats.weighted_sum.len() {
@@ -397,7 +498,7 @@ fn build_weighted_primary_design(
     primary_design: ScaleDesignMatrixRef<'_>,
     sqrtw: &Array1<f64>,
     chunk_rows: usize,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, ScaleDesignError> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let mut wx = Array2::<f64>::zeros((n, p_primary));
@@ -443,7 +544,7 @@ fn solve_scale_projection(
     weights: &Array1<f64>,
     first_active: usize,
     chunk_rows: usize,
-) -> Result<(Array2<f64>, f64), String> {
+) -> Result<(Array2<f64>, f64), ScaleDesignError> {
     let n = primary_design.nrows();
     let p_primary = primary_design.ncols();
     let p_noise = noise_design.ncols();
@@ -459,11 +560,14 @@ fn solve_scale_projection(
     // Thin SVD of W^{1/2} X_primary: replay reduces to V * diag(filter) * U^T
     // applied to the weighted noise RHS.  Tikhonov filter factors are the
     // smooth alternative to RRQR rank truncation + coefficient cap.
-    let (u_opt, singular, vt_opt) = wx
-        .svd(true, true)
-        .map_err(|e| format!("scale projection SVD failed: {e:?}"))?;
+    let (u_opt, singular, vt_opt) =
+        wx.svd(true, true).map_err(|e| ScaleDesignError::SvdFailed {
+            reason: format!("scale projection SVD failed: {e:?}"),
+        })?;
     let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        return Err("scale projection SVD did not return singular vectors".to_string());
+        return Err(ScaleDesignError::SvdFailed {
+            reason: "scale projection SVD did not return singular vectors".to_string(),
+        });
     };
     let alpha = choose_scale_projection_ridge_alpha(singular.as_slice().unwrap_or(&[]));
     let rank = singular.len();
@@ -676,6 +780,7 @@ pub fn infer_non_intercept_start_design(
             weights.len()
         ),
     )
+    .map_err(|e| e.to_string())
 }
 
 pub fn build_scale_deviation_transform_design(
@@ -691,6 +796,7 @@ pub fn build_scale_deviation_transform_design(
         non_intercept_start,
         "scale deviation transform design row mismatch",
     )
+    .map_err(|e| e.to_string())
 }
 
 /// Apply the scale-deviation reparameterisation to a chunk of rows.
