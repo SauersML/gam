@@ -9293,7 +9293,10 @@ mod tests {
             None => Ok(None),
             Some(runtime) => {
                 runtime.derivative_q0(q0).map(|_| ())?;
-                runtime.constrained_basis(q0, basis_options).map(Some)
+                runtime
+                    .constrained_basis(q0, basis_options)
+                    .map(Some)
+                    .map_err(String::from)
             }
         }
     }
@@ -9303,7 +9306,7 @@ mod tests {
         model: &SavedModel,
     ) -> Result<Array1<f64>, String> {
         match model.saved_link_wiggle()? {
-            Some(runtime) => runtime.derivative_q0(q0),
+            Some(runtime) => runtime.derivative_q0(q0).map_err(String::from),
             None => Ok(Array1::ones(q0.len())),
         }
     }
@@ -9438,14 +9441,14 @@ mod tests {
                 &link_breaks,
                 |z| {
                     if let (Some(runtime), Some(beta)) = (score_runtime, score_beta) {
-                        runtime.local_cubic_at(beta, z)
+                        runtime.local_cubic_at(beta, z).map_err(String::from)
                     } else {
                         Ok(saved_survival_default_score_span())
                     }
                 },
                 |u| {
                     if let (Some(runtime), Some(beta)) = (link_runtime, link_beta) {
-                        runtime.local_cubic_at(beta, u)
+                        runtime.local_cubic_at(beta, u).map_err(String::from)
                     } else {
                         Ok(saved_survival_default_link_span())
                     }
@@ -10095,7 +10098,10 @@ mod tests {
         let err = model
             .saved_prediction_runtime()
             .expect_err("payload drift should be rejected");
-        assert!(err.contains("saved time coefficients disagree with fit_result"));
+        assert!(
+            err.to_string()
+                .contains("saved time coefficients disagree with fit_result")
+        );
     }
 
     #[test]
@@ -11765,7 +11771,10 @@ mod tests {
     fn parse_linkwiggle_rejects_unknown_options() {
         let err = parse_formula("y ~ x + linkwiggle(knots=9)")
             .expect_err("unknown linkwiggle options should be rejected");
-        assert!(err.contains("linkwiggle() does not support option(s) knots"));
+        assert!(
+            err.to_string()
+                .contains("linkwiggle() does not support option(s) knots")
+        );
     }
 
     #[test]
@@ -11879,7 +11888,10 @@ mod tests {
     fn parse_timewiggle_rejects_unknown_options() {
         let err = parse_formula("Surv(entry, exit, event) ~ timewiggle(knots=9)")
             .expect_err("unknown timewiggle options should be rejected");
-        assert!(err.contains("timewiggle() does not support option(s) knots"));
+        assert!(
+            err.to_string()
+                .contains("timewiggle() does not support option(s) knots")
+        );
     }
 
     #[test]
@@ -12053,7 +12065,7 @@ mod tests {
         let err = SavedModel::from_payload(bernoulli)
             .validate_for_persistence()
             .expect_err("bernoulli marginal-slope payload without z normalization should fail");
-        assert!(err.contains("latent_z_normalization"));
+        assert!(err.to_string().contains("latent_z_normalization"));
 
         let mut survival = test_payload(
             "Surv(entry, exit, event) ~ 1",
@@ -12088,7 +12100,7 @@ mod tests {
         let err = SavedModel::from_payload(survival)
             .validate_for_persistence()
             .expect_err("survival marginal-slope payload without z normalization should fail");
-        assert!(err.contains("latent_z_normalization"));
+        assert!(err.to_string().contains("latent_z_normalization"));
     }
 
     #[test]
@@ -12465,7 +12477,9 @@ mod tests {
         )
         .expect_err("lower-only survival bounds must be rejected");
         assert!(
-            err_lower_only.contains("survival_upper missing"),
+            err_lower_only
+                .to_string()
+                .contains("survival_upper missing"),
             "lower-only error message wrong: {err_lower_only}"
         );
 
@@ -12479,7 +12493,9 @@ mod tests {
         )
         .expect_err("upper-only survival bounds must be rejected");
         assert!(
-            err_upper_only.contains("survival_lower missing"),
+            err_upper_only
+                .to_string()
+                .contains("survival_lower missing"),
             "upper-only error message wrong: {err_upper_only}"
         );
 
@@ -12550,7 +12566,7 @@ mod tests {
         )
         .expect_err("lower-only binary bounds must be rejected");
         assert!(
-            err_lower_only.contains("event_upper missing"),
+            err_lower_only.to_string().contains("event_upper missing"),
             "lower-only binary error message wrong: {err_lower_only}"
         );
 
@@ -12564,7 +12580,7 @@ mod tests {
         )
         .expect_err("upper-only binary bounds must be rejected");
         assert!(
-            err_upper_only.contains("event_lower missing"),
+            err_upper_only.to_string().contains("event_lower missing"),
             "upper-only binary error message wrong: {err_upper_only}"
         );
 
@@ -12903,7 +12919,7 @@ mod tests {
 
         let err = super::load_survival_time_basis_config_from_model(&model)
             .expect_err("survival model without basis metadata should fail");
-        assert!(err.contains("missing survival_time_basis"));
+        assert!(err.to_string().contains("missing survival_time_basis"));
     }
 
     #[test]
@@ -12967,8 +12983,8 @@ mod tests {
         let err = model
             .saved_prediction_runtime()
             .expect_err("invalid survival anchored deviation runtime should fail validation");
-        assert!(err.contains("unsupported kernel"));
-        assert!(err.contains("anchored score-warp"));
+        assert!(err.to_string().contains("unsupported kernel"));
+        assert!(err.to_string().contains("anchored score-warp"));
     }
 
     #[test]
@@ -13954,21 +13970,30 @@ mod tests {
     fn parse_link_choice_rejects_flexible_beta_logistic() {
         let err = parse_link_choice(Some("flexible(beta-logistic)"), false)
             .expect_err("flexible(beta-logistic) should be rejected");
-        assert!(err.contains("does not support sas/beta-logistic"));
+        assert!(
+            err.to_string()
+                .contains("does not support sas/beta-logistic")
+        );
     }
 
     #[test]
     fn parse_link_choice_rejects_flexible_sas() {
         let err = parse_link_choice(Some("flexible(sas)"), false)
             .expect_err("flexible(sas) should be rejected");
-        assert!(err.contains("does not support sas/beta-logistic"));
+        assert!(
+            err.to_string()
+                .contains("does not support sas/beta-logistic")
+        );
     }
 
     #[test]
     fn parse_link_choice_rejects_flexible_blended_link() {
         let err = parse_link_choice(Some("flexible(blended(logit,probit))"), false)
             .expect_err("flexible(blended(...)) should be rejected");
-        assert!(err.contains("does not support blended(...)/mixture(...)"));
+        assert!(
+            err.to_string()
+                .contains("does not support blended(...)/mixture(...)")
+        );
     }
 
     #[test]
@@ -15380,7 +15405,7 @@ mod tests {
     #[test]
     fn parse_formula_reports_unbalanced_parentheses() {
         let err = parse_formula("y ~ s(x, k=10").expect_err("expected parse failure");
-        assert!(err.contains("unbalanced parentheses"));
+        assert!(err.to_string().contains("unbalanced parentheses"));
     }
 
     #[test]
@@ -15396,7 +15421,7 @@ mod tests {
         let err = parse_matching_auxiliary_formula("noise ~ s(x)", "y", "--predict-noise")
             .expect_err("explicit response should fail");
         assert_eq!(
-            err,
+            err.to_string(),
             "--predict-noise expects only the terms after '~', not a full 'response ~ terms' formula; use --predict-noise 's(x)' instead of --predict-noise 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
         );
     }
@@ -15410,7 +15435,7 @@ mod tests {
         )
         .expect_err("explicit survival response should fail");
         assert_eq!(
-            err,
+            err.to_string(),
             "--predict-noise expects only the terms after '~', not a full 'response ~ terms' formula; use --predict-noise 's(x)' instead of --predict-noise 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
         );
     }
@@ -15435,14 +15460,15 @@ mod tests {
         // showing the user the exact 3-arg rewrite.
         let err = parse_surv_response("Surv(exit_time, event)")
             .expect_err("invalid Surv arity should fail");
+        let err_msg = err.to_string();
         assert!(
-            err.contains("needs three columns") && err.contains("entry"),
-            "expected actionable 2-arg error, got: {err}"
+            err_msg.contains("needs three columns") && err_msg.contains("entry"),
+            "expected actionable 2-arg error, got: {err_msg}"
         );
         // 1-arg, 4-arg, etc still get the generic message
         let err =
             parse_surv_response("Surv(entry_time)").expect_err("invalid Surv arity should fail");
-        assert!(err.contains("expects exactly three columns"));
+        assert!(err.to_string().contains("expects exactly three columns"));
     }
 
     #[test]
@@ -15552,7 +15578,7 @@ mod tests {
         let err = model
             .saved_link_wiggle()
             .expect_err("expected partial-metadata error");
-        assert!(err.contains("link-wiggle"));
+        assert!(err.to_string().contains("link-wiggle"));
     }
 
     #[test]
