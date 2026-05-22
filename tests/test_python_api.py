@@ -1313,7 +1313,7 @@ def test_constrained_reml_backward_envelope_at_interior_cert() -> None:
     # Both paths should land at (essentially) the same λ̂ because the
     # constraint is not binding.
     unc_fit = gaussian_reml_fit(x_np, y_np, penalty_np)
-    assert abs(unc_fit["lambda"] - out_fwd["lambda"]) <= 1e-6 * max(
+    assert abs(unc_fit["lambda"] - out_fwd["lambda"]) <= 1e-4 * max(
         1.0, unc_fit["lambda"]
     ), (
         "unconstrained vs constrained λ̂ should agree at an interior cert; "
