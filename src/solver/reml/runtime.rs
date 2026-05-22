@@ -2605,6 +2605,115 @@ impl<'a> RemlState<'a> {
         Some(cols.clone())
     }
 
+    fn predict_warm_start_beta_joint_ift_with_outcome(
+        &self,
+        new_rho: &Array1<f64>,
+        max_dtheta_cap: f64,
+    ) -> Option<(Coefficients, IftPredictionOutcome)> {
+        let theta = self.pending_joint_ift_theta()?;
+        let cache = {
+            let guard = ift_joint_mode_response_caches().lock().unwrap();
+            guard.get(&self.ift_mode_response_cache_key())?.clone()
+        };
+        if cache.active_constraints {
+            log::info!(
+                "[IFT-REJECTED] reason=active_constraints joint_dim={}",
+                cache.theta.len(),
+            );
+            return None;
+        }
+        if cache.theta.len() <= cache.rho_dim {
+            return None;
+        }
+        if theta.len() != cache.theta.len()
+            || new_rho.len() != cache.rho_dim
+            || cache.beta_original.len() != self.p
+            || cache.mode_response_cols.nrows() != self.p
+            || cache.mode_response_cols.ncols() != cache.theta.len()
+        {
+            return None;
+        }
+        for i in 0..cache.rho_dim {
+            if theta[i].to_bits() != new_rho[i].to_bits() {
+                return None;
+            }
+        }
+
+        let mut max_abs_dtheta = 0.0_f64;
+        let dtheta: Array1<f64> = theta
+            .iter()
+            .zip(cache.theta.iter())
+            .map(|(&new_value, &old_value)| {
+                let d = new_value - old_value;
+                if !d.is_finite() {
+                    return f64::INFINITY;
+                }
+                if d.abs() > max_abs_dtheta {
+                    max_abs_dtheta = d.abs();
+                }
+                d
+            })
+            .collect();
+        if !max_abs_dtheta.is_finite() || max_abs_dtheta > max_dtheta_cap {
+            log::info!(
+                "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                max_dtheta_cap,
+                cache.theta.len(),
+            );
+            return None;
+        }
+        if dtheta.iter().all(|d| d.abs() <= IFT_WARM_START_DRHO_EPS) {
+            log::info!(
+                "[IFT-NOOP] reason=all_dtheta_below_eps max_dtheta={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                cache.theta.len(),
+            );
+            return Some((
+                Coefficients::new(cache.beta_original),
+                IftPredictionOutcome::Noop,
+            ));
+        }
+
+        let solution_original = cache.mode_response_cols.dot(&dtheta);
+        if !solution_original.iter().all(|v| v.is_finite()) {
+            log::info!(
+                "[IFT-REJECTED] reason=non_finite_solution max_dtheta={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                cache.theta.len(),
+            );
+            return None;
+        }
+
+        let mut predicted = cache.beta_original;
+        for (target, &correction) in predicted.iter_mut().zip(solution_original.iter()) {
+            *target -= correction;
+        }
+        if !predicted.iter().all(|v| v.is_finite()) {
+            log::info!(
+                "[IFT-REJECTED] reason=non_finite_predicted max_dtheta={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                cache.theta.len(),
+            );
+            return None;
+        }
+        log::info!(
+            "[IFT-CACHE] outcome=joint_mode_response_hit joint_dim={} rho_dim={} p={}",
+            cache.theta.len(),
+            cache.rho_dim,
+            self.p,
+        );
+        log::debug!(
+            "[warm-start] joint IFT prediction reused mode responses: max|Δθ|={:.3e}, ‖Δβ‖={:.3e}",
+            max_abs_dtheta,
+            solution_original.dot(&solution_original).sqrt(),
+        );
+        Some((
+            Coefficients::new(predicted),
+            IftPredictionOutcome::Predicted,
+        ))
+    }
+
     /// Wipe every atomic-bit-packed signal used by the adaptive
     /// policies (inner-cap schedule margin, IFT |Δρ| cap, LM-λ
     /// hint clamp). Called from the same invalidation paths as
@@ -4250,8 +4359,6 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        let cache_guard = self.ift_warm_start_cache.read().unwrap();
-        let cache = cache_guard.as_ref()?;
         // The NaN sentinel + the is_finite() check together cover three
         // cases in one expression: "no signal yet" (sentinel decodes to
         // NaN, which fails is_finite), "corrupted state" (any non-finite
@@ -4265,6 +4372,13 @@ impl<'a> RemlState<'a> {
             None
         };
         let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+        if let Some(prediction) =
+            self.predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap)
+        {
+            return Some(prediction);
+        }
+        let cache_guard = self.ift_warm_start_cache.read().unwrap();
+        let cache = cache_guard.as_ref()?;
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
         // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
