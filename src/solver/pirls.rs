@@ -3579,8 +3579,8 @@ fn update_sparse_diagonal_in_place(
 }
 
 fn solve_subsystem_direction(
-    h_sub: &Array2<f64>,
-    g_sub: &Array1<f64>,
+    h_sub: ndarray::ArrayView2<f64>,
+    g_sub: ndarray::ArrayView1<f64>,
     out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
     let n = g_sub.len();
@@ -3588,8 +3588,8 @@ fn solve_subsystem_direction(
         *out = Array1::zeros(n);
     }
     // Try direct factorization first.
-    if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize(h_sub) {
-        out.assign(g_sub);
+    if let Ok(factor) = StableSolver::new("pirls bounded subsystem").factorize_any(&h_sub) {
+        out.assign(&g_sub);
         let mut rhs = array1_to_col_matmut(out);
         factor.solve_in_place(rhs.as_mut());
         out.mapv_inplace(|v| -v);
@@ -3611,7 +3611,7 @@ fn solve_subsystem_direction(
             h_reg[[i, i]] = h_sub[[i, i]] + tau;
         }
         if let Ok(factor) = StableSolver::new("pirls bounded subsystem ridge").factorize(&h_reg) {
-            out.assign(g_sub);
+            out.assign(&g_sub);
             let mut rhs = array1_to_col_matmut(out);
             factor.solve_in_place(rhs.as_mut());
             out.mapv_inplace(|v| -v);
@@ -3789,10 +3789,25 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
     let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);
+    // Hoist active-set scratch buffers above the pivot loop. Each pivot used
+    // to allocate Array2<f64>::zeros((n_free, n_free)) (≈70 MB for p≈3000),
+    // an Array1<f64>::zeros(n_free), and two Vec<usize>. We now keep them at
+    // the maximum possible size (p) and reslice/refill in place per pivot.
+    let mut h_ff_buf = Array2::<f64>::zeros((p, p));
+    let mut g_f_buf = Array1::<f64>::zeros(p);
+    let mut free_idx: Vec<usize> = Vec::with_capacity(p);
+    let mut active_idx: Vec<usize> = Vec::with_capacity(p);
     for it in 0..max_iters {
         let use_blands = it >= blands_threshold;
-        let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
-        let active_idx: Vec<usize> = (0..p).filter(|&i| active[i]).collect();
+        free_idx.clear();
+        active_idx.clear();
+        for i in 0..p {
+            if active[i] {
+                active_idx.push(i);
+            } else {
+                free_idx.push(i);
+            }
+        }
         direction_out.fill(0.0);
         for &i in &active_idx {
             let lb = lower_bounds[i];
@@ -3814,18 +3829,26 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
         }
 
         let n_free = free_idx.len();
-        let mut h_ff = Array2::<f64>::zeros((n_free, n_free));
-        let mut g_f = Array1::<f64>::zeros(n_free);
-        for (ii, &i) in free_idx.iter().enumerate() {
-            g_f[ii] = gradient[i];
-            for &j in &active_idx {
-                g_f[ii] += hessian[[i, j]] * direction_out[j];
-            }
-            for (jj, &j) in free_idx.iter().enumerate() {
-                h_ff[[ii, jj]] = hessian[[i, j]];
+        // Reuse hoisted top-left n_free×n_free block and length-n_free prefix.
+        {
+            let mut h_ff = h_ff_buf.slice_mut(ndarray::s![..n_free, ..n_free]);
+            let mut g_f = g_f_buf.slice_mut(ndarray::s![..n_free]);
+            for (ii, &i) in free_idx.iter().enumerate() {
+                let mut gi = gradient[i];
+                for &j in &active_idx {
+                    gi += hessian[[i, j]] * direction_out[j];
+                }
+                g_f[ii] = gi;
+                for (jj, &j) in free_idx.iter().enumerate() {
+                    h_ff[[ii, jj]] = hessian[[i, j]];
+                }
             }
         }
-        solve_subsystem_direction(&h_ff, &g_f, &mut d_free)?;
+        solve_subsystem_direction(
+            h_ff_buf.slice(ndarray::s![..n_free, ..n_free]),
+            g_f_buf.slice(ndarray::s![..n_free]),
+            &mut d_free,
+        )?;
         for (ii, &i) in free_idx.iter().enumerate() {
             direction_out[i] = d_free[ii];
         }

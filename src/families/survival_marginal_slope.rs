@@ -1031,6 +1031,18 @@ fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
     &unit_primary_direction_table()[idx]
 }
 
+/// Returns a reference to the static zero direction in primary space
+/// (an `Array1::zeros(N_PRIMARY)`). Used by sigma-jet contractions to
+/// avoid the per-call `Array1::zeros(primary_dim)` allocation storm in
+/// `row_sigma_primary_terms`, which previously allocated 2-4 fresh zero
+/// slots per kernel invocation and ~30 zero slots per row.
+#[inline]
+fn zero_primary_direction_ref() -> &'static Array1<f64> {
+    use std::sync::OnceLock;
+    static ZERO: OnceLock<Array1<f64>> = OnceLock::new();
+    ZERO.get_or_init(|| Array1::<f64>::zeros(N_PRIMARY))
+}
+
 #[inline]
 fn poly_mul(lhs: &[f64], rhs: &[f64]) -> PolyVec {
     if lhs.is_empty() || rhs.is_empty() {
@@ -2072,80 +2084,60 @@ impl BlockHessianAccumulator {
         ];
         let pt = jt[0].len();
         let pm = jm[0].len();
-        let tt_chunks = Self::deterministic_lhs_chunks(pt, pt);
-        let tt_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = tt_chunks
-            .into_par_iter()
-            .map(|chunk| {
-                let mut local = Array2::zeros((chunk.len(), pt));
-                for (local_a, a) in chunk.clone().enumerate() {
-                    for b in 0..pt {
-                        let mut v = 0.0;
-                        for u in 0..3 {
-                            for w in 0..3 {
-                                v += ph[[u, w]] * jt[u][a] * jt[w][b];
-                            }
-                        }
-                        for u in 0..3 {
-                            v += fg[u] * ktt[u][[a, b]];
-                        }
-                        local[[local_a, b]] = v;
+        // Serial accumulation directly into self.h_tt / h_mm / h_tm.
+        // The outer (over rows) parallelism is what saturates threads at
+        // biobank N; nesting inner par_iter here adds work-stealing
+        // overhead, per-chunk Array2::zeros allocations, and risks
+        // OnceLock + nested rayon deadlock. Row order, accumulation
+        // order, and per-row arithmetic remain bit-identical to the
+        // previous serialised partial-merge pass.
+        for a in 0..pt {
+            for b in 0..pt {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jt[u][a] * jt[w][b];
                     }
                 }
-                Ok((chunk, local))
-            })
-            .collect();
-        Self::add_ordered_lhs_partials(&mut self.h_tt, tt_partials)?;
+                for u in 0..3 {
+                    v += fg[u] * ktt[u][[a, b]];
+                }
+                self.h_tt[[a, b]] += v;
+            }
+        }
 
-        let mm_chunks = Self::deterministic_lhs_chunks(pm, pm);
-        let mm_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = mm_chunks
-            .into_par_iter()
-            .map(|chunk| {
-                let mut local = Array2::zeros((chunk.len(), pm));
-                for (local_a, a) in chunk.clone().enumerate() {
-                    for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 {
-                            for w in 0..3 {
-                                v += ph[[u, w]] * jm[u][a] * jm[w][b];
-                            }
-                        }
-                        for u in 0..3 {
-                            v += fg[u] * kmm[u][[a, b]];
-                        }
-                        local[[local_a, b]] = v;
+        for a in 0..pm {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jm[u][a] * jm[w][b];
                     }
                 }
-                Ok((chunk, local))
-            })
-            .collect();
-        Self::add_ordered_lhs_partials(&mut self.h_mm, mm_partials)?;
+                for u in 0..3 {
+                    v += fg[u] * kmm[u][[a, b]];
+                }
+                self.h_mm[[a, b]] += v;
+            }
+        }
         family
             .logslope_design
             .syr_row_into(row, ph[[3, 3]], &mut self.h_gg)
             .map_err(|e| format!("add_pullback_with_q_geometry gg syr: {e}"))?;
-        let tm_chunks = Self::deterministic_lhs_chunks(pt, pm);
-        let tm_partials: Vec<Result<(std::ops::Range<usize>, Array2<f64>), String>> = tm_chunks
-            .into_par_iter()
-            .map(|chunk| {
-                let mut local = Array2::zeros((chunk.len(), pm));
-                for (local_a, a) in chunk.clone().enumerate() {
-                    for b in 0..pm {
-                        let mut v = 0.0;
-                        for u in 0..3 {
-                            for w in 0..3 {
-                                v += ph[[u, w]] * jt[u][a] * jm[w][b];
-                            }
-                        }
-                        for u in 0..3 {
-                            v += fg[u] * ktm[u][[a, b]];
-                        }
-                        local[[local_a, b]] = v;
+        for a in 0..pt {
+            for b in 0..pm {
+                let mut v = 0.0;
+                for u in 0..3 {
+                    for w in 0..3 {
+                        v += ph[[u, w]] * jt[u][a] * jm[w][b];
                     }
                 }
-                Ok((chunk, local))
-            })
-            .collect();
-        Self::add_ordered_lhs_partials(&mut self.h_tm, tm_partials)?;
+                for u in 0..3 {
+                    v += fg[u] * ktm[u][[a, b]];
+                }
+                self.h_tm[[a, b]] += v;
+            }
+        }
         let gc = family
             .logslope_design
             .try_row_chunk(row..row + 1)
@@ -4088,7 +4080,7 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
-        dirs: &[Array1<f64>],
+        dirs: &[&Array1<f64>],
         scale_jet: &MultiDirJet,
     ) -> Result<f64, String> {
         let k = dirs.len();
@@ -4188,42 +4180,57 @@ impl SurvivalMarginalSlopeFamily {
         second_sigma: bool,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let primary_dim = N_PRIMARY;
+        let zero = zero_primary_direction_ref();
+        // sigma_scale_jet only depends on the multi-dir spec, not on the
+        // row — so resolve each variant once and reuse across the
+        // objective + grad + hess sweeps for this row. Previously this
+        // was rebuilt 1 + N_PRIMARY + N_PRIMARY*(N_PRIMARY+1)/2 = 15
+        // times per row.
+        let (scale_obj, scale_grad, scale_hess) = if second_sigma {
+            (
+                self.sigma_scale_jet(2, &[1, 2], &[3])?,
+                self.sigma_scale_jet(3, &[1, 2], &[3])?,
+                self.sigma_scale_jet(4, &[1, 2], &[3])?,
+            )
+        } else {
+            (
+                self.sigma_scale_jet(1, &[1], &[])?,
+                self.sigma_scale_jet(2, &[1], &[])?,
+                self.sigma_scale_jet(3, &[1], &[])?,
+            )
+        };
         let objective = if second_sigma {
-            let scale = self.sigma_scale_jet(2, &[1, 2], &[3])?;
             self.row_neglog_directional_with_scale_jet(
                 row,
                 block_states,
-                &[Array1::zeros(primary_dim), Array1::zeros(primary_dim)],
-                &scale,
+                &[zero, zero],
+                &scale_obj,
             )?
         } else {
-            let scale = self.sigma_scale_jet(1, &[1], &[])?;
             self.row_neglog_directional_with_scale_jet(
                 row,
                 block_states,
-                &[Array1::zeros(primary_dim)],
-                &scale,
+                &[zero],
+                &scale_obj,
             )?
         };
 
         let mut grad = Array1::<f64>::zeros(primary_dim);
         for a in 0..primary_dim {
-            let da = unit_primary_direction(a);
+            let da = unit_primary_direction_ref(a);
             let value = if second_sigma {
-                let scale = self.sigma_scale_jet(3, &[1, 2], &[3])?;
                 self.row_neglog_directional_with_scale_jet(
                     row,
                     block_states,
-                    &[Array1::zeros(primary_dim), Array1::zeros(primary_dim), da],
-                    &scale,
+                    &[zero, zero, da],
+                    &scale_grad,
                 )?
             } else {
-                let scale = self.sigma_scale_jet(2, &[1], &[])?;
                 self.row_neglog_directional_with_scale_jet(
                     row,
                     block_states,
-                    &[Array1::zeros(primary_dim), da],
-                    &scale,
+                    &[zero, da],
+                    &scale_grad,
                 )?
             };
             grad[a] = value;
@@ -4231,29 +4238,22 @@ impl SurvivalMarginalSlopeFamily {
 
         let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
         for a in 0..primary_dim {
-            let da = unit_primary_direction(a);
+            let da = unit_primary_direction_ref(a);
             for b in a..primary_dim {
-                let db = unit_primary_direction(b);
+                let db = unit_primary_direction_ref(b);
                 let value = if second_sigma {
-                    let scale = self.sigma_scale_jet(4, &[1, 2], &[3])?;
                     self.row_neglog_directional_with_scale_jet(
                         row,
                         block_states,
-                        &[
-                            Array1::zeros(primary_dim),
-                            Array1::zeros(primary_dim),
-                            da.clone(),
-                            db,
-                        ],
-                        &scale,
+                        &[zero, zero, da, db],
+                        &scale_hess,
                     )?
                 } else {
-                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
                     self.row_neglog_directional_with_scale_jet(
                         row,
                         block_states,
-                        &[Array1::zeros(primary_dim), da.clone(), db],
-                        &scale,
+                        &[zero, da, db],
+                        &scale_hess,
                     )?
                 };
                 hess[[a, b]] = value;
@@ -4501,6 +4501,12 @@ impl SurvivalMarginalSlopeFamily {
         let primary_dim = N_PRIMARY;
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
+        // Sigma scale jets and the zero primary direction are constant
+        // across rows; resolve once outside the fold instead of rebuilding
+        // per-row (and per (a,b) pair) inside it.
+        let scale_grad = self.sigma_scale_jet(3, &[1], &[])?;
+        let scale_hess = self.sigma_scale_jet(4, &[1], &[])?;
+        let zero = zero_primary_direction_ref();
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
@@ -4514,26 +4520,24 @@ impl SurvivalMarginalSlopeFamily {
                 )?;
                 let mut grad = Array1::<f64>::zeros(primary_dim);
                 for a in 0..primary_dim {
-                    let da = unit_primary_direction(a);
-                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
+                    let da = unit_primary_direction_ref(a);
                     grad[a] = self.row_neglog_directional_with_scale_jet(
                         row,
                         block_states,
-                        &[Array1::zeros(primary_dim), row_dir.clone(), da],
-                        &scale,
+                        &[zero, &row_dir, da],
+                        &scale_grad,
                     )?;
                 }
                 let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
                 for a in 0..primary_dim {
-                    let da = unit_primary_direction(a);
+                    let da = unit_primary_direction_ref(a);
                     for b in a..primary_dim {
-                        let db = unit_primary_direction(b);
-                        let scale = self.sigma_scale_jet(4, &[1], &[])?;
+                        let db = unit_primary_direction_ref(b);
                         let value = self.row_neglog_directional_with_scale_jet(
                             row,
                             block_states,
-                            &[Array1::zeros(primary_dim), row_dir.clone(), da.clone(), db],
-                            &scale,
+                            &[zero, &row_dir, da, db],
+                            &scale_hess,
                         )?;
                         hess[[a, b]] = value;
                         hess[[b, a]] = value;
@@ -7278,6 +7282,7 @@ impl SurvivalMarginalSlopeFamily {
 
     fn build_eval_cache(&self, block_states: &[ParameterBlockState]) -> Result<EvalCache, String> {
         let row_bases = (0..self.n)
+            .into_par_iter()
             .map(|row| {
                 let (_, gradient, hessian) =
                     self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;

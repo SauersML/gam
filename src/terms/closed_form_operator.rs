@@ -239,14 +239,14 @@ impl ClosedFormPenaltyOperator {
         if self.is_raw_layout() {
             return Array1::from_elem(n, self.raw_diagonal_value());
         }
+        // Read the diagonal directly off the cached dense form. This is the
+        // same matrix `matvec(e_i)` would reconstruct via the chain
+        // T^T diag(Z, I)^T S_raw diag(Z, I) T, but extracting the diagonal
+        // here is O(n) instead of O(n * K^2).
+        let dense = self.ensure_dense();
         let mut out = Array1::<f64>::zeros(n);
-        let mut e = Array1::<f64>::zeros(n);
-        let mut col = Array1::<f64>::zeros(n);
         for i in 0..n {
-            e.fill(0.0);
-            e[i] = 1.0;
-            self.matvec(e.view(), col.view_mut());
-            out[i] = col[i];
+            out[i] = dense[[i, i]];
         }
         out
     }
