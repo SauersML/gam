@@ -5431,6 +5431,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.survival_exit = Some(args.exit);
             payload.survival_event = Some(args.event);
             payload.survivalspec = Some(effectivespec);
+            payload.survival_cause_count = Some(cause_count);
+            payload.survival_endpoint_names = Some(
+                (1..=cause_count)
+                    .map(|idx| format!("cause_{idx}"))
+                    .collect(),
+            );
             payload.survival_baseline_target =
                 Some(survival_baseline_targetname(fit.baseline_cfg.target).to_string());
             payload.survival_baseline_scale = fit.baseline_cfg.scale;
