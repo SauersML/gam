@@ -549,8 +549,8 @@ def gaussian_reml_fit_blocks(
     ``λ_k`` driven by the outer Newton/EFS loop. Returns the per-block
     smoothing parameters in ``AdditiveRemlOutput.lambdas`` (1D tensor of
     length ``F``), per-block EDFs in ``.edf``, and a working backward
-    through every output (envelope + IFT composed through the warm-started
-    outer optimum).
+    through every output using the closed-form envelope + IFT VJP at the
+    converged outer optimum.
 
     Parameters
     ----------

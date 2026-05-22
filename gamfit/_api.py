@@ -2136,8 +2136,8 @@ def gaussian_reml_fit_blocks_backward(
 
     Computes VJPs of ``(coefficients, fitted, lambdas, log_lambdas,
     reml_score, edf)`` back to ``(designs, penalties, y, weights)`` using
-    the closed-form Gaussian/identity block REML VJP at the converged
-    log-λ vector.
+    the profiled Gaussian/identity block REML VJP and the outer implicit
+    smoothing-parameter adjoint at the converged log-λ vector.
     """
     import numpy as np
 
