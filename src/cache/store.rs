@@ -115,7 +115,7 @@ impl WarmStartStore {
     /// Corrupt or schema-mismatched candidates are silently cleaned up and
     /// skipped.
     pub fn lookup(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
-        self.lookup_with(key, entry_better)
+        self.lookup_with(key, LookupMode::Best)
     }
 
     /// Look up the newest valid entry for `key`, or `None` if no valid entry
@@ -126,17 +126,35 @@ impl WarmStartStore {
     /// different folds, diseases, or row sets, and objective magnitudes are
     /// not comparable. Exact-key resume should keep using [`Self::lookup`].
     pub fn lookup_latest(&self, key: &Fingerprint) -> Result<Option<CachedEntry>, StoreError> {
-        self.lookup_with(key, entry_newer)
+        self.lookup_with(key, LookupMode::Latest)
     }
 
     fn lookup_with(
         &self,
         key: &Fingerprint,
-        better: fn(&OnDiskMeta, &OnDiskMeta) -> bool,
+        mode: LookupMode,
     ) -> Result<Option<CachedEntry>, StoreError> {
         let dir = self.key_dir(key);
         if !dir.exists() {
+            // A stale in-memory cache entry could outlive its directory if
+            // another process evicted us. Drop it so we don't return data
+            // for a key whose backing files are gone.
+            lookup_cache_invalidate(&LookupCacheKey { fp: *key, mode });
             return Ok(None);
+        }
+        // Fast path: if the same (key, mode) was looked up before and the
+        // chosen meta file's mtime is unchanged, return the cached entry
+        // without re-reading any JSON or re-checksumming the .bin payload.
+        // A separate writer (this process or another) bumps mtime on
+        // rename → mismatch → we fall through to the slow path.
+        let cache_key = LookupCacheKey { fp: *key, mode };
+        if let Some(hit) = lookup_cache_get(&cache_key) {
+            if let Ok(md) = fs::metadata(&hit.meta_path) {
+                if md.modified().ok() == Some(hit.meta_mtime) {
+                    return Ok(Some(hit.entry));
+                }
+            }
+            lookup_cache_invalidate(&cache_key);
         }
         let mut best: Option<(OnDiskMeta, PathBuf)> = None;
         for entry in fs::read_dir(&dir)? {
@@ -173,20 +191,20 @@ impl WarmStartStore {
                 let _ = fs::remove_file(&path);
                 continue;
             }
-            best = match best {
-                None => Some((meta, path)),
-                Some((cur, cur_path)) => {
-                    if better(&meta, &cur) {
-                        Some((meta, path))
-                    } else {
-                        Some((cur, cur_path))
-                    }
-                }
+            let take = match best {
+                None => true,
+                Some((ref cur, _)) => mode.better(&meta, cur),
             };
+            if take {
+                best = Some((meta, path));
+            }
         }
         let (meta, meta_path) = match best {
             Some(b) => b,
-            None => return Ok(None),
+            None => {
+                lookup_cache_invalidate(&cache_key);
+                return Ok(None);
+            }
         };
         let bin_path = meta_path.with_extension("bin");
         let payload = match fs::read(&bin_path) {
@@ -197,15 +215,31 @@ impl WarmStartStore {
         if checksum_hex(&payload) != meta.checksum_hex {
             let _ = fs::remove_file(&meta_path);
             let _ = fs::remove_file(&bin_path);
+            lookup_cache_invalidate(&cache_key);
             return Ok(None);
         }
-        Ok(Some(CachedEntry {
+        let entry = CachedEntry {
             payload,
             objective: meta.objective,
             iteration: meta.iteration,
             written_unix_secs: meta.written_unix_secs,
             kind: meta.kind,
-        }))
+        };
+        // Record (meta_path, mtime) → entry so subsequent identical lookups
+        // short-circuit until the meta file's mtime changes.
+        if let Ok(md) = fs::metadata(&meta_path) {
+            if let Ok(mtime) = md.modified() {
+                lookup_cache_insert(
+                    cache_key,
+                    CachedLookup {
+                        meta_path: meta_path.clone(),
+                        meta_mtime: mtime,
+                        entry: entry.clone(),
+                    },
+                );
+            }
+        }
+        Ok(Some(entry))
     }
 
     /// Save a new entry with a fresh run-id. Returns the run-id (caller may
@@ -284,8 +318,19 @@ impl WarmStartStore {
             let _ = fs::remove_file(&meta_tmp);
             return Err(StoreError::Io(e));
         }
-        // 5. Best-effort eviction; failure here is non-fatal.
-        let _ = self.evict_overflow();
+        // 5. Best-effort eviction; failure here is non-fatal. Skip the
+        // full directory scan on most saves — a per-store save counter
+        // triggers eviction only every `EVICT_EVERY_N_SAVES` writes plus
+        // on the first save of a process, and whenever a single payload
+        // is large enough that it alone could push us over budget. That
+        // bounds the eviction's amortized cost without losing correctness:
+        // the budget can briefly overshoot by up to K-1 payloads, which
+        // the next sweep reclaims.
+        let oversize_trigger = (payload.len() as u64) * 2 >= self.opts.size_budget_bytes;
+        let n = save_counter().fetch_add(1, Ordering::Relaxed);
+        if oversize_trigger || n % EVICT_EVERY_N_SAVES == 0 {
+            let _ = self.evict_overflow();
+        }
         Ok(())
     }
 
@@ -396,6 +441,76 @@ impl WarmStartStore {
         }
         Ok(())
     }
+}
+
+/// How [`WarmStartStore::lookup_with`] ranks candidate entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LookupMode {
+    /// Lowest objective wins; ties to [`entry_better`].
+    Best,
+    /// Newest write wins; objectives ignored.
+    Latest,
+}
+
+impl LookupMode {
+    fn better(&self, candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
+        match self {
+            LookupMode::Best => entry_better(candidate, current),
+            LookupMode::Latest => entry_newer(candidate, current),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LookupCacheKey {
+    fp: Fingerprint,
+    mode: LookupMode,
+}
+
+#[derive(Clone)]
+struct CachedLookup {
+    meta_path: PathBuf,
+    meta_mtime: SystemTime,
+    entry: CachedEntry,
+}
+
+/// Process-wide in-memory cache for [`WarmStartStore::lookup_with`]. Hot poll
+/// loops hit the same (key, mode) repeatedly between writes, so caching the
+/// resolved entry behind an mtime check eliminates the per-call directory
+/// walk, JSON parse, and SHA-256 recomputation. Mtime mismatch — including
+/// writes from a sibling process — invalidates the row and falls back to
+/// the full slow path.
+fn lookup_cache() -> &'static Mutex<HashMap<LookupCacheKey, CachedLookup>> {
+    static CACHE: OnceLock<Mutex<HashMap<LookupCacheKey, CachedLookup>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lookup_cache_get(key: &LookupCacheKey) -> Option<CachedLookup> {
+    let guard = lookup_cache().lock().ok()?;
+    guard.get(key).cloned()
+}
+
+fn lookup_cache_insert(key: LookupCacheKey, val: CachedLookup) {
+    if let Ok(mut guard) = lookup_cache().lock() {
+        guard.insert(key, val);
+    }
+}
+
+fn lookup_cache_invalidate(key: &LookupCacheKey) {
+    if let Ok(mut guard) = lookup_cache().lock() {
+        guard.remove(key);
+    }
+}
+
+/// Run a full [`WarmStartStore::evict_overflow`] sweep every Nth save. The
+/// budget can briefly overshoot by K-1 payloads, which the next sweep
+/// reclaims. K=32 keeps the amortized cost negligible on hot checkpoint
+/// paths while still bounding worst-case disk drift.
+const EVICT_EVERY_N_SAVES: u64 = 32;
+
+fn save_counter() -> &'static AtomicU64 {
+    static COUNTER: OnceLock<AtomicU64> = OnceLock::new();
+    COUNTER.get_or_init(|| AtomicU64::new(0))
 }
 
 fn parse_tmp_pid(name: &str) -> Option<u32> {
