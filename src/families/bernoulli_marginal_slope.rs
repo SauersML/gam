@@ -3478,9 +3478,12 @@ pub fn marginal_slope_preserving_scale(
     probit_scale: f64,
 ) -> Result<f64, String> {
     if !probit_scale.is_finite() {
-        return Err(format!(
-            "marginal-slope probit scale must be finite, got {probit_scale}"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "marginal-slope probit scale must be finite, got {probit_scale}"
+            ),
+        }
+        .into());
     }
     let observed_slopes = slopes
         .iter()
@@ -3498,21 +3501,30 @@ pub fn marginal_slope_probit_eta(
     probit_scale: f64,
 ) -> Result<f64, String> {
     if z.len() != slopes.len() {
-        return Err(format!(
-            "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
-            z.len(),
-            slopes.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
+                z.len(),
+                slopes.len()
+            ),
+        }
+        .into());
     }
     if slopes.len() != covariance.dim() {
-        return Err(format!(
-            "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
-            slopes.len(),
-            covariance.dim()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
+                slopes.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
     }
     if !q.is_finite() || z.iter().any(|value| !value.is_finite()) {
-        return Err("marginal-slope probit eta inputs must be finite".to_string());
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: "marginal-slope probit eta inputs must be finite".to_string(),
+        }
+        .into());
     }
     let scale = marginal_slope_preserving_scale(slopes, covariance, probit_scale)?;
     let linear = z
@@ -3561,9 +3573,12 @@ fn empirical_rigid_calibration_eval(
     weights: &[f64],
 ) -> Result<(f64, f64, f64), String> {
     if !intercept.is_finite() {
-        return Err(format!(
-            "empirical latent calibration: non-finite intercept {intercept}"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "empirical latent calibration: non-finite intercept {intercept}"
+            ),
+        }
+        .into());
     }
     let observed_slope = rigid_observed_logslope(slope, probit_scale);
     const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
@@ -3588,9 +3603,12 @@ fn empirical_rigid_calibration_eval(
         }
         let eta = intercept + observed_slope * node;
         if !eta.is_finite() {
-            return Err(format!(
-                "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
+                ),
+            }
+            .into());
         }
         let log_w = weight.ln();
         let log_phi = -0.5 * eta * eta - HALF_LOG_2PI;
@@ -3611,9 +3629,12 @@ fn empirical_rigid_calibration_eval(
     }
 
     if !(sum_phi.is_finite() && sum_cdf.is_finite() && sum_phi > 0.0 && sum_cdf > 0.0) {
-        return Err(format!(
-            "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
+            ),
+        }
+        .into());
     }
 
     let log_s_phi = log_max_phi + sum_phi.ln();
@@ -3661,9 +3682,12 @@ fn empirical_rigid_calibration_eval(
     let f_double_prime = -s_etaphi_over_s_cdf - f_prime * f_prime;
 
     if !(f.is_finite() && f_prime.is_finite() && f_prime > 0.0 && f_double_prime.is_finite()) {
-        return Err(format!(
-            "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
+            ),
+        }
+        .into());
     }
     Ok((f, f_prime, f_double_prime))
 }
@@ -3678,9 +3702,12 @@ pub(crate) fn empirical_intercept_from_marginal(
     initial: Option<f64>,
 ) -> Result<f64, String> {
     if !(target_mu.is_finite() && target_mu > 0.0 && target_mu < 1.0) {
-        return Err(format!(
-            "empirical latent calibration requires target mu in (0,1), got {target_mu}"
-        ));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "empirical latent calibration requires target mu in (0,1), got {target_mu}"
+            ),
+        }
+        .into());
     }
     let log_target_mu = target_mu.ln();
     let closed_form_seed = rigid_intercept_from_marginal(target_q, slope, probit_scale);
@@ -3730,9 +3757,12 @@ pub(crate) fn empirical_intercept_from_marginal(
         }
     };
     if f_best.abs() > abs_tol {
-        return Err(format!(
-            "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
-        ));
+        return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+            reason: format!(
+                "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
+            ),
+        }
+        .into());
     }
     Ok(root)
 }
@@ -3813,9 +3843,12 @@ impl RigidProbitKernel {
         let m = s * eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
         if !logcdf.is_finite() {
-            return Err(format!(
-                "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
+                ),
+            }
+            .into());
         }
         Ok(-w * logcdf)
     }
@@ -5571,9 +5604,12 @@ where
     F: Fn(usize) -> Result<f64, String> + Sync,
 {
     if !threshold.is_finite() {
-        return Err(format!(
-            "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
-        ));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
+            ),
+        }
+        .into());
     }
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
@@ -5598,10 +5634,13 @@ where
         // log-likelihood and can prove the line-search trial rejected before
         // the full row sweep finishes.
         if -total_ll > threshold {
-            return Err(format!(
-                "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                -total_ll, threshold
-            ));
+            return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                reason: format!(
+                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
+                    -total_ll, threshold
+                ),
+            }
+            .into());
         }
     }
     Ok(total_ll)
@@ -5694,9 +5733,12 @@ impl BernoulliMarginalSlopeFamily {
         let signed = (2.0 * self.y[row] - 1.0) * observed_eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
         if !logcdf.is_finite() {
-            return Err(format!(
-                "empirical rigid neglog_only: non-finite log Φ at row {row}"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "empirical rigid neglog_only: non-finite log Φ at row {row}"
+                ),
+            }
+            .into());
         }
         Ok(-self.weights[row] * logcdf)
     }
@@ -6704,10 +6746,13 @@ impl BernoulliMarginalSlopeFamily {
             if let Some(threshold) = line_search_options.early_exit_threshold
                 && -log_likelihood > threshold
             {
-                return Err(format!(
-                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -log_likelihood, threshold
-                ));
+                return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                    reason: format!(
+                        "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
+                        -log_likelihood, threshold
+                    ),
+                }
+                .into());
             }
         }
 
@@ -6794,15 +6839,21 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<f64, String> {
         let k = dirs.len();
         if k > 4 {
-            return Err(format!(
-                "bernoulli marginal-slope sigma row directional expects 0..=4 directions, got {k}"
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "bernoulli marginal-slope sigma row directional expects 0..=4 directions, got {k}"
+                ),
+            }
+            .into());
         }
         if scale_jet.coeffs.len() != (1usize << k) {
-            return Err(format!(
-                "bernoulli marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
-                scale_jet.coeffs.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
+                    scale_jet.coeffs.len()
+                ),
+            }
+            .into());
         }
 
         let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
@@ -6954,10 +7005,12 @@ impl BernoulliMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if self.effective_flex_active(block_states)? {
-            return Err(
-                "bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason:
+                    "bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
+                        .to_string(),
+            }
+            .into());
         }
         if self.gaussian_frailty_sd.is_none() {
             return Ok(None);
@@ -7029,10 +7082,12 @@ impl BernoulliMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if self.effective_flex_active(block_states)? {
-            return Err(
-                "bernoulli marginal-slope second log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason:
+                    "bernoulli marginal-slope second log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
+                        .to_string(),
+            }
+            .into());
         }
         if self.gaussian_frailty_sd.is_none() {
             return Ok(None);
@@ -7103,21 +7158,26 @@ impl BernoulliMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Array2<f64>>, String> {
         if self.effective_flex_active(block_states)? {
-            return Err(
-                "bernoulli marginal-slope log-sigma Hessian directional derivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason:
+                    "bernoulli marginal-slope log-sigma Hessian directional derivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
+                        .to_string(),
+            }
+            .into());
         }
         if self.gaussian_frailty_sd.is_none() {
             return Ok(None);
         }
         let slices = block_slices(self);
         if d_beta_flat.len() != slices.total {
-            return Err(format!(
-                "bernoulli marginal-slope d_beta length mismatch for sigma Hessian derivative: got {}, expected {}",
-                d_beta_flat.len(),
-                slices.total
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope d_beta length mismatch for sigma Hessian derivative: got {}, expected {}",
+                    d_beta_flat.len(),
+                    slices.total
+                ),
+            }
+            .into());
         }
         let n = self.y.len();
         let primary = primary_slices(&slices);
@@ -7265,46 +7325,61 @@ impl BernoulliMarginalSlopeFamily {
         let expected_blocks =
             2usize + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         if block_states.len() != expected_blocks {
-            return Err(format!(
-                "bernoulli marginal-slope block count mismatch: got {}, expected {}",
-                block_states.len(),
-                expected_blocks
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope block count mismatch: got {}, expected {}",
+                    block_states.len(),
+                    expected_blocks
+                ),
+            }
+            .into());
         }
 
         let n_rows = self.y.len();
         let marginal = &block_states[0];
         let marginal_ncols = self.marginal_design.ncols();
         if marginal_ncols > 0 && marginal.beta.len() != marginal_ncols {
-            return Err(format!(
-                "bernoulli marginal-slope marginal beta length mismatch: got {}, expected {}",
-                marginal.beta.len(),
-                marginal_ncols
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope marginal beta length mismatch: got {}, expected {}",
+                    marginal.beta.len(),
+                    marginal_ncols
+                ),
+            }
+            .into());
         }
         if marginal.eta.len() != n_rows {
-            return Err(format!(
-                "bernoulli marginal-slope marginal eta length mismatch: got {}, expected {}",
-                marginal.eta.len(),
-                n_rows
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope marginal eta length mismatch: got {}, expected {}",
+                    marginal.eta.len(),
+                    n_rows
+                ),
+            }
+            .into());
         }
 
         let logslope = &block_states[1];
         let logslope_ncols = self.logslope_design.ncols();
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
-            return Err(format!(
-                "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
-                logslope.beta.len(),
-                logslope_ncols
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
+                    logslope.beta.len(),
+                    logslope_ncols
+                ),
+            }
+            .into());
         }
         if logslope.eta.len() != n_rows {
-            return Err(format!(
-                "bernoulli marginal-slope logslope eta length mismatch: got {}, expected {}",
-                logslope.eta.len(),
-                n_rows
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope logslope eta length mismatch: got {}, expected {}",
+                    logslope.eta.len(),
+                    n_rows
+                ),
+            }
+            .into());
         }
 
         if let Some(runtime) = &self.score_warp {
@@ -7312,18 +7387,24 @@ impl BernoulliMarginalSlopeFamily {
                 .score_block_state(block_states)?
                 .expect("score-warp block should exist when runtime is present");
             if score.beta.len() != runtime.basis_dim() {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp beta length mismatch: got {}, expected {}",
-                    score.beta.len(),
-                    runtime.basis_dim()
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli marginal-slope score-warp beta length mismatch: got {}, expected {}",
+                        score.beta.len(),
+                        runtime.basis_dim()
+                    ),
+                }
+                .into());
             }
             if score.eta.len() != n_rows {
-                return Err(format!(
-                    "bernoulli marginal-slope score-warp eta length mismatch: got {}, expected {}",
-                    score.eta.len(),
-                    n_rows
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli marginal-slope score-warp eta length mismatch: got {}, expected {}",
+                        score.eta.len(),
+                        n_rows
+                    ),
+                }
+                .into());
             }
         }
 
@@ -7332,18 +7413,24 @@ impl BernoulliMarginalSlopeFamily {
                 .link_block_state(block_states)?
                 .expect("link-deviation block should exist when runtime is present");
             if link.beta.len() != runtime.basis_dim() {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation beta length mismatch: got {}, expected {}",
-                    link.beta.len(),
-                    runtime.basis_dim()
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli marginal-slope link-deviation beta length mismatch: got {}, expected {}",
+                        link.beta.len(),
+                        runtime.basis_dim()
+                    ),
+                }
+                .into());
             }
             if link.eta.len() != n_rows {
-                return Err(format!(
-                    "bernoulli marginal-slope link-deviation eta length mismatch: got {}, expected {}",
-                    link.eta.len(),
-                    n_rows
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli marginal-slope link-deviation eta length mismatch: got {}, expected {}",
+                        link.eta.len(),
+                        n_rows
+                    ),
+                }
+                .into());
             }
         }
 
