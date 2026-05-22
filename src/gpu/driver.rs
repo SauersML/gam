@@ -14,6 +14,8 @@
 use libloading::Library;
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 
+use super::error::GpuError;
+
 pub type CuResult = i32;
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
@@ -39,28 +41,21 @@ pub struct DriverApi {
 }
 
 impl DriverApi {
-    pub fn load(library: &Library) -> Result<Self, String> {
+    pub fn load(library: &Library) -> Result<Self, GpuError> {
+        let sym = |e: libloading::Error| GpuError::DriverSymbolMissing {
+            reason: e.to_string(),
+        };
         unsafe {
             Ok(Self {
-                cu_init: *library.get(b"cuInit\0").map_err(|e| e.to_string())?,
-                cu_device_get: *library.get(b"cuDeviceGet\0").map_err(|e| e.to_string())?,
-                cu_ctx_create: *library
-                    .get(b"cuCtxCreate_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_ctx_set_current: *library
-                    .get(b"cuCtxSetCurrent\0")
-                    .map_err(|e| e.to_string())?,
-                cu_ctx_destroy: *library
-                    .get(b"cuCtxDestroy_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_mem_alloc: *library.get(b"cuMemAlloc_v2\0").map_err(|e| e.to_string())?,
-                cu_mem_free: *library.get(b"cuMemFree_v2\0").map_err(|e| e.to_string())?,
-                cu_memcpy_htod: *library
-                    .get(b"cuMemcpyHtoD_v2\0")
-                    .map_err(|e| e.to_string())?,
-                cu_memcpy_dtoh: *library
-                    .get(b"cuMemcpyDtoH_v2\0")
-                    .map_err(|e| e.to_string())?,
+                cu_init: *library.get(b"cuInit\0").map_err(sym)?,
+                cu_device_get: *library.get(b"cuDeviceGet\0").map_err(sym)?,
+                cu_ctx_create: *library.get(b"cuCtxCreate_v2\0").map_err(sym)?,
+                cu_ctx_set_current: *library.get(b"cuCtxSetCurrent\0").map_err(sym)?,
+                cu_ctx_destroy: *library.get(b"cuCtxDestroy_v2\0").map_err(sym)?,
+                cu_mem_alloc: *library.get(b"cuMemAlloc_v2\0").map_err(sym)?,
+                cu_mem_free: *library.get(b"cuMemFree_v2\0").map_err(sym)?,
+                cu_memcpy_htod: *library.get(b"cuMemcpyHtoD_v2\0").map_err(sym)?,
+                cu_memcpy_dtoh: *library.get(b"cuMemcpyDtoH_v2\0").map_err(sym)?,
             })
         }
     }
@@ -102,7 +97,7 @@ impl CudaWorkingState {
     /// Bind this context to the calling thread. Library runtimes call
     /// this before issuing work because cuCtxSetCurrent is per-thread.
     #[inline]
-    pub fn set_current(&self) -> Result<(), String> {
+    pub fn set_current(&self) -> Result<(), GpuError> {
         check_cuda(
             unsafe { (self.api.cu_ctx_set_current)(self.context) },
             "cuCtxSetCurrent",
