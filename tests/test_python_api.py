@@ -1080,6 +1080,7 @@ def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
     basis1, _ = gamfit.periodic_spline_curve_basis(
         np.array([1.0]), n_knots=10, degree=3
     )
+    assert isinstance(result.coefficients, torch.Tensor)
     coef = result.coefficients.detach().cpu().numpy()  # shape (K, D)
     f0 = basis0 @ coef
     f1 = basis1 @ coef
@@ -1117,6 +1118,7 @@ def test_sphere_torch_fit_smoke_all_kernels() -> None:
         n_centers = 20 if kernel != "harmonic" else 5  # harmonic: L → 5*(5+2)=35 cols
         spec = Sphere(n_centers=n_centers, penalty_order=2, kernel=kernel, radians=False)
         result = torch_fit(points, response, spec)
+        assert isinstance(result.coefficients, torch.Tensor)
         coef = result.coefficients.detach().cpu().numpy()
         fitted = result.fitted.detach().cpu().numpy()
         assert coef.ndim == 2 and coef.shape[1] == 2, (
@@ -1181,6 +1183,7 @@ def test_torch_convex_smooth() -> None:
     # derived from x for consistency.
     knots = None
     b_grid = bspline_basis(grid, knots, degree=3, periodic=False).detach().cpu().numpy()
+    assert isinstance(result.coefficients, torch.Tensor)
     coef = result.coefficients.detach().cpu().numpy()
     # coef may be (M, 1); flatten.
     coef_flat = coef.reshape(coef.shape[0], -1)
