@@ -978,20 +978,27 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 problem.fit,
             )?;
             let lambda = problem.fit.lambda;
-            if !(problem.fit.reml_hess_rho.is_finite() && problem.fit.reml_hess_rho.abs() > 1.0e-14)
-            {
-                return Err(EstimationError::ModelIsIllConditioned {
-                    condition_number: f64::INFINITY,
-                });
-            }
             let n = problem.x.nrows();
             let p = problem.x.ncols();
             let d = problem.y.ncols();
+            if !(problem.fit.reml_hess_rho.is_finite() && problem.fit.reml_hess_rho.abs() > 1.0e-14)
+            {
+                // Graceful degradation — see `gaussian_reml_multi_closed_form_backward_from_fit`.
+                warn_ill_conditioned_backward_once(p, d, f64::INFINITY);
+                return Ok(zero_backward_result(n, p, d));
+            }
             let weight = gaussian_reml_weights(n, problem.weights.as_ref().map(|w| w.view()))?;
             let inverse_hessian = if let Some(ref stacks) = batched_inverses {
                 stacks[b].clone()
             } else {
-                gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, lambda)?
+                match gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, lambda) {
+                    Ok(inv) => inv,
+                    Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
+                        warn_ill_conditioned_backward_once(p, d, condition_number);
+                        return Ok(zero_backward_result(n, p, d));
+                    }
+                    Err(err) => return Err(err),
+                }
             };
             gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
                 problem.x.view(),
@@ -3378,6 +3385,89 @@ mod tests {
         }
         for (a, b) in refit.grad_weights.iter().zip(from_fit.grad_weights.iter()) {
             assert!((a - b).abs() <= 1.0e-12);
+        }
+    }
+
+    /// Regression: when `K = XᵀWX + λS` is effectively rank-deficient (e.g.
+    /// `λ` has saturated very large), the backward must NOT error — it must
+    /// degrade gracefully and return zero gradients of the correct shape.
+    /// This is the production-training scenario where individual atoms can
+    /// saturate `λ_k` in early batches; raising here would crash an entire
+    /// step. We construct the degenerate state by running a real forward
+    /// fit and then corrupting `reml_hess_rho` to 0 (the gate variable the
+    /// backward checks). We assert: (a) no error, (b) all gradients finite,
+    /// (c) shapes match the inputs.
+    #[test]
+    fn backward_degrades_gracefully_when_k_is_near_singular() {
+        // Small, full-rank S with a moderately-conditioned X. The exact
+        // numbers don't matter; what matters is that we then force the
+        // ill-conditioned gate to fire.
+        let x = array![
+            [1.0, -1.0, 0.5],
+            [1.0, -0.5, 0.2],
+            [1.0, 0.0, -0.1],
+            [1.0, 0.5, 0.3],
+            [1.0, 1.0, 0.8],
+            [1.0, 1.5, 1.1],
+            [1.0, 2.0, 1.5],
+            [1.0, 2.5, 2.0],
+            [1.0, 3.0, 2.6],
+            [1.0, 3.5, 3.1],
+        ];
+        let y = array![
+            [0.1],
+            [0.3],
+            [0.4],
+            [0.7],
+            [1.0],
+            [1.5],
+            [2.0],
+            [2.7],
+            [3.3],
+            [4.0]
+        ];
+        // Full-rank S to keep the forward well-posed.
+        let penalty = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+        let mut fit =
+            gaussian_reml_multi_closed_form(x.view(), y.view(), penalty.view(), None, Some(0.0))
+                .expect("forward fit must succeed for well-posed input");
+        // Force the ill-conditioned gate to fire by zeroing the REML
+        // Hessian w.r.t. rho — this is exactly what happens in production
+        // when `λ` saturates to 1e10+ and `d²ℓ/dρ² → 0`.
+        fit.reml_hess_rho = 0.0;
+
+        let result = gaussian_reml_multi_closed_form_backward_from_fit(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            &fit,
+            // Nonzero upstreams to force the backward to actually try to
+            // populate gradients (rather than short-circuit on zero seeds).
+            1.0,
+            None,
+            None,
+            1.0,
+            1.0,
+        )
+        .expect("backward must NOT error on near-singular K");
+
+        assert_eq!(result.grad_x.dim(), (x.nrows(), x.ncols()));
+        assert_eq!(result.grad_y.dim(), (y.nrows(), y.ncols()));
+        assert_eq!(result.grad_penalty.dim(), (x.ncols(), x.ncols()));
+        assert_eq!(result.grad_weights.dim(), x.nrows());
+        for v in result.grad_x.iter() {
+            assert!(v.is_finite(), "grad_x must be finite, got {v}");
+        }
+        for v in result.grad_y.iter() {
+            assert!(v.is_finite(), "grad_y must be finite, got {v}");
+        }
+        for v in result.grad_penalty.iter() {
+            assert!(v.is_finite(), "grad_penalty must be finite, got {v}");
+        }
+        for v in result.grad_weights.iter() {
+            assert!(v.is_finite(), "grad_weights must be finite, got {v}");
         }
     }
 }
