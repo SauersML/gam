@@ -5124,10 +5124,11 @@ impl BernoulliExactNewtonAccumulator {
 
 fn add_weighted_chunk_gradient(
     chunk: &Array2<f64>,
-    weights: &Array1<f64>,
+    weights: &[f64],
     target: &mut Array1<f64>,
 ) {
-    *target += &crate::faer_ndarray::fast_atv(chunk, weights);
+    let weights_view = ndarray::ArrayView1::from(weights);
+    *target += &crate::faer_ndarray::fast_atv(chunk, &weights_view);
 }
 
 fn new_cell_moment_lru_cache(
@@ -5141,8 +5142,9 @@ fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCacheStats> {
     Arc::new(exact_kernel::CellMomentCacheStats::default())
 }
 
-fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &Array1<f64>, target: &mut Array2<f64>) {
-    *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, weights);
+fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &[f64], target: &mut Array2<f64>) {
+    let weights_view = ndarray::ArrayView1::from(weights);
+    *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, &weights_view);
 }
 
 /// Chunk size for parallel row accumulation. Rows within a chunk are
@@ -15452,15 +15454,17 @@ impl BernoulliMarginalSlopeFamily {
                             .logslope_design
                             .try_row_chunk(start..end)
                             .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-                        let mut hm_w = Array1::<f64>::zeros(rows);
-                        let mut hl_w = Array1::<f64>::zeros(rows);
+                        let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let hm_w = &mut hm_w_buf[..rows];
+                        let hl_w = &mut hl_w_buf[..rows];
                         for local_row in 0..rows {
                             let h = &cache.hessians[start + local_row];
                             hm_w[local_row] = h[0][0];
                             hl_w[local_row] = h[1][1];
                         }
-                        add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
-                        add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
+                        add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm);
+                        add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl);
                         Ok((hm, hl))
                     },
                 )
@@ -15559,10 +15563,14 @@ impl BernoulliMarginalSlopeFamily {
                             .logslope_design
                             .try_row_chunk(start..end)
                             .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-                        let mut gm_w = Array1::<f64>::zeros(rows);
-                        let mut gl_w = Array1::<f64>::zeros(rows);
-                        let mut hm_w = Array1::<f64>::zeros(rows);
-                        let mut hl_w = Array1::<f64>::zeros(rows);
+                        let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                        let gm_w = &mut gm_w_buf[..rows];
+                        let gl_w = &mut gl_w_buf[..rows];
+                        let hm_w = &mut hm_w_buf[..rows];
+                        let hl_w = &mut hl_w_buf[..rows];
                         for local_row in 0..rows {
                             let row = start + local_row;
                             let marginal_eta = block_states[0].eta[row];
@@ -15578,10 +15586,10 @@ impl BernoulliMarginalSlopeFamily {
                             hm_w[local_row] = h[0][0];
                             hl_w[local_row] = h[1][1];
                         }
-                        add_weighted_chunk_gradient(&marginal_chunk, &gm_w, &mut gm);
-                        add_weighted_chunk_gradient(&logslope_chunk, &gl_w, &mut gl);
-                        add_weighted_chunk_gram(&marginal_chunk, &hm_w, &mut hm);
-                        add_weighted_chunk_gram(&logslope_chunk, &hl_w, &mut hl);
+                        add_weighted_chunk_gradient(&marginal_chunk, gm_w, &mut gm);
+                        add_weighted_chunk_gradient(&logslope_chunk, gl_w, &mut gl);
+                        add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm);
+                        add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl);
                         Ok((ll, gm, gl, hm, hl))
                     },
                 )
