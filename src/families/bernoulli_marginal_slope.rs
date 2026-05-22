@@ -15174,11 +15174,7 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
-                    if w != 1.0 {
-                        f_arr.mapv_inplace(|v| v * w);
-                    }
-                    acc.add_pullback(self, row, slices, primary, &f_arr);
+                    acc.add_pullback_rigid_2x2(self, row, &f, w);
                     Ok(acc)
                 })
                 .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
@@ -15266,11 +15262,7 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
-                    if w != 1.0 {
-                        f_arr.mapv_inplace(|v| v * w);
-                    }
-                    acc.add_pullback(self, row, slices, primary, &f_arr);
+                    acc.add_pullback_rigid_2x2(self, row, &f, w);
                     Ok(acc)
                 })
                 .try_reduce(make_acc, |mut left, right| -> Result<_, String> {
