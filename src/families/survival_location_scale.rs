@@ -3,15 +3,14 @@ use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
     CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyPsiSecondDesignAction, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
+    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, weighted_crossprod_psi_maps, wrap_spatial_implicit_psi_operator,
+    resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
+    wrap_spatial_implicit_psi_operator,
 };
 use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
 
@@ -1571,6 +1570,105 @@ impl SurvivalLocationScaleFamily {
     fn time_derivative_lower_bound(&self) -> f64 {
         assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
         self.derivative_guard
+    }
+
+    fn max_feasible_time_step(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason:
+                    "survival location-scale time block missing structural coefficient lower bounds"
+                        .to_string(),
+            }
+            .into());
+        };
+        if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+                "survival location-scale time-step lower-bound dimension mismatch: beta={}, delta={}, bounds={}",
+                beta.len(),
+                delta.len(),
+                lower_bounds.len()
+            ) }.into());
+        }
+        let mut alpha = 1.0f64;
+        for j in 0..lower_bounds.len() {
+            let lower_bound = lower_bounds[j];
+            if !lower_bound.is_finite() {
+                continue;
+            }
+            let slack = beta[j] - lower_bound;
+            if slack < -1e-10 {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
+                ) }.into());
+            }
+            let drift = delta[j];
+            if drift < 0.0 {
+                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+            }
+        }
+        let coefficient_alpha = if alpha >= 1.0 {
+            1.0
+        } else {
+            (0.995 * alpha).clamp(0.0, 1.0)
+        };
+        let deriv = self.x_time_deriv.as_ref();
+        if deriv.ncols() == beta.len() {
+            let guard = self.derivative_guard;
+            for row in 0..deriv.nrows() {
+                let row_view = deriv.row(row);
+                let current = self.time_derivative_offset_exit[row] + row_view.dot(beta);
+                let drift = row_view.dot(delta);
+                let slack = current - guard;
+                if slack < -1e-10 {
+                    return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                        "survival location-scale current time derivative violates guard at row {row}: slack={slack:.3e}"
+                    ) }.into());
+                }
+                if current + drift < guard {
+                    return Ok(Some(0.0));
+                }
+            }
+        }
+        Ok(Some(coefficient_alpha))
+    }
+
+    fn max_feasible_link_wiggle_step(
+        &self,
+        beta: &Array1<f64>,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        if beta.len() != delta.len() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "survival location-scale linkwiggle-step dimension mismatch: beta={}, delta={}",
+                    beta.len(),
+                    delta.len()
+                ),
+            }
+            .into());
+        }
+        let mut alpha = 1.0f64;
+        for j in 0..beta.len() {
+            let slack = beta[j];
+            if slack < -1e-10 {
+                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+                    "survival location-scale current linkwiggle block violates nonnegativity at coefficient {j}: beta={slack:.3e}"
+                ) }.into());
+            }
+            let drift = delta[j];
+            if drift < 0.0 {
+                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+            }
+        }
+        if alpha >= 1.0 {
+            Ok(Some(1.0))
+        } else {
+            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
+        }
     }
 
     #[inline]
@@ -8764,42 +8862,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn exact_newton_joint_psisecond_order_terms(
         &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_i: usize,
-        psi_j: usize,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_i: usize,
+        _psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi second-order terms expect {} specs and derivative blocks, got {} and {}",
-                self.expected_blocks(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let Some(dir_i) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_i)?
-        else {
-            return Ok(None);
-        };
-        let Some(dir_j) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_j)?
-        else {
-            return Ok(None);
-        };
-        let q = self.collect_joint_quantities(block_states)?;
-        Ok(Some(
-            self.exact_newton_joint_psisecond_order_terms_from_parts(
-                block_states,
-                derivative_blocks,
-                &q,
-                &dir_i,
-                &dir_j,
-            )?,
-        ))
+        Ok(None)
     }
 
     fn exact_newton_joint_psi_workspace(
@@ -8861,58 +8930,25 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
+        _block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _psi_index: usize,
+        _d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        if specs.len() != self.expected_blocks()
-            || derivative_blocks.len() != self.expected_blocks()
-        {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "SurvivalLocationScaleFamily joint psi hessian directional derivative expects {} specs and derivative blocks, got {} and {}",
-                self.expected_blocks(),
-                specs.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let Some(dir) =
-            self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index)?
-        else {
-            return Ok(None);
-        };
-        let q = self.collect_joint_quantities(block_states)?;
-        Ok(Some(
-            self.exact_newton_joint_psihessian_directional_derivative_from_parts(
-                &q,
-                &dir,
-                d_beta_flat,
-            )?,
-        ))
+        Ok(None)
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _block_states: &[ParameterBlockState],
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let q = self.collect_joint_quantities_rescaled(
-            block_states,
-            self.hessian_deriv_log_rescale(block_states),
-        )?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
-            block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-            &q,
-            &dynamic,
-        )
+        Ok(None)
     }
 
-    fn block_constraints(
+    fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
         block_idx: usize,
@@ -9692,6 +9728,76 @@ impl SurvivalLocationScaleFamily {
     }
 }
 
+struct SurvivalExactNewtonJointPsiWorkspace {
+    family: SurvivalLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
+    specs: Vec<ParameterBlockSpec>,
+    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    row_mask: Option<Arc<Array1<f64>>>,
+}
+
+impl SurvivalExactNewtonJointPsiWorkspace {
+    fn new(
+        family: SurvivalLocationScaleFamily,
+        block_states: Vec<ParameterBlockState>,
+        specs: Vec<ParameterBlockSpec>,
+        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            family,
+            block_states,
+            specs,
+            derivative_blocks,
+            row_mask: None,
+        })
+    }
+
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.family.n;
+        let mut mask = Array1::<f64>::zeros(n);
+        for r in rows {
+            if r.index < n {
+                mask[r.index] = r.weight;
+            }
+        }
+        self.row_mask = Some(Arc::new(mask));
+    }
+}
+
+impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.family.exact_newton_joint_psi_terms_masked(
+            &self.block_states,
+            &self.specs,
+            &self.derivative_blocks,
+            psi_index,
+            self.row_mask.as_deref(),
+        )
+    }
+
+    fn second_order_terms(
+        &self,
+        _psi_i: usize,
+        _psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        Ok(None)
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        _psi_index: usize,
+        _d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+        Ok(None)
+    }
+}
+
 /// Workspace caching the direction-independent state used by the survival
 /// location-scale joint-Hessian directional derivative operators.
 struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
@@ -9767,36 +9873,18 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
 
     fn second_directional_derivative(
         &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )
+        Ok(None)
     }
 
     fn second_directional_derivative_operator(
         &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        Ok(self
-            .family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )?
-            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
+        Ok(None)
     }
 }
 
