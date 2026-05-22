@@ -7081,6 +7081,10 @@ fn scatter_joint_active_set(
 ///
 /// Returns `None` when no block has any active constraints — the caller
 /// can then skip the constraint-aware kernel entirely.
+#[allow(dead_code)] // Wired in by the constraint-aware kernel path; called by
+                    // BlockwiseInnerResult assembly when active inequality
+                    // constraints are present. Stays defined unconditionally
+                    // so the cert-point pseudo-inverse helper is one grep away.
 fn assemble_active_constraint_block(
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: &[Option<Vec<usize>>],
@@ -10678,6 +10682,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
                 kkt_residual,
+                active_constraints: {
+                    let block_constraints =
+                        collect_block_linear_constraints(family, &states, specs)?;
+                    assemble_active_constraint_block(
+                        &block_constraints,
+                        &cached_active_sets,
+                        &ranges,
+                        total_p,
+                    )
+                    .map(std::sync::Arc::new)
+                },
             });
         }
         // Soft warm-start across rho changes.
@@ -12792,6 +12807,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             )?;
             let kkt_residual =
                 require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
+            // Build the joint active-constraint block for the unified
+            // evaluator's constraint-aware kernel
+            // `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. Returns `None` when
+            // the family has no declared inequality constraints, or when
+            // no rows are currently active at the cert point; in either
+            // case the consumer-side `with_active_constraints` helper
+            // degrades back to the bare penalty-projected pseudo-inverse.
+            let active_constraints = {
+                let block_constraints =
+                    collect_block_linear_constraints(family, &states, specs)?;
+                assemble_active_constraint_block(
+                    &block_constraints,
+                    &cached_active_sets,
+                    &ranges,
+                    total_p,
+                )
+                .map(std::sync::Arc::new)
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -12804,6 +12837,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
                 kkt_residual,
+                active_constraints,
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -13704,6 +13738,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         s_lambdas,
         joint_workspace: None,
         kkt_residual,
+        active_constraints: None,
     })
 }
 
