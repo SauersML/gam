@@ -294,6 +294,18 @@ impl LikelihoodFamily {
         matches!(self, Self::BinomialLatentCLogLog)
     }
 
+    /// `true` for the Gaussian-identity family.
+    #[inline]
+    pub fn is_gaussian_identity(self) -> bool {
+        matches!(self, Self::GaussianIdentity)
+    }
+
+    /// `true` for the Royston-Parmar (flexible parametric survival) family.
+    #[inline]
+    pub fn is_royston_parmar(self) -> bool {
+        matches!(self, Self::RoystonParmar)
+    }
+
     /// `true` for the blended/mixture-of-inverse-links binomial family.
     #[inline]
     pub fn is_binomial_mixture(self) -> bool {
