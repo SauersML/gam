@@ -5850,23 +5850,6 @@ fn apply_ht_mask_second(
     weights.d2h_ls_ls = d2hll;
 }
 
-/// Apply a Horvitz–Thompson mask to a single per-row array in place: each
-/// sampled row's entry is multiplied by `WeightedOuterRow.weight = 1/π_i`,
-/// all other entries are zeroed. Used by the wiggle ψ path where per-row
-/// coefficient arrays are computed inline (one variable per array) rather
-/// than packed into a struct.
-fn apply_ht_mask_array(
-    arr: &mut Array1<f64>,
-    rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
-) {
-    let n = arr.len();
-    let mut out = Array1::<f64>::zeros(n);
-    for r in rows {
-        out[r.index] = arr[r.index] * r.weight;
-    }
-    *arr = out;
-}
-
 /// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
 /// other `apply_ht_mask_*` helpers; consumed row-linearly by
 /// `gaussian_joint_psi_mixedhessian_drift_fromweights`.
