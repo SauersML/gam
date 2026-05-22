@@ -8836,7 +8836,17 @@ struct TransformationNormalPsiDhMatrixFreeOperator {
     op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     axis: usize,
     row_quantities: TransformationNormalRowQuantityCache,
-    dense_cache: OnceLock<Array2<f64>>,
+    // `RayonSafeOnce` (not `OnceLock`): `dense_matrix()` materializes via
+    // `scop_psi_hessian_directional_derivative`, which dispatches an
+    // `into_par_iter` over rows. This operator is invoked from outer
+    // par_iter contexts (HyperOperator HVP / dense build paths); a plain
+    // `OnceLock::get_or_init` here would park sibling rayon workers on the
+    // OS mutex while the leader tries to schedule child rayon tasks no
+    // worker is free to pick up — classic OnceLock-under-rayon deadlock
+    // (see `feedback_oncelock_rayon_deadlock`). `RayonSafeOnce` keeps the
+    // init lock-free; racers redundantly compute but `set()` discards the
+    // losers.
+    dense_cache: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 impl TransformationNormalPsiDhMatrixFreeOperator {
@@ -8855,7 +8865,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             op,
             axis,
             row_quantities,
-            dense_cache: OnceLock::new(),
+            dense_cache: crate::resource::RayonSafeOnce::new(),
         }
     }
 

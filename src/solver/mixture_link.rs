@@ -841,6 +841,174 @@ pub fn inverse_link_jet_for_inverse_link(
     link.jet(eta)
 }
 
+/// Specialized `(mu, d1)` inverse-link evaluation that skips the d2/d3
+/// polynomial chain used by the full jet. Numerical semantics are preserved:
+/// the returned `mu` and `d1` are bit-identical to the corresponding fields of
+/// `inverse_link_jet_for_inverse_link(link, eta)?` for every supported link.
+///
+/// For latent cloglog the underlying lognormal-Laplace kernel produces all
+/// orders together, so this falls back to the full jet for that branch — the
+/// savings come from the parameterised polynomial links (SAS, beta-logistic,
+/// mixture) and the simple analytic links where d2/d3 are pure waste.
+pub fn inverse_link_mu_d1_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<(f64, f64), EstimationError> {
+    match link {
+        InverseLink::Standard(link_fn) => Ok(link_function_mu_d1(*link_fn, eta)?),
+        InverseLink::LatentCLogLog(state) => {
+            let jet = latent_cloglog_point_jet(state, eta)?;
+            Ok((jet.mu, jet.d1))
+        }
+        InverseLink::Sas(state) => Ok(sas_inverse_link_mu_d1(eta, state.epsilon, state.log_delta)),
+        InverseLink::BetaLogistic(state) => Ok(beta_logistic_inverse_link_mu_d1(
+            eta,
+            state.log_delta,
+            state.epsilon,
+        )),
+        InverseLink::Mixture(state) => Ok(mixture_inverse_link_mu_d1(state, eta)),
+    }
+}
+
+fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), EstimationError> {
+    match link {
+        LinkFunction::Identity => Ok((eta, 1.0)),
+        LinkFunction::Log => {
+            let e = eta.clamp(-700.0, 700.0).exp();
+            Ok((e, e))
+        }
+        LinkFunction::Logit => Ok(component_inverse_link_mu_d1(LinkComponent::Logit, eta)),
+        LinkFunction::Probit => Ok(component_inverse_link_mu_d1(LinkComponent::Probit, eta)),
+        LinkFunction::CLogLog => Ok(component_inverse_link_mu_d1(LinkComponent::CLogLog, eta)),
+        LinkFunction::Sas => Err(EstimationError::InvalidInput(
+            "LinkFunction::Sas inverse-link requires explicit SAS link state".to_string(),
+        )),
+        LinkFunction::BetaLogistic => Err(EstimationError::InvalidInput(
+            "LinkFunction::BetaLogistic inverse-link requires explicit Beta-Logistic link state"
+                .to_string(),
+        )),
+    }
+}
+
+#[inline]
+fn component_inverse_link_mu_d1(component: LinkComponent, eta: f64) -> (f64, f64) {
+    // The full per-component jet already factors `mu` and `d1` exactly the same
+    // way the higher orders are derived, so we either reuse the cheap closed
+    // forms directly (Logit/Probit/CLogLog/LogLog/Cauchit) or fall back to the
+    // existing canonicalised jet for the few cases without a separate fast
+    // path — bit-identical to `component_inverse_link_jet(...).{mu,d1}`.
+    match component {
+        LinkComponent::Logit => {
+            let jet = logit_inverse_link_jet5(eta);
+            (jet.mu, canonicalzero(jet.d1))
+        }
+        LinkComponent::Probit => {
+            if eta.is_nan() {
+                return (f64::NAN, f64::NAN);
+            }
+            if eta == f64::INFINITY {
+                return (1.0, 0.0);
+            }
+            if eta == f64::NEG_INFINITY {
+                return (0.0, 0.0);
+            }
+            let phi = normal_pdf(eta);
+            (normal_cdf(eta), canonicalzero(phi))
+        }
+        LinkComponent::CLogLog => {
+            if eta.is_nan() {
+                return (f64::NAN, f64::NAN);
+            }
+            let t = eta.exp();
+            if !t.is_finite() {
+                return (1.0, 0.0);
+            }
+            (
+                -(-t).exp_m1(),
+                canonicalzero(stable_nonnegative_poly_times_exp_neg(t, &[0.0, 1.0])),
+            )
+        }
+        LinkComponent::LogLog => {
+            if eta.is_nan() {
+                return (f64::NAN, f64::NAN);
+            }
+            let r = (-eta).exp();
+            if !r.is_finite() {
+                return (0.0, 0.0);
+            }
+            (
+                (-r).exp(),
+                canonicalzero(stable_nonnegative_poly_times_exp_neg(r, &[0.0, 1.0])),
+            )
+        }
+        LinkComponent::Cauchit => {
+            if eta.is_nan() {
+                return (f64::NAN, f64::NAN);
+            }
+            let den = 1.0 + eta * eta;
+            let d1 = if eta.is_finite() {
+                1.0 / (std::f64::consts::PI * den)
+            } else {
+                0.0
+            };
+            (
+                0.5 + eta.atan() / std::f64::consts::PI,
+                canonicalzero(d1),
+            )
+        }
+    }
+}
+
+fn sas_inverse_link_mu_d1(eta: f64, epsilon: f64, log_delta: f64) -> (f64, f64) {
+    let delta_id = sas_delta_from_raw_log_delta(log_delta);
+    if epsilon.abs() < 1e-12 && (delta_id - 1.0).abs() < 1e-12 {
+        return component_inverse_link_mu_d1(LinkComponent::Probit, eta);
+    }
+    let e = if eta.is_finite() { eta } else { 0.0 };
+    let a = e.asinh();
+    let delta = delta_id;
+    let u_raw = delta * a - epsilon;
+    let u = tanh_bound(u_raw, SAS_U_CLAMP);
+    let g1 = tanh_bound_d1(u_raw, SAS_U_CLAMP);
+    let s = u.sinh();
+    let c = u.cosh();
+    let z = s;
+    let q = e.hypot(1.0);
+    let inv_q = 1.0 / q;
+    let r1 = delta * inv_q;
+    let u1 = g1 * r1;
+    let z1 = c * u1;
+    // `mu = Phi(z)` and `d1 = phi(z) * z1`, the same closed forms used by the
+    // full jet via `chain_inverse_link_jet(probit_jet(z), z1, _, _)`.
+    let base = probit_jet(z);
+    (base.mu, canonicalzero(base.d1 * z1))
+}
+
+fn beta_logistic_inverse_link_mu_d1(eta: f64, delta: f64, epsilon: f64) -> (f64, f64) {
+    let (u, du) = logistic_uwith_derivatives(eta);
+    let a = (delta - epsilon).exp();
+    let b = (delta + epsilon).exp();
+    let mu = beta_reg(a, b, u);
+    if du == 0.0 {
+        return (mu, 0.0);
+    }
+    let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
+    (mu, log_d1.exp())
+}
+
+fn mixture_inverse_link_mu_d1(state: &MixtureLinkState, eta: f64) -> (f64, f64) {
+    let mut mu = 0.0_f64;
+    let mut d1 = 0.0_f64;
+    let k = state.components.len().min(state.pi.len());
+    for i in 0..k {
+        let (mu_i, d1_i) = component_inverse_link_mu_d1(state.components[i], eta);
+        let w = state.pi[i];
+        mu += w * mu_i;
+        d1 += w * d1_i;
+    }
+    (mu, d1)
+}
+
 #[derive(Clone, Copy)]
 enum PdfDerivativeOrder {
     Third,

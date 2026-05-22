@@ -32,7 +32,8 @@ use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, inverse_link_pdffourth_derivative_for_inverse_link,
+    inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
+    inverse_link_pdffourth_derivative_for_inverse_link,
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
@@ -11900,16 +11901,16 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let mut w_wiggle = Array1::<f64>::zeros(n);
         for i in 0..n {
             let q = eta[i] + etaw[i];
-            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+            let (mu_q, d1_q) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
                 .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
             let yi = self.y[i];
             let wi = self.weights[i];
-            ll += binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, jet.mu)?;
+            ll += binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, mu_q)?;
 
-            let mu = jet.mu.clamp(1e-12, 1.0 - 1e-12);
+            let mu = mu_q.clamp(1e-12, 1.0 - 1e-12);
             let var = (mu * (1.0 - mu)).max(MIN_PROB);
-            let dmu_deta = jet.d1 * dq_dq0[i];
-            let dmu_dw = jet.d1;
+            let dmu_deta = d1_q * dq_dq0[i];
+            let dmu_dw = d1_q;
             if wi == 0.0 || !var.is_finite() {
                 z_eta[i] = eta[i];
                 z_wiggle[i] = etaw[i];
