@@ -11880,6 +11880,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     order: crate::solver::outer_strategy::OuterEvalOrder,
+    design_revision: Option<u64>,
 ) -> Result<
     (
         f64,
@@ -11899,6 +11900,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
         warm_start_beta,
         "evaluate_joint_reml_outer_eval_at_theta",
         order,
+        design_revision,
     )
 }
 
@@ -11909,6 +11911,7 @@ fn evaluate_joint_reml_efs_at_theta(
     rho_dim: usize,
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
+    design_revision: Option<u64>,
 ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
     evaluator.evaluate_efs(
         &design.design,
@@ -11920,6 +11923,7 @@ fn evaluate_joint_reml_efs_at_theta(
         hyper_dirs,
         warm_start_beta,
         "evaluate_joint_reml_efs_at_theta",
+        design_revision,
     )
 }
 
@@ -13084,6 +13088,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 )
             })?;
 
+            let design_revision = Some(self.cache.design_revision());
             let eval = evaluate_joint_reml_outer_eval_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -13096,6 +13101,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 } else {
                     OuterEvalOrder::ValueAndGradient
                 },
+                design_revision,
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -13121,6 +13127,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                     "failed to build aniso hyper_dirs for exact-joint EFS".to_string(),
                 )
             })?;
+            let design_revision = Some(self.cache.design_revision());
             evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -13128,6 +13135,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
+                design_revision,
             )
         }
 
@@ -13143,6 +13151,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             if self.cache.ensure_theta(theta).is_err() {
                 return f64::INFINITY;
             }
+            let design_revision = Some(self.cache.design_revision());
             let result = {
                 let design = self.cache.design();
                 self.evaluator.evaluate_cost_only(
@@ -13154,6 +13163,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                     self.rho_dim,
                     None,
                     "spatial-aniso-joint cost-only",
+                    design_revision,
                 )
             };
             match result {
@@ -13387,6 +13397,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 )
             })?;
 
+            let design_revision = Some(self.cache.design_revision());
             let eval = evaluate_joint_reml_outer_eval_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -13399,6 +13410,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 } else {
                     OuterEvalOrder::ValueAndGradient
                 },
+                design_revision,
             );
             if let Ok(ref value) = eval {
                 self.cache.store_eval(value.clone());
@@ -13424,6 +13436,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                     "failed to build isotropic hyper_dirs for exact-joint EFS".to_string(),
                 )
             })?;
+            let design_revision = Some(self.cache.design_revision());
             evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -13431,6 +13444,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 self.rho_dim,
                 hyper_dirs,
                 None,
+                design_revision,
             )
         }
 
@@ -13453,6 +13467,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             if self.cache.ensure_theta(theta).is_err() {
                 return f64::INFINITY;
             }
+            let design_revision = Some(self.cache.design_revision());
             let result = {
                 let design = self.cache.design();
                 self.evaluator.evaluate_cost_only(
@@ -13464,6 +13479,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
                     self.rho_dim,
                     None,
                     "spatial-iso-joint cost-only",
+                    design_revision,
                 )
             };
             match result {
