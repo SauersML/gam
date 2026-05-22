@@ -3356,61 +3356,67 @@ fn with_gh_nodesweights<R>(
     }
 }
 
-fn choleskywith_jitter(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
-    let n = cov.len();
-    if n == 0 || cov.iter().any(|r| r.len() != n) {
+/// Stack-allocated Cholesky factor for `D x D` symmetric PSD matrices.
+///
+/// Returns the lower-triangular factor `L` (with strict upper triangle = 0)
+/// such that `L L^T = cov`, or `None` if `cov` is not positive definite
+/// (non-finite or non-positive pivot encountered).
+///
+/// This mirrors a standard textbook Cholesky inner loop bit-for-bit at a
+/// single jitter level, but avoids any heap allocation — critical for
+/// per-row GHQ where this runs once per observation.
+#[inline]
+fn cholesky_static<const D: usize>(cov: &[[f64; D]; D]) -> Option<[[f64; D]; D]> {
+    let mut l = [[0.0_f64; D]; D];
+    for i in 0..D {
+        for j in 0..=i {
+            let mut sum = cov[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if !sum.is_finite() || sum <= 0.0 {
+                    return None;
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    Some(l)
+}
+
+/// Stack-allocated Cholesky with a jitter-retry ladder
+/// (0, 1e-12, 1e-11, …, 1e-6 added to diagonal).
+#[inline]
+fn cholesky_static_with_jitter<const D: usize>(
+    cov: &[[f64; D]; D],
+) -> Option<[[f64; D]; D]> {
+    if D == 0 {
         return None;
     }
-    let mut base = cov.to_vec();
     for retry in 0..8 {
         let jitter = if retry == 0 {
             0.0
         } else {
             1e-12 * 10f64.powi(retry - 1)
         };
-        if jitter > 0.0 {
-            for i in 0..n {
+        if jitter == 0.0 {
+            if let Some(l) = cholesky_static::<D>(cov) {
+                return Some(l);
+            }
+        } else {
+            let mut base = *cov;
+            for i in 0..D {
                 base[i][i] = cov[i][i] + jitter;
             }
-        }
-        let mut l = vec![vec![0.0_f64; n]; n];
-        let mut ok = true;
-        for i in 0..n {
-            for j in 0..=i {
-                let mut sum = base[i][j];
-                for k in 0..j {
-                    sum -= l[i][k] * l[j][k];
-                }
-                if i == j {
-                    if !sum.is_finite() || sum <= 0.0 {
-                        ok = false;
-                        break;
-                    }
-                    l[i][j] = sum.sqrt();
-                } else {
-                    l[i][j] = sum / l[j][j];
-                }
+            if let Some(l) = cholesky_static::<D>(&base) {
+                return Some(l);
             }
-            if !ok {
-                break;
-            }
-        }
-        if ok {
-            return Some(l);
         }
     }
     None
-}
-
-#[inline]
-fn array_cov_to_vec<const D: usize>(cov: &[[f64; D]; D]) -> Vec<Vec<f64>> {
-    let mut out = vec![vec![0.0; D]; D];
-    for i in 0..D {
-        for j in 0..D {
-            out[i][j] = cov[i][j];
-        }
-    }
-    out
 }
 
 #[inline]
@@ -3436,11 +3442,15 @@ where
     }
     let n = adaptive_point_countwith_cap(maxvar.sqrt(), max_n);
 
-    let mut covvec = array_cov_to_vec(&cov);
-    for (i, row) in covvec.iter_mut().enumerate() {
-        row[i] = row[i].max(0.0);
+    // Sanitize variances on the stack (clamp negative diagonal to 0),
+    // then run a stack-allocated Cholesky-with-jitter. This avoids the
+    // `Vec<Vec<f64>>` per-row allocation that previously serialized
+    // through the global allocator inside parallel workers.
+    let mut cov_arr = cov;
+    for i in 0..D {
+        cov_arr[i][i] = cov_arr[i][i].max(0.0);
     }
-    let l = match choleskywith_jitter(&covvec) {
+    let l = match cholesky_static_with_jitter::<D>(&cov_arr) {
         Some(v) => v,
         None => return Ok(None),
     };
