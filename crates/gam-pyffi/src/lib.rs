@@ -10,6 +10,7 @@ use gam::estimate::{
 };
 use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback,
+    fast_xt_diag_x,
 };
 use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
@@ -1663,6 +1664,223 @@ fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
     value
 }
 
+fn build_joint_design_and_offsets(designs: &[Array2<f64>]) -> (Array2<f64>, Vec<usize>) {
+    let n = designs[0].nrows();
+    let mut offsets = Vec::with_capacity(designs.len() + 1);
+    offsets.push(0_usize);
+    for design in designs {
+        offsets.push(offsets.last().copied().unwrap() + design.ncols());
+    }
+    let p_total = *offsets.last().unwrap();
+    let mut z = Array2::<f64>::zeros((n, p_total));
+    for block in 0..designs.len() {
+        z.slice_mut(s![.., offsets[block]..offsets[block + 1]])
+            .assign(&designs[block]);
+    }
+    (z, offsets)
+}
+
+fn gaussian_reml_blocks_state(
+    z: &Array2<f64>,
+    offsets: &[usize],
+    penalties: &[Array2<f64>],
+    ranks: &[usize],
+    penalty_logdets: &[f64],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    rhos: &Array1<f64>,
+) -> Result<
+    (
+        Array2<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        f64,
+        Array1<f64>,
+        Array2<f64>,
+    ),
+    EstimationError,
+> {
+    let n = y.len();
+    let f_blocks = penalties.len();
+    let p_total = z.ncols();
+    let lambdas = rhos.mapv(f64::exp);
+    let mut k_matrix = gam::faer_ndarray::fast_xt_diag_x(&z.view(), &weights);
+    for block in 0..f_blocks {
+        for local_i in 0..penalties[block].nrows() {
+            let global_i = offsets[block] + local_i;
+            for local_j in 0..penalties[block].ncols() {
+                let global_j = offsets[block] + local_j;
+                k_matrix[[global_i, global_j]] +=
+                    lambdas[block] * penalties[block][[local_i, local_j]];
+            }
+        }
+    }
+    let a = invert_spd_with_ridge(&k_matrix, 0.0)?;
+    let mut xtwy = Array1::<f64>::zeros(p_total);
+    for row in 0..n {
+        let wy = weights[row] * y[row];
+        for col in 0..p_total {
+            xtwy[col] += z[[row, col]] * wy;
+        }
+    }
+    let beta = a.dot(&xtwy);
+    let fitted = z.dot(&beta);
+    let residual = &y.to_owned() - &fitted;
+
+    let mut rss = 0.0_f64;
+    for row in 0..n {
+        rss += weights[row] * residual[row] * residual[row];
+    }
+    let mut beta_p_beta = 0.0_f64;
+    let mut logdet_p = 0.0_f64;
+    let mut score = Array1::<f64>::zeros(f_blocks);
+    let mut edf = Array1::<f64>::zeros(f_blocks);
+    for block in 0..f_blocks {
+        let start = offsets[block];
+        let end = offsets[block + 1];
+        let beta_k = beta.slice(s![start..end]).to_owned();
+        let s_beta = penalties[block].dot(&beta_k);
+        let a_kk = a.slice(s![start..end, start..end]);
+        let trace_a_s = trace_product(a_kk, penalties[block].view());
+        let beta_s_beta = beta_k.dot(&s_beta);
+        beta_p_beta += lambdas[block] * beta_s_beta;
+        logdet_p += ranks[block] as f64 * rhos[block] + penalty_logdets[block];
+        score[block] = 0.5 * (ranks[block] as f64 - lambdas[block] * (beta_s_beta + trace_a_s));
+        edf[block] = (ranks[block] as f64 - lambdas[block] * trace_a_s)
+            .clamp(0.0, ranks[block] as f64);
+    }
+    let reml_score =
+        0.5 * rss + 0.5 * beta_p_beta + 0.5 * logdet_spd(&k_matrix)? - 0.5 * logdet_p;
+    Ok((a, beta, fitted, score, reml_score, edf, k_matrix))
+}
+
+fn gaussian_reml_optimize_blocks(
+    designs: &[Array2<f64>],
+    penalties_raw: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    init_rhos: Option<&[f64]>,
+) -> Result<GaussianRemlBlocksForwardExact, EstimationError> {
+    let (z, offsets) = build_joint_design_and_offsets(designs);
+    let penalties: Vec<Array2<f64>> = penalties_raw.iter().map(symmetrized_matrix).collect();
+    let mut ranks = Vec::with_capacity(penalties.len());
+    let mut penalty_logdets = Vec::with_capacity(penalties.len());
+    for penalty in &penalties {
+        let (rank, logdet) = block_penalty_rank_and_logdet(penalty)?;
+        ranks.push(rank);
+        penalty_logdets.push(logdet);
+    }
+
+    let f_blocks = penalties.len();
+    let mut rhos = init_rhos
+        .map(Array1::from_iter)
+        .unwrap_or_else(|| Array1::<f64>::zeros(f_blocks));
+    for rho in rhos.iter_mut() {
+        *rho = rho.clamp(-30.0, 30.0);
+    }
+
+    let mut last = gaussian_reml_blocks_state(
+        &z,
+        &offsets,
+        &penalties,
+        &ranks,
+        &penalty_logdets,
+        y,
+        weights,
+        &rhos,
+    )?;
+
+    for _ in 0..80 {
+        let (a, beta, _, score, current_cost, _, _) = &last;
+        let grad_norm = score.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        if grad_norm <= 1.0e-8 {
+            break;
+        }
+
+        let lambdas = rhos.mapv(f64::exp);
+        let mut c_vectors = Vec::with_capacity(f_blocks);
+        let mut t_matrices = Vec::with_capacity(f_blocks);
+        let mut s_beta_blocks = Vec::with_capacity(f_blocks);
+        let mut h_values = Array1::<f64>::zeros(f_blocks);
+        for block in 0..f_blocks {
+            let start = offsets[block];
+            let end = offsets[block + 1];
+            let beta_k = beta.slice(s![start..end]).to_owned();
+            let s_beta = penalties[block].dot(&beta_k);
+            let a_block_s = a.slice(s![.., start..end]).dot(&penalties[block]);
+            let c_i = a_block_s.dot(&beta_k);
+            let t_i = a_block_s.dot(&a.slice(s![start..end, ..]));
+            let trace_a_s = trace_product(
+                a.slice(s![start..end, start..end]),
+                penalties[block].view(),
+            );
+            h_values[block] = beta_k.dot(&s_beta) + trace_a_s;
+            c_vectors.push(c_i);
+            t_matrices.push(t_i);
+            s_beta_blocks.push(s_beta);
+        }
+
+        let mut j_outer = Array2::<f64>::zeros((f_blocks, f_blocks));
+        for i in 0..f_blocks {
+            for j in 0..f_blocks {
+                let js = offsets[j];
+                let je = offsets[j + 1];
+                let beta_term = c_vectors[i].slice(s![js..je]).dot(&s_beta_blocks[j]);
+                let trace_term =
+                    trace_product(t_matrices[i].slice(s![js..je, js..je]), penalties[j].view());
+                j_outer[[i, j]] =
+                    lambdas[i] * lambdas[j] * (beta_term + 0.5 * trace_term);
+                if i == j {
+                    j_outer[[i, j]] -= 0.5 * lambdas[i] * h_values[i];
+                }
+            }
+        }
+        let step = solve_spd_vector_with_ridge(&(-j_outer), score, 1.0e-8)?;
+        let max_step = step.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let scale = if max_step > 4.0 { 4.0 / max_step } else { 1.0 };
+
+        let mut accepted = false;
+        let mut trial_scale = scale;
+        for _ in 0..12 {
+            let trial_rhos = &rhos + &(step.mapv(|v| v * trial_scale));
+            let trial_rhos = trial_rhos.mapv(|v| v.clamp(-30.0, 30.0));
+            if let Ok(trial) = gaussian_reml_blocks_state(
+                &z,
+                &offsets,
+                &penalties,
+                &ranks,
+                &penalty_logdets,
+                y,
+                weights,
+                &trial_rhos,
+            ) {
+                if trial.4 <= *current_cost || trial_scale <= 1.0e-3 {
+                    rhos = trial_rhos;
+                    last = trial;
+                    accepted = true;
+                    break;
+                }
+            }
+            trial_scale *= 0.5;
+        }
+        if !accepted {
+            break;
+        }
+    }
+
+    let (_, beta, fitted, _, reml_score, edf, _) = last;
+    let lambdas = rhos.mapv(f64::exp);
+    Ok(GaussianRemlBlocksForwardExact {
+        coefficients: beta,
+        fitted,
+        lambdas,
+        log_lambdas: rhos,
+        reml_score,
+        edf,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_blocks_backward_analytic(
     designs: &[Array2<f64>],
@@ -1712,6 +1930,11 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             )));
         }
     }
+    if !grad_reml_score.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "grad_reml_score must be finite; got {grad_reml_score}"
+        )));
+    }
     if let Some(vec) = grad_lambdas {
         if vec.len() != f_blocks {
             return Err(EstimationError::InvalidInput(format!(
@@ -1736,6 +1959,80 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             )));
         }
     }
+    if let Some(gc) = grad_coefficients {
+        if let Some(((row, col), value)) =
+            gc.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_coefficients[{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(gf) = grad_fitted {
+        if let Some(((row, col), value)) =
+            gf.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_fitted[{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_lambdas {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_lambdas[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_log_lambdas {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_log_lambdas[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_edf {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_edf[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    for (block, design) in designs.iter().enumerate() {
+        if let Some(((row, col), value)) =
+            design.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "designs[{block}][{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    for (block, penalty) in penalties_raw.iter().enumerate() {
+        if let Some(((row, col), value)) =
+            penalty.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalties[{block}][{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some((row, value)) = y.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "y[{row}] must be finite; got {value}"
+        )));
+    }
+    if let Some((row, value)) = weights
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value < 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "weights[{row}] must be finite and non-negative; got {value}"
+        )));
+    }
 
     let mut z = Array2::<f64>::zeros((n, p_total));
     for k in 0..f_blocks {
@@ -1753,7 +2050,16 @@ fn gaussian_reml_fit_blocks_backward_analytic(
     }
 
     let lambdas = Array1::from_iter(rhos.iter().map(|rho| rho.exp()));
-    let mut k_matrix = gam::faer_ndarray::fast_xt_diag_x(&z.view(), &weights);
+    if let Some((block, lambda)) = lambdas
+        .iter()
+        .enumerate()
+        .find(|(_, lambda)| !lambda.is_finite() || **lambda <= 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "exp(log_lambdas[{block}]) must be finite and positive; got {lambda}"
+        )));
+    }
+    let mut k_matrix = fast_xt_diag_x(&z.view(), &weights);
     for block in 0..f_blocks {
         let lambda = lambdas[block];
         for local_i in 0..penalties[block].nrows() {
@@ -1764,7 +2070,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             }
         }
     }
-    let a = invert_spd_with_ridge(&k_matrix, 0.0)?;
+    let r = invert_spd_with_ridge(&k_matrix, 0.0)?;
 
     let mut xtwy = Array1::<f64>::zeros(p_total);
     for row in 0..n {
@@ -1773,27 +2079,61 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             xtwy[col] += z[[row, col]] * wy;
         }
     }
-    let beta = a.dot(&xtwy);
+    let beta = r.dot(&xtwy);
     let fitted = z.dot(&beta);
+    if let Some((col, value)) = beta.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "solved coefficient {col} is non-finite: {value}"
+        )));
+    }
     let residual = &y.to_owned() - &fitted;
-    let weighted_residual = &residual * &weights;
+    let weighted_residual = &residual * &weights.to_owned();
+    let ywy = y
+        .iter()
+        .zip(weights.iter())
+        .map(|(&yi, &wi)| wi * yi * yi)
+        .sum::<f64>();
+    let q = (ywy - xtwy.dot(&beta)).max(1.0e-300);
+    if !q.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML residual quadratic form must be finite; got {q}"
+        )));
+    }
+    let nullity = penalties
+        .iter()
+        .zip(ranks.iter())
+        .map(|(penalty, rank)| penalty.nrows().saturating_sub(*rank))
+        .sum::<usize>();
+    let nu = n as f64 - nullity as f64;
+    if !(nu.is_finite() && nu > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML residual degrees of freedom must be positive; got {nu}"
+        )));
+    }
+    let tau = nu / q;
+    let tau_q = -nu / (q * q);
+    if !(tau.is_finite() && tau_q.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML scale derivatives are non-finite: tau={tau}, tau_q={tau_q}"
+        )));
+    }
 
     let mut grad_z = Array2::<f64>::zeros((n, p_total));
-    let mut grad_y = Array2::<f64>::zeros((n, 1));
-    let mut grad_weights = Array1::<f64>::zeros(n);
-    let mut grad_penalties: Vec<Array2<f64>> = penalties
+    let mut g_kernel = Array2::<f64>::zeros((p_total, p_total));
+    let mut h_kernel = Array1::<f64>::zeros(p_total);
+    let mut q_kernel = 0.0_f64;
+    let mut j_blocks: Vec<Array2<f64>> = penalties
         .iter()
         .map(|p| Array2::<f64>::zeros(p.dim()))
         .collect();
-    let v_bar = -grad_reml_score;
 
-    let mut beta_bar = Array1::<f64>::zeros(p_total);
+    let mut beta_tilde = Array1::<f64>::zeros(p_total);
     if let Some(gc) = grad_coefficients {
-        beta_bar += &gc.column(0).to_owned();
+        beta_tilde += &gc.column(0).to_owned();
     }
     if let Some(gf) = grad_fitted {
         let gf_col = gf.column(0).to_owned();
-        beta_bar += &z.t().dot(&gf_col);
+        beta_tilde += &z.t().dot(&gf_col);
         for row in 0..n {
             for col in 0..p_total {
                 grad_z[[row, col]] += gf_col[row] * beta[col];
@@ -1801,80 +2141,76 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         }
     }
 
-    let u = a.dot(&beta_bar);
-    let zu = z.dot(&u);
-    let wzu = &zu * &weights;
-    for row in 0..n {
-        grad_y[[row, 0]] += wzu[row] - v_bar * weighted_residual[row];
-        grad_weights[row] += residual[row] * zu[row];
-        for col in 0..p_total {
-            grad_z[[row, col]] += weighted_residual[row] * u[col]
-                - weights[row] * zu[row] * beta[col]
-                + v_bar * weighted_residual[row] * beta[col];
+    // Generic downstream losses that explicitly seed beta_hat or fitted
+    // values cannot use the REML envelope shortcut. Route those seeds through
+    // the fixed-rho KKT adjoint K u = beta_tilde before differentiating
+    // designs, penalties, y, weights, and rho.
+    let u = r.dot(&beta_tilde);
+    h_kernel += &u;
+    for i in 0..p_total {
+        for j in 0..p_total {
+            g_kernel[[i, j]] -= 0.5 * (beta[i] * u[j] + u[i] * beta[j]);
         }
-    }
-    let za = z.dot(&a);
-    for row in 0..n {
-        let mut diag_za = 0.0;
-        for col in 0..p_total {
-            diag_za += z[[row, col]] * za[[row, col]];
-            grad_z[[row, col]] -= v_bar * weights[row] * za[[row, col]];
-        }
-        grad_weights[row] += v_bar * (-0.5 * residual[row] * residual[row] - 0.5 * diag_za);
     }
 
-    let mut h_values = Array1::<f64>::zeros(f_blocks);
-    let mut score_g = Array1::<f64>::zeros(f_blocks);
-    let mut eta = Array1::<f64>::zeros(f_blocks);
+    let mut alpha = Array1::<f64>::zeros(f_blocks);
     if let Some(gl) = grad_lambdas {
         for block in 0..f_blocks {
-            eta[block] += gl[block] * lambdas[block];
+            alpha[block] += gl[block] * lambdas[block];
         }
     }
     if let Some(grho) = grad_log_lambdas {
-        eta += &grho.to_owned();
+        alpha += &grho.to_owned();
     }
 
-    let mut s_beta_blocks = Vec::with_capacity(f_blocks);
-    let mut c_vectors = Vec::with_capacity(f_blocks);
-    let mut t_matrices = Vec::with_capacity(f_blocks);
+    let mut p_betas = Vec::with_capacity(f_blocks);
+    let mut m_vectors = Vec::with_capacity(f_blocks);
+    let mut rp_matrices = Vec::with_capacity(f_blocks);
+    let mut rpr_matrices = Vec::with_capacity(f_blocks);
+    let mut b_values = Array1::<f64>::zeros(f_blocks);
+    let mut t_values = Array1::<f64>::zeros(f_blocks);
 
     for block in 0..f_blocks {
         let start = offsets[block];
         let end = offsets[block + 1];
         let beta_k = beta.slice(s![start..end]).to_owned();
-        let u_k = u.slice(s![start..end]).to_owned();
         let s_beta = penalties[block].dot(&beta_k);
-        let a_kk = a.slice(s![start..end, start..end]).to_owned();
-        let trace_a_s = trace_product(a_kk.view(), penalties[block].view());
-        let beta_s_beta = beta_k.dot(&s_beta);
-        h_values[block] = beta_s_beta + trace_a_s;
-        score_g[block] = 0.5 * (ranks[block] as f64 - lambdas[block] * h_values[block]);
-        eta[block] += -lambdas[block] * u_k.dot(&s_beta);
-        eta[block] += v_bar * score_g[block];
-
-        let a_block_s = a.slice(s![.., start..end]).dot(&penalties[block]);
-        let c_i = a_block_s.dot(&beta_k);
-        let t_i = a_block_s.dot(&a.slice(s![start..end, ..]));
-        s_beta_blocks.push(s_beta);
-        c_vectors.push(c_i);
-        t_matrices.push(t_i);
-
-        let mut sym_u_beta = Array2::<f64>::zeros((end - start, end - start));
-        for i in 0..(end - start) {
-            for j in 0..(end - start) {
-                sym_u_beta[[i, j]] = 0.5 * (u_k[i] * beta_k[j] + beta_k[i] * u_k[j]);
+        let lambda = lambdas[block];
+        let mut p_beta = Array1::<f64>::zeros(p_total);
+        for local_i in 0..(end - start) {
+            p_beta[start + local_i] = lambda * s_beta[local_i];
+        }
+        let mut p_full = Array2::<f64>::zeros((p_total, p_total));
+        for local_i in 0..(end - start) {
+            for local_j in 0..(end - start) {
+                p_full[[start + local_i, start + local_j]] =
+                    lambda * penalties[block][[local_i, local_j]];
             }
         }
-        for i in 0..(end - start) {
-            for j in 0..(end - start) {
-                grad_penalties[block][[i, j]] += -lambdas[block] * sym_u_beta[[i, j]]
-                    + v_bar
-                        * (-0.5
-                            * lambdas[block]
-                            * (beta_k[i] * beta_k[j] + a_kk[[i, j]])
-                            + 0.5 * pinvs[block][[i, j]]);
-            }
+        let rp = r.dot(&p_full);
+        let rpr = rp.dot(&r);
+        let m = r.dot(&p_beta);
+        b_values[block] = beta.dot(&p_beta);
+        t_values[block] = (0..p_total).map(|i| rp[[i, i]]).sum::<f64>();
+        alpha[block] -= u.dot(&p_beta);
+        p_betas.push(p_beta);
+        m_vectors.push(m);
+        rp_matrices.push(rp);
+        rpr_matrices.push(rpr);
+    }
+
+    if grad_reml_score != 0.0 {
+        q_kernel += 0.5 * grad_reml_score * tau;
+        g_kernel += &(r.clone() * (0.5 * grad_reml_score));
+        for block in 0..f_blocks {
+            j_blocks[block] -= &(pinvs[block].clone() * (0.5 * grad_reml_score / lambdas[block]));
+        }
+    }
+
+    let mut trace_pairs = Array2::<f64>::zeros((f_blocks, f_blocks));
+    for i in 0..f_blocks {
+        for j in 0..f_blocks {
+            trace_pairs[[i, j]] = trace_product(rp_matrices[i].view(), rp_matrices[j].view());
         }
     }
 
@@ -1886,131 +2222,142 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             }
             let start = offsets[edf_block];
             let end = offsets[edf_block + 1];
-            let lambda_l = lambdas[edf_block];
-            let a_kk = a.slice(s![start..end, start..end]);
-            let trace_a_s = trace_product(a_kk, penalties[edf_block].view());
-            let raw_edf = ranks[edf_block] as f64 - lambda_l * trace_a_s;
-            if !(raw_edf > 0.0 && raw_edf < ranks[edf_block] as f64) {
+            g_kernel += &(rpr_matrices[edf_block].clone() * scale);
+            j_blocks[edf_block] -= &(r.slice(s![start..end, start..end]).to_owned() * scale);
+            for rho_block in 0..f_blocks {
+                alpha[rho_block] += scale * trace_pairs[[edf_block, rho_block]];
+                if rho_block == edf_block {
+                    alpha[rho_block] -= scale * t_values[edf_block];
+                }
+            }
+        }
+    }
+
+    if let Some((block, value)) = alpha
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho adjoint seed for block {block} is non-finite: {value}"
+        )));
+    }
+
+    if alpha.iter().any(|value| *value != 0.0) {
+        let mut outer_h = Array2::<f64>::zeros((f_blocks, f_blocks));
+        for k in 0..f_blocks {
+            for j in 0..f_blocks {
+                let beta_pk_r_pj_beta = p_betas[k].dot(&m_vectors[j]);
+                outer_h[[k, j]] = 0.5 * trace_pairs[[k, j]]
+                    + tau * beta_pk_r_pj_beta
+                    - if k == j {
+                        0.5 * (t_values[k] + tau * b_values[k])
+                    } else {
+                        0.0
+                    }
+                    - 0.5 * tau_q * b_values[k] * b_values[j];
+            }
+        }
+        // This is the Gaussian/identity closed-form rho curvature used in
+        // H^T alpha = c. The analytic Hessian is symmetric; enforce that
+        // identity before factorization so one-sided trace roundoff cannot
+        // perturb the outer IFT solve.
+        symmetrize_in_place(&mut outer_h);
+        if let Some(((row, col), value)) = outer_h
+            .indexed_iter()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer rho curvature entry ({row},{col}) is non-finite: {value}"
+            )));
+        }
+        let rho_adj = solve_spd_vector_with_ridge(&outer_h, &alpha, 1.0e-10)?;
+        if let Some((block, value)) = rho_adj
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer rho adjoint for block {block} is non-finite: {value}"
+            )));
+        }
+        let weighted_b_sum = rho_adj
+            .iter()
+            .zip(b_values.iter())
+            .map(|(&zk, &bk)| zk * bk)
+            .sum::<f64>();
+        q_kernel += 0.5 * tau_q * weighted_b_sum;
+        for block in 0..f_blocks {
+            let zk = rho_adj[block];
+            if zk == 0.0 {
                 continue;
             }
-            let t_l = &t_matrices[edf_block];
-            let zt = z.dot(t_l);
-            for row in 0..n {
-                let mut diag = 0.0;
-                for col in 0..p_total {
-                    grad_z[[row, col]] +=
-                        2.0 * scale * lambda_l * weights[row] * zt[[row, col]];
-                    diag += z[[row, col]] * zt[[row, col]];
-                }
-                grad_weights[row] += scale * lambda_l * diag;
-            }
-            for j_block in 0..f_blocks {
-                let js = offsets[j_block];
-                let je = offsets[j_block + 1];
-                let t_jj = t_l.slice(s![js..je, js..je]);
-                for i in 0..(je - js) {
-                    for j in 0..(je - js) {
-                        grad_penalties[j_block][[i, j]] +=
-                            scale * lambda_l * lambdas[j_block] * t_jj[[i, j]];
-                    }
-                }
-                if j_block == edf_block {
-                    for i in 0..(end - start) {
-                        for j in 0..(end - start) {
-                            grad_penalties[j_block][[i, j]] -=
-                                scale * lambda_l * a_kk[[i, j]];
-                        }
-                    }
+            g_kernel -= &(rpr_matrices[block].clone() * (0.5 * zk));
+            let m = &m_vectors[block];
+            for i in 0..p_total {
+                h_kernel[i] += tau * zk * m[i];
+                for j in 0..p_total {
+                    g_kernel[[i, j]] -= 0.5 * tau * zk * (beta[i] * m[j] + m[i] * beta[j]);
                 }
             }
-            for rho_block in 0..f_blocks {
-                let rs = offsets[rho_block];
-                let re = offsets[rho_block + 1];
-                let trace_t_s = trace_product(
-                    t_l.slice(s![rs..re, rs..re]),
-                    penalties[rho_block].view(),
-                );
-                eta[rho_block] += scale * lambda_l * lambdas[rho_block] * trace_t_s;
-                if rho_block == edf_block {
-                    eta[rho_block] -= scale * lambda_l * trace_a_s;
+            let start = offsets[block];
+            let end = offsets[block + 1];
+            j_blocks[block] += &(r.slice(s![start..end, start..end]).to_owned() * (0.5 * zk));
+            for i in 0..(end - start) {
+                for j in 0..(end - start) {
+                    j_blocks[block][[i, j]] +=
+                        0.5 * tau * zk * beta[start + i] * beta[start + j];
                 }
             }
         }
     }
 
-    let mut j_outer = Array2::<f64>::zeros((f_blocks, f_blocks));
-    for i in 0..f_blocks {
-        for j in 0..f_blocks {
-            let js = offsets[j];
-            let je = offsets[j + 1];
-            let beta_term = c_vectors[i].slice(s![js..je]).dot(&s_beta_blocks[j]);
-            let trace_term =
-                trace_product(t_matrices[i].slice(s![js..je, js..je]), penalties[j].view());
-            j_outer[[i, j]] =
-                lambdas[i] * lambdas[j] * (beta_term + 0.5 * trace_term);
-            if i == j {
-                j_outer[[i, j]] -= 0.5 * lambdas[i] * h_values[i];
-            }
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += -2.0 * q_kernel * weighted_residual[row] * beta[col];
         }
     }
-    let h_plus = -j_outer;
-    let alpha = solve_spd_vector_with_ridge(&h_plus, &eta, 1.0e-8)?;
+    let zg = z.dot(&g_kernel);
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += 2.0 * weights[row] * zg[[row, col]];
+        }
+    }
+    let wy = y.to_owned() * &weights.to_owned();
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += wy[row] * h_kernel[col];
+        }
+    }
 
-    for i in 0..f_blocks {
-        if alpha[i] == 0.0 {
-            continue;
-        }
-        let lambda_i = lambdas[i];
-        let c_i = &c_vectors[i];
-        let zc = z.dot(c_i);
-        let zt = z.dot(&t_matrices[i]);
-        for row in 0..n {
-            grad_y[[row, 0]] += -alpha[i] * lambda_i * weights[row] * zc[row];
-            grad_weights[row] += alpha[i]
-                * lambda_i
-                * (-residual[row] * zc[row]
-                    + 0.5
-                        * (0..p_total)
-                            .map(|col| z[[row, col]] * zt[[row, col]])
-                            .sum::<f64>());
-            for col in 0..p_total {
-                grad_z[[row, col]] += alpha[i]
-                    * lambda_i
-                    * (-weighted_residual[row] * c_i[col]
-                        + weights[row] * zc[row] * beta[col]
-                        + weights[row] * zt[[row, col]]);
-            }
-        }
+    let mut grad_y = Array2::<f64>::zeros((n, 1));
+    let zh = z.dot(&h_kernel);
+    for row in 0..n {
+        grad_y[[row, 0]] = 2.0 * q_kernel * weighted_residual[row] + weights[row] * zh[row];
+    }
 
-        for j_block in 0..f_blocks {
-            let js = offsets[j_block];
-            let je = offsets[j_block + 1];
-            let c_j = c_i.slice(s![js..je]);
-            let beta_j = beta.slice(s![js..je]);
-            let t_jj = t_matrices[i].slice(s![js..je, js..je]);
-            for row in 0..(je - js) {
-                for col in 0..(je - js) {
-                    let sym_c_beta =
-                        0.5 * (c_j[row] * beta_j[col] + beta_j[row] * c_j[col]);
-                    grad_penalties[j_block][[row, col]] += alpha[i]
-                        * (lambda_i
-                            * lambdas[j_block]
-                            * (sym_c_beta + 0.5 * t_jj[[row, col]]));
-                }
-            }
-            if i == j_block {
-                let beta_i = beta.slice(s![js..je]);
-                let a_ii = a.slice(s![js..je, js..je]);
-                for row in 0..(je - js) {
-                    for col in 0..(je - js) {
-                        grad_penalties[j_block][[row, col]] += alpha[i]
-                            * (-0.5
-                                * lambda_i
-                                * (beta_i[row] * beta_i[col] + a_ii[[row, col]]));
-                    }
-                }
+    let mut grad_weights = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let diag_zgz = (0..p_total)
+            .map(|col| z[[row, col]] * zg[[row, col]])
+            .sum::<f64>();
+        grad_weights[row] = q_kernel * residual[row] * residual[row] + diag_zgz + y[row] * zh[row];
+    }
+
+    let mut grad_penalties = Vec::with_capacity(f_blocks);
+    for block in 0..f_blocks {
+        let start = offsets[block];
+        let end = offsets[block + 1];
+        let mut local = g_kernel.slice(s![start..end, start..end]).to_owned();
+        for i in 0..(end - start) {
+            for j in 0..(end - start) {
+                local[[i, j]] += q_kernel * beta[start + i] * beta[start + j];
             }
         }
+        local += &j_blocks[block];
+        local *= lambdas[block];
+        symmetrize_in_place(&mut local);
+        grad_penalties.push(local);
     }
 
     let mut grad_designs = Vec::with_capacity(f_blocks);
@@ -2035,9 +2382,9 @@ fn gaussian_reml_fit_blocks_backward_analytic(
 ///
 /// Computes VJPs of (coefficients, fitted, lambdas, log_lambdas, reml_score,
 /// edf) back to (design_blocks, penalty_blocks, y, weights). The VJP is
-/// assembled at the converged log-λ vector: fixed-ρ β/fitted/REML/EDF terms
-/// are accumulated first, then the shared smoothing-parameter sensitivity is
-/// routed through the F×F positive outer curvature H₊ = -Vρρ.
+/// assembled at the converged log-λ vector: fixed-ρ β/fitted/negative-REML/EDF
+/// terms are accumulated first, then the smoothing-parameter sensitivity is
+/// routed through the F×F REML score Hessian from the implicit optimum.
 #[pyfunction(signature = (
     designs,
     penalties,
