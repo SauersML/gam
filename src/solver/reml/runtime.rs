@@ -376,7 +376,6 @@ fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>
 }
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct IftModeResponseRuntimeCache {
     rho: Array1<f64>,
     rho_mode_response_cols: Option<Array2<f64>>,
@@ -2665,7 +2664,6 @@ impl<'a> RemlState<'a> {
         );
     }
 
-    #[allow(dead_code)]
     fn cached_ift_rho_mode_response_cols(
         &self,
         cache: &super::IftWarmStartCache,
@@ -6310,7 +6308,6 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     ))
 }
 
-#[allow(dead_code)]
 fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,
     new_rho: &Array1<f64>,

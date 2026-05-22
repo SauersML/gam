@@ -8894,7 +8894,6 @@ impl GaussianLocationScaleHessianWorkspace {
     /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
     /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian.
-    #[allow(dead_code)]
     fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
@@ -11962,7 +11961,6 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
     /// The Gaussian wiggle has 7 coefficient arrays (no `coeff_lw_d`, unlike
     /// the binomial wiggle's 8) because the wiggle enters the Gaussian
     /// likelihood only through `q = η_μ + η_w` (no σ-chain).
-    #[allow(dead_code)]
     fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
@@ -17691,7 +17689,6 @@ impl BinomialLocationScaleHessianWorkspace {
     /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
     /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian.
-    #[allow(dead_code)]
     fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
@@ -22253,7 +22250,6 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
     /// via `Xᵀ diag(W) Y`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian. The `b0`/`d0` basis matrices
     /// are independent of the per-row weights and remain unchanged.
-    #[allow(dead_code)]
     fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
