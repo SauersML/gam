@@ -5832,9 +5832,31 @@ pub enum EvalMode {
 pub struct RemlLamlResult {
     /// The REML/LAML objective value (to be minimized).
     pub cost: f64,
-    /// Newton-decrement energy `½ rᵀH⁻¹r` for the cost-side IFT residual correction.
+    /// Newton-decrement energy `½ rᵀH⁻¹r` of the converged inner KKT
+    /// residual at this `ρ`, where `r = ∇_β L(β̂, ρ)` and `H` is the inner
+    /// Hessian. Bounds the inner sub-optimality `|V(β̂) − V(β*)| ≤
+    /// ½ rᵀH⁻¹r` to first order, and is consumed by:
+    ///
+    /// * the HyperGradientBudget controller, which uses it as the
+    ///   inner-channel energy proxy `E_inner` when estimating
+    ///   `s_inner` and re-allocating per-channel tolerances; and
+    /// * the trust-energy gate in the outer strategy, which shrinks the
+    ///   trust radius when this energy exceeds
+    ///   `TRUST_ENERGY_FACTOR × |predicted_decrease|`.
+    ///
+    /// `None` when the inner solve did not compute an energy estimate
+    /// (e.g., projected-pseudo-inverse paths that lack a full-H solve).
     pub ift_residual_energy: Option<f64>,
-    /// Full-H one-step inner polish vector `H⁻¹r`, when already computed.
+    /// One-Newton-step inner polish vector `w = H⁻¹ r`, populated only
+    /// when the evaluator solves against the full inner Hessian `H` (not
+    /// the projected pseudo-inverse used on rank-deficient paths).
+    ///
+    /// Applied by the runtime as a *free* refinement of the warm-start β
+    /// at the next outer iteration: `β_warm ← β̂ + w` short-circuits one
+    /// PIRLS step, exploiting the Hessian factorization already paid for
+    /// during the cost-side IFT correction. `None` whenever the polish
+    /// step was not produced (projected-pseudo-inverse path, value-only
+    /// evaluation, etc.).
     pub inner_polish_step: Option<Array1<f64>>,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,

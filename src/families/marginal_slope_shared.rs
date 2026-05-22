@@ -675,6 +675,30 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
 /// [`OuterScoreSubsample::new`]); it can drift from that value under the
 /// stratified builder's rare-stratum boost. It is not the per-row scaling
 /// factor — consumers must read `rows[i].weight` for HT correctness.
+///
+/// # Horvitz–Thompson contract
+///
+/// Per-row weight `rows[i].weight = 1 / π_i`, where `π_i` is the
+/// inclusion probability of row `i` under the stratified sampler. Any
+/// outer-only score/gradient routine that consumes this subsample must
+/// form `Σ_{i ∈ mask} w_i · f_i` so the resulting estimator is unbiased:
+///
+/// ```text
+///   E[ score_subsample ]  =  score_full.
+/// ```
+///
+/// The following families consume this subsample on their outer-loop hot
+/// paths: Gaussian-LS, Binomial-LS, the Wiggle variants, CTN, and
+/// Survival-LS. Each routes the `rows[i].weight` factor through its
+/// per-row accumulator (gradient, Hessian-action, trace probes).
+///
+/// # Convergence warning
+///
+/// Subsampled gradients are noisy by construction. The outer driver must
+/// **never** declare convergence on a subsampled gradient — near
+/// convergence it switches back to the full-data score so that the KKT
+/// stopping test sees the unbiased, low-variance signal. New consumers
+/// adding subsampled paths must preserve this invariant.
 #[derive(Debug, Clone)]
 pub struct OuterScoreSubsample {
     pub mask: Arc<Vec<usize>>,

@@ -6183,6 +6183,52 @@ fn gaussian_identity_inner_residual_norm(
 }
 
 /// Evaluate IFT and flat warm-start inner residuals at `rho + delta_rho`.
+///
+/// Computes the inner-KKT residual norm at the IFT-predicted coefficient
+/// `β_pred(ρ+Δρ)` obtained by linearizing the inner solution around the
+/// converged `β̂(ρ)`, alongside the residual norm for the "flat" warm start
+/// `β̂(ρ)` (the same coefficient without any IFT correction). The pair lets
+/// callers verify that the IFT predictor reduces the inner residual to the
+/// expected second-order remainder in `‖Δρ‖`.
+///
+/// # Math
+///
+/// Let `β̂(ρ)` minimize the penalized inner objective and `v_j = ∂β̂/∂ρ_j`
+/// be the IFT sensitivity vectors at `ρ`. The first-order predictor is
+///
+/// ```text
+///   β_pred(ρ + Δρ) = β̂(ρ) − Σ_j Δρ_j · v_j.
+/// ```
+///
+/// Writing `r(β, ρ) = ∇_β L(β, ρ)` for the inner-KKT residual, the test
+/// invariant exercised by callers is
+///
+/// ```text
+///   ‖ r( β_pred(ρ+Δρ),  ρ + Δρ ) ‖ = O( ‖Δρ‖² ).
+/// ```
+///
+/// The flat baseline `‖ r( β̂(ρ), ρ + Δρ ) ‖` is `O(‖Δρ‖)` for comparison.
+///
+/// # Arguments
+///
+/// * `y`, `w`, `x`, `offset` — full-data response, weights, design, offset.
+/// * `s_list` — blockwise penalty specifications matching `rho`.
+/// * `opts` — external optimization options; must be `GaussianIdentity`
+///   with no linear constraints.
+/// * `rho` — base log-smoothing parameter vector at which the IFT
+///   sensitivities are taken.
+/// * `delta_rho` — perturbation applied to `rho` for the residual probe.
+///
+/// # Returns
+///
+/// `(ift_residual_norm, flat_residual_norm)` — the L2 norm of the inner
+/// KKT residual at `β_pred(ρ+Δρ)` and at the flat warm start `β̂(ρ)`,
+/// both evaluated at `ρ + Δρ`.
+///
+/// # Used by
+///
+/// Tests that exercise the IFT predictor's residual-order property; not
+/// part of the production solver hot path.
 pub fn evaluate_external_ift_residual_at_perturbed_rho<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
