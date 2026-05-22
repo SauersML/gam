@@ -191,6 +191,26 @@ impl From<gam::inference::data::DataError> for CliError {
     }
 }
 
+impl From<gam::WorkflowError> for CliError {
+    fn from(err: gam::WorkflowError) -> Self {
+        // The workflow layer is the bridge between user-supplied config /
+        // formula / data and the solver. Its errors are routed through the
+        // shared classifier so error text already carries CLI-friendly
+        // wording, hints, and family-specific advice.
+        classify_cli_error(err.to_string())
+    }
+}
+
+impl From<gam::estimate::EstimationError> for CliError {
+    fn from(err: gam::estimate::EstimationError) -> Self {
+        // EstimationError is the solver's structured failure type. We route
+        // it through the shared `classify_cli_error` so its hints and
+        // model-overparameterisation breakdown stay user-facing identical
+        // to the prior `.to_string()` boundary path.
+        classify_cli_error(err.to_string())
+    }
+}
+
 fn extract_quoted_field(message: &str) -> Option<String> {
     let mut it = message.match_indices('\'');
     let (start_q, _) = it.next()?;
