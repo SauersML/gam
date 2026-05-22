@@ -76,6 +76,7 @@ from ._model import (
     CompetingRisksPrediction,
     Model,
     SurvivalPrediction,
+    TermBlock,
     competing_risks_cif,
 )
 from ._response_geometry import (
@@ -150,6 +151,7 @@ __all__ = [
     "SharedPrecisionGroup",
     "Summary",
     "SurvivalPrediction",
+    "TermBlock",
     "__version__",
     "alr",
     "build_info",

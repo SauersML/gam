@@ -5840,6 +5840,24 @@ pub struct RemlLamlResult {
     pub gradient: Option<Array1<f64>>,
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
     pub hessian: crate::solver::outer_strategy::HessianResult,
+    /// Rho-coordinate mode responses, one `K · g_j` vector per column, when
+    /// they were already built for derivative corrections.
+    pub rho_mode_response_cols: Option<Array2<f64>>,
+    /// Extended-coordinate mode responses, one `K · g_j` vector per column,
+    /// when extended derivative coordinates required them.
+    pub ext_mode_response_cols: Option<Array2<f64>>,
+}
+
+fn mode_response_columns(vectors: &[Array1<f64>]) -> Array2<f64> {
+    let Some(first) = vectors.first() else {
+        return Array2::<f64>::zeros((0, 0));
+    };
+    let mut cols = Array2::<f64>::zeros((first.len(), vectors.len()));
+    for (idx, vector) in vectors.iter().enumerate() {
+        debug_assert_eq!(vector.len(), first.len());
+        cols.column_mut(idx).assign(vector);
+    }
+    cols
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -7279,6 +7297,8 @@ pub fn reml_laml_evaluate(
             inner_polish_step,
             gradient: None,
             hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+            rho_mode_response_cols: None,
+            ext_mode_response_cols: None,
         });
     }
 
@@ -7451,6 +7471,11 @@ pub fn reml_laml_evaluate(
             (rho_v_ks, ext_v_is)
         }
     };
+    let rho_mode_response_cols = rho_v_ks
+        .as_deref()
+        .filter(|vectors| !vectors.is_empty())
+        .map(mode_response_columns);
+    let ext_mode_response_cols = (!ext_v_is.is_empty()).then(|| mode_response_columns(&ext_v_is));
     let coord_corrections: Vec<Option<DriftDerivResult>> = if need_family_corrections {
         let rho_vs = rho_v_ks
             .as_ref()
@@ -8153,6 +8178,8 @@ pub fn reml_laml_evaluate(
                 inner_polish_step,
                 gradient: Some(grad),
                 hessian,
+                rho_mode_response_cols,
+                ext_mode_response_cols,
             });
         }
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
@@ -8346,6 +8373,8 @@ pub fn reml_laml_evaluate(
         inner_polish_step,
         gradient: gradient_out,
         hessian,
+        rho_mode_response_cols,
+        ext_mode_response_cols,
     })
 }
 

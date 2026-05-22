@@ -4112,8 +4112,7 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
-        let current_ift_step_cap =
-            self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+        let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
         // to identity) AND the large-Δρ rejection case (|Δρ| exceeds

@@ -1654,6 +1654,249 @@ class Model:
         except Exception:
             return rows_out
 
+    def _coefficient_state(self) -> dict[str, Any]:
+        """Decode the Rust coefficient-state JSON payload."""
+        try:
+            return json.loads(rust_module().coefficient_state_json(self._model_bytes))
+        except Exception as exc:
+            raise map_exception(exc) from exc
+
+    @property
+    def term_blocks(self) -> tuple[TermBlock, ...]:
+        """Per-term coefficient column ranges, sorted by ``start``.
+
+        Returns a tuple of :class:`TermBlock` records covering the
+        intercept, every linear term, every random-effect term, and every
+        smooth term in the fitted model. Each entry's ``[start, end)``
+        indexes the same coefficient vector returned by ``summary()`` and
+        the same design-matrix columns produced by :meth:`design_matrix`.
+        """
+        state = self._coefficient_state()
+        raw = state.get("term_blocks") or []
+        blocks = [
+            TermBlock(
+                name=str(item.get("name", "")),
+                kind=str(item.get("kind", "")),
+                start=int(item.get("start", 0)),
+                end=int(item.get("end", 0)),
+            )
+            for item in raw
+            if isinstance(item, dict)
+        ]
+        blocks.sort(key=lambda b: b.start)
+        return tuple(blocks)
+
+    def partial_dependence(
+        self,
+        term: str,
+        data: Any,
+        grid: Any | None = None,
+        n_points: int = 100,
+    ) -> dict[str, Any]:
+        """Per-term partial-dependence plot data with delta-method SE.
+
+        Analogue of mgcv's ``plot.gam()`` per-term plot, and term-wise
+        contribution computation. For the requested ``term`` this evaluates
+        f_t(x) = X_t(x) beta_t and the matching delta-method SE
+        sqrt(diag(X_t V_t X_t^T)) where V_t is the corresponding diagonal
+        block of the joint coefficient covariance.
+
+        Parameters
+        ----------
+        term:
+            Term name as it appears in :attr:`term_blocks` (e.g.
+            ``"s(x1)"`` for a 1D smooth).
+        data:
+            Reference table; non-``term`` columns supply template values
+            for the constructed grid rows.
+        grid:
+            Optional explicit grid. For 1D smooths, a 1-D array of input
+            values. For multi-D smooths, a 2-D array of shape
+            ``(n_points, d)`` whose columns align with the smooth's input
+            features in formula order.
+        n_points:
+            Number of grid points for 1D smooths when ``grid`` is ``None``.
+
+        Returns
+        -------
+        dict
+            ``{"grid": array, "predicted": array, "standard_error": array}``.
+        """
+        import numpy as np
+
+        block = next(
+            (b for b in self.term_blocks if b.name == term),
+            None,
+        )
+        if block is None:
+            available = [b.name for b in self.term_blocks]
+            raise ValueError(
+                f"partial_dependence: term {term!r} not found; available: {available}"
+            )
+        state = self._coefficient_state()
+        beta_full = np.asarray(state.get("beta", []), dtype=float)
+        cov_n = int(state.get("covariance_n", 0))
+        cov_flat = np.asarray(state.get("covariance_flat", []), dtype=float)
+        if cov_flat.size != cov_n * cov_n or beta_full.size != cov_n:
+            raise ValueError("coefficient covariance payload has inconsistent dimensions")
+        cov = cov_flat.reshape(cov_n, cov_n)
+        cov = 0.5 * (cov + cov.T)
+        cols = slice(block.start, block.end)
+        beta_term = beta_full[cols]
+        cov_term = cov[cols, cols]
+
+        schema_cols = list((state.get("schema") or {}).get("columns") or [])
+        ranges = state.get("training_feature_ranges") or []
+        names = [str(c.get("name")) for c in schema_cols]
+
+        # Build a template row from the supplied data.
+        template: dict[str, Any] = {}
+        headers, rows, _ = normalize_table(data)
+        if rows:
+            first = rows[0]
+            template.update({h: first[i] for i, h in enumerate(headers)})
+        for idx, col in enumerate(schema_cols):
+            name = str(col.get("name"))
+            if name in template:
+                continue
+            if col.get("kind") == "categorical":
+                levels = col.get("levels") or ["0"]
+                template[name] = str(levels[0])
+            elif idx < len(ranges):
+                lo, hi = map(float, ranges[idx])
+                template[name] = str(0.5 * (lo + hi))
+            else:
+                template[name] = "0"
+
+        # Heuristic axis inference: a smooth named e.g. ``s(x1)`` owns the
+        # schema column ``x1``. Tensor / multi-d smooths expose multiple
+        # arguments in the same parenthesized list.
+        term_args: tuple[str, ...] = ()
+        if "(" in term and ")" in term:
+            inside = term[term.index("(") + 1 : term.rindex(")")]
+            term_args = tuple(
+                a.strip() for a in inside.split(",") if a.strip() and a.strip() in names
+            )
+
+        if grid is None:
+            if len(term_args) != 1:
+                raise ValueError(
+                    "partial_dependence: cannot infer a 1D sweep axis from term "
+                    f"{term!r} (axes inferred: {term_args!r}); pass an explicit "
+                    "`grid=` array. Multi-dimensional smooths always require an "
+                    "explicit grid."
+                )
+            term_argument = term_args[0]
+            col_idx = names.index(term_argument)
+            if col_idx < len(ranges):
+                lo, hi = map(float, ranges[col_idx])
+            else:
+                lo, hi = 0.0, 1.0
+            if not (np.isfinite(lo) and np.isfinite(hi)) or lo == hi:
+                lo, hi = 0.0, 1.0
+            grid_arr = np.linspace(float(lo), float(hi), int(n_points))
+            sweep_columns: tuple[str, ...] = (term_argument,)
+            grid_matrix = grid_arr.reshape(-1, 1)
+            grid_out: Any = grid_arr
+        else:
+            grid_matrix = np.asarray(grid, dtype=float)
+            if grid_matrix.ndim == 1:
+                if len(term_args) != 1:
+                    raise ValueError(
+                        "partial_dependence: a 1-D grid requires a single-axis "
+                        f"term; {term!r} has axes {term_args!r}. Pass a 2-D grid."
+                    )
+                sweep_columns = (term_args[0],)
+                grid_matrix = grid_matrix.reshape(-1, 1)
+                grid_out = grid_matrix.reshape(-1)
+            elif grid_matrix.ndim == 2:
+                if len(term_args) != grid_matrix.shape[1]:
+                    raise ValueError(
+                        "partial_dependence: explicit grid shape "
+                        f"{grid_matrix.shape} does not match term axes "
+                        f"{term_args!r}"
+                    )
+                sweep_columns = term_args
+                grid_out = grid_matrix
+            else:
+                raise ValueError("partial_dependence: grid must be 1-D or 2-D")
+
+        eval_rows = []
+        for row_vals in grid_matrix:
+            row = dict(template)
+            for col_name, value in zip(sweep_columns, row_vals, strict=False):
+                row[col_name] = str(float(value))
+            eval_rows.append(row)
+
+        design = np.asarray(self.design_matrix(eval_rows), dtype=float)
+        x_term = design[:, cols]
+        predicted = x_term @ beta_term
+        var = np.einsum("ij,jk,ik->i", x_term, cov_term, x_term)
+        se = np.sqrt(np.maximum(var, 0.0))
+        return {
+            "grid": grid_out,
+            "predicted": predicted,
+            "standard_error": se,
+        }
+
+    def variance_share(
+        self,
+        data: Any,
+        term: str | None = None,
+    ) -> dict[str, float] | float:
+        """Term-wise variance decomposition on ``data``.
+
+        Analogous to mgcv's ``summary(model)`` per-row ``edf`` and
+        ``p-value`` columns, but reporting variance fractions instead:
+        variance_share(t) = Var(X_t beta_t) / Var(X beta), with all
+        variances computed empirically on the rows of ``data``.
+
+        ``data`` is required because :class:`Model` does not persist
+        training fitted values. The intercept is excluded from the
+        per-term decomposition.
+
+        Parameters
+        ----------
+        data:
+            Table-like input used to evaluate the design matrix.
+        term:
+            If ``None``, returns ``{term_name: fraction}`` for every
+            non-intercept term. If given, returns the scalar fraction.
+        """
+        import numpy as np
+
+        beta_full = np.asarray(self._coefficient_state().get("beta", []), dtype=float)
+        design = np.asarray(self.design_matrix(data), dtype=float)
+        if design.shape[1] != beta_full.size:
+            raise ValueError(
+                "variance_share: design matrix and beta dimensions disagree: "
+                f"design has {design.shape[1]} columns, beta has {beta_full.size}"
+            )
+        eta_total = design @ beta_full
+        total_var = float(np.var(eta_total))
+
+        def share_for(block: TermBlock) -> float:
+            if not np.isfinite(total_var) or total_var <= 0.0:
+                return 0.0
+            cols = slice(block.start, block.end)
+            contribution = design[:, cols] @ beta_full[cols]
+            return float(np.var(contribution)) / total_var
+
+        if term is not None:
+            block = next((b for b in self.term_blocks if b.name == term), None)
+            if block is None:
+                available = [b.name for b in self.term_blocks]
+                raise ValueError(
+                    f"variance_share: term {term!r} not found; available: {available}"
+                )
+            return share_for(block)
+
+        return {
+            block.name: share_for(block)
+            for block in self.term_blocks
+            if block.kind != "intercept"
+        }
+
     def save(self, path: str | Path) -> None:
         """Serialise the fitted model to ``path``.
 

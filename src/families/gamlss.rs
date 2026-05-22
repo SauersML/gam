@@ -8499,6 +8499,35 @@ impl GaussianLocationScaleHessianWorkspace {
             coeff_ll,
         })
     }
+
+    /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
+    /// per-row coefficient arrays in place.
+    ///
+    /// Each sampled row's `coeff_*[i]` is multiplied by its
+    /// `WeightedOuterRow.weight` (the HT inverse-inclusion factor 1/π_i —
+    /// uniform or stratified sampling both supported). All non-sampled rows
+    /// are zeroed. Because every downstream assembly (`hessian_dense`,
+    /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
+    /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
+    /// estimator of the full-data joint Hessian.
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.coeff_mm.len();
+        let mut mask_mm = Array1::<f64>::zeros(n);
+        let mut mask_ml = Array1::<f64>::zeros(n);
+        let mut mask_ll = Array1::<f64>::zeros(n);
+        for r in rows {
+            let i = r.index;
+            mask_mm[i] = self.coeff_mm[i] * r.weight;
+            mask_ml[i] = self.coeff_ml[i] * r.weight;
+            mask_ll[i] = self.coeff_ll[i] * r.weight;
+        }
+        self.coeff_mm = mask_mm;
+        self.coeff_ml = mask_ml;
+        self.coeff_ll = mask_ll;
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace {
