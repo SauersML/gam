@@ -24,11 +24,62 @@ use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
 use crate::term_builder::resolve_role_col;
 
+/// Typed errors emitted while assembling a [`PredictInput`] from a saved model.
+///
+/// Each variant carries a pre-formatted `reason` string so `Display` is
+/// byte-equivalent to the original `format!(...)` outputs the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind without dragging the string apart.
+#[derive(Debug, Clone)]
+pub enum PredictInputError {
+    /// Request-level input did not satisfy the predict contract: bad offset
+    /// lengths, non-finite covariates, unsupported predict options for the
+    /// saved model class, or unparseable model metadata at the boundary.
+    InvalidInput { reason: String },
+    /// Rebuilt prediction designs disagree with saved coefficient blocks or
+    /// transform matrices (model/design column counts, basis shapes,
+    /// reshape failures).
+    DimensionMismatch { reason: String },
+    /// The saved model is missing payload metadata required to drive the
+    /// prediction (response knots, transform, degree, calibration block,
+    /// unified fit, z column, etc.).
+    MissingMetadata { reason: String },
+}
+
+impl std::fmt::Display for PredictInputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PredictInputError::InvalidInput { reason }
+            | PredictInputError::DimensionMismatch { reason }
+            | PredictInputError::MissingMetadata { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for PredictInputError {}
+
+impl From<PredictInputError> for String {
+    fn from(err: PredictInputError) -> String {
+        err.to_string()
+    }
+}
+
+impl From<String> for PredictInputError {
+    /// Inbound conversion from the many `Result<_, String>` helpers this
+    /// module still calls into (basis builders, term-collection assembly,
+    /// fit deserializers). The text is preserved verbatim; we only pick a
+    /// category so external messages flow through `?` without per-callsite
+    /// `.map_err`.
+    fn from(reason: String) -> PredictInputError {
+        PredictInputError::InvalidInput { reason }
+    }
+}
+
 fn build_marginal_slope_local_auxiliary_matrix(
     model: &FittedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
-) -> Result<Option<Array2<f64>>, String> {
+) -> Result<Option<Array2<f64>>, PredictInputError> {
     let Some(LatentMeasureKind::LocalEmpirical {
         feature_cols,
         input_scales,
@@ -48,44 +99,46 @@ fn build_marginal_slope_local_auxiliary_matrix(
             .copied()
             .unwrap_or(fit_col);
         if prediction_col >= data.ncols() {
-            return Err(format!(
-                "local empirical marginal-slope prediction feature column {fit_col} is out of bounds for {} columns",
-                data.ncols()
-            ));
+            return Err(PredictInputError::DimensionMismatch {
+                reason: format!(
+                    "local empirical marginal-slope prediction feature column {fit_col} is out of bounds for {} columns",
+                    data.ncols()
+                ),
+            });
         }
         out.column_mut(local_col)
             .assign(&data.column(prediction_col));
     }
     if let Some(scales) = input_scales.as_ref() {
         if scales.len() != d {
-            return Err(format!(
-                "local empirical marginal-slope prediction input scale dimension mismatch: scales={}, features={d}",
-                scales.len()
-            ));
+            return Err(PredictInputError::DimensionMismatch {
+                reason: format!(
+                    "local empirical marginal-slope prediction input scale dimension mismatch: scales={}, features={d}",
+                    scales.len()
+                ),
+            });
         }
         for (col, &scale) in scales.iter().enumerate() {
             if !(scale.is_finite() && scale > 0.0) {
-                return Err(format!(
-                    "local empirical marginal-slope prediction input scale {col} must be finite and positive, got {scale}"
-                ));
+                return Err(PredictInputError::InvalidInput {
+                    reason: format!(
+                        "local empirical marginal-slope prediction input scale {col} must be finite and positive, got {scale}"
+                    ),
+                });
             }
             out.column_mut(col).mapv_inplace(|value| value / scale);
         }
     }
     if out.iter().any(|value| !value.is_finite()) {
-        return Err(
-            "local empirical marginal-slope prediction conditioning values must be finite"
+        return Err(PredictInputError::InvalidInput {
+            reason: "local empirical marginal-slope prediction conditioning values must be finite"
                 .to_string(),
-        );
+        });
     }
     Ok(Some(out))
 }
 
-/// Build a `PredictInput` for model types backed directly by `PredictableModel`.
-///
-/// Survival prediction has its own design assembly because it needs entry/exit
-/// time geometry before it can call the same predictor/output machinery.
-pub fn build_predict_input_for_model(
+fn build_predict_input_for_model_inner(
     model: &FittedModel,
     data: ndarray::ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
@@ -93,7 +146,7 @@ pub fn build_predict_input_for_model(
     offset: &Array1<f64>,
     offset_noise: &Array1<f64>,
     noise_offset_supplied: bool,
-) -> Result<PredictInput, String> {
+) -> Result<PredictInput, PredictInputError> {
     let spec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -103,29 +156,35 @@ pub fn build_predict_input_for_model(
     let clipped = model.axis_clip_to_training_ranges(data, col_map);
     let design_input = clipped.as_ref().map_or(data, |arr| arr.view());
     let design = build_term_collection_design(design_input, &spec)
-        .map_err(|e| format!("failed to build prediction design: {e}"))?;
+        .map_err(|e| PredictInputError::InvalidInput {
+            reason: format!("failed to build prediction design: {e}"),
+        })?;
     let n = data.nrows();
     if offset.len() != n || offset_noise.len() != n {
-        return Err(format!(
-            "prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
-            offset.len(),
-            offset_noise.len()
-        ));
+        return Err(PredictInputError::DimensionMismatch {
+            reason: format!(
+                "prediction offset length mismatch: rows={n}, offset={}, noise_offset={}",
+                offset.len(),
+                offset_noise.len()
+            ),
+        });
     }
 
     match model.predict_model_class() {
         PredictModelClass::Standard => {
             if noise_offset_supplied {
-                return Err(
-                    "--noise-offset-column is not supported for standard prediction".to_string(),
-                );
+                return Err(PredictInputError::InvalidInput {
+                    reason: "--noise-offset-column is not supported for standard prediction"
+                        .to_string(),
+                });
             }
             let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
             let beta = if model.has_link_wiggle() {
                 fit_saved
                     .block_by_role(BlockRole::Mean)
-                    .ok_or_else(|| {
-                        "standard link-wiggle model is missing Mean coefficient block".to_string()
+                    .ok_or_else(|| PredictInputError::MissingMetadata {
+                        reason: "standard link-wiggle model is missing Mean coefficient block"
+                            .to_string(),
                     })?
                     .beta
                     .clone()
@@ -144,11 +203,13 @@ pub fn build_predict_input_for_model(
                 )?)
             };
             if beta.len() != mean_design.ncols() {
-                return Err(format!(
-                    "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
-                    beta.len(),
-                    mean_design.ncols()
-                ));
+                return Err(PredictInputError::DimensionMismatch {
+                    reason: format!(
+                        "model/design mismatch: model beta has {} coefficients but new-data design has {} columns",
+                        beta.len(),
+                        mean_design.ncols()
+                    ),
+                });
             }
             Ok(PredictInput {
                 design: mean_design,
@@ -167,7 +228,9 @@ pub fn build_predict_input_for_model(
                 "resolved_termspec_noise",
             )?;
             let design_noise_raw = build_term_collection_design(design_input, &spec_noise)
-                .map_err(|e| format!("failed to build noise prediction design: {e}"))?;
+                .map_err(|e| PredictInputError::InvalidInput {
+                    reason: format!("failed to build noise prediction design: {e}"),
+                })?;
 
             let noise_transform = scale_transform_from_payload(
                 &model.noise_projection,
@@ -199,7 +262,9 @@ pub fn build_predict_input_for_model(
             let z_name = model
                 .z_column
                 .as_ref()
-                .ok_or_else(|| "marginal-slope model is missing z_column".to_string())?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "marginal-slope model is missing z_column".to_string(),
+                })?;
             let z_col = resolve_role_col(col_map, z_name, "z")?;
             let z = data.column(z_col).to_owned();
             let spec_logslope = resolve_termspec_for_prediction(
@@ -209,7 +274,9 @@ pub fn build_predict_input_for_model(
                 "resolved_termspec_logslope",
             )?;
             let design_logslope = build_term_collection_design(design_input, &spec_logslope)
-                .map_err(|e| format!("failed to build logslope prediction design: {e}"))?;
+                .map_err(|e| PredictInputError::InvalidInput {
+                    reason: format!("failed to build logslope prediction design: {e}"),
+                })?;
             let auxiliary_matrix =
                 build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             Ok(PredictInput {
@@ -221,31 +288,42 @@ pub fn build_predict_input_for_model(
                 auxiliary_matrix,
             })
         }
-        PredictModelClass::Survival => Err(
-            "build_predict_input_for_model should not be called for survival models".to_string(),
-        ),
+        PredictModelClass::Survival => Err(PredictInputError::InvalidInput {
+            reason: "build_predict_input_for_model should not be called for survival models"
+                .to_string(),
+        }),
         PredictModelClass::TransformationNormal => {
             if noise_offset_supplied {
-                return Err(
-                    "--noise-offset-column is not supported for transformation-normal prediction"
-                        .to_string(),
-                );
+                return Err(PredictInputError::InvalidInput {
+                    reason:
+                        "--noise-offset-column is not supported for transformation-normal prediction"
+                            .to_string(),
+                });
             }
             let payload = model.payload();
             let response_knots = payload
                 .transformation_response_knots
                 .as_ref()
-                .ok_or("saved transformation-normal model missing response_knots")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing response_knots".to_string(),
+                })?;
             let response_transform_vecs = payload
                 .transformation_response_transform
                 .as_ref()
-                .ok_or("saved transformation-normal model missing response_transform")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing response_transform"
+                        .to_string(),
+                })?;
             let response_degree = payload
                 .transformation_response_degree
-                .ok_or("saved transformation-normal model missing response_degree")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing response_degree".to_string(),
+                })?;
             let response_median = payload
                 .transformation_response_median
-                .ok_or("saved transformation-normal model missing response_median")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing response_median".to_string(),
+                })?;
 
             let t_rows = response_transform_vecs.len();
             let t_cols = if t_rows > 0 {
@@ -266,14 +344,18 @@ pub fn build_predict_input_for_model(
                 .split('~')
                 .next()
                 .map(str::trim)
-                .ok_or("cannot parse response column from formula")?;
+                .ok_or_else(|| PredictInputError::InvalidInput {
+                    reason: "cannot parse response column from formula".to_string(),
+                })?;
             let response_col_idx = resolve_role_col(col_map, response_col_name, "response")?;
             let response_new = data.column(response_col_idx).to_owned();
             for value in response_new.iter().copied() {
                 if !value.is_finite() {
-                    return Err(format!(
-                        "transformation-normal response value in prediction data is not finite: {value}"
-                    ));
+                    return Err(PredictInputError::InvalidInput {
+                        reason: format!(
+                            "transformation-normal response value in prediction data is not finite: {value}"
+                        ),
+                    });
                 }
             }
 
@@ -283,14 +365,16 @@ pub fn build_predict_input_for_model(
                 response_degree,
                 BasisOptions::i_spline(),
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
             let raw_val = raw_val_basis.as_ref().clone();
             if raw_val.ncols() != resp_transform.nrows() {
-                return Err(format!(
-                    "saved transformation-normal response transform shape mismatch: raw I-spline cols={} transform rows={}",
-                    raw_val.ncols(),
-                    resp_transform.nrows()
-                ));
+                return Err(PredictInputError::DimensionMismatch {
+                    reason: format!(
+                        "saved transformation-normal response transform shape mismatch: raw I-spline cols={} transform rows={}",
+                        raw_val.ncols(),
+                        resp_transform.nrows()
+                    ),
+                });
             }
             let shape_val = raw_val.dot(&resp_transform);
             let p_shape = resp_transform.ncols();
@@ -305,13 +389,15 @@ pub fn build_predict_input_for_model(
                 response_degree,
                 1,
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
             if raw_deriv.ncols() != resp_transform.nrows() {
-                return Err(format!(
-                    "saved transformation-normal derivative transform shape mismatch: raw M-spline cols={} transform rows={}",
-                    raw_deriv.ncols(),
-                    resp_transform.nrows()
-                ));
+                return Err(PredictInputError::DimensionMismatch {
+                    reason: format!(
+                        "saved transformation-normal derivative transform shape mismatch: raw M-spline cols={} transform rows={}",
+                        raw_deriv.ncols(),
+                        resp_transform.nrows()
+                    ),
+                });
             }
             let shape_deriv = raw_deriv.dot(&resp_transform);
             let mut resp_deriv = ndarray::Array2::<f64>::zeros((n, p_resp));
@@ -321,33 +407,44 @@ pub fn build_predict_input_for_model(
 
             let fit_saved = model
                 .unified()
-                .ok_or("saved transformation-normal model missing unified fit")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing unified fit".to_string(),
+                })?;
             let beta = &fit_saved.blocks[0].beta;
             let p_cov = design.design.ncols();
             if beta.len() != p_resp * p_cov {
-                return Err(format!(
-                    "beta length {} != p_resp({}) * p_cov({})",
-                    beta.len(),
-                    p_resp,
-                    p_cov
-                ));
+                return Err(PredictInputError::DimensionMismatch {
+                    reason: format!(
+                        "beta length {} != p_resp({}) * p_cov({})",
+                        beta.len(),
+                        p_resp,
+                        p_cov
+                    ),
+                });
             }
             let beta_mat = beta
                 .view()
                 .into_shape_with_order((p_resp, p_cov))
-                .map_err(|e| format!("beta reshape failed: {e}"))?;
+                .map_err(|e| PredictInputError::DimensionMismatch {
+                    reason: format!("beta reshape failed: {e}"),
+                })?;
             let cov_mat = design
                 .design
                 .try_row_chunk(0..n)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| PredictInputError::InvalidInput { reason: e.to_string() })?;
             let calibration = payload
                 .transformation_score_calibration
                 .as_ref()
-                .ok_or("saved transformation-normal model missing score calibration")?;
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal model missing score calibration"
+                        .to_string(),
+                })?;
             calibration.validate("saved transformation-normal score calibration")?;
 
             if resp_knots.is_empty() {
-                return Err("saved transformation-normal response knots are empty".to_string());
+                return Err(PredictInputError::MissingMetadata {
+                    reason: "saved transformation-normal response knots are empty".to_string(),
+                });
             }
             let mut response_lower_basis = vec![0.0; p_resp];
             let mut response_upper_basis = vec![0.0; p_resp];
@@ -383,13 +480,15 @@ pub fn build_predict_input_for_model(
                 })
                 .reduce(|| f64::INFINITY, f64::min);
             if min_h_prime < monotonicity_eps {
-                return Err(format!(
-                    "prediction failed: transformation-normal h'(y, x) numerical floor \
-                     violated. Minimum evaluated h'(y, x) is {min_h_prime:.3e}, threshold \
-                     {monotonicity_eps:.0e}. Under SCOP h' = ε + Σ M_r γ_r² holds \
-                     structurally, so this indicates floating-point cancellation below \
-                     the fixed derivative floor."
-                ));
+                return Err(PredictInputError::InvalidInput {
+                    reason: format!(
+                        "prediction failed: transformation-normal h'(y, x) numerical floor \
+                         violated. Minimum evaluated h'(y, x) is {min_h_prime:.3e}, threshold \
+                         {monotonicity_eps:.0e}. Under SCOP h' = ε + Σ M_r γ_r² holds \
+                         structurally, so this indicates floating-point cancellation below \
+                         the fixed derivative floor."
+                    ),
+                });
             }
 
             // h_i and finite-support endpoints share the same γ_r(x_i). The
@@ -434,10 +533,11 @@ pub fn build_predict_input_for_model(
                 .iter()
                 .any(|value| !value.is_finite() || value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX)
             {
-                return Err(
-                    "prediction failed: transformation-normal PIT produced non-finite or out-of-range z values"
-                        .to_string(),
-                );
+                return Err(PredictInputError::InvalidInput {
+                    reason:
+                        "prediction failed: transformation-normal PIT produced non-finite or out-of-range z values"
+                            .to_string(),
+                });
             }
             Ok(PredictInput {
                 design: DesignMatrix::from(ndarray::Array2::from_shape_fn((n, 1), |_| 1.0)),
@@ -449,4 +549,29 @@ pub fn build_predict_input_for_model(
             })
         }
     }
+}
+
+/// Build a `PredictInput` for model types backed directly by `PredictableModel`.
+///
+/// Survival prediction has its own design assembly because it needs entry/exit
+/// time geometry before it can call the same predictor/output machinery.
+pub fn build_predict_input_for_model(
+    model: &FittedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    offset: &Array1<f64>,
+    offset_noise: &Array1<f64>,
+    noise_offset_supplied: bool,
+) -> Result<PredictInput, String> {
+    build_predict_input_for_model_inner(
+        model,
+        data,
+        col_map,
+        training_headers,
+        offset,
+        offset_noise,
+        noise_offset_supplied,
+    )
+    .map_err(Into::into)
 }

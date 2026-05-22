@@ -168,6 +168,43 @@ impl OuterHessianMaterialization {
     }
 }
 
+/// Typed error for the outer-strategy Hessian-operator surface.
+///
+/// All construction sites inside `outer_strategy` build one of these variants
+/// instead of an ad-hoc `String`; the historical `Result<_, String>` boundary
+/// on the [`OuterHessianOperator`] trait (which has out-of-crate implementors
+/// in `families/*` and `solver/reml/*`) is preserved by an explicit
+/// `OuterStrategyError -> String` conversion at the leaf return points.
+#[derive(Debug, Clone)]
+pub enum OuterStrategyError {
+    /// Length / shape mismatch raised by an outer Hessian operator
+    /// (matvec input/output length, `mul_mat` factor row count,
+    /// `materialize_dense` output dimensions, etc.).
+    OperatorShape { reason: String },
+    /// Dense materialization produced non-finite entries.
+    NonFiniteHessian { reason: String },
+    /// Shape / dimension violation of a rho-block additive Hessian update.
+    RhoBlockShape { reason: String },
+}
+
+impl std::fmt::Display for OuterStrategyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OuterStrategyError::OperatorShape { reason }
+            | OuterStrategyError::NonFiniteHessian { reason }
+            | OuterStrategyError::RhoBlockShape { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for OuterStrategyError {}
+
+impl From<OuterStrategyError> for String {
+    fn from(err: OuterStrategyError) -> String {
+        err.to_string()
+    }
+}
+
 /// Matrix-free outer Hessian operator.
 ///
 /// This is the exact outer Hessian action `H_outer * v` evaluated at the
@@ -205,11 +242,14 @@ pub trait OuterHessianOperator: Send + Sync {
     fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
         let result = self.matvec(v)?;
         if result.len() != out.len() {
-            return Err(format!(
-                "outer Hessian operator matvec produced length {} but expected {}",
-                result.len(),
-                out.len()
-            ));
+            return Err(OuterStrategyError::OperatorShape {
+                reason: format!(
+                    "outer Hessian operator matvec produced length {} but expected {}",
+                    result.len(),
+                    out.len()
+                ),
+            }
+            .into());
         }
         out.assign(&result);
         Ok(())
@@ -261,11 +301,14 @@ pub trait OuterHessianOperator: Send + Sync {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let dim = self.dim();
         if factor.nrows() != dim {
-            return Err(format!(
-                "outer Hessian operator factor row count mismatch: got {}, expected {}",
-                factor.nrows(),
-                dim
-            ));
+            return Err(OuterStrategyError::OperatorShape {
+                reason: format!(
+                    "outer Hessian operator factor row count mismatch: got {}, expected {}",
+                    factor.nrows(),
+                    dim
+                ),
+            }
+            .into());
         }
         let m = factor.ncols();
         let cols: Result<Vec<Array1<f64>>, String> = (0..m)
@@ -274,11 +317,14 @@ pub trait OuterHessianOperator: Send + Sync {
                 let col = factor.column(j).to_owned();
                 let hv = self.matvec(&col)?;
                 if hv.len() != dim {
-                    return Err(format!(
-                        "outer Hessian operator matvec length mismatch: got {}, expected {}",
-                        hv.len(),
-                        dim
-                    ));
+                    return Err(OuterStrategyError::OperatorShape {
+                        reason: format!(
+                            "outer Hessian operator matvec length mismatch: got {}, expected {}",
+                            hv.len(),
+                            dim
+                        ),
+                    }
+                    .into());
                 }
                 Ok(hv)
             })
@@ -300,13 +346,16 @@ pub trait OuterHessianOperator: Send + Sync {
         let identity = Array2::<f64>::eye(dim);
         let mut dense = self.mul_mat(identity.view())?;
         if dense.nrows() != dim || dense.ncols() != dim {
-            return Err(format!(
-                "outer Hessian operator mul_mat returned {}x{}, expected {}x{}",
-                dense.nrows(),
-                dense.ncols(),
-                dim,
-                dim
-            ));
+            return Err(OuterStrategyError::OperatorShape {
+                reason: format!(
+                    "outer Hessian operator mul_mat returned {}x{}, expected {}x{}",
+                    dense.nrows(),
+                    dense.ncols(),
+                    dim,
+                    dim
+                ),
+            }
+            .into());
         }
         for row in 0..dim {
             for col in (row + 1)..dim {
@@ -316,9 +365,11 @@ pub trait OuterHessianOperator: Send + Sync {
             }
         }
         if !dense.iter().all(|value| value.is_finite()) {
-            return Err(
-                "outer Hessian dense materialization produced non-finite entries".to_string(),
-            );
+            return Err(OuterStrategyError::NonFiniteHessian {
+                reason: "outer Hessian dense materialization produced non-finite entries"
+                    .to_string(),
+            }
+            .into());
         }
         Ok(dense)
     }
@@ -337,11 +388,14 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
 
     fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
         if v.len() != self.dim {
-            return Err(format!(
-                "outer Hessian operator input length mismatch: got {}, expected {}",
-                v.len(),
-                self.dim
-            ));
+            return Err(OuterStrategyError::OperatorShape {
+                reason: format!(
+                    "outer Hessian operator input length mismatch: got {}, expected {}",
+                    v.len(),
+                    self.dim
+                ),
+            }
+            .into());
         }
         let mut out = self.base.matvec(v)?;
         let k = self.rho_block.nrows();
@@ -363,12 +417,15 @@ impl OuterHessianOperator for RhoBlockAdditiveOuterHessian {
         let k = self.rho_block.nrows();
         if k > 0 {
             if k > out.nrows() {
-                return Err(format!(
-                    "rho-block Hessian update shape mismatch: rho_block is {}x{}, mul_mat output has {} rows",
-                    self.rho_block.nrows(),
-                    self.rho_block.ncols(),
-                    out.nrows()
-                ));
+                return Err(OuterStrategyError::RhoBlockShape {
+                    reason: format!(
+                        "rho-block Hessian update shape mismatch: rho_block is {}x{}, mul_mat output has {} rows",
+                        self.rho_block.nrows(),
+                        self.rho_block.ncols(),
+                        out.nrows()
+                    ),
+                }
+                .into());
             }
             // Update the leading-k rows of `out` by the rho_block contribution
             // to the first k rows of v: out[..k, :] += rho_block · factor[..k, :].
@@ -1470,22 +1527,28 @@ impl HessianResult {
 
     pub fn add_rho_block_dense(&mut self, rho_block: &Array2<f64>) -> Result<(), String> {
         if rho_block.nrows() != rho_block.ncols() {
-            return Err(format!(
-                "rho-block Hessian update must be square, got {}x{}",
-                rho_block.nrows(),
-                rho_block.ncols()
-            ));
+            return Err(OuterStrategyError::RhoBlockShape {
+                reason: format!(
+                    "rho-block Hessian update must be square, got {}x{}",
+                    rho_block.nrows(),
+                    rho_block.ncols()
+                ),
+            }
+            .into());
         }
         match self {
             HessianResult::Analytic(h) => {
                 if rho_block.nrows() > h.nrows() || rho_block.ncols() > h.ncols() {
-                    return Err(format!(
-                        "rho-block Hessian update shape mismatch: got {}x{}, outer Hessian is {}x{}",
-                        rho_block.nrows(),
-                        rho_block.ncols(),
-                        h.nrows(),
-                        h.ncols()
-                    ));
+                    return Err(OuterStrategyError::RhoBlockShape {
+                        reason: format!(
+                            "rho-block Hessian update shape mismatch: got {}x{}, outer Hessian is {}x{}",
+                            rho_block.nrows(),
+                            rho_block.ncols(),
+                            h.nrows(),
+                            h.ncols()
+                        ),
+                    }
+                    .into());
                 }
                 let k = rho_block.nrows();
                 let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
@@ -1496,12 +1559,15 @@ impl HessianResult {
                 let base = Arc::clone(op);
                 let dim = base.dim();
                 if rho_block.nrows() > dim {
-                    return Err(format!(
-                        "rho-block Hessian update dimension mismatch: got {}x{}, operator dim is {}",
-                        rho_block.nrows(),
-                        rho_block.ncols(),
-                        dim
-                    ));
+                    return Err(OuterStrategyError::RhoBlockShape {
+                        reason: format!(
+                            "rho-block Hessian update dimension mismatch: got {}x{}, operator dim is {}",
+                            rho_block.nrows(),
+                            rho_block.ncols(),
+                            dim
+                        ),
+                    }
+                    .into());
                 }
                 *self = HessianResult::Operator(Arc::new(RhoBlockAdditiveOuterHessian {
                     base,
@@ -5931,7 +5997,10 @@ mod tests {
         }
 
         fn materialize_dense(&self) -> Result<Array2<f64>, String> {
-            Err("seed materialization failed".to_string())
+            Err(OuterStrategyError::OperatorShape {
+                reason: "seed materialization failed".to_string(),
+            }
+            .into())
         }
     }
 
