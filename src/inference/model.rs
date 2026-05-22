@@ -1150,6 +1150,7 @@ fn validate_marginal_slope_saved_fit_impl(
 impl SavedLinkWiggleRuntime {
     fn validate_global_monotonicity(&self) -> Result<(), FittedModelError> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved link-wiggle")
+            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
     }
 
     fn validate_monotone_derivative(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -1158,9 +1159,11 @@ impl SavedLinkWiggleRuntime {
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
         let dq_dq0 = d_constrained.dot(&beta_link_wiggle) + 1.0;
         if let Some((idx, value)) = dq_dq0.iter().copied().enumerate().find(|(_, v)| *v <= 0.0) {
-            return Err(format!(
-                "saved link-wiggle is not monotone at row {idx}: dq/dq0={value:.3e} <= 0"
-            ));
+            return Err(FittedModelError::PayloadCorrupt {
+                reason: format!(
+                    "saved link-wiggle is not monotone at row {idx}: dq/dq0={value:.3e} <= 0"
+                ),
+            });
         }
         Ok(dq_dq0)
     }
@@ -1176,13 +1179,16 @@ impl SavedLinkWiggleRuntime {
             &knot_arr,
             self.degree,
             basis_options.derivative_order,
-        )?;
+        )
+        .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
         if constrained.ncols() != self.beta.len() {
-            return Err(format!(
-                "saved link-wiggle dimension mismatch: coefficients have {} entries but basis has {} columns",
-                self.beta.len(),
-                constrained.ncols()
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved link-wiggle dimension mismatch: coefficients have {} entries but basis has {} columns",
+                    self.beta.len(),
+                    constrained.ncols()
+                ),
+            });
         }
         Ok(constrained)
     }
@@ -1196,10 +1202,12 @@ impl SavedLinkWiggleRuntime {
         let q = Array1::from_vec(vec![q0]);
         let x = self.design(&q)?;
         if x.nrows() != 1 {
-            return Err(format!(
-                "saved link-wiggle scalar evaluation expected 1 row, got {}",
-                x.nrows()
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved link-wiggle scalar evaluation expected 1 row, got {}",
+                    x.nrows()
+                ),
+            });
         }
         Ok(x.row(0).to_owned())
     }
@@ -1219,6 +1227,7 @@ impl SavedLinkWiggleRuntime {
 impl SavedBaselineTimeWiggleRuntime {
     pub fn validate_global_monotonicity(&self) -> Result<(), FittedModelError> {
         validate_monotone_wiggle_beta_nonnegative(&self.beta, "saved baseline-timewiggle")
+            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
     }
 }
 
