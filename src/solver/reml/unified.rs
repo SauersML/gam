@@ -5654,6 +5654,18 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
+    /// Stash the active linear-inequality constraint block carried alongside the
+    /// inner solution. Used by `PenaltySubspaceTrace::with_active_constraints`
+    /// at REML/LAML evaluation time to form the constraint-aware kernel
+    /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`.
+    pub fn active_constraints(
+        mut self,
+        block: Option<Arc<ActiveLinearConstraintBlock>>,
+    ) -> Self {
+        self.active_constraints = block;
+        self
+    }
+
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {

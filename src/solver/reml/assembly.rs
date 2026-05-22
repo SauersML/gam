@@ -236,6 +236,11 @@ pub struct InnerAssembly<'dp> {
     pub nullspace_dim: Option<f64>,
     pub barrier_config: Option<BarrierConfig>,
     pub kkt_residual: Option<ProjectedKktResidual>,
+    /// Active linear-inequality constraint rows at the converged inner
+    /// iterate. When `Some`, the unified evaluator builds the
+    /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
+    /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
+    pub active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 
     // === Extended hyperparameter coordinates ===
     pub ext_coords: Vec<HyperCoord>,
@@ -272,6 +277,7 @@ impl<'dp> InnerAssembly<'dp> {
         }
         builder = builder.barrier_config(self.barrier_config);
         builder = builder.kkt_residual(self.kkt_residual);
+        builder = builder.active_constraints(self.active_constraints);
 
         if !self.ext_coords.is_empty() {
             builder = builder.ext_coords(self.ext_coords);
