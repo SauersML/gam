@@ -1292,16 +1292,18 @@ impl SavedAnchoredDeviationRuntime {
             Some(c) => c,
             None => {
                 if !self.anchor_residual_components.is_empty() {
-                    return Err(
-                        "saved anchored deviation runtime has anchor_residual_components but no anchor_residual_coefficients"
-                            .to_string(),
-                    );
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason:
+                            "saved anchored deviation runtime has anchor_residual_components but no anchor_residual_coefficients"
+                                .to_string(),
+                    });
                 }
                 if self.anchor_residual_rotation.is_some() {
-                    return Err(
-                        "saved anchored deviation runtime has anchor_residual_rotation but no anchor_residual_coefficients"
-                            .to_string(),
-                    );
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason:
+                            "saved anchored deviation runtime has anchor_residual_rotation but no anchor_residual_coefficients"
+                                .to_string(),
+                    });
                 }
                 return Ok(());
             }
@@ -1314,51 +1316,63 @@ impl SavedAnchoredDeviationRuntime {
             })
             .sum();
         if coeffs.len() != d {
-            return Err(format!(
-                "saved anchored deviation runtime anchor_residual_coefficients has {} rows; expected {} (sum of component ncols)",
-                coeffs.len(),
-                d,
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation runtime anchor_residual_coefficients has {} rows; expected {} (sum of component ncols)",
+                    coeffs.len(),
+                    d,
+                ),
+            });
         }
         for (i, row) in coeffs.iter().enumerate() {
             if row.len() != self.basis_dim {
-                return Err(format!(
-                    "saved anchored deviation runtime anchor_residual_coefficients row {} has width {}, expected basis_dim {}",
-                    i,
-                    row.len(),
-                    self.basis_dim,
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "saved anchored deviation runtime anchor_residual_coefficients row {} has width {}, expected basis_dim {}",
+                        i,
+                        row.len(),
+                        self.basis_dim,
+                    ),
+                });
             }
             for (j, &v) in row.iter().enumerate() {
                 if !v.is_finite() {
-                    return Err(format!(
-                        "saved anchored deviation runtime anchor_residual_coefficients ({i},{j}) is non-finite"
-                    ));
+                    return Err(FittedModelError::PayloadCorrupt {
+                        reason: format!(
+                            "saved anchored deviation runtime anchor_residual_coefficients ({i},{j}) is non-finite"
+                        ),
+                    });
                 }
             }
         }
         if let Some(rot) = self.anchor_residual_rotation.as_ref() {
             if rot.len() != d {
-                return Err(format!(
-                    "saved anchored deviation runtime anchor_residual_rotation has {} rows; expected {}",
-                    rot.len(),
-                    d,
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "saved anchored deviation runtime anchor_residual_rotation has {} rows; expected {}",
+                        rot.len(),
+                        d,
+                    ),
+                });
             }
             for (i, row) in rot.iter().enumerate() {
                 if row.len() != d {
-                    return Err(format!(
-                        "saved anchored deviation runtime anchor_residual_rotation row {} has width {}; expected {}",
-                        i,
-                        row.len(),
-                        d,
-                    ));
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved anchored deviation runtime anchor_residual_rotation row {} has width {}; expected {}",
+                            i,
+                            row.len(),
+                            d,
+                        ),
+                    });
                 }
                 for (j, &v) in row.iter().enumerate() {
                     if !v.is_finite() {
-                        return Err(format!(
-                            "saved anchored deviation runtime anchor_residual_rotation ({i},{j}) is non-finite"
-                        ));
+                        return Err(FittedModelError::PayloadCorrupt {
+                            reason: format!(
+                                "saved anchored deviation runtime anchor_residual_rotation ({i},{j}) is non-finite"
+                            ),
+                        });
                     }
                 }
             }
@@ -1389,12 +1403,14 @@ impl SavedAnchoredDeviationRuntime {
                     || (left_d1 - right_d1).abs() > TOL
                     || (left_d2 - right_d2).abs() > TOL
                 {
-                    return Err(format!(
-                        "saved anchored deviation runtime must be C2 cubic at breakpoint {span_idx}, basis {basis_idx}: value jump={:.3e}, d1 jump={:.3e}, d2 jump={:.3e}",
-                        left_value - right_value,
-                        left_d1 - right_d1,
-                        left_d2 - right_d2
-                    ));
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "saved anchored deviation runtime must be C2 cubic at breakpoint {span_idx}, basis {basis_idx}: value jump={:.3e}, d1 jump={:.3e}, d2 jump={:.3e}",
+                            left_value - right_value,
+                            left_d1 - right_d1,
+                            left_d2 - right_d2
+                        ),
+                    });
                 }
             }
         }
@@ -1408,26 +1424,32 @@ impl SavedAnchoredDeviationRuntime {
         expected_rows: usize,
     ) -> Result<(), FittedModelError> {
         if matrix.len() != expected_rows {
-            return Err(format!(
-                "saved anchored deviation runtime {label} row count mismatch: got {}, expected {}",
-                matrix.len(),
-                expected_rows
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation runtime {label} row count mismatch: got {}, expected {}",
+                    matrix.len(),
+                    expected_rows
+                ),
+            });
         }
         for (row_idx, row) in matrix.iter().enumerate() {
             if row.len() != self.basis_dim {
-                return Err(format!(
-                    "saved anchored deviation runtime {label} row {} has width {}, expected {}",
-                    row_idx,
-                    row.len(),
-                    self.basis_dim
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "saved anchored deviation runtime {label} row {} has width {}, expected {}",
+                        row_idx,
+                        row.len(),
+                        self.basis_dim
+                    ),
+                });
             }
             for (j, &value) in row.iter().enumerate() {
                 if !value.is_finite() {
-                    return Err(format!(
-                        "saved anchored deviation runtime {label} entry ({row_idx},{j}) is non-finite"
-                    ));
+                    return Err(FittedModelError::PayloadCorrupt {
+                        reason: format!(
+                            "saved anchored deviation runtime {label} entry ({row_idx},{j}) is non-finite"
+                        ),
+                    });
                 }
             }
         }
@@ -1453,9 +1475,11 @@ impl SavedAnchoredDeviationRuntime {
         let mut out = Array2::<f64>::zeros((values.len(), self.basis_dim));
         for (row_idx, &value) in values.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!(
-                    "saved anchored deviation runtime design value at row {row_idx} is non-finite ({value})"
-                ));
+                return Err(FittedModelError::PayloadCorrupt {
+                    reason: format!(
+                        "saved anchored deviation runtime design value at row {row_idx} is non-finite ({value})"
+                    ),
+                });
             }
             if value < left_ep {
                 if derivative_order == 0 {
@@ -1487,9 +1511,11 @@ impl SavedAnchoredDeviationRuntime {
                     3 => 6.0 * c3,
                     4 => 0.0,
                     other => {
-                        return Err(format!(
-                            "saved anchored deviation runtime only supports derivative orders up to 4, got {other}"
-                        ));
+                        return Err(FittedModelError::IncompatibleConfig {
+                            reason: format!(
+                                "saved anchored deviation runtime only supports derivative orders up to 4, got {other}"
+                            ),
+                        });
                     }
                 };
             }
@@ -1509,6 +1535,7 @@ impl SavedAnchoredDeviationRuntime {
     pub fn span_index_for(&self, value: f64) -> Result<usize, FittedModelError> {
         let points = self.breakpoints()?;
         span_index_for_breakpoints(&points, value, "saved anchored deviation span lookup")
+            .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
     }
 
     fn left_biased_span_index_for(&self, value: f64) -> Result<usize, FittedModelError> {
@@ -1516,7 +1543,8 @@ impl SavedAnchoredDeviationRuntime {
             &self.breakpoints,
             value,
             "saved anchored deviation span lookup",
-        )?;
+        )
+        .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
         // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
         // saved cubic basis is C2, but d3 remains span-local.
         if span_idx > 0 && value == self.breakpoints[span_idx] {
@@ -1533,11 +1561,13 @@ impl SavedAnchoredDeviationRuntime {
     {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
-            return Err(format!(
-                "saved anchored deviation coefficient length mismatch: got {}, expected {}",
-                beta.len(),
-                self.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation coefficient length mismatch: got {}, expected {}",
+                    beta.len(),
+                    self.basis_dim
+                ),
+            });
         }
         self.local_cubic_on_span_validated(beta, span_idx)
     }
@@ -1550,11 +1580,13 @@ impl SavedAnchoredDeviationRuntime {
     {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
-            return Err(format!(
-                "saved anchored deviation span index {} out of range for {} spans",
-                span_idx,
-                points.len() - 1
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation span index {} out of range for {} spans",
+                    span_idx,
+                    points.len() - 1
+                ),
+            });
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
@@ -1594,10 +1626,12 @@ impl SavedAnchoredDeviationRuntime {
     {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
-            return Err(format!(
-                "saved anchored deviation basis index {} out of range for {} coefficients",
-                basis_idx, self.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation basis index {} out of range for {} coefficients",
+                    basis_idx, self.basis_dim
+                ),
+            });
         }
         self.basis_span_cubic_validated(span_idx, basis_idx)
     }
@@ -1610,11 +1644,13 @@ impl SavedAnchoredDeviationRuntime {
     {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
-            return Err(format!(
-                "saved anchored deviation span index {} out of range for {} spans",
-                span_idx,
-                points.len() - 1
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation span index {} out of range for {} spans",
+                    span_idx,
+                    points.len() - 1
+                ),
+            });
         }
         Ok(
             crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
@@ -1636,10 +1672,12 @@ impl SavedAnchoredDeviationRuntime {
     {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
-            return Err(format!(
-                "saved anchored deviation basis index {} out of range for {} coefficients",
-                basis_idx, self.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation basis index {} out of range for {} coefficients",
+                    basis_idx, self.basis_dim
+                ),
+            });
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
