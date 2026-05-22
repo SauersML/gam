@@ -32,20 +32,17 @@ try:
     from ._basis import (
         bspline_basis,
         bspline_basis_derivative,
-        duchon_basis_1d,
-        duchon_basis_1d_derivative,
+        duchon_basis,
         gaussian_weighted_ridge,
         gaussian_weighted_ridge_batch,
         smoothness_penalty,
     )
     from ._reml import (
-        FrozenPositionPredictor,
+        AdditiveRemlOutput,
         GaussianRemlOutput,
-        GaussianRemlPositionOutput,
         gaussian_reml_fit,
+        gaussian_reml_fit_additive,
         gaussian_reml_fit_batched,
-        gaussian_reml_fit_positions,
-        gaussian_reml_fit_positions_batched,
     )
     from .geometry import (
         alr,
@@ -69,21 +66,18 @@ except ImportError as _exc:  # pragma: no cover - import-time guard
     raise
 
 __all__ = [
+    "AdditiveRemlOutput",
     "GaussianRemlOutput",
-    "GaussianRemlPositionOutput",
-    "FrozenPositionPredictor",
     "alr",
     "bspline_basis",
     "bspline_basis_derivative",
     "closure",
     "clr",
-    "duchon_basis_1d",
-    "duchon_basis_1d_derivative",
+    "duchon_basis",
     "from_fitted",
     "gaussian_reml_fit",
+    "gaussian_reml_fit_additive",
     "gaussian_reml_fit_batched",
-    "gaussian_reml_fit_positions",
-    "gaussian_reml_fit_positions_batched",
     "gaussian_weighted_ridge",
     "gaussian_weighted_ridge_batch",
     "inverse_alr",

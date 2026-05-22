@@ -9,6 +9,7 @@ Rust backward so the result composes inside larger torch graphs.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, NamedTuple, cast
 
 import numpy as np
@@ -29,7 +30,24 @@ class GaussianRemlOutput(NamedTuple):
     edf: torch.Tensor
 
 
-class GaussianRemlPositionOutput(NamedTuple):
+@dataclass
+class AdditiveRemlOutput:
+    """Forward outputs for the multi-smooth additive REML fit.
+
+    ``coefficients`` is a list of per-smooth coefficient blocks (each of
+    shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam`` is
+    the shared scalar smoothing parameter; ``reml_score`` and ``edf`` are
+    scalars from the underlying single-λ fit.
+    """
+
+    coefficients: list[torch.Tensor]
+    fitted: torch.Tensor
+    lam: torch.Tensor
+    reml_score: torch.Tensor
+    edf: torch.Tensor
+
+
+class _GaussianRemlPositionOutputRemoved(NamedTuple):
     """Forward outputs for position-based REML wrappers.
 
     Adds the resolved basis state to :class:`GaussianRemlOutput` so the
