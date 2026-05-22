@@ -8110,6 +8110,7 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
         }
     }
     let choice = parse_link_choice(args.link.as_deref(), false).map_err(|err| {
+        let err = err.to_string();
         if let Some(raw) = args.link.as_deref() {
             let name = raw.trim().to_ascii_lowercase();
             if err.starts_with("unsupported --link ") || err.starts_with("unsupported link type ") {
