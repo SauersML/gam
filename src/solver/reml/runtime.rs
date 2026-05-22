@@ -2709,6 +2709,23 @@ impl<'a> RemlState<'a> {
         ))
     }
 
+    fn joint_ift_cache_matches_pending_theta(&self, new_rho: &Array1<f64>) -> bool {
+        let Some(theta) = self.pending_joint_ift_theta() else {
+            return false;
+        };
+        let guard = ift_joint_mode_response_caches().lock().unwrap();
+        let Some(cache) = guard.get(&self.ift_mode_response_cache_key()) else {
+            return false;
+        };
+        if cache.theta.len() <= cache.rho_dim
+            || theta.len() != cache.theta.len()
+            || new_rho.len() != cache.rho_dim
+        {
+            return false;
+        }
+        (0..cache.rho_dim).all(|i| theta[i].to_bits() == new_rho[i].to_bits())
+    }
+
     /// Wipe every atomic-bit-packed signal used by the adaptive
     /// policies (inner-cap schedule margin, IFT |Δρ| cap, LM-λ
     /// hint clamp). Called from the same invalidation paths as
@@ -4367,10 +4384,9 @@ impl<'a> RemlState<'a> {
             None
         };
         let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
-        if let Some(prediction) =
-            self.predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap)
-        {
-            return Some(prediction);
+        if self.joint_ift_cache_matches_pending_theta(new_rho) {
+            return self
+                .predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap);
         }
         let cache_guard = self.ift_warm_start_cache.read().unwrap();
         let cache = cache_guard.as_ref()?;
