@@ -113,7 +113,7 @@ impl From<SurvivalLocationScaleError> for String {
 }
 
 impl From<String> for SurvivalLocationScaleError {
-    /// Inbound conversion from the many `Result<_, SurvivalLocationScaleError>` helpers this
+    /// Inbound conversion from the many `Result<_, String>` helpers this
     /// module still calls into. The text is preserved verbatim; we only
     /// pick a generic category so external messages flow through `?`
     /// without per-callsite `.map_err`.
@@ -265,11 +265,11 @@ fn safe_hadamard_product(lhs: &Array1<f64>, rhs: &Array1<f64>) -> Result<Array1<
             "safe_hadamard_product length mismatch: lhs has {}, rhs has {}",
             lhs.len(),
             rhs.len()
-        ) });
+        ) }.into());
     }
     let out = Array1::from_shape_fn(lhs.len(), |i| safe_product(lhs[i], rhs[i]));
     if out.iter().any(|value| value.is_nan()) {
-        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "safe_hadamard_product produced NaN values".to_string() });
+        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "safe_hadamard_product produced NaN values".to_string() }.into());
     }
     Ok(out)
 }
@@ -287,13 +287,13 @@ fn safe_linear_combo2_arrays(
             b.len(),
             c.len(),
             d.len()
-        ) });
+        ) }.into());
     }
     let out = Array1::from_shape_fn(a.len(), |i| {
         safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
     });
     if out.iter().any(|value| value.is_nan()) {
-        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "safe_linear_combo2_arrays produced NaN values".to_string() });
+        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "safe_linear_combo2_arrays produced NaN values".to_string() }.into());
     }
     Ok(out)
 }
@@ -646,7 +646,9 @@ fn inverse_link_pdffourth_derivative(inverse_link: &InverseLink, eta: f64) -> Re
             inverse_link,
             eta,
         )
-        .map_err(|e| format!("inverse link fourth-derivative evaluation failed at eta={eta}: {e}")),
+        .map_err(|e| SurvivalLocationScaleError::NumericalFailure {
+            reason: format!("inverse link fourth-derivative evaluation failed at eta={eta}: {e}"),
+        }),
     }
 }
 
@@ -670,7 +672,7 @@ pub(crate) fn structural_time_coefficient_constraints(
     design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     derivative_guard: f64,
-) -> Result<Option<LinearInequalityConstraints>, SurvivalLocationScaleError> {
+) -> Result<Option<LinearInequalityConstraints>, String> {
     if design_derivative_exit.ncols() == 0 {
         return Ok(None);
     }
@@ -926,13 +928,13 @@ impl SurvivalLambdaLayout {
         self.k_time + self.k_threshold + self.k_log_sigma..self.total()
     }
 
-    fn validate_rho(&self, rho: &Array1<f64>, label: &str) -> Result<(), SurvivalLocationScaleError> {
+    fn validate_rho(&self, rho: &Array1<f64>, label: &str) -> Result<(), String> {
         if rho.len() != self.total() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "{label} rho length mismatch: got {}, expected {}",
                 rho.len(),
                 self.total()
-            ) });
+            ) }.into());
         }
         Ok(())
     }
@@ -965,7 +967,7 @@ impl SurvivalLambdaLayout {
 /// Build a `UnifiedFitResult` from survival-specific fields.
 pub fn survival_fit_from_parts(
     parts: SurvivalLocationScaleFitResultParts,
-) -> Result<UnifiedFitResult, SurvivalLocationScaleError> {
+) -> Result<UnifiedFitResult, String> {
     let SurvivalLocationScaleFitResultParts {
         beta_time,
         beta_threshold,
@@ -1013,10 +1015,10 @@ pub fn survival_fit_from_parts(
         validate_all_finite_estimation("survival_fit.link_wiggle_knots", knots.iter().copied())
             .map_err(|e| e.to_string())?;
         if link_wiggle_degree.is_none() {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit.beta_link_wiggle requires link_wiggle_degree".to_string() });
+            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit.beta_link_wiggle requires link_wiggle_degree".to_string() }.into());
         }
     } else if link_wiggle_knots.is_some() || link_wiggle_degree.is_some() {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit link-wiggle metadata requires beta_link_wiggle coefficients".to_string(), });
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit link-wiggle metadata requires beta_link_wiggle coefficients".to_string(), }.into());
     }
     validate_all_finite_estimation("survival_fit.lambdas_time", lambdas_time.iter().copied())
         .map_err(|e| e.to_string())?;
@@ -1032,7 +1034,7 @@ pub fn survival_fit_from_parts(
     .map_err(|e| e.to_string())?;
     if let Some(lambdas_wiggle) = lambdas_linkwiggle.as_ref() {
         if beta_link_wiggle.is_none() {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit.lambdas_linkwiggle requires beta_link_wiggle".to_string() });
+            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival_fit.lambdas_linkwiggle requires beta_link_wiggle".to_string() }.into());
         }
         validate_all_finite_estimation(
             "survival_fit.lambdas_linkwiggle",
@@ -1063,7 +1065,7 @@ pub fn survival_fit_from_parts(
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
                 "survival_fit.covariance_conditional must be {}x{}, got {}x{}",
                 total_p, total_p, rows, cols
-            ) });
+            ) }.into());
         }
     }
     if let Some(geom) = geometry.as_ref() {
@@ -1074,14 +1076,14 @@ pub fn survival_fit_from_parts(
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
                 "survival_fit.geometry.penalized_hessian must be {}x{}, got {}x{}",
                 total_p, total_p, rows, cols
-            ) });
+            ) }.into());
         }
         if geom.working_weights.len() != geom.working_response.len() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "survival_fit.geometry working length mismatch: weights={}, response={}",
                 geom.working_weights.len(),
                 geom.working_response.len()
-            ) });
+            ) }.into());
         }
     }
 
@@ -1442,7 +1444,7 @@ fn split_survival_psi_design(
     n: usize,
     time_varying: bool,
     label: &str,
-) -> Result<(Array2<f64>, Array2<f64>), SurvivalLocationScaleError> {
+) -> Result<(Array2<f64>, Array2<f64>), String> {
     if time_varying {
         if x_psi.nrows() != 2 * n && x_psi.nrows() != 3 * n {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
@@ -1450,7 +1452,7 @@ fn split_survival_psi_design(
                 x_psi.nrows(),
                 2 * n,
                 3 * n,
-            ) });
+            ) }.into());
         }
         Ok((
             x_psi.slice(s![0..n, ..]).to_owned(),
@@ -1462,7 +1464,7 @@ fn split_survival_psi_design(
                 "{label} psi design row mismatch: got {}, expected {}",
                 x_psi.nrows(),
                 n
-            ) });
+            ) }.into());
         }
         Ok((x_psi.clone(), x_psi.clone()))
     }
@@ -1492,10 +1494,10 @@ impl SurvivalLocationScaleFamily {
         &self,
         beta: &Array1<f64>,
         delta: &Array1<f64>,
-    ) -> Result<Option<f64>, SurvivalLocationScaleError> {
+    ) -> Result<Option<f64>, String> {
         let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref() else {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale time block missing structural coefficient lower bounds"
-                    .to_string(), });
+                    .to_string(), }.into());
         };
         if beta.len() != lower_bounds.len() || delta.len() != lower_bounds.len() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
@@ -1503,7 +1505,7 @@ impl SurvivalLocationScaleFamily {
                 beta.len(),
                 delta.len(),
                 lower_bounds.len()
-            ) });
+            ) }.into());
         }
         let mut alpha = 1.0f64;
         for j in 0..lower_bounds.len() {
@@ -1515,7 +1517,7 @@ impl SurvivalLocationScaleFamily {
             if slack < -1e-10 {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "survival location-scale current time coefficient violates structural lower bound at coefficient {j}: slack={slack:.3e}"
-                ) });
+                ) }.into());
             }
             let drift = delta[j];
             if drift < 0.0 {
@@ -1574,7 +1576,7 @@ impl SurvivalLocationScaleFamily {
                 if slack < -1e-10 {
                     return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                         "survival location-scale current time derivative violates guard at row {row}: slack={slack:.3e}"
-                    ) });
+                    ) }.into());
                 }
                 // Full-step value of g_r at α = 1; if below the guard, gate closes.
                 if current + drift < guard {
@@ -1589,13 +1591,13 @@ impl SurvivalLocationScaleFamily {
         &self,
         beta: &Array1<f64>,
         delta: &Array1<f64>,
-    ) -> Result<Option<f64>, SurvivalLocationScaleError> {
+    ) -> Result<Option<f64>, String> {
         if beta.len() != delta.len() {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "survival location-scale linkwiggle-step dimension mismatch: beta={}, delta={}",
                 beta.len(),
                 delta.len()
-            ) });
+            ) }.into());
         }
         let mut alpha = 1.0f64;
         for j in 0..beta.len() {
@@ -1603,7 +1605,7 @@ impl SurvivalLocationScaleFamily {
             if slack < -1e-10 {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "survival location-scale current linkwiggle block violates nonnegativity at coefficient {j}: beta={slack:.3e}"
-                ) });
+                ) }.into());
             }
             let drift = delta[j];
             if drift < 0.0 {
@@ -1652,7 +1654,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         q0: ndarray::ArrayView1<'_, f64>,
         beta_w: ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Option<SurvivalWiggleGeometry>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalWiggleGeometry>, String> {
         let (Some(knots), Some(degree)) = (self.wiggle_knots.as_ref(), self.wiggle_degree) else {
             return Ok(None);
         };
@@ -1682,7 +1684,7 @@ impl SurvivalLocationScaleFamily {
                 basis_d2.ncols(),
                 basis_d3.ncols(),
                 beta_w.len()
-            ) });
+            ) }.into());
         }
         let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
         let d2q_dq02 = fast_av(&basis_d2, &beta_w);
@@ -1703,7 +1705,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         h0: ndarray::ArrayView1<'_, f64>,
         beta_w: ndarray::ArrayView1<'_, f64>,
-    ) -> Result<Option<SurvivalWiggleGeometry>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalWiggleGeometry>, String> {
         let (Some(knots), Some(degree)) =
             (self.time_wiggle_knots.as_ref(), self.time_wiggle_degree)
         else {
@@ -1725,7 +1727,7 @@ impl SurvivalLocationScaleFamily {
                 basis_d2.ncols(),
                 basis_d3.ncols(),
                 beta_w.len()
-            ) });
+            ) }.into());
         }
         let dq = fast_av(&basis_d1, &beta_w) + 1.0;
         let d2 = fast_av(&basis_d2, &beta_w);
@@ -1772,7 +1774,7 @@ impl SurvivalLocationScaleFamily {
                 "SurvivalLocationScaleFamily expects {} blocks, got {}",
                 self.expected_blocks(),
                 block_states.len()
-            ) });
+            ) }.into());
         }
         let n = self.n;
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
@@ -1783,7 +1785,7 @@ impl SurvivalLocationScaleFamily {
             .as_ref()
             .map(|_| &block_states[Self::BLOCK_LINK_WIGGLE].eta);
         if eta_time.len() != 3 * n {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "survival location-scale time eta dimension mismatch".to_string() });
+            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "survival location-scale time eta dimension mismatch".to_string() }.into());
         }
         // For time-varying blocks the stacked design is
         // [exit_design; entry_design; derivative_exit_design], giving eta of
@@ -1794,7 +1796,7 @@ impl SurvivalLocationScaleFamily {
                     "time-varying threshold eta length mismatch: got {}, expected {}",
                     eta_t_raw.len(),
                     3 * n
-                ) });
+                ) }.into());
             }
             (
                 eta_t_raw.slice(s![0..n]),
@@ -1806,7 +1808,7 @@ impl SurvivalLocationScaleFamily {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "threshold eta length mismatch: got {}, expected {n}",
                     eta_t_raw.len()
-                ) });
+                ) }.into());
             }
             (eta_t_raw.slice(s![0..n]), eta_t_raw.slice(s![0..n]), None)
         };
@@ -1816,7 +1818,7 @@ impl SurvivalLocationScaleFamily {
                     "time-varying log-sigma eta length mismatch: got {}, expected {}",
                     eta_ls_raw.len(),
                     3 * n
-                ) });
+                ) }.into());
             }
             (
                 eta_ls_raw.slice(s![0..n]),
@@ -1828,14 +1830,14 @@ impl SurvivalLocationScaleFamily {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "log-sigma eta length mismatch: got {}, expected {n}",
                     eta_ls_raw.len()
-                ) });
+                ) }.into());
             }
             (eta_ls_raw.slice(s![0..n]), eta_ls_raw.slice(s![0..n]), None)
         };
         if let Some(w) = etaw
             && w.len() != n
         {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "survival location-scale wiggle eta dimension mismatch".to_string() });
+            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "survival location-scale wiggle eta dimension mismatch".to_string() }.into());
         }
         Ok((
             eta_time.slice(s![0..n]),
@@ -1854,7 +1856,7 @@ impl SurvivalLocationScaleFamily {
     fn collect_joint_quantities(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<SurvivalJointQuantities, SurvivalLocationScaleError> {
+    ) -> Result<SurvivalJointQuantities, String> {
         self.collect_joint_quantities_rescaled(block_states, 0.0)
     }
 
@@ -1867,7 +1869,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         deriv_log_scale: f64,
-    ) -> Result<SurvivalJointQuantities, SurvivalLocationScaleError> {
+    ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut d1_q = Array1::<f64>::zeros(n);
@@ -2019,7 +2021,7 @@ impl SurvivalLocationScaleFamily {
     pub(crate) fn offset_channel_geometry(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), SurvivalLocationScaleError> {
+    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), String> {
         let n = self.n;
         // Defensive degraded-fit path: a custom-family `fit_custom_family` whose
         // outer ARC stalled into the "deterministic-replay" branch can land in
@@ -2069,7 +2071,7 @@ impl SurvivalLocationScaleFamily {
         let rows = (0..n)
             .into_par_iter()
             .map(
-                |i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), SurvivalLocationScaleError> {
+                |i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
                     let state = self.row_predictor_state(
                         dynamic.h_entry[i],
                         dynamic.h_exit[i],
@@ -2097,7 +2099,7 @@ impl SurvivalLocationScaleFamily {
                     Ok((i, r_entry, r_exit, r_deriv, curv))
                 },
             )
-            .collect::<Result<Vec<_>, SurvivalLocationScaleError>>()?;
+            .collect::<Result<Vec<_>, String>>()?;
 
         for (i, r_entry, r_exit, r_deriv, curv) in rows {
             entry[i] = r_entry;
@@ -2121,7 +2123,7 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<SurvivalJointPsiDirection>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalJointPsiDirection>, String> {
         if block_states.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -2130,7 +2132,7 @@ impl SurvivalLocationScaleFamily {
                 self.expected_blocks(),
                 block_states.len(),
                 derivative_blocks.len()
-            ) });
+            ) }.into());
         }
 
         let n = self.n;
@@ -2199,7 +2201,7 @@ impl SurvivalLocationScaleFamily {
                                 PsiDesignMap::Zero { .. } => {}
                                 PsiDesignMap::Second { .. } => {
                                     return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "SurvivalLocationScaleFamily threshold: unexpected Second variant from _psi_map"
-                                            .to_string(), });
+                                            .to_string(), }.into());
                                 }
                             }
                         }
@@ -2243,7 +2245,7 @@ impl SurvivalLocationScaleFamily {
                                 PsiDesignMap::Zero { .. } => {}
                                 PsiDesignMap::Second { .. } => {
                                     return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "SurvivalLocationScaleFamily log-sigma: unexpected Second variant from _psi_map"
-                                            .to_string(), });
+                                            .to_string(), }.into());
                                 }
                             }
                         }
@@ -2278,7 +2280,7 @@ impl SurvivalLocationScaleFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_a: &SurvivalJointPsiDirection,
         psi_b: &SurvivalJointPsiDirection,
-    ) -> Result<SurvivalJointPsiSecondDrifts, SurvivalLocationScaleError> {
+    ) -> Result<SurvivalJointPsiSecondDrifts, String> {
         let n = self.n;
         let pt = self.x_threshold.ncols();
         let pls = self.x_log_sigma.ncols();
@@ -2334,7 +2336,7 @@ impl SurvivalLocationScaleFamily {
                         PsiDesignMap::Zero { .. } => {}
                         PsiDesignMap::First { .. } => {
                             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "SurvivalLocationScaleFamily threshold: unexpected First variant from _psi_psi_map"
-                                    .to_string(), });
+                                    .to_string(), }.into());
                         }
                     }
                 }
@@ -2372,7 +2374,7 @@ impl SurvivalLocationScaleFamily {
                         PsiDesignMap::Zero { .. } => {}
                         PsiDesignMap::First { .. } => {
                             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "SurvivalLocationScaleFamily log-sigma: unexpected First variant from _psi_psi_map"
-                                    .to_string(), });
+                                    .to_string(), }.into());
                         }
                     }
                 }
@@ -2498,7 +2500,7 @@ impl SurvivalLocationScaleFamily {
         inverse_link: &InverseLink,
         eta: f64,
         deriv_log_scale: f64,
-    ) -> Result<(f64, f64, f64, f64, f64), SurvivalLocationScaleError> {
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(LinkFunction::Probit) => Ok((
                 -0.5 * eta * eta - 0.5 * (2.0 * std::f64::consts::PI).ln(),
@@ -2542,7 +2544,7 @@ impl SurvivalLocationScaleFamily {
                 if !(f.is_finite() && f > 0.0) {
                     return Err(SurvivalLocationScaleError::NumericalFailure { reason: format!(
                         "inverse-link pdf must be finite and positive, got {f} at eta={eta}"
-                    ) });
+                    ) }.into());
                 }
                 let fp = jet.d2;
                 let fpp = jet.d3;
@@ -2572,7 +2574,7 @@ impl SurvivalLocationScaleFamily {
         inverse_link: &InverseLink,
         eta: f64,
         deriv_log_scale: f64,
-    ) -> Result<(f64, f64, f64, f64, f64), SurvivalLocationScaleError> {
+    ) -> Result<(f64, f64, f64, f64, f64), String> {
         match inverse_link {
             InverseLink::Standard(LinkFunction::Probit) => {
                 let (log_s, r, dr, ddr, dddr) = probit_log_survival_and_ratio_derivatives(eta);
@@ -2603,7 +2605,7 @@ impl SurvivalLocationScaleFamily {
                 if !(s.is_finite() && s > 0.0) {
                     return Err(SurvivalLocationScaleError::NumericalFailure { reason: format!(
                         "identity-link survival invalid at eta={eta}: S={s}"
-                    ) });
+                    ) }.into());
                 }
                 let inv = s.recip();
                 Ok((s.ln(), inv, inv * inv, 2.0 * inv.powi(3), 6.0 * inv.powi(4)))
@@ -2615,7 +2617,7 @@ impl SurvivalLocationScaleFamily {
                 if !(s.is_finite() && s > 0.0 && s <= 1.0) {
                     return Err(SurvivalLocationScaleError::NumericalFailure { reason: format!(
                         "inverse-link survival probability must lie in (0,1], got {s} at eta={eta}"
-                    ) });
+                    ) }.into());
                 }
                 let fppp = inverse_link_pdfthird_derivative_for_inverse_link(inverse_link, eta)
                     .map_err(|e| {
@@ -2671,12 +2673,12 @@ impl SurvivalLocationScaleFamily {
     }
 
     #[inline]
-    fn validated_event_target(&self, row: usize) -> Result<f64, SurvivalLocationScaleError> {
+    fn validated_event_target(&self, row: usize) -> Result<f64, String> {
         let d = self.y[row];
         if !(d.is_finite() && (0.0..=1.0).contains(&d)) {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                 "survival location-scale event target must lie in [0,1] at row {row}, got {d}"
-            ) });
+            ) }.into());
         }
         Ok(d)
     }
@@ -2685,7 +2687,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         row: usize,
         state: SurvivalPredictorState,
-    ) -> Result<Option<SurvivalExactRowKernel>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalExactRowKernel>, String> {
         self.exact_row_kernel_rescaled(row, state, 0.0)
     }
 
@@ -2697,7 +2699,7 @@ impl SurvivalLocationScaleFamily {
         row: usize,
         state: SurvivalPredictorState,
         deriv_log_scale: f64,
-    ) -> Result<Option<SurvivalExactRowKernel>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalExactRowKernel>, String> {
         let w = self.w[row];
         if w <= 0.0 {
             return Ok(None);
@@ -2765,7 +2767,7 @@ impl SurvivalLocationScaleFamily {
         if g.is_nan() {
             return Err(SurvivalLocationScaleError::NumericalFailure { reason: format!(
                 "survival location-scale time derivative is non-finite at row {row}: d_eta/dt={g}"
-            ) });
+            ) }.into());
         }
         if g == f64::INFINITY {
             g = f64::MAX;
@@ -2806,7 +2808,7 @@ impl SurvivalLocationScaleFamily {
                  d_eta/dt={g:.3e} <= 0 (lower_bound={guard:.3e}) \
                  (operand_scale={:.3e}, roundoff_slack={roundoff_slack:.3e})",
                 state.g_operand_scale
-            ) });
+            ) }.into());
         }
         let (log_g, d_log_g, d2_log_g, d3_log_g, ..) = Self::logwith_derivatives_positive(g);
 
@@ -2839,7 +2841,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         row: usize,
         state: SurvivalPredictorState,
-    ) -> Result<Option<SurvivalRowDerivatives>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalRowDerivatives>, String> {
         self.row_derivatives_rescaled(row, state, 0.0)
     }
 
@@ -2848,7 +2850,7 @@ impl SurvivalLocationScaleFamily {
         row: usize,
         state: SurvivalPredictorState,
         deriv_log_scale: f64,
-    ) -> Result<Option<SurvivalRowDerivatives>, SurvivalLocationScaleError> {
+    ) -> Result<Option<SurvivalRowDerivatives>, String> {
         let Some(kernel) = self.exact_row_kernel_rescaled(row, state, deriv_log_scale)? else {
             return Ok(None);
         };
@@ -3027,13 +3029,13 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{name} design row mismatch: got {}, expected {n}",
             b.design.nrows()
-        ) });
+        ) }.into());
     }
     if b.offset.len() != n {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{name} offset length mismatch: got {}, expected {n}",
             b.offset.len()
-        ) });
+        ) }.into());
     }
     let p = b.design.ncols();
     if let Some(beta0) = &b.initial_beta
@@ -3042,7 +3044,7 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{name} initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
-        ) });
+        ) }.into());
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
@@ -3051,7 +3053,7 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{name} initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
-        ) });
+        ) }.into());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -3068,14 +3070,14 @@ fn validate_cov_block(name: &str, n: usize, b: &CovariateBlockInput) -> Result<(
                         col_range.end,
                         local.nrows(),
                         local.ncols()
-                    ) });
+                    ) }.into());
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
             | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
-                    return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}") });
+                    return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}") }.into());
                 }
             }
         }
@@ -3091,26 +3093,26 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying covariate design row mismatch: got {}, expected {n}",
                     tv.design_covariates.nrows()
-                ) });
+                ) }.into());
             }
             if tv.time_basis_entry.nrows() != n || tv.time_basis_exit.nrows() != n {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying time basis row mismatch: entry={}, exit={}, expected {n}",
                     tv.time_basis_entry.nrows(),
                     tv.time_basis_exit.nrows()
-                ) });
+                ) }.into());
             }
             if tv.time_basis_derivative_exit.nrows() != n {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying derivative basis row mismatch: got {}, expected {n}",
                     tv.time_basis_derivative_exit.nrows()
-                ) });
+                ) }.into());
             }
             if tv.offset.len() != n {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying offset length mismatch: got {}, expected {n}",
                     tv.offset.len()
-                ) });
+                ) }.into());
             }
             let p_cov = tv.design_covariates.ncols();
             let p_time = tv.time_basis_exit.ncols();
@@ -3119,14 +3121,14 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                     "{name} time-varying time basis column mismatch: entry={}, exit={}",
                     tv.time_basis_entry.ncols(),
                     p_time
-                ) });
+                ) }.into());
             }
             if tv.time_basis_derivative_exit.ncols() != p_time {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying derivative basis column mismatch: derivative={}, exit={}",
                     tv.time_basis_derivative_exit.ncols(),
                     p_time
-                ) });
+                ) }.into());
             }
             let p_tensor = p_cov * p_time;
             let k = tv.penalties.len();
@@ -3136,7 +3138,7 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying initial_beta length mismatch: got {}, expected {p_tensor}",
                     beta0.len()
-                ) });
+                ) }.into());
             }
             if let Some(rho0) = &tv.initial_log_lambdas
                 && rho0.len() != k
@@ -3144,14 +3146,14 @@ fn validate_cov_block_kind(name: &str, n: usize, bk: &CovariateBlockKind) -> Res
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "{name} time-varying initial_log_lambdas length mismatch: got {}, expected {k}",
                     rho0.len()
-                ) });
+                ) }.into());
             }
             for (idx, s) in tv.penalties.iter().enumerate() {
                 let (r, c) = s.shape();
                 if r != p_tensor || c != p_tensor {
                     return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                         "{name} time-varying penalty {idx} must be {p_tensor}x{p_tensor}, got {r}x{c}"
-                    ) });
+                    ) }.into());
                 }
             }
             Ok(())
@@ -3189,12 +3191,12 @@ fn design_column_tail(
     design: &DesignMatrix,
     first_col: usize,
     label: &str,
-) -> Result<DesignMatrix, SurvivalLocationScaleError> {
+) -> Result<DesignMatrix, String> {
     let p = design.ncols();
     if first_col > p {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: first retained column {first_col} exceeds design width {p}"
-        ) });
+        ) }.into());
     }
     if first_col == 0 {
         return Ok(design.clone());
@@ -3225,7 +3227,7 @@ fn drop_leading_initial_beta(
     fixed_cols: usize,
     full_dim: usize,
     label: &str,
-) -> Result<Option<Array1<f64>>, SurvivalLocationScaleError> {
+) -> Result<Option<Array1<f64>>, String> {
     let Some(beta) = beta else {
         return Ok(None);
     };
@@ -3233,7 +3235,7 @@ fn drop_leading_initial_beta(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: initial_beta length mismatch before identifiability reduction: got {}, expected {full_dim}",
             beta.len()
-        ) });
+        ) }.into());
     }
     Ok(Some(beta.slice(s![fixed_cols..]).to_owned()))
 }
@@ -3243,18 +3245,18 @@ fn expand_leading_fixed_beta(
     fixed_cols: usize,
     full_dim: usize,
     label: &str,
-) -> Result<Array1<f64>, SurvivalLocationScaleError> {
+) -> Result<Array1<f64>, String> {
     if fixed_cols > full_dim {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: fixed column count {fixed_cols} exceeds full width {full_dim}"
-        ) });
+        ) }.into());
     }
     let active_dim = full_dim - fixed_cols;
     if beta_active.len() != active_dim {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: active beta length mismatch: got {}, expected {active_dim}",
             beta_active.len()
-        ) });
+        ) }.into());
     }
     if fixed_cols == 0 {
         return Ok(beta_active.clone());
@@ -3271,18 +3273,18 @@ fn drop_leading_penalty_columns(
     fixed_cols: usize,
     full_dim: usize,
     label: &str,
-) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), SurvivalLocationScaleError> {
+) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
     if fixed_cols > full_dim {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: fixed column count {fixed_cols} exceeds full penalty width {full_dim}"
-        ) });
+        ) }.into());
     }
     if initial_log_lambdas.len() != penalties.len() {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "{label}: initial log-lambda length {} does not match {} penalties",
             initial_log_lambdas.len(),
             penalties.len()
-        ) });
+        ) }.into());
     }
     if fixed_cols == 0 {
         return Ok((
@@ -3308,7 +3310,7 @@ fn drop_leading_penalty_columns(
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "{label}: penalty {idx} has dimension {}, expected {full_dim}",
                 penalty.dim()
-            ) });
+            ) }.into());
         }
 
         let reduced = match penalty {
@@ -3320,7 +3322,7 @@ fn drop_leading_penalty_columns(
                 if *total_dim != full_dim {
                     return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                         "{label}: blockwise penalty {idx} total_dim {total_dim} does not match {full_dim}"
-                    ) });
+                    ) }.into());
                 }
                 if col_range.end <= fixed_cols {
                     None
@@ -3463,7 +3465,7 @@ fn build_survival_covariate_block_from_design(
     offset: &Array1<f64>,
     initial_log_lambdas: Option<Array1<f64>>,
     initial_beta: Option<Array1<f64>>,
-) -> Result<CovariateBlockKind, SurvivalLocationScaleError> {
+) -> Result<CovariateBlockKind, String> {
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
             Ok(CovariateBlockKind::Static(CovariateBlockInput {
@@ -3530,7 +3532,7 @@ fn build_survival_covariate_block_psi_derivatives(
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     template: &SurvivalCovariateTermBlockTemplate,
-) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, SurvivalLocationScaleError> {
+) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
     let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
     let Some(info_list) =
         try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, &spatial_terms)
@@ -3552,7 +3554,7 @@ fn build_survival_covariate_block_psi_derivatives(
             .into_iter()
             .enumerate()
             .map(
-                |(psi_idx, info)| -> Result<CustomFamilyBlockPsiDerivative, SurvivalLocationScaleError> {
+                |(psi_idx, info)| -> Result<CustomFamilyBlockPsiDerivative, String> {
                     let penalty_indices = info.penalty_indices.clone();
                     let embed_design = |local: &Array2<f64>| {
                         EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
@@ -3988,25 +3990,25 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
     let n = spec.event_target.len();
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
     if n == 0 {
-        return Err(SurvivalLocationScaleError::InternalInvariant { reason: "fit_survival_location_scale: empty dataset".to_string() });
+        return Err(SurvivalLocationScaleError::InternalInvariant { reason: "fit_survival_location_scale: empty dataset".to_string() }.into());
     }
     if spec.age_entry.len() != n || spec.age_exit.len() != n || spec.weights.len() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "fit_survival_location_scale: top-level input size mismatch".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "fit_survival_location_scale: top-level input size mismatch".to_string() }.into());
     }
     if !(spec.tol.is_finite() && spec.tol > 0.0) {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "fit_survival_location_scale: invalid tol {}",
             spec.tol
-        ) });
+        ) }.into());
     }
     if spec.max_iter == 0 {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "fit_survival_location_scale: max_iter must be > 0".to_string() });
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "fit_survival_location_scale: max_iter must be > 0".to_string() }.into());
     }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "fit_survival_location_scale: derivative_guard must be > 0, got {}",
             spec.derivative_guard
-        ) });
+        ) }.into());
     }
     validate_time_block(
         n,
@@ -4018,21 +4020,21 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
     validate_cov_block_kind("log_sigma_block", n, &spec.log_sigma_block)?;
     if let Some(w) = spec.timewiggle_block.as_ref() {
         if w.ncols == 0 {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "timewiggle_block must have at least one coefficient".to_string() });
+            return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "timewiggle_block must have at least one coefficient".to_string() }.into());
         }
         if w.ncols >= spec.time_block.design_exit.ncols() {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
                 "timewiggle_block.ncols must be smaller than time_block columns: wiggle={}, total={}",
                 w.ncols,
                 spec.time_block.design_exit.ncols()
-            ) });
+            ) }.into());
         }
         if w.knots.len() < 2 * (w.degree + 1) {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
                 "timewiggle_block knot vector is too short for degree {}: got {} knots",
                 w.degree,
                 w.knots.len()
-            ) });
+            ) }.into());
         }
     }
     if let Some(w) = spec.linkwiggle_block.as_ref() {
@@ -4048,21 +4050,21 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
                 i + 1,
                 spec.age_entry[i],
                 spec.age_exit[i]
-            ) });
+            ) }.into());
         }
         if !spec.weights[i].is_finite() || spec.weights[i] < 0.0 {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
                 "fit_survival_location_scale: invalid weight at row {} ({})",
                 i + 1,
                 spec.weights[i]
-            ) });
+            ) }.into());
         }
         if !spec.event_target[i].is_finite() || !(0.0..=1.0).contains(&spec.event_target[i]) {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                 "fit_survival_location_scale: event_target must be in [0,1], found {} at row {}",
                 spec.event_target[i],
                 i + 1
-            ) });
+            ) }.into());
         }
     }
     Ok(())
@@ -4070,7 +4072,7 @@ fn validate_survival_location_scale_spec(spec: &SurvivalLocationScaleSpec) -> Re
 
 fn prepare_survival_location_scale_model(
     spec: &SurvivalLocationScaleSpec,
-) -> Result<PreparedSurvivalLocationScaleModel, SurvivalLocationScaleError> {
+) -> Result<PreparedSurvivalLocationScaleModel, String> {
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
@@ -4394,7 +4396,7 @@ fn prepare_survival_location_scale_model(
 fn finalize_survival_location_scale_fit(
     prepared: &PreparedSurvivalLocationScaleModel,
     fit: &UnifiedFitResult,
-) -> Result<UnifiedFitResult, SurvivalLocationScaleError> {
+) -> Result<UnifiedFitResult, String> {
     let beta_time_reduced = fit.block_states[SurvivalLocationScaleFamily::BLOCK_TIME]
         .beta
         .clone();
@@ -4525,7 +4527,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "linkwiggle_block design row mismatch: got {}, expected {n}",
             b.design.nrows()
-        ) });
+        ) }.into());
     }
     let p = b.design.ncols();
     if b.knots.len() < b.degree + 2 {
@@ -4533,7 +4535,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
             "linkwiggle_block knot vector is too short for degree {}: got {} knots",
             b.degree,
             b.knots.len()
-        ) });
+        ) }.into());
     }
     if let Some(beta0) = &b.initial_beta
         && beta0.len() != p
@@ -4541,7 +4543,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "linkwiggle_block initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
-        ) });
+        ) }.into());
     }
     if let Some(beta0) = &b.initial_beta {
         if let Some(beta0_slice) = beta0.as_slice() {
@@ -4564,7 +4566,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "linkwiggle_block initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
-        ) });
+        ) }.into());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
@@ -4581,7 +4583,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
                         col_range.end,
                         local.nrows(),
                         local.ncols()
-                    ) });
+                    ) }.into());
                 }
             }
             crate::solver::estimate::PenaltySpec::Dense(m)
@@ -4590,7 +4592,7 @@ fn validatewiggle_block(n: usize, b: &LinkWiggleBlockInput) -> Result<(), Surviv
                 if r != p || c != p {
                     return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                         "linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}"
-                    ) });
+                    ) }.into());
                 }
             }
         }
@@ -4611,15 +4613,15 @@ fn validate_time_block(
         || b.offset_exit.len() != n
         || b.derivative_offset_exit.len() != n
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "time_block input size mismatch".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "time_block input size mismatch".to_string() }.into());
     }
     let p = b.design_exit.ncols();
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "time_block design column mismatch across entry/exit/derivative".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "time_block design column mismatch across entry/exit/derivative".to_string() }.into());
     }
     if !b.structural_monotonicity {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "time_block requires structural monotonicity by construction; non-structural time transforms are no longer supported"
-                .to_string(), });
+                .to_string(), }.into());
     }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &b.design_derivative_exit,
@@ -4633,7 +4635,7 @@ fn validate_time_block(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "time_block initial_beta length mismatch: got {}, expected {p}",
             beta0.len()
-        ) });
+        ) }.into());
     }
     let k = b.penalties.len();
     if let Some(rho0) = &b.initial_log_lambdas
@@ -4642,14 +4644,14 @@ fn validate_time_block(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "time_block initial_log_lambdas length mismatch: got {}, expected {k}",
             rho0.len()
-        ) });
+        ) }.into());
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         let (r, c) = s.dim();
         if r != p || c != p {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "time_block penalty {idx} must be {p}x{p}, got {r}x{c}"
-            ) });
+            ) }.into());
         }
     }
     Ok(())
@@ -4691,13 +4693,13 @@ fn structural_time_coefficient_lower_bounds(
     design_derivative_exit: &DesignMatrix,
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
-) -> Result<Option<Array1<f64>>, SurvivalLocationScaleError> {
+) -> Result<Option<Array1<f64>>, String> {
     if design_derivative_exit.nrows() != derivative_offset_exit.len() {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "structural time coefficient bounds require matching rows/offsets: rows={}, offsets={}",
             design_derivative_exit.nrows(),
             derivative_offset_exit.len()
-        ) });
+        ) }.into());
     }
     if design_derivative_exit.ncols() == 0 {
         return Ok(None);
@@ -4705,7 +4707,7 @@ fn structural_time_coefficient_lower_bounds(
     if !lower_bound.is_finite() || lower_bound <= 0.0 {
         return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
             "structural time coefficient lower bound must be finite and > 0, got {lower_bound}"
-        ) });
+        ) }.into());
     }
 
     const DERIVATIVE_TOL: f64 = 1e-12;
@@ -4719,12 +4721,12 @@ fn structural_time_coefficient_lower_bounds(
         if !offset.is_finite() {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                 "structural time coefficient bounds require finite derivative offsets; found offset[{row}]={offset}"
-            ) });
+            ) }.into());
         }
         if lower_bound - offset > FEASIBILITY_TOL {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                 "structural time coefficient bounds require derivative offsets to encode the derivative guard at row {row}: offset={offset:.3e} < guard={lower_bound:.3e}"
-            ) });
+            ) }.into());
         }
     }
     // Stream column-by-column so operator-backed (Lazy) designs never have to
@@ -4739,7 +4741,7 @@ fn structural_time_coefficient_lower_bounds(
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "structural time coefficient bounds: extract_column returned {} entries for column {col}, expected {nrows}",
                 column.len()
-            ) });
+            ) }.into());
         }
         let mut has_positive_support = false;
         let mut col_max = 0.0_f64;
@@ -4747,12 +4749,12 @@ fn structural_time_coefficient_lower_bounds(
             if !value.is_finite() {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "structural time coefficient bounds require finite derivative design entries; found row {row}, column {col}"
-                ) });
+                ) }.into());
             }
             if value < -DERIVATIVE_TOL {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "structural time coefficient bounds require a non-negative derivative basis at row {row}, column {col}; found {value:.3e}"
-                ) });
+                ) }.into());
             }
             if value > DERIVATIVE_TOL {
                 has_positive_support = true;
@@ -4825,7 +4827,7 @@ fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
     derivative_offset_exit: &Array1<f64>,
     lower_bound: f64,
     monotone_time_wiggle_ncols: usize,
-) -> Result<Option<Array1<f64>>, SurvivalLocationScaleError> {
+) -> Result<Option<Array1<f64>>, String> {
     let mut lower_bounds = structural_time_coefficient_lower_bounds(
         design_derivative_exit,
         derivative_offset_exit,
@@ -4841,7 +4843,7 @@ fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "structural time coefficient bounds cannot reserve {monotone_time_wiggle_ncols} monotone wiggle columns from {} coefficients",
             bounds.len()
-        ) });
+        ) }.into());
     }
 
     // Time wiggle columns are appended as zero-derivative tail columns in the
@@ -4901,11 +4903,11 @@ fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
     monotone_time_wiggle_ncols: usize,
-) -> Result<TimeBlockPrepared, SurvivalLocationScaleError> {
+) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.structural_monotonicity {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "time_block requires structural monotonicity by construction; non-structural time transforms are no longer supported"
-                .to_string(), });
+                .to_string(), }.into());
     }
     // Materialize to dense at the location-scale boundary — the hot path
     // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense).
@@ -4946,14 +4948,14 @@ fn prepare_identified_time_block(
 fn initial_log_lambdas<T>(
     penalties: &[T],
     rho0: Option<Array1<f64>>,
-) -> Result<Array1<f64>, SurvivalLocationScaleError> {
+) -> Result<Array1<f64>, String> {
     let k = penalties.len();
     let rho = rho0.unwrap_or_else(|| Array1::zeros(k));
     if rho.len() != k {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "initial_log_lambdas mismatch: got {}, expected {k}",
             rho.len()
-        ) });
+        ) }.into());
     }
     Ok(rho)
 }
@@ -5048,7 +5050,7 @@ fn weighted_crossprod_dense_stable(
     left: &Array2<f64>,
     weights: &Array1<f64>,
     right: &Array2<f64>,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "weighted_crossprod_dense stable row mismatch: left is {}x{}, weights has {}, right is {}x{}",
@@ -5057,7 +5059,7 @@ fn weighted_crossprod_dense_stable(
             weights.len(),
             right.nrows(),
             right.ncols()
-        ) });
+        ) }.into());
     }
 
     let nrows = weights.len();
@@ -5110,7 +5112,7 @@ fn weighted_crossprod_dense_stable(
     };
 
     if out.iter().any(|value| !value.is_finite()) {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "weighted_crossprod_dense stable accumulation produced non-finite values".to_string(), });
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "weighted_crossprod_dense stable accumulation produced non-finite values".to_string(), }.into());
     }
     Ok(out)
 }
@@ -5119,7 +5121,7 @@ fn weighted_crossprod_dense(
     left: &Array2<f64>,
     weights: &Array1<f64>,
     right: &Array2<f64>,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     weighted_crossprod_dense_with_parallelism(left, weights, right, faer::get_global_parallelism())
 }
 
@@ -5128,7 +5130,7 @@ fn weighted_crossprod_dense_with_parallelism(
     weights: &Array1<f64>,
     right: &Array2<f64>,
     par: faer::Par,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     if left.nrows() != weights.len() || right.nrows() != weights.len() {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "weighted_crossprod_dense row mismatch: left is {}x{}, weights has {}, right is {}x{}",
@@ -5137,10 +5139,10 @@ fn weighted_crossprod_dense_with_parallelism(
             weights.len(),
             right.nrows(),
             right.ncols()
-        ) });
+        ) }.into());
     }
     if left.iter().any(|value| !value.is_finite()) || right.iter().any(|value| !value.is_finite()) {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "weighted_crossprod_dense inputs contain non-finite design values".to_string() });
+        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "weighted_crossprod_dense inputs contain non-finite design values".to_string() }.into());
     }
 
     let nrows = weights.len();
@@ -5231,7 +5233,7 @@ fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f6
             "row scaling dimension mismatch: matrix has {} rows but coeffs have {} entries",
             mat.nrows(),
             coeffs.len()
-        ) });
+        ) }.into());
     }
     let sanitized_coeffs = sanitize_survival_weight_vector(coeffs);
     let work = mat.nrows().saturating_mul(mat.ncols());
@@ -5265,7 +5267,7 @@ fn scale_dense_rows(mat: &Array2<f64>, coeffs: &Array1<f64>) -> Result<Array2<f6
     }
 
     if out.iter().any(|value| value.is_nan()) {
-        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "row scaling produced NaN values".to_string() });
+        return Err(SurvivalLocationScaleError::NumericalFailure { reason: "row scaling produced NaN values".to_string() }.into());
     }
     Ok(out)
 }
@@ -5274,14 +5276,14 @@ fn embed_tail_columns(
     local: &Array2<f64>,
     total_cols: usize,
     tail_range: std::ops::Range<usize>,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     if tail_range.end > total_cols || tail_range.len() != local.ncols() {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "tail embedding mismatch: local_cols={}, total_cols={}, tail={:?}",
             local.ncols(),
             total_cols,
             tail_range
-        ) });
+        ) }.into());
     }
     let mut out = Array2::<f64>::zeros((local.nrows(), total_cols));
     out.slice_mut(s![.., tail_range]).assign(local);
@@ -5310,11 +5312,11 @@ fn assign_symmetric_block(
 
 fn validate_predict_inverse_link(inverse_link: &InverseLink) -> Result<(), SurvivalLocationScaleError> {
     match inverse_link {
-        InverseLink::Standard(LinkFunction::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }),
+        InverseLink::Standard(LinkFunction::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }.into()),
         InverseLink::Standard(LinkFunction::Sas) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction requires explicit SasLinkState; state-less Standard(Sas) is unsupported"
-                .to_string(), }),
+                .to_string(), }.into()),
         InverseLink::Standard(LinkFunction::BetaLogistic) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction requires explicit Beta-Logistic link state; state-less Standard(BetaLogistic) is unsupported"
-                .to_string(), }),
+                .to_string(), }.into()),
         _ => Ok(()),
     }
 }
@@ -5322,7 +5324,9 @@ fn validate_predict_inverse_link(inverse_link: &InverseLink) -> Result<(), Survi
 fn inverse_link_failure_prob_checked(inverse_link: &InverseLink, eta: f64) -> Result<f64, SurvivalLocationScaleError> {
     inverse_link_jet_for_inverse_link(inverse_link, eta)
         .map(|j| j.mu.clamp(0.0, 1.0))
-        .map_err(|e| format!("inverse link prediction failed at eta={eta}: {e}"))
+        .map_err(|e| SurvivalLocationScaleError::NumericalFailure {
+            reason: format!("inverse link prediction failed at eta={eta}: {e}"),
+        })
 }
 
 fn inverse_link_survival_prob_checked(inverse_link: &InverseLink, eta: f64) -> Result<f64, SurvivalLocationScaleError> {
@@ -5717,20 +5721,20 @@ struct SurvivalDynamicGeometry {
 }
 
 impl SurvivalDynamicGeometry {
-    fn validate_precomputed_channels(&self) -> Result<(), SurvivalLocationScaleError> {
+    fn validate_precomputed_channels(&self) -> Result<(), String> {
         let n = self.h_exit.len();
         if self.time_base_derivative_exit.len() != n {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "survival dynamic geometry derivative length mismatch: base_derivative={}, rows={n}",
                 self.time_base_derivative_exit.len()
-            ) });
+            ) }.into());
         }
         if let Some(basis) = self.time_wiggle_basis_d1_entry.as_ref() {
             if basis.nrows() != n {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d1 entry row mismatch: rows={}, expected {n}",
                     basis.nrows()
-                ) });
+                ) }.into());
             }
         }
         if let Some(basis) = self.time_wiggle_basis_d1_exit.as_ref() {
@@ -5738,7 +5742,7 @@ impl SurvivalDynamicGeometry {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d1 exit row mismatch: rows={}, expected {n}",
                     basis.nrows()
-                ) });
+                ) }.into());
             }
         }
         if let Some(basis) = self.time_wiggle_basis_d2_exit.as_ref() {
@@ -5746,7 +5750,7 @@ impl SurvivalDynamicGeometry {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d2 exit row mismatch: rows={}, expected {n}",
                     basis.nrows()
-                ) });
+                ) }.into());
             }
         }
         if let Some(values) = self.time_wiggle_d2_entry.as_ref() {
@@ -5754,7 +5758,7 @@ impl SurvivalDynamicGeometry {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d2 entry length mismatch: len={}, expected {n}",
                     values.len()
-                ) });
+                ) }.into());
             }
         }
         if let Some(values) = self.time_wiggle_d2_exit.as_ref() {
@@ -5762,7 +5766,7 @@ impl SurvivalDynamicGeometry {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d2 exit length mismatch: len={}, expected {n}",
                     values.len()
-                ) });
+                ) }.into());
             }
         }
         if let Some(values) = self.time_wiggle_d3_exit.as_ref() {
@@ -5770,7 +5774,7 @@ impl SurvivalDynamicGeometry {
                 return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                     "survival dynamic geometry wiggle d3 exit length mismatch: len={}, expected {n}",
                     values.len()
-                ) });
+                ) }.into());
             }
         }
         Ok(())
@@ -5782,7 +5786,7 @@ fn survival_wiggle_basis_with_options(
     knots: &Array1<f64>,
     degree: usize,
     options: BasisOptions,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     monotone_wiggle_basis_with_derivative_order(q0, knots, degree, options.derivative_order)
 }
 
@@ -5790,7 +5794,7 @@ fn survival_wiggle_third_basis(
     q0: ndarray::ArrayView1<'_, f64>,
     knots: &Array1<f64>,
     degree: usize,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     monotone_wiggle_basis_with_derivative_order(q0, knots, degree, 3)
 }
 
@@ -5799,14 +5803,14 @@ fn survival_wiggle_fourth_q(
     knots: &Array1<f64>,
     degree: usize,
     beta_w: ndarray::ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, SurvivalLocationScaleError> {
+) -> Result<Array1<f64>, String> {
     let basis_d4 = monotone_wiggle_basis_with_derivative_order(q0, knots, degree, 4)?;
     if basis_d4.ncols() != beta_w.len() {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "survival linkwiggle fourth-derivative dimension mismatch: basis has {} columns but beta has {} entries",
             basis_d4.ncols(),
             beta_w.len()
-        ) });
+        ) }.into());
     }
     Ok(fast_av(&basis_d4, &beta_w))
 }
@@ -5963,7 +5967,7 @@ impl SurvivalLocationScaleFamily {
     fn build_dynamic_geometry(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<SurvivalDynamicGeometry, SurvivalLocationScaleError> {
+    ) -> Result<SurvivalDynamicGeometry, String> {
         let n = self.n;
         let joint_states = self.validate_joint_states(block_states)?;
         let h_entry_base = joint_states.0.to_owned();
@@ -6032,12 +6036,12 @@ impl SurvivalLocationScaleFamily {
         };
         if self.x_link_wiggle.is_some() && (wiggle_exit.is_none() || wiggle_entry.is_none()) {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale linkwiggle requires dynamic knot/degree metadata"
-                    .to_string(), });
+                    .to_string(), }.into());
         }
         if self.time_wiggle_ncols > 0 && (time_wiggle_exit.is_none() || time_wiggle_entry.is_none())
         {
             return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale timewiggle requires dynamic knot/degree metadata"
-                    .to_string(), });
+                    .to_string(), }.into());
         }
 
         let mut h_entry = h_entry_base.clone();
@@ -6340,7 +6344,7 @@ struct PredictionLinearPredictors {
 fn prediction_linear_predictors(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
-) -> Result<PredictionLinearPredictors, SurvivalLocationScaleError> {
+) -> Result<PredictionLinearPredictors, String> {
     validate_predict_inverse_link(&input.inverse_link)?;
     let n = input.x_time_exit.nrows();
     let beta_threshold = fit.beta_threshold();
@@ -6350,7 +6354,7 @@ fn prediction_linear_predictors(
         || input.x_log_sigma.nrows() != n
         || input.eta_log_sigma_offset.len() != n
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() }.into());
     }
     let eta_t =
         input.x_threshold.matrixvectormultiply(&beta_threshold) + &input.eta_threshold_offset;
@@ -6382,7 +6386,7 @@ pub(crate) fn predict_survival_location_scale_from_linear_components(
     link_wiggle_degree: Option<usize>,
     inverse_link: &InverseLink,
     fit: &UnifiedFitResult,
-) -> Result<SurvivalLocationScalePredictResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScalePredictResult, String> {
     validate_predict_inverse_link(inverse_link)?;
     let predictors = prediction_linear_predictors_from_components(
         x_time_exit,
@@ -6410,7 +6414,7 @@ fn prediction_linear_predictors_from_components(
     link_wiggle_knots: Option<&Array1<f64>>,
     link_wiggle_degree: Option<usize>,
     fit: &UnifiedFitResult,
-) -> Result<PredictionLinearPredictors, SurvivalLocationScaleError> {
+) -> Result<PredictionLinearPredictors, String> {
     let n = x_time_exit.nrows();
     let beta_time = fit.beta_time();
     let beta_link_wiggle = fit.beta_link_wiggle();
@@ -6419,10 +6423,10 @@ fn prediction_linear_predictors_from_components(
             "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
             x_time_exit.ncols(),
             beta_time.len()
-        ) });
+        ) }.into());
     }
     if eta_time_offset_exit.len() != n || eta_t.len() != n || eta_ls.len() != n {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() }.into());
     }
     let h_base = fast_av(x_time_exit, &beta_time) + eta_time_offset_exit;
     let mut h = h_base.clone();
@@ -6452,7 +6456,7 @@ fn prediction_linear_predictors_from_components(
                 time_basis.ncols(),
                 time_basis_d1.ncols(),
                 beta_time_w.len()
-            ) });
+            ) }.into());
         }
         let dq = fast_av(&time_basis_d1, &beta_time_w) + 1.0;
         h = &h_base + &fast_av(&time_basis, &beta_time_w);
@@ -6481,7 +6485,7 @@ fn prediction_linear_predictors_from_components(
                 "predict_survival_location_scale: link-wiggle design/beta mismatch: {} vs {}",
                 design.ncols(),
                 betaw.len()
-            ) });
+            ) }.into());
         }
         let basis_d1 = survival_wiggle_basis_with_options(
             q0.view(),
@@ -6598,7 +6602,7 @@ struct LowRankGaussianFactor {
 fn factorize_psd_covariance(
     covariance: &Array2<f64>,
     label: &str,
-) -> Result<LowRankGaussianFactor, SurvivalLocationScaleError> {
+) -> Result<LowRankGaussianFactor, String> {
     let covariance = symmetrize_and_clip_covariance(covariance);
     let (eigenvalues, eigenvectors_full) = covariance
         .eigh(faer::Side::Lower)
@@ -6613,7 +6617,7 @@ fn factorize_psd_covariance(
             eigenvalues
                 .iter()
                 .fold(f64::INFINITY, |acc, &ev| acc.min(ev))
-        ) });
+        ) }.into());
     }
 
     let active = eigenvalues
@@ -6658,9 +6662,9 @@ fn low_rank_normal_expectation_pair_3d_result<F>(
     max_n: usize,
     label: &str,
     integrand: F,
-) -> Result<(f64, f64), SurvivalLocationScaleError>
+) -> Result<(f64, f64), String>
 where
-    F: Fn([f64; 3], &[f64]) -> Result<(f64, f64), SurvivalLocationScaleError>,
+    F: Fn([f64; 3], &[f64]) -> Result<(f64, f64), String>,
 {
     let factorization = factorize_psd_covariance(&covariance3_to_array2(covariance), label)?;
     match factorization.factor.ncols() {
@@ -6704,7 +6708,7 @@ where
                 )
             },
         ),
-        rank => Err(SurvivalLocationScaleError::InternalInvariant { reason: format!("{label} unexpectedly has rank {rank} > 3") }),
+        rank => Err(SurvivalLocationScaleError::InternalInvariant { reason: format!("{label} unexpectedly has rank {rank} > 3") }.into()),
     }
 }
 
@@ -6719,10 +6723,10 @@ fn exact_survival_response_moments_row(
     x_log_sigma_dense: &Array2<f64>,
     row: usize,
     quadctx: &crate::quadrature::QuadratureContext,
-) -> Result<(f64, f64), SurvivalLocationScaleError> {
+) -> Result<(f64, f64), String> {
     if input.time_wiggle_ncols > 0 {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "predict_survival_location_scale: exact response moments are not implemented for time-wiggle models"
-                .to_string(), });
+                .to_string(), }.into());
     }
 
     let beta_time = fit.beta_time();
@@ -6837,7 +6841,7 @@ fn exact_survival_response_moments_row(
                         "predict_survival_location_scale: link-wiggle basis/beta mismatch: {} vs {}",
                         basis.ncols(),
                         cond_mean.len()
-                    ) });
+                    ) }.into());
                 }
                 let b = basis.row(0).to_owned();
                 let w_mean = b.dot(&cond_mean);
@@ -6878,7 +6882,7 @@ fn exact_survival_response_moments(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
-) -> Result<(Array1<f64>, Array1<f64>), SurvivalLocationScaleError> {
+) -> Result<(Array1<f64>, Array1<f64>), String> {
     validate_predict_inverse_link(&input.inverse_link)?;
 
     let n = input.x_time_exit.nrows();
@@ -6894,14 +6898,14 @@ fn exact_survival_response_moments(
             covariance.ncols(),
             p_total,
             p_total
-        ) });
+        ) }.into());
     }
     if input.x_time_exit.ncols() != p_time {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
             "predict_survival_location_scale: time design/beta mismatch: {} vs {}",
             input.x_time_exit.ncols(),
             p_time
-        ) });
+        ) }.into());
     }
     if input.eta_time_offset_exit.len() != n
         || input.x_threshold.nrows() != n
@@ -6909,7 +6913,7 @@ fn exact_survival_response_moments(
         || input.x_log_sigma.nrows() != n
         || input.eta_log_sigma_offset.len() != n
     {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() });
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scale: row mismatch across inputs".to_string() }.into());
     }
 
     let x_threshold_dense = input.x_threshold.to_dense_arc();
@@ -6928,7 +6932,7 @@ fn exact_survival_response_moments(
             .zip(second_slice.par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK))
             .enumerate()
             .try_for_each(
-                |(chunk_idx, (first_chunk, second_chunk))| -> Result<(), SurvivalLocationScaleError> {
+                |(chunk_idx, (first_chunk, second_chunk))| -> Result<(), String> {
                     let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
                     let quadctx = crate::quadrature::QuadratureContext::new();
                     for offset in 0..first_chunk.len() {
@@ -6977,20 +6981,20 @@ fn lift_conditional_covariance(
     p_log_sigma_full: usize,
     log_sigma_fixed_cols: usize,
     p_linkwiggle: usize,
-) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+) -> Result<Array2<f64>, String> {
     let p_time_reduced = z.ncols();
     let p_time_full = z.nrows();
     if threshold_fixed_cols + p_threshold_reduced != p_threshold_full {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "survival location-scale covariance lift threshold dimensions are inconsistent: fixed={}, reduced={}, full={}",
             threshold_fixed_cols, p_threshold_reduced, p_threshold_full
-        ) });
+        ) }.into());
     }
     if log_sigma_fixed_cols + p_log_sigma_reduced != p_log_sigma_full {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
             "survival location-scale covariance lift log-sigma dimensions are inconsistent: fixed={}, reduced={}, full={}",
             log_sigma_fixed_cols, p_log_sigma_reduced, p_log_sigma_full
-        ) });
+        ) }.into());
     }
     let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
     let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
@@ -6999,7 +7003,7 @@ fn lift_conditional_covariance(
             "survival location-scale covariance lift expected reduced matrix {p_reduced}x{p_reduced}, got {}x{}",
             cov_reduced.nrows(),
             cov_reduced.ncols()
-        ) });
+        ) }.into());
     }
 
     let mut t_map = Array2::<f64>::zeros((p_full, p_reduced));
@@ -7036,7 +7040,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         q: &SurvivalJointQuantities,
         block_states: &[ParameterBlockState],
-    ) -> Result<Vec<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Vec<Array2<f64>>, String> {
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
         let x_threshold_exit = &*x_threshold_exit_cow;
@@ -7078,7 +7082,7 @@ impl SurvivalLocationScaleFamily {
             faer::get_global_parallelism()
         };
 
-        let assemble_h_time = || -> Result<Array2<f64>, SurvivalLocationScaleError> {
+        let assemble_h_time = || -> Result<Array2<f64>, String> {
             // Time-time block (mirrors line 5846-5849 in the joint assembly).
             Ok(safe_fast_xt_diag_x_with_parallelism(
                 &dynamic.time_jac_entry,
@@ -7095,7 +7099,7 @@ impl SurvivalLocationScaleFamily {
             ))
         };
 
-        let assemble_h_tt = || -> Result<Array2<f64>, SurvivalLocationScaleError> {
+        let assemble_h_tt = || -> Result<Array2<f64>, String> {
             // Threshold-threshold block.
             if let Some(x_t_deriv) = x_threshold_deriv {
                 let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
@@ -7145,7 +7149,7 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
-        let assemble_h_ll = || -> Result<Array2<f64>, SurvivalLocationScaleError> {
+        let assemble_h_ll = || -> Result<Array2<f64>, String> {
             // Log-sigma–log-sigma block.
             if let Some(x_ls_deriv) = x_log_sigma_deriv {
                 let dq_ls_entry = q.dq_ls_entry.as_ref().unwrap();
@@ -7200,7 +7204,7 @@ impl SurvivalLocationScaleFamily {
             }
         };
 
-        let assemble_h_wiggle = || -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+        let assemble_h_wiggle = || -> Result<Option<Array2<f64>>, String> {
             // Optional link-wiggle block.
             if let (Some(xw_exit), Some(xw_entry), Some(xw_qdot)) = (
                 dynamic.wiggle_basis_exit.as_ref(),
@@ -7257,7 +7261,7 @@ impl SurvivalLocationScaleFamily {
         &self,
         q: &SurvivalJointQuantities,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let joint_states = self.validate_joint_states(block_states)?;
         let eta_t_exit = joint_states.3;
@@ -7307,7 +7311,7 @@ impl SurvivalLocationScaleFamily {
                          left: &Array2<f64>,
                          weights: &Array1<f64>,
                          right: &Array2<f64>|
-         -> Result<(), SurvivalLocationScaleError> {
+         -> Result<(), String> {
             *acc += &weighted_crossprod_dense(left, weights, right)?;
             Ok(())
         };
@@ -7608,7 +7612,7 @@ impl SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_rescaled(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<(Array2<f64>, f64)>, SurvivalLocationScaleError> {
+    ) -> Result<Option<(Array2<f64>, f64)>, String> {
         let log_scale = self.hessian_deriv_log_rescale(block_states);
         if log_scale == 0.0 {
             return Ok(self
@@ -7626,7 +7630,7 @@ impl SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
         log_rescale: f64,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
@@ -7651,7 +7655,7 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -7660,7 +7664,7 @@ impl SurvivalLocationScaleFamily {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "joint d_beta length mismatch: got {}, expected {p_total}",
                 d_beta_flat.len()
-            ) });
+            ) }.into());
         }
         let _ = block_states;
 
@@ -8017,7 +8021,7 @@ impl SurvivalLocationScaleFamily {
         q: &SurvivalJointQuantities,
         dir_i: &SurvivalJointPsiDirection,
         dir_j: &SurvivalJointPsiDirection,
-    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, SurvivalLocationScaleError> {
+    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
             derivative_blocks,
@@ -8729,7 +8733,7 @@ impl SurvivalLocationScaleFamily {
         q: &SurvivalJointQuantities,
         dir: &SurvivalJointPsiDirection,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Array2<f64>, SurvivalLocationScaleError> {
+    ) -> Result<Array2<f64>, String> {
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -8738,7 +8742,7 @@ impl SurvivalLocationScaleFamily {
             return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
                 "joint psi hessian directional derivative length mismatch: got {}, expected {p_total}",
                 d_beta_flat.len()
-            ) });
+            ) }.into());
         }
 
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
@@ -9041,7 +9045,7 @@ impl SurvivalLocationScaleFamily {
     fn evaluate_log_likelihood_and_block_gradients(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<(f64, Vec<Array1<f64>>), SurvivalLocationScaleError> {
+    ) -> Result<(f64, Vec<Array1<f64>>), String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut ll = 0.0;
@@ -9082,7 +9086,7 @@ impl SurvivalLocationScaleFamily {
             };
             let acc = (0..n)
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, i| -> Result<_, SurvivalLocationScaleError> {
+                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
                     let state = self.row_predictor_state(
                         dynamic.h_entry[i],
                         dynamic.h_exit[i],
@@ -9216,7 +9220,7 @@ impl SurvivalLocationScaleFamily {
         d_beta_v_flat: &Array1<f64>,
         q: &SurvivalJointQuantities,
         dynamic: &SurvivalDynamicGeometry,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let _ = block_states;
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
@@ -9227,7 +9231,7 @@ impl SurvivalLocationScaleFamily {
                 "joint d_beta length mismatch: got ({}, {}), expected {p_total}",
                 d_beta_u_flat.len(),
                 d_beta_v_flat.len()
-            ) });
+            ) }.into());
         }
 
         // Split both directions into per-block slices.
@@ -9793,7 +9797,7 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         family: SurvivalLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    ) -> Result<Self, SurvivalLocationScaleError> {
+    ) -> Result<Self, String> {
         let joint_quantities = family.collect_joint_quantities(&block_states)?;
         let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
         Ok(Self {
@@ -9808,7 +9812,7 @@ impl SurvivalExactNewtonJointPsiWorkspace {
     fn psi_direction(
         &self,
         psi_index: usize,
-    ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, String> {
         self.psi_directions.get_or_try_init(psi_index, || {
             self.family.exact_newton_joint_psi_direction(
                 &self.block_states,
@@ -9824,7 +9828,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         &self,
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, SurvivalLocationScaleError> {
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         let Some(dir_i) = self.psi_direction(psi_i)? else {
             return Ok(None);
         };
@@ -9847,7 +9851,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, SurvivalLocationScaleError> {
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
         let Some(dir) = self.psi_direction(psi_index)? else {
             return Ok(None);
         };
@@ -9901,7 +9905,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         !crate::custom_family::use_joint_matrix_free_path(p_total, self.n)
     }
 
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, SurvivalLocationScaleError> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let (ll, block_gradients) =
             self.evaluate_log_likelihood_and_block_gradients(block_states)?;
 
@@ -9917,7 +9921,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 "SurvivalLocationScaleFamily evaluate block count mismatch: gradients={}, hessians={}",
                 block_gradients.len(),
                 block_hessians.len()
-            ) });
+            ) }.into());
         }
         let blockworking_sets = block_gradients
             .into_iter()
@@ -9933,13 +9937,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         })
     }
 
-    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, SurvivalLocationScaleError> {
+    fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         // Fast path for backtracking line search: compute only the scalar
         // log-likelihood, skipping all gradient/Hessian/derivative assembly.
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
 
-        let row_log_likelihood = |i: usize| -> Result<f64, SurvivalLocationScaleError> {
+        let row_log_likelihood = |i: usize| -> Result<f64, String> {
             let state = self.row_predictor_state(
                 dynamic.h_entry[i],
                 dynamic.h_exit[i],
@@ -9964,7 +9968,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let chunk_sums: Vec<Result<f64, SurvivalLocationScaleError>> = (0..n.div_ceil(LOG_LIKELIHOOD_CHUNK_ROWS))
+        let chunk_sums: Vec<Result<f64, String>> = (0..n.div_ceil(LOG_LIKELIHOOD_CHUNK_ROWS))
             .into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * LOG_LIKELIHOOD_CHUNK_ROWS;
@@ -9989,7 +9993,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         d_beta: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let dims = self.joint_block_dims();
         if block_idx >= dims.len() {
             return Ok(None);
@@ -9999,7 +10003,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 "block {block_idx} d_beta length mismatch: got {}, expected {}",
                 d_beta.len(),
                 dims[block_idx]
-            ) });
+            ) }.into());
         }
         let offsets = self.joint_block_offsets();
         let mut d_beta_flat = Array1::<f64>::zeros(*offsets.last().unwrap());
@@ -10032,7 +10036,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
         self.assemble_joint_hessian_from_quantities(&q, block_states)
     }
@@ -10041,7 +10045,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, SurvivalLocationScaleError> {
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         let (log_likelihood, block_gradients) =
             self.evaluate_log_likelihood_and_block_gradients(block_states)?;
         if block_gradients.len() != specs.len() {
@@ -10049,7 +10053,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 "SurvivalLocationScaleFamily joint gradient block count mismatch: gradients={}, specs={}",
                 block_gradients.len(),
                 specs.len()
-            ) });
+            ) }.into());
         }
 
         let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
@@ -10064,7 +10068,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     "SurvivalLocationScaleFamily joint gradient length mismatch for block {block_idx}: got {}, expected {}",
                     block_gradient.len(),
                     width
-                ) });
+                ) }.into());
             }
             gradient
                 .slice_mut(s![offset..offset + width])
@@ -10085,7 +10089,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_outer_curvature(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<Option<ExactNewtonOuterCurvature>, SurvivalLocationScaleError> {
+    ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
         Ok(self
             .exact_newton_joint_hessian_rescaled(block_states)?
             .map(|(hessian, log_scale)| {
@@ -10102,7 +10106,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         // The trait method uses the full rescale for the outer curvature path.
         self.exact_newton_joint_hessian_directional_derivative_rescaled(
             block_states,
@@ -10117,7 +10121,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
-    ) -> Result<Option<ExactNewtonJointPsiTerms>, SurvivalLocationScaleError> {
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -10126,7 +10130,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 self.expected_blocks(),
                 specs.len(),
                 derivative_blocks.len()
-            ) });
+            ) }.into());
         }
         let Some(dir) =
             self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index)?
@@ -10687,7 +10691,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, SurvivalLocationScaleError> {
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
         if specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -10696,7 +10700,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 self.expected_blocks(),
                 specs.len(),
                 derivative_blocks.len()
-            ) });
+            ) }.into());
         }
         let Some(dir_i) =
             self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_i)?
@@ -10725,7 +10729,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if block_states.len() != self.expected_blocks()
             || specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
@@ -10736,7 +10740,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 block_states.len(),
                 specs.len(),
                 derivative_blocks.len()
-            ) });
+            ) }.into());
         }
         Ok(Some(Arc::new(SurvivalExactNewtonJointPsiWorkspace::new(
             self.clone(),
@@ -10752,7 +10756,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         if specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -10761,7 +10765,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                 self.expected_blocks(),
                 specs.len(),
                 derivative_blocks.len()
-            ) });
+            ) }.into());
         }
         let Some(dir) =
             self.exact_newton_joint_psi_direction(block_states, derivative_blocks, psi_index)?
@@ -10783,7 +10787,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities_rescaled(
             block_states,
             self.hessian_deriv_log_rescale(block_states),
@@ -10803,7 +10807,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         _: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
-    ) -> Result<Option<LinearInequalityConstraints>, SurvivalLocationScaleError> {
+    ) -> Result<Option<LinearInequalityConstraints>, String> {
         if block_idx == Self::BLOCK_LINK_WIGGLE {
             return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
         }
@@ -10821,7 +10825,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         block_idx: usize,
         delta: &Array1<f64>,
-    ) -> Result<Option<f64>, SurvivalLocationScaleError> {
+    ) -> Result<Option<f64>, String> {
         if block_idx == Self::BLOCK_TIME {
             return self.max_feasible_time_step(&block_states[Self::BLOCK_TIME].beta, delta);
         }
@@ -10838,7 +10842,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_idx: usize,
         _: &ParameterBlockSpec,
         mut beta: Array1<f64>,
-    ) -> Result<Array1<f64>, SurvivalLocationScaleError> {
+    ) -> Result<Array1<f64>, String> {
         // Accepted line-search trials are not guaranteed to satisfy the
         // structural lower bounds at zero tolerance: the QP solver's internal
         // `project_to_lower_bounds` runs only inside the constrained solve,
@@ -10867,7 +10871,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
                     "survival location-scale time post-update dimension mismatch: beta={}, bounds={}",
                     beta.len(),
                     lower_bounds.len()
-                ) });
+                ) }.into());
             }
             for j in 0..beta.len() {
                 let lb = lower_bounds[j];
@@ -10904,7 +10908,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         _specs: &[ParameterBlockSpec],
-    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -10946,7 +10950,7 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
     fn new(
         family: SurvivalLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
-    ) -> Result<Self, SurvivalLocationScaleError> {
+    ) -> Result<Self, String> {
         let log_rescale = family.hessian_deriv_log_rescale(&block_states);
         let q = family.collect_joint_quantities_rescaled(&block_states, log_rescale)?;
         let dynamic = family.build_dynamic_geometry(&block_states)?;
@@ -10963,7 +10967,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         self.family
             .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
                 &self.block_states,
@@ -10976,7 +10980,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         Ok(self
             .family
             .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
@@ -10992,7 +10996,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Array2<f64>>, String> {
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
                 &self.block_states,
@@ -11007,7 +11011,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         &self,
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, SurvivalLocationScaleError> {
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         Ok(self
             .family
             .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
@@ -11049,7 +11053,7 @@ fn fit_survival_location_scale_with_geometry(
     // can terminate at the current θ instead of propagating a hard panic up
     // to the Python wrapper.
     if fit.block_states.is_empty() {
-        return Err(SurvivalLocationScaleError::InternalInvariant { reason: SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER.to_string() });
+        return Err(SurvivalLocationScaleError::InternalInvariant { reason: SURVIVAL_LOCATION_SCALE_EMPTY_BLOCK_STATES_MARKER.to_string() }.into());
     }
     let geom = prepared.family.offset_channel_geometry(&fit.block_states)?;
     let finalized = finalize_survival_location_scale_fit(&prepared, &fit)?;
@@ -11068,7 +11072,7 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
     pilot: &SurvivalLocationScaleTermFitResult,
     wiggle_cfg: &WiggleBlockConfig,
     wiggle_penalty_orders: &[usize],
-) -> Result<SelectedWiggleBasis, SurvivalLocationScaleError> {
+) -> Result<SelectedWiggleBasis, String> {
     let eta_threshold = pilot
         .threshold_design
         .design
@@ -11119,7 +11123,7 @@ pub(crate) fn fit_survival_location_scale_terms_with_selected_wiggle(
     mut spec: SurvivalLocationScaleTermSpec,
     selected_wiggle_basis: SelectedWiggleBasis,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<SurvivalLocationScaleTermFitResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScaleTermFitResult, String> {
     spec.linkwiggle_block = Some(linkwiggle_block_input_from_selected_basis(
         selected_wiggle_basis,
     ));
@@ -11130,7 +11134,7 @@ pub(crate) fn fit_survival_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: SurvivalLocationScaleTermSpec,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<SurvivalLocationScaleTermFitResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScaleTermFitResult, String> {
     let threshold_boot_design =
         build_term_collection_design(data, &spec.thresholdspec).map_err(|e| e.to_string())?;
     let log_sigma_boot_design =
@@ -11186,7 +11190,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 "survival time initial_log_lambdas length mismatch: got {}, expected {}",
                 time_rho0.len(),
                 layout.k_time
-            ) });
+            ) }.into());
         }
         let range = layout.time_range();
         rho0.slice_mut(s![range.start..range.end])
@@ -11202,7 +11206,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                     "survival threshold initial_log_lambdas length mismatch: got {}, expected {}",
                     seed.len(),
                     layout.k_threshold
-                ) });
+                ) }.into());
             }
             let range = layout.threshold_range();
             let mut slice = rho0.slice_mut(s![range.start..range.end]);
@@ -11220,7 +11224,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                     "survival log_sigma initial_log_lambdas length mismatch: got {}, expected {}",
                     seed.len(),
                     layout.k_log_sigma
-                ) });
+                ) }.into());
             }
             let range = layout.log_sigma_range();
             let mut slice = rho0.slice_mut(s![range.start..range.end]);
@@ -11268,7 +11272,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                       _: &TermCollectionSpec,
                       threshold_design: &TermCollectionDesign,
                       log_sigma_design: &TermCollectionDesign|
-     -> Result<SurvivalLocationScaleSpec, SurvivalLocationScaleError> {
+     -> Result<SurvivalLocationScaleSpec, String> {
         layout.validate_rho(rho, "survival term fit")?;
         let time_beta = filtered_initial_beta(
             time_beta_hint.borrow().as_ref(),
@@ -11410,7 +11414,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             use crate::solver::estimate::reml::unified::EvalMode;
             if !analytic_joint_gradient_available {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "analytic spatial psi derivatives are unavailable for survival exact two-block path"
-                        .to_string(), });
+                        .to_string(), }.into());
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
@@ -11455,14 +11459,14 @@ pub(crate) fn fit_survival_location_scale_terms(
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
-                return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale exact joint inner solve did not converge".to_string(), });
+                return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale exact joint inner solve did not converge".to_string(), }.into());
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
             if !analytic_joint_gradient_available {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "analytic spatial psi derivatives are unavailable for survival exact two-block path"
-                        .to_string(), });
+                        .to_string(), }.into());
             }
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let assembled = build_spec(&rho, &specs[0], &specs[1], &designs[0], &designs[1])?;
@@ -11497,7 +11501,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "survival location-scale exact joint EFS inner solve did not converge"
-                        .to_string(), });
+                        .to_string(), }.into());
             }
             Ok(eval.efs_eval)
         },
@@ -11600,7 +11604,7 @@ pub(crate) fn fit_survival_location_scale_terms(
 pub fn predict_survival_location_scale(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
-) -> Result<SurvivalLocationScalePredictResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScalePredictResult, String> {
     let predictors = prediction_linear_predictors(input, fit)?;
     survival_location_scale_response_from_predictors(&input.inverse_link, predictors)
 }
@@ -11608,7 +11612,7 @@ pub fn predict_survival_location_scale(
 fn survival_location_scale_response_from_predictors(
     inverse_link: &InverseLink,
     predictors: PredictionLinearPredictors,
-) -> Result<SurvivalLocationScalePredictResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScalePredictResult, String> {
     use ndarray::Zip;
 
     let n = predictors.h.len();
@@ -11649,7 +11653,7 @@ pub fn predict_survival_location_scale_posterior_mean(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
     covariance: &Array2<f64>,
-) -> Result<SurvivalLocationScalePredictResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScalePredictResult, String> {
     let pred = predict_survival_location_scale(input, fit)?;
     let (survival_prob, _) = exact_survival_response_moments(input, fit, covariance)?;
 
@@ -11665,7 +11669,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
     covariance: &Array2<f64>,
     posterior_mean: bool,
     include_response_sd: bool,
-) -> Result<SurvivalLocationScalePredictUncertaintyResult, SurvivalLocationScaleError> {
+) -> Result<SurvivalLocationScalePredictUncertaintyResult, String> {
     let base = predict_survival_location_scale(input, fit)?;
     let n = input.x_time_exit.nrows();
     let p_time = fit.beta_time().len();
@@ -11688,7 +11692,7 @@ pub fn predict_survival_location_scalewith_uncertainty(
             covariance.ncols(),
             p_total,
             p_total
-        ) });
+        ) }.into());
     }
     if pw > 0
         && (beta_link_wiggle.is_none()
@@ -11696,13 +11700,13 @@ pub fn predict_survival_location_scalewith_uncertainty(
             || resolved_wiggle_degree.is_none())
     {
         return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "predict_survival_location_scalewith_uncertainty: dynamic link-wiggle metadata is incomplete"
-                .to_string(), });
+                .to_string(), }.into());
     }
 
     let predictors = prediction_linear_predictors(input, fit)?;
     if input.x_threshold.nrows() != n || input.x_log_sigma.nrows() != n {
         return Err(SurvivalLocationScaleError::DimensionMismatch { reason: "predict_survival_location_scalewith_uncertainty: row mismatch across design views"
-                .to_string(), });
+                .to_string(), }.into());
     }
     let inv_sigma = predictors.eta_ls.mapv(exp_sigma_inverse_from_eta_scalar);
     let wiggle_design = predictors.wiggle_design.as_ref();

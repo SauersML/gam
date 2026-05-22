@@ -10463,9 +10463,12 @@ impl SurvivalMarginalSlopeFamily {
         let beta_w = self.flex_link_beta(block_states)?;
 
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(format!(
-                "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival third contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
+                ),
+            }
+            .into());
         }
 
         let (a0, d0) = self.solve_row_survival_intercept_with_slot(
@@ -10491,10 +10494,13 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
-            return Err(format!(
-                "survival third contracted row {row}: non-positive chi1={:.3e}",
-                exit.chi,
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival third contracted row {row}: non-positive chi1={:.3e}",
+                    exit.chi,
+                ),
+            }
+            .into());
         }
 
         let entry_ext = self.compute_survival_timepoint_directional_exact(
@@ -10612,11 +10618,14 @@ impl SurvivalMarginalSlopeFamily {
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir_u.len() != p || dir_v.len() != p {
-            return Err(format!(
-                "survival fourth contracted: dir lengths ({},{}) != {p}",
-                dir_u.len(),
-                dir_v.len(),
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival fourth contracted: dir lengths ({},{}) != {p}",
+                    dir_u.len(),
+                    dir_v.len(),
+                ),
+            }
+            .into());
         }
         if dir_u.iter().all(|v| v.abs() == 0.0) || dir_v.iter().all(|v| v.abs() == 0.0) {
             return Ok(Array2::<f64>::zeros((p, p)));
@@ -10631,9 +10640,12 @@ impl SurvivalMarginalSlopeFamily {
         let beta_w = self.flex_link_beta(block_states)?;
 
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(format!(
-                "survival fourth contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival fourth contracted monotonicity violated at row {row}: qd1={qd1:.3e}"
+                ),
+            }
+            .into());
         }
 
         let (a0, d0) = self.solve_row_survival_intercept_with_slot(
@@ -10659,10 +10671,13 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
-            return Err(format!(
-                "survival fourth contracted row {row}: non-positive chi1={:.3e}",
-                exit_base.chi,
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival fourth contracted row {row}: non-positive chi1={:.3e}",
+                    exit_base.chi,
+                ),
+            }
+            .into());
         }
 
         let entry_ext_u = self.compute_survival_timepoint_directional_exact(
