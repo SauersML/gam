@@ -14,7 +14,11 @@ use statrs::function::gamma::digamma;
 use std::sync::OnceLock;
 
 const SAS_U_CLAMP: f64 = 50.0;
-const SAS_LOG_DELTA_BOUND: f64 = 12.0;
+/// Bound B used by the bounded sinh-arcsinh log-delta parameterisation:
+/// `delta = exp(B * tanh(raw_log_delta / B))`. Exposed for the outer-strategy
+/// edge-barrier helpers in `solver/estimate.rs` that previously had to
+/// hard-code the same `12.0` with a "must match" comment.
+pub(crate) const SAS_LOG_DELTA_BOUND: f64 = 12.0;
 const BETA_LOGISTIC_U_EPS: f64 = 1e-12;
 
 #[inline]
