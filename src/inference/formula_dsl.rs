@@ -1210,19 +1210,22 @@ fn parse_bounded_priorspec(
 
     let target_mode = target.is_some() || strength.is_some();
     if prior_mode.is_some() && pull.is_some() {
-        return Err(format!(
-            "bounded() cannot combine prior=... with pull=...: {raw}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!("bounded() cannot combine prior=... with pull=...: {raw}"),
+        }
+        .into());
     }
     if prior_mode.is_some() && target_mode {
-        return Err(format!(
-            "bounded() cannot combine prior=... with target/strength: {raw}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!("bounded() cannot combine prior=... with target/strength: {raw}"),
+        }
+        .into());
     }
     if pull.is_some() && target_mode {
-        return Err(format!(
-            "bounded() cannot combine pull=... with target/strength: {raw}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!("bounded() cannot combine pull=... with target/strength: {raw}"),
+        }
+        .into());
     }
 
     if let Some(priorname) = prior_mode {
@@ -1232,10 +1235,13 @@ fn parse_bounded_priorspec(
                 Ok(BoundedCoefficientPriorSpec::Uniform)
             }
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(format!(
-                "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
-                priorname
-            )),
+            _ => Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "bounded() prior must currently be one of none|uniform|log-jacobian|center, got '{}': {raw}",
+                    priorname
+                ),
+            }
+            .into()),
         };
     }
 
@@ -1245,25 +1251,36 @@ fn parse_bounded_priorspec(
                 Ok(BoundedCoefficientPriorSpec::Uniform)
             }
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
-            _ => Err(format!(
-                "bounded() pull must currently be 'uniform'/'log-jacobian' or 'center', got '{}': {raw}",
-                pull_mode
-            )),
+            _ => Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "bounded() pull must currently be 'uniform'/'log-jacobian' or 'center', got '{}': {raw}",
+                    pull_mode
+                ),
+            }
+            .into()),
         };
     }
 
     if target_mode {
-        let targetvalue =
-            target.ok_or_else(|| format!("bounded() target is required with strength: {raw}"))?;
-        let strengthvalue =
-            strength.ok_or_else(|| format!("bounded() strength is required with target: {raw}"))?;
+        let targetvalue = target.ok_or_else(|| FormulaDslError::MalformedConfig {
+            reason: format!("bounded() target is required with strength: {raw}"),
+        })?;
+        let strengthvalue = strength.ok_or_else(|| FormulaDslError::MalformedConfig {
+            reason: format!("bounded() strength is required with target: {raw}"),
+        })?;
         if !(min < targetvalue && targetvalue < max) {
-            return Err(format!(
-                "bounded() target must lie strictly inside ({min}, {max}): {raw}"
-            ));
+            return Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "bounded() target must lie strictly inside ({min}, {max}): {raw}"
+                ),
+            }
+            .into());
         }
         if !strengthvalue.is_finite() || strengthvalue <= 0.0 {
-            return Err(format!("bounded() strength must be finite and > 0: {raw}"));
+            return Err(FormulaDslError::InvalidArgument {
+                reason: format!("bounded() strength must be finite and > 0: {raw}"),
+            }
+            .into());
         }
         let z = (targetvalue - min) / (max - min);
         let a = 1.0 + strengthvalue * z;
@@ -1281,7 +1298,10 @@ fn parse_bounded_priorspec(
 pub fn formula_rhs_text(formula: &str) -> Result<String, String> {
     let parsed = parse_formula_dsl(formula)?;
     if parsed.rhs_terms.is_empty() {
-        return Err("formula right-hand side cannot be empty".to_string());
+        return Err(FormulaDslError::ParseError {
+            reason: "formula right-hand side cannot be empty".to_string(),
+        }
+        .into());
     }
     Ok(parsed.rhs_terms.join(" + "))
 }
@@ -1309,18 +1329,24 @@ pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>
         // when they give two columns, name them explicitly in the error so
         // the fix ("prepend an entry column of zeros") is obvious.
         if vars.len() == 2 {
-            return Err(format!(
-                "Surv(...) needs three columns: Surv(entry, exit, event). \
-                 Got `Surv({}, {})` — if these are (exit, event) from an mgcv-style \
-                 left-truncation-free dataset, add a leading entry-time column of \
-                 zeros and call `Surv(0_entry, {}, {})`.",
-                vars[0], vars[1], vars[0], vars[1]
-            ));
+            return Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "Surv(...) needs three columns: Surv(entry, exit, event). \
+                     Got `Surv({}, {})` — if these are (exit, event) from an mgcv-style \
+                     left-truncation-free dataset, add a leading entry-time column of \
+                     zeros and call `Surv(0_entry, {}, {})`.",
+                    vars[0], vars[1], vars[0], vars[1]
+                ),
+            }
+            .into());
         }
-        return Err(format!(
-            "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
-            vars.len()
-        ));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!(
+                "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
+                vars.len()
+            ),
+        }
+        .into());
     }
     Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
 }
@@ -1342,9 +1368,11 @@ fn top_level_formula_separator(input: &str) -> Result<Option<usize>, String> {
     }
 
     if in_single || in_double || depth != 0 {
-        return Err(
-            "invalid auxiliary formula syntax: unbalanced parentheses or quotes".to_string(),
-        );
+        return Err(FormulaDslError::ParseError {
+            reason: "invalid auxiliary formula syntax: unbalanced parentheses or quotes"
+                .to_string(),
+        }
+        .into());
     }
     Ok(None)
 }
@@ -1356,9 +1384,12 @@ pub fn parse_matching_auxiliary_formula(
 ) -> Result<(String, ParsedFormula), String> {
     let rhs = formula.trim();
     if top_level_formula_separator(rhs)?.is_some() {
-        return Err(format!(
-            "{flag_name} expects only the terms after '~', not a full 'response ~ terms' formula; use {flag_name} 's(x)' instead of {flag_name} 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
-        ));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!(
+                "{flag_name} expects only the terms after '~', not a full 'response ~ terms' formula; use {flag_name} 's(x)' instead of {flag_name} 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
+            ),
+        }
+        .into());
     }
     let parsed_formula = parse_formula(&format!("{response} ~ {rhs}"))?;
     Ok((rhs.to_string(), parsed_formula))
@@ -1369,29 +1400,44 @@ pub fn validate_auxiliary_formula_controls(
     flag_name: &str,
 ) -> Result<(), String> {
     if parsed_formula.linkwiggle.is_some() {
-        return Err(format!(
-            "linkwiggle(...) is only supported in the main formula, not {flag_name}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "linkwiggle(...) is only supported in the main formula, not {flag_name}"
+            ),
+        }
+        .into());
     }
     if parsed_formula.timewiggle.is_some() {
-        return Err(format!(
-            "timewiggle(...) is only supported in the main survival formula, not {flag_name}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "timewiggle(...) is only supported in the main survival formula, not {flag_name}"
+            ),
+        }
+        .into());
     }
     if parsed_formula.linkspec.is_some() {
-        return Err(format!(
-            "link(...) is only supported in the main formula, not {flag_name}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "link(...) is only supported in the main formula, not {flag_name}"
+            ),
+        }
+        .into());
     }
     if parsed_formula.survivalspec.is_some() {
-        return Err(format!(
-            "survmodel(...) is only supported in the main survival formula, not {flag_name}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "survmodel(...) is only supported in the main survival formula, not {flag_name}"
+            ),
+        }
+        .into());
     }
     if !parsed_formula.logslope_surfaces.is_empty() && flag_name != "--logslope-formula" {
-        return Err(format!(
-            "logslope(...) is only supported in --logslope-formula, not {flag_name}"
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "logslope(...) is only supported in --logslope-formula, not {flag_name}"
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -1400,7 +1446,10 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
     let parsed_dsl = parse_formula_dsl(formula)?;
     let lhs = parsed_dsl.response_expr.trim();
     if lhs.is_empty() {
-        return Err("formula response (left-hand side) cannot be empty".to_string());
+        return Err(FormulaDslError::ParseError {
+            reason: "formula response (left-hand side) cannot be empty".to_string(),
+        }
+        .into());
     }
     let mut terms = Vec::<ParsedTerm>::new();
     let mut linkwiggle: Option<LinkWiggleFormulaSpec> = None;
@@ -1722,9 +1771,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" => {
                 if vars.is_empty() {
-                    return Err(format!(
-                        "smooth()/s() requires at least one variable: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("smooth()/s() requires at least one variable: {raw}"),
+                    }
+                    .into());
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
                     options.insert("type".to_string(), "cyclic".to_string());
@@ -1738,10 +1788,13 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "sphere" | "sos" | "spherical" => {
                 if vars.len() != 2 {
-                    return Err(format!(
-                        "sphere()/sos() expects exactly two variables: latitude and longitude; got {} in {raw}",
-                        vars.len()
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "sphere()/sos() expects exactly two variables: latitude and longitude; got {} in {raw}",
+                            vars.len()
+                        ),
+                    }
+                    .into());
                 }
                 options.insert("type".to_string(), "sphere".to_string());
                 return Ok(ParsedTerm::Smooth {
@@ -1753,7 +1806,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "matern" => {
                 if vars.is_empty() {
-                    return Err(format!("matern() requires at least one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("matern() requires at least one variable: {raw}"),
+                    }
+                    .into());
                 }
                 options.insert("type".to_string(), "matern".to_string());
                 return Ok(ParsedTerm::Smooth {
@@ -1765,7 +1821,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "duchon" => {
                 if vars.is_empty() {
-                    return Err(format!("duchon() requires at least one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("duchon() requires at least one variable: {raw}"),
+                    }
+                    .into());
                 }
                 options.insert("type".to_string(), "duchon".to_string());
                 return Ok(ParsedTerm::Smooth {
@@ -1777,55 +1836,76 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "linkwiggle" => {
                 if !vars.is_empty() {
-                    return Err(format!(
-                        "linkwiggle() takes named options only; positional args are not supported: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "linkwiggle() takes named options only; positional args are not supported: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::LinkWiggle { options });
             }
             "timewiggle" => {
                 if !vars.is_empty() {
-                    return Err(format!(
-                        "timewiggle() takes named options only; positional args are not supported: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "timewiggle() takes named options only; positional args are not supported: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::TimeWiggle { options });
             }
             "link" => {
                 if !vars.is_empty() {
-                    return Err(format!(
-                        "link() takes named options only; positional args are not supported: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "link() takes named options only; positional args are not supported: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::LinkConfig { options });
             }
             "survmodel" => {
                 if !vars.is_empty() {
-                    return Err(format!(
-                        "survmodel() takes named options only; positional args are not supported: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "survmodel() takes named options only; positional args are not supported: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::SurvivalConfig { options });
             }
             "logslope" | "log_slope" | "log_slope_surface" => {
                 validate_known_term_options("logslope", &options, &[], raw)?;
                 if vars.len() < 2 {
-                    return Err(format!(
-                        "logslope() expects a z column followed by one or more RHS terms; add one logslope(z, ...) declaration per vector-z coordinate: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "logslope() expects a z column followed by one or more RHS terms; add one logslope(z, ...) declaration per vector-z coordinate: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 let z_column = vars[0].trim();
                 if !is_exact_ident(z_column) {
-                    return Err(format!(
-                        "logslope() z column must be a bare column name, got `{z_column}` in {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "logslope() z column must be a bare column name, got `{z_column}` in {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 let rhs = vars[1..].join(" + ");
                 let parsed = parse_formula(&format!("__logslope__ ~ {rhs}"))?;
                 if !parsed.logslope_surfaces.is_empty() {
-                    return Err(format!(
-                        "logslope() declarations cannot be nested inside another logslope(): {raw}"
-                    ));
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: format!(
+                            "logslope() declarations cannot be nested inside another logslope(): {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 validate_auxiliary_formula_controls(&parsed, "logslope()")?;
                 return Ok(ParsedTerm::LogSlopeSurface {
@@ -1835,7 +1915,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "linear" => {
                 if vars.len() != 1 {
-                    return Err(format!("linear() expects exactly one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("linear() expects exactly one variable: {raw}"),
+                    }
+                    .into());
                 }
                 validate_known_term_options(
                     "linear",
@@ -1853,16 +1936,22 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 });
             }
             _ => {
-                return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
-                ));
+                return Err(FormulaDslError::UnknownIdentifier {
+                    reason: format!(
+                        "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
+                    ),
+                }
+                .into());
             }
         }
     }
 
     let ident = raw.trim();
     if !is_exact_ident(ident) {
-        return Err(format!("unsupported top-level RHS term: {raw}"));
+        return Err(FormulaDslError::UnknownIdentifier {
+            reason: format!("unsupported top-level RHS term: {raw}"),
+        }
+        .into());
     }
 
     Ok(ParsedTerm::Linear {
@@ -1906,17 +1995,21 @@ pub fn parse_link_choice(
             })
         {
             parse_link_component_list(components_inner)?;
-            return Err(
-                "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
-                    .to_string(),
-            );
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason:
+                    "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
+                        .to_string(),
+            }
+            .into());
         }
         let link = parse_linkname(inner)?;
         if !linkname_supports_joint_wiggle(link) {
-            return Err(
-                "flexible(...) does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
-                    .to_string(),
-            );
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason:
+                    "flexible(...) does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
+                        .to_string(),
+            }
+            .into());
         }
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
@@ -1930,10 +2023,12 @@ pub fn parse_link_choice(
         .or_else(|| t.strip_prefix("mixture(").and_then(|s| s.strip_suffix(')')))
     {
         if flexible_flag {
-            return Err(
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason:
                     "--flexible-link cannot be combined with --link blended(...)/mixture(...); blended inverse links are not flexible-link mode"
                         .to_string(),
-            );
+            }
+            .into());
         }
         let components = parse_link_component_list(inner)?;
         return Ok(Some(LinkChoice {
@@ -1945,10 +2040,12 @@ pub fn parse_link_choice(
 
     let link = parse_linkname(&t)?;
     if flexible_flag && !linkname_supports_joint_wiggle(link) {
-        return Err(
-            "--flexible-link does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
-                .to_string(),
-        );
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason:
+                "--flexible-link does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
+                    .to_string(),
+        }
+        .into());
     }
     Ok(Some(LinkChoice {
         mode: if flexible_flag {
@@ -1970,11 +2067,14 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
         "cloglog" | "binomial-cloglog" => Ok(LinkFunction::CLogLog),
         "sas" => Ok(LinkFunction::Sas),
         "beta-logistic" => Ok(LinkFunction::BetaLogistic),
-        other => Err(format!(
-            "unsupported link type '{other}'; \
-             use one of identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
-             Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
-        )),
+        other => Err(FormulaDslError::UnknownIdentifier {
+            reason: format!(
+                "unsupported link type '{other}'; \
+                 use one of identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
+                 Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
+            ),
+        }
+        .into()),
     }
 }
 
@@ -1985,9 +2085,12 @@ pub fn parse_link_component(v: &str) -> Result<LinkComponent, String> {
         "cloglog" => Ok(LinkComponent::CLogLog),
         "loglog" => Ok(LinkComponent::LogLog),
         "cauchit" => Ok(LinkComponent::Cauchit),
-        other => Err(format!(
-            "unsupported blended-link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
-        )),
+        other => Err(FormulaDslError::UnknownIdentifier {
+            reason: format!(
+                "unsupported blended-link component '{other}'; use probit|logit|cloglog|loglog|cauchit"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -2000,12 +2103,18 @@ pub fn parse_link_component_list(v: &str) -> Result<Vec<LinkComponent>, String> 
         }
         let comp = parse_link_component(trimmed)?;
         if out.contains(&comp) {
-            return Err("blended(...) cannot contain duplicate components".to_string());
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: "blended(...) cannot contain duplicate components".to_string(),
+            }
+            .into());
         }
         out.push(comp);
     }
     if out.len() < 2 {
-        return Err("blended(...) requires at least two components".to_string());
+        return Err(FormulaDslError::InvalidArgument {
+            reason: "blended(...) requires at least two components".to_string(),
+        }
+        .into());
     }
     Ok(out)
 }
