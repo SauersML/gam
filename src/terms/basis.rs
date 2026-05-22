@@ -21227,11 +21227,15 @@ pub(crate) mod internal {
             } else if x_eval < knots[degree] {
                 degree
             } else {
-                let mut span = degree;
-                while span < num_basis && x_eval >= knots[span + 1] {
-                    span += 1;
-                }
-                span
+                // Binary search to replace the linear scan
+                //   while span < num_basis && x_eval >= knots[span + 1] { span += 1; }
+                // The loop counts how many of knots[degree+1..=num_basis] are
+                // `<= x_eval`, so `partition_point(|&k| k <= x_eval)` on that
+                // slice gives the same offset from `degree`.
+                let slice = knots
+                    .as_slice()
+                    .expect("B-spline knot vector is contiguous");
+                degree + slice[degree + 1..=num_basis].partition_point(|&k| k <= x_eval)
             }
         };
 

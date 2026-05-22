@@ -2165,21 +2165,23 @@ fn fill_weighted_rhs_no_alloc(
     weights: Option<ArrayView1<'_, f64>>,
     workspace: &mut GaussianRemlNoAllocWorkspace,
 ) -> Result<(), EstimationError> {
-    let n = x.nrows();
-    let p = x.ncols();
     let d = y.ncols();
-    workspace.xtwy.fill(0.0);
-    workspace.ywy.fill(0.0);
 
-    for row in 0..n {
-        let wi = weights.map_or(1.0, |w| w[row]);
-        for output in 0..d {
-            let weighted_y = wi * y[[row, output]];
-            workspace.ywy[output] += y[[row, output]] * weighted_y;
-            for col in 0..p {
-                workspace.xtwy[[col, output]] += x[[row, col]] * weighted_y;
-            }
-        }
+    // XᵀWY and YᵀWY via faer BLAS. Both `fast_xt_diag_y` and `fast_atb`
+    // dispatch to faer's SIMD-optimized GEMM (with chunked weight scaling
+    // when weights are present), replacing the previous scalar triple loop
+    // over (n, p, d). For YᵀWY we only need the diagonal entries, but d is
+    // small (typically 1–10) so computing the full d×d Gram is negligible.
+    let (xtwy, ywy_full) = match weights {
+        Some(w) => (
+            fast_xt_diag_y(&x, &w, &y),
+            fast_xt_diag_y(&y, &w, &y),
+        ),
+        None => (fast_atb(&x, &y), fast_atb(&y, &y)),
+    };
+    workspace.xtwy.assign(&xtwy);
+    for output in 0..d {
+        workspace.ywy[output] = ywy_full[[output, output]];
     }
 
     if workspace
@@ -2199,15 +2201,15 @@ fn project_rhs_no_alloc(
     cache: &GaussianRemlEigenCache,
     workspace: &mut GaussianRemlNoAllocWorkspace,
 ) {
+    // projected_rhs = coefficient_basisᵀ · xtwy, computed via faer BLAS
+    // (was previously a scalar triple loop over (p, d, p)).
+    let projected = fast_atb(&cache.coefficient_basis, &workspace.xtwy);
+    workspace.projected_rhs.assign(&projected);
     let p = cache.penalty_eigenvalues.len();
     let d = workspace.ywy.len();
     for eig in 0..p {
         for output in 0..d {
-            let mut value = 0.0;
-            for col in 0..p {
-                value += cache.coefficient_basis[[col, eig]] * workspace.xtwy[[col, output]];
-            }
-            workspace.projected_rhs[[eig, output]] = value;
+            let value = workspace.projected_rhs[[eig, output]];
             workspace.projected_rhs_squared[[eig, output]] = value * value;
         }
     }

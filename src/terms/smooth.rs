@@ -3462,20 +3462,88 @@ fn second_cumulative_exp(values: &Array1<f64>, sign: f64) -> Array1<f64> {
 }
 
 fn cumulative_sum_transform_matrix(dim: usize, order: usize, sign: f64) -> Array2<f64> {
-    let mut t = Array2::<f64>::eye(dim);
-    for _ in 0..order {
-        let mut next = Array2::<f64>::zeros((dim, dim));
+    // The loop form `t = next^order` where `next` is the unit lower-triangular
+    // matrix of ones (`next[i,j] = 1` iff `i >= j`) has the closed form
+    //     T[i,j] = C(i - j + order - 1, order - 1)   for i >= j, else 0.
+    // Order 0 yields the identity (consistent with the loop, which leaves
+    // t = I when `order == 0`).
+    let mut t = Array2::<f64>::zeros((dim, dim));
+    if order == 0 {
+        for i in 0..dim {
+            t[[i, i]] = 1.0;
+        }
+    } else {
+        let k = order - 1;
         for i in 0..dim {
             for j in 0..=i {
-                next[[i, j]] = 1.0;
+                t[[i, j]] = binomial(i - j + k, k) as f64;
             }
         }
-        t = t.dot(&next);
     }
     if sign < 0.0 {
         t.mapv_inplace(|v| -v);
     }
     t
+}
+
+/// Small integer binomial coefficient C(n, k). Used to build the
+/// cumulative-sum transform; n stays small (dim plus a tiny order).
+fn binomial(n: usize, k: usize) -> u64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut num: u64 = 1;
+    for i in 0..k {
+        num = num * (n - i) as u64 / (i + 1) as u64;
+    }
+    num
+}
+
+#[cfg(test)]
+mod cumulative_sum_transform_tests {
+    use super::cumulative_sum_transform_matrix;
+    use ndarray::Array2;
+
+    fn reference(dim: usize, order: usize, sign: f64) -> Array2<f64> {
+        let mut t = Array2::<f64>::eye(dim);
+        for _ in 0..order {
+            let mut next = Array2::<f64>::zeros((dim, dim));
+            for i in 0..dim {
+                for j in 0..=i {
+                    next[[i, j]] = 1.0;
+                }
+            }
+            t = t.dot(&next);
+        }
+        if sign < 0.0 {
+            t.mapv_inplace(|v| -v);
+        }
+        t
+    }
+
+    #[test]
+    fn closed_form_matches_loop() {
+        for &dim in &[5usize, 10] {
+            for &order in &[1usize, 2, 3, 4] {
+                for &sign in &[1.0_f64, -1.0] {
+                    let got = cumulative_sum_transform_matrix(dim, order, sign);
+                    let want = reference(dim, order, sign);
+                    for i in 0..dim {
+                        for j in 0..dim {
+                            assert!(
+                                (got[[i, j]] - want[[i, j]]).abs() < 1e-12,
+                                "mismatch at dim={dim} order={order} sign={sign} ({i},{j}): \
+                                 got {} want {}",
+                                got[[i, j]],
+                                want[[i, j]],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64)> {
