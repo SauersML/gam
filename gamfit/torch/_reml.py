@@ -697,7 +697,22 @@ class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
         ctx.coefficients_np = np.asarray(out["coefficients"], dtype=np.float64)
         ctx.fitted_np = np.asarray(out["fitted"], dtype=np.float64)
         ctx.log_lambda_at_optimum = float(out["log_lambda"])
-        ctx.active_indices_np = np.asarray(out["active_indices"], dtype=np.uint64)
+        # Recompute the true active set honestly from |A·β̂ - b|: the
+        # `active_indices` field returned by the Rust forward uses a
+        # feasibility-style threshold and overcounts inactive feasible
+        # rows. The analytic VJP branches on the *true* active set
+        # (empty ⇒ envelope/interior cert path; non-empty ⇒ deferred
+        # tangent-projection path), so doing the test ourselves keeps
+        # the contract robust to that quirk.
+        if a_np is None or a_np.shape[0] == 0:
+            ctx.active_indices_np = np.zeros(0, dtype=np.uint64)
+        else:
+            beta_flat = ctx.coefficients_np.reshape(-1)
+            slack = a_np @ beta_flat - (b_np if b_np is not None else np.zeros(a_np.shape[0]))
+            scale = max(1.0, float(np.abs(beta_flat).max()))
+            tol = 1e-7 * scale
+            true_active = np.where(np.abs(slack) <= tol)[0]
+            ctx.active_indices_np = np.asarray(true_active, dtype=np.uint64)
         ctx.ref = x
         ctx.penalty_ref = penalty
 
