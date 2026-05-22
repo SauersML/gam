@@ -39,6 +39,55 @@ use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
 
+/// Typed errors emitted by the survival prediction pipeline.
+///
+/// Each variant carries a pre-formatted `reason` string so `Display` is
+/// byte-equivalent to the original `format!(...)` outputs the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind without dragging the string apart.
+#[derive(Debug, Clone)]
+pub enum SurvivalPredictError {
+    /// Request-level input did not satisfy the predict contract: bad offset
+    /// lengths, malformed time grids, empty grids, non-finite times.
+    InvalidInput { reason: String },
+    /// The saved model is missing metadata required to drive the prediction
+    /// (anchor, link/distribution tags, likelihood-mode marker, etc.) or
+    /// carries legacy metadata that the current runtime refuses to consume.
+    MissingFitMetadata { reason: String },
+    /// Saved coefficient blocks, design columns, or baseline-timewiggle
+    /// runtime dimensions disagree with the rebuilt prediction designs.
+    IncompatibleSchema { reason: String },
+    /// The requested combination of saved-model mode and predict-time
+    /// options is not implemented in this library entry point yet (e.g.
+    /// uncertainty for non-location-scale, latent window prediction,
+    /// competing-risks with `with_uncertainty`).
+    UnsupportedConfiguration { reason: String },
+    /// A numerical step (hazard / derivative / survival reconstruction)
+    /// produced a non-finite or out-of-domain value that downstream code
+    /// cannot consume.
+    NumericalFailure { reason: String },
+}
+
+impl std::fmt::Display for SurvivalPredictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SurvivalPredictError::InvalidInput { reason }
+            | SurvivalPredictError::MissingFitMetadata { reason }
+            | SurvivalPredictError::IncompatibleSchema { reason }
+            | SurvivalPredictError::UnsupportedConfiguration { reason }
+            | SurvivalPredictError::NumericalFailure { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SurvivalPredictError {}
+
+impl From<SurvivalPredictError> for String {
+    fn from(err: SurvivalPredictError) -> String {
+        err.to_string()
+    }
+}
+
 /// Inputs to the unified survival predict pipeline.
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,

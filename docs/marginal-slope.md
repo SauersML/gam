@@ -1,43 +1,44 @@
 # Marginal-slope models
 
-Marginal-slope handles a **standardised risk score** (e.g. a polygenic
-score) whose effect on the outcome varies across covariate space. The
-baseline risk surface and the score's effect live in separate formulas, so
-the baseline cannot absorb signal that belongs to the slope (or vice
-versa).
+A marginal-slope model fits a standardised risk score `z` whose effect on
+the outcome varies across covariate space. The baseline risk surface and
+the score's log-slope surface live in two separate formulas, so the
+baseline does not absorb score-specific signal and vice versa.
 
 ![two-surface marginal-slope viz over a joint Duchon smooth](images/marginal_slope_3d.png)
 
 The vertical gap between the two probability surfaces is the risk
-difference for that score contrast. The modeled score effect itself lives
-on the probit/log-slope scale and varies smoothly across covariate space.
+difference for a unit contrast in `z`. The modelled score effect lives on
+the probit/log-slope scale and varies smoothly with covariates.
 
-Two flavours:
+Two families:
 
-- **Bernoulli marginal-slope** for binary outcomes.
-- **Survival marginal-slope** for time-to-event outcomes.
+- Bernoulli marginal-slope (`family="bernoulli-marginal-slope"`) for
+  binary outcomes.
+- Survival marginal-slope (`survival_likelihood="marginal-slope"`) for
+  time-to-event outcomes.
 
-Both pair with **transformation-normal** calibration of the underlying
-score on ancestry/covariate PCs, so the input score is conditionally
-N(0, 1) before it enters the marginal-slope fit.
+Both assume `z` is approximately `N(0, 1)` conditional on the covariates.
+Use the transformation-normal calibration step to enforce that.
 
 ## When to use it
 
 You have:
 
-1. A binary or survival outcome.
-2. A continuous risk score, ideally already standardised (zero mean, unit
-   variance, marginally) — a polygenic score or similar.
-3. Reason to believe the *score's* effect size varies across some
-   covariate space — across age, across ancestry PCs, etc.
+1. A binary or time-to-event outcome.
+2. A continuous risk score that is, or can be made, conditionally
+   `N(0, 1)`.
+3. Reason to believe the score's effect size varies across covariates
+   (e.g. across age, ancestry PCs).
 
-Standard logistic regression on `outcome ~ score + age + ...` forces a
-*single* slope on `score`. Marginal-slope makes the slope itself a smooth
-function of the covariates while leaving the baseline as its own smooth.
+A single-coefficient logistic or Cox fit on `outcome ~ score + ...`
+forces one slope on the score. Marginal-slope makes the slope itself a
+smooth function of covariates while leaving the baseline as a separate
+smooth.
 
 ## Stage 1: transformation-normal calibration
 
-If your raw score is not already conditionally N(0, 1), fit:
+If the raw score is not already conditionally `N(0, 1)`, fit:
 
 ```python
 calib = gamfit.fit(
@@ -46,15 +47,12 @@ calib = gamfit.fit(
     transformation_normal=True,
     scale_dimensions=True,
 )
-df["z"] = calib.predict(df)   # 1-D numpy array of conditional z-scores
+df["z"] = calib.predict(df)
 ```
 
-`transformation_normal=True` fits `h(score | PCs) ~ N(0, 1)`. The
-`predict()` of a transformation-normal model returns a **1-D numpy array of
-z-scores**, not a table.
-
-After calibration, `df["z"]` is approximately N(0, 1) conditional on the
-PCs, which is what the marginal-slope likelihood expects in `z_column`.
+`transformation_normal=True` fits `h(score | covariates) ~ N(0, 1)`. The
+`predict()` method of a transformation-normal model returns a 1-D numpy
+array of z-scores.
 
 ## Stage 2a: Bernoulli marginal-slope
 
@@ -72,19 +70,20 @@ model = gamfit.fit(
 probs = model.predict(test_df, return_type="dict")["mean"]
 ```
 
-- `family="bernoulli-marginal-slope"` selects the marginal-slope likelihood.
-- `link="probit"` — required. Bernoulli marginal-slope only supports the
-  probit base link, which pairs with the Gaussian z assumption.
-- `z_column="z"` — name of the standardised score column in `df` and `test_df`.
-- `logslope_formula="..."` — formula governing how `z`'s log-slope varies
-  across covariates. Typically a smooth on the same covariates as the
-  baseline.
+- `family="bernoulli-marginal-slope"` selects the marginal-slope
+  likelihood.
+- `link="probit"`: required. The Bernoulli marginal-slope kernel is
+  derived for the probit base link and rejects any other link choice,
+  including `flexible(...)`, `blended(...)`, `sas`, and `beta-logistic`.
+- `z_column="z"`: name of the conditional z-score column in both the
+  training and prediction tables.
+- `logslope_formula="..."`: formula for the log-slope surface as a
+  function of covariates.
 
-The main formula (`case ~ s(age) + matern(pc1, pc2, pc3)`) controls the
-**baseline risk landscape**. The `logslope_formula` controls how strongly
-`z` modifies that risk at each point in covariate space.
+The main formula controls the baseline risk; `logslope_formula` controls
+the strength of the `z` effect at each point in covariate space.
 
-From the CLI the same fit is `--logslope-formula '...'` plus `--z-column z`:
+CLI equivalent:
 
 ```bash
 gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
@@ -92,9 +91,9 @@ gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
     --scale-dimensions --out model.gam
 ```
 
-For vector-valued scores, keep the first coordinate in `--z-column` and add
-one `logslope(z_col, ...)` declaration per additional coordinate inside
-`--logslope-formula`:
+For vector-valued scores, place the first coordinate in `--z-column` and
+add one `logslope(z_col, ...)` declaration per additional coordinate
+inside `--logslope-formula`:
 
 ```bash
 gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
@@ -103,9 +102,9 @@ gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
     --scale-dimensions --out model.gam
 ```
 
-The unwrapped RHS remains the first log-slope surface. Each extra
-`logslope(z_col, ...)` term declares another surface for that z coordinate,
-with its own coefficient and smoothing-parameter block.
+The unwrapped RHS is the log-slope surface for the first coordinate.
+Each extra `logslope(z_col, ...)` adds a surface for that coordinate
+with its own coefficients and smoothing parameters.
 
 ## Stage 2b: Survival marginal-slope
 
@@ -122,13 +121,15 @@ pred = model.predict(test_df)
 S = pred.survival_at([1, 5, 10])
 ```
 
-Same idea, applied to survival data. The baseline hazard surface is
-specified by the main formula; the score's log hazard ratio is a smooth
-function of covariates given by `logslope_formula`.
+The main formula specifies the baseline hazard surface; the score's log
+hazard ratio is a smooth function of covariates given by
+`logslope_formula`.
 
-## Frailty for marginal-slope survival
+## Frailty in marginal-slope survival
 
-Marginal-slope survival pairs with frailty for unmeasured heterogeneity:
+Survival marginal-slope supports only `frailty_kind="gaussian-shift"`
+with a fixed `frailty_sd`. `"hazard-multiplier"` and a learnable
+gaussian-shift sigma are rejected at fit time.
 
 ```python
 gamfit.fit(df,
@@ -141,43 +142,37 @@ gamfit.fit(df,
 )
 ```
 
-Survival marginal-slope only supports `frailty_kind="gaussian-shift"` with
-a fixed `frailty_sd`; `"hazard-multiplier"` is rejected at fit time. See
-[survival.md](survival.md#frailty) for the broader frailty options.
-
 ## Detecting marginal-slope models after loading
 
 ```python
 model = gamfit.load("model.gam")
 model.is_marginal_slope            # True if a marginal-slope family
 model.is_survival                  # True if survival
-model.is_transformation_normal     # True if Stage 1 calibration model
+model.is_transformation_normal     # True if a Stage 1 calibration model
 model.model_class                  # full class string
 ```
 
-## Tips
+## Notes
 
-- **Order matters.** Run Stage 1 (transformation-normal) before Stage 2 so
-  that `z_column` is genuinely conditionally N(0, 1).
-- **Scale your covariates** for Stage 1. Set `scale_dimensions=True` when
-  fitting transformation-normal on a handful of PCs.
-- **Sampling / posterior:** Bernoulli marginal-slope and
-  transformation-normal models use the Gaussian Laplace approximation for
-  `Model.sample(...)`. Survival marginal-slope uses
-  exact NUTS over the joint coefficient vector. See
-  [posterior-sampling.md](posterior-sampling.md).
-- **Predict output:** Bernoulli marginal-slope returns a 1-D array of
-  probabilities by default. Pass `id_column=` or `return_type="dict"` to
-  get a table back. Same applies to transformation-normal output.
+- Run Stage 1 (transformation-normal) before Stage 2 so `z_column` is
+  conditionally `N(0, 1)`.
+- Set `scale_dimensions=True` when calibrating on a handful of PCs so
+  anisotropic length scales are learned per axis.
+- Posterior sampling: Bernoulli marginal-slope and transformation-normal
+  models use the Gaussian Laplace approximation in `Model.sample(...)`;
+  survival marginal-slope uses NUTS over the joint coefficient vector.
+  See [posterior-sampling.md](posterior-sampling.md).
+- Predict output: Bernoulli marginal-slope returns a 1-D probability
+  array by default. Pass `id_column=` or `return_type="dict"` for a
+  table. The same applies to transformation-normal models.
 
-## Recipe: full two-stage pipeline
+## Two-stage pipeline
 
 ```python
 import gamfit
 import numpy as np
 import pandas as pd
 
-# Synthetic data: PGS to calibrate, then disease outcomes
 n = 1000
 rng = np.random.default_rng(0)
 df = pd.DataFrame({
@@ -206,7 +201,6 @@ model = gamfit.fit(
     scale_dimensions=True,
 )
 
-# Predict probabilities
 test = df.head(50).copy()
 probs = model.predict(test, return_type="dict")["mean"]
 ```

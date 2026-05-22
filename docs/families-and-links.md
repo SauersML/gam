@@ -1,89 +1,95 @@
 # Families and link functions
 
-`gamfit` supports Gaussian, binomial, Poisson, and Gamma GLMs, plus survival
-models ([survival.md](survival.md)) and conditional transformation-normal
-models ([marginal-slope.md](marginal-slope.md)). The family is detected from
-the response unless overridden.
+`gamfit` supports Gaussian, binomial, Poisson, Gamma, and Royston-Parmar
+GLM-style likelihoods, plus survival ([survival.md](survival.md)),
+conditional transformation-normal ([marginal-slope.md](marginal-slope.md)),
+location-scale ([location-scale.md](location-scale.md)) and
+marginal-slope families. The family is inferred from the response unless
+overridden via `family=`.
 
 ## Auto-detection
 
-| Response column looks like... | Inferred family | Default link |
+| Response column | Inferred family | Default link |
 | --- | --- | --- |
-| Binary `{0, 1}` only | binomial | logit |
+| Binary `{0, 1}` | binomial | logit |
 | Continuous numeric | Gaussian | identity |
-| `Surv(entry, exit, event)` | survival | depends on likelihood mode |
+| `Surv(entry, exit, event)` | survival | depends on `survival_likelihood` |
 
-For counts (Poisson) and positive-continuous data (Gamma), set the link with
-`link(type=log)` and pass `family=` to `fit()`:
+For Poisson counts and Gamma positive-continuous data, set the link with
+`link(type=log)` and pass `family=`:
 
 ```python
 gamfit.fit(df, "y ~ s(x) + link(type=log)", family="poisson")
 gamfit.fit(df, "y ~ s(x) + link(type=log)", family="gamma")
 ```
 
-## Overriding family or link
+## Setting family and link
 
-Two equivalent ways to set the link:
+The `family=` kwarg accepts `"auto"`, `"gaussian"`, `"binomial-logit"`,
+`"binomial-probit"`, `"binomial-cloglog"`, `"latent-cloglog-binomial"`,
+`"poisson-log"`, `"gamma-log"`, `"royston-parmar"`, `"transformation-normal"`,
+and `"bernoulli-marginal-slope"`. The link can be set in the formula via
+`link(type=...)` or with the `link=` kwarg. If both are set, the formula
+specification takes precedence.
 
 ```python
-# Formula-level
+# Formula
 gamfit.fit(df, "case ~ s(age) + link(type=probit)")
 
-# Python kwarg
+# Kwarg
 gamfit.fit(df, "case ~ s(age)", link="probit")
 ```
 
-If both are set, the formula wins.
+## Link functions
 
-## Link functions in detail
+The engine recognises the following link types in `link(type=...)` and
+`--link`:
 
-### Identity — `link(type=identity)`
+### `identity`
 
-Inverse link: `eta`. Default for continuous responses.
+Inverse link `eta`. Default for continuous Gaussian responses.
 
-### Logit — `link(type=logit)`
+### `logit`
 
-Inverse link: `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
-Symmetric.
+Inverse link `1 / (1 + exp(-eta))`. Default for binary `{0, 1}` responses.
 
-### Probit — `link(type=probit)`
+### `probit`
 
-Inverse link: `Phi(eta)` (standard normal CDF). Lighter tails than logit. Common when
-a Gaussian latent-variable interpretation applies. Required by Bernoulli
-marginal-slope models — see [marginal-slope.md](marginal-slope.md).
+Inverse link `Phi(eta)`, the standard normal CDF. Required for the
+Bernoulli marginal-slope family (see [marginal-slope.md](marginal-slope.md)).
 
-### Complementary log-log — `link(type=cloglog)`
+### `cloglog`
 
-Inverse link: `1 - exp(-exp(eta))`. Left-skewed. Use for grouped discrete-time
-hazards or rare events.
+Inverse link `1 - exp(-exp(eta))`. Used for grouped discrete-time hazards
+and rare-event Bernoulli data.
 
-### Log — `link(type=log)`
+### `log`
 
-Inverse link: `exp(eta)`. For positive responses. Use with Poisson (counts) and Gamma
-(positive continuous):
+Inverse link `exp(eta)`. Pair with `family="poisson"` for counts and
+`family="gamma"` for positive continuous responses.
 
 ```python
 gamfit.fit(df, "count ~ s(time) + link(type=log)",
-           family="poisson", offset="offset_log_exposure")
+           family="poisson", offset="log_exposure")
 ```
 
-The offset column is supplied via `offset=`; do not also place it on the
-formula RHS (a bare RHS identifier would be parsed as a linear term with
-its own coefficient).
+Pass the offset column via `offset=`; do not include it on the formula RHS.
 
-### SAS (sinh-arcsinh) — `link(type=sas)`
+### `sas`
 
-Link with learned skewness and tail-weight parameters. Cannot be combined
-with `linkwiggle(...)`.
+Sinh-arcsinh inverse link with learned skewness (`epsilon`) and
+tail-weight (`delta`) parameters. Cannot be combined with `linkwiggle(...)`
+or with blended/mixture links.
 
-### Beta-logistic — `link(type=beta-logistic)`
+### `beta-logistic`
 
-Bounded link with learned shape parameters. Cannot be combined with
-`linkwiggle(...)`.
+Bounded inverse link with two learned shape parameters. Cannot be
+combined with `linkwiggle(...)` or with blended/mixture links.
 
-### Blended mixture — `link(type=blended(a, b, …))`
+### `blended(a, b, ...)` / `mixture(a, b, ...)`
 
-Mixture of two or more component inverse links with learned mixing weights:
+Convex combination of two or more inverse links with learned mixing
+weights:
 
 ```
 link(type=blended(logit, probit))
@@ -92,22 +98,23 @@ link(type=blended(logit, probit, cloglog))
 ```
 
 Component options: `logit`, `probit`, `cloglog`, `loglog`, `cauchit`. At
-least two required. Cannot be combined with `linkwiggle(...)`.
+least two components are required. Cannot be combined with `linkwiggle(...)`
+or with `flexible(...)`.
 
-### Flexible — `link(type=flexible(base))`
+### `flexible(base)`
 
-Adds a spline offset to a base link. The data corrects for link
-misspecification; the base is the default:
+Adds a jointly fit anchored spline offset to a base link. Accepted base
+links: `identity`, `log`, `logit`, `probit`, `cloglog`. The `sas`,
+`beta-logistic`, `blended(...)`, and `mixture(...)` types are not
+supported as a `flexible(...)` base.
 
 ```
 link(type=flexible(probit))
 link(type=flexible(logit))
 link(type=flexible(cloglog))
-link(type=flexible(identity))
-link(type=flexible(log))
 ```
 
-Enables `linkwiggle`. Tune the offset spline directly:
+`flexible(...)` enables `linkwiggle(...)` for tuning the offset spline:
 
 ```
 y ~ s(x) + link(type=flexible(probit)) + linkwiggle(internal_knots=8, penalty_order=all)
@@ -116,44 +123,30 @@ y ~ s(x) + link(type=flexible(probit)) + linkwiggle(internal_knots=8, penalty_or
 See [formulas.md](formulas.md#linkwiggle-flexible-link-offset) for
 `linkwiggle` options.
 
-## Choosing a link
-
-| You want... | Use... |
-| --- | --- |
-| Binary outcome, no strong prior | `logit` (default). |
-| Binary outcome, Gaussian latent interpretation | `probit`. |
-| Rare events / grouped discrete-time hazards | `cloglog`. |
-| Count / positive continuous | `log` (with `family="poisson"` or `"gamma"`). |
-| Base link approximately right, want a safety net | `flexible(base)` + `linkwiggle`. |
-| Two link shapes both plausible | `blended(a, b)`. |
-| Skewness in the residuals | `sas`. |
-
 ## Firth bias reduction
 
-For separable or near-separable logistic problems, enable Firth's
-bias-reduced estimator with `firth=True`:
+`firth=True` activates Firth's bias-reduced estimator. The shared
+implementation is available only for the standard logit binomial family
+(`LikelihoodFamily::BinomialLogit`); other families reject `firth=True`.
+Firth is not compatible with survival models, location-scale fitting, or
+the Bernoulli marginal-slope family.
 
 ```python
-gamfit.fit(df, "rare_event ~ s(x)", family="binomial", firth=True)
+gamfit.fit(df, "rare_event ~ s(x)", family="binomial-logit", firth=True)
 ```
 
-Shrinks the MLE toward the Jeffreys prior, stabilising estimates when
-classes are imbalanced and a coefficient would otherwise diverge.
-
 ## Offsets and weights
-
-Both are referenced by column name:
 
 ```python
 gamfit.fit(df,
     "count ~ s(age) + link(type=log)",
     family="poisson",
-    offset="log_exposure",   # column in df
-    weights="freq",          # column in df
+    offset="log_exposure",
+    weights="freq",
 )
 ```
 
-- **`offset`**: additive term on the linear predictor; not estimated. For
-  Poisson rate models, pass `log(exposure)`.
-- **`weights`**: per-observation weight on the likelihood. Use for
-  frequency-weighted or inverse-variance-weighted data.
+- `offset`: column added to the linear predictor and not estimated. For
+  Poisson rate models pass `log(exposure)`.
+- `weights`: per-observation likelihood weight. Use for frequency or
+  inverse-variance weighting.
