@@ -1,7 +1,7 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::linalg::utils::KahanSum;
+use crate::linalg::utils::{KahanSum, inf_norm};
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -2839,7 +2839,7 @@ mod tests {
 
         let expected = rep.qs.t().dot(&inv.split.q_null);
         let diff = &rep.u_truncated - &expected;
-        let max_abs = diff.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let max_abs = inf_norm(diff.iter().copied());
         assert!(
             max_abs <= 1e-10,
             "u_truncated frame mismatch: max_abs={max_abs}"
