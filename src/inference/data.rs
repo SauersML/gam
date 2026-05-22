@@ -213,14 +213,11 @@ fn detect_format(path: &Path) -> Result<DataFormat, DataError> {
 pub fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
-    match detect_format(path).map_err(String::from)? {
-        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns)
-            .map_err(String::from),
-        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns)
-            .map_err(String::from),
-        DataFormat::Parquet => load_parquet_inferred(path, requested_columns)
-            .map_err(String::from),
+) -> Result<EncodedDataset, DataError> {
+    match detect_format(path)? {
+        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns),
+        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns),
+        DataFormat::Parquet => load_parquet_inferred(path, requested_columns),
     }
 }
 
@@ -228,7 +225,7 @@ pub fn load_datasetwith_schema(
     path: &Path,
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, DataError> {
     load_datasetwith_schema_projected(path, schema, unseen_policy, &[])
 }
 
@@ -237,19 +234,16 @@ pub fn load_datasetwith_schema_projected(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
-    match detect_format(path).map_err(String::from)? {
+) -> Result<EncodedDataset, DataError> {
+    match detect_format(path)? {
         DataFormat::Csv => {
             load_delimited_with_schema(path, b',', schema, unseen_policy, requested_columns)
-                .map_err(String::from)
         }
         DataFormat::Tsv => {
             load_delimited_with_schema(path, b'\t', schema, unseen_policy, requested_columns)
-                .map_err(String::from)
         }
         DataFormat::Parquet => {
             load_parquet_with_schema(path, schema, unseen_policy, requested_columns)
-                .map_err(String::from)
         }
     }
 }
@@ -258,16 +252,16 @@ pub fn load_datasetwith_schema_projected(
 // Legacy wrappers — keep existing call-sites compiling
 // ---------------------------------------------------------------------------
 
-pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, String> {
-    load_delimited_inferred(path, b',', &[]).map_err(String::from)
+pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, DataError> {
+    load_delimited_inferred(path, b',', &[])
 }
 
 pub fn load_csvwith_schema(
     path: &Path,
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
-) -> Result<EncodedDataset, String> {
-    load_delimited_with_schema(path, b',', schema, unseen_policy, &[]).map_err(String::from)
+) -> Result<EncodedDataset, DataError> {
+    load_delimited_with_schema(path, b',', schema, unseen_policy, &[])
 }
 
 // ---------------------------------------------------------------------------
