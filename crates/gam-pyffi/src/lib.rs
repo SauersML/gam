@@ -64,7 +64,7 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, 
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
 };
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict};
 use serde::{Deserialize, Serialize};
@@ -405,6 +405,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_positions_batched_backward",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
+            "gaussian_reml_fit_with_constraints_backward",
         ],
     )?;
     info.set_item(
@@ -2613,6 +2614,158 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
     out.set_item("reml_score", fit.reml_score)?;
     out.set_item("edf", edf_total)?;
     out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+/// Analytic backward (VJP) for `gaussian_reml_fit_with_constraints_forward`.
+///
+/// Math identity (see task spec): at the constrained cert exit with active
+/// set `A_act β̂ = 0`, the envelope theorem applied to the tangent-projected
+/// outer objective `V_T(ρ)` gives the same closed-form VJP as the
+/// unconstrained Gaussian REML backward, with `H⁻¹` replaced by the
+/// projected pseudo-inverse `P = Z (ZᵀHZ)⁻¹ Zᵀ` and `S⁺` replaced by
+/// `Z (ZᵀSZ)⁺ Zᵀ` (where `Z` is the basis of `null(A_act)`).
+///
+/// Implementation status:
+/// - **Interior cert (empty active set):** the projection `Z = I_p` is the
+///   identity, so the tangent-projected VJP coincides with the unconstrained
+///   closed-form Gaussian REML backward. This case delegates to
+///   `gaussian_reml_multi_closed_form_backward` and produces gradients
+///   identical to `gaussian_reml_fit_backward` (round-off agreement).
+/// - **Active cert (non-empty active set):** STOPPED per task instructions
+///   (the existing closed-form backward stack is hard-coded to the
+///   unconstrained `GaussianRemlEigenCache`/`reml_hess_rho` and cannot
+///   accept a tangent-wrapped operator without a substantial refactor —
+///   see report). Returns `NotImplementedError`.
+#[pyfunction(signature = (
+    x,
+    y,
+    penalty,
+    weights = None,
+    a_inequality = None,
+    b_inequality = None,
+    log_lambda_at_optimum = None,
+    coefficients_at_optimum = None,
+    fitted_at_optimum = None,
+    active_indices = None,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_lambda = 0.0,
+    grad_log_lambda = 0.0,
+    grad_reml_score = 0.0,
+    grad_edf = 0.0,
+))]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_with_constraints_backward<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    a_inequality: Option<PyReadonlyArray2<'py, f64>>,
+    b_inequality: Option<PyReadonlyArray1<'py, f64>>,
+    log_lambda_at_optimum: Option<f64>,
+    coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
+    fitted_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
+    active_indices: Option<PyReadonlyArray1<'py, u64>>,
+    grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_lambda: f64,
+    grad_log_lambda: f64,
+    grad_reml_score: f64,
+    grad_edf: f64,
+) -> PyResult<Py<PyDict>> {
+    // Unused-suppression: `fitted_at_optimum` is part of the documented API
+    // surface so callers can pre-compute or cache it, but the analytic
+    // backward derives the residual `y - X β̂` from `coefficients_at_optimum`
+    // directly via the closed-form fit.
+    let _ = fitted_at_optimum;
+    let _ = coefficients_at_optimum;
+    let _ = b_inequality;
+
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+    let weight_view = weights.as_ref().map(|w| w.as_array());
+
+    // Determine whether the active set is empty (interior cert).
+    let active_empty = match active_indices.as_ref() {
+        Some(a) => a.as_array().len() == 0,
+        None => true,
+    };
+    // No active constraint matrix at all is also the interior-cert case.
+    let no_constraints = match a_inequality.as_ref() {
+        Some(a) => a.as_array().nrows() == 0,
+        None => true,
+    };
+    let is_interior = active_empty || no_constraints;
+
+    if !is_interior {
+        // See header doc + report: the closed-form Gaussian REML backward
+        // stack is welded to the unconstrained eigen-cache. The tangent-
+        // projected variant requires constructing `P = Z (ZᵀHZ)⁻¹ Zᵀ` and a
+        // projected penalty pinv `Z (ZᵀSZ)⁺ Zᵀ`, plus a projected
+        // `reml_hess_rho_T`. Refactoring the per-helper VJPs to accept these
+        // as separate parameters (instead of pulling from `cache`) is
+        // intentionally deferred.
+        return Err(PyNotImplementedError::new_err(
+            "gaussian_reml_fit_with_constraints_backward: analytic VJP at \
+             non-empty active sets (active cert exit) is not yet implemented. \
+             The math identity is `H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ`, `S⁺ → Z(ZᵀSZ)⁺Zᵀ`, \
+             but the closed-form Gaussian REML helpers in \
+             `src/solver/gaussian_reml.rs` consume the unconstrained \
+             `GaussianRemlEigenCache` directly and cannot yet accept these \
+             projected operators."
+                .to_string(),
+        ));
+    }
+
+    // Interior cert: envelope theorem in full p-space. The constrained
+    // forward converges identically to the unconstrained forward (no
+    // constraint is binding), so the closed-form Gaussian REML backward
+    // applied to the unconstrained problem produces the correct VJP.
+    let init_lambda = log_lambda_at_optimum.map(|rho| rho.exp());
+
+    // The constrained forward returns the smoothing parameter as `lambda`
+    // and `log_lambda`. Upstream `grad_lambda` and `grad_log_lambda` both
+    // pull on the same scalar; chain `grad_log_lambda` through
+    // `dlog λ / dλ = 1/λ` and add to `grad_lambda`.
+    let mut effective_grad_lambda = grad_lambda;
+    if grad_log_lambda != 0.0 {
+        let lam = init_lambda.unwrap_or(0.0);
+        if lam > 0.0 {
+            effective_grad_lambda += grad_log_lambda / lam;
+        } else {
+            // log λ undefined / unstable here. Surface a clear error rather
+            // than silently zero the contribution.
+            return Err(py_value_error(
+                "gaussian_reml_fit_with_constraints_backward: \
+                 grad_log_lambda is non-zero but log_lambda_at_optimum is \
+                 missing or λ ≤ 0; cannot chain dlog λ/dλ = 1/λ."
+                    .to_string(),
+            ));
+        }
+    }
+
+    let backward = gaussian_reml_multi_closed_form_backward(
+        x_view,
+        y_view,
+        penalty_view,
+        weight_view,
+        init_lambda,
+        effective_grad_lambda,
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score,
+        grad_edf,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+
+    let out = PyDict::new(py);
+    out.set_item("grad_x", backward.grad_x.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -5141,6 +5294,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_backward, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_with_constraints_forward,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_with_constraints_backward,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
