@@ -12,6 +12,9 @@ use gam::faer_ndarray::{array2_to_matmut, factorize_symmetricwith_fallback};
 use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
+use gam::families::survival_location_scale::{
+    ResidualDistribution, residual_distribution_from_inverse_link,
+};
 use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
@@ -46,9 +49,6 @@ use gam::terms::basis::{
     create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::families::survival_location_scale::{
-    ResidualDistribution, residual_distribution_from_inverse_link,
-};
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
