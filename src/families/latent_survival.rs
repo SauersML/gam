@@ -692,11 +692,13 @@ fn validate_latent_binary_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentBinaryTermSpec,
     frailty: &FrailtySpec,
-) -> Result<f64, String> {
-    let (sigma, hazard_loading) = fixed_latent_hazard_frailty(frailty, "latent-binary")?;
+) -> Result<f64, LatentSurvivalError> {
+    let (sigma, hazard_loading) = fixed_latent_hazard_frailty_typed(frailty, "latent-binary")?;
     let n = data.nrows();
     if n == 0 {
-        return Err("latent-binary requires a non-empty dataset".to_string());
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: "latent-binary requires a non-empty dataset".to_string(),
+        });
     }
     if spec.age_entry.len() != n
         || spec.age_exit.len() != n
@@ -706,22 +708,26 @@ fn validate_latent_binary_inputs(
         || spec.unloaded_mass_exit.len() != n
         || spec.mean_offset.len() != n
     {
-        return Err(format!(
-            "latent-binary size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, offset={}",
-            spec.age_entry.len(),
-            spec.age_exit.len(),
-            spec.event_target.len(),
-            spec.weights.len(),
-            spec.unloaded_mass_entry.len(),
-            spec.unloaded_mass_exit.len(),
-            spec.mean_offset.len()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-binary size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, offset={}",
+                spec.age_entry.len(),
+                spec.age_exit.len(),
+                spec.event_target.len(),
+                spec.weights.len(),
+                spec.unloaded_mass_entry.len(),
+                spec.unloaded_mass_exit.len(),
+                spec.mean_offset.len()
+            ),
+        });
     }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard < 0.0 {
-        return Err(format!(
-            "latent-binary derivative_guard must be finite and >= 0, got {}",
-            spec.derivative_guard
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-binary derivative_guard must be finite and >= 0, got {}",
+                spec.derivative_guard
+            ),
+        });
     }
     for i in 0..n {
         let entry = spec.age_entry[i];
@@ -731,46 +737,56 @@ fn validate_latent_binary_inputs(
         let unloaded_exit = spec.unloaded_mass_exit[i];
         let event = spec.event_target[i];
         if !entry.is_finite() || !exit.is_finite() {
-            return Err(format!(
-                "latent-binary row {} has non-finite entry/exit ages: entry={}, exit={}",
-                i + 1,
-                entry,
-                exit
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-binary row {} has non-finite entry/exit ages: entry={}, exit={}",
+                    i + 1,
+                    entry,
+                    exit
+                ),
+            });
         }
         if entry < 0.0 || exit < entry {
-            return Err(format!(
-                "latent-binary row {} has invalid delayed-entry bounds: entry={}, exit={}",
-                i + 1,
-                entry,
-                exit
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-binary row {} has invalid delayed-entry bounds: entry={}, exit={}",
+                    i + 1,
+                    entry,
+                    exit
+                ),
+            });
         }
         if event > 1 {
-            return Err(format!(
-                "latent-binary row {} has invalid event target {}; expected 0 or 1",
-                i + 1,
-                event
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-binary row {} has invalid event target {}; expected 0 or 1",
+                    i + 1,
+                    event
+                ),
+            });
         }
         if !weight.is_finite() || weight < 0.0 {
-            return Err(format!(
-                "latent-binary row {} has invalid weight {}; expected a finite non-negative weight",
-                i + 1,
-                weight
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-binary row {} has invalid weight {}; expected a finite non-negative weight",
+                    i + 1,
+                    weight
+                ),
+            });
         }
         if !unloaded_entry.is_finite()
             || !unloaded_exit.is_finite()
             || unloaded_entry < 0.0
             || unloaded_exit < unloaded_entry
         {
-            return Err(format!(
-                "latent-binary row {} has invalid unloaded mass decomposition: entry_mass={}, exit_mass={}",
-                i + 1,
-                unloaded_entry,
-                unloaded_exit,
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-binary row {} has invalid unloaded mass decomposition: entry_mass={}, exit_mass={}",
+                    i + 1,
+                    unloaded_entry,
+                    unloaded_exit,
+                ),
+            });
         }
         validate_unloaded_components_for_loading(
             "latent-binary",
@@ -787,35 +803,41 @@ fn validate_latent_binary_inputs(
         || time_block.design_exit.nrows() != n
         || time_block.design_derivative_exit.nrows() != n
     {
-        return Err(format!(
-            "latent-binary time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
-            n,
-            time_block.design_entry.nrows(),
-            time_block.design_exit.nrows(),
-            time_block.design_derivative_exit.nrows()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-binary time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
+                n,
+                time_block.design_entry.nrows(),
+                time_block.design_exit.nrows(),
+                time_block.design_derivative_exit.nrows()
+            ),
+        });
     }
     if time_block.design_entry.ncols() != p_time
         || time_block.design_derivative_exit.ncols() != p_time
     {
-        return Err(format!(
-            "latent-binary time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
-            time_block.design_entry.ncols(),
-            time_block.design_exit.ncols(),
-            time_block.design_derivative_exit.ncols()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-binary time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
+                time_block.design_entry.ncols(),
+                time_block.design_exit.ncols(),
+                time_block.design_derivative_exit.ncols()
+            ),
+        });
     }
     if time_block.offset_entry.len() != n
         || time_block.offset_exit.len() != n
         || time_block.derivative_offset_exit.len() != n
     {
-        return Err(format!(
-            "latent-binary time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
-            n,
-            time_block.offset_entry.len(),
-            time_block.offset_exit.len(),
-            time_block.derivative_offset_exit.len()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-binary time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
+                n,
+                time_block.offset_entry.len(),
+                time_block.offset_exit.len(),
+                time_block.derivative_offset_exit.len()
+            ),
+        });
     }
     Ok(sigma)
 }
@@ -823,12 +845,12 @@ fn validate_latent_binary_inputs(
 fn prepare_latent_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
-) -> Result<PreparedLatentTimeBlock, String> {
+) -> Result<PreparedLatentTimeBlock, LatentSurvivalError> {
     if !input.structural_monotonicity {
-        return Err(
-            "latent survival requires a structurally monotone time block; non-structural time transforms are unsupported"
+        return Err(LatentSurvivalError::UnsupportedConfiguration {
+            reason: "latent survival requires a structurally monotone time block; non-structural time transforms are unsupported"
                 .to_string(),
-        );
+        });
     }
     let design_entry = input
         .design_entry
@@ -1142,29 +1164,35 @@ fn latent_kernel_sum_log_jet(
     state: LatentKernelPrimaryState,
     directions: &[LatentKernelPrimaryDirection],
     context: &str,
-) -> Result<LatentMultiDirJet, String> {
+) -> Result<LatentMultiDirJet, LatentSurvivalError> {
     let term_lists = latent_kernel_term_lists_for_directions(base_terms, directions);
     let max_k = term_lists
         .iter()
         .flat_map(|terms| terms.iter().map(|term| term.k))
         .max()
         .unwrap_or(0);
-    let bundle = log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k)
-        .map_err(|e| format!("{context} kernel evaluation failed: {e}"))?;
+    let bundle = log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(
+        |e| LatentSurvivalError::NumericalFailure {
+            reason: format!("{context} kernel evaluation failed: {e}"),
+        },
+    )?;
 
-    let evaluate_terms = |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), String> {
-        let mut log_mags = Vec::new();
-        let mut signs = Vec::new();
-        for term in terms {
-            if term.coeff == 0.0 {
-                continue;
-            }
-            if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
-                return Err(format!(
-                    "{context} requires positive finite qdot for exact-event directional terms, got {}",
-                    state.qdot
-                ));
-            }
+    let evaluate_terms =
+        |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
+            let mut log_mags = Vec::new();
+            let mut signs = Vec::new();
+            for term in terms {
+                if term.coeff == 0.0 {
+                    continue;
+                }
+                if term.qdot_power > 0 && !(state.qdot.is_finite() && state.qdot > 0.0) {
+                    return Err(LatentSurvivalError::NumericalFailure {
+                        reason: format!(
+                            "{context} requires positive finite qdot for exact-event directional terms, got {}",
+                            state.qdot
+                        ),
+                    });
+                }
             let log_qdot = if term.qdot_power > 0 {
                 state.qdot.ln()
             } else {
@@ -1186,9 +1214,9 @@ fn latent_kernel_sum_log_jet(
 
     let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
     if !(base_log_sum.is_finite() && base_sign > 0.0) {
-        return Err(format!(
-            "{context} produced a non-positive signed kernel sum"
-        ));
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!("{context} produced a non-positive signed kernel sum"),
+        });
     }
 
     let mut normalized = LatentMultiDirJet::constant(directions.len(), 1.0);
@@ -1353,10 +1381,11 @@ fn latent_survival_row_primary_log_jet(
             terms
         }
         LatentSurvivalEventType::IntervalCensored => {
-            return Err(
-                "latent survival dynamic time derivatives do not implement interval censoring"
+            return Err(LatentSurvivalError::UnsupportedConfiguration {
+                reason: "latent survival dynamic time derivatives do not implement interval censoring"
                     .to_string(),
-            );
+            }
+            .into());
         }
     };
     let numerator = latent_kernel_sum_log_jet(
@@ -2334,7 +2363,7 @@ fn latent_survival_time_jet(
     qdot_exit: f64,
     mu: f64,
     sigma: f64,
-) -> Result<LatentSurvivalTimeJet, String> {
+) -> Result<LatentSurvivalTimeJet, LatentSurvivalError> {
     let (entry_d1, entry_d2, _) = logk_q_derivatives(quadctx, 0, row.mass_entry, mu, sigma)?;
     match row.event_type {
         LatentSurvivalEventType::RightCensored => {
@@ -2348,13 +2377,18 @@ fn latent_survival_time_jet(
         }
         LatentSurvivalEventType::ExactEvent => {
             if !(qdot_exit.is_finite() && qdot_exit > 0.0) {
-                return Err(format!(
-                    "latent survival requires positive finite baseline hazard derivative, got {qdot_exit}"
-                ));
+                return Err(LatentSurvivalError::NumericalFailure {
+                    reason: format!(
+                        "latent survival requires positive finite baseline hazard derivative, got {qdot_exit}"
+                    ),
+                });
             }
             if row.hazard_unloaded > 0.0 {
-                let bundle = log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, 3)
-                    .map_err(|e| format!("latent survival kernel evaluation failed: {e}"))?;
+                let bundle = log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, 3).map_err(
+                    |e| LatentSurvivalError::NumericalFailure {
+                        reason: format!("latent survival kernel evaluation failed: {e}"),
+                    },
+                )?;
                 let (unloaded_d1, unloaded_d2, _) =
                     logk_q_derivatives(quadctx, 0, row.mass_exit, mu, sigma)?;
                 let (loaded_log_d1, loaded_d2, _) =
@@ -2367,10 +2401,10 @@ fn latent_survival_time_jet(
                 let unloaded_weight = (log_unloaded - shift).exp();
                 let normalizer = loaded_weight + unloaded_weight;
                 if !(normalizer.is_finite() && normalizer > 0.0) {
-                    return Err(
-                        "latent survival exact-event numerator became non-finite under loaded/unloaded hazard decomposition"
+                    return Err(LatentSurvivalError::NumericalFailure {
+                        reason: "latent survival exact-event numerator became non-finite under loaded/unloaded hazard decomposition"
                             .to_string(),
-                    );
+                    });
                 }
                 let w_loaded = loaded_weight / normalizer;
                 let w_unloaded = unloaded_weight / normalizer;
@@ -2395,10 +2429,12 @@ fn latent_survival_time_jet(
                 })
             }
         }
-        LatentSurvivalEventType::IntervalCensored => Err(
-            "latent survival dynamic time derivatives do not implement interval censoring"
-                .to_string(),
-        ),
+        LatentSurvivalEventType::IntervalCensored => {
+            Err(LatentSurvivalError::UnsupportedConfiguration {
+                reason: "latent survival dynamic time derivatives do not implement interval censoring"
+                    .to_string(),
+            })
+        }
     }
 }
 
