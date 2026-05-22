@@ -14281,6 +14281,7 @@ fn build_custom_family_inner_assembly<'dp>(
         rho_ext_pair_fn,
         fixed_drift_deriv,
         kkt_residual: inner.kkt_residual.clone(),
+        active_constraints: inner.active_constraints.clone(),
     };
 
     Ok((evaluator, ext_dim))
