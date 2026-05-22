@@ -6586,7 +6586,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         // — anything that would change the right-hand side or the system
         // beyond the additive penalty would invalidate the cache.
         let cache_eligible = gaussian_fixed_cache.is_some()
-            && matches!(likelihood.family, GlmLikelihoodFamily::GaussianIdentity)
+            && likelihood.family.is_gaussian_identity()
             && !config.firth_bias_reduction
             && penalty.coefficient_lower_bounds.is_none()
             && penalty.linear_constraints_original.is_none();

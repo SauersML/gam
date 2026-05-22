@@ -380,6 +380,12 @@ impl GlmLikelihoodFamily {
     pub fn supports_firth(self) -> bool {
         LikelihoodFamily::from(self).supports_firth()
     }
+
+    /// `true` for the Gaussian-identity GLM family.
+    #[inline]
+    pub fn is_gaussian_identity(self) -> bool {
+        matches!(self, Self::GaussianIdentity)
+    }
 }
 
 /// How a likelihood's scale parameter is handled by the fit/result contract.
