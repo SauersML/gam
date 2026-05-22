@@ -1,7 +1,9 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use crate::linalg::utils::{KahanSum, inf_norm};
+use crate::linalg::utils::KahanSum;
+#[cfg(test)]
+use crate::linalg::utils::inf_norm;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
