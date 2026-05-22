@@ -4355,6 +4355,53 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
+    /// Fast-path pullback for the rigid (no flex / no h/w / no dense_correction)
+    /// joint-Hessian directional-derivative path. Takes the 2x2 contracted
+    /// Hessian as a stack `[[f64; 2]; 2]` plus a scalar weight, so the caller
+    /// does not allocate an `Array2` per row.
+    ///
+    /// Equivalent to `add_pullback` with `h[i][j] = t[i][j] * w` but skips the
+    /// `dense_correction` branch — which is `None` whenever this method is
+    /// reached because the flex-inactive path constructs the accumulator from
+    /// `BlockSlices` with no `h`/`w` ranges.
+    fn add_pullback_rigid_2x2(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        row: usize,
+        t: &[[f64; 2]; 2],
+        w: f64,
+    ) {
+        debug_assert!(
+            self.dense_correction.is_none(),
+            "add_pullback_rigid_2x2 called on accumulator with dense_correction"
+        );
+        let h00 = t[0][0] * w;
+        let h11 = t[1][1] * w;
+        let h01 = t[0][1] * w;
+
+        family
+            .marginal_design
+            .syr_row_into(row, h00, &mut self.h_mm)
+            .expect("marginal syr_row_into dimension mismatch");
+
+        family
+            .logslope_design
+            .syr_row_into(row, h11, &mut self.h_gg)
+            .expect("logslope syr_row_into dimension mismatch");
+
+        if h01 != 0.0 {
+            family
+                .marginal_design
+                .row_outer_into_view(
+                    row,
+                    &family.logslope_design,
+                    h01,
+                    self.h_mg.view_mut(),
+                )
+                .expect("marginal-logslope row_outer_into dimension mismatch");
+        }
+    }
+
     fn add_hw_pullback_only(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,

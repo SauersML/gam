@@ -14189,17 +14189,6 @@ fn build_single_smooth_term_realization(
     finish_single_smooth_term_realization(raw)
 }
 
-/// Like `build_single_smooth_term_realization` but reuses a persistent
-/// `BasisWorkspace` for distance-matrix caching across κ proposals.
-fn build_single_smooth_term_realization_withworkspace(
-    data: ArrayView2<'_, f64>,
-    termspec: &SmoothTermSpec,
-    workspace: &mut crate::basis::BasisWorkspace,
-) -> Result<SingleSmoothTermRealization, BasisError> {
-    let raw = build_smooth_design_withworkspace(data, std::slice::from_ref(termspec), workspace)?;
-    finish_single_smooth_term_realization(raw)
-}
-
 fn finish_single_smooth_term_realization(
     raw: RawSmoothDesign,
 ) -> Result<SingleSmoothTermRealization, BasisError> {
