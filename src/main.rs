@@ -8614,13 +8614,15 @@ fn response_interval_from_mean_sd(
     (lower, upper)
 }
 
-fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
+fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, CliError> {
     if a.nrows() != a.ncols() {
-        return Err(format!(
-            "matrix must be square for inversion; got {}x{}",
-            a.nrows(),
-            a.ncols()
-        ));
+        return Err(CliError::Internal {
+            reason: format!(
+                "matrix must be square for inversion; got {}x{}",
+                a.nrows(),
+                a.ncols()
+            ),
+        });
     }
     let n = a.nrows();
     let h = gam::faer_ndarray::FaerArrayView::new(a);
@@ -8629,7 +8631,9 @@ fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         rhs[(i, i)] = 1.0;
     }
     let factor = gam::faer_ndarray::factorize_symmetricwith_fallback(h.as_ref(), Side::Lower)
-        .map_err(|_| "failed to factorize matrix for inversion".to_string())?;
+        .map_err(|_| CliError::Internal {
+            reason: "failed to factorize matrix for inversion".to_string(),
+        })?;
     factor.solve_in_place(rhs.as_mut());
     let mut out = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -8638,7 +8642,9 @@ fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         }
     }
     if out.iter().any(|v| !v.is_finite()) {
-        return Err("inversion produced non-finite entries".to_string());
+        return Err(CliError::Internal {
+            reason: "inversion produced non-finite entries".to_string(),
+        });
     }
     Ok(out)
 }
@@ -8703,25 +8709,32 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
     .expect("external optimizer returned invalid fit metrics")
 }
 
-fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), String> {
+fn write_matrix_csv(path: &Path, mat: &Array2<f64>, prefix: &str) -> Result<(), CliError> {
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(path)
-        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+        .map_err(|e| CliError::FileWriteFailed {
+            reason: format!("failed to create output csv '{}': {e}", path.display()),
+        })?;
     let headers = (0..mat.ncols())
         .map(|j| format!("{prefix}_{j}"))
         .collect::<Vec<_>>();
     wtr.write_record(headers)
-        .map_err(|e| format!("failed to write csv header: {e}"))?;
+        .map_err(|e| CliError::FileWriteFailed {
+            reason: format!("failed to write csv header: {e}"),
+        })?;
     for i in 0..mat.nrows() {
         let row = (0..mat.ncols())
             .map(|j| format!("{:.12}", mat[[i, j]]))
             .collect::<Vec<_>>();
         wtr.write_record(row)
-            .map_err(|e| format!("failed to write csv row {i}: {e}"))?;
+            .map_err(|e| CliError::FileWriteFailed {
+                reason: format!("failed to write csv row {i}: {e}"),
+            })?;
     }
-    wtr.flush()
-        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
+    wtr.flush().map_err(|e| CliError::FileWriteFailed {
+        reason: format!("failed to flush csv writer: {e}"),
+    })?;
     Ok(())
 }
 
