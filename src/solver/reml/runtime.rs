@@ -409,7 +409,7 @@ impl HyperGradientBudget {
         }
         for channel in 0..3 {
             let mut min_recent = f64::INFINITY;
-            let mut max_recent = 0.0;
+            let mut max_recent: f64 = 0.0;
             for sensitivities in self.sensitivity_history.iter() {
                 let value = sensitivities[channel];
                 if !value.is_finite() || value <= 0.0 {
