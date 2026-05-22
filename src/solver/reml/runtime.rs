@@ -502,8 +502,8 @@ impl<'a> RemlState<'a> {
             return None;
         }
         let ceiling = pirls_config.convergence_tolerance;
-        let floor = (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
-            .min(ceiling);
+        let floor =
+            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
         if !(floor > 0.0 && ceiling >= floor) {
             return None;
         }
@@ -554,8 +554,12 @@ impl<'a> RemlState<'a> {
 
         if state.budget.history.len() <= HGB_WARMUP_ITERS {
             state.adaptive_kkt_override = None;
-            if let Ok(mut trace) = state.trace_state.lock() {
-                trace.solve_rel_tol_override = None;
+            match state.trace_state.lock() {
+                Ok(mut trace) => trace.solve_rel_tol_override = None,
+                Err(poisoned) => {
+                    let mut trace = poisoned.into_inner();
+                    trace.solve_rel_tol_override = None;
+                }
             }
             return;
         }
@@ -571,20 +575,22 @@ impl<'a> RemlState<'a> {
         state.budget.target_mse = (HGB_TARGET_FRACTION * previous_grad_norm).powi(2);
         let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state.budget.allocate();
 
-        let ceiling = self.config.convergence_tolerance;
+        let ceiling = self.config.pirls_convergence_tolerance;
         let pirls_floor =
-            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
-                .min(ceiling);
-        let tau_inner = (eps2_inner.sqrt() / state.budget.s_inner)
-            .clamp(pirls_floor, ceiling)
-            .max(0.0);
-        state.adaptive_kkt_override = (tau_inner.is_finite() && tau_inner > 0.0).then_some(tau_inner);
+            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
+        let tau_raw = eps2_inner.sqrt() / state.budget.s_inner;
+        let tau_inner = if pirls_floor > 0.0 && ceiling >= pirls_floor {
+            tau_raw.clamp(pirls_floor, ceiling)
+        } else {
+            tau_raw
+        }
+        .max(0.0);
+        state.adaptive_kkt_override =
+            (tau_inner.is_finite() && tau_inner > 0.0).then_some(tau_inner);
 
         let rel_tol = eps2_linear.sqrt() / state.budget.s_linear;
         let k_target = if eps2_trace > 0.0 && sigma_sq.is_finite() && sigma_sq > 0.0 {
-            (sigma_sq / eps2_trace)
-                .ceil()
-                .clamp(0.0, usize::MAX as f64) as usize
+            (sigma_sq / eps2_trace).ceil().clamp(0.0, usize::MAX as f64) as usize
         } else {
             current_floor
         };
@@ -639,10 +645,12 @@ impl<'a> RemlState<'a> {
         let beta_original = match pirls_result.coordinate_frame {
             pirls::PirlsCoordinateFrame::OriginalSparseNative => polished_solution_beta,
             pirls::PirlsCoordinateFrame::TransformedQs => {
-                if polished_solution_beta.len() != pirls_result.reparam_result.qs.ncols() {
+                if self.active_constraint_free_basis(pirls_result).is_some()
+                    || polished_solution_beta.len() != self.p
+                {
                     return;
                 }
-                pirls_result.reparam_result.qs.dot(&polished_solution_beta)
+                polished_solution_beta
             }
         };
         if beta_original.len() != self.p || beta_original.iter().any(|v| !v.is_finite()) {
@@ -3023,6 +3031,7 @@ impl<'a> RemlState<'a> {
         // the helpers' doc-comments for the per-slot staleness arguments.
         self.clear_warm_start_predictor_state();
         self.clear_warm_start_adaptive_signals();
+        self.reset_hypergradient_budget_controller();
         Ok(())
     }
 
@@ -4346,6 +4355,7 @@ impl<'a> RemlState<'a> {
         self.outer_inner_cap.store(0, Ordering::Relaxed);
         self.screening_max_inner_iterations
             .store(0, Ordering::Relaxed);
+        self.reset_hypergradient_budget_controller();
     }
 
     // Accessor methods for private fields
@@ -4892,19 +4902,24 @@ impl<'a> RemlState<'a> {
                 pirls_config.initial_lm_lambda =
                     adaptive_lm_lambda_hint(cached_lambda, last_iters, last_converged);
             }
-            let adaptive_kkt_tolerance = if !in_screening
-                && let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt)
-            {
-                let ceiling = pirls_config.convergence_tolerance;
-                let floor = (self.config.reml_convergence_tolerance
-                    / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
-                    .min(ceiling);
-                (floor > 0.0 && ceiling >= floor).then_some(pirls::AdaptiveKktTolerance {
-                    eta: ADAPTIVE_KKT_ETA,
-                    floor,
-                    ceiling,
-                    outer_grad_norm,
-                })
+            let adaptive_kkt_tolerance = if !in_screening {
+                if let Some(override_tol) = self.hypergradient_adaptive_kkt_override(&pirls_config)
+                {
+                    Some(override_tol)
+                } else if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
+                    let ceiling = pirls_config.convergence_tolerance;
+                    let floor = (self.config.reml_convergence_tolerance
+                        / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
+                        .min(ceiling);
+                    (floor > 0.0 && ceiling >= floor).then_some(pirls::AdaptiveKktTolerance {
+                        eta: ADAPTIVE_KKT_ETA,
+                        floor,
+                        ceiling,
+                        outer_grad_norm,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -7186,10 +7201,23 @@ impl<'a> RemlState<'a> {
         let prior = self.build_prior(rho, mode);
         self.validate_tk_ext_coords(mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, &assembly.ext_coords)?;
-        let result = assembly
-            .evaluate(rho.as_slice().unwrap(), mode, prior)
-            .map_err(EstimationError::InvalidInput)?;
-        self.apply_tk_to_result(result, tk_terms)
+        let trace_state = self.hypergradient_trace_state();
+        Self::reset_hypergradient_trace_telemetry(&trace_state);
+        let mut inner_solution = assembly.build();
+        inner_solution.stochastic_trace_state = trace_state;
+        let solution_beta = inner_solution.beta.clone();
+        let result = super::assembly::evaluate_solution(
+            &inner_solution,
+            rho.as_slice().unwrap(),
+            mode,
+            prior,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let result = self.apply_tk_to_result(result, tk_terms)?;
+        if let Some(polish_step) = result.inner_polish_step.as_ref() {
+            self.apply_inner_polish_step_to_warm_start(bundle, &solution_beta, polish_step);
+        }
+        Ok(result)
     }
 
     fn assemble_and_evaluate_efs(
@@ -7574,6 +7602,7 @@ impl<'a> RemlState<'a> {
                 &bundle,
                 super::unified::EvalMode::ValueAndGradient,
             )?;
+            let ift_residual_energy = result.ift_residual_energy;
             let grad = result.gradient.unwrap();
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
             log::debug!(
@@ -7582,10 +7611,12 @@ impl<'a> RemlState<'a> {
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
+            self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
             return Ok(grad);
         }
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
+        let ift_residual_energy = result.ift_residual_energy;
         let grad = result.gradient.unwrap();
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         log::debug!(
@@ -7594,6 +7625,7 @@ impl<'a> RemlState<'a> {
             t_assemble.elapsed().as_secs_f64() * 1000.0,
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
+        self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
         Ok(grad)
     }
 
@@ -7691,6 +7723,7 @@ impl<'a> RemlState<'a> {
             self.evaluate_unified(p, &bundle, eval_mode)?
         };
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
+        let ift_residual_energy = result.ift_residual_energy;
 
         let gradient = result.gradient.ok_or_else(|| {
             EstimationError::InvalidInput(format!(
@@ -7720,6 +7753,7 @@ impl<'a> RemlState<'a> {
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
         }
+        self.update_hypergradient_budget_after_outer_eval(p, &eval.gradient, ift_residual_energy);
         self.cache_manager.store_outer_eval(&rho_key, &eval);
         Ok(eval)
     }

@@ -6503,6 +6503,366 @@ fn outer_hessian_entry(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Constraint-tangent-space projection
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// When the inner solver converges at a constrained-stationary point with a
+// non-empty active inequality-constraint set `A_act β = b_act` (k_act rows),
+// the Laplace approximation lives on the tangent manifold `T = β̂ + null(A_act)`.
+// With orthonormal basis `Z ∈ ℝ^{p × m}` for null(A_act) (m = p − k_act), the
+// principled outer LAML objective is
+//
+//   V_T(ρ) = -ℓ(β̂) + ½ β̂ᵀ S(λ) β̂ + ½ log|ZᵀHZ| − ½ log|Zᵀ S(λ) Z|_+ + …
+//
+// (β̂-quadratic terms stay in p-space; β̂ doesn't change under projection.)
+// The gradient is the envelope-theorem derivative at fixed β̂:
+//
+//   ∂_ρ_k V_T = ½ λ_k β̂ᵀ S_k β̂ + ½ tr((ZᵀHZ)⁻¹ Zᵀ(λ_k S_k) Z)
+//             − ½ λ_k tr((ZᵀSZ)⁺ ZᵀS_kZ)
+//
+// Refs: Wood 2011; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2.
+//
+// The implementation strategy: wrap the inner Hessian operator in a
+// tangent-projected adapter that transforms its trace/solve/logdet APIs
+// from p-space to tangent space, recompute `PenaltyLogdetDerivs` for
+// `ZᵀS(λ)Z`, then recurse into the regular `reml_laml_evaluate` with
+// `active_constraints = None`. This routes the entire downstream pipeline
+// (gradient, Hessian, IFT corrections) through the projected operator
+// without duplicating cost/gradient formulas.
+
+/// Orthonormal basis `Z ∈ ℝ^{p × m}` for `null(A_act)` via eigendecomposition
+/// of `A_actᵀ A_act` (PSD; `null(A_actᵀ A_act) = null(A_act)`). Returns
+/// `None` when the active set is empty or the tangent space is empty
+/// (k_act ≥ p).
+fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2<f64>> {
+    let k_act = a_act.nrows();
+    let p = a_act.ncols();
+    if k_act == 0 || k_act >= p {
+        return None;
+    }
+    let ata = a_act.t().dot(a_act);
+    let (evals, evecs) = ata.eigh(faer::Side::Lower).ok()?;
+    let evals_slice = evals.as_slice()?;
+    let threshold = positive_eigenvalue_threshold(evals_slice);
+    // Eigenvalues are ascending; null basis = eigenvectors with σ ≤ threshold.
+    let null_count = evals_slice.iter().filter(|&&s| s <= threshold).count();
+    if null_count == 0 || null_count >= p {
+        return None;
+    }
+    Some(evecs.slice(ndarray::s![.., 0..null_count]).to_owned())
+}
+
+/// Dense `p × p` materialization of a penalty coordinate via canonical
+/// basis vectors. `S_k e_j` is the `j`-th column of `S_k`; assembled into
+/// a p × p matrix. Cost O(p² · matvec).
+fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros((p, p));
+    let mut e_j = Array1::<f64>::zeros(p);
+    for j in 0..p {
+        if j > 0 {
+            e_j[j - 1] = 0.0;
+        }
+        e_j[j] = 1.0;
+        let col = coord.scaled_matvec(&e_j, 1.0);
+        out.column_mut(j).assign(&col);
+    }
+    out
+}
+
+/// Reconstruct the regularized Hessian `H_reg = V · diag(r_ε(σ)) · Vᵀ`
+/// from a `DenseSpectralOperator`. Eigenpairs flagged inactive under
+/// `HardPseudo` are excluded (their `w_factor` columns are zero in the
+/// operator's own kernels, so excluding them here preserves consistency).
+fn assemble_h_reg_dense(op: &DenseSpectralOperator) -> Array2<f64> {
+    let p = op.dim();
+    let mut h = Array2::<f64>::zeros((p, p));
+    for j in 0..p {
+        let r = op.reg_eigenvalue(j);
+        if !op.eigenpair_active(j) || r == 0.0 {
+            continue;
+        }
+        for col in 0..p {
+            let v_col_j = op.eigenvector_entry(col, j);
+            if v_col_j == 0.0 {
+                continue;
+            }
+            let scaled = r * v_col_j;
+            for row in 0..p {
+                h[[row, col]] += op.eigenvector_entry(row, j) * scaled;
+            }
+        }
+    }
+    h
+}
+
+/// Tangent-projected `HessianOperator` adapter. Wraps an `m × m`
+/// `H_T = ZᵀHZ` operator and exposes the `p × p` interface needed by the
+/// existing evaluator pipeline. All p-space inputs are projected via `Z`
+/// before being passed to the tangent operator; outputs are lifted back
+/// via `Z`. By construction this is the constraint-aware pseudo-inverse
+/// `H⁺_T = Z (ZᵀHZ)⁻¹ Zᵀ`, which is bounded independent of σ_min(H)
+/// when σ_min(ZᵀHZ) is bounded.
+struct TangentProjectedHessianOperator {
+    /// Orthonormal basis for null(A_act), `p × m`.
+    z: Array2<f64>,
+    /// `H_T = ZᵀHZ`, re-eigendecomposed with its own `r_ε` regularization.
+    h_t_op: DenseSpectralOperator,
+}
+
+impl HessianOperator for TangentProjectedHessianOperator {
+    fn dim(&self) -> usize {
+        self.z.nrows()
+    }
+    fn logdet(&self) -> f64 {
+        self.h_t_op.logdet()
+    }
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        let r_t = self.z.t().dot(rhs);
+        let q_t = self.h_t_op.solve(&r_t);
+        self.z.dot(&q_t)
+    }
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let r_t = self.z.t().dot(rhs);
+        let q_t = self.h_t_op.solve_multi(&r_t);
+        self.z.dot(&q_t)
+    }
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        // tr(Z H_T⁻¹ Zᵀ · A) = tr(H_T⁻¹ · ZᵀAZ) (cyclic permutation).
+        let zaz = self.z.t().dot(a).dot(&self.z);
+        self.h_t_op.trace_hinv_product(&zaz)
+    }
+    fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
+        // tr(G_ε(H) · A) where H is the wrapped tangent operator.
+        // d log|ZᵀHZ|/dt = tr((ZᵀHZ)⁻¹ · Zᵀ Ḣ Z) → use H_T's logdet kernel
+        // applied to ZᵀḢZ.
+        let zaz = self.z.t().dot(a).dot(&self.z);
+        self.h_t_op.trace_logdet_gradient(&zaz)
+    }
+}
+
+/// Build `PenaltyLogdetDerivs` for `log|ZᵀS(λ)Z|_+`, its first
+/// derivatives, and its second derivatives. The identities are the same
+/// as in p-space, applied to the projected penalty:
+///   value      = log|M(λ)|_+,                M(λ) = ZᵀS(λ)Z = Σ_k λ_k Zᵀ S_k Z
+///   ∂_k value  = λ_k · tr(M⁺ · Zᵀ S_k Z)
+///   ∂²_kl      = δ_{kl} ∂_k value − λ_k λ_l · tr(M⁺ · Zᵀ S_l Z · M⁺ · Zᵀ S_k Z)
+fn tangent_penalty_logdet(
+    z: &Array2<f64>,
+    penalty_coords: &[PenaltyCoordinate],
+    lambdas: &[f64],
+    p: usize,
+) -> Result<PenaltyLogdetDerivs, String> {
+    let m = z.ncols();
+    let k = lambdas.len();
+    let zsz: Vec<Array2<f64>> = penalty_coords
+        .iter()
+        .map(|c| {
+            let s_k_full = materialize_penalty_coord_dense(c, p);
+            z.t().dot(&s_k_full).dot(z)
+        })
+        .collect();
+    let mut s_t = Array2::<f64>::zeros((m, m));
+    for k_idx in 0..k {
+        s_t.scaled_add(lambdas[k_idx], &zsz[k_idx]);
+    }
+    let (evals, evecs) = s_t
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("tangent S eigendecomposition failed: {e}"))?;
+    let evals_slice = evals.as_slice().ok_or_else(|| {
+        "tangent S eigendecomposition returned non-contiguous eigenvalues".to_string()
+    })?;
+    let threshold = positive_eigenvalue_threshold(evals_slice);
+    let value = exact_pseudo_logdet(evals_slice, threshold);
+    // Build M⁺ = Σ_{σ_j > τ} u_j u_jᵀ / σ_j once for first AND second derivatives.
+    let mut s_t_plus = Array2::<f64>::zeros((m, m));
+    for j in 0..m {
+        if evals[j] > threshold {
+            let inv = 1.0 / evals[j];
+            for r in 0..m {
+                let factor = evecs[[r, j]] * inv;
+                for c in 0..m {
+                    s_t_plus[[r, c]] += factor * evecs[[c, j]];
+                }
+            }
+        }
+    }
+    let mut first = Array1::<f64>::zeros(k);
+    for k_idx in 0..k {
+        first[k_idx] = lambdas[k_idx] * trace_matrix_product(&s_t_plus, &zsz[k_idx]);
+    }
+    let mut second = Array2::<f64>::zeros((k, k));
+    // δ_{kl} ∂_k value contribution (from ∂_ρ_l λ_k = λ_k δ_{kl}).
+    for k_idx in 0..k {
+        second[[k_idx, k_idx]] += first[k_idx];
+    }
+    // − λ_k λ_l · tr(M⁺ · Zᵀ S_l Z · M⁺ · Zᵀ S_k Z).
+    let s_plus_zsz: Vec<Array2<f64>> = zsz.iter().map(|m_k| s_t_plus.dot(m_k)).collect();
+    for k_idx in 0..k {
+        for l_idx in 0..=k_idx {
+            let cross = trace_matrix_product(&s_plus_zsz[k_idx], &s_plus_zsz[l_idx]);
+            let entry = -lambdas[k_idx] * lambdas[l_idx] * cross;
+            second[[k_idx, l_idx]] += entry;
+            if l_idx != k_idx {
+                second[[l_idx, k_idx]] += entry;
+            }
+        }
+    }
+    Ok(PenaltyLogdetDerivs {
+        value,
+        first,
+        second: Some(second),
+    })
+}
+
+/// Borrowing adapter that lets a tangent-projected `InnerSolution` reuse
+/// the original `HessianDerivativeProvider` without taking ownership.
+/// The provider returns p-space drift matrices (`D_β H[v]`) which the
+/// tangent-wrapped `HessianOperator` correctly projects via `ZᵀMZ` in
+/// its `trace_logdet_gradient` / `trace_hinv_product` methods. So no
+/// per-method projection is needed here — pure delegation suffices.
+struct BorrowedDerivProvider<'a>(&'a dyn HessianDerivativeProvider);
+
+impl<'a> HessianDerivativeProvider for BorrowedDerivProvider<'a> {
+    fn hessian_derivative_correction(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.0.hessian_derivative_correction(v)
+    }
+    fn hessian_derivative_correction_result(
+        &self,
+        v: &Array1<f64>,
+    ) -> Result<DriftDerivResult, String> {
+        self.0.hessian_derivative_correction_result(v)
+    }
+    fn hessian_derivative_corrections_result(
+        &self,
+        vs: &[Array1<f64>],
+    ) -> Result<Vec<DriftDerivResult>, String> {
+        self.0.hessian_derivative_corrections_result(vs)
+    }
+    fn has_corrections(&self) -> bool {
+        self.0.has_corrections()
+    }
+    fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
+        self.0.outer_hessian_derivative_kernel()
+    }
+    fn family_outer_hessian_operator(
+        &self,
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        self.0.family_outer_hessian_operator()
+    }
+    fn scalar_glm_ingredients(&self) -> Option<ScalarGlmIngredients<'_>> {
+        self.0.scalar_glm_ingredients()
+    }
+}
+
+/// If the inner solution carries a non-empty active inequality-constraint
+/// set, build a tangent-projected solution and dispatch the outer
+/// derivative computation to it. Returns `Ok(None)` when no projection is
+/// required (no active constraints); `Ok(Some(result))` when projection
+/// succeeded and the recursive evaluate returned a value; `Err` only if
+/// projection failed (e.g., dense backend required but not available).
+fn try_tangent_projected_evaluate(
+    solution: &InnerSolution<'_>,
+    rho: &[f64],
+    mode: EvalMode,
+    prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
+) -> Result<Option<RemlLamlResult>, String> {
+    let block = match solution.active_constraints.as_ref() {
+        Some(b) if b.a.nrows() > 0 => b,
+        _ => return Ok(None),
+    };
+    let p = solution.beta.len();
+    if block.a.ncols() != p {
+        return Err(format!(
+            "active_constraints.a has {} columns but β is {}-dim",
+            block.a.ncols(),
+            p
+        ));
+    }
+    let z = match compute_active_constraint_tangent_basis(&block.a) {
+        Some(z) => z,
+        None => {
+            // Constraint matrix spans the full p-space — tangent manifold is
+            // {β̂}. There is no degree of freedom left to optimise over and
+            // the outer LAML cost is the constant `-ℓ(β̂) + ½ β̂ᵀSβ̂`. We
+            // can return a degenerate result, but it's simpler and clearer
+            // to surface the situation.
+            return Err(format!(
+                "active constraint matrix has rank {} on {}-dim space; \
+                 tangent manifold is a single point ({β̂}), no outer \
+                 derivative is defined",
+                block.a.nrows(),
+                p
+            ));
+        }
+    };
+    let ds = solution
+        .hessian_op
+        .as_exact_dense_spectral()
+        .ok_or_else(|| {
+            "tangent-space projection requires a `DenseSpectralOperator` backend; \
+             other backends do not yet expose the raw H needed to form ZᵀHZ"
+                .to_string()
+        })?;
+    let h_full = assemble_h_reg_dense(ds);
+    let h_t = z.t().dot(&h_full).dot(&z);
+    let h_t_op = DenseSpectralOperator::from_symmetric(&h_t)
+        .map_err(|e| format!("tangent H eigendecomposition failed: {e}"))?;
+    let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+    let projected_logdet = tangent_penalty_logdet(&z, &solution.penalty_coords, &lambdas, p)?;
+    // Project the KKT residual to lift the IFT correction into tangent
+    // coordinates: with `q = H⁺_T r = Z (ZᵀHZ)⁻¹ Zᵀ r`, the formulas
+    // `-½ rᵀ q` and `-aᵀ_k q + ½ qᵀ A_k q` are the same as the p-space
+    // formulas (Zᵀ cancels through the operator wrapper). We pass r in
+    // p-space; the wrapper does the projection internally.
+    let projected_kkt = solution
+        .kkt_residual
+        .as_ref()
+        .map(|r| ProjectedKktResidual::from_projected(r.as_array().clone()));
+    let wrapper = TangentProjectedHessianOperator {
+        z: z.clone(),
+        h_t_op,
+    };
+    // Construct the projected InnerSolution. The fields that must be
+    // overridden are: hessian_op (now tangent-wrapped), penalty_logdet
+    // (now in tangent space), hessian_logdet_correction (0; folded into
+    // tangent logdet already), penalty_subspace_trace (None; direct
+    // tangent-H path replaces the kernel route), active_constraints
+    // (None; prevents recursion). Everything else passes through.
+    let projected = InnerSolution {
+        log_likelihood: solution.log_likelihood,
+        penalty_quadratic: solution.penalty_quadratic,
+        hessian_op: Arc::new(wrapper),
+        beta: solution.beta.clone(),
+        penalty_coords: solution.penalty_coords.clone(),
+        penalty_logdet: projected_logdet,
+        deriv_provider: Box::new(BorrowedDerivProvider(solution.deriv_provider.as_ref())),
+        tk_correction: solution.tk_correction,
+        tk_gradient: solution.tk_gradient.clone(),
+        firth: solution.firth.clone(),
+        hessian_logdet_correction: 0.0,
+        penalty_subspace_trace: None,
+        rho_curvature_scale: solution.rho_curvature_scale,
+        rho_prior: solution.rho_prior.clone(),
+        n_observations: solution.n_observations,
+        nullspace_dim: solution.nullspace_dim,
+        dispersion: solution.dispersion.clone(),
+        ext_coords: solution.ext_coords.clone(),
+        ext_coord_pair_fn: None,
+        rho_ext_pair_fn: None,
+        fixed_drift_deriv: None,
+        barrier_config: solution.barrier_config.clone(),
+        kkt_residual: projected_kkt,
+        active_constraints: None,
+        stochastic_trace_state: solution.stochastic_trace_state.clone(),
+    };
+    let result = reml_laml_evaluate(&projected, rho, mode, prior_cost_gradient)?;
+    Ok(Some(result))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  The single evaluator
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -6561,6 +6921,17 @@ pub fn reml_laml_evaluate(
     mode: EvalMode,
     prior_cost_gradient: Option<(f64, Array1<f64>, Option<Array2<f64>>)>,
 ) -> Result<RemlLamlResult, String> {
+    // Constraint-tangent-space dispatch. When the inner converged at a
+    // constrained-stationary point with a non-empty active inequality set,
+    // the principled LAML outer objective lives on `null(A_act)`. Build a
+    // tangent-projected `InnerSolution` (wrapped operator + recomputed
+    // penalty logdet) and recurse with `active_constraints = None`. See
+    // the header comment on `try_tangent_projected_evaluate`.
+    if let Some(result) =
+        try_tangent_projected_evaluate(solution, rho, mode, prior_cost_gradient.clone())?
+    {
+        return Ok(result);
+    }
     let cost_phase_start = std::time::Instant::now();
     let k = rho.len();
     let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
@@ -7581,54 +7952,9 @@ pub fn reml_laml_evaluate(
         }
         .into());
     }
-    // Tangent-projection contract. When the inner converged at a constrained-
-    // stationary point with a non-empty active set, the principled LAML outer
-    // objective lives on the constraint tangent space T = null(A_act):
-    //
-    //     V_T(ρ) = -ℓ(β̂) + ½ β̂ᵀ S(λ) β̂ + ½ log|ZᵀHZ| − ½ log|ZᵀS(λ)Z|_+,
-    //     ∂_k V_T = ½ aᵀ_k β̂ + ½ tr((ZᵀHZ)⁻¹ Zᵀ(λ_k S_k) Z) − ½ ∂_k log|ZᵀSZ|_+
-    //
-    // where Z ∈ ℝ^{p × (p − k_act)} is an orthonormal basis for null(A_act).
-    // Refs: Wood 2011; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2.
-    //
-    // The current evaluator computes the full-space `log|H|`, `log|S|_+`,
-    // and `tr(H⁻¹·∂H/∂ρ)`. Under an active constraint whose normal lies
-    // outside `null(S_k)`, these inflate by O(1/σ_min(H_active_normal))
-    // while the tangent-projected formulas stay bounded. The IFT
-    // correction `−aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r_proj` cannot
-    // repair this (it is independent of the envelope trace and is
-    // identically zero at the cert exit where `r_proj ≈ 0`).
-    //
-    // Until the tangent-projection dispatch lands in reml_laml_evaluate
-    // (Z computation, H_T operator over `ZᵀHZ`, per-coord `ZᵀS_kZ`,
-    // tangent-space penalty log-determinant derivatives), refuse to
-    // silently return a wrong derivative: surface a typed contract error
-    // that names what is missing.
-    if !envelope_suppresses_outputs
-        && matches!(
-            mode,
-            EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian
-        )
-        && solution
-            .active_constraints
-            .as_ref()
-            .is_some_and(|block| block.a.nrows() > 0)
-    {
-        return Err(RemlError::ContractViolation {
-            reason: "REML/LAML outer derivative requested under a non-empty active inequality \
-                     constraint set, but constraint-tangent-space projection is not yet \
-                     plumbed through this evaluator. Principled formulas: \
-                     cost = … + ½ log|ZᵀHZ| − ½ log|ZᵀSZ|_+, \
-                     grad_k = … + ½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z) − ½ ∂_k log|ZᵀSZ|_+, \
-                     with Z = orthonormal basis of null(A_act). The full-space formula \
-                     currently in use inflates by O(1/σ_min(H_active_normal)) when the \
-                     constraint normal is not in null(S_k); the IFT residual correction \
-                     cannot repair the envelope trace. Refs: Wood 2011; Wood–Pya–Säfken \
-                     2016 §3; Marra–Wood 2012 §2"
-                .to_string(),
-        }
-        .into());
-    }
+    // (Active-constraint tangent-space dispatch lives at the very top of
+    // this function; by the time we reach this point we are already on
+    // the post-projection recursion or the unconstrained path.)
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
@@ -14920,7 +15246,10 @@ impl StochasticTraceEstimator {
             }
         }
 
-        self.record_probe_batch(Self::max_probe_variance(m2s.as_slice().unwrap(), n_drawn), n_drawn);
+        self.record_probe_batch(
+            Self::max_probe_variance(m2s.as_slice().unwrap(), n_drawn),
+            n_drawn,
+        );
         self.raise_probe_floor(n_drawn);
         for d in 0..n_coords {
             for e in (d + 1)..n_coords {
