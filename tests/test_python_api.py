@@ -1064,20 +1064,26 @@ def test_torch_additive_recovers_per_smooth_lambda() -> None:
     torch = pytest.importorskip("torch")
     from gamfit.torch import Duchon, fit
 
-    rng = np.random.default_rng(42)
-    n = 400
-    x = np.linspace(0.0, 1.0, n)
-    # Wiggly true function on x1, very smooth (near-linear) true function on x2.
-    f_wiggly = np.sin(8.0 * np.pi * x) + 0.5 * np.cos(12.0 * np.pi * x)
-    f_smooth = 1.5 * x + 0.3
-    y_np = f_wiggly + f_smooth + 0.05 * rng.standard_normal(n)
+    rng = np.random.default_rng(11)
+    n = 1000
+    # Independent uniform covariates so the two smooths are not collinear.
+    x1 = rng.uniform(0.0, 1.0, n)
+    x2 = rng.uniform(0.0, 1.0, n)
+    # Wiggly true function on x1 (sin at 3 cycles), very smooth (near-linear)
+    # true function on x2. The REML criterion should drive λ_1 well below
+    # λ_2 because x2's effect is fully captured by the Duchon m=2 null space
+    # (constant + linear) and demands maximal shrinkage of the wiggly basis.
+    f_wiggly = np.sin(6.0 * np.pi * x1)
+    f_smooth = 0.7 * x2 - 0.3
+    y_np = f_wiggly + f_smooth + 0.1 * rng.standard_normal(n)
 
-    pts = torch.as_tensor(x, dtype=torch.float64).reshape(-1, 1)
+    pts1 = torch.as_tensor(x1, dtype=torch.float64).reshape(-1, 1)
+    pts2 = torch.as_tensor(x2, dtype=torch.float64).reshape(-1, 1)
     y = torch.as_tensor(y_np, dtype=torch.float64)
-    centers = torch.linspace(0.0, 1.0, 25, dtype=torch.float64).reshape(-1, 1)
+    centers = torch.linspace(0.0, 1.0, 20, dtype=torch.float64).reshape(-1, 1)
 
     result = fit(
-        points=[pts, pts],
+        points=[pts1, pts2],
         response=y,
         smooths=[Duchon(centers=centers, m=2), Duchon(centers=centers, m=2)],
     )
