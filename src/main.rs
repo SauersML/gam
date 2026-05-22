@@ -8920,40 +8920,51 @@ fn prepend_id_column_to_prediction_csv(
 /// element, formatting every value to 12 decimal places.
 ///
 /// All columns must have the same length.  An empty column list is an error.
-fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> Result<(), String> {
+fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> CliResult<()> {
     if columns.is_empty() {
-        return Err("internal error: write_prediction_csv_unified called with no columns".into());
+        return Err(CliError::Internal {
+            reason: "internal error: write_prediction_csv_unified called with no columns"
+                .to_string(),
+        });
     }
     let n = columns[0].1.len();
     for (name, data) in columns.iter() {
         if data.len() != n {
-            return Err(format!(
-                "internal error: column '{}' has length {} but expected {}",
-                name,
-                data.len(),
-                n,
-            ));
+            return Err(CliError::Internal {
+                reason: format!(
+                    "internal error: column '{}' has length {} but expected {}",
+                    name,
+                    data.len(),
+                    n,
+                ),
+            });
         }
     }
 
     let mut wtr = WriterBuilder::new()
         .has_headers(true)
         .from_path(path)
-        .map_err(|e| format!("failed to create output csv '{}': {e}", path.display()))?;
+        .map_err(|e| CliError::FileWriteFailed {
+            reason: format!("failed to create output csv '{}': {e}", path.display()),
+        })?;
 
     let headers: Vec<&str> = columns.iter().map(|(name, _)| *name).collect();
     wtr.write_record(&headers)
-        .map_err(|e| format!("failed writing csv header: {e}"))?;
+        .map_err(|e| CliError::FileWriteFailed {
+            reason: format!("failed writing csv header: {e}"),
+        })?;
 
     // Validate all prediction values are finite before writing.
     // NaN or Inf in clinical output would be dangerous.
     for (col_name, data) in columns {
         for (i, val) in data.iter().enumerate() {
             if !val.is_finite() {
-                return Err(format!(
-                    "non-finite prediction value in column '{}' at row {}: {}",
-                    col_name, i, val
-                ));
+                return Err(CliError::Internal {
+                    reason: format!(
+                        "non-finite prediction value in column '{}' at row {}: {}",
+                        col_name, i, val
+                    ),
+                });
             }
         }
     }
@@ -8964,11 +8975,14 @@ fn write_prediction_csv_unified(path: &Path, columns: &[(&str, &[f64])]) -> Resu
             .map(|(_, data)| format!("{:.12}", data[i]))
             .collect();
         wtr.write_record(&row)
-            .map_err(|e| format!("failed writing csv row {i}: {e}"))?;
+            .map_err(|e| CliError::FileWriteFailed {
+                reason: format!("failed writing csv row {i}: {e}"),
+            })?;
     }
 
-    wtr.flush()
-        .map_err(|e| format!("failed to flush csv writer: {e}"))?;
+    wtr.flush().map_err(|e| CliError::FileWriteFailed {
+        reason: format!("failed to flush csv writer: {e}"),
+    })?;
     Ok(())
 }
 
@@ -9021,7 +9035,7 @@ fn write_prediction_csv(
         });
     }
 
-    write_prediction_csv_unified(path, &cols).map_err(|reason| CliError::FileWriteFailed { reason })
+    write_prediction_csv_unified(path, &cols)
 }
 
 /// Convenience wrapper for Gaussian location-scale predictions (always
@@ -9033,7 +9047,7 @@ fn write_gaussian_location_scale_prediction_csv(
     sigma: ArrayView1<'_, f64>,
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
     let mean_v: Vec<f64> = mean.to_vec();
     let sigma_v: Vec<f64> = sigma.to_vec();
@@ -9046,17 +9060,18 @@ fn write_gaussian_location_scale_prediction_csv(
     if let Some(lo) = mean_lower {
         lo_v = lo.to_vec();
         hi_v = mean_upper
-            .ok_or_else(|| {
-                "internal error: mean_upper missing while mean_lower is present".to_string()
+            .ok_or_else(|| CliError::Internal {
+                reason: "internal error: mean_upper missing while mean_lower is present"
+                    .to_string(),
             })?
             .to_vec();
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if mean_upper.is_some() {
-        return Err(
-            "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
+        return Err(CliError::Internal {
+            reason: "internal error: gaussian location-scale output requires both mean_lower and mean_upper"
                 .to_string(),
-        );
+        });
     }
 
     write_prediction_csv_unified(path, &cols)
@@ -9071,7 +9086,7 @@ fn write_survival_prediction_csv(
     eta_se: Option<ArrayView1<'_, f64>>,
     survival_lower: Option<ArrayView1<'_, f64>>,
     survival_upper: Option<ArrayView1<'_, f64>>,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
     let surv_v: Vec<f64> = survival_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let risk_v: Vec<f64> = eta_v.clone();
@@ -9108,13 +9123,15 @@ fn write_survival_prediction_csv(
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if survival_lower.is_some() {
-        return Err(
-            "internal error: survival_upper missing while survival_lower is present".to_string(),
-        );
+        return Err(CliError::Internal {
+            reason: "internal error: survival_upper missing while survival_lower is present"
+                .to_string(),
+        });
     } else if survival_upper.is_some() {
-        return Err(
-            "internal error: survival_lower missing while survival_upper is present".to_string(),
-        );
+        return Err(CliError::Internal {
+            reason: "internal error: survival_lower missing while survival_upper is present"
+                .to_string(),
+        });
     }
 
     write_prediction_csv_unified(path, &cols)
