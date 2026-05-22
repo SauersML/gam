@@ -4892,38 +4892,61 @@ fn binomial_location_scale_core(
     let el_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
     let ew_slice = etawiggle.map(|w| w.as_slice().expect("etawiggle must be contiguous"));
 
-    let rows: Vec<BinomialLocationScaleRow> = (0..n)
+    // Write each row's seven scalar derivatives directly into preallocated
+    // output buffers in parallel, reducing the per-row log-likelihood
+    // alongside. The previous path collected a `Vec<BinomialLocationScaleRow>`
+    // (8 scalar fields plus alignment) and then serially scattered into the
+    // seven `Array1`s, which at biobank scale n=3e5 cost ~50 MB of transient
+    // allocation and a single-threaded post-pass.
+    let mut sigma = vec![0.0_f64; n];
+    let mut dsigma_deta = vec![0.0_f64; n];
+    let mut q0 = vec![0.0_f64; n];
+    let mut mu = vec![0.0_f64; n];
+    let mut dmu_dq = vec![0.0_f64; n];
+    let mut d2mu_dq2 = vec![0.0_f64; n];
+    let mut d3mu_dq3 = vec![0.0_f64; n];
+
+    /// Wrapper to send raw pointers across threads for disjoint per-row writes.
+    /// SAFETY: each parallel iteration writes to a unique index `i`, and the
+    /// caller ensures the pointers outlive the parallel region.
+    #[derive(Clone, Copy)]
+    struct SendPtr(*mut f64);
+    unsafe impl Send for SendPtr {}
+    unsafe impl Sync for SendPtr {}
+
+    let sigma_p = SendPtr(sigma.as_mut_ptr());
+    let dsigma_p = SendPtr(dsigma_deta.as_mut_ptr());
+    let q0_p = SendPtr(q0.as_mut_ptr());
+    let mu_p = SendPtr(mu.as_mut_ptr());
+    let dmu_p = SendPtr(dmu_dq.as_mut_ptr());
+    let d2mu_p = SendPtr(d2mu_dq2.as_mut_ptr());
+    let d3mu_p = SendPtr(d3mu_dq3.as_mut_ptr());
+
+    let ll = (0..n)
         .into_par_iter()
         .map(|i| {
-            binomial_location_scalerow(
+            let row = binomial_location_scalerow(
                 y_slice[i],
                 w_slice[i],
                 et_slice[i],
                 el_slice[i],
                 ew_slice.map_or(0.0, |w| w[i]),
                 link_kind,
-            )
+            )?;
+            // SAFETY: index `i` is unique across the parallel iter; each pointer
+            // targets a distinct preallocated buffer of length `n`.
+            unsafe {
+                *sigma_p.0.add(i) = row.sigma;
+                *dsigma_p.0.add(i) = row.dsigma_deta;
+                *q0_p.0.add(i) = row.q0;
+                *mu_p.0.add(i) = row.inverse_link.mu;
+                *dmu_p.0.add(i) = row.inverse_link.d1;
+                *d2mu_p.0.add(i) = row.inverse_link.d2;
+                *d3mu_p.0.add(i) = row.inverse_link.d3;
+            }
+            Ok::<f64, String>(row.ll)
         })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let mut sigma = Vec::with_capacity(n);
-    let mut dsigma_deta = Vec::with_capacity(n);
-    let mut q0 = Vec::with_capacity(n);
-    let mut mu = Vec::with_capacity(n);
-    let mut dmu_dq = Vec::with_capacity(n);
-    let mut d2mu_dq2 = Vec::with_capacity(n);
-    let mut d3mu_dq3 = Vec::with_capacity(n);
-    let mut ll = 0.0_f64;
-    for row in rows {
-        sigma.push(row.sigma);
-        dsigma_deta.push(row.dsigma_deta);
-        q0.push(row.q0);
-        mu.push(row.inverse_link.mu);
-        dmu_dq.push(row.inverse_link.d1);
-        d2mu_dq2.push(row.inverse_link.d2);
-        d3mu_dq3.push(row.inverse_link.d3);
-        ll += row.ll;
-    }
+        .try_reduce(|| 0.0_f64, |a, b| Ok(a + b))?;
 
     Ok(BinomialLocationScaleCore {
         sigma: Array1::from_vec(sigma),
