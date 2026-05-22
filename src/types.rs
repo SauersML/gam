@@ -215,6 +215,269 @@ impl Default for RhoPrior {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Unified likelihood specification (in-progress migration)
+// ---------------------------------------------------------------------------
+//
+// The codebase historically carries two parallel selectors:
+//
+//   * `LikelihoodFamily` — a flat enum mixing response distribution and link
+//     (e.g. `BinomialLogit`, `BinomialProbit`, `PoissonLog`).
+//   * `InverseLink` — a parameterized inverse-link selector (Standard,
+//     LatentCLogLog, Sas, BetaLogistic, Mixture).
+//
+// These two have to be kept consistent at every call site, which has caused
+// real drift bugs. The principled refactor is:
+//
+//   pub struct LikelihoodSpec { response: ResponseFamily, link: InverseLink }
+//
+// where `ResponseFamily` is a pure distribution selector
+// (`Gaussian | Binomial | Poisson | Gamma | RoystonParmar`) and every existing
+// `LikelihoodFamily` variant decomposes uniquely into the (response, link)
+// pair.
+//
+// MIGRATION PLAN (multi-phase):
+//
+//   Phase 1 (LANDED):
+//     - Introduce `ResponseFamily` and `LikelihoodSpec` alongside the legacy
+//       `LikelihoodFamily`.
+//     - Bidirectional conversion: `From<LikelihoodFamily> for LikelihoodSpec`
+//       (total) and `TryFrom<LikelihoodSpec> for LikelihoodFamily` (fails on
+//       (response, link) pairs that have no legacy variant — currently only
+//       Royston-Parmar with a non-identity link).
+//     - Mirror the 7 typed predicates on `LikelihoodSpec` so leaf modules can
+//       switch over without losing semantics.
+//     - Compatibility shim only. Zero behavior change. `cargo check` clean.
+//
+//   Phase 2 (LANDED, demonstration):
+//     - Migrated `src/families/family_meta.rs` and
+//       `src/families/survival_predict.rs` — the two smallest leaf modules — to
+//       use `LikelihoodSpec` predicates internally while their public APIs
+//       still accept `LikelihoodFamily` (bridged via `.into()` at entry).
+//
+//   Phase 3 (FUTURE):
+//     - Migrate remaining leaves (`solver/mixture_link`, `inference/probability`,
+//       `inference/generative`, `inference/sample`, `inference/formula_dsl`)
+//       upward to `solver/reml/runtime`, `solver/workflow`, `inference/model`.
+//
+//   Phase 4 (FUTURE):
+//     - Migrate the four large hubs in dependency order:
+//       `inference/quadrature.rs` → `families/strategy.rs` → `inference/predict.rs`
+//       → `inference/hmc.rs` → `solver/estimate.rs` → `solver/pirls.rs` →
+//       `terms/smooth.rs` → `src/main.rs`.
+//
+//   Phase 5 (FUTURE):
+//     - Once every site reads from `LikelihoodSpec`, replace remaining storage
+//       of `LikelihoodFamily` with `LikelihoodSpec` and delete the legacy enum
+//       (or keep as a thin newtype if serialized configs need a stable name).
+//
+// Predicate semantics on `LikelihoodSpec`:
+//   * `is_binomial`         <=> response == Binomial
+//   * `is_gaussian_identity`<=> response == Gaussian && link == Identity
+//   * `is_royston_parmar`   <=> response == RoystonParmar
+//   * `is_latent_cloglog`   <=> response == Binomial && link matches LatentCLogLog
+//   * `is_binomial_mixture` <=> response == Binomial && link matches Mixture
+//   * `is_binomial_sas`     <=> response == Binomial && link matches Sas
+//   * `is_binomial_beta_logistic` <=> response == Binomial && link matches BetaLogistic
+//
+// These mirror `LikelihoodFamily`'s predicates one-for-one. Any code that holds
+// both a `LikelihoodFamily` and an `InverseLink` should convert to
+// `LikelihoodSpec` ASAP so the two cannot drift.
+
+/// Pure response distribution selector — no link information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResponseFamily {
+    Gaussian,
+    Binomial,
+    Poisson,
+    Gamma,
+    RoystonParmar,
+}
+
+impl ResponseFamily {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gaussian => "gaussian",
+            Self::Binomial => "binomial",
+            Self::Poisson => "poisson",
+            Self::Gamma => "gamma",
+            Self::RoystonParmar => "royston-parmar",
+        }
+    }
+}
+
+/// Unified likelihood specification: response distribution + parameterized link.
+///
+/// This is the target replacement for `LikelihoodFamily`. During migration both
+/// types coexist; `From<LikelihoodFamily> for LikelihoodSpec` decomposes a
+/// legacy variant into the (response, link) pair, and
+/// `TryFrom<LikelihoodSpec> for LikelihoodFamily` reconstructs a legacy variant
+/// when one exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LikelihoodSpec {
+    pub response: ResponseFamily,
+    pub link: InverseLink,
+}
+
+impl LikelihoodSpec {
+    #[inline]
+    pub fn new(response: ResponseFamily, link: InverseLink) -> Self {
+        Self { response, link }
+    }
+
+    #[inline]
+    pub fn link_function(&self) -> LinkFunction {
+        self.link.link_function()
+    }
+
+    #[inline]
+    pub fn is_binomial(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+    }
+
+    #[inline]
+    pub fn is_gaussian_identity(&self) -> bool {
+        matches!(self.response, ResponseFamily::Gaussian)
+            && matches!(self.link, InverseLink::Standard(LinkFunction::Identity))
+    }
+
+    #[inline]
+    pub fn is_royston_parmar(&self) -> bool {
+        matches!(self.response, ResponseFamily::RoystonParmar)
+    }
+
+    #[inline]
+    pub fn is_latent_cloglog(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+            && matches!(self.link, InverseLink::LatentCLogLog(_))
+    }
+
+    #[inline]
+    pub fn is_binomial_mixture(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+            && matches!(self.link, InverseLink::Mixture(_))
+    }
+
+    #[inline]
+    pub fn is_binomial_sas(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+            && matches!(self.link, InverseLink::Sas(_))
+    }
+
+    #[inline]
+    pub fn is_binomial_beta_logistic(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+            && matches!(self.link, InverseLink::BetaLogistic(_))
+    }
+
+    /// Default scale metadata for this (response, link). Mirrors
+    /// `LikelihoodFamily::default_scale_metadata` for the response.
+    #[inline]
+    pub fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
+        match self.response {
+            ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
+            ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
+            ResponseFamily::Binomial | ResponseFamily::Poisson => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
+            ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
+        }
+    }
+}
+
+impl From<LikelihoodFamily> for LikelihoodSpec {
+    fn from(value: LikelihoodFamily) -> Self {
+        let response = match value {
+            LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
+            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
+            LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
+            LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
+            LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialLatentCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture => ResponseFamily::Binomial,
+        };
+        // For the standard scalar-link variants we can build a Standard(link)
+        // directly. For the parameterized variants we synthesize a default
+        // state, since the legacy `LikelihoodFamily` does not carry one. Call
+        // sites that need the real parameterized state must build
+        // `LikelihoodSpec` directly with the live `InverseLink`.
+        let link = match value {
+            LikelihoodFamily::GaussianIdentity | LikelihoodFamily::RoystonParmar => {
+                InverseLink::Standard(LinkFunction::Identity)
+            }
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+                InverseLink::Standard(LinkFunction::Log)
+            }
+            LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
+            LikelihoodFamily::BinomialProbit => InverseLink::Standard(LinkFunction::Probit),
+            LikelihoodFamily::BinomialCLogLog => InverseLink::Standard(LinkFunction::CLogLog),
+            LikelihoodFamily::BinomialLatentCLogLog => {
+                InverseLink::LatentCLogLog(LatentCLogLogState { latent_sd: 0.0 })
+            }
+            LikelihoodFamily::BinomialSas => InverseLink::Sas(SasLinkState {
+                epsilon: 0.0,
+                log_delta: 0.0,
+                delta: 1.0,
+            }),
+            LikelihoodFamily::BinomialBetaLogistic => InverseLink::BetaLogistic(SasLinkState {
+                epsilon: 0.0,
+                log_delta: 0.0,
+                delta: 1.0,
+            }),
+            LikelihoodFamily::BinomialMixture => InverseLink::Mixture(MixtureLinkState {
+                components: Vec::new(),
+                rho: Array1::zeros(0),
+                pi: Array1::zeros(0),
+            }),
+        };
+        Self { response, link }
+    }
+}
+
+impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
+    type Error = &'static str;
+
+    fn try_from(value: LikelihoodSpec) -> Result<Self, Self::Error> {
+        match (value.response, &value.link) {
+            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
+                Ok(Self::GaussianIdentity)
+            }
+            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
+                Ok(Self::PoissonLog)
+            }
+            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => {
+                Ok(Self::GammaLog)
+            }
+            (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
+                Ok(Self::RoystonParmar)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+                Ok(Self::BinomialLogit)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                Ok(Self::BinomialProbit)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+                Ok(Self::BinomialCLogLog)
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                Ok(Self::BinomialLatentCLogLog)
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => Ok(Self::BinomialSas),
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+                Ok(Self::BinomialBetaLogistic)
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => Ok(Self::BinomialMixture),
+            _ => Err("no legacy LikelihoodFamily variant matches this (response, link) pair"),
+        }
+    }
+}
+
 /// Engine-level likelihood selector used by generic APIs.
 /// Some families remain restricted to domain-specific entrypoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
