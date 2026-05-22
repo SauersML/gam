@@ -342,6 +342,64 @@ fn safe_fast_xt_diag_x_with_parallelism(
     fast_xt_diag_x_with_parallelism(x, &sanitized, par)
 }
 
+/// Horvitz-Thompson outer-subsample row mask. When `mask` is `None` this
+/// returns `weighted_crossprod_dense(left, weights, right)` verbatim, which is
+/// the byte-identical pre-refactor expression. When `mask` is `Some(m)`, the
+/// per-row weight `weights[i]` is replaced by `weights[i] * m[i]` before the
+/// cross product. The math invariant is that each survival-LS assembly site
+/// is row-additive — `Σ_i x_i y_iᵀ · w_i` — so per-row HT-masking is unbiased.
+#[inline]
+fn mxtwx(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+    mask: Option<&Array1<f64>>,
+) -> Result<Array2<f64>, String> {
+    match mask {
+        Some(m) => weighted_crossprod_dense(left, &(weights * m), right),
+        None => weighted_crossprod_dense(left, weights, right),
+    }
+}
+
+#[inline]
+fn mxtwx_with_parallelism(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+    par: faer::Par,
+    mask: Option<&Array1<f64>>,
+) -> Result<Array2<f64>, String> {
+    match mask {
+        Some(m) => weighted_crossprod_dense_with_parallelism(left, &(weights * m), right, par),
+        None => weighted_crossprod_dense_with_parallelism(left, weights, right, par),
+    }
+}
+
+#[inline]
+fn mxtwxd(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    mask: Option<&Array1<f64>>,
+) -> Array2<f64> {
+    match mask {
+        Some(m) => safe_fast_xt_diag_x(x, &(weights * m)),
+        None => safe_fast_xt_diag_x(x, weights),
+    }
+}
+
+#[inline]
+fn mxtwxd_with_parallelism(
+    x: &Array2<f64>,
+    weights: &Array1<f64>,
+    par: faer::Par,
+    mask: Option<&Array1<f64>>,
+) -> Array2<f64> {
+    match mask {
+        Some(m) => safe_fast_xt_diag_x_with_parallelism(x, &(weights * m), par),
+        None => safe_fast_xt_diag_x_with_parallelism(x, weights, par),
+    }
+}
+
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
 /// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
 /// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
