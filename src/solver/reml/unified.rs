@@ -17499,6 +17499,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17632,6 +17633,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: Some(ProjectedKktResidual::from_projected(array![0.0, 0.0])),
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17712,8 +17714,7 @@ mod tests {
         let beta_hat = array![xty[0] / h_mat[[0, 0]], xty[1] / h_mat[[1, 1]], 0.5];
 
         let a_act = array![[0.0, 0.0, 1.0]];
-        let b_act = array![0.5];
-        let active = ActiveLinearConstraintBlock { a: a_act, b: b_act };
+        let active = ActiveLinearConstraintBlock { a: a_act };
 
         let mut sol = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true);
         sol.dispersion = DispersionHandling::Fixed {
@@ -17814,6 +17815,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let err = match reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -17872,6 +17874,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
@@ -18208,6 +18211,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18500,6 +18504,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18641,6 +18646,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -18783,6 +18789,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho = vec![0.0_f64; k];
         let result =
@@ -18958,6 +18965,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
@@ -19058,6 +19066,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
         let rho = [lambda.ln()];
 
@@ -19221,6 +19230,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let rho = [0.0]; // λ = 1
@@ -19281,6 +19291,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let result = reml_laml_evaluate(&solution, &[], EvalMode::ValueOnly, None).unwrap();
@@ -19387,6 +19398,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         };
 
         let result =
@@ -19465,6 +19477,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -19667,6 +19680,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -19720,6 +19734,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -21442,6 +21457,7 @@ mod tests {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -21764,6 +21780,7 @@ mod tests {
             barrier_config: None,
             kkt_residual,
             active_constraints: None,
+            monotone_probe_floor: Arc::new(Mutex::new(0)),
         }
     }
 
