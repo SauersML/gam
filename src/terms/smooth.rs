@@ -54,6 +54,71 @@ use std::ops::Range;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
+// ---------------------------------------------------------------------------
+// Typed errors
+// ---------------------------------------------------------------------------
+
+/// Typed errors emitted by smooth-term helpers in this module. `Display`
+/// reproduces the exact pre-refactor `format!(...)` text byte-for-byte, so
+/// string-matching callers (tests, log assertions) keep working unchanged.
+/// Public boundaries that interface with `term_builder.rs` / `construction`
+/// continue to return `Result<_, String>`; typed `Err(...)` values flow
+/// through `From<SmoothError> for String` at those boundaries via `.into()`.
+#[derive(Clone, Debug)]
+pub enum SmoothError {
+    /// Spec-level configuration error: unfrozen knots/centers, invalid
+    /// numeric bounds on coefficient priors, length-scale optimizer options
+    /// that violate `min > 0 < max` / `min < max` invariants, etc.
+    InvalidConfig { reason: String },
+    /// Shape / length disagreement between design columns, penalty blocks,
+    /// coefficient ranges, directional-derivative vectors, theta length, and
+    /// other bookkeeping invariants that are checked at runtime.
+    DimensionMismatch { reason: String },
+    /// Out-of-range index into adaptive hyperparameter components, psi
+    /// derivative blocks, or non-zero block indices for single-block
+    /// custom-family impls that only support `block_idx == 0`.
+    InvalidIndex { reason: String },
+}
+
+impl std::fmt::Display for SmoothError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SmoothError::InvalidConfig { reason }
+            | SmoothError::DimensionMismatch { reason }
+            | SmoothError::InvalidIndex { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SmoothError {}
+
+impl From<SmoothError> for String {
+    fn from(err: SmoothError) -> String {
+        err.to_string()
+    }
+}
+
+impl SmoothError {
+    #[inline]
+    fn invalid_config(reason: impl Into<String>) -> Self {
+        SmoothError::InvalidConfig {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn dimension_mismatch(reason: impl Into<String>) -> Self {
+        SmoothError::DimensionMismatch {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn invalid_index(reason: impl Into<String>) -> Self {
+        SmoothError::InvalidIndex {
+            reason: reason.into(),
+        }
+    }
+}
+
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
         CenterStrategy::Auto(inner) => describe_thin_plate_center_request(inner),
@@ -427,44 +492,49 @@ impl TermCollectionSpec {
             if let (Some(min), Some(max)) = (linear.coefficient_min, linear.coefficient_max)
                 && (!min.is_finite() || !max.is_finite() || min > max)
             {
-                return Err(format!(
+                return Err(SmoothError::invalid_config(format!(
                     "{label} linear term '{}' has invalid coefficient constraint [{min}, {max}]",
                     linear.name
-                ));
+                ))
+                .into());
             }
             if let Some(min) = linear.coefficient_min
                 && !min.is_finite()
             {
-                return Err(format!(
+                return Err(SmoothError::invalid_config(format!(
                     "{label} linear term '{}' has non-finite coefficient minimum {min}",
                     linear.name
-                ));
+                ))
+                .into());
             }
             if let Some(max) = linear.coefficient_max
                 && !max.is_finite()
             {
-                return Err(format!(
+                return Err(SmoothError::invalid_config(format!(
                     "{label} linear term '{}' has non-finite coefficient maximum {max}",
                     linear.name
-                ));
+                ))
+                .into());
             }
             if let LinearCoefficientGeometry::Bounded { min, max, prior } =
                 &linear.coefficient_geometry
             {
                 if !min.is_finite() || !max.is_finite() || min >= max {
-                    return Err(format!(
+                    return Err(SmoothError::invalid_config(format!(
                         "{label} bounded term '{}' has invalid bounds [{min}, {max}]",
                         linear.name
-                    ));
+                    ))
+                    .into());
                 }
                 match prior {
                     BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
-                            return Err(format!(
+                            return Err(SmoothError::invalid_config(format!(
                                 "{label} bounded term '{}' has invalid Beta prior ({a}, {b})",
                                 linear.name
-                            ));
+                            ))
+                            .into());
                         }
                     }
                 }
@@ -477,60 +547,67 @@ impl TermCollectionSpec {
                         spec.knotspec,
                         BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
                     ) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: BSpline knotspec must be Provided or PeriodicUniform",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::ThinPlate { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: ThinPlate centers must be UserProvided",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                     if matches!(
                         spec.identifiability,
                         SpatialIdentifiability::OrthogonalToParametric
                     ) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: ThinPlate identifiability must be FrozenTransform or None",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::Sphere { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Sphere centers must be UserProvided",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::Matern { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Matern centers must be UserProvided",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::Duchon { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Duchon centers must be UserProvided",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                     if matches!(
                         spec.identifiability,
                         SpatialIdentifiability::OrthogonalToParametric
                     ) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::TensorBSpline { spec, .. } => {
@@ -539,20 +616,22 @@ impl TermCollectionSpec {
                             marginal.knotspec,
                             BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
                         ) {
-                            return Err(format!(
+                            return Err(SmoothError::invalid_config(format!(
                                 "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided or PeriodicUniform",
                                 st.name, dim
-                            ));
+                            ))
+                            .into());
                         }
                     }
                     if matches!(
                         spec.identifiability,
                         TensorBSplineIdentifiability::SumToZero
                     ) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::FactorSmooth { spec } => {
@@ -560,26 +639,29 @@ impl TermCollectionSpec {
                         spec.marginal.knotspec,
                         BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
                     ) {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: factor-smooth marginal knotspec must be Provided or PeriodicUniform",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                     if spec.group_frozen_levels.is_none() {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: factor smooth missing group_frozen_levels",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                 }
                 SmoothBasisSpec::BySmooth { smooth, by_kind } => {
                     if let ByVarKind::Factor { frozen_levels, .. } = by_kind
                         && frozen_levels.is_none()
                     {
-                        return Err(format!(
+                        return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: factor by-smooth missing frozen_levels",
                             st.name
-                        ));
+                        ))
+                        .into());
                     }
                     let nested = TermCollectionSpec {
                         linear_terms: vec![],
@@ -597,10 +679,11 @@ impl TermCollectionSpec {
 
         for rt in &self.random_effect_terms {
             if rt.frozen_levels.is_none() {
-                return Err(format!(
+                return Err(SmoothError::invalid_config(format!(
                     "{label} random-effect term '{}' is not frozen: missing frozen_levels",
                     rt.name
-                ));
+                ))
+                .into());
             }
         }
 
@@ -2523,34 +2606,39 @@ impl SpatialLengthScaleOptimizationOptions {
     /// NaN-propagation inside the outer optimizer.
     pub fn validate(&self) -> Result<(), String> {
         if !self.min_length_scale.is_finite() || self.min_length_scale <= 0.0 {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "SpatialLengthScaleOptimizationOptions::min_length_scale must be > 0 and finite, got {}",
                 self.min_length_scale
-            ));
+            ))
+            .into());
         }
         if !self.max_length_scale.is_finite() || self.max_length_scale <= 0.0 {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "SpatialLengthScaleOptimizationOptions::max_length_scale must be > 0 and finite, got {}",
                 self.max_length_scale
-            ));
+            ))
+            .into());
         }
         if self.min_length_scale >= self.max_length_scale {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "SpatialLengthScaleOptimizationOptions requires min_length_scale < max_length_scale, got min={} max={}",
                 self.min_length_scale, self.max_length_scale
-            ));
+            ))
+            .into());
         }
         if !self.rel_tol.is_finite() || self.rel_tol <= 0.0 {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "SpatialLengthScaleOptimizationOptions::rel_tol must be > 0 and finite, got {}",
                 self.rel_tol
-            ));
+            ))
+            .into());
         }
         if !self.log_step.is_finite() || self.log_step <= 0.0 {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "SpatialLengthScaleOptimizationOptions::log_step must be > 0 and finite, got {}",
                 self.log_step
-            ));
+            ))
+            .into());
         }
         Ok(())
     }
@@ -9495,7 +9583,11 @@ impl SpatialAdaptiveExactFamily {
                     betahessian,
                 ))
             }
-            _ => Err(format!("invalid adaptive component index {}", component)),
+            _ => Err(SmoothError::invalid_index(format!(
+                "invalid adaptive component index {}",
+                component
+            ))
+            .into()),
         }
     }
 
@@ -9596,7 +9688,11 @@ impl SpatialAdaptiveExactFamily {
                     betahessian,
                 ))
             }
-            _ => Err(format!("invalid adaptive component index {}", component)),
+            _ => Err(SmoothError::invalid_index(format!(
+                "invalid adaptive component index {}",
+                component
+            ))
+            .into()),
         }
     }
 
@@ -9697,7 +9793,11 @@ impl SpatialAdaptiveExactFamily {
                     betahessian,
                 ))
             }
-            _ => Err(format!("invalid adaptive component index {}", component)),
+            _ => Err(SmoothError::invalid_index(format!(
+                "invalid adaptive component index {}",
+                component
+            ))
+            .into()),
         }
     }
 
@@ -9859,7 +9959,13 @@ impl SpatialAdaptiveExactFamily {
                     )
                     .map_err(|e| e.to_string())?
             }
-            _ => return Err(format!("invalid adaptive component index {}", component)),
+            _ => {
+                return Err(SmoothError::invalid_index(format!(
+                    "invalid adaptive component index {}",
+                    component
+                ))
+                .into());
+            }
         };
 
         Ok(self.embed_local_hyper_hessian(&cache.coeff_global_range, &local_hessian))
@@ -9923,7 +10029,13 @@ impl SpatialAdaptiveExactFamily {
                     )
                     .map_err(|e| e.to_string())?
             }
-            _ => return Err(format!("invalid adaptive component index {}", component)),
+            _ => {
+                return Err(SmoothError::invalid_index(format!(
+                    "invalid adaptive component index {}",
+                    component
+                ))
+                .into());
+            }
         };
 
         Ok(self.embed_local_hyper_hessian(&cache.coeff_global_range, &local_hessian))
@@ -10333,11 +10445,12 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
         if d_beta_flat.len() != beta.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family direction length mismatch: got {}, expected {}",
                 d_beta_flat.len(),
                 beta.len()
-            ));
+            ))
+            .into());
         }
         let eval = self.exact_evaluation(beta)?;
         Ok(Some(
@@ -10363,12 +10476,13 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
                 block_states.len(),
                 specs.len(),
                 derivative_blocks.len()
-            ));
+            ))
+            .into());
         }
         derivative_blocks[0]
             .get(psi_index)
@@ -10419,12 +10533,13 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
                 block_states.len(),
                 specs.len(),
                 derivative_blocks.len()
-            ));
+            ))
+            .into());
         }
         derivative_blocks[0]
             .get(psi_i)
@@ -10464,20 +10579,22 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         if block_states.len() != 1 || specs.len() != 1 || derivative_blocks.len() != 1 {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family expects one block/state/spec/psi payload, got states={} specs={} deriv_blocks={}",
                 block_states.len(),
                 specs.len(),
                 derivative_blocks.len()
-            ));
+            ))
+            .into());
         }
         let beta = &block_states[0].beta;
         if direction.len() != beta.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "spatial adaptive exact family direction length mismatch: got {}, expected {}",
                 direction.len(),
                 beta.len()
-            ));
+            ))
+            .into());
         }
         derivative_blocks[0]
             .get(psi_index)
@@ -10514,19 +10631,21 @@ fn expect_single_block_state<'a>(
     family_name: &str,
 ) -> Result<&'a ParameterBlockState, String> {
     if block_states.len() != 1 {
-        return Err(format!(
+        return Err(SmoothError::invalid_index(format!(
             "{family_name} expects 1 block, got {}",
             block_states.len()
-        ));
+        ))
+        .into());
     }
     Ok(&block_states[0])
 }
 
 fn expect_block_idx_zero(block_idx: usize, family_name: &str, context: &str) -> Result<(), String> {
     if block_idx != 0 {
-        return Err(format!(
+        return Err(SmoothError::invalid_index(format!(
             "{family_name} expects block_idx 0{context}, got {block_idx}"
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -10705,11 +10824,12 @@ impl CustomFamily for BoundedLinearFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         let latent_beta = &expect_single_block_state(block_states, "bounded linear family")?.beta;
         if d_beta_flat.len() != latent_beta.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "bounded linear family directional derivative length mismatch: got {}, expected {}",
                 d_beta_flat.len(),
                 latent_beta.len()
-            ));
+            ))
+            .into());
         }
 
         let (obs, _, _, _, second_diag, third_diag, priorthird) =
@@ -10777,7 +10897,10 @@ impl CustomFamily for BoundedLinearFamily {
         let x = if spec.design.ncols() == self.designzeroed.ncols() {
             self.designzeroed.clone()
         } else {
-            return Err("bounded linear family design column mismatch".to_string());
+            return Err(SmoothError::dimension_mismatch(
+                "bounded linear family design column mismatch",
+            )
+            .into());
         };
         Ok((
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x)),
@@ -10803,11 +10926,12 @@ impl CustomFamily for BoundedLinearFamily {
         )?;
         expect_single_block_state(block_states, "bounded linear family")?;
         if d_beta.len() != spec.design.ncols() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "bounded linear family geometry derivative direction mismatch: got {}, expected {}",
                 d_beta.len(),
                 spec.design.ncols()
-            ));
+            ))
+            .into());
         }
         let (_, jac_diag, _, _, _) = self.bounded_term_derivative_data(&block_states[0].beta);
         let mut d_offset = Array1::<f64>::zeros(self.offset.len());
@@ -10846,7 +10970,7 @@ fn dense_diag_gram_chunkrows(p: usize) -> usize {
 
 fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
     if x.nrows() != w.len() {
-        return Err("xt_diag_x_dense row mismatch".to_string());
+        return Err(SmoothError::dimension_mismatch("xt_diag_x_dense row mismatch").into());
     }
     let (n, p) = x.dim();
     if n == 0 || p == 0 {
@@ -10892,7 +11016,9 @@ fn xt_diag_x_dense(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Arr
 
 fn trace_of_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> Result<f64, String> {
     if a.nrows() != a.ncols() || b.nrows() != b.ncols() || a.nrows() != b.nrows() {
-        return Err("trace_of_dense_product dimension mismatch".to_string());
+        return Err(
+            SmoothError::dimension_mismatch("trace_of_dense_product dimension mismatch").into(),
+        );
     }
     let mut trace = 0.0;
     for i in 0..a.nrows() {
@@ -13965,11 +14091,12 @@ fn rebuild_smooth_auxiliary_state(
     dropped_penaltyinfo_by_term: &[Vec<DroppedPenaltyBlockInfo>],
 ) -> Result<(), String> {
     if dropped_penaltyinfo_by_term.len() != smooth.terms.len() {
-        return Err(format!(
+        return Err(SmoothError::dimension_mismatch(format!(
             "smooth dropped-penalty cache mismatch: terms={}, dropped_sets={}",
             smooth.terms.len(),
             dropped_penaltyinfo_by_term.len()
-        ));
+        ))
+        .into());
     }
 
     let total_p = smooth.total_smooth_cols();
@@ -13982,12 +14109,13 @@ fn rebuild_smooth_auxiliary_state(
         let range = term.coeff_range.clone();
         if let Some(lb_local) = term.lower_bounds_local.as_ref() {
             if lb_local.len() != range.len() {
-                return Err(format!(
+                return Err(SmoothError::dimension_mismatch(format!(
                     "smooth lower-bound cache mismatch for term '{}': bounds={}, coeffs={}",
                     term.name,
                     lb_local.len(),
                     range.len()
-                ));
+                ))
+                .into());
             }
             coefficient_lower_bounds
                 .slice_mut(s![range.clone()])
@@ -13996,12 +14124,13 @@ fn rebuild_smooth_auxiliary_state(
         }
         if let Some(lin_local) = term.linear_constraints_local.as_ref() {
             if lin_local.a.ncols() != range.len() {
-                return Err(format!(
+                return Err(SmoothError::dimension_mismatch(format!(
                     "smooth linear-constraint cache mismatch for term '{}': cols={}, coeffs={}",
                     term.name,
                     lin_local.a.ncols(),
                     range.len()
-                ));
+                ))
+                .into());
             }
             for r in 0..lin_local.a.nrows() {
                 let mut row = Array1::<f64>::zeros(total_p);
@@ -14041,11 +14170,12 @@ fn rebuild_term_collection_auxiliary_state(
     design: &mut TermCollectionDesign,
 ) -> Result<(), String> {
     if spec.linear_terms.len() != design.linear_ranges.len() {
-        return Err(format!(
+        return Err(SmoothError::dimension_mismatch(format!(
             "term-collection linear bookkeeping mismatch: spec_terms={}, design_ranges={}",
             spec.linear_terms.len(),
             design.linear_ranges.len()
-        ));
+        ))
+        .into());
     }
 
     let p_total = design.design.ncols();
@@ -14057,11 +14187,12 @@ fn rebuild_term_collection_auxiliary_state(
 
     for (linear, (_, range)) in spec.linear_terms.iter().zip(design.linear_ranges.iter()) {
         if range.len() != 1 {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "linear term '{}' expected one coefficient column, found {}",
                 linear.name,
                 range.len()
-            ));
+            ))
+            .into());
         }
         let col = range.start;
         if let Some(lb) = linear.coefficient_min {
@@ -14080,11 +14211,12 @@ fn rebuild_term_collection_auxiliary_state(
 
     if let Some(lb_smooth) = design.smooth.coefficient_lower_bounds.as_ref() {
         if lb_smooth.len() != design.smooth.total_smooth_cols() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "smooth lower-bound width mismatch: bounds={}, smooth_cols={}",
                 lb_smooth.len(),
                 design.smooth.total_smooth_cols()
-            ));
+            ))
+            .into());
         }
         coefficient_lower_bounds
             .slice_mut(s![

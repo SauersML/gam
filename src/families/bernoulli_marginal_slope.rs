@@ -52,6 +52,75 @@ pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
 
+// ── Typed errors ──────────────────────────────────────────────────────
+//
+// Categorizes the failure modes of the bernoulli marginal-slope family
+// so callers can match on the kind without parsing strings. The
+// `reason` fields preserve the original `format!(...)` text byte-for-
+// byte; the `Display` impl prints just the reason, making
+// `e.to_string()` identical to the pre-migration `String` errors that
+// flowed through `?`. Trait implementations in this module still expose
+// `Result<_, String>`, so leaf `Err` sites construct a typed variant
+// and finish with `.into()` to forward through the `From<…> for String`
+// bridge.
+#[derive(Debug, Clone)]
+pub enum BernoulliMarginalSlopeError {
+    /// Spec, data, or runtime configuration failed input validation
+    /// (binary y, finite/non-negative weights, finite z/offsets,
+    /// supported base_link, frailty constraints, missing block state,
+    /// derivative-control configuration, ...).
+    InvalidInput { reason: String },
+    /// Lengths, row/column counts, basis widths, or coefficient block
+    /// sizes do not agree (design rows vs n, covariance dim vs vector
+    /// length, beta length vs basis dim, jet direction lengths vs
+    /// primary dimension, batched gradient state/spec mismatch, ...).
+    IncompatibleDimensions { reason: String },
+    /// A numerical step produced a non-finite, non-positive, or
+    /// internally inconsistent quantity that downstream code cannot
+    /// consume (non-positive probit density, non-finite η / log Φ,
+    /// log-space accumulation failure, non-finite intercept / root
+    /// state, non-finite covariance entries, ...).
+    NumericalFailure { reason: String },
+    /// An empirical latent-measure grid, mixture, calibration target,
+    /// or auto-detection input is malformed (missing feature columns,
+    /// non-positive bandwidth, weights that do not sum to 1, no
+    /// positive-weight rows, target mu outside (0,1), compressed grid
+    /// too small, ...).
+    LatentMeasureFailure { reason: String },
+    /// An integration / inner solve / line search failed to make
+    /// progress (intercept root finder, pilot line search, early-exit
+    /// threshold rejection).
+    IntegrationFailed { reason: String },
+    /// The requested combination of options is not implemented (non-
+    /// probit base link, psi terms for non-marginal/non-logslope
+    /// blocks, unreachable constraint state, fingerprint mismatch on
+    /// reuse, ...).
+    UnsupportedConfiguration { reason: String },
+}
+
+impl std::fmt::Display for BernoulliMarginalSlopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BernoulliMarginalSlopeError::InvalidInput { reason }
+            | BernoulliMarginalSlopeError::IncompatibleDimensions { reason }
+            | BernoulliMarginalSlopeError::NumericalFailure { reason }
+            | BernoulliMarginalSlopeError::LatentMeasureFailure { reason }
+            | BernoulliMarginalSlopeError::IntegrationFailed { reason }
+            | BernoulliMarginalSlopeError::UnsupportedConfiguration { reason } => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for BernoulliMarginalSlopeError {}
+
+impl From<BernoulliMarginalSlopeError> for String {
+    fn from(err: BernoulliMarginalSlopeError) -> String {
+        err.to_string()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,
@@ -277,61 +346,88 @@ impl LatentMeasureKind {
                 ..
             } => {
                 if feature_cols.is_empty() {
-                    return Err(format!(
-                        "{context} local empirical latent measure needs feature columns"
-                    ));
+                    return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                        reason: format!(
+                            "{context} local empirical latent measure needs feature columns"
+                        ),
+                    }
+                    .into());
                 }
                 if centers.is_empty() {
-                    return Err(format!(
-                        "{context} local empirical latent measure needs centers"
-                    ));
+                    return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                        reason: format!(
+                            "{context} local empirical latent measure needs centers"
+                        ),
+                    }
+                    .into());
                 }
                 if centers.len() != grids.len() {
-                    return Err(format!(
-                        "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
-                        centers.len(),
-                        grids.len()
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
+                            centers.len(),
+                            grids.len()
+                        ),
+                    }
+                    .into());
                 }
                 if *top_k == 0 || *top_k > centers.len() {
-                    return Err(format!(
-                        "{context} local empirical latent measure top_k must be in 1..={}, got {top_k}",
-                        centers.len()
-                    ));
+                    return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                        reason: format!(
+                            "{context} local empirical latent measure top_k must be in 1..={}, got {top_k}",
+                            centers.len()
+                        ),
+                    }
+                    .into());
                 }
                 if !(*bandwidth).is_finite() || *bandwidth <= 0.0 {
-                    return Err(format!(
-                        "{context} local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
-                    ));
+                    return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                        reason: format!(
+                            "{context} local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
+                        ),
+                    }
+                    .into());
                 }
                 if let Some(scales) = input_scales.as_ref() {
                     if scales.len() != feature_cols.len() {
-                        return Err(format!(
-                            "{context} local empirical latent measure input scale dimension mismatch: scales={}, features={}",
-                            scales.len(),
-                            feature_cols.len()
-                        ));
+                        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                            reason: format!(
+                                "{context} local empirical latent measure input scale dimension mismatch: scales={}, features={}",
+                                scales.len(),
+                                feature_cols.len()
+                            ),
+                        }
+                        .into());
                     }
                     for (scale_idx, scale) in scales.iter().enumerate() {
                         if !(scale.is_finite() && *scale > 0.0) {
-                            return Err(format!(
-                                "{context} local empirical latent measure input scale {scale_idx} must be finite and positive, got {scale}"
-                            ));
+                            return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                                reason: format!(
+                                    "{context} local empirical latent measure input scale {scale_idx} must be finite and positive, got {scale}"
+                                ),
+                            }
+                            .into());
                         }
                     }
                 }
                 for (center_idx, center) in centers.iter().enumerate() {
                     if center.len() != feature_cols.len() {
-                        return Err(format!(
-                            "{context} local empirical latent center {center_idx} dimension mismatch: got {}, expected {}",
-                            center.len(),
-                            feature_cols.len()
-                        ));
+                        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                            reason: format!(
+                                "{context} local empirical latent center {center_idx} dimension mismatch: got {}, expected {}",
+                                center.len(),
+                                feature_cols.len()
+                            ),
+                        }
+                        .into());
                     }
                     if center.iter().any(|value| !value.is_finite()) {
-                        return Err(format!(
-                            "{context} local empirical latent center {center_idx} has non-finite coordinates"
-                        ));
+                        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                            reason: format!(
+                                "{context} local empirical latent center {center_idx} has non-finite coordinates"
+                            ),
+                        }
+                        .into());
                     }
                 }
                 for (grid_idx, grid) in grids.iter().enumerate() {
@@ -378,35 +474,50 @@ impl LatentMeasureKind {
 
 fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
     if nodes.len() != weights.len() {
-        return Err(format!(
-            "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
-            nodes.len(),
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
+                nodes.len(),
+                weights.len()
+            ),
+        }
+        .into());
     }
     if nodes.len() < 2 {
-        return Err(format!(
-            "{context} empirical latent measure requires at least two nodes"
-        ));
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: format!(
+                "{context} empirical latent measure requires at least two nodes"
+            ),
+        }
+        .into());
     }
     let mut total = 0.0;
     for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
         if !node.is_finite() {
-            return Err(format!(
-                "{context} empirical latent measure node {idx} is non-finite ({node})"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "{context} empirical latent measure node {idx} is non-finite ({node})"
+                ),
+            }
+            .into());
         }
         if !(weight.is_finite() && weight > 0.0) {
-            return Err(format!(
-                "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
-            ));
+            return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                reason: format!(
+                    "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
+                ),
+            }
+            .into());
         }
         total += weight;
     }
     if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
-        return Err(format!(
-            "{context} empirical latent measure weights must sum to 1, got {total}"
-        ));
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: format!(
+                "{context} empirical latent measure weights must sum to 1, got {total}"
+            ),
+        }
+        .into());
     }
     Ok(())
 }
@@ -416,15 +527,21 @@ fn combine_empirical_grids(
     mixture: &[(usize, f64)],
 ) -> Result<EmpiricalZGrid, String> {
     if mixture.is_empty() {
-        return Err("local empirical latent measure row mixture is empty".to_string());
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: "local empirical latent measure row mixture is empty".to_string(),
+        }
+        .into());
     }
     let mut nodes = Vec::new();
     let mut weights = Vec::new();
     for &(grid_idx, grid_weight) in mixture {
         if !grid_weight.is_finite() || grid_weight <= 0.0 {
-            return Err(format!(
-                "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
-            ));
+            return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+                reason: format!(
+                    "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
+                ),
+            }
+            .into());
         }
         let grid = grids.get(grid_idx).ok_or_else(|| {
             format!("local empirical latent mixture references missing grid {grid_idx}")
@@ -436,9 +553,11 @@ fn combine_empirical_grids(
     }
     let total = weights.iter().copied().sum::<f64>();
     if !(total.is_finite() && total > 0.0) {
-        return Err(
-            "local empirical latent combined grid has non-positive total weight".to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: "local empirical latent combined grid has non-positive total weight"
+                .to_string(),
+        }
+        .into());
     }
     for weight in &mut weights {
         *weight /= total;
@@ -510,13 +629,19 @@ pub struct LatentZNormalization {
 impl LatentZNormalization {
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
         if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > BMS_VARIANCE_FLOOR) {
-            return Err(format!(
-                "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
-                self.mean, self.sd
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
+                    self.mean, self.sd
+                ),
+            }
+            .into());
         }
         if z.iter().any(|value| !value.is_finite()) {
-            return Err(format!("{context} requires finite z values"));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!("{context} requires finite z values"),
+            }
+            .into());
         }
         Ok(z.mapv(|zi| (zi - self.mean) / self.sd))
     }
@@ -581,33 +706,48 @@ impl LatentZRankIntCalibration {
     /// mean / SD for sanity-check logging.
     pub fn fit(z: &Array1<f64>, weights: &Array1<f64>) -> Result<Self, String> {
         if z.len() != weights.len() {
-            return Err(format!(
-                "rank-INT calibration: z length {} != weights length {}",
-                z.len(),
-                weights.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "rank-INT calibration: z length {} != weights length {}",
+                    z.len(),
+                    weights.len()
+                ),
+            }
+            .into());
         }
         if z.is_empty() {
-            return Err("rank-INT calibration requires at least one observation".to_string());
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: "rank-INT calibration requires at least one observation".to_string(),
+            }
+            .into());
         }
         let w_total = weights.iter().copied().sum::<f64>();
         if !(w_total.is_finite() && w_total > 0.0) {
-            return Err(format!(
-                "rank-INT calibration requires positive finite total weight, got {w_total}"
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "rank-INT calibration requires positive finite total weight, got {w_total}"
+                ),
+            }
+            .into());
         }
         for (idx, value) in z.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!(
-                    "rank-INT calibration: z[{idx}] = {value} not finite"
-                ));
+                return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "rank-INT calibration: z[{idx}] = {value} not finite"
+                    ),
+                }
+                .into());
             }
         }
         for (idx, weight) in weights.iter().enumerate() {
             if !(weight.is_finite() && *weight >= 0.0) {
-                return Err(format!(
-                    "rank-INT calibration: weight[{idx}] = {weight} not finite/non-negative"
-                ));
+                return Err(BernoulliMarginalSlopeError::InvalidInput {
+                    reason: format!(
+                        "rank-INT calibration: weight[{idx}] = {weight} not finite/non-negative"
+                    ),
+                }
+                .into());
             }
         }
         let mut order: Vec<usize> = (0..z.len()).collect();
@@ -676,14 +816,20 @@ impl LatentZRankIntCalibration {
     /// [`Self::apply_at_predict`], but vectorised.
     pub fn apply_to_training(&self, z: &Array1<f64>) -> Result<Array1<f64>, String> {
         if self.sorted_z.is_empty() {
-            return Err("rank-INT calibration has no knots".to_string());
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: "rank-INT calibration has no knots".to_string(),
+            }
+            .into());
         }
         let mut out = Array1::<f64>::zeros(z.len());
         for (idx, &zi) in z.iter().enumerate() {
             if !zi.is_finite() {
-                return Err(format!(
-                    "rank-INT calibration apply: z[{idx}] = {zi} not finite"
-                ));
+                return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "rank-INT calibration apply: z[{idx}] = {zi} not finite"
+                    ),
+                }
+                .into());
             }
             out[idx] = self.apply_at_predict(zi);
         }
@@ -802,11 +948,14 @@ fn latent_z_is_standard_normal_enough(
     policy: &LatentZPolicy,
 ) -> Result<bool, String> {
     if z.len() != weights.len() {
-        return Err(format!(
-            "latent-measure auto-detection length mismatch: z={}, weights={}",
-            z.len(),
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "latent-measure auto-detection length mismatch: z={}, weights={}",
+                z.len(),
+                weights.len()
+            ),
+        }
+        .into());
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
@@ -815,14 +964,19 @@ fn latent_z_is_standard_normal_enough(
         && weight_sq_sum.is_finite()
         && weight_sq_sum > 0.0)
     {
-        return Err("latent-measure auto-detection requires positive finite weights".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "latent-measure auto-detection requires positive finite weights".to_string(),
+        }
+        .into());
     }
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     if !(effective_n.is_finite() && effective_n > 1.0) {
-        return Err(
-            "latent-measure auto-detection requires at least two effective observations"
-                .to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason:
+                "latent-measure auto-detection requires at least two effective observations"
+                    .to_string(),
+        }
+        .into());
     }
     let mean = z
         .iter()
@@ -899,10 +1053,12 @@ fn weighted_ks_to_standard_normal(
     let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
     for (&zi, &wi) in z.iter().zip(weights.iter()) {
         if !zi.is_finite() || !wi.is_finite() || wi < 0.0 {
-            return Err(
-                "latent-measure KS diagnostic requires finite z and non-negative finite weights"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason:
+                    "latent-measure KS diagnostic requires finite z and non-negative finite weights"
+                        .to_string(),
+            }
+            .into());
         }
         if wi > 0.0 {
             pairs.push((zi, wi));
@@ -945,37 +1101,52 @@ fn build_empirical_z_grid(
     context: &str,
 ) -> Result<EmpiricalZGrid, String> {
     if grid_size < 3 {
-        return Err(format!(
-            "empirical latent measure grid_size must be at least 3, got {grid_size}"
-        ));
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: format!(
+                "empirical latent measure grid_size must be at least 3, got {grid_size}"
+            ),
+        }
+        .into());
     }
     if z.len() != weights.len() {
-        return Err(format!(
-            "{context} length mismatch: z={}, weights={}",
-            z.len(),
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "{context} length mismatch: z={}, weights={}",
+                z.len(),
+                weights.len()
+            ),
+        }
+        .into());
     }
     let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
     for (idx, (&zi, &wi)) in z.iter().zip(weights.iter()).enumerate() {
         if !zi.is_finite() {
-            return Err(format!(
-                "{context} z value at row {idx} is non-finite ({zi})"
-            ));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "{context} z value at row {idx} is non-finite ({zi})"
+                ),
+            }
+            .into());
         }
         if !wi.is_finite() || wi < 0.0 {
-            return Err(format!(
-                "{context} weight at row {idx} must be finite and non-negative, got {wi}"
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "{context} weight at row {idx} must be finite and non-negative, got {wi}"
+                ),
+            }
+            .into());
         }
         if wi > 0.0 {
             pairs.push((zi, wi));
         }
     }
     if pairs.len() < 2 {
-        return Err(format!(
-            "{context} requires at least two positive-weight rows"
-        ));
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: format!(
+                "{context} requires at least two positive-weight rows"
+            ),
+        }
+        .into());
     }
     pairs.sort_by(|left, right| {
         left.0
@@ -984,7 +1155,10 @@ fn build_empirical_z_grid(
     });
     let total_weight = pairs.iter().map(|(_, weight)| *weight).sum::<f64>();
     if !(total_weight.is_finite() && total_weight > 0.0) {
-        return Err(format!("{context} requires positive finite total weight"));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!("{context} requires positive finite total weight"),
+        }
+        .into());
     }
 
     let m = grid_size.min(pairs.len());
@@ -1016,9 +1190,12 @@ fn build_empirical_z_grid(
         }
     }
     if nodes.len() < 2 {
-        return Err(format!(
-            "{context} compression produced fewer than two nodes"
-        ));
+        return Err(BernoulliMarginalSlopeError::LatentMeasureFailure {
+            reason: format!(
+                "{context} compression produced fewer than two nodes"
+            ),
+        }
+        .into());
     }
     recenter_rescale_empirical_grid(&mut nodes, &out_weights);
     let total = out_weights.iter().sum::<f64>();
@@ -1425,9 +1602,12 @@ pub(crate) fn bernoulli_marginal_link_map(
     let phi_eta = normal_pdf(eta);
     let phi_q = normal_pdf(q);
     if !phi_q.is_finite() || phi_q <= 0.0 {
-        return Err(format!(
-            "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
+            ),
+        }
+        .into());
     }
     let mu1 = phi_eta;
     let mu2 = -eta * phi_eta;
@@ -1460,9 +1640,12 @@ fn require_probit_marginal_slope_link(
     if matches!(base_link, InverseLink::Standard(LinkFunction::Probit)) {
         Ok(())
     } else {
-        Err(format!(
-            "{context} requires link(type=probit); non-probit marginal-slope base links are not supported by the calibrated de-nested probit kernel"
-        ))
+        Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "{context} requires link(type=probit); non-probit marginal-slope base links are not supported by the calibrated de-nested probit kernel"
+            ),
+        }
+        .into())
     }
 }
 
@@ -1485,10 +1668,13 @@ fn build_deviation_block_from_knots_and_design_seed(
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
-        return Err(format!(
-            "structural deviation runtime is cubic; degree must be 3, got {}",
-            cfg.degree
-        ));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "structural deviation runtime is cubic; degree must be 3, got {}",
+                cfg.degree
+            ),
+        }
+        .into());
     }
     let penalty_orders = resolve_deviation_operator_orders(cfg)?;
     let knots = initialize_monotone_wiggle_knots_from_seed(
@@ -1508,7 +1694,10 @@ fn build_deviation_block_from_knots_and_design_seed(
     let design = runtime.design(design_seed)?;
     let p = design.ncols();
     if p == 0 {
-        return Err("structural deviation basis has no free derivative controls".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "structural deviation basis has no free derivative controls".to_string(),
+        }
+        .into());
     }
     let mut block = ParameterBlockInput {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
@@ -1539,20 +1728,25 @@ fn resolve_deviation_operator_orders(cfg: &DeviationBlockConfig) -> Result<Vec<u
             continue;
         }
         if order > cfg.degree {
-            return Err(format!(
-                "deviation function penalty derivative order {order} exceeds basis degree {}",
-                cfg.degree
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "deviation function penalty derivative order {order} exceeds basis degree {}",
+                    cfg.degree
+                ),
+            }
+            .into());
         }
         if !orders.contains(&order) {
             orders.push(order);
         }
     }
     if orders.is_empty() {
-        return Err(
-            "deviation block requires at least one positive function-penalty derivative order"
-                .to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason:
+                "deviation block requires at least one positive function-penalty derivative order"
+                    .to_string(),
+        }
+        .into());
     }
     Ok(orders)
 }
@@ -1763,11 +1957,14 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     };
 
     if parametric_anchor_blocks.len() != anchors.len() {
-        return Err(format!(
-            "cross-block identifiability: parametric_anchor_blocks length {} does not match anchors length {}",
-            parametric_anchor_blocks.len(),
-            anchors.len(),
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "cross-block identifiability: parametric_anchor_blocks length {} does not match anchors length {}",
+                parametric_anchor_blocks.len(),
+                anchors.len(),
+            ),
+        }
+        .into());
     }
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
@@ -1777,11 +1974,14 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         return Ok(CrossBlockIdentifiabilityOutcome::Reparameterised);
     }
     if training_row_weights.len() != n {
-        return Err(format!(
-            "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
-            training_row_weights.len(),
-            n,
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
+                training_row_weights.len(),
+                n,
+            ),
+        }
+        .into());
     }
 
     // Materialise the parametric-anchor blocks to dense, stacking them
@@ -1798,21 +1998,27 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         match anchor {
             CrossBlockAnchor::FlexEvaluation(a) => {
                 if a.nrows() != n {
-                    return Err(format!(
-                        "cross-block identifiability: flex anchor has {} rows, candidate has {}",
-                        a.nrows(),
-                        n,
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "cross-block identifiability: flex anchor has {} rows, candidate has {}",
+                            a.nrows(),
+                            n,
+                        ),
+                    }
+                    .into());
                 }
                 // Intentionally skipped — see comment above.
             }
             CrossBlockAnchor::Parametric(d) => {
                 if d.nrows() != n {
-                    return Err(format!(
-                        "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
-                        d.nrows(),
-                        n,
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
+                            d.nrows(),
+                            n,
+                        ),
+                    }
+                    .into());
                 }
                 let p_a = d.ncols();
                 if p_a == 0 {
@@ -1862,9 +2068,12 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     let mut sqrt_w = Array1::<f64>::zeros(n);
     for (i, &w) in training_row_weights.iter().enumerate() {
         if !w.is_finite() || w < 0.0 {
-            return Err(format!(
-                "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
+                ),
+            }
+            .into());
         }
         sqrt_w[i] = w.sqrt();
     }
@@ -2067,27 +2276,39 @@ pub(crate) fn project_monotone_feasible_beta(
     label: &str,
 ) -> Result<Array1<f64>, String> {
     if current.len() != runtime.basis_dim() {
-        return Err(format!(
-            "{label} monotone projection current length mismatch: current={}, expected={}",
-            current.len(),
-            runtime.basis_dim()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "{label} monotone projection current length mismatch: current={}, expected={}",
+                current.len(),
+                runtime.basis_dim()
+            ),
+        }
+        .into());
     }
     if proposed.len() != runtime.basis_dim() {
-        return Err(format!(
-            "{label} monotone projection length mismatch: proposed={}, expected={}",
-            proposed.len(),
-            runtime.basis_dim()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "{label} monotone projection length mismatch: proposed={}, expected={}",
+                proposed.len(),
+                runtime.basis_dim()
+            ),
+        }
+        .into());
     }
     for (idx, value) in current.iter().enumerate() {
         if !value.is_finite() {
-            return Err(format!("{label} current coefficient {idx} is non-finite"));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!("{label} current coefficient {idx} is non-finite"),
+            }
+            .into());
         }
     }
     for (idx, value) in proposed.iter().enumerate() {
         if !value.is_finite() {
-            return Err(format!("{label} coefficient {idx} is non-finite"));
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!("{label} coefficient {idx} is non-finite"),
+            }
+            .into());
         }
     }
     runtime.monotonicity_feasible(current, &format!("{label} current beta"))?;
