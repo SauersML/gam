@@ -1179,8 +1179,13 @@ def duchon_basis(
     centers : array-like of shape (K, d), or ``None`` (auto: K=10 quantile
         centers for d=1), or an ``int`` K (auto-quantile centers, d=1 only).
     m : int, default 2 — spline order.
-    periodic_per_axis : sequence of bool of length d, optional. Currently
-        only ``d=1`` supports periodicity.
+    periodic_per_axis : sequence of bool of length d, optional. For ``d=1``
+        the Bernoulli-Green builder is used (true Green's function on the
+        circle). For ``d ≥ 2`` with any periodic axis, the multi-D
+        mixed-periodicity builder uses cylinder/torus chord distance
+        ``d_j(x, y) = (P_j/π) sin(π(x − y)/P_j)`` on periodic axes and
+        Euclidean distance on non-periodic axes; per-axis periods ``P_j``
+        are auto-derived from the centers' span along each periodic axis.
 
     Returns
     -------
@@ -1390,9 +1395,11 @@ def duchon_function_norm_penalty(
     m : int, default 2
         Spline order.
     periodic_per_axis : sequence of bool of length d, optional
-        Per-axis periodicity. Currently only d=1 supports periodicity
-        (the underlying Rust core's periodic Duchon path requires d=1);
-        ``periodic_per_axis`` with any True entry for d > 1 will raise.
+        Per-axis periodicity. ``d=1`` uses the Bernoulli-Green Gram on
+        the circle; ``d ≥ 2`` with any periodic axis uses the multi-D
+        mixed-periodicity radial polyharmonic kernel evaluated at the
+        cylinder/torus chord distance (see :func:`duchon_basis` for the
+        per-axis formula).
 
     Returns
     -------
@@ -2108,6 +2115,56 @@ def gaussian_reml_fit_blocks_forward(
                 result[key] = np.asarray(result[key], dtype=float)
     if "reml_score" in result:
         result["reml_score"] = float(result["reml_score"])
+    return result
+
+
+def gaussian_reml_fit_with_constraints_forward(
+    x: Any,
+    y: Any,
+    penalty: Any,
+    *,
+    weights: Any | None = None,
+    init_log_lambda: float | None = None,
+    a_inequality: Any | None = None,
+    b_inequality: Any | None = None,
+) -> dict[str, Any]:
+    """Constrained Gaussian REML forward fit (single penalty block).
+
+    Wraps the active-set + REML driver with an optional linear inequality
+    system ``A·β ≤ b``. Forward-only; no analytic VJP is provided through
+    this path.
+    """
+    import numpy as np
+
+    x_np = _numeric_matrix(x, "x")
+    y_np = _numeric_matrix(y, "y")
+    penalty_np = _numeric_matrix(penalty, "penalty")
+    weights_np = None if weights is None else _numeric_vector(weights, "weights")
+    a_np = None if a_inequality is None else _numeric_matrix(a_inequality, "a_inequality")
+    b_np = None if b_inequality is None else _numeric_vector(b_inequality, "b_inequality")
+    init_rho = None if init_log_lambda is None else float(init_log_lambda)
+
+    try:
+        out = rust_module().gaussian_reml_fit_with_constraints_forward(
+            x_np,
+            y_np,
+            penalty_np,
+            weights_np,
+            init_rho,
+            a_np,
+            b_np,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("coefficients", "fitted"):
+        if key in result:
+            result[key] = np.asarray(result[key], dtype=float)
+    if "active_indices" in result:
+        result["active_indices"] = np.asarray(result["active_indices"], dtype=np.uintp)
+    for key in ("lambda", "log_lambda", "reml_score", "edf"):
+        if key in result:
+            result[key] = float(result[key])
     return result
 
 
