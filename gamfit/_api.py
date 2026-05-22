@@ -373,6 +373,120 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
     return [shape_f, rate_f]
 
 
+_SHAPE_CONSTRAINT_NORMAL = {
+    "none": "none",
+    "monotone_increasing": "monotone_increasing",
+    "increasing": "monotone_increasing",
+    "mpi": "monotone_increasing",
+    "monotone_decreasing": "monotone_decreasing",
+    "decreasing": "monotone_decreasing",
+    "mpd": "monotone_decreasing",
+    "convex": "convex",
+    "cvx": "convex",
+    "concave": "concave",
+    "ccv": "concave",
+}
+
+
+def _normalize_shape_constraint(value: Any) -> str:
+    if value is None:
+        return "none"
+    key = str(value).strip().lower().replace("-", "_")
+    if key not in _SHAPE_CONSTRAINT_NORMAL:
+        raise ValueError(
+            f"unknown shape_constraint {value!r}; expected one of "
+            "monotone_increasing, monotone_decreasing, convex, concave, none"
+        )
+    return _SHAPE_CONSTRAINT_NORMAL[key]
+
+
+_SMOOTH_HEAD_RE = re.compile(
+    r"\b(s|smooth|te|tensor|thinplate|tps|duchon|matern|sphere|bs|bspline)\s*\("
+)
+
+
+def _apply_shape_constraints_to_formula(
+    formula: str, constraints: Mapping[str, Any]
+) -> str:
+    """Rewrite smooth-term calls in ``formula`` so each named smooth carries
+    a ``shape=<kind>`` option understood by the Rust formula DSL.
+
+    The mapping is keyed by the smooth-term text as it appears in the
+    formula (e.g. ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``).
+    Comparison is exact after whitespace normalization.
+    """
+    if not constraints:
+        return formula
+    normalized: dict[str, str] = {}
+    for key, value in constraints.items():
+        kind = _normalize_shape_constraint(value)
+        if kind == "none":
+            continue
+        # Whitespace-collapsed key for matching against scanner output.
+        normalized[re.sub(r"\s+", "", str(key))] = kind
+    if not normalized:
+        return formula
+
+    out: list[str] = []
+    i = 0
+    matched: set[str] = set()
+    while i < len(formula):
+        m = _SMOOTH_HEAD_RE.search(formula, i)
+        if not m:
+            out.append(formula[i:])
+            break
+        out.append(formula[i : m.start()])
+        # Find the matching closing paren respecting nesting and string literals.
+        head_start = m.start()
+        paren_open = m.end() - 1
+        depth = 1
+        j = m.end()
+        in_str: str | None = None
+        while j < len(formula) and depth > 0:
+            ch = formula[j]
+            if in_str is not None:
+                if ch == in_str:
+                    in_str = None
+            elif ch in ("'", '"'):
+                in_str = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            # Unbalanced — bail out and emit the remainder verbatim. The
+            # Rust parser will produce the canonical error.
+            out.append(formula[head_start:])
+            break
+        term_text = formula[head_start : j + 1]
+        key_normalized = re.sub(r"\s+", "", term_text)
+        kind = normalized.get(key_normalized)
+        if kind is None:
+            out.append(term_text)
+        else:
+            inside = formula[m.end() : j].strip()
+            if inside:
+                new_term = f"{formula[head_start:m.end()]}{inside}, shape={kind})"
+            else:
+                new_term = f"{formula[head_start:m.end()]}shape={kind})"
+            out.append(new_term)
+            matched.add(key_normalized)
+        i = j + 1
+    rewritten = "".join(out)
+    missing = set(normalized.keys()) - matched
+    if missing:
+        original_keys = {re.sub(r"\s+", "", str(k)): str(k) for k in constraints}
+        labels = sorted(original_keys.get(k, k) for k in missing)
+        raise ValueError(
+            "shape constraints referenced smooth term(s) not found in formula: "
+            + ", ".join(labels)
+        )
+    return rewritten
+
+
 def _group_terms_from_formula(formula: str) -> list[str]:
     return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
 
@@ -444,6 +558,7 @@ def fit(
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     precision_hyperpriors: Any | None = ...,
+    constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
@@ -477,6 +592,7 @@ def fit(
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     precision_hyperpriors: Any | None = ...,
+    constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
@@ -509,6 +625,7 @@ def fit(
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     precision_hyperpriors: Any | None = None,
+    constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
     response_columns: list[str] | tuple[str, ...] | None = None,
     response_coordinates: str | None = None,
@@ -597,6 +714,24 @@ def fit(
         it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
+    constraints:
+        Optional mapping of smooth-term text to a shape-constraint kind.
+        Keys are the literal smooth term as it appears in ``formula`` (e.g.
+        ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``; whitespace
+        differences are ignored). Values are one of ``"monotone_increasing"``,
+        ``"monotone_decreasing"``, ``"convex"``, ``"concave"``, or
+        ``"none"`` / ``None`` for the default unconstrained fit. Shape
+        constraints are enforced by the inner solver as joint linear
+        inequalities ``A·β ≤ b`` on the coefficient vector; when active at
+        convergence the outer REML score uses the tangent-projected LAML
+        formulation. This is the same functionality exposed by mgcv's
+        ``scop=...`` argument and the ``scam`` R library. Currently restricted
+        to univariate 1D B-spline / thin-plate / Duchon smooths.
+
+        Example::
+
+            gamfit.fit(df, "y ~ s(x)",
+                       constraints={"s(x)": "monotone_increasing"})
     config:
         Escape-hatch dict of extra pipeline keys. Any key already set via a
         dedicated kwarg wins over the same key in ``config``.
@@ -607,6 +742,8 @@ def fit(
         A fitted model object with ``predict``, ``summary``, and save/load
         helpers.
     """
+    if constraints:
+        formula = _apply_shape_constraints_to_formula(formula, constraints)
     if config:
         if response_geometry is None and config.get("response_geometry") is not None:
             response_geometry = str(config["response_geometry"])
@@ -1085,6 +1222,64 @@ def duchon_basis(
         raise map_exception(exc) from exc
 
 
+def sphere_basis(
+    points: Any,
+    n_centers: int,
+    *,
+    penalty_order: int = 2,
+    kernel: str = "sobolev",
+    radians: bool = False,
+) -> tuple[Any, Any]:
+    """Build a spherical-spline (S²) design and penalty matrix.
+
+    Parameters
+    ----------
+    points : array-like of shape ``(N, 2)`` — latitude, longitude.
+    n_centers : Wahba center count (``kernel='sobolev' | 'pseudo'``) or
+        truncation degree ``L`` for ``kernel='harmonic'`` (basis dim
+        ``L*(L+2)``).
+    penalty_order : roughness order ``m ∈ {1,2,3,4}``. Default ``2``.
+    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    radians : default ``False`` (degrees). True for radians.
+
+    Returns
+    -------
+    (design (N, K), penalty (K, K)) as ndarrays.
+    """
+    import numpy as np
+
+    pts_np = np.asarray(points, dtype=float)
+    if pts_np.ndim != 2 or pts_np.shape[1] != 2:
+        raise ValueError(
+            f"sphere_basis expects points of shape (N, 2); got {pts_np.shape}"
+        )
+    if not np.all(np.isfinite(pts_np)):
+        raise ValueError("sphere_basis: points contains NaN/Inf")
+    lat = pts_np[:, 0]
+    if radians:
+        bound = float(np.pi / 2.0)
+        if np.any(lat < -bound - 1e-9) or np.any(lat > bound + 1e-9):
+            raise ValueError(
+                "sphere_basis: latitude (radians) must lie in [-π/2, π/2]"
+            )
+    else:
+        if np.any(lat < -90.0 - 1e-9) or np.any(lat > 90.0 + 1e-9):
+            raise ValueError(
+                "sphere_basis: latitude (degrees) must lie in [-90, 90]"
+            )
+    try:
+        design, penalty = rust_module().sphere_basis(
+            pts_np,
+            int(n_centers),
+            int(penalty_order),
+            str(kernel),
+            bool(radians),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(design, dtype=float), np.asarray(penalty, dtype=float)
+
+
 def smoothness_penalty(
     knots: Any,
     *,
@@ -1108,6 +1303,47 @@ def smoothness_penalty(
     except Exception as exc:
         raise map_exception(exc) from exc
     return np.asarray(penalty, dtype=float), np.asarray(null_basis, dtype=float)
+
+
+def periodic_spline_curve_basis(
+    t: Any,
+    n_knots: int,
+    *,
+    degree: int = 3,
+    penalty_order: int = 2,
+) -> tuple[Any, Any]:
+    """Return ``(basis, penalty)`` for a closed cyclic B-spline basis on ``t``.
+
+    The basis is uniform on ``[0, 1)`` and periodic (wraps cleanly). The
+    penalty is the cyclic ``order``-th difference penalty on the ``n_knots``
+    cyclic control points. To fit a closed curve ``t -> R^d``, regress a
+    ``(N, d)`` response against the returned ``(N, K)`` basis with the
+    returned ``(K, K)`` penalty.
+
+    Parameters
+    ----------
+    t : array-like of shape ``(N,)``. Values are taken modulo 1.
+    n_knots : number of cyclic control points / basis columns.
+    degree : B-spline degree. Default 3.
+    penalty_order : order of the cyclic difference penalty. Default 2.
+
+    Returns
+    -------
+    (ndarray of shape (N, n_knots), ndarray of shape (n_knots, n_knots))
+    """
+    import numpy as np
+
+    t_np = _numeric_vector(t, "t")
+    try:
+        basis, penalty = rust_module().periodic_spline_curve_basis(
+            t_np,
+            int(n_knots),
+            int(degree),
+            int(penalty_order),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(basis, dtype=float), np.asarray(penalty, dtype=float)
 
 
 def _duchon_operator_penalties(
@@ -1182,13 +1418,23 @@ def duchon_function_norm_penalty(
                 f"periodic_per_axis must have length matching centers dim ({d}), "
                 f"got {len(per_list)}"
             )
+    elif periodic:
+        # Legacy scalar `periodic=True` only made sense for 1D centers; map
+        # to per-axis flags for the Rust binding which prefers the explicit
+        # per-axis form.
+        if d != 1:
+            raise ValueError(
+                "scalar `periodic=True` only valid for 1D centers; "
+                "use `periodic_per_axis` for d > 1"
+            )
+        per_list = [True]
 
     try:
         penalty = rust_module().duchon_function_norm_penalty(
             ctrs_in,
             int(m),
             False,
-            None,
+            float(period) if period is not None else None,
             per_list,
         )
     except Exception as exc:
