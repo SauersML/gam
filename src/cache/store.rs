@@ -298,6 +298,20 @@ impl WarmStartStore {
         iteration: Option<u64>,
         kind: EntryKind,
     ) -> Result<(), StoreError> {
+        // Any new write under this key may change which entry wins both
+        // `LookupMode::Best` and `LookupMode::Latest`, so drop both cached
+        // rows before touching disk. A pure save_overwrite of the same
+        // run_id would also bump mtime and self-invalidate, but a save()
+        // with a fresh run_id leaves the old meta file unchanged — only
+        // explicit invalidation catches that.
+        lookup_cache_invalidate(&LookupCacheKey {
+            fp: *key,
+            mode: LookupMode::Best,
+        });
+        lookup_cache_invalidate(&LookupCacheKey {
+            fp: *key,
+            mode: LookupMode::Latest,
+        });
         let dir = self.key_dir(key);
         fs::create_dir_all(&dir)?;
         let pid = std::process::id();
