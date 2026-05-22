@@ -2703,6 +2703,17 @@ pub struct BlockwiseInnerResult {
     /// enforced by the [`ProjectedKktResidual`] newtype so this field can only
     /// be populated by an active-set-aware constructor.
     pub kkt_residual: Option<ProjectedKktResidual>,
+    /// Joint active linear-inequality constraint block at the converged
+    /// inner iterate. When `Some`, downstream consumers (unified REML
+    /// evaluator) build the constraint-aware kernel
+    /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` so the per-coordinate IFT
+    /// mode response `v_k = ∂β/∂ρ_k` lies in the smooth tangent
+    /// `T = range(S₊) ∩ ker(A_act)` — the manifold the inner is
+    /// genuinely moving on at a constrained-stationary point — and the
+    /// derivative agrees with the constrained Laplace cost
+    /// `log|U_Tᵀ H U_T|`.
+    pub active_constraints:
+        Option<Arc<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -7053,6 +7064,82 @@ fn scatter_joint_active_set(
         per_block.push(Some(local));
     }
     per_block
+}
+
+/// Assemble the **active rows** of the joint linear inequality constraint
+/// matrix into a single `(k_active × total_p)` block, suitable for the
+/// unified evaluator's constraint-aware kernel.
+///
+/// Inputs:
+/// * `block_constraints`: per-block dense `LinearInequalityConstraints`
+///   (the family's full inequality system per block, output of
+///   `collect_block_linear_constraints`).
+/// * `block_active_sets`: per-block indices of rows currently active
+///   (output of the joint Newton's QP solver / `cached_active_sets`).
+/// * `ranges`: per-block column ranges within the joint β.
+/// * `total_p`: sum of block widths.
+///
+/// Returns `None` when no block has any active constraints — the caller
+/// can then skip the constraint-aware kernel entirely.
+fn assemble_active_constraint_block(
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    block_active_sets: &[Option<Vec<usize>>],
+    ranges: &[(usize, usize)],
+    total_p: usize,
+) -> Option<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock> {
+    if block_constraints.len() != ranges.len()
+        || block_active_sets.len() != ranges.len()
+    {
+        return None;
+    }
+    let mut active_per_block: Vec<(usize, &[usize], &LinearInequalityConstraints)> = Vec::new();
+    let mut total_active = 0usize;
+    for (b, (range, (constraints_opt, active_opt))) in ranges
+        .iter()
+        .zip(block_constraints.iter().zip(block_active_sets.iter()))
+        .enumerate()
+    {
+        let Some(constraints) = constraints_opt else {
+            continue;
+        };
+        let Some(active) = active_opt else {
+            continue;
+        };
+        if active.is_empty() {
+            continue;
+        }
+        if constraints.a.ncols() != range.1 - range.0 {
+            return None;
+        }
+        if !active.iter().all(|&r| r < constraints.a.nrows()) {
+            return None;
+        }
+        total_active += active.len();
+        active_per_block.push((b, active.as_slice(), constraints));
+    }
+    if total_active == 0 {
+        return None;
+    }
+    let mut a = ndarray::Array2::<f64>::zeros((total_active, total_p));
+    let mut b_vec = ndarray::Array1::<f64>::zeros(total_active);
+    let mut out_row = 0usize;
+    for (b_idx, active, constraints) in active_per_block {
+        let (start, end) = ranges[b_idx];
+        let block_p = end - start;
+        for &local_row in active {
+            for col in 0..block_p {
+                a[[out_row, start + col]] = constraints.a[[local_row, col]];
+            }
+            b_vec[out_row] = constraints.b[local_row];
+            out_row += 1;
+        }
+    }
+    Some(
+        crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock {
+            a,
+            b: b_vec,
+        },
+    )
 }
 
 struct SimpleLowerBounds {
@@ -12840,6 +12927,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
                 kkt_residual: None,
+                active_constraints: None,
             });
         }
         if coupled_exact_joint_required {
@@ -19802,6 +19890,7 @@ mod tests {
             s_lambdas: vec![s_lambda.clone()],
             joint_workspace: None,
             kkt_residual: None,
+            active_constraints: None,
         };
         let per_block = vec![rho.clone()];
         let options = BlockwiseFitOptions {
@@ -19977,6 +20066,7 @@ mod tests {
                 s_lambdas: vec![s_lambda.clone()],
                 joint_workspace: None,
                 kkt_residual: None,
+                active_constraints: None,
             };
             let per_block = vec![rho.clone()];
             let options = BlockwiseFitOptions {
@@ -20350,6 +20440,7 @@ mod tests {
             s_lambdas: s_lambdas_local,
             joint_workspace: None,
             kkt_residual: None,
+            active_constraints: None,
         };
 
         let options = BlockwiseFitOptions {
