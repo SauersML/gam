@@ -414,8 +414,12 @@ impl ParametricColumnConditioning {
         }
         let mut intercept_idx = None;
         let mut columns = Vec::new();
-        for &j in unpenalized_cols {
-            let col = x.extract_column(j);
+        // Batched extract avoids per-column unit-vector dispatch when `x` is a
+        // lazy operator (e.g. ReparamOperator): one GEMM versus
+        // `unpenalized_cols.len()` separate matvecs.
+        let block = x.extract_columns(unpenalized_cols);
+        for (k, &j) in unpenalized_cols.iter().enumerate() {
+            let col = block.column(k);
             let first = col[0];
             let is_constant = col.iter().all(|&v| (v - first).abs() <= 1e-12);
             if is_constant {
