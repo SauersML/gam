@@ -209,7 +209,7 @@ pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
 #[inline]
 pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array2<f64>) {
     use faer::Accum;
-    use faer::linalg::matmul::matmul;
+    use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
 
     let (n, p) = a.dim();
     debug_assert_eq!(out.nrows(), p, "output rows must match p");
@@ -226,7 +226,33 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     let a_ref = aview.as_ref();
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
-    matmul(outview.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
+    // A^T * A is symmetric; write only the lower triangle then mirror.
+    tri_matmul(
+        outview.as_mut(),
+        BlockStructure::TriangularLower,
+        Accum::Replace,
+        a_t,
+        BlockStructure::Rectangular,
+        a_ref,
+        BlockStructure::Rectangular,
+        1.0,
+        par,
+    );
+    mirror_lower_to_upper(out);
+}
+
+/// Copy the strict lower triangle of a square matrix into its strict upper triangle.
+/// Used after a triangular GEMM that fills only the lower triangle of a known-symmetric result.
+#[inline]
+fn mirror_lower_to_upper(m: &mut Array2<f64>) {
+    let n = m.nrows();
+    debug_assert_eq!(m.ncols(), n, "matrix must be square to mirror");
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let v = m[[j, i]];
+            m[[i, j]] = v;
+        }
+    }
 }
 
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
@@ -567,7 +593,7 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     par: Par,
 ) -> Array2<f64> {
     use faer::Accum;
-    use faer::linalg::matmul::matmul;
+    use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
     use ndarray::{ShapeBuilder, s};
 
     let (n, p) = x.dim();
@@ -642,16 +668,25 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
         let wx_slice = wx_chunk.slice(s![0..rows, ..]);
         let x_view = FaerArrayView::new(&x_slice);
         let wx_view = FaerArrayView::new(&wx_slice);
-        matmul(
+        // X^T diag(W) X is symmetric; accumulate the lower triangle only, then
+        // mirror once after the chunk loop. ~50% fewer FLOPs vs. full GEMM.
+        tri_matmul(
             out_view.as_mut(),
+            BlockStructure::TriangularLower,
             Accum::Add,
             x_view.as_ref().transpose(),
+            BlockStructure::Rectangular,
             wx_view.as_ref(),
+            BlockStructure::Rectangular,
             1.0,
             par,
         );
     }
 
+    // Mirror the accumulated lower triangle into the upper triangle so callers
+    // see the full symmetric matrix.
+    drop(out_view);
+    mirror_lower_to_upper(&mut result);
     result
 }
 
@@ -1851,6 +1886,50 @@ mod tests {
             err,
             FaerLinalgError::SelfAdjointEigenNonFiniteInput
         ));
+    }
+
+    #[test]
+    fn fast_ata_matches_full_gemm_above_threshold() {
+        // Pick (n, p) large enough to trigger the faer triangular path
+        // (should_use_faer_matmul threshold is MIN_DIM=32, MIN_FLOP_SCALE=64*64).
+        let n = 200;
+        let p = 40;
+        let a: Array2<f64> =
+            Array2::from_shape_fn((n, p), |(i, j)| ((i * 7 + j * 3) as f64).sin() + 0.1 * j as f64);
+        let expected = a.t().dot(&a);
+        let got = fast_ata(&a);
+        let max_err = (&got - &expected)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(max_err < 1e-10, "fast_ata mismatch: {max_err:e}");
+        // Output must be fully populated and symmetric.
+        for i in 0..p {
+            for j in 0..p {
+                assert!((got[[i, j]] - got[[j, i]]).abs() < 1e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_xt_diag_x_matches_naive_above_threshold() {
+        let n = 400;
+        let p = 36;
+        let x: Array2<f64> =
+            Array2::from_shape_fn((n, p), |(i, j)| ((i as f64 * 0.1).cos() + j as f64 * 0.05));
+        let w: Array1<f64> = Array1::from_shape_fn(n, |i| (i as f64 * 0.03).sin());
+        // Naive reference: X^T diag(w) X.
+        let wx = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
+        let expected = x.t().dot(&wx);
+        let got = fast_xt_diag_x(&x, &w);
+        let max_err = (&got - &expected)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(max_err < 1e-9, "fast_xt_diag_x mismatch: {max_err:e}");
+        for i in 0..p {
+            for j in 0..p {
+                assert!((got[[i, j]] - got[[j, i]]).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]
