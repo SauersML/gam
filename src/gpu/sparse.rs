@@ -161,7 +161,7 @@ fn with_runtime<T>(
                         Some(Mutex::new(runtime))
                     }
                     Err(err) => {
-                        diagnostics::log_library_unavailable("cuSPARSE", &err);
+                        diagnostics::log_library_unavailable("cuSPARSE", &err.to_string());
                         None
                     }
                 }
