@@ -9401,6 +9401,20 @@ impl SurvivalLocationScaleFamily {
         dir: &SurvivalJointPsiDirection,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        self.exact_newton_joint_psihessian_directional_derivative_from_parts_masked(
+            q, dir, d_beta_flat, None,
+        )
+    }
+
+    /// HT-mask-aware variant of
+    /// [`Self::exact_newton_joint_psihessian_directional_derivative_from_parts`].
+    fn exact_newton_joint_psihessian_directional_derivative_from_parts_masked(
+        &self,
+        q: &SurvivalJointQuantities,
+        dir: &SurvivalJointPsiDirection,
+        d_beta_flat: &Array1<f64>,
+        row_mask: Option<&Array1<f64>>,
+    ) -> Result<Array2<f64>, String> {
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
