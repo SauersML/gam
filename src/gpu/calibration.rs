@@ -72,12 +72,13 @@ impl DeviceCalibration {
 /// device under test (typically the runtime probe via
 /// `runtime::cuda_context_for`). Calibration uses the context's default
 /// stream and creates its own `CudaBlas` handle scoped to that stream.
-pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String> {
+pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuError> {
+    let driver_err = |reason: String| GpuError::DriverCallFailed { reason };
     // Bind the calling thread to this context so allocations and copies
     // land on the right device when the runtime drives multiple GPUs from
     // a single probe thread.
     ctx.bind_to_thread()
-        .map_err(|e| format!("bind_to_thread: {e}"))?;
+        .map_err(|e| driver_err(format!("bind_to_thread: {e}")))?;
 
     // Use a *created* (non-blocking) stream rather than `default_stream()`'s
     // legacy null stream. cudarc routes `alloc_zeros` through `cuMemAllocAsync`
@@ -111,13 +112,13 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     // -- Device allocations -------------------------------------------------
     let mut a_dev = stream
         .alloc_zeros::<f64>(M * K)
-        .map_err(|e| format!("alloc A {}x{}: {e}", M, K))?;
+        .map_err(|e| driver_err(format!("alloc A {}x{}: {e}", M, K)))?;
     let mut b_dev = stream
         .alloc_zeros::<f64>(K * N)
-        .map_err(|e| format!("alloc B {}x{}: {e}", K, N))?;
+        .map_err(|e| driver_err(format!("alloc B {}x{}: {e}", K, N)))?;
     let mut c_dev = stream
         .alloc_zeros::<f64>(M * N)
-        .map_err(|e| format!("alloc C {}x{}: {e}", M, N))?;
+        .map_err(|e| driver_err(format!("alloc C {}x{}: {e}", M, N)))?;
 
     // -- H2D bandwidth ------------------------------------------------------
     // Use an f64-typed buffer so a single element count = one chunk
@@ -126,24 +127,26 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     let transfer_host: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
     let mut transfer_dev = stream
         .alloc_zeros::<f64>(TRANSFER_F64)
-        .map_err(|e| format!("alloc transfer buffer {} bytes: {e}", TRANSFER_BYTES))?;
+        .map_err(|e| driver_err(format!("alloc transfer buffer {} bytes: {e}", TRANSFER_BYTES)))?;
 
     // Warm the path once so first-call driver overhead doesn't skew the GB/s.
     stream
         .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
-        .map_err(|e| format!("h2d warmup: {e}"))?;
+        .map_err(|e| driver_err(format!("h2d warmup: {e}")))?;
     stream
         .synchronize()
-        .map_err(|e| format!("h2d warmup sync: {e}"))?;
+        .map_err(|e| driver_err(format!("h2d warmup sync: {e}")))?;
 
     let h2d_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
         stream
             .memcpy_htod(transfer_host.as_slice(), &mut transfer_dev)
-            .map_err(|e| format!("h2d copy: {e}"))?;
+            .map_err(|e| driver_err(format!("h2d copy: {e}")))?;
         // Synchronize so timing reflects real kernel completion, not just
         // the host-side queue insertion.
-        stream.synchronize().map_err(|e| format!("h2d sync: {e}"))?;
+        stream
+            .synchronize()
+            .map_err(|e| driver_err(format!("h2d sync: {e}")))?;
         Ok(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
@@ -151,17 +154,19 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     let mut transfer_back: Vec<f64> = vec![0.0_f64; TRANSFER_F64];
     stream
         .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
-        .map_err(|e| format!("d2h warmup: {e}"))?;
+        .map_err(|e| driver_err(format!("d2h warmup: {e}")))?;
     stream
         .synchronize()
-        .map_err(|e| format!("d2h warmup sync: {e}"))?;
+        .map_err(|e| driver_err(format!("d2h warmup sync: {e}")))?;
 
     let d2h_gb_s = best_of_n_transfer(3, || {
         let start = Instant::now();
         stream
             .memcpy_dtoh(&transfer_dev, transfer_back.as_mut_slice())
-            .map_err(|e| format!("d2h copy: {e}"))?;
-        stream.synchronize().map_err(|e| format!("d2h sync: {e}"))?;
+            .map_err(|e| driver_err(format!("d2h copy: {e}")))?;
+        stream
+            .synchronize()
+            .map_err(|e| driver_err(format!("d2h sync: {e}")))?;
         Ok(bytes_per_sec(TRANSFER_BYTES, start.elapsed().as_secs_f64()))
     })?;
 
@@ -170,17 +175,17 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     // changes between runs, and dgemm always overwrites it.
     stream
         .memcpy_htod(a_host.as_slice(), &mut a_dev)
-        .map_err(|e| format!("h2d A: {e}"))?;
+        .map_err(|e| driver_err(format!("h2d A: {e}")))?;
     stream
         .memcpy_htod(b_host.as_slice(), &mut b_dev)
-        .map_err(|e| format!("h2d B: {e}"))?;
+        .map_err(|e| driver_err(format!("h2d B: {e}")))?;
     stream
         .synchronize()
-        .map_err(|e| format!("h2d AB sync: {e}"))?;
+        .map_err(|e| driver_err(format!("h2d AB sync: {e}")))?;
 
-    let m_i = i32::try_from(M).map_err(|e| format!("M overflow i32: {e}"))?;
-    let n_i = i32::try_from(N).map_err(|e| format!("N overflow i32: {e}"))?;
-    let k_i = i32::try_from(K).map_err(|e| format!("K overflow i32: {e}"))?;
+    let m_i = i32::try_from(M).map_err(|e| driver_err(format!("M overflow i32: {e}")))?;
+    let n_i = i32::try_from(N).map_err(|e| driver_err(format!("N overflow i32: {e}")))?;
+    let k_i = i32::try_from(K).map_err(|e| driver_err(format!("K overflow i32: {e}")))?;
 
     let cfg = GemmConfig::<f64> {
         transa: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
@@ -204,10 +209,10 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
         // map to invalid device memory accesses; the shapes here are
         // statically known and match the allocations.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
-            .map_err(|e| format!("dgemm warmup {i}: {e}"))?;
+            .map_err(|e| driver_err(format!("dgemm warmup {i}: {e}")))?;
         stream
             .synchronize()
-            .map_err(|e| format!("dgemm warmup {i} sync: {e}"))?;
+            .map_err(|e| driver_err(format!("dgemm warmup {i} sync: {e}")))?;
     }
 
     let flops = 2.0_f64 * (M as f64) * (N as f64) * (K as f64);
@@ -216,13 +221,15 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
         // SAFETY: same as the warmup block above — cfg matches the
         // allocations and they remain in scope.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
-            .map_err(|e| format!("dgemm timed: {e}"))?;
+            .map_err(|e| driver_err(format!("dgemm timed: {e}")))?;
         stream
             .synchronize()
-            .map_err(|e| format!("dgemm timed sync: {e}"))?;
+            .map_err(|e| driver_err(format!("dgemm timed sync: {e}")))?;
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed <= 0.0 {
-            return Err(format!("dgemm timing nonpositive elapsed: {elapsed}"));
+            return Err(GpuError::CalibrationFailed {
+                reason: format!("dgemm timing nonpositive elapsed: {elapsed}"),
+            });
         }
         Ok(flops / elapsed / 1e9)
     })?;
@@ -231,10 +238,10 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     // serves as a sanity check that dgemm actually wrote something).
     let _c_host = stream
         .clone_dtoh(&c_dev)
-        .map_err(|e| format!("d2h C result: {e}"))?;
+        .map_err(|e| driver_err(format!("d2h C result: {e}")))?;
     stream
         .synchronize()
-        .map_err(|e| format!("d2h C result sync: {e}"))?;
+        .map_err(|e| driver_err(format!("d2h C result sync: {e}")))?;
 
     let calibration = DeviceCalibration {
         fp64_gflops,
@@ -244,10 +251,12 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String
     if calibration.is_usable() {
         Ok(calibration)
     } else {
-        Err(format!(
-            "calibration result not usable: fp64_gflops={} h2d_gb_s={} d2h_gb_s={}",
-            calibration.fp64_gflops, calibration.h2d_gb_s, calibration.d2h_gb_s
-        ))
+        Err(GpuError::CalibrationFailed {
+            reason: format!(
+                "calibration result not usable: fp64_gflops={} h2d_gb_s={} d2h_gb_s={}",
+                calibration.fp64_gflops, calibration.h2d_gb_s, calibration.d2h_gb_s
+            ),
+        })
     }
 }
 
@@ -326,13 +335,13 @@ fn bytes_per_sec(bytes: usize, seconds: f64) -> f64 {
 /// Best-of-N: run `f` `n` times, return the maximum result. The fastest
 /// run is closest to the un-throttled peak; slower runs include thermal
 /// dips, OS preemption, and host-side scheduler noise.
-fn best_of_n_transfer<F>(n: usize, mut f: F) -> Result<f64, String>
+fn best_of_n_transfer<F>(n: usize, mut f: F) -> Result<f64, GpuError>
 where
-    F: FnMut() -> Result<f64, String>,
+    F: FnMut() -> Result<f64, GpuError>,
 {
     let mut best = f64::NEG_INFINITY;
     let mut any = false;
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<GpuError> = None;
     for _ in 0..n {
         match f() {
             Ok(value) if value.is_finite() && value > best => {
@@ -346,7 +355,9 @@ where
     if any {
         Ok(best)
     } else {
-        Err(last_err.unwrap_or_else(|| format!("no usable sample across {n} iterations")))
+        Err(last_err.unwrap_or_else(|| GpuError::CalibrationFailed {
+            reason: format!("no usable sample across {n} iterations"),
+        }))
     }
 }
 

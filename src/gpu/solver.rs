@@ -422,14 +422,16 @@ struct CusolverRuntime {
 }
 
 impl CusolverRuntime {
-    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, String> {
+    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, crate::gpu::GpuError> {
         let solver_lib = load_static_library(cusolver_library_candidates())?;
         let solver = CusolverApi::load(solver_lib)?;
         cuda.set_current()?;
         let mut handle = 0_usize;
         let status = unsafe { (solver.create)(&mut handle) };
         if status != CUSOLVER_STATUS_SUCCESS {
-            return Err(format!("cusolverDnCreate failed with status {status}"));
+            return Err(crate::gpu::GpuError::DriverCallFailed {
+                reason: format!("cusolverDnCreate failed with status {status}"),
+            });
         }
         Ok(Self {
             cuda,
@@ -894,33 +896,20 @@ struct CusolverApi {
 }
 
 impl CusolverApi {
-    fn load(library: &Library) -> Result<Self, String> {
+    fn load(library: &Library) -> Result<Self, crate::gpu::GpuError> {
+        let sym = |e: libloading::Error| crate::gpu::GpuError::DriverSymbolMissing {
+            reason: e.to_string(),
+        };
         unsafe {
             Ok(Self {
-                create: *library
-                    .get(b"cusolverDnCreate\0")
-                    .map_err(|e| e.to_string())?,
-                destroy: *library
-                    .get(b"cusolverDnDestroy\0")
-                    .map_err(|e| e.to_string())?,
-                dsyevd_buffersize: *library
-                    .get(b"cusolverDnDsyevd_bufferSize\0")
-                    .map_err(|e| e.to_string())?,
-                dsyevd: *library
-                    .get(b"cusolverDnDsyevd\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrf_buffersize: *library
-                    .get(b"cusolverDnDpotrf_bufferSize\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrf: *library
-                    .get(b"cusolverDnDpotrf\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrs: *library
-                    .get(b"cusolverDnDpotrs\0")
-                    .map_err(|e| e.to_string())?,
-                dpotrf_batched: *library
-                    .get(b"cusolverDnDpotrfBatched\0")
-                    .map_err(|e| e.to_string())?,
+                create: *library.get(b"cusolverDnCreate\0").map_err(sym)?,
+                destroy: *library.get(b"cusolverDnDestroy\0").map_err(sym)?,
+                dsyevd_buffersize: *library.get(b"cusolverDnDsyevd_bufferSize\0").map_err(sym)?,
+                dsyevd: *library.get(b"cusolverDnDsyevd\0").map_err(sym)?,
+                dpotrf_buffersize: *library.get(b"cusolverDnDpotrf_bufferSize\0").map_err(sym)?,
+                dpotrf: *library.get(b"cusolverDnDpotrf\0").map_err(sym)?,
+                dpotrs: *library.get(b"cusolverDnDpotrs\0").map_err(sym)?,
+                dpotrf_batched: *library.get(b"cusolverDnDpotrfBatched\0").map_err(sym)?,
             })
         }
     }
