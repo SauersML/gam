@@ -31,6 +31,26 @@ pub enum SurvivalError {
     NonMonotoneCumulativeHazard,
     #[error("instantaneous hazard must stay strictly positive during integration")]
     NonPositiveHazard,
+    #[error("{reason}")]
+    InvalidInput { reason: String },
+    #[error("{reason}")]
+    CauseSpecificDimensionMismatch { reason: String },
+    #[error("{reason}")]
+    NumericalFailure { reason: String },
+    #[error("{reason}")]
+    EventCodeInvalid { reason: String },
+    #[error("cause-specific survival block {block}: {source}")]
+    CauseSpecificBlock {
+        block: usize,
+        #[source]
+        source: Box<SurvivalError>,
+    },
+}
+
+impl From<SurvivalError> for String {
+    fn from(err: SurvivalError) -> Self {
+        err.to_string()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -203,13 +223,19 @@ pub struct CauseSpecificRoystonParmarFamily {
 impl CauseSpecificRoystonParmarFamily {
     pub fn new(blocks: Vec<CauseSpecificRoystonParmarBlock>) -> Result<Self, String> {
         if blocks.is_empty() {
-            return Err(
-                "cause-specific survival family requires at least one endpoint".to_string(),
-            );
+            return Err(SurvivalError::InvalidInput {
+                reason: "cause-specific survival family requires at least one endpoint".to_string(),
+            }
+            .into());
         }
         for (idx, block) in blocks.iter().enumerate() {
-            validate_cause_specific_block(block)
-                .map_err(|err| format!("cause-specific survival block {}: {err}", idx + 1))?;
+            validate_cause_specific_block(block).map_err(|err| {
+                SurvivalError::CauseSpecificBlock {
+                    block: idx + 1,
+                    source: Box::new(err),
+                }
+                .to_string()
+            })?;
         }
         Ok(Self { blocks })
     }
@@ -219,11 +245,15 @@ impl CauseSpecificRoystonParmarFamily {
     }
 }
 
-fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Result<(), String> {
+fn validate_cause_specific_block(
+    block: &CauseSpecificRoystonParmarBlock,
+) -> Result<(), SurvivalError> {
     let n = block.event_target.len();
     let p = block.x_exit.ncols();
     if n == 0 || p == 0 {
-        return Err("empty event vector or coefficient block".to_string());
+        return Err(SurvivalError::InvalidInput {
+            reason: "empty event vector or coefficient block".to_string(),
+        });
     }
     if block.age_entry.len() != n
         || block.age_exit.len() != n
@@ -237,7 +267,9 @@ fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Res
         || block.offset_eta_exit.len() != n
         || block.offset_derivative_exit.len() != n
     {
-        return Err("dimension mismatch".to_string());
+        return Err(SurvivalError::CauseSpecificDimensionMismatch {
+            reason: "dimension mismatch".to_string(),
+        });
     }
     if block.age_entry.iter().any(|v| !v.is_finite())
         || block.age_exit.iter().any(|v| !v.is_finite())
@@ -255,7 +287,9 @@ fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Res
         || !block.derivative_floor.is_finite()
         || block.derivative_floor < 0.0
     {
-        return Err("non-finite input".to_string());
+        return Err(SurvivalError::InvalidInput {
+            reason: "non-finite input".to_string(),
+        });
     }
     Ok(())
 }
@@ -263,14 +297,13 @@ fn validate_cause_specific_block(block: &CauseSpecificRoystonParmarBlock) -> Res
 fn evaluate_cause_specific_block(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
-) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+) -> Result<(f64, Array1<f64>, Array2<f64>), SurvivalError> {
     let n = block.event_target.len();
     let p = block.x_exit.ncols();
     if beta.len() != p {
-        return Err(format!(
-            "beta length mismatch: got {}, expected {p}",
-            beta.len()
-        ));
+        return Err(SurvivalError::CauseSpecificDimensionMismatch {
+            reason: format!("beta length mismatch: got {}, expected {p}", beta.len()),
+        });
     }
     let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
     let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
@@ -288,13 +321,17 @@ fn evaluate_cause_specific_block(
             continue;
         }
         if block.age_exit[i] < block.age_entry[i] {
-            return Err(format!("age_exit < age_entry at row {i}"));
+            return Err(SurvivalError::InvalidInput {
+                reason: format!("age_exit < age_entry at row {i}"),
+            });
         }
         let has_entry = block.age_entry[i] > 1e-8;
         let h_exit = eta_exit[i].exp();
         let h_entry = if has_entry { eta_entry[i].exp() } else { 0.0 };
         if !(h_exit.is_finite() && h_entry.is_finite()) {
-            return Err(format!("non-finite cumulative hazard at row {i}"));
+            return Err(SurvivalError::NumericalFailure {
+                reason: format!("non-finite cumulative hazard at row {i}"),
+            });
         }
         log_likelihood -= weight * (h_exit - h_entry);
         w_exit[i] = weight * h_exit;
@@ -302,9 +339,11 @@ fn evaluate_cause_specific_block(
         if block.event_target[i] > 0 {
             let deriv = derivative[i];
             if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(format!(
-                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                ));
+                return Err(SurvivalError::NumericalFailure {
+                    reason: format!(
+                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                    ),
+                });
             }
             log_likelihood += weight * (eta_exit[i] + deriv.ln());
             w_event[i] = weight;
@@ -328,11 +367,14 @@ fn evaluate_cause_specific_block(
 impl CustomFamily for CauseSpecificRoystonParmarFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != self.blocks.len() {
-            return Err(format!(
-                "cause-specific survival expected {} endpoint blocks, got {}",
-                self.blocks.len(),
-                block_states.len()
-            ));
+            return Err(SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected {} endpoint blocks, got {}",
+                    self.blocks.len(),
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let mut log_likelihood = 0.0;
         let mut blockworking_sets = Vec::with_capacity(self.blocks.len());
@@ -352,11 +394,14 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != self.blocks.len() {
-            return Err(format!(
-                "cause-specific survival expected {} endpoint blocks, got {}",
-                self.blocks.len(),
-                block_states.len()
-            ));
+            return Err(SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected {} endpoint blocks, got {}",
+                    self.blocks.len(),
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         let mut log_likelihood = 0.0;
         for (block, state) in self.blocks.iter().zip(block_states.iter()) {
@@ -388,18 +433,24 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         spec: &crate::families::custom_family::ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected block index < {}, got {block_idx}",
-                self.blocks.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected block index < {}, got {block_idx}",
+                    self.blocks.len()
+                ),
+            }
+            .to_string()
         })?;
         if block.x_derivative.ncols() != spec.design.ncols() {
-            return Err(format!(
-                "cause-specific survival derivative design has {} columns but block '{}' has {}",
-                block.x_derivative.ncols(),
-                spec.name,
-                spec.design.ncols()
-            ));
+            return Err(SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival derivative design has {} columns but block '{}' has {}",
+                    block.x_derivative.ncols(),
+                    spec.name,
+                    spec.design.ncols()
+                ),
+            }
+            .into());
         }
         let rhs = block
             .offset_derivative_exit
@@ -417,20 +468,29 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected block index < {}, got {block_idx}",
-                self.blocks.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected block index < {}, got {block_idx}",
+                    self.blocks.len()
+                ),
+            }
+            .to_string()
         })?;
         let state = block_states.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected {} block states, got {}",
-                self.blocks.len(),
-                block_states.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected {} block states, got {}",
+                    self.blocks.len(),
+                    block_states.len()
+                ),
+            }
+            .to_string()
         })?;
         if delta.len() != state.beta.len() || block.x_derivative.ncols() != delta.len() {
-            return Err("cause-specific survival feasible-step dimension mismatch".to_string());
+            return Err(SurvivalError::CauseSpecificDimensionMismatch {
+                reason: "cause-specific survival feasible-step dimension mismatch".to_string(),
+            }
+            .into());
         }
         let derivative = fast_av(&block.x_derivative, &state.beta) + &block.offset_derivative_exit;
         let derivative_delta = fast_av(&block.x_derivative, delta);
@@ -458,17 +518,23 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         d_beta: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected block index < {}, got {block_idx}",
-                self.blocks.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected block index < {}, got {block_idx}",
+                    self.blocks.len()
+                ),
+            }
+            .to_string()
         })?;
         let state = block_states.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected {} block states, got {}",
-                self.blocks.len(),
-                block_states.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected {} block states, got {}",
+                    self.blocks.len(),
+                    block_states.len()
+                ),
+            }
+            .to_string()
         })?;
         Ok(Some(cause_specific_hessian_directional_derivative(
             block,
@@ -485,17 +551,23 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         d_beta_v: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected block index < {}, got {block_idx}",
-                self.blocks.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected block index < {}, got {block_idx}",
+                    self.blocks.len()
+                ),
+            }
+            .to_string()
         })?;
         let state = block_states.get(block_idx).ok_or_else(|| {
-            format!(
-                "cause-specific survival expected {} block states, got {}",
-                self.blocks.len(),
-                block_states.len()
-            )
+            SurvivalError::CauseSpecificDimensionMismatch {
+                reason: format!(
+                    "cause-specific survival expected {} block states, got {}",
+                    self.blocks.len(),
+                    block_states.len()
+                ),
+            }
+            .to_string()
         })?;
         Ok(Some(cause_specific_hessian_second_directional_derivative(
             block,
@@ -510,10 +582,12 @@ fn cause_specific_hessian_directional_derivative(
     block: &CauseSpecificRoystonParmarBlock,
     beta: &Array1<f64>,
     d_beta: &Array1<f64>,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, SurvivalError> {
     let p = block.x_exit.ncols();
     if beta.len() != p || d_beta.len() != p {
-        return Err("cause-specific survival Hessian derivative dimension mismatch".to_string());
+        return Err(SurvivalError::CauseSpecificDimensionMismatch {
+            reason: "cause-specific survival Hessian derivative dimension mismatch".to_string(),
+        });
     }
     let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
     let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
@@ -538,9 +612,11 @@ fn cause_specific_hessian_directional_derivative(
         if block.event_target[i] > 0 {
             let deriv = derivative[i];
             if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(format!(
-                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                ));
+                return Err(SurvivalError::NumericalFailure {
+                    reason: format!(
+                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                    ),
+                });
             }
             w_derivative[i] = -2.0 * weight * d_derivative[i] / (deriv * deriv * deriv);
         }
@@ -557,12 +633,13 @@ fn cause_specific_hessian_second_directional_derivative(
     beta: &Array1<f64>,
     d_beta_u: &Array1<f64>,
     d_beta_v: &Array1<f64>,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, SurvivalError> {
     let p = block.x_exit.ncols();
     if beta.len() != p || d_beta_u.len() != p || d_beta_v.len() != p {
-        return Err(
-            "cause-specific survival second Hessian derivative dimension mismatch".to_string(),
-        );
+        return Err(SurvivalError::CauseSpecificDimensionMismatch {
+            reason: "cause-specific survival second Hessian derivative dimension mismatch"
+                .to_string(),
+        });
     }
     let eta_entry = fast_av(&block.x_entry, beta) + &block.offset_eta_entry;
     let eta_exit = fast_av(&block.x_exit, beta) + &block.offset_eta_exit;
@@ -590,9 +667,11 @@ fn cause_specific_hessian_second_directional_derivative(
         if block.event_target[i] > 0 {
             let deriv = derivative[i];
             if !(deriv.is_finite() && deriv > 0.0) {
-                return Err(format!(
-                    "cause-specific survival derivative must be positive at row {i}, got {deriv}"
-                ));
+                return Err(SurvivalError::NumericalFailure {
+                    reason: format!(
+                        "cause-specific survival derivative must be positive at row {i}, got {deriv}"
+                    ),
+                });
             }
             w_derivative[i] = 6.0 * weight * u_derivative[i] * v_derivative[i] / deriv.powi(4);
         }
@@ -608,29 +687,41 @@ pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8
     const INTEGER_TOL: f64 = 1e-8;
     const MAX_AUTO_CAUSES: u8 = 32;
     if !value.is_finite() {
-        return Err(format!(
-            "survival event value at row {} is non-finite",
-            row_index + 1
-        ));
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "survival event value at row {} is non-finite",
+                row_index + 1
+            ),
+        }
+        .into());
     }
     if value < 0.0 {
-        return Err(format!(
-            "survival event value at row {} is negative: {value}",
-            row_index + 1
-        ));
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "survival event value at row {} is negative: {value}",
+                row_index + 1
+            ),
+        }
+        .into());
     }
     let rounded = value.round();
     if (value - rounded).abs() > INTEGER_TOL {
-        return Err(format!(
-            "survival event value at row {} must be an integer code with 0=censored, got {value}",
-            row_index + 1
-        ));
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "survival event value at row {} must be an integer code with 0=censored, got {value}",
+                row_index + 1
+            ),
+        }
+        .into());
     }
     if rounded > f64::from(MAX_AUTO_CAUSES) {
-        return Err(format!(
-            "survival event value at row {} has code {rounded}; automatic competing-risks detection supports codes 0..={MAX_AUTO_CAUSES}",
-            row_index + 1
-        ));
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "survival event value at row {} has code {rounded}; automatic competing-risks detection supports codes 0..={MAX_AUTO_CAUSES}",
+                row_index + 1
+            ),
+        }
+        .into());
     }
     Ok(rounded as u8)
 }
