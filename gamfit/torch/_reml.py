@@ -47,81 +47,6 @@ class AdditiveRemlOutput:
     edf: torch.Tensor
 
 
-class _GaussianRemlPositionOutputRemoved(NamedTuple):
-    """Forward outputs for position-based REML wrappers.
-
-    Adds the resolved basis state to :class:`GaussianRemlOutput` so the
-    caller can replay the exact same basis at predict time without having
-    to thread or recompute ``knots_or_centers``. Pass these fields back
-    into :func:`gamfit.torch.duchon_basis_1d` /
-    :func:`gamfit.torch.bspline_basis` and the basis is guaranteed to
-    match the one used during the fit.
-    """
-
-    coefficients: torch.Tensor
-    fitted: torch.Tensor
-    lam: torch.Tensor
-    reml_score: torch.Tensor
-    edf: torch.Tensor
-    knots_or_centers: torch.Tensor
-    penalty: torch.Tensor
-    basis_kind: str
-    basis_order: int
-    periodic: bool
-    period: float | None
-
-    def freeze(self) -> "FrozenPositionPredictor":
-        """Return a cached predictor using this fit's resolved basis state."""
-        return FrozenPositionPredictor(
-            coefficients=self.coefficients.detach(),
-            knots_or_centers=self.knots_or_centers.detach(),
-            basis_kind=self.basis_kind,
-            basis_order=self.basis_order,
-            periodic=self.periodic,
-            period=self.period,
-        )
-
-
-class FrozenPositionPredictor(NamedTuple):
-    """Cached position-basis predictor for inference."""
-
-    coefficients: torch.Tensor
-    knots_or_centers: torch.Tensor
-    basis_kind: str
-    basis_order: int
-    periodic: bool
-    period: float | None
-
-    def evaluate(self, t_new: torch.Tensor) -> torch.Tensor:
-        from ._basis import bspline_basis, duchon_basis_1d
-
-        kind = self.basis_kind.strip().lower().replace("_", "").replace("-", "")
-        # 1D thin-plate and duchon_multipenalty share Duchon's basis evaluation;
-        # only the penalty differs. So they evaluate through the same Duchon path.
-        if kind in {"duchon", "duchonspline", "duchonmultipenalty",
-                    "duchontripleoperator", "thinplate", "thinplatespline", "tps"}:
-            m = 2 if kind in {"thinplate", "thinplatespline", "tps"} else int(self.basis_order)
-            basis = duchon_basis_1d(
-                t_new,
-                self.knots_or_centers.to(device=t_new.device, dtype=t_new.dtype),
-                m=m,
-                periodic=self.periodic,
-            )
-        elif kind in {"bspline", "spline"}:
-            basis = bspline_basis(
-                t_new,
-                self.knots_or_centers.to(device=t_new.device, dtype=t_new.dtype),
-                degree=self.basis_order,
-                periodic=self.periodic,
-            )
-        else:
-            raise ValueError(f"unsupported frozen position basis {self.basis_kind!r}")
-        coefficients = self.coefficients.to(device=t_new.device, dtype=t_new.dtype)
-        if coefficients.ndim == 3:
-            coefficients = coefficients[0]
-        return basis @ coefficients
-
-
 def _scalar_grad(grad: torch.Tensor | None) -> float:
     if grad is None:
         return 0.0
@@ -342,350 +267,6 @@ class _GaussianRemlFitBatchedFn(torch.autograd.Function):
         return grad_x, grad_y, None, grad_penalty, grad_weights, grad_by, None, None
 
 
-class _GaussianRemlFitPositionsFn(torch.autograd.Function):
-    """Autograd Function for the position-based closed-form Gaussian REML fit."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        t: torch.Tensor,
-        y: torch.Tensor,
-        knots_or_centers: torch.Tensor,
-        penalty: torch.Tensor,
-        weights: torch.Tensor | None,
-        by: torch.Tensor | None,
-        basis_kind: str,
-        basis_order: int | None,
-        periodic: bool,
-        period: float | None,
-        init_lambda: float | None,
-        by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        t_np = to_numpy_f64(t)
-        y_np = to_numpy_f64(y)
-        knots_np = to_numpy_f64(knots_or_centers)
-        penalty_np = to_numpy_f64(penalty)
-        weights_np = None if weights is None else to_numpy_f64(weights)
-        by_np = None if by is None else to_numpy_f64(by)
-
-        out = _np_api.gaussian_reml_fit_positions(
-            t_np,
-            y_np,
-            basis_kind,
-            knots_np,
-            penalty_np,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-            weights=weights_np,
-            init_lambda=init_lambda,
-            by=by_np,
-            by_start_col=by_start_col,
-        )
-
-        _save_diff_tensors(ctx, t, y, penalty, weights, by)
-        ctx.t_np = t_np
-        ctx.y_np = y_np
-        ctx.knots_np = knots_np
-        ctx.penalty_np = penalty_np
-        ctx.weights_np = weights_np
-        ctx.by_np = by_np
-        ctx.basis_kind = basis_kind
-        ctx.basis_order = basis_order
-        ctx.periodic = periodic
-        ctx.period = period
-        ctx.init_lambda = init_lambda
-        ctx.by_start_col = by_start_col
-        ctx.forward_state = _copy_forward_state(out)
-        ctx.has_weights = weights is not None
-        ctx.has_by = by is not None
-        ctx.ref = t
-        ctx.penalty_ref = penalty
-
-        coefficients = from_numpy_like(out["coefficients"], t)
-        fitted = from_numpy_like(out["fitted"], t)
-        lam = from_numpy_like(out["lambda"], t)
-        reml_score = from_numpy_like(out["reml_score"], t)
-        edf = from_numpy_like(out["edf"], t)
-        return coefficients, fitted, lam, reml_score, edf
-
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
-        _check_saved_versions(ctx)
-        grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
-        grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
-        grad_lambda_scalar = _scalar_grad(grad_lam)
-        grad_reml_scalar = _scalar_grad(grad_reml_score)
-        grad_edf_scalar = _scalar_grad(grad_edf)
-
-        result = _np_api.gaussian_reml_fit_positions_backward(
-            ctx.t_np,
-            ctx.y_np,
-            ctx.basis_kind,
-            ctx.knots_np,
-            ctx.penalty_np,
-            grad_lambda=grad_lambda_scalar,
-            grad_coefficients=grad_coef_np,
-            grad_fitted=grad_fitted_np,
-            grad_reml_score=grad_reml_scalar,
-            grad_edf=grad_edf_scalar,
-            forward_state=ctx.forward_state,
-            basis_order=ctx.basis_order,
-            periodic=ctx.periodic,
-            period=ctx.period,
-            weights=ctx.weights_np,
-            init_lambda=ctx.init_lambda,
-            by=ctx.by_np,
-            by_start_col=ctx.by_start_col,
-        )
-
-        ref = ctx.ref
-        grad_t = _wrap_optional(result.get("grad_t"), ref)
-        grad_y = _wrap_optional(result.get("grad_y"), ref)
-        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
-        grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
-        grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
-        # Order matches forward(...): t, y, knots_or_centers, penalty, weights, by,
-        # basis_kind, basis_order, periodic, period, init_lambda, by_start_col.
-        return grad_t, grad_y, None, grad_penalty, grad_weights, grad_by, None, None, None, None, None, None
-
-
-class _GaussianRemlFitPositionsBatchedFn(torch.autograd.Function):
-    """Autograd Function for the ragged batched position-based REML fit."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        t: torch.Tensor,
-        y: torch.Tensor,
-        row_offsets: torch.Tensor,
-        knots_or_centers: torch.Tensor,
-        penalty: torch.Tensor,
-        weights: torch.Tensor | None,
-        by: torch.Tensor | None,
-        basis_kind: str,
-        basis_order: int | None,
-        periodic: bool,
-        period: float | None,
-        init_lambda: float | None,
-        by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        t_np = to_numpy_f64(t)
-        y_np = to_numpy_f64(y)
-        offsets_np = to_numpy_uintp(row_offsets)
-        knots_np = to_numpy_f64(knots_or_centers)
-        penalty_np = to_numpy_f64(penalty)
-        weights_np = None if weights is None else to_numpy_f64(weights)
-        by_np = None if by is None else to_numpy_f64(by)
-
-        out = _np_api.gaussian_reml_fit_positions_batched(
-            t_np,
-            y_np,
-            offsets_np,
-            basis_kind,
-            knots_np,
-            penalty_np,
-            basis_order=basis_order,
-            periodic=periodic,
-            period=period,
-            weights=weights_np,
-            init_lambda=init_lambda,
-            by=by_np,
-            by_start_col=by_start_col,
-        )
-
-        _save_diff_tensors(ctx, t, y, penalty, weights, by)
-        ctx.t_np = t_np
-        ctx.y_np = y_np
-        ctx.offsets_np = offsets_np
-        ctx.knots_np = knots_np
-        ctx.penalty_np = penalty_np
-        ctx.weights_np = weights_np
-        ctx.by_np = by_np
-        ctx.basis_kind = basis_kind
-        ctx.basis_order = basis_order
-        ctx.periodic = periodic
-        ctx.period = period
-        ctx.init_lambda = init_lambda
-        ctx.by_start_col = by_start_col
-        ctx.forward_state = _copy_forward_state(out)
-        ctx.has_weights = weights is not None
-        ctx.has_by = by is not None
-        ctx.ref = t
-        ctx.penalty_ref = penalty
-
-        coefficients = from_numpy_like(out["coefficients"], t)
-        fitted = from_numpy_like(out["fitted"], t)
-        lam = from_numpy_like(out["lambda"], t)
-        reml_score = from_numpy_like(out["reml_score"], t)
-        edf = from_numpy_like(out["edf"], t)
-        return coefficients, fitted, lam, reml_score, edf
-
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
-        _check_saved_versions(ctx)
-        grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
-        grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
-        grad_lambda_vec = _batch_grad(grad_lam)
-        grad_reml_vec = _batch_grad(grad_reml_score)
-        grad_edf_vec = _batch_grad(grad_edf)
-
-        result = _np_api.gaussian_reml_fit_positions_batched_backward(
-            ctx.t_np,
-            ctx.y_np,
-            ctx.offsets_np,
-            ctx.basis_kind,
-            ctx.knots_np,
-            ctx.penalty_np,
-            grad_lambda=grad_lambda_vec,
-            grad_coefficients=grad_coef_np,
-            grad_fitted=grad_fitted_np,
-            grad_reml_score=grad_reml_vec,
-            grad_edf=grad_edf_vec,
-            forward_state=ctx.forward_state,
-            basis_order=ctx.basis_order,
-            periodic=ctx.periodic,
-            period=ctx.period,
-            weights=ctx.weights_np,
-            init_lambda=ctx.init_lambda,
-            by=ctx.by_np,
-            by_start_col=ctx.by_start_col,
-        )
-
-        ref = ctx.ref
-        grad_t = _wrap_optional(result.get("grad_t"), ref)
-        grad_y = _wrap_optional(result.get("grad_y"), ref)
-        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
-        grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
-        grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
-        # Order matches forward(...): t, y, row_offsets, knots_or_centers, penalty,
-        # weights, by, basis_kind, basis_order, periodic, period, init_lambda,
-        # by_start_col.
-        return (
-            grad_t,
-            grad_y,
-            None,
-            None,
-            grad_penalty,
-            grad_weights,
-            grad_by,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-
-
-class _GaussianRemlFreeBScoreBatchedFn(torch.autograd.Function):
-    """Free-coefficient REML score with VJPs for B, log_lambda, and penalty."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        row_offsets: torch.Tensor,
-        coefficients: torch.Tensor,
-        log_lambda: torch.Tensor,
-        penalty: torch.Tensor,
-        weights: torch.Tensor | None,
-        by: torch.Tensor | None,
-        by_start_col: int,
-    ) -> torch.Tensor:
-        x_np = to_numpy_f64(x)
-        y_np = to_numpy_f64(y)
-        offsets_np = to_numpy_uintp(row_offsets)
-        coef_np = to_numpy_f64(coefficients)
-        log_lambda_np = to_numpy_f64(log_lambda)
-        penalty_np = to_numpy_f64(penalty)
-        weights_np = None if weights is None else to_numpy_f64(weights)
-        by_np = None if by is None else to_numpy_f64(by)
-        batch = int(offsets_np.size - 1)
-        if coef_np.ndim == 2:
-            coef_np = np.broadcast_to(coef_np, (batch, coef_np.shape[0], coef_np.shape[1]))
-        scores = np.zeros(batch, dtype=np.float64)
-        grad_coef = np.zeros_like(coef_np)
-        grad_penalty = np.zeros((batch, penalty_np.shape[0], penalty_np.shape[1]), dtype=np.float64)
-        grad_log_lambda = np.zeros(batch, dtype=np.float64)
-        grad_penalty_available = False
-        for b in range(batch):
-            start = int(offsets_np[b])
-            end = int(offsets_np[b + 1])
-            if start == end:
-                scores[b] = np.nan
-                continue
-            lam_value = float(log_lambda_np.reshape(-1)[0] if log_lambda_np.size == 1 else log_lambda_np.reshape(-1)[b])
-            out = _np_api._gaussian_reml_score(
-                x_np[start:end],
-                y_np[start:end],
-                coef_np[b],
-                lam_value,
-                penalty_np,
-                weights=None if weights_np is None else weights_np[start:end],
-                by=None if by_np is None else by_np[start:end],
-                by_start_col=by_start_col,
-            )
-            scores[b] = float(out["reml_score"])
-            grad_coef[b] = out["grad_coefficients"]
-            # ``grad_penalty`` is optional in the Rust kernel — older builds
-            # of the free-B score function omit it. When absent, downstream
-            # backward returns ``None`` for the penalty input gradient (no
-            # autograd chain through ``S``).
-            grad_penalty_block = out.get("grad_penalty")
-            if grad_penalty_block is not None:
-                grad_penalty[b] = grad_penalty_block
-                grad_penalty_available = True
-            grad_log_lambda[b] = float(out["grad_log_lambda"])
-        _save_diff_tensors(ctx, coefficients, log_lambda, penalty)
-        ctx.grad_coef = grad_coef
-        ctx.grad_penalty = grad_penalty if grad_penalty_available else None
-        ctx.grad_log_lambda = grad_log_lambda
-        ctx.batch = batch
-        ctx.coefficients_was_2d = coefficients.ndim == 2
-        ctx.log_lambda_shape = tuple(log_lambda.shape)
-        ctx.ref = x
-        ctx.coefficients_ref = coefficients
-        ctx.log_lambda_ref = log_lambda
-        ctx.penalty_ref = penalty
-        return from_numpy_like(scores, x)
-
-    @staticmethod
-    def backward(ctx: Any, grad_score: torch.Tensor) -> tuple[Any, ...]:
-        _check_saved_versions(ctx)
-        upstream = to_numpy_f64(grad_score).reshape(-1)
-        grad_coef_np = ctx.grad_coef * upstream[:, None, None]
-        if ctx.coefficients_was_2d:
-            grad_coef_np = grad_coef_np.sum(axis=0)
-        if ctx.grad_penalty is None:
-            grad_penalty_tensor = None
-        else:
-            grad_penalty_np = (
-                ctx.grad_penalty * upstream[:, None, None]
-            ).sum(axis=0).astype(np.float64)
-            grad_penalty_tensor = from_numpy_like(grad_penalty_np, ctx.penalty_ref)
-        grad_log_np = ctx.grad_log_lambda * upstream
-        if ctx.log_lambda_shape == ():
-            grad_log_np = np.asarray(grad_log_np.sum(), dtype=np.float64)
-        elif int(np.prod(ctx.log_lambda_shape)) == 1:
-            grad_log_np = np.asarray([grad_log_np.sum()], dtype=np.float64).reshape(ctx.log_lambda_shape)
-        else:
-            grad_log_np = grad_log_np.reshape(ctx.log_lambda_shape)
-        return (
-            None,
-            None,
-            None,
-            from_numpy_like(grad_coef_np, ctx.coefficients_ref),
-            from_numpy_like(grad_log_np, ctx.log_lambda_ref),
-            grad_penalty_tensor,
-            None,
-            None,
-            None,
-        )
-
 
 def gaussian_reml_fit(
     x: torch.Tensor,
@@ -785,530 +366,101 @@ def gaussian_reml_fit_batched(
     return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
-def _canonical_basis_name(basis_kind: str | None, basis: str | None) -> str:
-    return str(basis if basis is not None else basis_kind if basis_kind is not None else "bspline")
-
-
-def _resolve_effective_basis(
-    basis_kind: str | None,
-    basis: str | None,
-    basis_order: int | None,
-) -> tuple[str, str, int]:
-    """Return ``(display_kind, effective_kind, order)``.
-
-    Aliases ``thinplate`` (1D ≡ Duchon ``m=2``) and ``duchon_multipenalty``
-    onto the engine's Duchon basis, while keeping the user-supplied name
-    available for output state and penalty resolution.
-    """
-    display_kind = _canonical_basis_name(basis_kind, basis)
-    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
-    return display_kind, effective_kind, order
-
-
-def _solve_beta_at_lambda(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    penalty: torch.Tensor,
-    log_lambda: torch.Tensor,
-    weights: torch.Tensor | None,
-    by: torch.Tensor | None,
-    by_start_col: int,
-    row_offsets: torch.Tensor,
-) -> torch.Tensor:
-    """Solve ``β = (XᵀWX + λS)⁻¹ XᵀWY`` per batch at fixed ``log_lambda``.
-
-    Returned as ``(batch, n_basis, n_outputs)``. Forward-only — the chain
-    through ``β`` vanishes by envelope theorem at the inner-problem
-    optimum, so subsequent backward only needs to chase the explicit
-    dependence of the REML score on ``log_lambda``, ``X``, ``Y``, and ``S``.
-    """
-    from ._basis import gaussian_weighted_ridge
-
-    n_batch = int(row_offsets.numel()) - 1
-    if n_batch <= 0:
-        raise ValueError("row_offsets must contain at least one segment")
-    lam_value = float(log_lambda.detach().reshape(-1)[0].exp().item())
-    pen = penalty.detach()
-    if by is not None:
-        by_det = by.detach()
-    else:
-        by_det = None
-    coefs: list[torch.Tensor] = []
-    for b in range(n_batch):
-        s = int(row_offsets[b].item())
-        e = int(row_offsets[b + 1].item())
-        if e <= s:
-            coefs.append(torch.zeros(pen.shape[0], y.shape[1], dtype=x.dtype, device=x.device))
-            continue
-        x_b = x[s:e].detach()
-        y_b = y[s:e].detach()
-        w_b = (
-            torch.ones(e - s, dtype=x.dtype, device=x.device)
-            if weights is None
-            else weights[s:e].detach()
-        )
-        if by_det is not None:
-            gated = x_b.clone()
-            gated[:, by_start_col:] = gated[:, by_start_col:] * by_det[s:e].unsqueeze(1)
-            x_b = gated
-        beta, _ = gaussian_weighted_ridge(x_b, y_b, pen, w_b, ridge_lambda=lam_value)
-        coefs.append(beta)
-    return torch.stack(coefs, dim=0)
-
-
-def _canonical_penalty_tensor(
-    locations: torch.Tensor,
+def gaussian_reml_fit_additive(
+    designs: list[torch.Tensor],
+    response: torch.Tensor,
+    penalties: list[torch.Tensor],
     *,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-    penalty: Any,
-    smoothing: str,
-    log_lambda: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    kind = basis_kind.strip().lower().replace("_", "").replace("-", "")
-    penalty_kind = (
-        None
-        if penalty is None or isinstance(penalty, torch.Tensor)
-        else str(penalty).strip().lower().replace("_", "-")
-    )
-    if isinstance(penalty, torch.Tensor):
-        return penalty, log_lambda
-    triple_operator_request = (
-        (kind in {"duchon", "duchonspline"} and penalty_kind in {"triple-operator", "tripleoperator", "operator"})
-        or kind in {"duchonmultipenalty", "duchontripleoperator"}
-    )
-    if triple_operator_request:
-        if periodic:
-            raise ValueError("triple-operator Duchon penalty is not defined for periodic bases")
-        # ``duchon_multipenalty`` carries triple-operator by definition; allow
-        # the explicit ``penalty="triple-operator"`` override on plain duchon
-        # but error on incompatible override strings for the multipenalty kind.
-        if kind in {"duchonmultipenalty", "duchontripleoperator"} and penalty_kind not in {
-            None,
-            "triple-operator",
-            "tripleoperator",
-            "operator",
-        }:
-            raise ValueError(
-                f"basis='duchon_multipenalty' only supports the triple-operator penalty; got {penalty!r}"
-            )
-        m = 2 if kind in {"duchonmultipenalty", "duchontripleoperator"} else int(basis_order)
-        mass, tension, stiffness = _np_api._duchon_operator_penalties(
-            to_numpy_f64(locations), m=m
-        )
-        pieces = [
-            from_numpy_like(mass, locations),
-            from_numpy_like(tension, locations),
-            from_numpy_like(stiffness, locations),
-        ]
-        if smoothing == "adam":
-            if log_lambda is None:
-                raise ValueError("smoothing='adam' with triple_operator requires log_lambda of length 3")
-            if int(log_lambda.numel()) != 3:
-                raise ValueError("triple_operator log_lambda must have length 3")
-            weights = log_lambda.reshape(3).exp()
-            combined = weights[0] * pieces[0] + weights[1] * pieces[1] + weights[2] * pieces[2]
-            return combined, None
-        if smoothing == "fixed":
-            if log_lambda is None or int(log_lambda.numel()) != 3:
-                raise ValueError("smoothing='fixed' with triple_operator requires log_lambda of length 3")
-            weights = log_lambda.detach().reshape(3).exp()
-            combined = weights[0] * pieces[0] + weights[1] * pieces[1] + weights[2] * pieces[2]
-            return combined, None
-        return pieces[0] + pieces[1] + pieces[2], None
-    if penalty is None or penalty_kind is not None:
-        penalty_np = _np_api._resolve_position_penalty(
-            penalty,
-            to_numpy_f64(locations),
-            basis_kind=basis_kind,
-            basis_order=basis_order,
-            periodic=bool(periodic),
-        )
-        return from_numpy_like(penalty_np, locations), log_lambda
-    return from_numpy_like(_np_api._numeric_matrix(penalty, "penalty"), locations), log_lambda
-
-
-def _position_design(
-    t: torch.Tensor,
-    locations: torch.Tensor,
-    *,
-    basis_kind: str,
-    basis_order: int,
-    periodic: bool,
-) -> torch.Tensor:
-    from ._basis import bspline_basis, duchon_basis_1d
-
-    kind = basis_kind.strip().lower().replace("_", "").replace("-", "")
-    if kind in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps", "duchonmultipenalty", "duchontripleoperator"}:
-        return duchon_basis_1d(t, locations, m=basis_order, periodic=periodic)
-    if kind in {"bspline", "spline"}:
-        return bspline_basis(t, locations, degree=basis_order, periodic=periodic)
-    raise ValueError(f"position REML basis {basis_kind!r} is not supported by the torch path yet")
-
-
-def gaussian_reml_fit_positions(
-    t: torch.Tensor,
-    y: torch.Tensor,
-    basis_kind: str | None = None,
-    knots_or_centers: Any = None,
-    penalty: Any = None,
-    *,
-    basis: str | None = None,
-    smoothing: str = "reml",
-    log_lambda: torch.Tensor | None = None,
-    coefficients: torch.Tensor | None = None,
-    basis_order: int | None = None,
-    periodic: bool = False,
-    period: float | None = None,
+    bys: list[torch.Tensor | None] | None = None,
     weights: torch.Tensor | None = None,
     init_lambda: float | None = None,
-    by: torch.Tensor | None = None,
-    by_start_col: int = 0,
-) -> GaussianRemlPositionOutput:
-    """Differentiable position-based closed-form Gaussian REML fit.
+) -> AdditiveRemlOutput:
+    """Joint multi-smooth additive Gaussian REML fit (single-λ approximation).
+
+    Concatenates the per-smooth design blocks (with optional per-smooth
+    ``by`` modulation applied to each block) into a wide design ``[D_1 |
+    D_2 | ...]`` and assembles a block-diagonal joint penalty from the
+    per-smooth ``S_i``. The combined problem is solved by the single-λ
+    :func:`gaussian_reml_fit` and the resulting joint coefficient block is
+    split back per-smooth at the boundary offsets.
 
     Parameters
     ----------
-    t:
-        1D tensor of evaluation positions of length ``N``.
-    y:
+    designs:
+        ``F`` per-smooth design matrices, each of shape ``(N, K_i)``.
+    response:
         Response matrix of shape ``(N, D)``.
-    basis_kind:
-        Internal basis identifier (e.g. ``"bspline"``, ``"duchon"``).
-    knots_or_centers:
-        1D tensor of basis knots (B-spline) or centers (Duchon). May also
-        be ``None`` to auto-derive from ``t`` quantiles, or an ``int`` to
-        request a specific basis count with quantile placement.
-    penalty:
-        Symmetric penalty matrix of shape ``(M, M)``. ``None`` defaults to
-        an identity ridge sized to the inferred basis dimension. See
-        :func:`gaussian_reml_fit` for the input contract.
-    basis_order:
-        Optional override for the basis order; defaults from ``basis_kind``.
-    periodic, period:
-        Periodic-basis toggle and period length.
-    weights, init_lambda, by_start_col:
-        See :func:`gaussian_reml_fit`.
-    by:
-        Optional per-row design multiplier. Importantly the returned
-        ``fitted`` is already ``by * (phi @ B)`` — callers wanting
-        ``by * smooth(t)`` (e.g. amplitude-weighted curves in SAEs)
-        should use ``fitted`` directly and NOT multiply by ``by`` a
-        second time downstream. Rows with ``by = 0`` produce
-        ``fitted = 0`` exactly and do not contribute to the REML fit.
-        See :func:`gaussian_reml_fit` for the full semantic.
+    penalties:
+        ``F`` per-smooth penalty matrices, each of shape ``(K_i, K_i)``.
+    bys:
+        Optional list of ``F`` per-smooth ``by`` vectors of shape ``(N,)``;
+        ``None`` entries skip the modulation for that smooth. When the full
+        list is ``None`` no modulation is applied anywhere.
+    weights:
+        Optional row weights of shape ``(N,)``.
+    init_lambda:
+        Optional initial smoothing parameter, forwarded to the single-λ fit.
+
+    Returns
+    -------
+    AdditiveRemlOutput
+        ``coefficients`` is a list of length ``F`` with the per-smooth
+        blocks; ``fitted`` is the joint ``(N, D)`` reconstruction;
+        ``lam``/``reml_score``/``edf`` are the shared scalar outputs of the
+        underlying single-λ REML fit.
     """
-    from ._basis import _resolve_basis_locations_tensor
+    if len(designs) != len(penalties):
+        raise ValueError(
+            f"designs and penalties must have equal length; got {len(designs)} vs {len(penalties)}"
+        )
+    if len(designs) == 0:
+        raise ValueError("gaussian_reml_fit_additive requires at least one smooth")
+    if bys is not None and len(bys) != len(designs):
+        raise ValueError(
+            f"bys must have one entry per smooth; got {len(bys)} for {len(designs)} smooths"
+        )
 
-    display_kind = _canonical_basis_name(basis_kind, basis)
-    smoothing = str(smoothing).strip().lower()
-    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
-    knots_t = _resolve_basis_locations_tensor(
-        t, knots_or_centers, basis_kind=effective_kind, degree=order
-    )
-    penalty_t, score_log_lambda = _canonical_penalty_tensor(
-        knots_t,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=bool(periodic),
-        penalty=penalty,
-        smoothing=smoothing,
-        log_lambda=log_lambda,
-    )
-    if coefficients is not None:
-        if smoothing == "reml":
-            raise ValueError("coefficients=... requires smoothing='adam' or smoothing='fixed' and log_lambda")
-        if score_log_lambda is None:
-            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
-        elif smoothing == "fixed":
-            score_log_lambda = score_log_lambda.detach()
-        x = _position_design(
-            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
-        )
-        if coefficients.ndim != 2:
-            raise ValueError("non-batched coefficients must have shape (n_basis, n_outputs)")
-        offsets = torch.tensor([0, int(t.numel())], dtype=torch.long, device=t.device)
-        apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
-        reml_score = apply_score(
-            x,
-            y,
-            offsets,
-            coefficients,
-            score_log_lambda,
-            penalty_t,
-            weights,
-            by,
-            by_start_col,
-        )[0]
-        fitted = x @ coefficients
-        lam = score_log_lambda.exp()
-        edf = torch.full_like(reml_score, float("nan"))
-        return GaussianRemlPositionOutput(
-            coefficients,
-            fitted,
-            lam,
-            reml_score,
-            edf,
-            knots_t,
-            penalty_t,
-            str(display_kind),
-            int(order),
-            bool(periodic),
-            None if period is None else float(period),
-        )
-    if smoothing != "reml":
-        # Auto-solve β at the user-supplied λ, then evaluate the free-B
-        # REML score so gradients can flow back to ``log_lambda`` (and ``X``,
-        # ``Y``, ``S``) in ``smoothing='adam'`` mode. ``smoothing='fixed'``
-        # uses a detached log_lambda so no gradient flows there.
-        if score_log_lambda is None:
-            # ``_canonical_penalty_tensor`` returns ``None`` for the explicit
-            # log_lambda input when it has already folded a vector λ into the
-            # combined penalty (the triple-operator path). In that mode the
-            # score function should see ``log_lambda = 0`` so its effective
-            # multiplier is 1, and gradients flow back to the user's vector
-            # log_lambda through torch's autograd on the combined penalty
-            # tensor — not through the score function's scalar log_lambda
-            # argument.
-            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
-        if smoothing == "fixed":
-            score_log_lambda = score_log_lambda.detach()
-        x = _position_design(
-            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
-        )
-        offsets = torch.tensor([0, int(t.numel())], dtype=torch.long, device=t.device)
-        coef_batched = _solve_beta_at_lambda(
-            x, y, penalty_t, score_log_lambda, weights, by, by_start_col, offsets
-        )
-        coefficients = coef_batched[0]
-        apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
-        reml_score = apply_score(
-            x, y, offsets, coefficients, score_log_lambda, penalty_t,
-            weights, by, by_start_col,
-        )[0]
-        fitted = x @ coefficients
-        lam = score_log_lambda.exp()
-        edf = torch.full_like(reml_score, float("nan"))
-        return GaussianRemlPositionOutput(
-            coefficients, fitted, lam, reml_score, edf,
-            knots_t, penalty_t,
-            str(display_kind), int(order), bool(periodic),
-            None if period is None else float(period),
-        )
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsFn.apply)
-    coefficients, fitted, lam, reml_score, edf = apply(
-        t,
-        y,
-        knots_t,
-        penalty_t,
-        weights,
-        by,
-        effective_kind,
-        order,
-        periodic,
-        period,
-        init_lambda,
-        by_start_col,
-    )
-    return GaussianRemlPositionOutput(
-        coefficients,
-        fitted,
-        lam,
-        reml_score,
-        edf,
-        knots_t,
-        penalty_t,
-        str(display_kind),
-        int(order),
-        bool(periodic),
-        None if period is None else float(period),
-    )
-
-
-def gaussian_reml_fit_positions_batched(
-    t: torch.Tensor,
-    y: torch.Tensor,
-    row_offsets: torch.Tensor,
-    basis_kind: str | None = None,
-    knots_or_centers: Any = None,
-    penalty: Any = None,
-    *,
-    basis: str | None = None,
-    smoothing: str = "reml",
-    log_lambda: torch.Tensor | None = None,
-    coefficients: torch.Tensor | None = None,
-    basis_order: int | None = None,
-    periodic: bool = False,
-    period: float | None = None,
-    weights: torch.Tensor | None = None,
-    init_lambda: float | None = None,
-    by: torch.Tensor | None = None,
-    by_start_col: int = 0,
-) -> GaussianRemlPositionOutput:
-    """Differentiable ragged batched position-based Gaussian REML fit.
-
-    Parameters
-    ----------
-    t:
-        1D tensor of positions of length ``N_total``.
-    y:
-        Response matrix of shape ``(N_total, D)``.
-    row_offsets:
-        ``uintp`` 1D tensor of length ``K + 1``.
-    basis_kind, knots_or_centers, penalty, basis_order, periodic, period:
-        Internal basis configuration; see
-        :func:`gaussian_reml_fit_positions`. ``knots_or_centers`` and
-        ``penalty`` accept the same auto-derived defaults — basis
-        locations are inferred from the concatenated ``t``.
-    weights, init_lambda, by_start_col:
-        See :func:`gaussian_reml_fit`.
-    by:
-        Optional per-row design multiplier. Importantly the returned
-        ``fitted`` is already ``by * (phi @ B)`` — callers wanting
-        ``by * smooth(t)`` (e.g. amplitude-weighted curves in SAEs)
-        should use ``fitted`` directly and NOT multiply by ``by`` a
-        second time downstream. Rows with ``by = 0`` produce
-        ``fitted = 0`` exactly and do not contribute to the REML fit.
-        See :func:`gaussian_reml_fit` for the full semantic.
-    """
-    from ._basis import _resolve_basis_locations_tensor
-
-    display_kind = _canonical_basis_name(basis_kind, basis)
-    smoothing = str(smoothing).strip().lower()
-    effective_kind, order, _ = _np_api._normalize_position_basis(display_kind, basis_order)
-    knots_t = _resolve_basis_locations_tensor(
-        t, knots_or_centers, basis_kind=effective_kind, degree=order
-    )
-    penalty_t, score_log_lambda = _canonical_penalty_tensor(
-        knots_t,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=bool(periodic),
-        penalty=penalty,
-        smoothing=smoothing,
-        log_lambda=log_lambda,
-    )
-    if coefficients is not None:
-        if smoothing == "reml":
-            raise ValueError("coefficients=... requires smoothing='adam' or smoothing='fixed' and log_lambda")
-        if score_log_lambda is None:
-            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
-        elif smoothing == "fixed":
-            score_log_lambda = score_log_lambda.detach()
-        x = _position_design(
-            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
-        )
-        apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
-        reml_score = apply_score(
-            x,
-            y,
-            row_offsets,
-            coefficients,
-            score_log_lambda,
-            penalty_t,
-            weights,
-            by,
-            by_start_col,
-        )
-        if coefficients.ndim == 2:
-            fitted = x @ coefficients
-        elif coefficients.ndim == 3:
-            pieces = []
-            offsets_np = to_numpy_uintp(row_offsets)
-            for b in range(int(offsets_np.size - 1)):
-                start = int(offsets_np[b])
-                end = int(offsets_np[b + 1])
-                pieces.append(x[start:end] @ coefficients[b])
-            fitted = torch.cat(pieces, dim=0)
+    # Apply per-smooth ``by`` modulation row-wise to each design block.
+    modulated: list[torch.Tensor] = []
+    for i, design in enumerate(designs):
+        if design.dim() != 2:
+            raise ValueError(
+                f"designs[{i}] must be 2D (N, K_i); got shape {tuple(design.shape)}"
+            )
+        if bys is not None and bys[i] is not None:
+            by_i = bys[i]
+            assert by_i is not None  # narrow for type-checkers
+            if by_i.dim() != 1 or by_i.shape[0] != design.shape[0]:
+                raise ValueError(
+                    f"bys[{i}] must be 1D of length N={design.shape[0]}; got {tuple(by_i.shape)}"
+                )
+            modulated.append(design * by_i.unsqueeze(1))
         else:
-            raise ValueError("batched coefficients must have shape (n_basis, n_outputs) or (batch, n_basis, n_outputs)")
-        lam = (
-            score_log_lambda.exp()
-            if score_log_lambda is not None
-            else torch.ones_like(reml_score)
-        )
-        edf = torch.full_like(reml_score, float("nan"))
-        return GaussianRemlPositionOutput(
-            coefficients,
-            fitted,
-            lam,
-            reml_score,
-            edf,
-            knots_t,
-            penalty_t,
-            str(display_kind),
-            int(order),
-            bool(periodic),
-            None if period is None else float(period),
-        )
-    if smoothing != "reml":
-        # Auto-solve β per batch at the user-supplied λ, then evaluate the
-        # free-B REML score (envelope theorem: chain through β is zero at
-        # the inner-problem optimum).
-        if score_log_lambda is None:
-            # ``_canonical_penalty_tensor`` returns ``None`` for the explicit
-            # log_lambda input when it has already folded a vector λ into the
-            # combined penalty (the triple-operator path). In that mode the
-            # score function should see ``log_lambda = 0`` so its effective
-            # multiplier is 1, and gradients flow back to the user's vector
-            # log_lambda through torch's autograd on the combined penalty
-            # tensor — not through the score function's scalar log_lambda
-            # argument.
-            score_log_lambda = torch.zeros((), dtype=t.dtype, device=t.device)
-        if smoothing == "fixed":
-            score_log_lambda = score_log_lambda.detach()
-        x = _position_design(
-            t, knots_t, basis_kind=effective_kind, basis_order=order, periodic=bool(periodic)
-        )
-        coef_batched = _solve_beta_at_lambda(
-            x, y, penalty_t, score_log_lambda, weights, by, by_start_col, row_offsets
-        )
-        apply_score = cast(Callable[..., torch.Tensor], _GaussianRemlFreeBScoreBatchedFn.apply)
-        reml_score = apply_score(
-            x, y, row_offsets, coef_batched, score_log_lambda, penalty_t,
-            weights, by, by_start_col,
-        )
-        offsets_np = to_numpy_uintp(row_offsets)
-        pieces = []
-        for b in range(int(offsets_np.size - 1)):
-            start = int(offsets_np[b]); end = int(offsets_np[b + 1])
-            pieces.append(x[start:end] @ coef_batched[b])
-        fitted = torch.cat(pieces, dim=0)
-        lam = score_log_lambda.exp() * torch.ones_like(reml_score)
-        edf = torch.full_like(reml_score, float("nan"))
-        return GaussianRemlPositionOutput(
-            coef_batched, fitted, lam, reml_score, edf,
-            knots_t, penalty_t,
-            str(display_kind), int(order), bool(periodic),
-            None if period is None else float(period),
-        )
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitPositionsBatchedFn.apply)
-    coefficients, fitted, lam, reml_score, edf = apply(
-        t,
-        y,
-        row_offsets,
-        knots_t,
-        penalty_t,
-        weights,
-        by,
-        effective_kind,
-        order,
-        periodic,
-        period,
-        init_lambda,
-        by_start_col,
+            modulated.append(design)
+
+    joint_design = torch.cat(modulated, dim=1)
+    joint_penalty = torch.block_diag(*penalties)
+
+    fit = gaussian_reml_fit(
+        joint_design,
+        response,
+        joint_penalty,
+        weights=weights,
+        init_lambda=init_lambda,
     )
-    return GaussianRemlPositionOutput(
-        coefficients,
-        fitted,
-        lam,
-        reml_score,
-        edf,
-        knots_t,
-        penalty_t,
-        str(display_kind),
-        int(order),
-        bool(periodic),
-        None if period is None else float(period),
+
+    # Split coefficients back per-smooth at the column offsets of ``joint_design``.
+    offsets: list[int] = [0]
+    for design in designs:
+        offsets.append(offsets[-1] + int(design.shape[1]))
+    per_smooth_coefs: list[torch.Tensor] = [
+        fit.coefficients[offsets[i]:offsets[i + 1]] for i in range(len(designs))
+    ]
+
+    return AdditiveRemlOutput(
+        coefficients=per_smooth_coefs,
+        fitted=fit.fitted,
+        lam=fit.lam,
+        reml_score=fit.reml_score,
+        edf=fit.edf,
     )
