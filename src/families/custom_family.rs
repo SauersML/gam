@@ -15,9 +15,10 @@ use crate::solver::active_set::{
 };
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
-    HessianDerivativeProvider, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    MatrixFreeSpdOperator, PenaltySubspaceTrace, ProjectedKktResidual,
+    BlockCoupledOperator, DenseSpectralOperator, DispersionHandling, DriftDerivResult,
+    FixedDriftDerivFn, HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift,
+    HyperCoordPair, HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace,
+    ProjectedKktResidual, StochasticTraceState,
     compute_block_penalty_logdet_derivs, exact_intersection_nullity, exact_pseudo_logdet,
     positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
@@ -14789,6 +14790,258 @@ fn build_custom_family_inner_assembly<'dp>(
     Ok((evaluator, ext_dim))
 }
 
+struct FirstOrderTraceSkipOperator {
+    inner: Arc<dyn HessianOperator>,
+    remaining_first_order_traces: AtomicUsize,
+}
+
+impl FirstOrderTraceSkipOperator {
+    fn new(inner: Arc<dyn HessianOperator>, skip_count: usize) -> Self {
+        Self {
+            inner,
+            remaining_first_order_traces: AtomicUsize::new(skip_count),
+        }
+    }
+
+    fn first_order_skip_active(&self) -> bool {
+        self.remaining_first_order_traces.load(Ordering::Acquire) > 0
+    }
+
+    fn consume_first_order_trace(&self) -> bool {
+        let mut current = self.remaining_first_order_traces.load(Ordering::Acquire);
+        while current > 0 {
+            match self.remaining_first_order_traces.compare_exchange(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+        false
+    }
+}
+
+impl HessianOperator for FirstOrderTraceSkipOperator {
+    fn logdet(&self) -> f64 {
+        self.inner.logdet()
+    }
+
+    fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
+        self.inner.trace_hinv_product(a)
+    }
+
+    fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        if self.first_order_skip_active() {
+            None
+        } else {
+            self.inner.as_exact_dense_spectral()
+        }
+    }
+
+    fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
+        self.inner.trace_hinv_operator(op)
+    }
+
+    fn trace_hinv_h_k(
+        &self,
+        a_k: &Array2<f64>,
+        third_deriv_correction: Option<&Array2<f64>>,
+    ) -> f64 {
+        self.inner.trace_hinv_h_k(a_k, third_deriv_correction)
+    }
+
+    fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        self.inner.solve(rhs)
+    }
+
+    fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        self.inner.solve_multi(rhs)
+    }
+
+    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
+        self.inner.stochastic_trace_solve(rhs, rel_tol)
+    }
+
+    fn stochastic_trace_solve_for_probe(
+        &self,
+        rhs: &Array1<f64>,
+        rel_tol: f64,
+        probe_id: u64,
+        trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
+    ) -> Array1<f64> {
+        self.inner
+            .stochastic_trace_solve_for_probe(rhs, rel_tol, probe_id, trace_state)
+    }
+
+    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
+        self.inner.stochastic_trace_solve_multi(rhs, rel_tol)
+    }
+
+    fn has_matrix_free_trace_cg_operator(&self) -> bool {
+        self.inner.has_matrix_free_trace_cg_operator()
+    }
+
+    fn trace_hinv_product_cross(&self, a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+        self.inner.trace_hinv_product_cross(a, b)
+    }
+
+    fn trace_hinv_matrix_operator_cross(
+        &self,
+        matrix: &Array2<f64>,
+        op: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner.trace_hinv_matrix_operator_cross(matrix, op)
+    }
+
+    fn trace_hinv_operator_cross(
+        &self,
+        left: &dyn HyperOperator,
+        right: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner.trace_hinv_operator_cross(left, right)
+    }
+
+    fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
+        if self.consume_first_order_trace() {
+            0.0
+        } else {
+            self.inner.trace_logdet_gradient(a)
+        }
+    }
+
+    fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
+        self.inner.xt_logdet_kernel_x_diagonal(x)
+    }
+
+    fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
+        if self.consume_first_order_trace() {
+            0.0
+        } else {
+            self.inner.trace_logdet_operator(op)
+        }
+    }
+
+    fn trace_logdet_h_k(
+        &self,
+        a_k: &Array2<f64>,
+        third_deriv_correction: Option<&Array2<f64>>,
+    ) -> f64 {
+        if self.consume_first_order_trace() {
+            0.0
+        } else {
+            self.inner.trace_logdet_h_k(a_k, third_deriv_correction)
+        }
+    }
+
+    fn trace_logdet_h_k_operator(
+        &self,
+        b_k: &dyn HyperOperator,
+        third_deriv_correction: Option<&Array2<f64>>,
+    ) -> f64 {
+        if self.consume_first_order_trace() {
+            0.0
+        } else {
+            self.inner
+                .trace_logdet_h_k_operator(b_k, third_deriv_correction)
+        }
+    }
+
+    fn trace_logdet_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        if self.consume_first_order_trace() {
+            0.0
+        } else {
+            self.inner.trace_logdet_block_local(block, scale, start, end)
+        }
+    }
+
+    fn trace_hinv_block_local(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        self.inner.trace_hinv_block_local(block, scale, start, end)
+    }
+
+    fn trace_hinv_block_local_cross(
+        &self,
+        block: &Array2<f64>,
+        scale: f64,
+        start: usize,
+        end: usize,
+    ) -> f64 {
+        self.inner
+            .trace_hinv_block_local_cross(block, scale, start, end)
+    }
+
+    fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
+        self.inner.trace_logdet_hessian_cross(h_i, h_j)
+    }
+
+    fn trace_logdet_hessian_cross_matrix_operator(
+        &self,
+        h_i: &Array2<f64>,
+        h_j: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner
+            .trace_logdet_hessian_cross_matrix_operator(h_i, h_j)
+    }
+
+    fn trace_logdet_hessian_cross_operator(
+        &self,
+        h_i: &dyn HyperOperator,
+        h_j: &dyn HyperOperator,
+    ) -> f64 {
+        self.inner.trace_logdet_hessian_cross_operator(h_i, h_j)
+    }
+
+    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
+        self.inner.trace_logdet_hessian_crosses(matrices)
+    }
+
+    fn active_rank(&self) -> usize {
+        self.inner.active_rank()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn is_dense(&self) -> bool {
+        self.inner.is_dense()
+    }
+
+    fn prefers_stochastic_trace_estimation(&self) -> bool {
+        if self.first_order_skip_active() {
+            false
+        } else {
+            self.inner.prefers_stochastic_trace_estimation()
+        }
+    }
+
+    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+        self.inner.logdet_traces_match_hinv_kernel()
+    }
+
+    fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
+        if self.first_order_skip_active() {
+            None
+        } else {
+            self.inner.as_dense_spectral()
+        }
+    }
+}
+
 /// Build an `InnerSolution` from joint Hessian data and call the unified evaluator.
 ///
 /// Bridge between the custom family's joint Hessian infrastructure and the
@@ -14813,6 +15066,7 @@ fn unified_joint_cost_gradient(
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
+    first_order_trace_skip: Option<Array1<f64>>,
 ) -> Result<
     (
         f64,
@@ -14821,6 +15075,15 @@ fn unified_joint_cost_gradient(
     ),
     String,
 > {
+    let hessian_op: Arc<dyn HessianOperator> = match first_order_trace_skip.as_ref() {
+        Some(trace_values) if !trace_values.is_empty() => {
+            Arc::new(FirstOrderTraceSkipOperator::new(
+                hessian_op,
+                trace_values.len(),
+            ))
+        }
+        _ => hessian_op,
+    };
     let (evaluator, ext_dim) = build_custom_family_inner_assembly(
         inner,
         specs,
@@ -14843,7 +15106,11 @@ fn unified_joint_cost_gradient(
     let rho_slice = rho
         .as_slice()
         .ok_or_else(|| "outer rho vector must be contiguous".to_string())?;
-    let result = evaluator.evaluate(rho_slice, eval_mode, None)?;
+    let first_order_trace_correction = first_order_trace_skip.map(|trace_values| {
+        let gradient_correction = trace_values.mapv(|trace| 0.5 * trace);
+        (0.0, gradient_correction, None)
+    });
+    let result = evaluator.evaluate(rho_slice, eval_mode, first_order_trace_correction)?;
 
     let cost = result.cost;
     let gradient = result
@@ -15114,6 +15381,7 @@ fn joint_outer_evaluate(
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
+    first_order_trace_skip: Option<Array1<f64>>,
     batched_outer_hessian_operator: Option<
         Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     >,
@@ -15282,6 +15550,17 @@ fn joint_outer_evaluate(
         provider_box,
         eval_mode,
         ext_bundle.map(|bundle| bundle.scaled(rho_curvature_scale)),
+        // Option C: when the caller already has the batched first-order
+        // logdet traces, let the unified VGH path keep all mode-response,
+        // second-order, and Hessian work, but short-circuit only the
+        // soon-discarded first-order trace calls. The projected-subspace
+        // trace path is left untouched because the Hessian shares that
+        // kernel and it is not routed through HessianOperator trace methods.
+        if penalty_subspace_trace.is_none() {
+            first_order_trace_skip
+        } else {
+            None
+        },
     )?;
     if !objective.is_finite() {
         log::warn!(

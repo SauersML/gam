@@ -43,10 +43,11 @@ use gam::smooth::{TermCollectionDesign, TermCollectionSpec, freeze_term_collecti
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
-    SpatialIdentifiability, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    build_duchon_basis, build_duchon_operator_penalty_matrices, build_thin_plate_penalty_matrix,
-    create_basis, create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense,
+    SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
+    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
+    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
+    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
+    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
@@ -684,6 +685,9 @@ fn duchon_basis<'py>(
     }
     let any_periodic = periodic_flags.iter().any(|&b| b);
     if any_periodic && d != 1 {
+        // Underlying `build_periodic_duchon_basis_1d` in src/terms/basis.rs
+        // rejects ncols != 1 with "periodic Duchon smooths currently require
+        // exactly one covariate"; surface a clearer FFI-level error.
         return Err(py_value_error(
             "periodic Duchon basis only supported in d=1 currently".to_string(),
         ));
@@ -778,20 +782,74 @@ fn duchon_operator_penalties<'py>(
     ))
 }
 
-#[pyfunction(signature = (centers, m = 2, periodic = false, period = None))]
+#[pyfunction(signature = (centers, m = 2, periodic = false, period = None, periodic_per_axis = None))]
 fn duchon_function_norm_penalty<'py>(
     py: Python<'py>,
-    centers: PyReadonlyArray1<'py, f64>,
+    centers: &Bound<'py, PyAny>,
     m: usize,
     periodic: bool,
     period: Option<f64>,
+    periodic_per_axis: Option<Vec<bool>>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    validate_position_period("duchon", centers.as_array(), periodic, period)
-        .map_err(py_value_error)?;
     if m == 0 {
         return Err(py_value_error("Duchon m must be at least 1".to_string()));
     }
-    let center_matrix = column_array(centers.as_array());
+    // Accept centers as either 1D (K,) or 2D (K, d). Promote 1D to (K, 1)
+    // for backward compatibility.
+    let center_matrix: Array2<f64> = if let Ok(arr2) = centers.extract::<PyReadonlyArray2<f64>>() {
+        arr2.as_array().to_owned()
+    } else {
+        let arr1 = centers.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
+            py_value_error(
+                "centers must be a 1D (K,) or 2D (K, d) float array".to_string(),
+            )
+        })?;
+        column_array(arr1.as_array())
+    };
+    let d = center_matrix.ncols();
+    // Resolve per-axis periodicity. `periodic_per_axis` (if given) takes
+    // precedence over the legacy scalar `periodic` flag. For backward
+    // compatibility, when neither is given (d=1, periodic=false) we treat
+    // periodicity as false; when scalar `periodic=true` (only valid for d=1)
+    // we map it to `[true]`.
+    let periodic_flags: Vec<bool> = if let Some(flags) = periodic_per_axis.clone() {
+        if flags.len() != d {
+            return Err(py_value_error(format!(
+                "periodic_per_axis must have length d={}, got {}",
+                d,
+                flags.len()
+            )));
+        }
+        flags
+    } else if periodic {
+        if d != 1 {
+            return Err(py_value_error(
+                "scalar `periodic=true` only valid for 1D centers; \
+                 use `periodic_per_axis` for d > 1".to_string(),
+            ));
+        }
+        vec![true]
+    } else {
+        vec![false; d]
+    };
+    let any_periodic = periodic_flags.iter().any(|&b| b);
+    // Underlying Rust `build_periodic_duchon_basis_1d` only supports d=1.
+    if any_periodic && d != 1 {
+        return Err(py_value_error(
+            "periodic Duchon basis only supported in d=1 currently".to_string(),
+        ));
+    }
+    // Validate period only for the 1D periodic case (matches the legacy
+    // 1D validator's contract).
+    if d == 1 {
+        let col = center_matrix.column(0);
+        validate_position_period("duchon", col, any_periodic, period)
+            .map_err(py_value_error)?;
+    } else if period.is_some() {
+        return Err(py_value_error(
+            "duchon period is only valid when periodic=true".to_string(),
+        ));
+    }
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
@@ -800,10 +858,11 @@ fn duchon_function_norm_penalty<'py>(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic,
+        periodic: any_periodic,
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
+    let periodic = any_periodic;
     // The scale-free pure-Duchon path emits the operator triplet (mass,
     // tension, stiffness); the function-norm seminorm is the curvature
     // (stiffness) block — `∫|∇^(p+s) f|²`-flavoured — *not* the leading
@@ -846,6 +905,75 @@ fn duchon_function_norm_penalty<'py>(
         })?;
     let penalty = built.penalties[stiffness_idx].clone();
     Ok(penalty.into_pyarray(py).unbind())
+}
+
+/// Build the spherical-spline (S²) basis and matching penalty matrix.
+///
+/// `points` is an `(N, 2)` array of latitude/longitude pairs (degrees by
+/// default, radians when `radians=True`). `n_centers` controls the number
+/// of Wahba centers (kernel = "sobolev" | "pseudo") or the truncation
+/// degree `L` for kernel = "harmonic" (basis dim = `L * (L + 2)`).
+///
+/// Returns `(design, penalty)` as numpy arrays, with shapes `(N, K)` and
+/// `(K, K)` respectively, where `K` is the chosen basis dimension after
+/// any sum-to-zero identifiability transform applied by the Rust builder.
+#[pyfunction(signature = (points, n_centers, penalty_order = 2, kernel = "sobolev", radians = false))]
+fn sphere_basis<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    n_centers: usize,
+    penalty_order: usize,
+    kernel: &str,
+    radians: bool,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let pts = points.as_array();
+    if pts.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis expects points of shape (N, 2) [lat, lon]; got d={}",
+            pts.ncols()
+        )));
+    }
+    if !(1..=4).contains(&penalty_order) {
+        return Err(py_value_error(format!(
+            "sphere_basis penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        )));
+    }
+    let (method, wahba_kernel, max_degree) = match kernel.to_ascii_lowercase().as_str() {
+        "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev, None),
+        "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo, None),
+        "harmonic" => (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev, Some(n_centers)),
+        other => {
+            return Err(py_value_error(format!(
+                "sphere_basis kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+            )));
+        }
+    };
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint { num_centers: n_centers },
+        penalty_order,
+        double_penalty: false,
+        radians,
+        method,
+        max_degree,
+        wahba_kernel,
+    };
+    let built = build_spherical_spline_basis(pts, &spec)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let primary_idx = built
+        .penaltyinfo
+        .iter()
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+        .ok_or_else(|| {
+            py_value_error(
+                "sphere_basis: primary penalty was not built; check spec".to_string(),
+            )
+        })?;
+    let penalty = built.penalties[primary_idx].clone();
+    let design = built.design.to_dense();
+    Ok((
+        design.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction(signature = (centers, m = 2, length_scale = 1.0))]
@@ -3629,6 +3757,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
     module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;
