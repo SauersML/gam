@@ -6633,16 +6633,18 @@ fn compute_active_constraint_tangent_basis(a_act: &Array2<f64>) -> Option<Array2
 /// basis vectors. `S_k e_j` is the `j`-th column of `S_k`; assembled into
 /// a p × p matrix. Cost O(p² · matvec).
 fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((p, p));
-    let mut e_j = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        if j > 0 {
-            e_j[j - 1] = 0.0;
-        }
-        e_j[j] = 1.0;
-        let col = coord.scaled_matvec(&e_j, 1.0);
-        out.column_mut(j).assign(&col);
-    }
+    // Each `PenaltyCoordinate` variant already has a structure-aware
+    // materializer (`scaled_dense_matrix(1.0)`):
+    //   - `DenseRoot` / `DenseRootCentered` → `Rᵀ R` via faer matmul
+    //     (BLAS3, parallel).
+    //   - `BlockRoot` / `BlockRootCentered` → block-local `Rᵀ R` embedded
+    //     into a `total_dim × total_dim` matrix.
+    //   - `KroneckerMarginal` → diagonal write (no matmul needed).
+    // Routing through it replaces the previous serial p-fold matvec loop
+    // with the variant-appropriate O(p²) (or O(p) for Kronecker) path.
+    let out = coord.scaled_dense_matrix(1.0);
+    debug_assert_eq!(out.nrows(), p, "penalty coord dim mismatch");
+    debug_assert_eq!(out.ncols(), p, "penalty coord dim mismatch");
     out
 }
 
@@ -6659,37 +6661,45 @@ fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array
 /// a modified smoothed objective. Inverting `r_ε` first restores the
 /// principled single-regularization identity.
 fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
-    let p = op.dim();
+    let p = op.n_dim;
     // `ε = √ε_mach · p`. Same `spectral_epsilon` formula as the operator's
     // own construction; depends only on dim.
     let epsilon = f64::EPSILON.sqrt() * (p as f64).max(1.0);
     let eps_sq = epsilon * epsilon;
-    let mut h = Array2::<f64>::zeros((p, p));
+    if p == 0 {
+        return Array2::<f64>::zeros((0, 0));
+    }
+    // Express `H = V · diag(σ_raw) · Vᵀ` as two BLAS3 matmuls (faer's
+    // `fast_ab` / `fast_atb` are already parallelized internally),
+    // replacing the previous triple-nested O(p³) loop.
+    //
+    //   sigma_j = r_j − ε²/r_j  for active, nonzero `r`; else 0.
+    //   VS = V · diag(sigma)    (scale columns of V by sigma)
+    //   H  = VS · Vᵀ            (= fast_abt(VS, V))
+    let mut vs = op.eigenvectors.clone();
     for j in 0..p {
-        if !op.eigenpair_active(j) {
-            continue;
-        }
-        let r = op.reg_eigenvalue(j);
-        if r == 0.0 {
-            continue;
-        }
-        // Invert r_ε: σ = r − ε²/r (since r_ε(σ) · (r_ε(σ) − σ) = ε²).
-        let sigma = r - eps_sq / r;
-        if sigma == 0.0 {
-            continue;
-        }
-        for col in 0..p {
-            let v_col_j = op.eigenvector_entry(col, j);
-            if v_col_j == 0.0 {
-                continue;
-            }
-            let scaled = sigma * v_col_j;
-            for row in 0..p {
-                h[[row, col]] += op.eigenvector_entry(row, j) * scaled;
+        let sigma = if op.active_mask[j] {
+            let r = op.reg_eigenvalues[j];
+            if r == 0.0 { 0.0 } else { r - eps_sq / r }
+        } else {
+            0.0
+        };
+        if sigma != 1.0 {
+            let mut col = vs.column_mut(j);
+            if sigma == 0.0 {
+                col.fill(0.0);
+            } else {
+                col.mapv_inplace(|v| v * sigma);
             }
         }
     }
-    h
+    // H = VS · Vᵀ. `fast_ab(A, B)` computes A·B; for A·Bᵀ use the
+    // transposed view via `fast_ab(&VS, &eigenvectors.t().to_owned())`.
+    // Avoid the explicit transpose copy by going through `fast_abt`
+    // when available; otherwise an explicit transpose is acceptable
+    // because the cost is O(p²) vs the O(p³) matmul.
+    let vt = op.eigenvectors.t().to_owned();
+    crate::faer_ndarray::fast_ab(&vs, &vt)
 }
 
 /// Tangent-projected `HessianOperator` adapter. Wraps an `m × m`
@@ -7005,6 +7015,46 @@ fn try_tangent_projected_evaluate(
     // `barrier_config` (cost evaluated at β̂ in p-space; barrier-derivative
     // wrapper produces p-space drift that the tangent operator projects
     // via ZᵀMZ in its trace methods) pass through unchanged.
+    // Active-constraint tangent projection for the Firth/Jeffreys term.
+    // Replace the operator's full-space `½ log|J|` with the projected
+    // `½ log|ZᵀJZ|`. The same underlying `FirthDenseOperator` is retained
+    // so any downstream β-gradient consumer still sees a consistent
+    // operator — only the scalar contribution to the outer LAML cost is
+    // overridden. This projection-aware Firth is exact under the same
+    // tangent-projected LAML setup as the rest of
+    // `try_tangent_projected_evaluate` (mode = ValueAndGradient or below).
+    let projected_firth = solution.firth.as_ref().map(|term| {
+        let op_arc = term.operator_arc();
+        let projected_value = op_arc.jeffreys_logdet_projected(z.view());
+        ExactJeffreysTerm::with_projected_value(op_arc, projected_value)
+    });
+    // Active-constraint tangent projection for ext coords. The tangent
+    // hessian wrapper accepts p-space `g` and p-space drift `M` and
+    // applies the `Zᵀ · Z` projection internally inside its `solve` /
+    // `trace_logdet_gradient` / `trace_hinv_product` methods, so
+    // pass-through is mathematically equivalent to projecting `g → Zᵀg`
+    // and `M → ZᵀMZ` here (the wrapper composes the projections with
+    // the inner H_T operator). This is the same pattern
+    // `BorrowedDerivProvider` uses for the deriv-provider corrections.
+    //
+    // The pair callbacks (`ext_coord_pair_fn`, `rho_ext_pair_fn`) return
+    // `HyperCoordPair` objects with p-space `b_mat` / `b_operator`; the
+    // pass-through is sound for any consumer that contracts those
+    // through the tangent hessian wrapper. They are kept available for
+    // `ValueAndGradient` mode. `ValueGradientHessian` mode additionally
+    // forms explicit p×p second-drift products that the wrapper cannot
+    // re-project a posteriori, so refuse that combination upfront.
+    if mode == EvalMode::ValueGradientHessian
+        && !solution.ext_coords.is_empty()
+        && (solution.ext_coord_pair_fn.is_some() || solution.rho_ext_pair_fn.is_some())
+    {
+        return Err(
+            "active constraints + ext_coords + mode=ValueGradientHessian not yet supported; \
+             fall back to ValueAndGradient. The ext-coord pair callbacks return p-space \
+             second-drift objects that the tangent hessian wrapper does not re-project."
+                .to_string(),
+        );
+    }
     let projected = InnerSolution {
         log_likelihood: solution.log_likelihood,
         penalty_quadratic: solution.penalty_quadratic,
@@ -7015,8 +7065,8 @@ fn try_tangent_projected_evaluate(
         deriv_provider: Box::new(BorrowedDerivProvider(solution.deriv_provider.as_ref())),
         tk_correction: solution.tk_correction,
         tk_gradient: solution.tk_gradient.clone(),
-        // Refused above when present.
-        firth: None,
+        // Same operator, projection-aware scalar contribution.
+        firth: projected_firth,
         hessian_logdet_correction: projected_hlogdet_correction,
         // Direct tangent-H path; the projected-kernel route is unused here.
         penalty_subspace_trace: None,
@@ -7025,8 +7075,9 @@ fn try_tangent_projected_evaluate(
         n_observations: solution.n_observations,
         nullspace_dim: solution.nullspace_dim,
         dispersion: solution.dispersion.clone(),
-        // Refused above when non-empty.
-        ext_coords: Vec::new(),
+        // ext_coord g/drift pass-through: projection is applied by the
+        // tangent hessian wrapper's trace and solve methods.
+        ext_coords: solution.ext_coords.clone(),
         ext_coord_pair_fn: None,
         rho_ext_pair_fn: None,
         fixed_drift_deriv: None,
