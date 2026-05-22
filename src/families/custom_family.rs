@@ -2539,6 +2539,7 @@ pub trait CustomFamily {
     }
 }
 
+/// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {
     pub inner_max_cycles: usize,
@@ -2580,6 +2581,8 @@ pub struct BlockwiseFitOptions {
     /// objective enough to be accepted. Default `None` preserves exact full-sum
     /// behavior and is the only mode used outside backtracking rejection tests.
     pub early_exit_threshold: Option<f64>,
+    /// Stable public API for installing outer-score subsampling.
+    ///
     /// Optional stratified row subsample used by outer-only score/gradient
     /// passes. When `Some(s)`, outer score/gradient hot loops should iterate
     /// only over `s.rows` and multiply each contribution by that row's
