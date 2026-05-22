@@ -9,9 +9,7 @@ use gam::estimate::{
     saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{array2_to_matmut, factorize_symmetricwith_fallback};
-use gam::families::family_meta::{
-    family_to_link, inverse_link_to_binomial_family, pretty_familyname,
-};
+use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
 use gam::families::survival_predict::{
