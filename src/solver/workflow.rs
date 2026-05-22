@@ -4276,8 +4276,8 @@ mod tests {
             .err()
             .expect("main formula should reject z-column reuse");
 
-        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
-        assert!(err.contains("main formula"));
+        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.to_string().contains("main formula"));
     }
 
     #[test]
@@ -4292,8 +4292,8 @@ mod tests {
             .err()
             .expect("logslope formula should reject z-column reuse");
 
-        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
-        assert!(err.contains("logslope_formula"));
+        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.to_string().contains("logslope_formula"));
     }
 
     #[test]
@@ -4307,8 +4307,8 @@ mod tests {
             .err()
             .expect("defaulted logslope spec should still reject z-column reuse");
 
-        assert!(err.contains("survival marginal-slope reserves z column 'z'"));
-        assert!(err.contains("main formula"));
+        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(err.to_string().contains("main formula"));
     }
 
     fn workflow_test_dataset() -> Dataset {
@@ -4634,7 +4634,7 @@ mod tests {
             Ok(_) => panic!("non-probit link should be rejected"),
             Err(err) => err,
         };
-        assert!(err.contains("only link(type=probit)"));
+        assert!(err.to_string().contains("only link(type=probit)"));
     }
 
     #[test]

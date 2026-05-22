@@ -462,7 +462,7 @@ mod tests {
     fn parse_formula_rejects_unsupported_top_level_rhs_expressions() {
         for formula in ["y ~ x - z", "y ~ -x", "y ~ x / z", "y ~ (x)", "y ~ x - 1"] {
             let err = parse_formula(formula).expect_err("expected formula parse failure");
-            assert!(err.contains("unsupported top-level RHS term"));
+            assert!(err.to_string().contains("unsupported top-level RHS term"));
         }
     }
 
