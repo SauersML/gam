@@ -7121,7 +7121,6 @@ fn assemble_active_constraint_block(
         return None;
     }
     let mut a = ndarray::Array2::<f64>::zeros((total_active, total_p));
-    let mut b_vec = ndarray::Array1::<f64>::zeros(total_active);
     let mut out_row = 0usize;
     for (b_idx, active, constraints) in active_per_block {
         let (start, end) = ranges[b_idx];
@@ -7130,16 +7129,10 @@ fn assemble_active_constraint_block(
             for col in 0..block_p {
                 a[[out_row, start + col]] = constraints.a[[local_row, col]];
             }
-            b_vec[out_row] = constraints.b[local_row];
             out_row += 1;
         }
     }
-    Some(
-        crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock {
-            a,
-            b: b_vec,
-        },
-    )
+    Some(crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock { a })
 }
 
 struct SimpleLowerBounds {
