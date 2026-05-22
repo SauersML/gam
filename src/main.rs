@@ -14712,6 +14712,7 @@ mod tests {
                         coefficient_lower_bounds: Some(lb),
                         linear_constraints: None,
                         initial_lm_lambda: None,
+                        adaptive_kkt_tolerance: None,
                     },
                     |_| {},
                 )
