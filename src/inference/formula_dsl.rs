@@ -1468,18 +1468,23 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
             continue;
         }
         if t == "0" || t == "-1" {
-            return Err(
-                "formula terms '0'/'-1' (intercept removal) are not supported yet".to_string(),
-            );
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: "formula terms '0'/'-1' (intercept removal) are not supported yet"
+                    .to_string(),
+            }
+            .into());
         }
         // Normalize whitespace so `smooth(x)` and `smooth( x )` match.
         let key: String = t.split_whitespace().collect::<Vec<_>>().join("");
         if !seen_term_keys.insert(key.clone()) {
-            return Err(format!(
-                "formula `{formula}` lists term `{t}` more than once. \
-                 Duplicate terms produce a rank-deficient design; \
-                 keep one copy or differentiate them (e.g. distinct k=, bs= options)."
-            ));
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: format!(
+                    "formula `{formula}` lists term `{t}` more than once. \
+                     Duplicate terms produce a rank-deficient design; \
+                     keep one copy or differentiate them (e.g. distinct k=, bs= options)."
+                ),
+            }
+            .into());
         }
         match parse_term(t)? {
             ParsedTerm::LinkWiggle { options } => {
