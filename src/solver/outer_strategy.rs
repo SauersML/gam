@@ -5000,6 +5000,7 @@ fn run_outer(
                 }
             })?;
     }
+    crate::solver::estimate::reml::runtime::clear_outer_ift_residual_energy_for_fit();
 
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
