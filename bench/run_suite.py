@@ -19,7 +19,7 @@ from pathlib import Path
 from shutil import disk_usage
 from time import monotonic, perf_counter
 
-# Statistical-regression gate (opt-in). Lives in bench/gate.py so it can
+# Statistical-regression gate. Lives in bench/gate.py so it can
 # be invoked stand-alone post-hoc as well. Imported lazily-safely: if the
 # module is unavailable for any reason the gate just stays quiet.
 try:
@@ -8409,10 +8409,9 @@ def main() -> None:
         choices=["report", "strict", "off"],
         default=None,
         help=(
-            "Statistical-regression gate mode. 'report' (default unless BENCH_GATE is "
-            "set) prints findings without failing. 'strict' fails the run on a "
-            "tolerance-breaking delta in final_neg_v or edf_per_term. 'off' skips "
-            "the gate entirely. Falls back to BENCH_GATE env var when not given."
+            "Statistical-regression gate mode. Default: strict. Set BENCH_GATE=report "
+            "or pass --gate report to opt out of failing CI on regression. 'off' "
+            "skips the gate entirely."
         ),
     )
     parser.add_argument(
@@ -8842,13 +8841,12 @@ def main() -> None:
     args.out.write_text(json.dumps(payload, indent=2))
     print(f"Wrote {args.out}")
 
-    # ---- Statistical-regression gate (opt-in) -----------------------------
+    # ---- Statistical-regression gate --------------------------------------
     # See bench/gate.py for tolerances and rationale. Default mode is
-    # 'report' so the gate is non-blocking until CI flips it to 'strict'
-    # via BENCH_GATE=strict or --gate strict.
-    gate_mode = args.gate or os.environ.get("BENCH_GATE", "").strip().lower() or "report"
+    # 'strict'; use BENCH_GATE=report or --gate report for non-blocking runs.
+    gate_mode = args.gate or os.environ.get("BENCH_GATE", "").strip().lower() or "strict"
     if gate_mode not in ("report", "strict", "off"):
-        gate_mode = "report"
+        gate_mode = "strict"
     if gate_mode != "off" and _gate_cmd_check_results is not None:
         gate_args = argparse.Namespace(
             results=str(args.out),

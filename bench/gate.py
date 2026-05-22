@@ -11,9 +11,9 @@ baseline:
     (``fit_result.edf_by_block`` keyed by the term names taken from
     ``resolved_term_spec.smooth_terms[i].name``).
 
-The gate is OPT-IN. Default behaviour is "report and don't fail" so it can
-land in CI without breaking existing runs. To make it fail on regression,
-set ``BENCH_GATE=strict`` or pass ``--gate strict``.
+The gate defaults to STRICT so CI fails on regression. Set
+``BENCH_GATE=report`` or pass ``--gate report`` to opt out of failing CI on
+regression.
 
 Tolerances (rationale):
 
@@ -128,6 +128,15 @@ def _baseline_path(key: str) -> Path:
     return BASELINES_DIR / f"{safe}.json"
 
 
+def _has_baseline_data(baseline: Any) -> bool:
+    if not isinstance(baseline, dict):
+        return False
+    if isinstance(baseline.get("final_neg_v"), (int, float)):
+        return True
+    edf = baseline.get("edf_per_term")
+    return isinstance(edf, dict) and bool(edf)
+
+
 def _format_delta(label: str, baseline: float, current: float, abs_tol: float | None = None, rel_tol: float | None = None) -> str:
     delta = current - baseline
     rel = abs(delta) / max(abs(baseline), 1e-12)
@@ -193,7 +202,7 @@ def _resolve_gate_mode(cli_value: str | None) -> str:
     env = os.environ.get("BENCH_GATE", "").strip().lower()
     if env in ("strict", "report"):
         return env
-    return "report"
+    return "strict"
 
 
 def _iter_model_files(root: Path) -> list[Path]:
@@ -226,12 +235,23 @@ def _gate_one(key: str, current: dict[str, Any], *, update: bool, mode: str) -> 
         print(f"[gate] wrote baseline {baseline_path}")
         return True
     if not baseline_path.is_file():
-        print(f"[gate] SKIP {key}: no baseline at {baseline_path} (use --update-baseline to create one)")
+        print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
         return True
     try:
-        baseline = json.loads(baseline_path.read_text())
+        baseline_text = baseline_path.read_text()
     except (OSError, ValueError) as e:
         print(f"[gate] SKIP {key}: baseline unreadable ({e})")
+        return True
+    if not baseline_text.strip():
+        print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
+        return True
+    try:
+        baseline = json.loads(baseline_text)
+    except ValueError as e:
+        print(f"[gate] SKIP {key}: baseline unreadable ({e})")
+        return True
+    if not _has_baseline_data(baseline):
+        print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
         return True
     passed, messages = compare(current, baseline)
     header = f"[gate] {key} {'PASS' if passed else 'FAIL'}"
@@ -306,8 +326,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--gate",
         choices=["report", "strict"],
         default=None,
-        help="report (default): print findings, exit 0. strict: exit 2 on regression. "
-        "Falls back to BENCH_GATE env var if not given.",
+        help="Statistical-regression gate mode. Default: strict. Set BENCH_GATE=report "
+        "to opt out of failing CI on regression.",
     )
     p.add_argument(
         "--update-baseline",
