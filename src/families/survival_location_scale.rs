@@ -53,7 +53,7 @@ use crate::solver::estimate::{
 };
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, LinkFunction};
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use statrs::function::erf::erfc;
@@ -11018,9 +11018,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             None,
         )
     }
+}
 
+impl SurvivalLocationScaleFamily {
     /// HT-mask-aware variant of [`Self::exact_newton_joint_psi_terms`].
-    fn exact_newton_joint_psi_terms_masked(
+    ///
+    /// Lives in an inherent impl (not the `impl CustomFamily` trait impl)
+    /// because the trait does not declare a `_masked` signature. The survival
+    /// ψ workspace overrides `first_order_terms` to invoke this directly with
+    /// the workspace's `row_mask`, so the trait dispatch stays on the
+    /// pre-refactor `exact_newton_joint_psi_terms` (full data) while staged
+    /// outer subsampling threads the HT mask through this side door.
+    pub(crate) fn exact_newton_joint_psi_terms_masked(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -11903,6 +11912,13 @@ struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
     /// Cached `SurvivalDynamicGeometry`. `build_dynamic_geometry` depends only
     /// on `block_states`.
     dynamic: SurvivalDynamicGeometry,
+    /// Optional Horvitz-Thompson row mask. `None` means full-data evaluation
+    /// (byte-identical to the pre-refactor workspace). `Some(m)` causes every
+    /// row-additive assembly site in the directional / second-directional
+    /// derivative paths to multiply the per-row weight by `m[i]` before the
+    /// final cross product / dot-product reduction, yielding an unbiased
+    /// outer-Hessian estimate for the configured subsample.
+    row_mask: Option<Arc<Array1<f64>>>,
 }
 
 impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
@@ -11918,7 +11934,26 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
             block_states,
             q,
             dynamic,
+            row_mask: None,
         })
+    }
+
+    /// Install a Horvitz-Thompson row mask: for each `WeightedOuterRow {
+    /// index, weight, .. }`, set `mask[index] = weight`; all other entries are
+    /// `0.0`. The mask is consumed by every `*_masked` assembly site reached
+    /// via the workspace methods.
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.family.n;
+        let mut mask = Array1::<f64>::zeros(n);
+        for r in rows {
+            if r.index < n {
+                mask[r.index] = r.weight;
+            }
+        }
+        self.row_mask = Some(Arc::new(mask));
     }
 }
 
@@ -11928,11 +11963,12 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         self.family
-            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
                 &self.block_states,
                 d_beta_flat,
                 &self.q,
                 &self.dynamic,
+                self.row_mask.as_deref(),
             )
     }
 
