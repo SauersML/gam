@@ -14574,14 +14574,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             || penalties_local.len() != smooth_penalty_range.len()
             || nullspace_dims.len() != smooth_penalty_range.len()
         {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer topology changed for term '{}': penalties={}, infos={}, nullspaces={}, cached_penalties={}",
                 name,
                 penalties_local.len(),
                 active_penaltyinfo.len(),
                 nullspace_dims.len(),
                 smooth_penalty_range.len()
-            ));
+            ))
+            .into());
         }
 
         self.design.smooth.term_designs[term_idx] = design_local;
@@ -14595,7 +14596,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             if penalty_local.nrows() != coeff_range.len()
                 || penalty_local.ncols() != coeff_range.len()
             {
-                return Err(format!(
+                return Err(SmoothError::dimension_mismatch(format!(
                     "incremental realizer penalty shape mismatch for term '{}' penalty {}: \
                      penalty is {}x{} but coeff_range has {} columns",
                     name,
@@ -14603,7 +14604,8 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     penalty_local.nrows(),
                     penalty_local.ncols(),
                     coeff_range.len()
-                ));
+                ))
+                .into());
             }
 
             let smooth_penalty = self
@@ -14922,13 +14924,14 @@ impl<'d> ExactJointDesignCache<'d> {
         let t_ensure = std::time::Instant::now();
         let kappa_theta_len = self.rho_dim + self.log_kappa_dim;
         if theta.len() < kappa_theta_len {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "exact-joint theta length mismatch: got {}, expected at least {} (rho_dim={}, log_kappa_dim={})",
                 theta.len(),
                 kappa_theta_len,
                 self.rho_dim,
                 self.log_kappa_dim
-            ));
+            ))
+            .into());
         }
         let theta_kappa = theta.slice(s![..kappa_theta_len]).to_owned();
         let full_log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(

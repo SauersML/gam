@@ -1234,38 +1234,47 @@ impl SavedBaselineTimeWiggleRuntime {
 impl SavedAnchoredDeviationRuntime {
     pub(crate) fn validate_exact_replay_contract(&self) -> Result<(), FittedModelError> {
         if self.kernel.is_empty() {
-            return Err(
-                "saved anchored deviation runtime is missing the exact kernel marker".to_string(),
-            );
+            return Err(FittedModelError::SchemaMismatch {
+                reason: "saved anchored deviation runtime is missing the exact kernel marker"
+                    .to_string(),
+            });
         }
         if self.kernel
             != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
         {
-            return Err(format!(
-                "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
-                self.kernel,
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-            ));
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: format!(
+                    "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
+                    self.kernel,
+                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                ),
+            });
         }
         if self.basis_dim == 0 {
-            return Err(format!(
-                "saved anchored deviation runtime basis_dim must be positive, got {}",
-                self.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation runtime basis_dim must be positive, got {}",
+                    self.basis_dim
+                ),
+            });
         }
         if self.breakpoints.len() < 2 {
-            return Err(format!(
-                "saved anchored deviation runtime requires at least two breakpoints, got {}",
-                self.breakpoints.len()
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation runtime requires at least two breakpoints, got {}",
+                    self.breakpoints.len()
+                ),
+            });
         }
         for window in self.breakpoints.windows(2) {
             let left = window[0];
             let right = window[1];
             if !left.is_finite() || !right.is_finite() || right <= left {
-                return Err(format!(
-                    "saved anchored deviation runtime breakpoints must be finite and strictly increasing, got [{left}, {right}]"
-                ));
+                return Err(FittedModelError::PayloadCorrupt {
+                    reason: format!(
+                        "saved anchored deviation runtime breakpoints must be finite and strictly increasing, got [{left}, {right}]"
+                    ),
+                });
             }
         }
         let span_count = self.breakpoints.len() - 1;
