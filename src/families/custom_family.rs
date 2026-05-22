@@ -14823,6 +14823,14 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
         }
     }
 
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        if self.first_order_skip_active() {
+            Err("backend does not support tangent projection".to_string())
+        } else {
+            self.inner.assemble_h_dense_for_tangent_projection()
+        }
+    }
+
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         self.inner.trace_hinv_operator(op)
     }
