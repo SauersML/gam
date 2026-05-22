@@ -1383,12 +1383,24 @@ enum PirlsPenalty {
         e_transformed: Array2<f64>,
         linear_shift: Array1<f64>,
         constant_shift: f64,
+        /// Aggregated prior-mean target `μ` in *transformed* coordinates,
+        /// summed over the canonical penalties' `full_width_prior_mean()`.
+        /// Used to keep the fixed stabilization ridge `δI` (and other PSD
+        /// rescue ridges) from biasing the recovered β away from the prior
+        /// mean: any site that adds `δI` to the penalized Hessian must also
+        /// add `δ · prior_mean_target` to the RHS so the augmented system
+        /// `(H + δI) β = r + δμ` keeps `β = μ` exact when the data has no
+        /// pull (X'WX = 0, X'Wz = 0). When all blocks have zero prior, this
+        /// vector is all zero and the RHS shift is a no-op.
+        prior_mean_target: Array1<f64>,
     },
     Diagonal {
         diag: Array1<f64>,
         positive_indices: Vec<usize>,
         linear_shift: Array1<f64>,
         constant_shift: f64,
+        /// See `Dense::prior_mean_target`.
+        prior_mean_target: Array1<f64>,
     },
 }
 
@@ -1432,6 +1444,20 @@ impl PirlsPenalty {
     fn linear_shift(&self) -> &Array1<f64> {
         match self {
             Self::Dense { linear_shift, .. } | Self::Diagonal { linear_shift, .. } => linear_shift,
+        }
+    }
+
+    /// Prior-mean target `μ` in transformed coordinates (see field docs on
+    /// the [`PirlsPenalty::Dense::prior_mean_target`] variant). The returned
+    /// slice has length `dim()`.
+    fn prior_mean_target(&self) -> &Array1<f64> {
+        match self {
+            Self::Dense {
+                prior_mean_target, ..
+            }
+            | Self::Diagonal {
+                prior_mean_target, ..
+            } => prior_mean_target,
         }
     }
 
@@ -6175,6 +6201,7 @@ fn build_diagonal_penalty_from_kronecker(
         positive_indices,
         linear_shift: Array1::zeros(p),
         constant_shift: 0.0,
+        prior_mean_target: Array1::zeros(p),
     }
 }
 
@@ -6198,24 +6225,47 @@ fn canonical_prior_shift(
     (linear, constant)
 }
 
+/// Aggregate prior-mean target across canonical penalty blocks: the sum of
+/// each block's `full_width_prior_mean()`. Used by the PIRLS solve sites
+/// that add a fixed stabilization ridge `δI` to the penalized Hessian — they
+/// must also add `δ · prior_mean_target` to the RHS to keep `β = μ` recovery
+/// exact when the data carries no information (X'WX = 0). Equivalent to
+/// `canonical_prior_shift` with all λ = 1 and dropping `S_k` from the linear
+/// piece (i.e., raw μ rather than `S_k μ`). Returned in the *original*
+/// coordinates; callers transform if needed.
+fn canonical_prior_mean_aggregate(
+    penalties: &[crate::construction::CanonicalPenalty],
+    p: usize,
+) -> Array1<f64> {
+    let mut mean = Array1::<f64>::zeros(p);
+    for cp in penalties {
+        mean += &cp.full_width_prior_mean();
+    }
+    mean
+}
+
 fn attach_penalty_shift(
     penalty: &mut PirlsPenalty,
     linear_shift: Array1<f64>,
     constant_shift: f64,
+    prior_mean_target: Array1<f64>,
 ) {
     match penalty {
         PirlsPenalty::Dense {
             linear_shift: target,
             constant_shift: constant,
+            prior_mean_target: mean_target,
             ..
         }
         | PirlsPenalty::Diagonal {
             linear_shift: target,
             constant_shift: constant,
+            prior_mean_target: mean_target,
             ..
         } => {
             *target = linear_shift;
             *constant = constant_shift;
+            *mean_target = prior_mean_target;
         }
     }
 }
@@ -6528,6 +6578,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             e_transformed: e_root,
             linear_shift: Array1::zeros(penalty.p),
             constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(penalty.p),
         }
     } else {
         let dense = dense_reparam_result
@@ -6538,6 +6589,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             e_transformed: dense.e_transformed.clone(),
             linear_shift: Array1::zeros(penalty.p),
             constant_shift: 0.0,
+            prior_mean_target: Array1::zeros(penalty.p),
         }
     };
     let (shift_original, shift_constant) =
@@ -6546,7 +6598,18 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         .as_ref()
         .map(|transform| transform.apply_transpose(&shift_original))
         .unwrap_or(shift_original);
-    attach_penalty_shift(&mut penalty_active, shift_active, shift_constant);
+    let prior_mean_original =
+        canonical_prior_mean_aggregate(penalty.canonical_penalties, penalty.p);
+    let prior_mean_active = transform_active
+        .as_ref()
+        .map(|transform| transform.apply_transpose(&prior_mean_original))
+        .unwrap_or(prior_mean_original);
+    attach_penalty_shift(
+        &mut penalty_active,
+        shift_active,
+        shift_constant,
+        prior_mean_active,
+    );
     // Build transformed constraints now that dense_reparam_result is available.
     let linear_constraints = if let Some(kc) = kronecker_constraints {
         kc
@@ -7136,12 +7199,22 @@ fn solve_penalized_least_squares_implicit(
                     )
                 })?;
 
-            // 2. RHS = X'W(z - offset)
+            // 2. RHS = X'W(z - offset) + S_λ μ + ridge_used · μ.
+            // The `ridge_used · μ` term matches the diagonal ridge added to
+            // the Hessian in step 1, keeping the augmented system a
+            // Tikhonov regularization centered at the prior mean target
+            // rather than at zero (see `prior_mean_target` field docs).
             let mut wz = z.to_owned();
             wz -= &offset;
             wz *= &weights_owned;
             let mut rhs = x_original.transpose_vector_multiply(&wz);
             rhs += penalty.linear_shift();
+            if ridge_used > 0.0 {
+                let prior_mean_target = penalty.prior_mean_target();
+                if prior_mean_target.len() == rhs.len() {
+                    rhs.scaled_add(ridge_used, prior_mean_target);
+                }
+            }
 
             // 3. Sparse Cholesky solve (factor reused from step 1)
             let betavec = solve_sparse_spd(&factor, &rhs)?;
@@ -7301,7 +7374,12 @@ fn solve_penalized_least_squares_implicit(
         );
     }
 
-    // 4. Ridge stabilization
+    // 4. Ridge stabilization. Augment both sides by the ridge so the
+    // stabilization is a Tikhonov regularization centered at the prior
+    // mean target: (H + δI) β = r + δ μ. The prior_mean_target is zero
+    // when no penalty block carries a non-zero prior mean, so this is a
+    // no-op in the common case but recovers `β = μ` exactly on
+    // X'WX = 0 / X'Wz = 0 problems where the data carries no information.
     let nugget = FIXED_STABILIZATION_RIDGE;
     let mut regularizedhessian = penalized_hessian.clone();
     if nugget > 0.0 {
@@ -7316,6 +7394,12 @@ fn solve_penalized_least_squares_implicit(
         workspace.rhs_full = Array1::zeros(p_dim);
     }
     workspace.rhs_full.assign(&workspace.vec_buf_p);
+    if nugget > 0.0 {
+        let prior_mean_target = penalty.prior_mean_target();
+        if prior_mean_target.len() == p_dim {
+            workspace.rhs_full.scaled_add(nugget, prior_mean_target);
+        }
+    }
     let factor = StableSolver::new("pirls implicit pls")
         .factorize(&regularizedhessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
