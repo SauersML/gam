@@ -92,29 +92,33 @@ impl EncodedDataset {
     /// `training_feature_ranges` so prediction can clip out-of-hull inputs
     /// to the training bounding box.
     pub fn feature_ranges(&self) -> Vec<(f64, f64)> {
-        let n_cols = self.headers.len();
-        let mut ranges = Vec::with_capacity(n_cols);
-        for col in 0..n_cols {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for row in 0..self.values.nrows() {
-                let v = self.values[[row, col]];
-                if v.is_finite() {
-                    if v < lo {
-                        lo = v;
-                    }
-                    if v > hi {
-                        hi = v;
-                    }
+        // Iterate column-by-column (contiguous in C-order Array2 along axis 0
+        // only when the array is Fortran-order; here Array2 is row-major so
+        // each column is strided. However, scanning one column at a time keeps
+        // each column's working set hot, lets rayon parallelize across
+        // columns, and avoids the previous outer-col/inner-row pattern that
+        // re-streamed all rows per column with stride `p`.
+        self.values
+            .axis_iter(Axis(1))
+            .into_par_iter()
+            .map(|col| {
+                let (lo, hi) = col.iter().fold(
+                    (f64::INFINITY, f64::NEG_INFINITY),
+                    |(lo, hi), &v| {
+                        if v.is_finite() {
+                            (lo.min(v), hi.max(v))
+                        } else {
+                            (lo, hi)
+                        }
+                    },
+                );
+                if !lo.is_finite() || !hi.is_finite() {
+                    (0.0, 0.0)
+                } else {
+                    (lo, hi)
                 }
-            }
-            if !lo.is_finite() || !hi.is_finite() {
-                ranges.push((0.0, 0.0));
-            } else {
-                ranges.push((lo, hi));
-            }
-        }
-        ranges
+            })
+            .collect()
     }
 }
 
@@ -558,10 +562,11 @@ fn infer_delimited_column(
             } else {
                 all_numeric = false;
                 all_binary = false;
-                if !level_index.contains_key(raw) {
-                    level_index.insert(raw.to_string(), levels.len());
+                level_index.entry(raw.to_string()).or_insert_with(|| {
+                    let idx = levels.len();
                     levels.push(raw.to_string());
-                }
+                    idx
+                });
                 // Store a placeholder for sample-window strings; once the
                 // final column kind is known, categorical columns are fixed up
                 // with the same level codes as the previous serial path.
@@ -591,11 +596,11 @@ fn infer_delimited_column(
         } else {
             all_numeric = false;
             all_binary = false;
-            if !level_index.contains_key(raw) {
-                level_index.insert(raw.to_string(), levels.len());
+            let idx = *level_index.entry(raw.to_string()).or_insert_with(|| {
+                let new_idx = levels.len();
                 levels.push(raw.to_string());
-            }
-            let idx = *level_index.get(raw).unwrap();
+                new_idx
+            });
             values.push(idx as f64);
         }
     }
@@ -799,10 +804,14 @@ fn load_delimited_with_schema(
                 } else {
                     infer_all_numeric[j] = false;
                     infer_all_binary[j] = false;
-                    if !infer_level_index[j].contains_key(raw) {
-                        infer_level_index[j].insert(raw.to_string(), infer_levels[j].len());
-                        infer_levels[j].push(raw.to_string());
-                    }
+                    let levels_ref = &mut infer_levels[j];
+                    infer_level_index[j]
+                        .entry(raw.to_string())
+                        .or_insert_with(|| {
+                            let idx = levels_ref.len();
+                            levels_ref.push(raw.to_string());
+                            idx
+                        });
                     infer_strings[j].push((total_rows - 1, raw.to_string()));
                     col_vecs[j].push(f64::NAN); // placeholder
                 }
@@ -875,21 +884,35 @@ fn load_delimited_with_schema(
     }
 
     let t_assemble = std::time::Instant::now();
-    // Assemble Array2.
+    // Assemble Array2 by column in parallel (mirrors the inferred path).
+    // Each column carries its own finiteness check; errors are surfaced
+    // through a parallel reduce so the first detected non-finite cell wins
+    // by lexicographic (column, row) order — deterministic given the
+    // collect.
     let mut values = Array2::<f64>::zeros((total_rows, p));
-    for j in 0..p {
-        for (i, &v) in col_vecs[j].iter().enumerate() {
-            if !v.is_finite() {
-                return Err(DataError::InvalidValue {
-                    reason: format!(
-                        "non-finite value at row {}, column '{}'",
-                        i + 1,
-                        &headers[j]
-                    ),
-                });
+    let assemble_err: Option<DataError> = values
+        .axis_iter_mut(Axis(1))
+        .into_par_iter()
+        .zip(col_vecs.par_iter())
+        .zip(headers.par_iter())
+        .map(|((mut out_col, col_vec), header)| {
+            for (i, &v) in col_vec.iter().enumerate() {
+                if !v.is_finite() {
+                    return Some(DataError::InvalidValue {
+                        reason: format!(
+                            "non-finite value at row {}, column '{}'",
+                            i + 1,
+                            header
+                        ),
+                    });
+                }
+                out_col[i] = v;
             }
-            values[[i, j]] = v;
-        }
+            None
+        })
+        .reduce(|| None, |a, b| a.or(b));
+    if let Some(e) = assemble_err {
+        return Err(e);
     }
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
     if assemble_ms > 100.0 {
@@ -1256,10 +1279,11 @@ fn load_parquet_inferred(
                 let mut level_index: HashMap<String, usize> = HashMap::new();
                 let mut levels_vec: Vec<String> = Vec::new();
                 for s in &strings {
-                    if !level_index.contains_key(s.as_str()) {
-                        level_index.insert(s.clone(), levels_vec.len());
+                    level_index.entry(s.clone()).or_insert_with(|| {
+                        let idx = levels_vec.len();
                         levels_vec.push(s.clone());
-                    }
+                        idx
+                    });
                 }
                 for (i, s) in strings.iter().enumerate() {
                     col_values[i] = *level_index.get(s.as_str()).unwrap() as f64;
@@ -1317,15 +1341,18 @@ fn load_parquet_inferred(
     }
 
     let t_assemble = std::time::Instant::now();
-    // Assemble Array2. Rows are independent; keep column order from col_vecs.
+    // Assemble Array2. Columns are independent; write by column in parallel
+    // so each task touches a contiguous source vec (and the strided
+    // destination column once) rather than scattering across all p columns
+    // per row.
     let mut values = Array2::<f64>::zeros((total_rows, p));
     values
-        .axis_iter_mut(Axis(0))
+        .axis_iter_mut(Axis(1))
         .into_par_iter()
-        .enumerate()
-        .for_each(|(i, mut row)| {
-            for j in 0..p {
-                row[j] = col_vecs[j][i];
+        .zip(col_vecs.par_iter())
+        .for_each(|(mut out_col, src)| {
+            for (dst, &v) in out_col.iter_mut().zip(src.iter()) {
+                *dst = v;
             }
         });
     let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
@@ -1632,10 +1659,11 @@ fn infer_schema_column(
         } else {
             all_numeric = false;
             all_binary = false;
-            if !level_index.contains_key(raw) {
-                level_index.insert(raw.to_string(), levels.len());
+            level_index.entry(raw.to_string()).or_insert_with(|| {
+                let idx = levels.len();
                 levels.push(raw.to_string());
-            }
+                idx
+            });
         }
     }
     let kind = if all_numeric {
