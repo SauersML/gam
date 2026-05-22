@@ -2161,6 +2161,7 @@ impl BernoulliMarginalSlopePredictor {
         };
         let solve_result: Result<(), EstimationError> = {
             use ndarray::Axis;
+            use rayon::iter::IndexedParallelIterator;
             let intercepts_chunks: Vec<ndarray::ArrayViewMut1<f64>> = intercepts
                 .axis_chunks_iter_mut(Axis(0), chunk_size)
                 .collect();
@@ -2461,80 +2462,76 @@ impl BernoulliMarginalSlopePredictor {
         let a_q_vec = a_q_vec.unwrap();
         let a_b_vec = a_b_vec.unwrap();
 
-        // Emit chunk Jacobians using precomputed scalars.
-        struct FlexGradientChunk {
-            start: usize,
-            end: usize,
-            grad: Array2<f64>,
-        }
-        let grad_chunks = (0..num_chunks)
-            .into_par_iter()
-            .map(|chunk_idx| -> Result<FlexGradientChunk, String> {
-                let start = chunk_idx * chunk_size;
-                let end = (start + chunk_size).min(n);
-                let mc = input
-                    .design
-                    .try_row_chunk(start..end)
-                    .map_err(|e| e.to_string())?;
-                let lc = design_logslope
-                    .try_row_chunk(start..end)
-                    .map_err(|e| e.to_string())?;
-                let rows = end - start;
-                let mut grad = Array2::<f64>::zeros((rows, theta.len()));
-
-                for li in 0..rows {
-                    let i = start + li;
-                    let mut row = grad.row_mut(li);
-
-                    let a_q = a_q_vec[i];
-                    for j in 0..marginal_dim {
-                        row[j] = a_q * mc[[li, j]];
-                    }
-
-                    let base_multiplier = link_c_obs.as_ref().map_or(1.0, |c| c[i]);
-                    let g_scale = base_multiplier * (a_b_vec[i] + z[i]) + score_dev_obs[i];
-                    for j in 0..logslope_dim {
-                        row[logslope_offset + j] = g_scale * lc[[li, j]];
-                    }
-
-                    if let (Some(a_h_rows), Some(obs_design)) =
-                        (a_h_rows.as_ref(), score_warp_obs_design.as_ref())
-                    {
-                        let slope = logslope_eta[i];
-                        for j in 0..score_warp_dim {
-                            row[score_warp_offset + j] =
-                                base_multiplier * a_h_rows[[i, j]] + slope * obs_design[[i, j]];
-                        }
-                    }
-
-                    if let Some(a_w_rows) = a_w_rows.as_ref() {
-                        for j in 0..link_dev_dim {
-                            row[link_dev_offset + j] = a_w_rows[[i, j]];
-                        }
-                    }
-
-                    if let (Some(link_c), Some(link_basis)) =
-                        (link_c_obs.as_ref(), link_basis_obs.as_ref())
-                    {
-                        let c = link_c[i];
-                        for j in 0..marginal_dim {
-                            row[j] *= c;
-                        }
-                        for j in 0..link_dev_dim {
-                            row[link_dev_offset + j] =
-                                c * row[link_dev_offset + j] + link_basis[[i, j]];
-                        }
-                    }
-                }
-
-                Ok(FlexGradientChunk { start, end, grad })
-            })
-            .collect::<Result<Vec<_>, String>>()
-            .map_err(EstimationError::InvalidInput)?;
+        // Emit chunk Jacobians using precomputed scalars; each worker writes
+        // directly into its exclusive `axis_chunks_iter_mut` slice of the
+        // preallocated `grad` output so no serial copy pass is needed.
         let mut grad = Array2::<f64>::zeros((n, theta.len()));
-        for chunk in grad_chunks {
-            grad.slice_mut(ndarray::s![chunk.start..chunk.end, ..])
-                .assign(&chunk.grad);
+        {
+            use ndarray::Axis;
+            use rayon::iter::IndexedParallelIterator;
+            let grad_result: Result<(), String> = grad
+                .axis_chunks_iter_mut(Axis(0), chunk_size)
+                .into_par_iter()
+                .enumerate()
+                .try_for_each(|(chunk_idx, mut grad_chunk)| -> Result<(), String> {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(n);
+                    let mc = input
+                        .design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| e.to_string())?;
+                    let lc = design_logslope
+                        .try_row_chunk(start..end)
+                        .map_err(|e| e.to_string())?;
+                    let rows = end - start;
+
+                    for li in 0..rows {
+                        let i = start + li;
+                        let mut row = grad_chunk.row_mut(li);
+
+                        let a_q = a_q_vec[i];
+                        for j in 0..marginal_dim {
+                            row[j] = a_q * mc[[li, j]];
+                        }
+
+                        let base_multiplier = link_c_obs.as_ref().map_or(1.0, |c| c[i]);
+                        let g_scale = base_multiplier * (a_b_vec[i] + z[i]) + score_dev_obs[i];
+                        for j in 0..logslope_dim {
+                            row[logslope_offset + j] = g_scale * lc[[li, j]];
+                        }
+
+                        if let (Some(a_h_rows), Some(obs_design)) =
+                            (a_h_rows.as_ref(), score_warp_obs_design.as_ref())
+                        {
+                            let slope = logslope_eta[i];
+                            for j in 0..score_warp_dim {
+                                row[score_warp_offset + j] =
+                                    base_multiplier * a_h_rows[[i, j]] + slope * obs_design[[i, j]];
+                            }
+                        }
+
+                        if let Some(a_w_rows) = a_w_rows.as_ref() {
+                            for j in 0..link_dev_dim {
+                                row[link_dev_offset + j] = a_w_rows[[i, j]];
+                            }
+                        }
+
+                        if let (Some(link_c), Some(link_basis)) =
+                            (link_c_obs.as_ref(), link_basis_obs.as_ref())
+                        {
+                            let c = link_c[i];
+                            for j in 0..marginal_dim {
+                                row[j] *= c;
+                            }
+                            for j in 0..link_dev_dim {
+                                row[link_dev_offset + j] =
+                                    c * row[link_dev_offset + j] + link_basis[[i, j]];
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            grad_result.map_err(EstimationError::InvalidInput)?;
         }
         if scale != 1.0 {
             grad.mapv_inplace(|v| scale * v);
