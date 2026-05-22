@@ -1734,10 +1734,17 @@ impl<'a> GamWorkingModel<'a> {
     /// Compute X_transformed * β into a pre-allocated buffer, avoiding
     /// per-iteration allocation in the dense case.
     fn transformed_matvec_into(&self, beta: &Coefficients, out: &mut Array1<f64>) {
+        self.transformed_matvec_array_into(beta.as_ref(), out);
+    }
+
+    /// View-based sibling of `transformed_matvec_into` that operates on a raw
+    /// `&Array1<f64>` to avoid wrapping (and cloning into) `Coefficients` on
+    /// hot LM-screen paths.
+    fn transformed_matvec_array_into(&self, beta: &Array1<f64>, out: &mut Array1<f64>) {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
-                    fast_av_into(dense, beta.as_ref(), out);
+                    fast_av_into(dense, beta, out);
                     return;
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
@@ -1745,7 +1752,7 @@ impl<'a> GamWorkingModel<'a> {
             WorkingCoordinateDesign::TransformedImplicit { transform } => {
                 // Composed: X · (Qs · beta).  Qs·beta is p-dim (cheap),
                 // then write X·(Qs·beta) directly into out when X is dense.
-                let beta_orig = transform.apply(beta.as_ref());
+                let beta_orig = transform.apply(beta);
                 if let Some(dense) = self.x_original.as_dense() {
                     fast_av_into(dense, &beta_orig, out);
                 } else {
@@ -1942,7 +1949,10 @@ impl<'a> GamWorkingModel<'a> {
         // Compute δη = X·direction once into the workspace, then assemble
         // η_cand = η_current + δη in parallel.
         let mut delta_eta = std::mem::take(&mut self.workspace.delta_eta);
-        self.transformed_matvec_into(&Coefficients::new(direction.clone()), &mut delta_eta);
+        // Avoid wrapping/cloning `direction` into a `Coefficients` newtype just
+        // to satisfy the &Coefficients overload — the view-based sibling
+        // performs the identical matvec without the per-LM-attempt clone.
+        self.transformed_matvec_array_into(direction, &mut delta_eta);
         Zip::from(&mut self.workspace.eta_buf)
             .and(current_eta.as_ref())
             .and(&delta_eta)
@@ -3623,7 +3633,7 @@ fn solve_subsystem_direction(
     }
     // All ridge attempts failed — fall back to steepest descent on the
     // free subspace: d = -g / ||g||, scaled to a conservative step.
-    let gnorm = g_sub.dot(g_sub).sqrt();
+    let gnorm = g_sub.dot(&g_sub).sqrt();
     if gnorm > 0.0 {
         let scale = 1.0 / gnorm.max(diag_scale);
         for i in 0..n {

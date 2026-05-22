@@ -21,6 +21,10 @@ const PI_SQ: f64 = PI * PI;
 //     = 2 · k · sqrt(2 / π) · x^{-3/2} · exp(-2k²/x).
 // Multiplied by 2 below so `coeff` is the full `2k · sqrt(2/π)` factor.
 const SQRT_2_OVER_SQRT_PI: f64 = 0.797_884_560_802_865_4;
+// sqrt(π/2) — used as the standard-normal-scale factor inside the
+// exponential-tail-mass calculation. Precomputed to avoid two `sqrt`
+// calls per PG draw setup.
+const SQRT_PI_OVER_2: f64 = 1.253_314_137_315_500_1;
 
 /// Sampler for the Pólya-Gamma PG(1, c) distribution.
 #[derive(Debug, Clone)]
@@ -80,12 +84,15 @@ impl PolyaGamma {
 
     fn exponential_tail_mass(&self, tilt: f64) -> f64 {
         let base = 0.125 * PI_SQ + 0.5 * tilt * tilt;
-        let upper = FRAC_PI_2.sqrt() * (FRAC_2_PI * tilt - 1.0);
-        let lower = -(FRAC_PI_2.sqrt() * (FRAC_2_PI * tilt + 1.0));
-        let log_base = base.ln() + base * FRAC_2_PI;
-        let log_p_upper = log_base - tilt + self.std_norm.cdf(upper).ln();
-        let log_p_lower = log_base + tilt + self.std_norm.cdf(lower).ln();
-        let exp_terms = (4.0 / PI) * (log_p_upper.exp() + log_p_lower.exp());
+        let upper = SQRT_PI_OVER_2 * (FRAC_2_PI * tilt - 1.0);
+        let lower = -(SQRT_PI_OVER_2 * (FRAC_2_PI * tilt + 1.0));
+        // Original formulation built `log_p = ln(base) + base·(2/π) ± tilt + ln(Φ(·))`
+        // and then exponentiated; the ln/exp roundtrip burns two transcendentals
+        // per term. Fold the factors directly: base · exp(base·2/π) · exp(∓tilt) · Φ(·).
+        let base_factor = base * (base * FRAC_2_PI).exp();
+        let p_upper = base_factor * (-tilt).exp() * self.std_norm.cdf(upper);
+        let p_lower = base_factor * tilt.exp() * self.std_norm.cdf(lower);
+        let exp_terms = (4.0 / PI) * (p_upper + p_lower);
         1.0 / (1.0 + exp_terms)
     }
 
