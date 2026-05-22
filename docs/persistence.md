@@ -1,11 +1,8 @@
 # Save and load
 
-`gamfit` persists two things: fitted **models** and **posterior samples**.
-Both round-trip exactly.
+`gamfit` persists fitted models (`.gam`) and posterior samples (`.npz`).
 
 ## Models — `.gam`
-
-A fitted `Model` saves to a single binary file:
 
 ```python
 model = gamfit.fit(train, "y ~ s(x)")
@@ -15,24 +12,21 @@ loaded = gamfit.load("model.gam")
 preds  = loaded.predict(test)
 ```
 
-Or as in-memory bytes:
+In-memory transport:
 
 ```python
-blob   = model.dumps()                     # bytes
+blob   = model.dumps()              # bytes
 loaded = gamfit.loads(blob)
 ```
 
-The `.gam` file is a binary blob produced by the Rust engine. It contains:
+The `.gam` file is the JSON serialisation of the Rust `Model` struct
+(produced by `serde_json::to_writer`). It contains:
 
-- coefficients, smoothing parameters, basis specifications
-- formula and family/link metadata
-- the schema needed by `Model.check(...)` and `Model.predict(...)`
+- coefficients, smoothing parameters, basis specifications;
+- formula and family / link metadata;
+- the data schema used by `Model.check(...)` and `Model.predict(...)`.
 
-It does not contain:
-
-- training data
-- the Python version or package version it was created with. Minor version
-  bumps usually load; major bumps are not guaranteed.
+It does not contain the training data.
 
 After loading, every method works as on the original model:
 
@@ -45,27 +39,30 @@ loaded.sample(test, seed=42)
 
 ## Posterior samples — `.npz`
 
-`PosteriorSamples.save(...)` writes a NumPy `.npz` archive:
-
 ```python
 posterior = model.sample(train, seed=42)
 posterior.save("posterior.npz")
 
 restored = gamfit.load_posterior("posterior.npz")
-# or:
+# equivalent:
 restored = gamfit.PosteriorSamples.load("posterior.npz")
 ```
 
-The archive includes:
+The archive (written via `numpy.savez`) contains:
 
-| Array | Shape | Meaning |
+| Array | Shape / dtype | Meaning |
 | --- | --- | --- |
-| `samples` | `(n_draws, n_coeffs) float64` | Raw draws. |
-| `mean`, `std` | `(n_coeffs,) float64` | Per-coeff posterior moments. |
-| `rhat`, `ess` | scalar | Convergence summaries. |
-| `converged` | scalar bool | `rhat < 1.1`. |
-| `model_bytes` | 1-D uint8 | The fitted model (so `predict(...)` works after a load). |
-| `metadata` | 0-D object (JSON) | `config`, `coefficient_names`, `method`, `model_class`, `family_kind`. |
+| `samples` | `(n_draws, n_coeffs)` float64 | Raw draws. |
+| `mean` | `(n_coeffs,)` float64 | Per-coefficient posterior mean. |
+| `std` | `(n_coeffs,)` float64 | Per-coefficient posterior std. |
+| `rhat` | scalar float64 | Convergence diagnostic. |
+| `ess` | scalar float64 | Effective sample size. |
+| `converged` | scalar bool | Convergence flag. |
+| `model_bytes` | 1-D uint8 | The fitted model's serialised bytes. |
+| `metadata` | 0-D object (JSON) | `coefficient_names`, `method`, `model_class`, `family_kind`, `config`. |
+
+`PosteriorSamples.load` requires `allow_pickle=True` to round-trip the
+metadata object array; only load archives produced by `save`.
 
 Because the model bytes are bundled, `predict()` and `predict_draws()`
 work after a round-trip:
@@ -77,41 +74,35 @@ bands    = restored.predict(test, level=0.95)
 
 ## Version compatibility
 
-`.gam` files and `.npz` posteriors written by `gamfit` `0.1.x` are not
-guaranteed to load with `0.2.x` or later. For long-term archival, either:
-
-- pin the gamfit version used to produce artefacts, or
-- re-fit on the new version when you upgrade.
-
-Save and reload within the same session work across all supported
-families.
+`.gam` payloads are version-gated by the Rust loader
+(`validate_for_persistence`). Models written by an older release may
+fail to load in a newer release if a required field has been added. For
+long-term archival, pin the `gamfit` version or refit after upgrades.
 
 ## Patterns
 
-### Save a model and a sampled posterior together
+### Save model and posterior together
 
 ```python
 model.save("model.gam")
 model.sample(train, seed=42).save("posterior.npz")
 ```
 
-Load them independently later, or load the posterior, which carries the
-model bytes.
+The posterior archive carries the model bytes, so loading just the
+posterior is enough to call `predict()`.
 
-### Inspect a model on a machine without the training data
+### Inspect a model without the training data
 
 ```python
 m = gamfit.load("model.gam")
-print(m.summary())            # coefficients, family, etc.
+print(m.summary())
 print(m.model_class, m.formula)
 ```
 
-Lets you share a model for reproducibility without sharing data.
-
-### Programmatic round-trip in tests
+### Round-trip in tests
 
 ```python
-import io
 blob = model.dumps()
-assert gamfit.loads(blob).predict(test)["mean"] == model.predict(test)["mean"]
+assert (gamfit.loads(blob).predict(test)["mean"]
+        == model.predict(test)["mean"]).all()
 ```

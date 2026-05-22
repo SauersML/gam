@@ -5,26 +5,25 @@
 [![Docs](https://img.shields.io/readthedocs/gamfit.svg)](https://gamfit.readthedocs.io/)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](https://github.com/SauersML/gam/blob/main/LICENSE)
 
-Formula-first generalized additive models for Python, backed by a Rust
+Formula-based generalized additive models for Python, backed by a Rust
 engine.
 
-`gamfit` fits Gaussian, binomial, Poisson, and Gamma GLMs with smooth
-terms, random effects, bounded/constrained coefficients, location-scale
-extensions, survival likelihoods, and flexible/learnable links. Smoothing
-parameters are selected by REML or LAML. Posterior sampling uses NUTS
-where supported, and Gaussian Laplace for model classes without an exact
-NUTS path.
+`gamfit` fits Gaussian, binomial (including Bernoulli marginal-slope),
+Poisson, and Gamma GLMs with smooth terms, random effects,
+bounded/constrained coefficients, location-scale extensions, survival
+likelihoods, and flexible/learnable links. Smoothing parameters are
+selected by REML or LAML. Posterior sampling uses NUTS where supported,
+and a Gaussian Laplace approximation otherwise.
 
-Geometric / manifold smooths handle predictor spaces that wrap, including
-circles, cylinders, tori, the sphere (intrinsic Wahba / spherical
-harmonic kernels), and periodic tensor products, with no seams or pole
-artefacts. The gallery's Möbius-looking example is a 4π-periodic
-double-cover parameterization of a Möbius embedding, not a twisted
-Möbius-strip predictor basis:
+Manifold smooths handle predictor spaces that wrap or close: circles,
+cylinders, tori, and the sphere (intrinsic Wahba and spherical-harmonic
+kernels), plus periodic tensor products and boundary-conditioned
+B-splines. The Möbius example in the gallery is a 4π-periodic
+double-cover parameterization, not a twisted Möbius-strip basis.
 
 ![rotating recovery of a trefoil knot, latent-free loop, wobbly cylinder, lumpy sphere, bumpy torus, and Möbius double-cover from noisy 3-D point clouds](https://raw.githubusercontent.com/SauersML/gam/main/docs/images/geometric_shapes_demo.gif)
 
-**Docs:** <https://gamfit.readthedocs.io/>
+Docs: <https://gamfit.readthedocs.io/>.
 
 ## Install
 
@@ -32,10 +31,10 @@ Möbius-strip predictor basis:
 uv add gamfit
 ```
 
-Wheels for Linux (x86_64, aarch64), macOS (x86_64, Apple silicon), and
-Windows. No Rust toolchain required.
+Wheels are published for Linux (x86_64, aarch64), macOS (x86_64, Apple
+silicon), and Windows. No Rust toolchain is required.
 
-## 30-second tour
+## Example
 
 ```python
 import gamfit
@@ -53,34 +52,31 @@ print(model.summary())
 model.save("model.gam")
 ```
 
-pandas, polars, pyarrow, numpy, dict-of-columns, and list-of-records inputs
-all work without conversion.
+pandas, polars, pyarrow, numpy, dict-of-columns, and list-of-records
+inputs are all accepted without conversion.
 
-## What's different
+## Features
 
-- **Three-part penalty structure.** Each smooth gets separate penalties for
-  magnitude, gradient, and curvature. Most GAM libraries use one or two.
-- **Flexible link functions.** Spline offsets from a base link
-  (`link(type=flexible(probit))`), blended mixture links, and SAS /
-  beta-logistic learnable shapes.
-- **Surface smooths in arbitrary dimension.** Thin-plate, Duchon (with
-  triple-operator regularization), and Matérn covariance, with automatic
-  knot placement.
-- **Geometric / manifold smooths.** Cyclic 1-D, cylinder / torus tensor,
-  intrinsic sphere (Wahba + spherical harmonics), Möbius double-cover demo,
-  boundary-conditioned B-splines. Predictor spaces that wrap or close
-  are first-class — no seams, no pole artefacts.
-- **Adaptive anisotropy.** Per-axis spatial anisotropy shrinks or stretches
-  each feature axis independently inside a single joint smooth.
-- **Composable basis/kernel.** Combine a spline kernel with a
-  length-scale behaviour (e.g. Duchon kernel with Matérn-style global κ).
-- **Marginal-slope models.** Separate baseline risk from a calibrated
-  score's effect, for both Bernoulli and survival outcomes.
-- **Posterior sampling.** `model.sample(...)` runs NUTS where supported,
-  and Gaussian Laplace for model classes without an exact NUTS path,
-  behind one API.
+- Polyharmonic / Duchon smooths combine magnitude, gradient, and
+  curvature penalty operators on the same basis. P-spline and
+  thin-plate smooths use their standard derivative penalties. Each
+  penalized block has its own smoothing parameter.
+- Flexible link functions: `flexible(base)` adds a spline offset on a
+  base link; `blended(...)` learns a mixture weight; `sas` and
+  `beta-logistic` learn shape parameters.
+- Surface smooths in arbitrary dimension: thin-plate, Duchon (scale-free
+  by default, hybrid with `length_scale=...`), and Matérn, with
+  automatic knot placement.
+- Manifold smooths: periodic 1-D, cylinder / torus tensor products,
+  intrinsic sphere (Wahba kernel or spherical harmonics), and
+  boundary-conditioned B-splines.
+- Per-axis anisotropy inside a single joint smooth.
+- Marginal-slope models that separate baseline risk from a calibrated
+  score's effect, for Bernoulli and survival outcomes.
+- Posterior sampling via NUTS where supported, Gaussian Laplace
+  otherwise, behind one API.
 
-## Highlights from the API
+## API examples
 
 ```python
 import gamfit
@@ -116,15 +112,19 @@ model.report("report.html")
 | --- | --- |
 | `gamfit.fit(data, formula, **kwargs)` | Fit a model. |
 | `gamfit.load(path)` / `gamfit.loads(bytes)` | Reload a saved model. |
+| `gamfit.load_posterior(path)` | Reload a `PosteriorSamples` archive. |
 | `gamfit.validate_formula(data, formula, ...)` | Type-check a formula without fitting. |
 | `gamfit.build_info()` | Native extension build metadata. |
+| `gamfit.cuda_diagnostics()` / `gamfit.format_cuda_diagnostics()` | CUDA probe results. |
 | `gamfit.explain_error(exc)` | Human-readable hint for a gamfit exception. |
-| `gamfit.Model` | Fitted-model handle: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
-| `gamfit.SurvivalPrediction` | Per-row hazard / survival surface; on-demand evaluation. |
-| `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive` | NUTS / posterior interface. |
+| `gamfit.Model` | Fitted model: `predict`, `summary`, `check`, `diagnose`, `plot`, `report`, `sample`, `save`. |
+| `gamfit.SurvivalPrediction` | Per-row hazard / survival surface. |
+| `gamfit.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
+| `gamfit.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
+| `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
 
-Full reference at <https://gamfit.readthedocs.io/en/latest/api-reference/>.
+Full reference: <https://gamfit.readthedocs.io/en/latest/api-reference/>.
 
 ## Optional extras
 
@@ -138,20 +138,19 @@ uv add "gamfit[all]"        # everything
 
 ## GPU acceleration
 
-CUDA acceleration (cuBLAS / cuSOLVER / cuSPARSE) is built in to the same
-wheel — no separate `gamfit-gpu` package. Per-op dispatch crossover is
-**measured** at probe time, so small kernels stay on the CPU where they
-are faster end-to-end. Inspect the calibrated thresholds with
+CUDA support (cuBLAS / cuSOLVER / cuSPARSE) is built into the same
+wheel; there is no separate `gamfit-gpu` package. Per-op dispatch
+thresholds are derived at probe time from measured GPU FP64 throughput,
+CPU FP64 throughput, and PCIe bandwidth, so small kernels stay on the
+CPU. Inspect the calibrated thresholds with
 `gamfit.build_info()["cuda_diagnostics"]` or
 `gamfit.format_cuda_diagnostics()`.
 
-On hosts that expose both a system CUDA toolkit and pip
-`nvidia-*-cu12` wheels, gamfit emits one warning per process about the
-dual mapping and proceeds — this is almost always benign because glibc
-resolves `dlopen(SONAME)` to a single file. If you pair gamfit with
-`torch`, pin to a `+cu12x` build (`torch<2.12` on the cluster's
-CUDA-12.x drivers) — torch's default `+cu130` wheels need a CUDA-13
-driver.
+If both a system CUDA toolkit and pip `nvidia-*-cu12` wheels are present
+in the same environment, gamfit warns once per conflict-set and
+continues; glibc resolves `dlopen(SONAME)` to a single file, so this is
+usually benign. If you use gamfit with `torch`, install a torch build
+whose CUDA suffix matches your driver.
 
 ## License
 
