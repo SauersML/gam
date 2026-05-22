@@ -34,10 +34,14 @@ const HGB_INNER_FLOOR: f64 = 1e-12;
 const HGB_LINEAR_FLOOR: f64 = 1e-12;
 const HGB_TRACE_FLOOR: f64 = 1e-12;
 const HGB_HISTORY_CAP: usize = 10;
-const HGB_WARMUP_ITERS: usize = 3;
+const HGB_WARMUP_ITERS_MIN: usize = 3;
+const HGB_WARMUP_ITERS_MAX: usize = 10;
 const HGB_TARGET_FRACTION: f64 = 0.1;
 // Treat log-lambda finite differences as local only up to a 1.0 log-scale step.
 const HGB_FD_DRHO_MAX_SQUARED: f64 = 1.0;
+const HGB_MIN_PAIRS_FOR_SENSITIVITY: usize = 3;
+const HGB_REGRESSION_RIDGE: f64 = 1e-6;
+const HGB_SENS_STABILITY_RATIO: f64 = 1.5;
 const S_INNER_INIT: f64 = 1.0;
 const S_LINEAR_INIT: f64 = 1.0;
 const S_TRACE_INIT: f64 = 1.0;
@@ -127,10 +131,10 @@ pub(crate) struct HyperGradHistoryEntry {
 ///
 /// # Warmup
 ///
-/// During the first `HGB_WARMUP_ITERS` (= 3) outer iterations the history
-/// has too few finite-difference pairs to identify sensitivities reliably;
-/// the controller falls back to the per-channel default tolerances and
-/// only switches to budgeted allocation once enough pairs accumulate.
+/// During warmup the history has too few stable finite-difference sensitivity
+/// estimates to identify sensitivities reliably; the controller falls back to
+/// the per-channel default tolerances and only switches to budgeted allocation
+/// once enough stable estimates accumulate, or after the hard warmup cap.
 pub(crate) struct HyperGradientBudget {
     /// Target MSE on `∇V` that the budgeted allocation aims to achieve.
     pub(crate) target_mse: f64,
@@ -155,6 +159,10 @@ pub(crate) struct HyperGradientBudget {
     /// Bounded history of `(ρ, g_outer, E_inner, E_linear, σ², k)`
     /// observations used to fit `s_*` via finite differences.
     pub(crate) history: VecDeque<HyperGradHistoryEntry>,
+    /// Recent successful sensitivity estimates used to decide when HGB warmup
+    /// can safely engage.
+    sensitivity_history: VecDeque<[f64; 3]>,
+    warmup_engaged: bool,
 }
 
 impl HyperGradientBudget {
@@ -168,6 +176,8 @@ impl HyperGradientBudget {
             s_linear: S_LINEAR_INIT,
             s_trace: S_TRACE_INIT,
             history: VecDeque::with_capacity(HGB_HISTORY_CAP),
+            sensitivity_history: VecDeque::with_capacity(HGB_WARMUP_ITERS_MIN),
+            warmup_engaged: false,
         }
     }
 
@@ -189,30 +199,49 @@ impl HyperGradientBudget {
             .unwrap_or(0.0)
     }
 
-    fn reestimate_sensitivities(&mut self) -> bool {
-        let Some(s_inner) = self.estimate_energy_sensitivity(|entry| entry.e_inner) else {
-            return false;
+    fn reestimate_sensitivities(&mut self) -> Option<[f64; 3]> {
+        let pairs = self.finite_difference_pairs();
+        if pairs.len() < HGB_MIN_PAIRS_FOR_SENSITIVITY {
+            log::info!(
+                "[HGB] small-sample fallback to defaults: pairs={}, threshold={}",
+                pairs.len(),
+                HGB_MIN_PAIRS_FOR_SENSITIVITY
+            );
+            return None;
+        }
+        let Some(s_inner) = self.estimate_energy_sensitivity(&pairs, |entry| entry.e_inner) else {
+            return None;
         };
-        let Some(s_linear) = self.estimate_energy_sensitivity(|entry| entry.e_linear) else {
-            return false;
+        let Some(s_linear) = self.estimate_energy_sensitivity(&pairs, |entry| entry.e_linear)
+        else {
+            return None;
         };
         let Some(s_trace) = self.estimate_trace_sensitivity() else {
-            return false;
+            return None;
         };
-        self.s_inner = s_inner.max(HGB_SENS_FLOOR);
-        self.s_linear = s_linear.max(HGB_SENS_FLOOR);
-        self.s_trace = s_trace.max(HGB_SENS_FLOOR);
-        true
+        let sensitivities = [
+            s_inner.max(HGB_SENS_FLOOR),
+            s_linear.max(HGB_SENS_FLOOR),
+            s_trace.max(HGB_SENS_FLOOR),
+        ];
+        self.s_inner = sensitivities[0];
+        self.s_linear = sensitivities[1];
+        self.s_trace = sensitivities[2];
+        self.sensitivity_history.push_back(sensitivities);
+        while self.sensitivity_history.len() > HGB_WARMUP_ITERS_MIN {
+            self.sensitivity_history.pop_front();
+        }
+        Some(sensitivities)
     }
 
-    fn estimate_energy_sensitivity<F>(&self, energy: F) -> Option<f64>
+    fn estimate_energy_sensitivity<F>(
+        &self,
+        pairs: &[(Array1<f64>, Array1<f64>, usize)],
+        energy: F,
+    ) -> Option<f64>
     where
         F: Fn(&HyperGradHistoryEntry) -> f64,
     {
-        let pairs = self.finite_difference_pairs();
-        if pairs.len() < HGB_WARMUP_ITERS {
-            return None;
-        }
         let mut estimates = Vec::new();
         for i in 0..pairs.len() {
             let (drho_i, dg_i, left_idx) = &pairs[i];
@@ -222,7 +251,11 @@ impl HyperGradientBudget {
                 if i == j || dg_j.len() != dg_i.len() {
                     continue;
                 }
-                let denom = drho_j.dot(drho_j);
+                let norm_squared = drho_j.dot(drho_j);
+                if !norm_squared.is_finite() || norm_squared <= 0.0 {
+                    continue;
+                }
+                let denom = norm_squared + HGB_REGRESSION_RIDGE;
                 if !denom.is_finite() || denom <= 0.0 {
                     continue;
                 }
@@ -230,7 +263,7 @@ impl HyperGradientBudget {
                 if !alpha.is_finite() {
                     continue;
                 }
-                let weight = 1.0 / (1.0 + denom.sqrt());
+                let weight = 1.0 / (1.0 + norm_squared.sqrt());
                 predicted.scaled_add(weight * alpha, dg_j);
                 total_weight += weight;
             }
@@ -287,7 +320,7 @@ impl HyperGradientBudget {
             .rev()
             .take_while(|entry| entry.k == last_k)
             .collect();
-        if fixed.len() < HGB_WARMUP_ITERS {
+        if fixed.len() < HGB_WARMUP_ITERS_MIN {
             return None;
         }
         if fixed
@@ -316,6 +349,15 @@ impl HyperGradientBudget {
     }
 
     fn allocate(&self) -> (f64, f64, f64, [bool; 3]) {
+        self.allocate_with_sensitivities(self.s_inner, self.s_linear, self.s_trace)
+    }
+
+    fn allocate_with_sensitivities(
+        &self,
+        s_inner: f64,
+        s_linear: f64,
+        s_trace: f64,
+    ) -> (f64, f64, f64, [bool; 3]) {
         let floors = self.inner_floor + self.linear_floor + self.trace_floor;
         let usable = self.target_mse - floors;
         if usable <= 0.0 || !usable.is_finite() {
@@ -334,9 +376,9 @@ impl HyperGradientBudget {
         // Sensitivity-weighted water filling: split the budget by s^2, then
         // add mandatory floors. This monotone rule is deliberately simple and
         // keeps every channel funded even when one sensitivity dominates.
-        let wi = self.s_inner * self.s_inner;
-        let wl = self.s_linear * self.s_linear;
-        let wt = self.s_trace * self.s_trace;
+        let wi = s_inner * s_inner;
+        let wl = s_linear * s_linear;
+        let wt = s_trace * s_trace;
         let sum = (wi + wl + wt).max(HGB_SENS_FLOOR * HGB_SENS_FLOOR);
         (
             self.inner_floor + usable * wi / sum,
@@ -344,6 +386,28 @@ impl HyperGradientBudget {
             self.trace_floor + usable * wt / sum,
             [false, false, false],
         )
+    }
+
+    fn sensitivities_stable(&self) -> bool {
+        if self.sensitivity_history.len() < HGB_WARMUP_ITERS_MIN {
+            return false;
+        }
+        for channel in 0..3 {
+            let mut min_recent = f64::INFINITY;
+            let mut max_recent = 0.0;
+            for sensitivities in self.sensitivity_history.iter() {
+                let value = sensitivities[channel];
+                if !value.is_finite() || value <= 0.0 {
+                    return false;
+                }
+                min_recent = min_recent.min(value);
+                max_recent = max_recent.max(value);
+            }
+            if max_recent / min_recent >= HGB_SENS_STABILITY_RATIO {
+                return false;
+            }
+        }
+        true
     }
 }
 
