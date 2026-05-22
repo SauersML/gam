@@ -2218,6 +2218,11 @@ impl TransformationNormalFamily {
 
         out.fill(0.0);
         let mut probe_gamma = vec![0.0; p_resp];
+        let mut h_factors = vec![0.0; p_resp];
+        let mut hp_factors = vec![0.0; p_resp];
+        let mut lower_factors = vec![0.0; p_resp];
+        let mut upper_factors = vec![0.0; p_resp];
+        let probe_rows: Vec<_> = (0..p_resp).map(|k| probe_mat.row(k)).collect();
 
         for i in 0..n {
             let cov_row = cov.row(i);
@@ -2231,60 +2236,64 @@ impl TransformationNormalFamily {
             let inv_hp_sq = inv_hp * inv_hp;
 
             for k in 0..p_resp {
-                probe_gamma[k] = probe_mat.row(k).dot(&cov_row);
+                probe_gamma[k] = probe_rows[k].dot(&cov_row);
             }
 
-            let mut h_probe = rv[0] * probe_gamma[0];
-            let mut hp_probe = rd[0] * probe_gamma[0];
-            let mut lower_probe = self.response_lower_basis[0] * probe_gamma[0];
-            let mut upper_probe = self.response_upper_basis[0] * probe_gamma[0];
+            h_factors[0] = rv[0];
+            hp_factors[0] = rd[0];
+            lower_factors[0] = self.response_lower_basis[0];
+            upper_factors[0] = self.response_upper_basis[0];
+            for k in 1..p_resp {
+                let two_gamma_k = 2.0 * gamma[k];
+                h_factors[k] = rv[k] * two_gamma_k;
+                hp_factors[k] = rd[k] * two_gamma_k;
+                lower_factors[k] = self.response_lower_basis[k] * two_gamma_k;
+                upper_factors[k] = self.response_upper_basis[k] * two_gamma_k;
+            }
+
+            let pg0 = probe_gamma[0];
+            let mut h_probe = rv[0] * pg0;
+            let mut hp_probe = rd[0] * pg0;
+            let mut lower_probe = self.response_lower_basis[0] * pg0;
+            let mut upper_probe = self.response_upper_basis[0] * pg0;
             for k in 1..p_resp {
                 let pg = probe_gamma[k];
-                let gamma_k = gamma[k];
-                h_probe += 2.0 * rv[k] * gamma_k * pg;
-                hp_probe += 2.0 * rd[k] * gamma_k * pg;
-                lower_probe += 2.0 * self.response_lower_basis[k] * gamma_k * pg;
-                upper_probe += 2.0 * self.response_upper_basis[k] * gamma_k * pg;
+                h_probe += h_factors[k] * pg;
+                hp_probe += hp_factors[k] * pg;
+                lower_probe += lower_factors[k] * pg;
+                upper_probe += upper_factors[k] * pg;
             }
             let q = row_quantities.endpoint_q[i];
 
-            for k in 0..p_resp {
-                let h_factor = if k == 0 {
-                    rv[0]
-                } else {
-                    2.0 * rv[k] * gamma[k]
-                };
-                let hp_factor = if k == 0 {
-                    rd[0]
-                } else {
-                    2.0 * rd[k] * gamma[k]
-                };
-                let lower_factor = if k == 0 {
-                    self.response_lower_basis[0]
-                } else {
-                    2.0 * self.response_lower_basis[k] * gamma[k]
-                };
-                let upper_factor = if k == 0 {
-                    self.response_upper_basis[0]
-                } else {
-                    2.0 * self.response_upper_basis[k] * gamma[k]
-                };
+            // k = 0 prologue: second_probe / lower_factor_probe / upper_factor_probe all vanish.
+            {
+                let h_factor = h_factors[0];
+                let hp_factor = hp_factors[0];
+                let lower_factor = lower_factors[0];
+                let upper_factor = upper_factors[0];
+                let normalizer_probe = (q.second[0][0] * upper_factor
+                    + q.second[1][0] * lower_factor)
+                    * upper_probe
+                    + (q.second[0][1] * upper_factor + q.second[1][1] * lower_factor)
+                        * lower_probe;
+                let scalar = wi
+                    * (h_factor * h_probe
+                        + hp_factor * hp_probe * inv_hp_sq
+                        + normalizer_probe);
+                for c in 0..p_cov {
+                    out[c] += scalar * cov_row[c];
+                }
+            }
+
+            for k in 1..p_resp {
+                let h_factor = h_factors[k];
+                let hp_factor = hp_factors[k];
+                let lower_factor = lower_factors[k];
+                let upper_factor = upper_factors[k];
                 let pg = probe_gamma[k];
-                let second_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * (hi * rv[k] - rd[k] * inv_hp) * pg
-                };
-                let lower_factor_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_lower_basis[k] * pg
-                };
-                let upper_factor_probe = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_upper_basis[k] * pg
-                };
+                let second_probe = 2.0 * (hi * rv[k] - rd[k] * inv_hp) * pg;
+                let lower_factor_probe = 2.0 * self.response_lower_basis[k] * pg;
+                let upper_factor_probe = 2.0 * self.response_upper_basis[k] * pg;
                 let normalizer_probe = q.first[0] * upper_factor_probe
                     + q.first[1] * lower_factor_probe
                     + (q.second[0][0] * upper_factor + q.second[1][0] * lower_factor) * upper_probe
@@ -2344,10 +2353,11 @@ impl TransformationNormalFamily {
                 probes.nrows()
             ) }.into());
         }
-        let beta_mat = beta
-            .view()
-            .into_shape_with_order((p_resp, p_cov))
-            .map_err(|e| format!("SCOP beta reshape failed: {e}"))?;
+        if !row_quantities.matches_beta(beta) {
+            return Err(
+                "SCOP dH matmat received row quantities for a different beta".to_string(),
+            );
+        }
         let dir_mat = direction
             .view()
             .into_shape_with_order((p_resp, p_cov))
@@ -2357,8 +2367,17 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP dH matmat requires cached covariate design: {e}"))?;
         let weights = self.weights.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
+        let gamma_rows = row_quantities.gamma.as_ref();
+        if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
+                "SCOP dH matmat gamma cache shape mismatch: got {}x{}, expected {}x{}",
+                gamma_rows.nrows(),
+                gamma_rows.ncols(),
+                n,
+                p_resp
+            ) }.into());
+        }
         let mut out = Array2::<f64>::zeros((p_total, n_probe));
-        let mut gamma = vec![0.0; p_resp];
         let mut gamma_dir = vec![0.0; p_resp];
         let mut gamma_probe = vec![0.0; p_resp * n_probe];
         let mut h_probe = vec![0.0; n_probe];
@@ -2378,8 +2397,8 @@ impl TransformationNormalFamily {
             let inv_hp_sq = inv_hp * inv_hp;
             let inv_hp_cu = inv_hp_sq * inv_hp;
 
+            let gamma = gamma_rows.row(i);
             for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
                 gamma_dir[k] = dir_mat.row(k).dot(&cov_row);
                 let row_offset = k * p_cov;
                 let probe_offset = k * n_probe;
