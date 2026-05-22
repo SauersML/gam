@@ -286,9 +286,12 @@ pub fn parse_survival_baseline_config(
         "gompertz" => SurvivalBaselineTarget::Gompertz,
         "gompertz-makeham" => SurvivalBaselineTarget::GompertzMakeham,
         other => {
-            return Err(format!(
-                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-            ));
+            return Err(SurvivalConstructionError::UnsupportedDistribution {
+                reason: format!(
+                    "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
+                ),
+            }
+            .into());
         }
     };
 
@@ -447,9 +450,12 @@ pub fn initial_survival_baseline_config_for_fit(
         "gompertz" => SurvivalBaselineTarget::Gompertz,
         "gompertz-makeham" => SurvivalBaselineTarget::GompertzMakeham,
         other => {
-            return Err(format!(
-                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
-            ));
+            return Err(SurvivalConstructionError::UnsupportedDistribution {
+                reason: format!(
+                    "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
+                ),
+            }
+            .into());
         }
     };
     let time_scale_seed = positive_survival_time_seed(age_exit);
@@ -539,10 +545,13 @@ fn survival_baseline_config_from_theta(
         },
         SurvivalBaselineTarget::Weibull => {
             if theta.len() != 2 {
-                return Err(format!(
-                    "weibull baseline parameter dimension mismatch: expected 2, got {}",
-                    theta.len()
-                ));
+                return Err(SurvivalConstructionError::IncompatibleDimensions {
+                    reason: format!(
+                        "weibull baseline parameter dimension mismatch: expected 2, got {}",
+                        theta.len()
+                    ),
+                }
+                .into());
             }
             SurvivalBaselineConfig {
                 target,
@@ -554,10 +563,13 @@ fn survival_baseline_config_from_theta(
         }
         SurvivalBaselineTarget::Gompertz => {
             if theta.len() != 2 {
-                return Err(format!(
-                    "gompertz baseline parameter dimension mismatch: expected 2, got {}",
-                    theta.len()
-                ));
+                return Err(SurvivalConstructionError::IncompatibleDimensions {
+                    reason: format!(
+                        "gompertz baseline parameter dimension mismatch: expected 2, got {}",
+                        theta.len()
+                    ),
+                }
+                .into());
             }
             SurvivalBaselineConfig {
                 target,
@@ -569,10 +581,13 @@ fn survival_baseline_config_from_theta(
         }
         SurvivalBaselineTarget::GompertzMakeham => {
             if theta.len() != 3 {
-                return Err(format!(
-                    "gompertz-makeham baseline parameter dimension mismatch: expected 3, got {}",
-                    theta.len()
-                ));
+                return Err(SurvivalConstructionError::IncompatibleDimensions {
+                    reason: format!(
+                        "gompertz-makeham baseline parameter dimension mismatch: expected 3, got {}",
+                        theta.len()
+                    ),
+                }
+                .into());
             }
             SurvivalBaselineConfig {
                 target,
@@ -665,12 +680,15 @@ where
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
     if !result.converged {
-        return Err(format!(
-            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        ));
+        return Err(SurvivalConstructionError::InvalidConfig {
+            reason: format!(
+                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            ),
+        }
+        .into());
     }
     survival_baseline_config_from_theta(target, &result.rho)
 }
@@ -768,12 +786,15 @@ where
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
     if !result.converged {
-        return Err(format!(
-            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        ));
+        return Err(SurvivalConstructionError::InvalidConfig {
+            reason: format!(
+                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            ),
+        }
+        .into());
     }
     survival_baseline_config_from_theta(target, &result.rho)
 }
@@ -875,12 +896,15 @@ where
         .run(&mut obj, context)
         .map_err(|e| format!("{context} failed: {e}"))?;
     if !result.converged {
-        return Err(format!(
-            "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        ));
+        return Err(SurvivalConstructionError::InvalidConfig {
+            reason: format!(
+                "{context} did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            ),
+        }
+        .into());
     }
     survival_baseline_config_from_theta(target, &result.rho)
 }
