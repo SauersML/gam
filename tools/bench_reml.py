@@ -79,17 +79,23 @@ def bench_one(*, N: int, F: int, M: int, D: int, mode: str, device: str,
             return {"status": "skipped", "reason": f"joint requires D=1, got D={D}"}
 
     try:
-        # Warmup
+        # Warmup — tolerate backward failures (degenerate-λ atoms)
         for _ in range(warmup):
             r = fit(points=points, response=response, smooths=smooths, mode=mode)
-            loss = r.fitted.sum()
-            loss.backward()
+            try:
+                loss = r.fitted.sum()
+                loss.backward()
+            except Exception:
+                pass
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        # Measure forward + backward
+        # Measure forward + backward. Backward can fail on rare per-atom
+        # near-singular K (a known degenerate-λ case being fixed separately);
+        # in that case report forward timing and "bwd: error".
         forward_times, backward_times = [], []
+        backward_error: str | None = None
         with _measure_memory() as peak_mb_fn:
             for _ in range(measure):
                 if torch.cuda.is_available():
@@ -99,23 +105,30 @@ def bench_one(*, N: int, F: int, M: int, D: int, mode: str, device: str,
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t1 = time.perf_counter()
-                loss = r.fitted.sum()
-                loss.backward()
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                t2 = time.perf_counter()
                 forward_times.append(t1 - t0)
-                backward_times.append(t2 - t1)
+                try:
+                    loss = r.fitted.sum()
+                    loss.backward()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t2 = time.perf_counter()
+                    backward_times.append(t2 - t1)
+                except Exception as exc:
+                    backward_error = f"{type(exc).__name__}: {str(exc)[:80]}"
             peak_mb = peak_mb_fn()
 
-        return {
-            "status": "ok",
+        result = {
+            "status": "ok" if backward_error is None else "ok_fwd_bwd_failed",
             "forward_s_mean": sum(forward_times) / len(forward_times),
             "forward_s_min": min(forward_times),
-            "backward_s_mean": sum(backward_times) / len(backward_times),
-            "backward_s_min": min(backward_times),
             "peak_mb": peak_mb,
         }
+        if backward_times:
+            result["backward_s_mean"] = sum(backward_times) / len(backward_times)
+            result["backward_s_min"] = min(backward_times)
+        if backward_error is not None:
+            result["backward_error"] = backward_error
+        return result
     except NotImplementedError as exc:
         return {"status": "not_implemented", "error": str(exc)[:200]}
     except Exception as exc:
@@ -161,6 +174,11 @@ def main() -> int:
                 print(
                     f"| {F} | {mode} | {r['forward_s_mean']*1000:.1f} "
                     f"| {r['backward_s_mean']*1000:.1f} | {r['peak_mb']:.1f} | ok |"
+                )
+            elif r.get("status") == "ok_fwd_bwd_failed":
+                print(
+                    f"| {F} | {mode} | {r['forward_s_mean']*1000:.1f} "
+                    f"| (err) | {r['peak_mb']:.1f} | fwd-only: {r.get('backward_error','')[:50]} |"
                 )
             else:
                 print(f"| {F} | {mode} | — | — | — | {r.get('status', '?')}: {r.get('reason', r.get('error', ''))[:50]} |")
