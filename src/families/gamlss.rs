@@ -4913,6 +4913,12 @@ fn binomial_location_scale_core(
     struct SendPtr(*mut f64);
     unsafe impl Send for SendPtr {}
     unsafe impl Sync for SendPtr {}
+    impl SendPtr {
+        #[inline(always)]
+        unsafe fn write(self, i: usize, v: f64) {
+            unsafe { *self.0.add(i) = v };
+        }
+    }
 
     let sigma_p = SendPtr(sigma.as_mut_ptr());
     let dsigma_p = SendPtr(dsigma_deta.as_mut_ptr());
@@ -4924,7 +4930,7 @@ fn binomial_location_scale_core(
 
     let ll = (0..n)
         .into_par_iter()
-        .map(|i| {
+        .map(move |i| {
             let row = binomial_location_scalerow(
                 y_slice[i],
                 w_slice[i],
@@ -4936,13 +4942,13 @@ fn binomial_location_scale_core(
             // SAFETY: index `i` is unique across the parallel iter; each pointer
             // targets a distinct preallocated buffer of length `n`.
             unsafe {
-                *sigma_p.0.add(i) = row.sigma;
-                *dsigma_p.0.add(i) = row.dsigma_deta;
-                *q0_p.0.add(i) = row.q0;
-                *mu_p.0.add(i) = row.inverse_link.mu;
-                *dmu_p.0.add(i) = row.inverse_link.d1;
-                *d2mu_p.0.add(i) = row.inverse_link.d2;
-                *d3mu_p.0.add(i) = row.inverse_link.d3;
+                sigma_p.write(i, row.sigma);
+                dsigma_p.write(i, row.dsigma_deta);
+                q0_p.write(i, row.q0);
+                mu_p.write(i, row.inverse_link.mu);
+                dmu_p.write(i, row.inverse_link.d1);
+                d2mu_p.write(i, row.inverse_link.d2);
+                d3mu_p.write(i, row.inverse_link.d3);
             }
             Ok::<f64, String>(row.ll)
         })
