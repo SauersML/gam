@@ -7003,6 +7003,24 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        if self.large_n_efs_single_loop_lane() {
+            self.cache_manager.invalidate_eval_bundle();
+            let previous_cap = self
+                .outer_inner_cap
+                .swap(efs_single_loop_encoded_cap(), Ordering::Relaxed);
+            let result = self.compute_efs_steps_with_psi_ext_inner(rho, hyper_dirs);
+            self.outer_inner_cap.store(previous_cap, Ordering::Relaxed);
+            self.cache_manager.invalidate_eval_bundle();
+            return result;
+        }
+        self.compute_efs_steps_with_psi_ext_inner(rho, hyper_dirs)
+    }
+
+    fn compute_efs_steps_with_psi_ext_inner(
+        &self,
+        rho: &Array1<f64>,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(rho) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
