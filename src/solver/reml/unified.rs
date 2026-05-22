@@ -256,6 +256,10 @@ pub mod debug_stash {
 pub struct StochasticTraceState {
     pub monotone_probe_floor: usize,
     pub cg_warm_starts: HashMap<u64, Array1<f64>>,
+    pub solve_rel_tol_override: Option<f64>,
+    pub last_linear_residual_norm: Option<f64>,
+    pub last_probe_sigma_sq: Option<f64>,
+    pub last_probe_count: usize,
 }
 
 /// Abstract interface for Hessian linear algebra operations.
@@ -14143,18 +14147,26 @@ impl MatrixFreeSpdOperator {
             _ => (Array1::<f64>::zeros(dim), false),
         };
 
-        let (solution, iters) =
+        let (solution, iters, residual_norm) =
             match conjugate_gradient_trace_solve(rhs, rel_tol, initial, |v| (self.apply)(v)) {
                 Some(result) => result,
                 None => return self.solve(rhs),
             };
 
-        if let (Some(id), Some(state)) = (probe_id, trace_state) {
+        if let Some(state) = trace_state {
             let mut guard = match state.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.cg_warm_starts.insert(id, solution.clone());
+            guard.last_linear_residual_norm = Some(
+                guard
+                    .last_linear_residual_norm
+                    .unwrap_or(0.0)
+                    .max(residual_norm),
+            );
+            if let Some(id) = probe_id {
+                guard.cg_warm_starts.insert(id, solution.clone());
+            }
         }
 
         let probe_label = probe_id
@@ -14177,7 +14189,7 @@ fn conjugate_gradient_trace_solve<F>(
     rel_tol: f64,
     mut x: Array1<f64>,
     apply: F,
-) -> Option<(Array1<f64>, usize)>
+) -> Option<(Array1<f64>, usize, f64)>
 where
     F: Fn(&Array1<f64>) -> Array1<f64>,
 {
@@ -14191,7 +14203,7 @@ where
         return None;
     }
     if rhs_norm_sq <= f64::MIN_POSITIVE {
-        return Some((Array1::<f64>::zeros(dim), 0));
+        return Some((Array1::<f64>::zeros(dim), 0, 0.0));
     }
 
     let target_sq = (rel_tol * rel_tol * rhs_norm_sq).max(f64::MIN_POSITIVE);
@@ -14209,11 +14221,12 @@ where
         return None;
     }
     if rs_old <= target_sq {
-        return Some((x, 0));
+        return Some((x, 0, rs_old.max(0.0).sqrt()));
     }
 
     let mut p = r.clone();
     let mut iters = 0usize;
+    let mut residual_norm = rs_old.max(0.0).sqrt();
     for k in 0..dim.max(1) {
         let ap = apply(&p);
         if ap.len() != dim || !ap.iter().all(|value| value.is_finite()) {
@@ -14239,6 +14252,7 @@ where
             return None;
         }
         iters = k + 1;
+        residual_norm = rs_new.max(0.0).sqrt();
         if rs_new <= target_sq {
             break;
         }
@@ -14251,7 +14265,7 @@ where
         rs_old = rs_new;
     }
 
-    Some((x, iters))
+    Some((x, iters, residual_norm))
 }
 
 impl HessianOperator for MatrixFreeSpdOperator {
@@ -14733,9 +14747,16 @@ impl StochasticTraceEstimator {
 
     /// Create a new estimator sharing fit-level stochastic trace state.
     fn with_shared_trace_state(
-        config: StochasticTraceConfig,
+        mut config: StochasticTraceConfig,
         trace_state: Arc<Mutex<StochasticTraceState>>,
     ) -> Self {
+        let override_tol = match trace_state.lock() {
+            Ok(guard) => guard.solve_rel_tol_override,
+            Err(poisoned) => poisoned.into_inner().solve_rel_tol_override,
+        };
+        if let Some(rel_tol) = override_tol.filter(|v| v.is_finite() && *v > 0.0) {
+            config.solve_rel_tol = rel_tol;
+        }
         Self {
             config,
             trace_state,
@@ -14841,6 +14862,7 @@ impl StochasticTraceEstimator {
             }
         }
 
+        self.record_probe_batch(Self::max_probe_variance(&m2s, n_drawn), n_drawn);
         self.raise_probe_floor(n_drawn);
         means
     }
@@ -14898,6 +14920,7 @@ impl StochasticTraceEstimator {
             }
         }
 
+        self.record_probe_batch(Self::max_probe_variance(m2s.as_slice().unwrap(), n_drawn), n_drawn);
         self.raise_probe_floor(n_drawn);
         for d in 0..n_coords {
             for e in (d + 1)..n_coords {
@@ -14907,6 +14930,25 @@ impl StochasticTraceEstimator {
             }
         }
         means
+    }
+
+    fn max_probe_variance(m2s: &[f64], n_drawn: usize) -> f64 {
+        if n_drawn <= 1 {
+            return 0.0;
+        }
+        let denom = (n_drawn - 1) as f64;
+        m2s.iter()
+            .map(|m2| (*m2 / denom).max(0.0))
+            .fold(0.0_f64, f64::max)
+    }
+
+    fn record_probe_batch(&self, sigma_sq: f64, n_drawn: usize) {
+        let mut state = match self.trace_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.last_probe_sigma_sq = Some(state.last_probe_sigma_sq.unwrap_or(0.0).max(sigma_sq));
+        state.last_probe_count = state.last_probe_count.max(n_drawn);
     }
 
     fn estimate_hinv_traces(
