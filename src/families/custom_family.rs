@@ -15531,6 +15531,21 @@ fn joint_outer_evaluate(
             .unwrap_or(0);
     let has_penalty_subspace_trace = penalty_subspace_trace.is_some();
 
+    // Option C: when the caller already has the batched first-order
+    // logdet traces, let the unified VGH path keep all mode-response,
+    // second-order, and Hessian work, but short-circuit only the
+    // soon-discarded first-order trace calls. The projected-subspace
+    // trace path is left untouched because the Hessian shares that
+    // kernel and it is not routed through HessianOperator trace methods.
+    // Bind the gating flag before `penalty_subspace_trace` is consumed by
+    // the call below so the trace-skip choice does not depend on a moved
+    // value (was: `if penalty_subspace_trace.is_none()` evaluated AFTER
+    // the trace had already been forwarded to `unified_joint_cost_gradient`).
+    let first_order_trace_skip = if penalty_subspace_trace.is_none() {
+        first_order_trace_skip
+    } else {
+        None
+    };
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
         specs,
@@ -20859,6 +20874,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("projected outer evaluation succeeds");
 
@@ -20887,6 +20903,7 @@ mod tests {
             &no_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
@@ -21031,6 +21048,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("projected eval ok");
 
@@ -21060,6 +21078,7 @@ mod tests {
                 &no_dh,
                 None,
                 &no_d2h,
+                None,
                 None,
                 None,
                 None,
@@ -21397,6 +21416,7 @@ mod tests {
             &compute_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
