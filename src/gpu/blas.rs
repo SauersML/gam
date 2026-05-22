@@ -647,7 +647,7 @@ fn cublas_runtimes() -> &'static [Mutex<CublasRuntime>] {
                         Some(Mutex::new(runtime))
                     }
                     Err(err) => {
-                        diagnostics::log_library_unavailable("cuBLAS", &err.to_string());
+                        diagnostics::log_library_unavailable("cuBLAS", &err);
                         None
                     }
                 })
@@ -1014,20 +1014,12 @@ struct CublasRuntime {
 // impl needed.
 
 impl CublasRuntime {
-    fn new(device: GpuDeviceInfo) -> Result<Self, crate::gpu::GpuError> {
-        use crate::gpu::GpuError;
-        let ctx = cuda_context_for(device.ordinal).ok_or_else(|| GpuError::DriverCallFailed {
-            reason: format!("CudaContext unavailable for ordinal {}", device.ordinal),
-        })?;
-        ctx.bind_to_thread().map_err(|e| GpuError::DriverCallFailed {
-            reason: e.to_string(),
-        })?;
-        let stream = ctx.new_stream().map_err(|e| GpuError::DriverCallFailed {
-            reason: e.to_string(),
-        })?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| GpuError::DriverCallFailed {
-            reason: e.to_string(),
-        })?;
+    fn new(device: GpuDeviceInfo) -> Result<Self, String> {
+        let ctx = cuda_context_for(device.ordinal)
+            .ok_or_else(|| format!("CudaContext unavailable for ordinal {}", device.ordinal))?;
+        ctx.bind_to_thread().map_err(|e| e.to_string())?;
+        let stream = ctx.new_stream().map_err(|e| e.to_string())?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|e| e.to_string())?;
         Ok(Self {
             device,
             ctx,

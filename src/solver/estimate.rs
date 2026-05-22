@@ -2119,14 +2119,6 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     kronecker_penalty_system: Option<crate::smooth::KroneckerPenaltySystem>,
     kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
     reml_state: RemlState<'a>,
-    /// Last realizer-side design-revision counter at which `reset_surface`
-    /// was actually applied. When the caller passes a `design_revision`
-    /// hint that matches this stash, the canonical penalty rebuild and the
-    /// cache wipes inside `reset_surface` can be skipped — the X / s_list
-    /// the caller is presenting is bit-identical to the one already on the
-    /// surface, so the gaussian-fixed / PIRLS caches keyed to (X, y, w,
-    /// offset) remain valid.
-    last_canonical_revision: Option<u64>,
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
@@ -2191,7 +2183,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             kronecker_penalty_system: opts.kronecker_penalty_system.clone(),
             kronecker_factored: opts.kronecker_factored.clone(),
             reml_state,
-            last_canonical_revision: None,
         })
     }
 
