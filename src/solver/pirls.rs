@@ -6,7 +6,8 @@ use crate::faer_ndarray::{
     fast_ab, fast_atb, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
-    factorize_sparse_spd, solve_sparse_spd, sparse_symmetric_upper_matvec_public,
+    factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
+    sparse_symmetric_upper_matvec_public,
 };
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
@@ -4514,8 +4515,16 @@ where
             _ => state.hessian.clone(),
         };
         let mut applied_lambda = 0.0_f64;
-        // Cache for sparse regularized hessian (reuse for predicted reduction).
+        // Cache for sparse regularized hessian (reuse for predicted reduction
+        // and for in-place diagonal updates on subsequent LM attempts).
         let mut cached_sparse_regularized: Option<SparseColMat<usize, f64>> = None;
+        // Track which lambda is currently baked into the cached sparse matrix's
+        // diagonal so we can apply a delta update (loop_lambda - sparse_applied_lambda)
+        // rather than rebuilding the regularized matrix each attempt.
+        let mut sparse_applied_lambda = 0.0_f64;
+        // Reusable candidate-coefficient buffer; size never changes across LM
+        // attempts so we hoist the allocation outside the loop.
+        let mut candidate_buf: Array1<f64> = Array1::zeros(beta.len());
 
         loop {
             attempts += 1;
@@ -4541,11 +4550,31 @@ where
                         "sparse-native PIRLS does not support constrained solves".to_string(),
                     ))
                 } else {
-                    let sparse_reg = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
-                    let factor = factorize_sparse_spd(&sparse_reg)?;
-                    newton_direction.assign(&solve_sparse_spd(&factor, &state.gradient)?);
+                    // First attempt this LM round: materialize the regularized
+                    // matrix by rebuilding (ensures every diagonal entry is
+                    // present). Subsequent attempts mutate the cached matrix's
+                    // diagonal in place — symbolic structure (col_ptr/row_idx)
+                    // is identical, only diagonal values change.
+                    if cached_sparse_regularized.is_none() {
+                        let sparse_reg = add_diagonal_to_upper_sparse(h_sparse, loop_lambda)?;
+                        cached_sparse_regularized = Some(sparse_reg);
+                        sparse_applied_lambda = loop_lambda;
+                    } else {
+                        let delta = loop_lambda - sparse_applied_lambda;
+                        if delta != 0.0 {
+                            let cached = cached_sparse_regularized.as_mut().unwrap();
+                            update_sparse_diagonal_in_place(cached, delta).map_err(|e| {
+                                EstimationError::InvalidInput(format!(
+                                    "sparse diagonal in-place update failed: {e}"
+                                ))
+                            })?;
+                            sparse_applied_lambda = loop_lambda;
+                        }
+                    }
+                    let sparse_reg_ref = cached_sparse_regularized.as_ref().unwrap();
+                    let factor = factorize_sparse_spd(sparse_reg_ref)?;
+                    solve_sparse_spd_into(&factor, &state.gradient, &mut newton_direction)?;
                     newton_direction.mapv_inplace(|g| -g);
-                    cached_sparse_regularized = Some(sparse_reg);
                     Ok(())
                 }
             } else {
@@ -4634,13 +4663,19 @@ where
             lm_predred_total += predred_start.elapsed();
 
             // 3. Compute Actual Reduction
-            let mut candidatevec = &*beta + direction;
+            // Reuse the hoisted candidate buffer: fill via assign + in-place add
+            // rather than allocating a fresh Array1 per LM attempt.
+            if candidate_buf.len() != beta.len() {
+                candidate_buf = Array1::zeros(beta.len());
+            }
+            candidate_buf.assign(beta.as_ref());
+            candidate_buf += direction;
             if options.linear_constraints.is_none()
                 && let Some(lb) = options.coefficient_lower_bounds.as_ref()
             {
-                project_coefficients_to_lower_bounds(&mut candidatevec, lb);
+                project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
             }
-            let candidate_beta = Coefficients::new(candidatevec);
+            let candidate_beta = Coefficients::new(std::mem::take(&mut candidate_buf));
             let candidate_eval_start = std::time::Instant::now();
             let candidate_eval_result = model.screen_candidate(
                 &candidate_beta,
@@ -5010,6 +5045,7 @@ where
                             regularized = state.hessian.clone();
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
+                            sparse_applied_lambda = 0.0;
                             loop_lambda = lambda;
                             // Different problem (Hessian curvature changed):
                             // restart the Madsen rejection-factor trajectory.
@@ -5152,6 +5188,7 @@ where
                         regularized = state.hessian.clone();
                         applied_lambda = 0.0;
                         cached_sparse_regularized = None;
+                        sparse_applied_lambda = 0.0;
                         loop_lambda = lambda;
                         // Different problem (Hessian curvature changed):
                         // restart the Madsen rejection-factor trajectory.
@@ -9639,6 +9676,74 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
+
+    #[test]
+    fn update_sparse_diagonal_in_place_matches_rebuild() {
+        // Build a small upper-triangular SparseColMat that already has every
+        // diagonal entry materialized. The in-place update should produce a
+        // value buffer bit-identical to the rebuild path used by
+        // `add_diagonal_to_upper_sparse`.
+        let n = 4;
+        let entries: Vec<(usize, usize, f64)> = vec![
+            (0, 0, 2.0),
+            (0, 1, 0.5),
+            (1, 1, 3.0),
+            (0, 2, -0.25),
+            (2, 2, 1.5),
+            (1, 3, 0.75),
+            (3, 3, 4.25),
+        ];
+        let triplets: Vec<_> = entries
+            .iter()
+            .map(|&(r, c, v)| Triplet::new(r, c, v))
+            .collect();
+        let base = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &triplets).unwrap();
+
+        let delta = 0.7_f64;
+        let rebuilt = super::add_diagonal_to_upper_sparse(&base, delta).unwrap();
+
+        let mut mutated = base.clone();
+        super::update_sparse_diagonal_in_place(&mut mutated, delta).unwrap();
+
+        // Compare value buffers under the shared symbolic structure.
+        let (sym_rebuilt, val_rebuilt) = rebuilt.parts();
+        let (sym_mut, val_mut) = mutated.parts();
+        assert_eq!(sym_rebuilt.col_ptr(), sym_mut.col_ptr());
+        assert_eq!(sym_rebuilt.row_idx(), sym_mut.row_idx());
+        assert_eq!(val_rebuilt.len(), val_mut.len());
+        for (a, b) in val_rebuilt.iter().zip(val_mut.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "value buffers must be bit-identical");
+        }
+
+        // Successive deltas accumulate correctly (LM trajectory simulation).
+        let mut chained = base.clone();
+        super::update_sparse_diagonal_in_place(&mut chained, 0.3).unwrap();
+        super::update_sparse_diagonal_in_place(&mut chained, 0.4).unwrap();
+        let (_sym, val_chained) = chained.parts();
+        for (a, b) in val_rebuilt.iter().zip(val_chained.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-15);
+        }
+
+        // delta = 0 is a no-op (early return path).
+        let mut noop = base.clone();
+        super::update_sparse_diagonal_in_place(&mut noop, 0.0).unwrap();
+        let (_sym_noop, val_noop) = noop.parts();
+        let (_sym_base, val_base) = base.parts();
+        for (a, b) in val_noop.iter().zip(val_base.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // Missing diagonal entries are reported as an error rather than
+        // silently fixed up — callers must materialize diagonals first.
+        let off_only = SparseColMat::<usize, f64>::try_new_from_triplets(
+            2,
+            2,
+            &[Triplet::new(0, 1, 1.0)],
+        )
+        .unwrap();
+        let mut missing = off_only.clone();
+        assert!(super::update_sparse_diagonal_in_place(&mut missing, 1.0).is_err());
+    }
 
     #[test]
     fn signed_streaming_xtwx_preserves_negative_observed_weights() {
