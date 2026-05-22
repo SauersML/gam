@@ -5207,10 +5207,11 @@ impl PenaltySubspaceTrace {
                 m[[j, i]] = avg;
             }
         }
-        let m_inv = match m.invh() {
-            Ok(inv) => inv,
-            Err(_) => Array2::zeros((k_active, k_active)),
-        };
+        let m_inv = crate::linalg::utils::matrix_inversewith_regularization(
+            &m,
+            "active-constraint kernel inverse",
+        )
+        .unwrap_or_else(|| Array2::zeros((k_active, k_active)));
         ConstrainedSubspaceKernel {
             kernel: self,
             z,
@@ -5451,6 +5452,48 @@ pub struct InnerSolution<'dp> {
     /// the envelope-only behaviour for callers that genuinely guarantee
     /// exact KKT.
     pub kkt_residual: Option<ProjectedKktResidual>,
+
+    /// Optional active linear-inequality constraints at the converged inner
+    /// iterate. `Some(rows)` means the joint constraint matrix's row indices
+    /// in `rows.active_indices` are pinned (treated as equality constraints
+    /// at the cert point). The unified evaluator combines this with the
+    /// `penalty_subspace_trace` to form the **constraint-aware** kernel
+    /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` for per-coordinate IFT mode
+    /// responses `v_k = ∂β/∂ρ_k`. See [`ConstrainedSubspaceKernel`] for
+    /// the full derivation and consistency with `log|U_Tᵀ H U_T|`.
+    ///
+    /// `None` is the legacy/unconstrained path (no active inequality
+    /// constraints to project against).
+    pub active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+}
+
+/// Active row block of the joint linear inequality constraint matrix at the
+/// converged inner iterate. Carries the dense rows needed for the
+/// constraint-aware pseudo-inverse `K_T` in
+/// [`PenaltySubspaceTrace::with_active_constraints`].
+#[derive(Clone, Debug)]
+pub struct ActiveLinearConstraintBlock {
+    /// `k_active × p` matrix of active constraint rows.
+    pub a: Array2<f64>,
+    /// `k_active` right-hand-side values (active equality targets). The
+    /// kernel itself only needs the `A` rows for its projection — the `b`
+    /// vector is carried alongside for downstream consumers that audit
+    /// constraint satisfaction.
+    #[allow(dead_code)]
+    pub b: Array1<f64>,
+}
+
+impl ActiveLinearConstraintBlock {
+    #[allow(dead_code)]
+    pub fn new(a: Array2<f64>, b: Array1<f64>) -> Self {
+        debug_assert_eq!(a.nrows(), b.len());
+        Self { a, b }
+    }
+
+    #[allow(dead_code)]
+    pub fn k_active(&self) -> usize {
+        self.a.nrows()
+    }
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
@@ -5482,6 +5525,7 @@ pub struct InnerSolutionBuilder<'dp> {
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
     barrier_config: Option<BarrierConfig>,
     kkt_residual: Option<ProjectedKktResidual>,
+    active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -5520,6 +5564,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             fixed_drift_deriv: None,
             barrier_config: None,
             kkt_residual: None,
+            active_constraints: None,
         }
     }
 
@@ -5645,6 +5690,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             fixed_drift_deriv: self.fixed_drift_deriv,
             barrier_config: self.barrier_config,
             kkt_residual: self.kkt_residual,
+            active_constraints: self.active_constraints,
         }
     }
 }
@@ -6674,11 +6720,31 @@ pub fn reml_laml_evaluate(
         // when no kernel is available.
         let kernel = solution.penalty_subspace_trace.as_ref();
         if let Some(kernel) = kernel {
+            // Lift to a *constraint-aware* kernel when the inner solver
+            // recorded active inequality constraints. The Schur-complement
+            // formula
+            //   K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S
+            // returns the minimum-norm IFT mode response inside
+            // T = range(S₊) ∩ ker(A_act) — the smooth manifold the inner
+            // is genuinely moving on — and matches the derivative of the
+            // projected Laplace cost log|U_Tᵀ H U_T|. When no active
+            // constraints are present the helper degrades to bare K_S
+            // with zero overhead.
+            let constrained = solution
+                .active_constraints
+                .as_ref()
+                .map(|block| kernel.with_active_constraints(block.a.view()));
+            let apply = |v: &Array1<f64>| -> Array1<f64> {
+                match constrained.as_ref() {
+                    Some(ck) if ck.has_active_constraints() => ck.apply_pseudo_inverse(v),
+                    _ => kernel.apply_pseudo_inverse(v),
+                }
+            };
             let rho_v_ks = if need_family_corrections {
                 Some(
                     rho_curvature_a_k_betas
                         .iter()
-                        .map(|a_k| kernel.apply_pseudo_inverse(a_k))
+                        .map(|a_k| apply(a_k))
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -6687,7 +6753,7 @@ pub fn reml_laml_evaluate(
             let ext_v_is: Vec<Array1<f64>> = solution
                 .ext_coords
                 .iter()
-                .map(|coord| kernel.apply_pseudo_inverse(&coord.g))
+                .map(|coord| apply(&coord.g))
                 .collect();
             (rho_v_ks, ext_v_is)
         } else {
@@ -17742,6 +17808,7 @@ mod tests {
             fixed_drift_deriv: None,
             barrier_config: None,
             kkt_residual: None,
+            active_constraints: None,
         }
     }
 
@@ -17943,6 +18010,7 @@ mod tests {
             fixed_drift_deriv: None,
             barrier_config: None,
             kkt_residual: None,
+            active_constraints: None,
         }
     }
 
@@ -17995,6 +18063,7 @@ mod tests {
             fixed_drift_deriv: None,
             barrier_config: None,
             kkt_residual: None,
+            active_constraints: None,
         }
     }
 
@@ -19716,6 +19785,7 @@ mod tests {
             fixed_drift_deriv: None,
             barrier_config: None,
             kkt_residual: None,
+            active_constraints: None,
         }
     }
 
