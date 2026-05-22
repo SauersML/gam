@@ -6,113 +6,124 @@ Every model in `gamfit` uses a Wilkinson-style formula:
 response ~ term + term + ... + option(...)
 ```
 
-Terms are joined with `+`. `*` and `:` are not supported — interactions come
-from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`, `matern(...)`,
-`duchon(...)`).
+Terms are joined with `+`. `*` and `:` are not supported; interactions
+come from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`,
+`matern(...)`, `duchon(...)`).
 
-This page lists every right-hand-side term, its options, and the
-formula-level options (`link(...)`, `linkwiggle(...)`, `timewiggle(...)`,
-`survmodel(...)`).
+This page lists each right-hand-side term, its options, and the
+formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
+`timewiggle(...)`, `survmodel(...)`).
 
-## The response (left of `~`)
+## Response (left of `~`)
 
-| Response | What it triggers |
+| Response | Default behaviour |
 | --- | --- |
-| `y` (continuous) | Gaussian family, identity link (default). |
-| `y` (binary `{0, 1}`) | Binomial family, logit link (default). |
-| `y` (count, with `link(type=log)` and explicit family) | Poisson. |
-| `y` (positive continuous, with `link(type=log)`) | Gamma. |
+| `y` continuous | Gaussian family, identity link. |
+| `y` binary `{0, 1}` | Binomial family, logit link. |
+| `y` count, with `link(type=log)` and explicit family | Poisson. |
+| `y` positive continuous, with `link(type=log)` | Gamma. |
 | `Surv(entry, exit, event)` | Survival model. See [survival.md](survival.md). |
 
-The family is detected from the response column. Override with `family=` or
-`link()`.
+The family is inferred from the response with `family="auto"`. Override
+with `family=` or by setting an explicit `link()`.
 
 ## Linear and constrained coefficients
 
 ```
 y ~ x                                # implicit penalized linear
-y ~ linear(x)                        # same, explicit
-y ~ linear(x, min=0)                 # box-constrained ≥ 0
-y ~ linear(x, min=-1, max=1)         # box-constrained
+y ~ linear(x)                        # explicit linear
+y ~ linear(x, min=0)                 # box-constrained coefficient >= 0
+y ~ linear(x, min=-1, max=1)         # box-constrained coefficient
 y ~ nonnegative(x)                   # sugar for linear(x, min=0)
 y ~ nonpositive(x)                   # sugar for linear(x, max=0)
-y ~ bounded(x, min=0, max=1)         # exact interval transform (no ridge)
+y ~ bounded(x, min=0, max=1)         # exact interval transform on x
 ```
 
-`linear(x, min=…, max=…)` keeps the penalized linear term and projects the
-coefficient into `[min, max]`. `bounded(...)` applies an exact interval
-transform instead, giving hard bounds without a ridge term pulling toward
-zero.
+`linear(x, min=..., max=...)` keeps a penalized linear term and
+projects the coefficient into `[min, max]`. Accepted aliases for the
+same function: `linear`, `constrain`, `constraint`, `box`. Each accepts
+`min`/`lower` and `max`/`upper`. `constrain()`/`constraint()`/`box()`
+requires at least one of those four to be set.
 
-`bounded(...)` supports a prior on the unit-scaled interior:
+`bounded(x, min, max)` applies an exact interval transform to `x`. It
+is a distinct term type from `linear`, not a constrained linear.
+Required options: `min` and `max` (finite, `min < max`).
+
+### bounded() priors
+
+`bounded()` accepts one of `prior=`, `target=`+`strength=`, or no
+prior:
 
 ```
 bounded(x, min=0, max=1, prior=uniform)
-bounded(x, min=0, max=1, prior=center)               # Beta(2, 2)
-bounded(x, min=0, max=1, target=0.5, strength=3)     # Beta from (target, strength)
-bounded(x, min=0, max=1, beta_a=2.5, beta_b=2.5)     # explicit Beta(a, b)
+bounded(x, min=0, max=1, prior=center)
+bounded(x, min=0, max=1, target=0.5, strength=3)
 ```
 
-`prior=` options:
+`prior=` values:
 
-- `none` — flat on the transformed scale, no penalty (default when no other
-  prior args are set).
-- `uniform` / `log-jacobian` — flat on the original scale (log-Jacobian
-  correction).
-- `center` — Beta(2, 2) toward the midpoint.
+- `none` — flat on the transformed scale, no penalty.
+- `uniform` (aliases `log-jacobian`, `log_jacobian`, `jacobian`) — flat
+  on the original scale, applied as a log-Jacobian correction.
+- `center` — `Beta(2, 2)` toward the midpoint.
 
-`target` ∈ `(min, max)` with `strength > 0` shorthand: sets
-`a = 1 + strength·z`, `b = 1 + strength·(1−z)`, where
-`z = (target − min) / (max − min)`.
+`target` plus `strength` is shorthand for a Beta prior:
+`a = 1 + strength * z`, `b = 1 + strength * (1 - z)` with
+`z = (target - min) / (max - min)`. `target` must lie strictly between
+`min` and `max`; `strength` must be positive.
 
-Aliases for box constraints: `linear`, `constrain`, `constraint`, `box`.
-`bounded(...)` is a separate term that uses an exact interval transform
-plus an optional Beta prior (parameterised by `target` / `strength`)
-rather than a quadratic ridge.
+`prior=`, `target`/`strength`, and the (legacy) `pull=` shorthand are
+mutually exclusive.
 
 ## Random effects and factor smooths
 
 ```
 y ~ x + group(site)
-y ~ x + re(site)                         # alias for random intercepts
+y ~ x + re(site)                         # alias of group()
 y ~ s(x, by=site) + site                 # separate smooth per factor level
 y ~ s(x, by=z)                           # numeric varying-coefficient smooth
 y ~ s(x, site, bs="fs")                  # partial-pooling random smooths
 y ~ fs(x, site)                          # alias for bs="fs"
-y ~ s(site, x, bs="sz") + s(x)           # sum-to-zero deviations from a main smooth
+y ~ s(site, x, bs="sz") + s(x)           # sum-to-zero deviations
 y ~ sz(site, x)                          # alias for bs="sz"
-y ~ s(site, x, bs="re") + group(site)    # random intercepts plus random slopes
+y ~ s(site, x, bs="re") + group(site)    # random slopes + random intercepts
 ```
 
-`group()`/`re()` adds a random intercept per level of a string- or
-integer-valued grouping column.
+`group(name)` and `re(name)` add a random intercept per level of a
+categorical column. The single argument must be a column name.
 
-Factor and numeric `by=` smooths multiply an ordinary smooth basis by a
-numeric covariate or by per-level indicators. Factor `by=` smooths create a
-separate smooth for each kept level; include the factor main effect (for
-example `+ site` or `+ group(site)`) when level offsets should be identifiable.
-Ordered-factor style difference smooths can be requested with an ordered
-factor column name/convention and skip the reference level.
+A `by=` option on a smooth multiplies the smooth basis by a column.
+For a categorical `by=`, one smooth is built per kept level; include
+the factor main effect (e.g. `+ site` or `+ group(site)`) when level
+offsets should be identifiable. For a numeric `by=`, the result is a
+varying-coefficient smooth.
 
-`bs="fs"` builds random smooths: each group gets its own curve, including
-penalized null-space components such as intercept and linear trend, so small
-groups shrink toward zero contribution while larger groups can retain distinct
-curves. New/unseen groups at prediction time contribute zero for the factor
-smooth term. `m=1` reduces the number of null-space shrinkage penalties;
-`m=2` is the default.
+`bs="fs"` builds factor smooths: each group gets its own curve,
+including penalized null-space components (intercept and linear
+trend). The default `m=2` applies two null-space shrinkage penalties;
+set `m=1` to apply one. New groups at prediction time contribute zero
+for the term.
 
-`bs="sz"` builds sum-to-zero factor-smooth deviations intended to be used with
-a population smooth such as `s(x)`. Deviations are constrained to sum to zero
-across factor levels at each spline coefficient. `bs="re"` with one grouping
-and one numeric variable builds random slopes as a factor-by-linear basis with
-an identity ridge penalty.
+`bs="sz"` builds sum-to-zero factor-smooth deviations; deviations sum
+to zero across factor levels at each spline coefficient. Use with a
+population smooth such as `s(x)`.
+
+`bs="re"` with one grouping column and one numeric column builds
+random slopes as a factor-by-linear basis with an identity ridge
+penalty.
+
+The `fs`/`sz`/`re` factor-smooth path accepts `k`, `basis_dim`,
+`knots`, `degree`, `penalty_order`, `m` (fs only), and
+`double_penalty`. It requires exactly two variables: one categorical
+or binary grouping column and one continuous (or binary) numeric
+column.
 
 ## Univariate smooths
 
 ```
 y ~ s(x)                    # P-spline (B-spline + difference penalty)
-y ~ smooth(x)               # alias
-y ~ s(x, k=15)              # 15-dim basis
+y ~ smooth(x)               # alias of s()
+y ~ s(x, k=15)              # basis dimension 15
 y ~ s(x, knots=10)          # 10 interior knots
 y ~ s(x, degree=3, penalty_order=2)
 y ~ s(x, type=ps)           # explicit P-spline
@@ -120,57 +131,73 @@ y ~ s(x, double_penalty=true)
 ```
 
 For a single covariate, `s(x)` defaults to a cubic P-spline with a
-second-order difference penalty. Options:
+second-order difference penalty.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `k` (or `basis_dim`) | auto from data | Total basis dimension. |
-| `knots` | auto | Number of interior knots. Cannot combine with `k`. |
+| `k` (`basis_dim`) | from data | Total basis dimension. |
+| `knots` | from data | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
-| `penalty_order` | 2 | Finite-difference order in the spline penalty (1 = first differences, 2 = second differences). |
-| `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`. |
+| `penalty_order` | 2 | Order of the difference penalty. |
+| `type` | `ps` (1-D), `tps` (≥2-D) | One of `ps`, `tps`, `matern`, `duchon`, etc. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
-| `bc` | `free` | Apply the same endpoint boundary condition on both ends: `free`, `clamped`, or `anchored`. |
-| `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition for half-open smooths. `clamped` forces zero endpoint derivative; `anchored` forces the endpoint value. |
-| `anchor_left`, `anchor_right` | `0` | Anchor value for `bc_left=anchored` / `bc_right=anchored`. Currently only zero anchors are supported by the fitter. |
+| `bc` | `free` | Same boundary condition on both ends: `free`, `clamped`, or `anchored`. |
+| `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition. Aliases: `left_bc`/`right_bc`, `start_bc`/`end_bc`. |
+| `anchor`, `anchor_left`, `anchor_right` | 0 | Anchor value for `anchored`. Aliases: `anchor_value`, `value`, `left_anchor`, `right_anchor`. |
+| `by` | none | Column for varying-coefficient or by-factor smooths. |
 
-Examples:
+The 1-D B-spline path accepts these options plus `periodic`, `period`,
+`periods`, `period_start`, `period_end`, `origin`, `identifiability`.
+
+Default interior knots:
+`clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`. The basis
+dimension is then `k = internal_knots + degree + 1`. Passing both `k`
+and `knots` is an error.
+
+Boundary-condition values: `free`/`none`/`open`,
+`clamped`/`zero_derivative`, `anchored`/`zero`/`zero_value`. `clamped`
+forces zero first derivative at the endpoint; `anchored` pins the
+endpoint value (anchor defaults to 0, currently the only supported
+anchor value).
 
 ```
-y ~ s(x, bc_left=clamped)                 # starts flat, right end free
-y ~ s(x, bc_left=anchored, bc_right=free) # starts at zero, right end free
-y ~ s(x, bc=clamped)                      # zero slope at both endpoints
+y ~ s(x, bc=clamped)                       # zero slope at both endpoints
+y ~ s(x, bc_left=clamped)                  # zero slope at the start, free at end
+y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
+y ~ s(x, start_bc=clamped, end_bc=anchored, end_anchor=0)
 ```
 
-Default interior knots: `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`.
-The basis dimension is then `k = internal_knots + degree + 1`. Pass `k=` to
-set the total basis dimension directly; passing both `k` and `knots` is an
-error.
+`bc(x)` (aliases `boundary(x)`, `boundary_conditioned(x)`) is sugar for
+`s(x, bc=clamped)`; if any anchor option is set, it defaults to
+`bc=anchored`. Per-side overrides are read directly by the smooth
+builder.
 
 ## Multivariate smooths
 
 ```
-y ~ s(x1, x2)                       # thin-plate (default for ≥ 2 args)
-y ~ tps(x1, x2)                     # alias
-y ~ thinplate(x1, x2)               # alias
-y ~ thin_plate(x1, x2)              # alias
+y ~ s(x1, x2)                # thin-plate (default for >=2 args)
+y ~ tps(x1, x2)              # alias of thin-plate
+y ~ thinplate(x1, x2)        # alias
+y ~ thin_plate(x1, x2)       # alias
 y ~ matern(x1, x2, x3)
 y ~ duchon(x1, x2, x3)
-y ~ te(x, z)                        # tensor product
-y ~ tensor(x, z)                    # alias
-y ~ interaction(x, z)               # alias of `te`
+y ~ te(x, z)                 # tensor product
+y ~ tensor(x, z)             # alias
+y ~ interaction(x, z)        # alias of te()
 ```
 
-### Thin-plate spline (`tps`, `thinplate`, `s(x1, x2)`)
+### Thin-plate (`tps`, `thinplate`, multivariate `s(...)`)
 
 Radial-basis surface smooth with thin-plate kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (or `k`) | auto | Number of radial basis centres. |
-| `length_scale` | auto | Data-derived global length-scale initialization. |
+| `centers` (`k`, `basis_dim`) | auto | Number of radial centres. |
+| `length_scale` | auto (data-derived) | Global length-scale init. |
 | `double_penalty` | `true` | Ridge + main penalty. |
-| `scale_dims` | `false` | Standardize inputs per-axis before kernel eval. |
+| `scale_dims` | `false` | Per-axis input standardisation. |
+| `include_intercept` | `false` | Append a constant column. |
+| `by`, `identifiability` | — | See common options above. |
 
 ### Matérn (`matern`)
 
@@ -178,14 +205,16 @@ Radial basis with Matérn covariance kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (or `k`) | auto | Number of centres. |
-| `length_scale` | auto | Data-derived global length-scale initialization. |
-| `nu` | `5/2` | Smoothness. Options: `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
+| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `length_scale` | auto | Global length-scale init. |
+| `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
 | `double_penalty` | `true` | Ridge + main penalty. |
-| `scale_dims` | `false` | Per-axis anisotropy (learns axis contrasts). |
+| `scale_dims` | `false` | Per-axis anisotropy (learns per-axis log-scales). |
 
-Higher `nu` gives smoother sample paths. `5/2` is smooth but not analytic.
+Higher `nu` gives smoother sample paths. `nu=1/2` is rejected for
+`d >= 2` because the exponential kernel's Laplacian is singular at
+zero, which makes the operator-collocation penalty non-invertible.
 
 ### Duchon (`duchon`)
 
@@ -194,142 +223,129 @@ stiffness). Scale-free unless `length_scale` is given.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `order` | auto | Polynomial nullspace order. `0`, `Linear`, or `Degree(d)`. |
-| `power` | auto | Kernel power. |
-| `centers` (or `k`) | auto | Number of centres. |
-| `length_scale` | none | Optional global scale (hybrid mode). |
-| `scale_dims` | `false` | Per-axis shape contrasts. Scale-free by default. |
+| `order` (`nullspace_order`) | auto | Polynomial nullspace order. |
+| `power` (`p`) | auto | Kernel power. |
+| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `length_scale` | none (scale-free) | Optional global scale. |
+| `scale_dims` | `false` | Per-axis contrasts. |
+| `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
-Three independent penalties (mass, tension, stiffness) each get their own
-smoothing parameter under REML.
+`duchon()` rejects `double_penalty`; the three operator penalties
+(mass, tension, stiffness) each get their own smoothing parameter
+under REML.
 
-### Tensor product (`te`, `tensor`)
+### Tensor product (`te`, `tensor`, `interaction`)
 
-Kronecker product of univariate B-spline bases. Each axis gets its own
-smoothing parameter. Use when axes have different units (e.g. space × time).
+Kronecker product of univariate B-spline bases. Each axis has its own
+smoothing parameter. Use when axes have different units (space × time).
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `k` | auto, per margin | Basis dim per margin. |
-| `knots` | auto, per margin | Interior knots per margin. |
+| `k` (`basis_dim`) | auto, per margin | Basis dim per margin. List form `k=[k1, k2]` accepted. |
+| `knots` | auto, per margin | Interior knots per margin. List form accepted. |
 | `degree` | 3 | Polynomial degree (all margins). |
-| `double_penalty` | `true` | Ridge + main penalty. |
+| `penalty_order` | 2 | Difference-penalty order. |
+| `double_penalty` | `false` | Ridge alongside per-margin penalties. |
+| `bc` | none | Per-margin boundary conditions (list form). |
+| `periodic`, `period`, `periods`, `origin`, `origins` | — | Per-margin periodicity (see below). |
+| `by`, `identifiability` | — | See common options above. |
+
+`k` and `knots` cannot both be set. Margins requested as a single
+value are broadcast across all margins.
 
 ### Picking the right smooth
 
-The four multivariate families recover the same headline structure when
-the truth is reasonable, but they take different paths to get there:
+| Situation | Term |
+| --- | --- |
+| One covariate | `s(x)` |
+| Two coordinates, same units | `s(x, y)` or `matern(x, y)` |
+| Coordinates in different units | `te(x, t)` |
+| Three or more coordinates | `duchon(...)` with `scale_dims=true`, or `matern(...)` |
+| Direct control of wiggliness | `matern(..., nu=...)` |
+| Scale-free behaviour | `duchon(...)` without `length_scale` |
 
 ![four smooth families on the same dataset](images/smooth_zoo.png)
 
-| You have... | Use... |
-| --- | --- |
-| One covariate | `s(x)` (P-spline). |
-| Two coordinates in the same units (lat, lon) | `s(x, y)` (thin-plate) or `matern(x, y)`. |
-| Coordinates in different units (space × time) | `te(x, t)`. |
-| 3+ coordinates, especially in different units | `duchon(...)` with `scale_dims=true`, or `matern(...)`. |
-| You want to control wiggliness directly | `matern(...)` with `nu`. |
-| You want scale-free behaviour | `duchon(...)` without `length_scale`. |
-
-### Periodic / cyclic smooths
-
-For a visual tour of the periodic, sphere, cylinder, torus,
-Möbius-double-cover, and boundary-conditioned smooths recovered from
-noisy 3-D point clouds, see the [manifold smooths gallery](manifold-smooths.md).
+### Periodic and cyclic smooths
 
 ```
-y ~ s(theta, periodic=true, period=6.283)             # cyclic 1D B-spline
-y ~ cyclic(theta, period_start=0, period_end=6.283)   # equivalent alias
-y ~ periodic(theta, period=6.283)                     # alias of `cyclic`
-y ~ cp(theta, period=6.283)                           # alias of `cyclic`
-y ~ cc(day_of_week, period=7)                         # mgcv `bs="cc"` alias
+y ~ s(theta, periodic=true, period=6.283)             # cyclic 1-D B-spline
+y ~ cyclic(theta, period_start=0, period_end=6.283)   # alias of s(..., periodic=true)
+y ~ periodic(theta, period=6.283)                     # alias
+y ~ cp(theta, period=6.283)                           # alias
+y ~ cc(day_of_week, period=7)                         # mgcv-style alias
 
-# Tensor with one or more periodic margins (cylinder, torus, …)
+# Tensor with one or more periodic margins
 y ~ te(theta, h,  periodic=[0], period=[2*pi, None])
 y ~ te(theta, phi, periodic=[0, 1], period=[2*pi, 2*pi])
 y ~ te(day, hour, bc=['periodic','periodic'], periods=[7, 24], origins=[0, 0])
 ```
 
-Formula-level `duchon(..., periodic=true)` is intentionally rejected until
-the wrapped-distance Duchon kernel has a REML kappa-derivative path. Use
-`s(x, periodic=true, period=...)` for 1-D cyclic smoothing, or `te(...)`
-with periodic margins for cylinder/torus-style geometries.
+`cyclic`, `periodic`, `cc`, `cp` are aliases of `s(..., type=cyclic)`.
 
-`periodic=[axes]` lists zero-based axis indices that wrap around; `period=`
-or `periods=` holds one positive period per margin (`None` for non-periodic).
-`origin=` / `origins=` fixes the half-open cyclic domain start when the
-sample does not contain the true boundary. The
-periodic margin uses a folded cardinal-cubic B-spline and a cyclic
-difference penalty. `period_start`/`period_end` (1D) override the data range
-when the angular domain is wider than the observed sample.
+`periodic=[axes]` lists zero-based axis indices that wrap. `period=` or
+`periods=` holds one positive period per margin (`None` for
+non-periodic margins). `origin=` / `origins=` fixes the half-open
+cyclic domain start when the sample does not contain the boundary.
+`period_start`/`period_end` (1-D) override the data range when the
+angular domain is wider than the observed sample.
 
-Period values can be plain numbers (e.g. `6.283185307`) or the symbolic
-constants `pi` / `PI` / `tau` / `TAU` (case-insensitive), optionally
-multiplied by a single numeric literal: `pi`, `2*pi`, `pi*2`, `.5*pi`,
-and `tau` are all accepted; `pi/2` and `2*3.14` (number ✕ number) are
-not. The same rule applies inside list syntax: `period=[2*pi, None]`.
+Period values can be plain numbers (e.g. `6.283185307`) or the
+symbolic constants `pi` / `PI` / `tau` / `TAU` (case-insensitive),
+optionally multiplied by a single numeric literal: `pi`, `2*pi`,
+`pi*2`, `.5*pi`, and `tau` are all accepted. `pi/2` and `2*3.14`
+(number × number) are not. The same rule applies inside list syntax
+(`period=[2*pi, None]`).
 
-### Boundary-conditioned 1D smooths
-
-```
-y ~ s(x, bc=clamped)                       # zero first derivative at both ends
-y ~ s(x, bc=clamped, side=left)            # zero first derivative at the start
-y ~ s(x, bc_left=anchored, anchor_left=0)  # endpoint value pinned to 0
-y ~ s(x, start_bc=clamped, end_bc=anchored, end_anchor=0)
-```
-
-Endpoint conditions are imposed by projecting onto the null space of the
-boundary-condition rows (Wood §5.4.1), so the constrained smooth honours
-the condition exactly. Aliases: `bc_left|left_bc|start_bc`, plus
-`bc_right|right_bc|end_bc`. Values: `free|none|open`, `clamped|zero_derivative`,
-`anchored|zero|zero_value`. Per-side anchor overrides: `anchor_<side>`,
-`<side>_anchor`, then global `anchor`/`anchor_value`/`value`.
+`duchon()` accepts `periodic` only for 1-D inputs. Formula-level
+multivariate `duchon(..., periodic=true)` is rejected.
 
 ### Intrinsic S² (sphere) smooth
 
 ```
 y ~ sphere(lat, lon)                                    # Wahba kernel, m=2
-y ~ sos(lat, lon)                                       # alias of sphere()
-y ~ spherical(lat, lon)                                 # alias of sphere()
+y ~ sos(lat, lon)                                       # alias
+y ~ spherical(lat, lon)                                 # alias
 y ~ s(lat, lon, type=sphere)                            # equivalent
-y ~ s(lat, lon, bs=sos)                                 # mgcv alias
-y ~ sphere(lat, lon, m=3, radians=true, k=64)           # m∈{1..4}; centers=k
-y ~ sphere(lat, lon, method=harmonic, max_degree=6)     # spherical-harmonic
+y ~ s(lat, lon, bs=sos)                                 # mgcv-style alias
+y ~ sphere(lat, lon, m=3, radians=true, k=64)
+y ~ sphere(lat, lon, method=harmonic, max_degree=6)
 ```
+
+`sphere()`, `sos()`, and `spherical()` require exactly two columns
+(latitude, longitude).
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `method` | `wahba` | `wahba` (reproducing kernel) or `harmonic` (spherical harmonics). |
-| `m` (`order`, `penalty_order`) | 2 | Wahba pseudo-spline order (1..4). |
-| `max_degree` (`L`, `harmonic_degree`) | auto | Maximum harmonic degree L; basis dim = L(L+2). |
-| `centers` (`k`) | auto | Wahba center count. |
-| `radians` (`units=radians`) | `false` | Treat lat/lon as radians (default: degrees). |
+| `method` | `wahba` | `wahba` (reproducing kernel) or `harmonic` (spherical harmonics). Aliases: `wahba_sobolev`, `wahba_pseudo`/`mgcv`/`sos`, `sh`. |
+| `m` (`order`, `penalty_order`) | 2 | Wahba pseudo-spline order, integer in `{1, 2, 3, 4}`. |
+| `max_degree` (`max_l`, `harmonic_degree`, `l`) | auto | Maximum harmonic degree L; basis dim = `L(L+2)`. |
+| `centers` (`k`, `basis_dim`) | auto | Wahba centre count. |
+| `radians` / `units=radians` | `false` | Treat lat/lon as radians (default: degrees). |
 | `double_penalty` | `true` | Add a ridge-like null-space shrinkage penalty. |
+| `kernel` (`wahba_kernel`) | `sobolev` | `sobolev` (default) or `pseudo`/`mgcv`/`sos`. |
 
-The Wahba and harmonic constructions are both intrinsic on the sphere
-(rotation-invariant). Harmonic is fixed-rank and has a diagonal Laplace-
-Beltrami squared penalty; Wahba uses centers via the closed-form
-reproducing kernel.
+Both Wahba and harmonic constructions are rotation-invariant. The
+harmonic basis is fixed-rank with a diagonal Laplace-Beltrami squared
+penalty; Wahba uses centres via a closed-form reproducing kernel.
 
 ## Adaptive anisotropy
 
-For multi-d smooths that support it, add `scale_dims=true` (or set
-`scale_dimensions=True` on `fit()`) to learn per-axis shrinkage:
+Multi-dimensional smooths that support `scale_dims=true` learn
+per-axis shrinkage. Setting `scale_dimensions=True` on `fit()`
+enables it globally across compatible spatial smooths.
 
 ```python
-gamfit.fit(
-    df,
-    "y ~ matern(pc1, pc2, pc3, pc4)",
-    scale_dimensions=True,
-)
+gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
-- **Matérn / hybrid Duchon (with `length_scale`):** optimizes a global scale
-  plus centered per-axis contrasts.
-- **Pure Duchon (no `length_scale`):** optimizes only the centered per-axis
-  contrasts; stays scale-free.
-- **Thin-plate / tensor:** standardizes inputs per axis before kernel
-  evaluation.
+- Matérn and hybrid Duchon (with `length_scale`): a global scale plus
+  centered per-axis contrasts.
+- Pure Duchon (no `length_scale`): centered per-axis contrasts only;
+  remains scale-free.
+- Thin-plate: per-axis input standardisation.
+- Tensor: each margin has its own smoothing parameter without this
+  option.
 
 ## Link function
 
@@ -345,26 +361,24 @@ y ~ x + link(type=blended(logit, probit))
 y ~ x + link(type=flexible(probit))
 ```
 
-| `link(type=...)` | What you get |
+| `link(type=...)` | Inverse link |
 | --- | --- |
-| `identity` | Inverse link `eta`. Default for Gaussian. |
-| `logit` | Inverse link `1 / (1 + exp(-eta))`. Default for binomial. Alias: `binomial-logit`. |
-| `probit` | Inverse link `Phi(eta)`. Alias: `binomial-probit`. |
-| `cloglog` | Inverse link `1 - exp(-exp(eta))`. Alias: `binomial-cloglog`. |
-| `log` | Inverse link `exp(eta)`. For counts and positive-continuous. |
-| `sas` | Sinh-arcsinh skewed link. Don't combine with `linkwiggle`. |
-| `beta-logistic` | Bounded link. Don't combine with `linkwiggle`. |
-| `blended(a, b, …)` | Mixture of two or more component inverse links (e.g. `logit`, `probit`, `cloglog`, `loglog`, `cauchit`). `mixture(...)` is an accepted alias. |
-| `flexible(base)` | A spline offset from a base link. Enables `linkwiggle`. |
+| `identity` | `eta`. Default for Gaussian. |
+| `logit` (alias `binomial-logit`) | `1 / (1 + exp(-eta))`. Default for binomial. |
+| `probit` (alias `binomial-probit`) | `Phi(eta)`. |
+| `cloglog` (alias `binomial-cloglog`) | `1 - exp(-exp(eta))`. |
+| `log` | `exp(eta)`. For counts and positive-continuous. |
+| `sas` | Sinh-arcsinh skewed link. Not compatible with `linkwiggle`. |
+| `beta-logistic` | Bounded link. Not compatible with `linkwiggle`. |
+| `blended(a, b, ...)` / `mixture(a, b, ...)` | Mixture of component inverse links from `logit`, `probit`, `cloglog`, `loglog`, `cauchit`. |
+| `flexible(base)` | Spline offset from a base link; enables `linkwiggle`. |
 
-Set it from Python with `link=` on `fit()`:
+`link(type=...)` in the formula and `link=` on `fit()` are equivalent.
+The formula value wins if both are set.
 
 ```python
 gamfit.fit(df, "case ~ s(age)", link="logit")
 ```
-
-`link(type=...)` in the formula and `link=` on `fit()` are equivalent. If
-both are set, the formula wins.
 
 ## `linkwiggle` — flexible link offset
 
@@ -374,28 +388,31 @@ y ~ s(x) + linkwiggle(internal_knots=10)
 y ~ s(x) + linkwiggle(degree=2, internal_knots=8, penalty_order=all)
 ```
 
-Adds a spline offset to a base link. The data can correct for link
-misspecification; the base link is the prior.
+Adds a spline offset to a base link. The base link is the prior; the
+data can correct for link misspecification.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `internal_knots` | ~10 | Interior knots for the offset spline. |
-| `degree` | 3 | Polynomial degree (≥ 1). |
-| `penalty_order` | `all` (= 1, 2, 3) | Which derivatives to penalise. Comma-separated `slope`, `curvature`, `curvature-change` (or `1, 2, 3`), or `all`. |
+| `internal_knots` | ~10 | Interior knots for the offset spline (must be > 0). |
+| `degree` | 3 | Polynomial degree (>= 1). |
+| `penalty_order` | `all` (1, 2, 3) | Which derivatives to penalise. Comma-separated `slope`, `curvature`, `curvature-change` (or `1`, `2`, `3`), or `all`. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 
-Available with `identity`, `log`, `logit`, `probit`, `cloglog` base links.
-Not with `sas`, `beta-logistic`, or `blended(...)`.
+Compatible base links: `identity`, `log`, `logit`, `probit`,
+`cloglog`. Not `sas`, `beta-logistic`, or `blended(...)`.
 
-## `timewiggle` — survival-only baseline offset
+`linkwiggle()` takes named options only; positional arguments are
+rejected.
+
+## `timewiggle` — survival baseline offset
 
 ```
 Surv(entry, exit, event) ~ age + timewiggle(internal_knots=8)
 ```
 
-Same options as `linkwiggle`. Adds a spline offset to the survival time
-basis so the baseline hazard can deviate from a parametric form. Survival
-formulas only, and the fit must use a non-linear scalar `baseline_target`
+Same options as `linkwiggle`. Adds a spline offset to the survival
+time basis so the baseline hazard can deviate from a parametric form.
+Survival formulas only, with a non-linear scalar `baseline_target`
 such as `weibull`, `gompertz`, or `gompertz-makeham`. See
 [survival.md](survival.md).
 
@@ -408,21 +425,23 @@ Surv(entry, exit, event) ~ age + survmodel(spec=net, distribution=gaussian)
 | Option | Meaning |
 | --- | --- |
 | `spec` | Baseline specification, e.g. `net`. |
-| `distribution` | Residual distribution. Accepted (case-insensitive): `gaussian` / `probit`, `gumbel` / `cloglog`, `logistic` / `logit`. |
+| `distribution` | Residual distribution. Case-insensitive. Accepted: `gaussian`/`probit`, `gumbel`/`cloglog`, `logistic`/`logit`. |
 
-Pair with `survival_likelihood=` on `fit()` and the `--predict-noise` route.
-See [survival.md](survival.md).
+`survmodel()` requires at least one named option and takes named
+arguments only. Only one `survmodel(...)` term is allowed per formula.
+Pair it with `survival_likelihood=` on `fit()`. See
+[survival.md](survival.md).
 
 ## Examples
 
 ```python
-# Simple GAM with a smooth and a linear term
+# GAM with a smooth and a linear term
 "y ~ s(bmi) + age"
 
 # Spatial smooth with per-axis anisotropy
 "z ~ matern(lat, lon, scale_dims=true)"
 
-# Tensor of space × time
+# Tensor of space x time
 "y ~ te(x_coord, time, k=8)"
 
 # 4-D scale-free Duchon
@@ -434,7 +453,7 @@ See [survival.md](survival.md).
 # Logistic with flexible link
 "case ~ s(age) + link(type=flexible(probit)) + linkwiggle(internal_knots=6)"
 
-# Survival with transformation likelihood + smooth covariate
+# Survival with smooth covariate
 "Surv(entry, exit, event) ~ s(age) + bmi"
 
 # Random intercept per site
