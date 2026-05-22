@@ -2011,22 +2011,21 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         let beta_k = beta.slice(s![start..end]).to_owned();
         let s_beta = penalties[block].dot(&beta_k);
         let lambda = lambdas[block];
+        let lambda_s_beta = s_beta.mapv(|value| lambda * value);
         let mut p_beta = Array1::<f64>::zeros(p_total);
         for local_i in 0..(end - start) {
-            p_beta[start + local_i] = lambda * s_beta[local_i];
+            p_beta[start + local_i] = lambda_s_beta[local_i];
         }
-        let mut p_full = Array2::<f64>::zeros((p_total, p_total));
-        for local_i in 0..(end - start) {
-            for local_j in 0..(end - start) {
-                p_full[[start + local_i, start + local_j]] =
-                    lambda * penalties[block][[local_i, local_j]];
-            }
-        }
-        let rp = r.dot(&p_full);
-        let rpr = rp.dot(&r);
-        let m = r.dot(&p_beta);
+        let weighted_penalty = penalties[block].mapv(|value| lambda * value);
+        let rp_block = r.slice(s![.., start..end]).dot(&weighted_penalty);
+        let mut rp = Array2::<f64>::zeros((p_total, p_total));
+        rp.slice_mut(s![.., start..end]).assign(&rp_block);
+        let rpr = rp_block.dot(&r.slice(s![start..end, ..]));
+        let m = r.slice(s![.., start..end]).dot(&lambda_s_beta);
         b_values[block] = beta.dot(&p_beta);
-        t_values[block] = (0..p_total).map(|i| rp[[i, i]]).sum::<f64>();
+        t_values[block] = (0..(end - start))
+            .map(|local_i| rp_block[[start + local_i, local_i]])
+            .sum::<f64>();
         alpha[block] -= u.dot(&p_beta);
         p_betas.push(p_beta);
         m_vectors.push(m);

@@ -152,51 +152,6 @@ def test_gaussian_reml_fit_batched_gradcheck() -> None:
     )
 
 
-<<<<<<< Updated upstream
-def test_gaussian_reml_fit_blocks_gradcheck() -> None:
-    """Analytic VJP for the multi-block per-smooth-λ Gaussian REML fit.
-
-    F=3 smooths, N=50 rows, M_k=6 cols per smooth, D=1. Differentiates
-    through every output (coefficients, fitted, lambdas, log_lambdas,
-    reml_score, edf) back to the per-block designs, per-block penalties,
-    and y. The IFT-based backward composes the F×F outer-Hessian inverse,
-    which amplifies any inner convergence noise.
-    """
-    _require_ffi("gaussian_reml_fit_blocks_forward")
-    _require_ffi("gaussian_reml_fit_blocks_backward")
-    from gamfit.torch import _reml as torch_reml
-
-    rng = np.random.default_rng(20260522)
-    n = 50
-    f_blocks = 3
-    k_per = 6
-
-    designs: list[torch.Tensor] = []
-    penalties: list[torch.Tensor] = []
-    fitted_truth = np.zeros(n)
-    for _ in range(f_blocks):
-        x = rng.standard_normal((n, k_per))
-        beta = 0.3 * rng.standard_normal(k_per)
-        fitted_truth += x @ beta
-        designs.append(torch.tensor(x, dtype=torch.float64, requires_grad=True))
-        penalty = np.eye(k_per)
-        penalties.append(torch.tensor(penalty, dtype=torch.float64, requires_grad=True))
-
-    y_np = fitted_truth + 0.1 * rng.standard_normal(n)
-    y_t = torch.tensor(
-        y_np.reshape(n, 1), dtype=torch.float64, requires_grad=True
-    )
-
-    def f(*args: torch.Tensor) -> torch.Tensor:
-        ds = list(args[:f_blocks])
-        ps = list(args[f_blocks : 2 * f_blocks])
-        y_ = args[2 * f_blocks]
-        out = torch_reml.gaussian_reml_fit_blocks(ds, ps, y_)
-        coef_sum = sum(c.sum() for c in out.coefficients)
-        return (
-            coef_sum
-            + out.fitted.sum()
-=======
 def _reml_block_inputs(
     n: int = 18, p_per: int = 3, seed: int = 20260522
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -282,25 +237,20 @@ def test_gaussian_reml_fit_blocks_gradcheck() -> None:
         out = gt.gaussian_reml_fit_blocks([a, b], [sa, sb], yy, weights=ww)
         return (
             out.fitted.sum()
->>>>>>> Stashed changes
             + out.lambdas.sum()
             + out.log_lambdas.sum()
             + out.reml_score
             + out.edf.sum()
-<<<<<<< Updated upstream
-=======
             + sum(c.sum() for c in out.coefficients)
->>>>>>> Stashed changes
         )
 
     assert torch.autograd.gradcheck(
         f,
-<<<<<<< Updated upstream
-        (*designs, *penalties, y_t),
-        eps=1e-6,
+        (x1_t, x2_t, s1_t, s2_t, y_t, w_t),
+        eps=1e-5,
         atol=1e-4,
         rtol=1e-3,
-        nondet_tol=1e-5,
+        nondet_tol=1e-6,
     )
 
 
@@ -315,7 +265,6 @@ def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
     """
     _require_ffi("gaussian_reml_fit_blocks_forward")
     _require_ffi("gaussian_reml_fit")
-    from gamfit.torch import _reml as torch_reml
 
     rng = np.random.default_rng(2026)
     n, m = 30, 5
@@ -326,7 +275,7 @@ def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
     x_blk = torch.tensor(X, dtype=torch.float64, requires_grad=True)
     p_blk = torch.tensor(s, dtype=torch.float64)
     y_blk = torch.tensor(y, dtype=torch.float64)
-    out_blocks = torch_reml.gaussian_reml_fit_blocks([x_blk], [p_blk], y_blk)
+    out_blocks = gt.gaussian_reml_fit_blocks([x_blk], [p_blk], y_blk)
     out_blocks.fitted.sum().backward()
     assert x_blk.grad is not None
     grad_x_blocks = x_blk.grad.detach().clone()
@@ -340,13 +289,3 @@ def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
     grad_x_single = x_single.grad.detach().clone()
 
     torch.testing.assert_close(grad_x_blocks, grad_x_single, rtol=2e-3, atol=2e-4)
-
-
-=======
-        (x1_t, x2_t, s1_t, s2_t, y_t, w_t),
-        eps=1e-5,
-        atol=1e-4,
-        rtol=1e-3,
-        nondet_tol=1e-6,
-    )
->>>>>>> Stashed changes
