@@ -124,18 +124,30 @@ use thiserror::Error;
 type CliResult<T> = Result<T, CliError>;
 
 #[derive(Debug, Error)]
-enum CliError {
+pub(crate) enum CliError {
     #[error("{message}")]
     Message {
         message: String,
         advice: Option<String>,
     },
+    #[error("{reason}")]
+    ArgumentInvalid { reason: String },
+    #[error("{reason}")]
+    IncompatibleConfig { reason: String },
+    #[error("{reason}")]
+    FileWriteFailed { reason: String },
+    #[error("{reason}")]
+    Internal { reason: String },
 }
 
 impl CliError {
     fn advice(&self) -> Option<&str> {
         match self {
             Self::Message { advice, .. } => advice.as_deref(),
+            Self::ArgumentInvalid { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::FileWriteFailed { .. }
+            | Self::Internal { .. } => None,
         }
     }
 }
@@ -143,6 +155,12 @@ impl CliError {
 impl From<String> for CliError {
     fn from(message: String) -> Self {
         classify_cli_error(message)
+    }
+}
+
+impl From<CliError> for String {
+    fn from(err: CliError) -> Self {
+        err.to_string()
     }
 }
 
@@ -600,21 +618,26 @@ struct CliFirthValidation<'a> {
     link_choice: Option<&'a LinkChoice>,
 }
 
-fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), String> {
+fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), CliError> {
     if !ctx.enabled {
         return Ok(());
     }
 
     if ctx.is_survival {
-        return Err("--firth is not supported for survival models".to_string());
+        return Err(CliError::IncompatibleConfig {
+            reason: "--firth is not supported for survival models".to_string(),
+        });
     }
     if ctx.predict_noise {
-        return Err(
-            "--firth is not supported with --predict-noise location-scale fitting".to_string(),
-        );
+        return Err(CliError::IncompatibleConfig {
+            reason: "--firth is not supported with --predict-noise location-scale fitting"
+                .to_string(),
+        });
     }
     if ctx.has_bounded_terms {
-        return Err("--firth is not yet supported with bounded() coefficients".to_string());
+        return Err(CliError::IncompatibleConfig {
+            reason: "--firth is not yet supported with bounded() coefficients".to_string(),
+        });
     }
     if ctx.family.supports_firth() {
         return Ok(());
@@ -624,14 +647,18 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), S
         .link_choice
         .is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
     {
-        return Err("--firth with flexible(...) currently requires logit base link".to_string());
+        return Err(CliError::IncompatibleConfig {
+            reason: "--firth with flexible(...) currently requires logit base link".to_string(),
+        });
     }
 
-    Err(format!(
-        "--firth currently requires {}; resolved family is {}",
-        LikelihoodFamily::BinomialLogit.pretty_name(),
-        ctx.family.pretty_name()
-    ))
+    Err(CliError::IncompatibleConfig {
+        reason: format!(
+            "--firth currently requires {}; resolved family is {}",
+            LikelihoodFamily::BinomialLogit.pretty_name(),
+            ctx.family.pretty_name()
+        ),
+    })
 }
 
 const FAMILY_GAUSSIAN_LOCATION_SCALE: &str = "gaussian-location-scale";
@@ -6501,10 +6528,12 @@ fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str {
     }
 }
 
-fn choose_formula(args: &FitArgs) -> Result<String, String> {
+fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
     let v = args.formula_positional.trim();
     if v.is_empty() {
-        return Err("FORMULA cannot be empty".to_string());
+        return Err(CliError::ArgumentInvalid {
+            reason: "FORMULA cannot be empty".to_string(),
+        });
     }
     Ok(v.to_string())
 }
@@ -9672,6 +9701,7 @@ mod tests {
         })
         .expect_err("Poisson Firth should be rejected through the shared family policy");
 
+        let err = err.to_string();
         assert!(
             err.contains("Binomial Logit"),
             "unexpected error message: {err}"
@@ -9768,7 +9798,7 @@ mod tests {
         })
         .expect_err("survival Firth should be rejected");
 
-        assert_eq!(err, "--firth is not supported for survival models");
+        assert_eq!(err.to_string(), "--firth is not supported for survival models");
     }
 
     #[test]
