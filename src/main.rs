@@ -181,6 +181,16 @@ impl From<gam::inference::formula_dsl::FormulaDslError> for CliError {
     }
 }
 
+impl From<gam::inference::data::DataError> for CliError {
+    fn from(err: gam::inference::data::DataError) -> Self {
+        // Data-loader failures land in the user-facing argument-validation
+        // surface: the path / schema / columns the user pointed us at could
+        // not be opened or parsed. The classifier still runs on the rendered
+        // text in case it carries hints we want to dress up further.
+        classify_cli_error(err.to_string())
+    }
+}
+
 fn extract_quoted_field(message: &str) -> Option<String> {
     let mut it = message.match_indices('\'');
     let (start_q, _) = it.next()?;
