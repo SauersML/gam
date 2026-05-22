@@ -7824,11 +7824,49 @@ fn stable_logdet_with_ridge_policy(
     }
 }
 
+/// Try Cholesky with an escalating diagonal ridge.
+///
+/// On attempt `k` (zero-indexed) the diagonal of `matrix` is boosted by
+/// `initial_boost * growth^k`. The first successful Cholesky for which
+/// `on_success` returns `Some(r)` short-circuits and yields `Some((r, boost,
+/// attempt))`; otherwise (Cholesky failure or `on_success` rejection) the
+/// ridge is grown and retried up to `max_attempts` times. Returns `None`
+/// when every attempt is exhausted.
+///
+/// Callers that need a no-ridge probe should perform it explicitly before
+/// invoking this helper; the helper itself always adds `initial_boost` on
+/// the first attempt (which may itself be zero if the caller passes 0.0).
+fn try_cholesky_with_escalating_ridge<R>(
+    matrix: &Array2<f64>,
+    initial_boost: f64,
+    max_attempts: usize,
+    growth: f64,
+    mut on_success: impl FnMut(&crate::faer_ndarray::FaerCholeskyFactor, usize, f64) -> Option<R>,
+) -> Option<(R, f64, usize)> {
+    let p = matrix.nrows();
+    let mut boost = initial_boost;
+    for attempt in 0..max_attempts {
+        let mut candidate = matrix.clone();
+        if boost != 0.0 {
+            for i in 0..p {
+                candidate[[i, i]] += boost;
+            }
+        }
+        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+            if let Some(r) = on_success(&chol, attempt, boost) {
+                return Some((r, boost, attempt));
+            }
+        }
+        boost *= growth;
+    }
+    None
+}
+
 /// Fallback for penalty pseudo-logdet when eigendecomposition fails.
 ///
 /// Penalty matrices are PSD by construction (weighted sum of PSD penalties),
-/// so the ridged matrix should be SPD.  Uses escalating-ridge Cholesky —
-/// same pattern as `positive_part_cholesky_fallback`.
+/// so the ridged matrix should be SPD.  Uses escalating-ridge Cholesky via
+/// the shared `try_cholesky_with_escalating_ridge` helper.
 fn penalty_logdet_cholesky_fallback(
     s_ridged: &Array2<f64>,
     existing_ridge: f64,
@@ -7845,13 +7883,14 @@ fn penalty_logdet_cholesky_fallback(
         .max(1.0);
 
     const MAX_ATTEMPTS: usize = 6;
-    let mut boost = diag_scale * 1e-8;
-    for attempt in 0..MAX_ATTEMPTS {
-        let mut candidate = s_ridged.clone();
-        for i in 0..p {
-            candidate[[i, i]] += boost;
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+    let initial_boost = diag_scale * 1e-8;
+
+    let outcome = try_cholesky_with_escalating_ridge(
+        s_ridged,
+        initial_boost,
+        MAX_ATTEMPTS,
+        10.0,
+        |chol, attempt, boost| {
             let logdet = 2.0 * chol.diag().mapv(f64::ln).sum();
             if logdet.is_finite() {
                 log::warn!(
@@ -7862,17 +7901,25 @@ fn penalty_logdet_cholesky_fallback(
                     attempt + 1,
                     existing_ridge,
                 );
-                return Ok(logdet);
+                Some(logdet)
+            } else {
+                None
             }
-        }
-        boost *= 10.0;
+        },
+    );
+
+    if let Some((logdet, _, _)) = outcome {
+        return Ok(logdet);
     }
 
+    // Mirror the original message: report the ridge that *would* have been
+    // applied on the (MAX_ATTEMPTS+1)-th attempt, i.e. initial_boost * 10^MAX_ATTEMPTS.
+    let final_boost = initial_boost * 10.0_f64.powi(MAX_ATTEMPTS as i32);
     Err(CustomFamilyError::BasisDecompositionFailed { reason: format!(
         "penalty logdet eigendecomposition failed for block {block} ({eigh_err}) and \
          Cholesky fallback also failed after {MAX_ATTEMPTS} attempts \
          (final ridge={:.2e}, p={p})",
-        boost + existing_ridge,
+        final_boost + existing_ridge,
     ) }.into())
 }
 
@@ -7891,25 +7938,33 @@ fn inverse_spdwith_retry(
 ) -> Result<Array2<f64>, String> {
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
-    for attempt in 0..=max_retry {
-        let ridge = if attempt == 0 {
-            0.0
-        } else {
-            baseridge * 10.0_f64.powi((attempt - 1) as i32)
-        };
-        let mut candidate = sym.clone();
-        if ridge > 0.0 {
-            for i in 0..candidate.nrows() {
-                candidate[[i, i]] += ridge;
-            }
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
-            let mut ident = Array2::<f64>::eye(candidate.nrows());
+
+    let invert_via_chol =
+        |chol: &crate::faer_ndarray::FaerCholeskyFactor, _attempt: usize, _boost: f64| {
+            let mut ident = Array2::<f64>::eye(sym.nrows());
             chol.solve_mat_in_place(&mut ident);
             symmetrize_dense_in_place(&mut ident);
-            return Ok(ident);
+            Some(ident)
+        };
+
+    // Attempt 0 in the original schedule uses ridge=0 (no diagonal addition).
+    // Express this as a single-attempt call with initial_boost=0.
+    if let Some((inv, _, _)) =
+        try_cholesky_with_escalating_ridge(&sym, 0.0, 1, 1.0, invert_via_chol)
+    {
+        return Ok(inv);
+    }
+
+    // Subsequent attempts use ridge = baseridge * 10^(k-1) for k = 1..=max_retry,
+    // which is `max_retry` total attempts with initial_boost=baseridge, growth=10.
+    if max_retry > 0 {
+        if let Some((inv, _, _)) =
+            try_cholesky_with_escalating_ridge(&sym, baseridge, max_retry, 10.0, invert_via_chol)
+        {
+            return Ok(inv);
         }
     }
+
     Err(CustomFamilyError::BasisDecompositionFailed { reason: "failed to invert SPD system after Cholesky ridge retries".to_string() }.into())
 }
 

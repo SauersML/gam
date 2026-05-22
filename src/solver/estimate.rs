@@ -2310,6 +2310,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
         order: crate::solver::outer_strategy::OuterEvalOrder,
+        design_revision: Option<u64>,
     ) -> Result<
         (
             f64,
@@ -2364,6 +2365,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             hyper_dirs,
             warm_start_beta,
             context,
+            design_revision,
         )?;
         self.reml_state
             .compute_joint_hyper_eval_with_order(theta, rho_dim, &hyper_dirs, order)
@@ -2380,6 +2382,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         hyper_dirs: Vec<DirectionalHyperParam>,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
+        design_revision: Option<u64>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
         let hyper_dirs = self.prepare_eval_state(
             x,
@@ -2391,6 +2394,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             hyper_dirs,
             warm_start_beta,
             context,
+            design_revision,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state
@@ -2480,6 +2484,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         rho_dim: usize,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
+        design_revision: Option<u64>,
     ) -> Result<f64, EstimationError> {
         if rho_dim > theta.len() {
             return Err(EstimationError::InvalidInput(format!(
@@ -2495,6 +2500,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             linear_constraints,
             warm_start_beta,
             context,
+            design_revision,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state.compute_cost(&rho)
@@ -2530,6 +2536,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             linear_constraints,
             None,
             context,
+            None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         // Drive PIRLS at this theta (populates eval bundle cache).
@@ -2569,6 +2576,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             linear_constraints,
             None,
             context,
+            None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         let _ = self.reml_state.compute_cost(&rho)?;
@@ -2594,6 +2602,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             linear_constraints,
             None,
             context,
+            None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         let _ = self.reml_state.compute_cost(&rho)?;
