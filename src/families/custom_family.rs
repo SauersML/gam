@@ -3044,7 +3044,7 @@ fn warm_start_without_cached_inner_for_psi_derivatives(
     if !has_psi_derivatives {
         return None;
     }
-    // TODO(WS1b-long-term): replace this conservative invalidation with a
+    // WS1b-long-term: replace this conservative invalidation with a
     // geometry_key/theta_key on the cached inner-mode record.
     warm_start.cloned().map(|mut warm| {
         warm.cached_inner = None;
@@ -17912,22 +17912,21 @@ fn derivative_quality_options_and_warm_start(
     let tolerance_differs = eval_options.inner_tol != direct_joint_hyper_inner_tol;
     let tightening = eval_options.inner_tol > direct_joint_hyper_inner_tol;
     let align = eval_options.inner_max_cycles > 1 && tolerance_differs;
+    let psi_safe_warm_start = warm_start_without_cached_inner_for_psi_derivatives(
+        warm_start.map(|warm| &warm.inner),
+        true,
+    )
+    .map(|inner| CustomFamilyWarmStart { inner });
     if !align {
-        return (eval_options, None);
+        return (eval_options, psi_safe_warm_start);
     }
     eval_options.inner_tol = direct_joint_hyper_inner_tol;
-    let psi_safe_warm_start =
-        warm_start_without_cached_inner_for_psi_derivatives(warm_start.map(|warm| &warm.inner), true)
-            .map(|inner| CustomFamilyWarmStart { inner });
-    let strict_warm_start = if tightening {
+    if tightening {
         eval_options.inner_max_cycles = eval_options
             .inner_max_cycles
             .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
-        psi_safe_warm_start
-    } else {
-        psi_safe_warm_start
-    };
-    (eval_options, strict_warm_start)
+    }
+    (eval_options, psi_safe_warm_start)
 }
 
 pub(crate) fn joint_hyper_options_for_outer_tolerance(
@@ -18033,8 +18032,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
-    let psi_safe_warm_start =
-        warm_start_without_cached_inner_for_psi_derivatives(warm_start, true);
+    let psi_safe_warm_start = warm_start_without_cached_inner_for_psi_derivatives(warm_start, true);
     let mut inner = inner_blockwise_fit(
         family,
         specs,
