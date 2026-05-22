@@ -2244,7 +2244,7 @@ impl BernoulliMarginalSlopePredictor {
                         continue;
                     }
 
-                    let intercept = intercepts[local_row];
+                    let intercept = intercepts_view[local_row];
                     let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
                         intercept,
                         q,
@@ -2256,7 +2256,8 @@ impl BernoulliMarginalSlopePredictor {
                         link_corr_row,
                     )?;
                     let m_a = m_a_raw.max(1e-12);
-                    a_q.as_mut().unwrap()[local_row] = marginal_map[i].mu1 / m_a;
+                    a_q.as_mut().expect("a_q allocated when need_gradient")[local_row] =
+                        marginal_map[i].mu1 / m_a;
                     let mut f_b = 0.0;
                     f_h_row.fill(0.0);
                     f_w_row.fill(0.0);
@@ -2392,73 +2393,25 @@ impl BernoulliMarginalSlopePredictor {
                             }
                         }
                     }
-                    if let Some(a_h) = a_h.as_mut() {
+                    if let Some(a_h_view) = a_h.as_mut() {
                         let factor = -1.0 / m_a;
                         for j in 0..score_warp_dim {
-                            a_h[[local_row, j]] = factor * f_h_row[j];
+                            a_h_view[[local_row, j]] = factor * f_h_row[j];
                         }
                     }
-                    if let Some(a_w) = a_w.as_mut() {
+                    if let Some(a_w_view) = a_w.as_mut() {
                         let factor = -1.0 / m_a;
                         for j in 0..link_dev_dim {
-                            a_w[[local_row, j]] = factor * f_w_row[j];
+                            a_w_view[[local_row, j]] = factor * f_w_row[j];
                         }
                     }
-                    a_b.as_mut().unwrap()[local_row] = -f_b / m_a;
+                    a_b.as_mut().expect("a_b allocated when need_gradient")[local_row] =
+                        -f_b / m_a;
                 }
-
-                Ok(FlexSolveChunk {
-                    start,
-                    end,
-                    intercepts,
-                    a_q,
-                    a_b,
-                    a_h,
-                    a_w,
-                })
+                Ok(())
             })
-            .collect::<Vec<_>>();
-
-        let mut intercepts = Array1::<f64>::zeros(n);
-        let mut a_q_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
-        let mut a_b_vec = need_gradient.then(|| Array1::<f64>::zeros(n));
-        let mut a_h_rows = if need_gradient && score_warp_dim > 0 {
-            Some(Array2::<f64>::zeros((n, score_warp_dim)))
-        } else {
-            None
         };
-        let mut a_w_rows = if need_gradient && link_dev_dim > 0 {
-            Some(Array2::<f64>::zeros((n, link_dev_dim)))
-        } else {
-            None
-        };
-
-        for solve_chunk in solve_chunks {
-            let chunk = solve_chunk?;
-            intercepts
-                .slice_mut(ndarray::s![chunk.start..chunk.end])
-                .assign(&chunk.intercepts);
-            if let (Some(target), Some(source)) = (a_q_vec.as_mut(), chunk.a_q.as_ref()) {
-                target
-                    .slice_mut(ndarray::s![chunk.start..chunk.end])
-                    .assign(source);
-            }
-            if let (Some(target), Some(source)) = (a_b_vec.as_mut(), chunk.a_b.as_ref()) {
-                target
-                    .slice_mut(ndarray::s![chunk.start..chunk.end])
-                    .assign(source);
-            }
-            if let (Some(target), Some(source)) = (a_h_rows.as_mut(), chunk.a_h.as_ref()) {
-                target
-                    .slice_mut(ndarray::s![chunk.start..chunk.end, ..])
-                    .assign(source);
-            }
-            if let (Some(target), Some(source)) = (a_w_rows.as_mut(), chunk.a_w.as_ref()) {
-                target
-                    .slice_mut(ndarray::s![chunk.start..chunk.end, ..])
-                    .assign(source);
-            }
-        }
+        solve_result?;
 
         let eta_base = &intercepts + &(&logslope_eta * &z);
 
