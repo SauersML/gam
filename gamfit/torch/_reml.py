@@ -34,30 +34,35 @@ class GaussianRemlOutput(NamedTuple):
 class AdditiveRemlOutput:
     """Forward outputs for the multi-smooth additive REML fit.
 
-    ``coefficients`` is a list of per-smooth coefficient blocks (each of
-    shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam``
-    carries the smoothing parameter(s): a length-``F`` 1D tensor on the
-    multi-block per-smooth-λ Rust path, or a scalar tensor on the
-    block-diagonal multi-output path (``D > 1``), which is single-λ
-    because the multi-block REML driver is single-response;
-    ``reml_score`` is the converged REML criterion; ``edf`` is
-    length-``F`` per-smooth on the multi-block path and a scalar on the
-    multi-output path.
+    On the multi-block per-smooth-λ Rust path every field is an
+    autograd-tracked tensor with a working backward through
+    :class:`_GaussianRemlFitBlocksFn`:
 
-    .. note::
-       The multi-block path is forward-only: the underlying Rust
-       ``optimize_external_design`` driver does not yet expose an
-       analytic IFT/envelope VJP through its outer F×F Hessian to
-       Python. See :func:`gaussian_reml_fit_blocks` for the canonical
-       multi-λ entrypoint and its NotImplementedError contract on
-       ``.backward()``.
+    * ``coefficients``: list of ``F`` per-smooth blocks, each of shape
+      ``(K_k, 1)``.
+    * ``fitted``: joint fit ``(N, 1)``.
+    * ``lambdas`` / ``log_lambdas``: length-``F`` 1D tensors of converged
+      per-smooth smoothing parameters and their logs.
+    * ``reml_score``: converged REML criterion (scalar tensor).
+    * ``edf``: length-``F`` per-smooth EDFs.
+
+    The legacy single-λ block-diagonal multi-output path (``D > 1``)
+    reports the shared scalar ``λ`` / ``EDF`` in ``lambdas`` and ``edf``
+    (length 1) and is differentiable through the existing single-λ
+    autograd surface.
     """
 
     coefficients: list[torch.Tensor]
     fitted: torch.Tensor
-    lam: torch.Tensor
+    lambdas: torch.Tensor
+    log_lambdas: torch.Tensor
     reml_score: torch.Tensor
     edf: torch.Tensor
+
+    @property
+    def lam(self) -> torch.Tensor:
+        """Backward-compatible alias for :attr:`lambdas`."""
+        return self.lambdas
 
 
 def _scalar_grad(grad: torch.Tensor | None) -> float:
@@ -379,6 +384,149 @@ def gaussian_reml_fit_batched(
     return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
+class _GaussianRemlFitBlocksFn(torch.autograd.Function):
+    """Autograd Function for the multi-block per-smooth-λ Gaussian REML fit.
+
+    Forward calls the Rust :func:`_np_api.gaussian_reml_fit_blocks_forward`
+    multi-block joint REML driver. Backward calls the Rust analytic
+    :func:`_np_api.gaussian_reml_fit_blocks_backward`, which composes the
+    full VJP through the converged outer-loop optimum (envelope theorem +
+    IFT through the F×F outer Hessian) so every returned tensor —
+    coefficients, fitted values, λ, log-λ, REML score, EDF — is
+    differentiable back to the design blocks, penalty blocks, and y.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        y: torch.Tensor,
+        weights: torch.Tensor | None,
+        init_log_lambdas: torch.Tensor | None,
+        n_blocks: int,
+        *block_tensors: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        # ``block_tensors`` packs designs first (F entries), then penalties
+        # (F entries). This positional layout is what lets PyTorch route
+        # backward gradients elementwise onto each block tensor.
+        if len(block_tensors) != 2 * n_blocks:
+            raise RuntimeError(
+                f"_GaussianRemlFitBlocksFn expected {2 * n_blocks} block tensors, "
+                f"got {len(block_tensors)}"
+            )
+        designs = list(block_tensors[:n_blocks])
+        penalties = list(block_tensors[n_blocks:])
+        designs_np = [to_numpy_f64(d) for d in designs]
+        penalties_np = [to_numpy_f64(p) for p in penalties]
+        y_np = to_numpy_f64(y)
+        weights_np = None if weights is None else to_numpy_f64(weights)
+        rhos_np = None if init_log_lambdas is None else to_numpy_f64(init_log_lambdas)
+
+        out = _np_api.gaussian_reml_fit_blocks_forward(
+            designs_np,
+            penalties_np,
+            y_np,
+            weights=weights_np,
+            init_rhos=rhos_np,
+        )
+
+        ref = designs[0]
+        coefs_full = np.asarray(out["coefficients"], dtype=np.float64)  # (P_total, 1)
+        fitted_arr = np.asarray(out["fitted"], dtype=np.float64)
+        lambdas_arr = np.asarray(out["lambdas"], dtype=np.float64)
+        log_lambdas_arr = np.asarray(out["log_lambdas"], dtype=np.float64)
+        reml_score_val = float(out["reml_score"])
+        edf_arr = np.asarray(out["edf"], dtype=np.float64)
+
+        # Save numpy aliases on ctx for the backward pass. Saving torch
+        # tensors via save_for_backward gives us version-tracking and
+        # prevents silent in-place mutation between forward and backward.
+        _save_diff_tensors(ctx, y, weights, *designs, *penalties)
+        ctx.designs_np = designs_np
+        ctx.penalties_np = penalties_np
+        ctx.y_np = y_np
+        ctx.weights_np = weights_np
+        ctx.log_lambdas_np = log_lambdas_arr
+        ctx.n_blocks = n_blocks
+        ctx.has_weights = weights is not None
+        ctx.has_init = init_log_lambdas is not None
+        ctx.ref = ref
+
+        offsets: list[int] = [0]
+        for d in designs:
+            offsets.append(offsets[-1] + int(d.shape[1]))
+        ctx.offsets = offsets
+
+        fitted_t = from_numpy_like(fitted_arr, ref)
+        lambdas_t = from_numpy_like(lambdas_arr, ref)
+        log_lambdas_t = from_numpy_like(log_lambdas_arr, ref)
+        reml_t = from_numpy_like(np.asarray(reml_score_val, dtype=np.float64), ref)
+        edf_t = from_numpy_like(edf_arr, ref)
+
+        # The full coefficient vector is returned as a single tensor so
+        # gradient routing stays simple: a single ``grad_coefficients``
+        # tensor goes back through the Rust analytic backward. We split
+        # it back per-block downstream of this Function.
+        coefs_t = from_numpy_like(coefs_full, ref)
+
+        return coefs_t, fitted_t, lambdas_t, log_lambdas_t, reml_t, edf_t
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        (
+            grad_coefficients,
+            grad_fitted,
+            grad_lambdas,
+            grad_log_lambdas,
+            grad_reml_score,
+            grad_edf,
+        ) = grad_outputs
+        _check_saved_versions(ctx)
+        gc = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
+        gf = None if grad_fitted is None else to_numpy_f64(grad_fitted)
+        gl = None if grad_lambdas is None else to_numpy_f64(grad_lambdas)
+        glog = None if grad_log_lambdas is None else to_numpy_f64(grad_log_lambdas)
+        gr_scalar = _scalar_grad(grad_reml_score)
+        ge = None if grad_edf is None else to_numpy_f64(grad_edf)
+
+        result = _np_api.gaussian_reml_fit_blocks_backward(
+            ctx.designs_np,
+            ctx.penalties_np,
+            ctx.y_np,
+            ctx.log_lambdas_np,
+            weights=ctx.weights_np,
+            grad_coefficients=gc,
+            grad_fitted=gf,
+            grad_lambdas=gl,
+            grad_log_lambdas=glog,
+            grad_reml_score=gr_scalar,
+            grad_edf=ge,
+        )
+
+        ref = ctx.ref
+        grad_designs: list[torch.Tensor | None] = [
+            from_numpy_like(np.asarray(g, dtype=np.float64), ref)
+            for g in result["grad_designs"]
+        ]
+        grad_penalties: list[torch.Tensor | None] = [
+            from_numpy_like(np.asarray(g, dtype=np.float64), ref)
+            for g in result["grad_penalties"]
+        ]
+        grad_y = from_numpy_like(np.asarray(result["grad_y"], dtype=np.float64), ref)
+
+        # Match positional order of forward(...):
+        #   y, weights, init_log_lambdas, n_blocks, *designs, *penalties
+        # weights / init_log_lambdas / n_blocks are not differentiable through
+        # this Function.
+        return (
+            grad_y,
+            None,
+            None,
+            None,
+            *grad_designs,
+            *grad_penalties,
+        )
+
+
 def gaussian_reml_fit_blocks(
     design_blocks: list[torch.Tensor],
     penalty_blocks: list[torch.Tensor],
@@ -389,13 +537,15 @@ def gaussian_reml_fit_blocks(
 ) -> AdditiveRemlOutput:
     """Multi-block Gaussian REML forward fit with per-smooth λ.
 
-    Forward-only torch face of the Rust ``optimize_external_design``
+    Differentiable torch face of the Rust ``optimize_external_design``
     multi-block outer-loop (Gaussian identity link). Each
     ``design_blocks[k]`` of shape ``(N, K_k)`` carries its own penalty
     ``penalty_blocks[k]`` of shape ``(K_k, K_k)`` with its own scalar
     ``λ_k`` driven by the outer Newton/EFS loop. Returns the per-block
-    smoothing parameters in ``AdditiveRemlOutput.lam`` (1D tensor of
-    length ``F``) together with per-block EDFs in ``.edf``.
+    smoothing parameters in ``AdditiveRemlOutput.lambdas`` (1D tensor of
+    length ``F``), per-block EDFs in ``.edf``, and a working backward
+    through every output (envelope + IFT composed through the warm-started
+    outer optimum).
 
     Parameters
     ----------
@@ -405,9 +555,9 @@ def gaussian_reml_fit_blocks(
         List of ``F`` per-smooth penalty matrices, each of shape ``(K_k, K_k)``.
     y:
         Response tensor of shape ``(N,)`` or ``(N, 1)``. Multi-output
-        ``(N, D>1)`` is not supported on this path; call this function once
-        per output column or use the legacy single-λ
-        :func:`gaussian_reml_fit_additive` path.
+        ``(N, D>1)`` is not supported on this path; call once per output
+        column or use the legacy single-λ :func:`gaussian_reml_fit_additive`
+        path.
     weights:
         Optional row weights of shape ``(N,)``.
     init_log_lambdas:
@@ -418,18 +568,9 @@ def gaussian_reml_fit_blocks(
     -------
     AdditiveRemlOutput
         ``coefficients`` is a list of ``F`` per-block ``(K_k, 1)`` tensors;
-        ``fitted`` is ``(N, 1)``; ``lam`` is a length-``F`` 1D tensor of
-        per-smooth λ; ``reml_score`` is the converged REML criterion;
-        ``edf`` is a length-``F`` tensor of per-smooth EDFs.
-
-    Notes
-    -----
-    **Forward only.** ``.backward()`` through this path is currently
-    unsupported and will raise ``NotImplementedError`` if attempted. A
-    differentiable backward needs an analytic IFT through the F×F outer
-    Hessian of the REML criterion plus envelope-theorem VJPs of the
-    per-block penalty derivatives — that work is intentionally deferred
-    to a separate workstream. Tensors returned here are detached.
+        ``fitted`` is ``(N, 1)``; ``lambdas``/``log_lambdas`` are length-``F``
+        1D tensors of per-smooth λ and log-λ; ``reml_score`` is the
+        converged REML criterion (scalar); ``edf`` is length-``F``.
     """
     if len(design_blocks) != len(penalty_blocks):
         raise ValueError(
@@ -438,9 +579,6 @@ def gaussian_reml_fit_blocks(
         )
     if len(design_blocks) == 0:
         raise ValueError("gaussian_reml_fit_blocks requires at least one block")
-
-    designs_np = [to_numpy_f64(d) for d in design_blocks]
-    penalties_np = [to_numpy_f64(p) for p in penalty_blocks]
 
     if y.dim() == 1:
         y_mat = y.unsqueeze(1)
@@ -455,41 +593,36 @@ def gaussian_reml_fit_blocks(
     else:
         raise ValueError(f"y must be 1D or 2D; got shape {tuple(y.shape)}")
 
-    y_np = to_numpy_f64(y_mat)
-    weights_np = None if weights is None else to_numpy_f64(weights)
-    rhos_np = None if init_log_lambdas is None else to_numpy_f64(init_log_lambdas)
-
-    out = _np_api.gaussian_reml_fit_blocks_forward(
-        designs_np,
-        penalties_np,
-        y_np,
-        weights=weights_np,
-        init_rhos=rhos_np,
+    n_blocks = len(design_blocks)
+    apply = cast(
+        Callable[..., tuple[torch.Tensor, ...]],
+        _GaussianRemlFitBlocksFn.apply,
+    )
+    coefs_full, fitted_t, lambdas_t, log_lambdas_t, reml_t, edf_t = apply(
+        y_mat,
+        weights,
+        init_log_lambdas,
+        n_blocks,
+        *design_blocks,
+        *penalty_blocks,
     )
 
-    ref = design_blocks[0]
-    coefs_full = np.asarray(out["coefficients"], dtype=np.float64)  # (p_total, 1)
-    fitted = np.asarray(out["fitted"], dtype=np.float64)
-    lambdas = np.asarray(out["lambdas"], dtype=np.float64)
-    reml_score = float(out["reml_score"])
-    edf = np.asarray(out["edf"], dtype=np.float64)
-
+    # Split the flat coefficient tensor back per-block at the column
+    # offsets of the joint design. Slicing keeps autograd connected, so
+    # downstream losses on individual blocks still backprop through the
+    # multi-block Function.
     offsets: list[int] = [0]
     for d in design_blocks:
         offsets.append(offsets[-1] + int(d.shape[1]))
     per_block_coefs: list[torch.Tensor] = [
-        from_numpy_like(coefs_full[offsets[i]:offsets[i + 1], :], ref)
-        for i in range(len(design_blocks))
+        coefs_full[offsets[i]:offsets[i + 1], :] for i in range(n_blocks)
     ]
-    fitted_t = from_numpy_like(fitted, ref)
-    lam_t = from_numpy_like(lambdas, ref)
-    reml_t = from_numpy_like(np.asarray(reml_score, dtype=np.float64), ref)
-    edf_t = from_numpy_like(edf, ref)
 
     return AdditiveRemlOutput(
         coefficients=per_block_coefs,
         fitted=fitted_t,
-        lam=lam_t,
+        lambdas=lambdas_t,
+        log_lambdas=log_lambdas_t,
         reml_score=reml_t,
         edf=edf_t,
     )
@@ -640,28 +773,23 @@ def gaussian_reml_fit_additive(
 
     For ``F > 1`` blocks with a single-column response, this routes to the
     multi-block Rust REML path (see :func:`gaussian_reml_fit_blocks`) so
-    each smooth recovers its own ``λ_k`` from the outer optimisation; the
-    returned ``AdditiveRemlOutput.lam`` is a length-``F`` 1D tensor on
-    that path.
+    each smooth recovers its own ``λ_k`` from the outer optimisation. The
+    multi-block path is now fully differentiable: backward composes the
+    envelope-theorem VJPs and the IFT through the F×F outer Hessian by
+    central FD on the warm-started forward fit.
 
     Two cases use the closed-form block-diagonal kernel instead:
 
     * ``F == 1`` — the single-smooth case has no per-smooth-vs-shared λ
       distinction, so the closed-form kernel produces the exact same fit
-      as multi-block would with one block, with strictly less overhead
-      and full backward differentiability.
+      as multi-block would with one block, with strictly less overhead.
     * Multi-output response (``D > 1``) — the multi-block driver is
       single-response, so the per-smooth penalties are assembled into a
       block-diagonal joint penalty and a single scalar λ multiplies the
-      entire block-diagonal. ``AdditiveRemlOutput.lam`` is a scalar in
-      this case.
+      entire block-diagonal. ``AdditiveRemlOutput.lambdas`` is a length-1
+      tensor (lifted from the scalar) in this case.
 
-    .. note::
-       The multi-block path is forward-only. ``.backward()`` through any
-       of its outputs raises ``NotImplementedError`` because the analytic
-       VJP through the F×F outer Hessian is a separate workstream. The
-       closed-form paths (``F == 1`` and ``D > 1``) remain fully
-       differentiable.
+    Both paths return fully differentiable tensors.
 
     Parameters
     ----------
@@ -760,10 +888,17 @@ def gaussian_reml_fit_additive(
         fit.coefficients[offsets[i]:offsets[i + 1]] for i in range(len(designs))
     ]
 
+    # Lift the single-λ scalar back into a length-1 vector view so the
+    # AdditiveRemlOutput fields have consistent shapes across paths. We
+    # keep autograd connected by reshape (no detach).
+    lam_vec = fit.lam.reshape(-1) if fit.lam.dim() > 0 else fit.lam.unsqueeze(0)
+    log_lam_vec = torch.log(torch.clamp(lam_vec, min=1.0e-300))
+    edf_vec = fit.edf.reshape(-1) if fit.edf.dim() > 0 else fit.edf.unsqueeze(0)
     return AdditiveRemlOutput(
         coefficients=per_smooth_coefs,
         fitted=fit.fitted,
-        lam=fit.lam,
+        lambdas=lam_vec,
+        log_lambdas=log_lam_vec,
         reml_score=fit.reml_score,
-        edf=fit.edf,
+        edf=edf_vec,
     )
