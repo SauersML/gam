@@ -444,7 +444,7 @@ impl CusolverRuntime {
     fn syevd_inplace(&mut self, a: &mut Array2<f64>) -> Option<Array1<f64>> {
         let p = a.nrows();
         let p_i32 = to_i32(p)?;
-        let mut a_col = to_col_major(a);
+        let mut a_col = to_col_major(a).into_owned();
         let mut eigs = vec![0.0_f64; p];
         let bytes_a = bytes_len::<f64>(a_col.len())?;
         let bytes_eigs = bytes_len::<f64>(p)?;
@@ -531,8 +531,8 @@ impl CusolverRuntime {
         let nrhs = rhs.ncols();
         let p_i32 = to_i32(p)?;
         let nrhs_i32 = to_i32(nrhs)?;
-        let mut a_col = to_col_major(a);
-        let mut rhs_col = to_col_major(rhs);
+        let mut a_col = to_col_major(a).into_owned();
+        let mut rhs_col = to_col_major(rhs).into_owned();
         let bytes_a = bytes_len::<f64>(a_col.len())?;
         let bytes_rhs = bytes_len::<f64>(rhs_col.len())?;
         let bytes_info = bytes_len::<i32>(1)?;
@@ -635,7 +635,7 @@ impl CusolverRuntime {
     fn cholesky_lower_inplace(&mut self, a: &mut Array2<f64>) -> Option<()> {
         let p = a.nrows();
         let p_i32 = to_i32(p)?;
-        let mut a_col = to_col_major(a);
+        let mut a_col = to_col_major(a).into_owned();
         let bytes_a = bytes_len::<f64>(a_col.len())?;
         let bytes_info = bytes_len::<i32>(1)?;
 
@@ -730,7 +730,7 @@ impl CusolverRuntime {
 
         let mut packed: Vec<f64> = Vec::with_capacity(total_doubles);
         for matrix in matrices.iter() {
-            packed.extend(to_col_major(matrix));
+            packed.extend(to_col_major(matrix).iter().copied());
         }
         debug_assert_eq!(packed.len(), total_doubles);
 
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn col_major_round_trip_preserves_layout() {
         let a = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
-        let packed = to_col_major(&a);
+        let packed = to_col_major(&a).into_owned();
         assert_eq!(packed, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         let mut back = Array2::<f64>::zeros((2, 3));
         from_col_major_inplace(&packed, &mut back);
