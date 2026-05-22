@@ -6642,6 +6642,17 @@ impl HessianOperator for TangentProjectedHessianOperator {
         let zaz = self.z.t().dot(a).dot(&self.z);
         self.h_t_op.trace_logdet_gradient(&zaz)
     }
+    fn is_dense(&self) -> bool {
+        self.h_t_op.is_dense()
+    }
+    fn logdet_traces_match_hinv_kernel(&self) -> bool {
+        self.h_t_op.logdet_traces_match_hinv_kernel()
+    }
+    // Deliberately keep `as_dense_spectral` and `as_exact_dense_spectral`
+    // at default `None`: their consumers expect a p-space spectral basis,
+    // whereas the wrapped operator lives in m-dimensional tangent space.
+    // Surfacing the tangent operator there would silently let downstream
+    // code mix p- and m-dim eigenvectors.
 }
 
 /// Build `PenaltyLogdetDerivs` for `log|ZᵀS(λ)Z|_+`, its first
