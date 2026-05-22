@@ -6671,15 +6671,24 @@ pub fn reml_laml_evaluate(
         // The projected pseudo-inverse kills any spurious null-space
         // component of `r` before the inverse is applied, recovering
         // the honest correction.
-        let cost_correction = if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-            -0.5_f64 * kernel.bilinear_pseudo_inverse(r, r)
-        } else {
-            let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
-            rhs.column_mut(0).assign(r);
-            let w_mat = hop.solve_multi(&rhs);
-            let w: Array1<f64> = w_mat.column(0).to_owned();
-            -0.5_f64 * r.view().dot(&w)
-        };
+        let (cost_correction, branch) =
+            if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                (-0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
+            } else {
+                let mut rhs = Array2::<f64>::zeros((hop.dim(), 1));
+                rhs.column_mut(0).assign(r);
+                let w_mat = hop.solve_multi(&rhs);
+                let w: Array1<f64> = w_mat.column(0).to_owned();
+                let cost_correction = -0.5_f64 * r.view().dot(&w);
+                (cost_correction, "full_h")
+            };
+        let residual_energy = -cost_correction;
+        log::info!(
+            "[IFT-ENERGY] residual_energy={:.3e} cost_correction={:.3e} branch={}",
+            residual_energy,
+            cost_correction,
+            branch,
+        );
         if cost_correction.is_finite() {
             cost += cost_correction;
         }
@@ -7449,15 +7458,15 @@ pub fn reml_laml_evaluate(
     }
 
     // Run the envelope-gradient sanity check *before* the outer-Hessian
-    // assembly. When the inner-KKT IFT correction was not applied and the
-    // envelope formula predicts a √ε-step cost change > 4·|cost| (i.e. the
-    // gradient is mathematically inconsistent with the function), the
-    // analytic gradient will be marked unavailable below. The Hessian
-    // computed from the same ill-conditioned inner state would also be
-    // untrustworthy and would just be discarded by the outer optimizer —
-    // and for biobank-scale custom families the assembly can take 20+
-    // minutes per evaluation. Decide once here, then reuse the verdict
-    // for both the gradient and the Hessian outputs.
+    // assembly. The check is intentionally applied after all analytic
+    // correction terms have been folded into `grad`; if the final derivative
+    // still predicts a sqrt(eps)-step cost change > 4*|cost|, it is not a
+    // valid local derivative of this cost surface. The Hessian computed from
+    // the same ill-conditioned inner state would also be untrustworthy and
+    // would just be discarded by the outer optimizer, and for biobank-scale
+    // custom families the assembly can take 20+ minutes per evaluation.
+    // Decide once here, then reuse the verdict for both the gradient and
+    // Hessian outputs.
     let cost_scale = cost.abs().max(1.0);
     let resolve_step = f64::EPSILON.sqrt();
     let envelope_inconsistent = grad
@@ -7484,10 +7493,8 @@ pub fn reml_laml_evaluate(
     // and when `‖r_proj‖∞ ≈ 0` (the cert-exit contract) the correction
     // `-aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r ≡ 0` is identically zero
     // (see `compute_kkt_residual_rho_corrections`). Suppress
-    // unconditionally and let the outer optimizer fall back to FD or
-    // reject the seed.
+    // unconditionally so the outer optimizer never consumes that derivative.
     let envelope_suppresses_outputs = envelope_inconsistent.is_some();
-    let _ = kkt_residual_correction_active; // cost-side IFT identity logged earlier
     if envelope_inconsistent.is_some()
         && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
         && solution.kkt_residual.is_none()
@@ -7698,8 +7705,8 @@ pub fn reml_laml_evaluate(
     // computed on (the `kkt_rho_corrections.gradient` block was folded in
     // earlier in this function). If the predicted √ε-step cost change
     // still exceeds 4·|cost| after that fold, the gradient is invalid as
-    // a descent direction. Suppress and let the outer optimizer fall
-    // back to FD or reject the seed. Threshold ratio > 4 keeps healthy
+    // a descent direction. Suppress so the outer optimizer rejects the
+    // seed (analytic gradient unavailable). Threshold ratio > 4 keeps healthy
     // near-stationary gradients (|g|∞ ≈ √ε·|cost|, ratio ≈ 1) from
     // tripping.
     let gradient_out = match envelope_inconsistent {
@@ -7727,13 +7734,13 @@ pub fn reml_laml_evaluate(
                  `Fixed` for the LAML IFT identity to hold), penalty_subspace_trace.is_some()={} \
                  (when true the cost IFT uses bilinear_pseudo_inverse on range(S₊); when false \
                  the full H⁻¹·r solve is the only path and is unsafe on near-singular H). \
-                 If kkt_residual.is_some()=false the convergent inner path forgot to populate \
-                 `BlockwiseInnerResult::kkt_residual` (call \
-                 `exact_newton_joint_kkt_residual_for_ift(..., Some(active_sets))` on return). \
-                 If kkt_residual.is_some()=true but the warning still fires, the dispersion or \
-                 length gate above tripped — the convergent path emitted a residual but the \
-                 evaluator refused it; check the length-mismatch hard error earlier in this \
-                 function or the dispersion variant printed here.",
+                 If kkt_residual.is_some()=false under fixed dispersion, the convergent inner \
+                 path forgot to populate `BlockwiseInnerResult::kkt_residual` (call \
+                 `exact_newton_joint_kkt_residual_for_ift(..., Some(active_sets))` on return) \
+                 and this evaluation is a contract error. If kkt_residual.is_some()=true and \
+                 the warning still fires, the projected-residual correction was insufficient: \
+                 the post-correction gradient is still inconsistent and must not be handed to \
+                 the outer optimizer.",
                 max_abs,
                 max_idx,
                 predicted_change,
@@ -16356,10 +16363,10 @@ mod tests {
     //   contract gives ZERO cancellation of the inflated envelope trace.
     //
     // BUG-2 (gate, envelope_inconsistent @ ~unified.rs:7466):
-    //   `kkt_residual_was_applied = kkt_residual_correction_active` only
-    //   checks `Some(..) && Fixed`, NOT whether the correction magnitude is
-    //   nonzero. So at the cert's r_proj=0 contract the tripwire goes to
-    //   the "applied" arm and passes an inflated meaningless gradient on.
+    //   The old gate treated `Some(..) && Fixed` as proof that the inflated
+    //   gradient was repaired, even when the correction magnitude was zero.
+    //   At the cert's r_proj=0 contract that routed an inflated meaningless
+    //   gradient through the "applied" arm.
     //
     // BUG-3 (math, envelope ½ tr(H⁻¹·∂H/∂ρ) at near-singular H):
     //   Without penalty_subspace_trace, the trace uses full H⁻¹ which
@@ -16412,12 +16419,10 @@ mod tests {
         }
     }
 
-    /// BUG-2 (hard failing): cert exit with r_proj = 0 passes an inflated
-    /// `|g|∞ = 1e20` gradient through the envelope tripwire because the gate
-    /// only checks `kkt_residual.is_some()`, not whether the correction is
-    /// nonzero. Contract under test: either suppress (gradient=None) OR
-    /// produce a numerically honest gradient (|g|∞·√ε ≤ 4·|cost|). Current
-    /// code does NEITHER and this assertion FAILS — pinpointing the gate bug.
+    /// BUG-2 regression: cert exit with r_proj = 0 must not pass an inflated
+    /// `|g|∞ = 1e20` gradient through the envelope tripwire. Contract under
+    /// test: either suppress (gradient=None) or produce a numerically honest
+    /// gradient (|g|∞·√ε ≤ 4·|cost|).
     #[test]
     fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate() {
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
@@ -16477,15 +16482,12 @@ mod tests {
         let ratio = predicted_change / cost_scale;
         assert!(
             result.gradient.is_none() || (ratio <= 4.0 && max_abs.is_finite()),
-            "BUG-2 PINPOINTED: cert exit with r_proj = 0 passed an inflated gradient \
+            "BUG-2 REGRESSION: cert exit with r_proj = 0 passed an inflated gradient \
              through the tripwire. |grad|∞ = {:.3e}, predicted Δcost along √ε step = \
              {:.3e}, cost = {:.3e}, ratio = {:.3e} (must be ≤ 4 OR gradient = None). \
-             The `kkt_residual_was_applied` gate at unified.rs:~7466 sets itself from \
-             `kkt_residual_correction_active` (which only checks Some(..) && Fixed), \
-             NOT from the magnitude of `corrections.gradient`. At r_proj = 0 the \
-             correction is identically zero (see BUG-1 test) but the gate still routes \
-             to the 'applied' arm of the match at unified.rs:~7720, passing the inflated \
-             envelope through. The outer optimizer then sees |g| ≈ 1e20 and rejects.",
+             At r_proj = 0 the projected-residual correction is identically zero \
+             (see BUG-1 test), so the inflated envelope gradient must remain \
+             unavailable to the outer optimizer.",
             max_abs,
             predicted_change,
             cost_scale,
