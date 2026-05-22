@@ -101,7 +101,7 @@ impl From<String> for SampleError {
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, SampleError> {
-    model.saved_baseline_time_wiggle().map_err(String::from).map_err(SampleError::from).map(|runtime| {
+    model.saved_baseline_time_wiggle().map_err(|e| SampleError::from(String::from(e))).map(|runtime| {
         runtime.map(|saved| LinkWiggleFormulaSpec {
             degree: saved.degree,
             num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
@@ -288,32 +288,34 @@ pub fn laplace_gaussian_fallback(
     model: &SavedModel,
     cfg: &NutsConfig,
     rationale: &'static str,
-) -> Result<NutsResult, String> {
+) -> Result<NutsResult, SampleError> {
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let mode = fit.beta.clone();
     let p = mode.len();
     if p == 0 {
-        return Err(format!(
-            "{rationale}: cannot sample from an empty coefficient vector"
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!("{rationale}: cannot sample from an empty coefficient vector"),
+        });
     }
-    let h = fit.penalized_hessian().ok_or_else(|| {
-        format!(
+    let h = fit.penalized_hessian().ok_or_else(|| SampleError::SamplerSetupFailed {
+        reason: format!(
             "{rationale}: posterior fallback requires the explicit penalised Hessian; \
              refit with exact geometry export to enable posterior sampling for this class."
-        )
+        ),
     })?;
     if h.nrows() != p || h.ncols() != p {
-        return Err(format!(
-            "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
-            h.nrows(),
-            h.ncols(),
-            p,
-            p
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
+                h.nrows(),
+                h.ncols(),
+                p,
+                p
+            ),
+        });
     }
-    let chol = h.cholesky(Side::Lower).map_err(|err| {
-        format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}")
+    let chol = h.cholesky(Side::Lower).map_err(|err| SampleError::SamplerSetupFailed {
+        reason: format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"),
     })?;
     let l = chol.lower_triangular();
 
@@ -383,7 +385,7 @@ fn sample_standard(
     training_headers: Option<&Vec<String>>,
     family: LikelihoodFamily,
     cfg: &NutsConfig,
-) -> Result<NutsResult, String> {
+) -> Result<NutsResult, SampleError> {
     if model.has_link_wiggle() {
         return sample_standard_link_wiggle(model, data, col_map, training_headers, family, cfg);
     }
@@ -454,7 +456,7 @@ fn sample_standard(
         }),
         cfg,
     )
-    .map_err(|e| format!("NUTS sampling failed: {e}"))
+    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("NUTS sampling failed: {e}") })
 }
 
 fn sample_standard_link_wiggle(
@@ -464,7 +466,7 @@ fn sample_standard_link_wiggle(
     training_headers: Option<&Vec<String>>,
     family: LikelihoodFamily,
     cfg: &NutsConfig,
-) -> Result<NutsResult, String> {
+) -> Result<NutsResult, SampleError> {
     let parsed = parse_formula(&model.formula)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
@@ -500,20 +502,24 @@ fn sample_standard_link_wiggle(
     let p_total = mode_beta.len() + p_wiggle;
 
     if mode_beta.len() != p_main {
-        return Err(format!(
-            "link-wiggle sample: saved mean block has {} coefficients but rebuilt design has {} columns",
-            mode_beta.len(),
-            p_main,
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "link-wiggle sample: saved mean block has {} coefficients but rebuilt design has {} columns",
+                mode_beta.len(),
+                p_main,
+            ),
+        });
     }
     if fit.beta.len() != p_total {
-        return Err(format!(
-            "link-wiggle sample: saved beta has {} coefficients but design has {} main + {} wiggle = {} total",
-            fit.beta.len(),
-            p_main,
-            p_wiggle,
-            p_total,
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "link-wiggle sample: saved beta has {} coefficients but design has {} main + {} wiggle = {} total",
+                fit.beta.len(),
+                p_main,
+                p_wiggle,
+                p_total,
+            ),
+        });
     }
 
     let hessian = &fit
@@ -533,11 +539,13 @@ fn sample_standard_link_wiggle(
         .lambdas
         .view();
     if base_lambdas.len() != n_base_penalties {
-        return Err(format!(
-            "link-wiggle sample: mean block has {} lambdas but rebuilt design has {} base penalties",
-            base_lambdas.len(),
-            n_base_penalties,
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "link-wiggle sample: mean block has {} lambdas but rebuilt design has {} base penalties",
+                base_lambdas.len(),
+                n_base_penalties,
+            ),
+        });
     }
 
     let penalty_base =
@@ -593,10 +601,12 @@ fn sample_standard_link_wiggle(
         LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
         LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
         _ => {
-            return Err(format!(
-                "NUTS sampling with link wiggle is not supported for family {}",
-                family.pretty_name()
-            ));
+            return Err(SampleError::UnsupportedFamily {
+                reason: format!(
+                    "NUTS sampling with link wiggle is not supported for family {}",
+                    family.pretty_name()
+                ),
+            });
         }
     };
 
@@ -618,7 +628,7 @@ fn sample_standard_link_wiggle(
         scale,
         cfg,
     )
-    .map_err(|e| format!("link-wiggle NUTS sampling failed: {e}"))
+    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("link-wiggle NUTS sampling failed: {e}") })
 }
 
 fn sample_survival(
@@ -627,7 +637,7 @@ fn sample_survival(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
-) -> Result<NutsResult, String> {
+) -> Result<NutsResult, SampleError> {
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if matches!(
         saved_likelihood_mode,
@@ -868,12 +878,17 @@ fn sample_survival(
     {
         "net" => SurvivalSpec::Net,
         "crude" => {
-            return Err(
-                "saved survival spec 'crude' is not supported by the one-hazard survival engine; refit or export a net survival model for this path"
-                    .to_string(),
-            );
+            return Err(SampleError::UnsupportedFamily {
+                reason:
+                    "saved survival spec 'crude' is not supported by the one-hazard survival engine; refit or export a net survival model for this path"
+                        .to_string(),
+            });
         }
-        other => return Err(format!("unsupported saved survival spec '{other}'")),
+        other => {
+            return Err(SampleError::UnsupportedFamily {
+                reason: format!("unsupported saved survival spec '{other}'"),
+            });
+        }
     };
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
     let mut model_surv = royston_parmar::working_model_from_flattened(
@@ -930,5 +945,5 @@ fn sample_survival(
         hessian.view(),
         cfg,
     )
-    .map_err(|e| format!("survival NUTS sampling failed: {e}"))
+    .map_err(|e| SampleError::SamplerSetupFailed { reason: format!("survival NUTS sampling failed: {e}") })
 }
