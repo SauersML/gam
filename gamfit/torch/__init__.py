@@ -11,8 +11,9 @@ Layout:
   variant :func:`gaussian_reml_fit_batched`, the multi-smooth additive
   wrapper :func:`gaussian_reml_fit_additive`, and the multi-block
   per-smooth-λ entrypoint :func:`gaussian_reml_fit_blocks`. The
-  closed-form paths have analytic forward and backward through Rust;
-  the multi-block per-smooth-λ path is forward-only.
+  closed-form paths have analytic forward and backward through Rust; the
+  multi-block per-smooth-λ path also exposes backward VJPs through the Rust
+  bridge for designs, penalties, response, and optional row weights.
 - Basis evaluations — :func:`bspline_basis` and :func:`duchon_basis`. The
   B-spline backward routes through the Rust derivative primitive (chain
   rule applied at the boundary); the Duchon basis (any dimensionality)

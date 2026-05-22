@@ -393,7 +393,8 @@ class _GaussianRemlFitBlocksFn(torch.autograd.Function):
     full VJP through the converged outer-loop optimum (envelope theorem +
     IFT through the F×F outer Hessian) so every returned tensor —
     coefficients, fitted values, λ, log-λ, REML score, EDF — is
-    differentiable back to the design blocks, penalty blocks, and y.
+    differentiable back to the design blocks, penalty blocks, y, and
+    optional row weights.
     """
 
     @staticmethod
@@ -512,14 +513,18 @@ class _GaussianRemlFitBlocksFn(torch.autograd.Function):
             for g in result["grad_penalties"]
         ]
         grad_y = from_numpy_like(np.asarray(result["grad_y"], dtype=np.float64), ref)
+        grad_weights = (
+            from_numpy_like(np.asarray(result["grad_weights"], dtype=np.float64), ref)
+            if ctx.has_weights
+            else None
+        )
 
         # Match positional order of forward(...):
         #   y, weights, init_log_lambdas, n_blocks, *designs, *penalties
-        # weights / init_log_lambdas / n_blocks are not differentiable through
-        # this Function.
+        # init_log_lambdas / n_blocks are not differentiable through this Function.
         return (
             grad_y,
-            None,
+            grad_weights,
             None,
             None,
             *grad_designs,
