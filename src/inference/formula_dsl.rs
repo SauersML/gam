@@ -118,6 +118,17 @@ impl From<FormulaDslError> for String {
     }
 }
 
+/// Inbound conversion from `String` is used by `?` cascades inside `parse_formula`
+/// and friends so that internal parser helpers still returning `Result<_, String>`
+/// can flow through without each call site needing an explicit `.map_err(...)`.
+/// We route into `ParseError` because by construction every internal helper that
+/// still produces a raw `String` is itself a parse/term-resolution stage.
+impl From<String> for FormulaDslError {
+    fn from(reason: String) -> Self {
+        FormulaDslError::ParseError { reason }
+    }
+}
+
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
     validate_balanced_delimiters(formula, "invalid formula syntax")?;
     let mut parsed = FormulaParser::parse(Rule::formula, formula).map_err(|e| {
@@ -2064,7 +2075,7 @@ pub fn parse_link_choice(
     }))
 }
 
-pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
+pub fn parse_linkname(v: &str) -> Result<LinkFunction, FormulaDslError> {
     match v.trim() {
         "identity" => Ok(LinkFunction::Identity),
         "log" => Ok(LinkFunction::Log),
@@ -2079,8 +2090,7 @@ pub fn parse_linkname(v: &str) -> Result<LinkFunction, String> {
                  use one of identity|log|logit|probit|cloglog|binomial-logit|binomial-probit|binomial-cloglog|sas|beta-logistic|blended(...)/mixture(...) or flexible(...). \
                  Both `--link <type>` (CLI flag) and `link(type=<type>)` (formula term) accept the same set."
             ),
-        }
-        .into()),
+        }),
     }
 }
 
