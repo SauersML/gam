@@ -1442,14 +1442,15 @@ pub fn validate_auxiliary_formula_controls(
     Ok(())
 }
 
-pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
-    let parsed_dsl = parse_formula_dsl(formula)?;
+pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
+    let parsed_dsl = parse_formula_dsl(formula).map_err(|reason| FormulaDslError::ParseError {
+        reason,
+    })?;
     let lhs = parsed_dsl.response_expr.trim();
     if lhs.is_empty() {
         return Err(FormulaDslError::ParseError {
             reason: "formula response (left-hand side) cannot be empty".to_string(),
-        }
-        .into());
+        });
     }
     let mut terms = Vec::<ParsedTerm>::new();
     let mut linkwiggle: Option<LinkWiggleFormulaSpec> = None;
