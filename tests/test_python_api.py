@@ -1309,11 +1309,12 @@ def test_partial_dependence_and_variance_share() -> None:
 def test_gaussian_reml_fit_blocks_torch_backward_finite_gradients() -> None:
     """Multi-block per-smooth-λ REML torch surface produces finite gradients.
 
-    Builds two random design blocks with ``requires_grad=True`` and a random
-    response, runs the autograd forward through
+    Builds two random design blocks plus row weights with ``requires_grad=True``
+    and a random response, runs the autograd forward through
     :class:`gamfit.torch._reml._GaussianRemlFitBlocksFn`, computes a squared
     error on ``fitted``, calls ``.backward()``, and verifies the gradients
-    propagated to the design blocks and ``y`` are finite and not all zero.
+    propagated to the design blocks, ``y``, and weights are finite and not all
+    zero.
     """
     torch = pytest.importorskip("torch")
     from gamfit.torch import _reml as torch_reml
@@ -1326,8 +1327,9 @@ def test_gaussian_reml_fit_blocks_torch_backward_finite_gradients() -> None:
     s1 = torch.tensor(np.eye(p_per), dtype=torch.float64)
     s2 = torch.tensor(np.eye(p_per), dtype=torch.float64)
     y = torch.tensor(rng.standard_normal((n, 1)), dtype=torch.float64, requires_grad=True)
+    weights = torch.tensor(rng.uniform(0.5, 1.5, n), dtype=torch.float64, requires_grad=True)
 
-    out = torch_reml.gaussian_reml_fit_blocks([x1, x2], [s1, s2], y)
+    out = torch_reml.gaussian_reml_fit_blocks([x1, x2], [s1, s2], y, weights=weights)
     assert out.lambdas.shape == (2,)
     assert out.log_lambdas.shape == (2,)
     assert out.fitted.shape == (n, 1)
@@ -1341,11 +1343,13 @@ def test_gaussian_reml_fit_blocks_torch_backward_finite_gradients() -> None:
     assert x1.grad is not None and torch.isfinite(x1.grad).all()
     assert x2.grad is not None and torch.isfinite(x2.grad).all()
     assert y.grad is not None and torch.isfinite(y.grad).all()
+    assert weights.grad is not None and torch.isfinite(weights.grad).all()
     # Some entries must be nonzero — perturbing a random design or response
     # always shifts the fit.
     assert float(x1.grad.abs().sum()) > 0.0
     assert float(x2.grad.abs().sum()) > 0.0
     assert float(y.grad.abs().sum()) > 0.0
+    assert float(weights.grad.abs().sum()) > 0.0
 
 
 def test_gaussian_reml_fit_blocks_torch_roundtrip_lambdas_converge() -> None:

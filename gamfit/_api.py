@@ -2131,20 +2131,13 @@ def gaussian_reml_fit_blocks_backward(
     grad_log_lambdas: Any | None = None,
     grad_reml_score: float = 0.0,
     grad_edf: Any | None = None,
-    fd_step: float = 1.0e-5,
 ) -> dict[str, Any]:
     """Analytic backward for the multi-block per-smooth-λ Gaussian REML fit.
 
     Computes VJPs of ``(coefficients, fitted, lambdas, log_lambdas,
-    reml_score, edf)`` back to ``(designs, penalties, y)``. The Rust kernel
-    applies central finite differences to the forward fit warm-started at
-    the converged log-λ\\*: each perturbed fit re-converges to the new
-    outer optimum, implicitly composing both the direct
-    ``∂(output)/∂p|_ρ*`` term and the indirect
-    ``∂(output)/∂ρ · ∂ρ*/∂p`` term through the F×F outer Hessian
-    ``H_joint(ρ*)``. The outer Hessian is never explicitly assembled — its
-    inverse is applied implicitly by the warm-started outer Newton loop
-    snapping to the new optimum after each perturbation.
+    reml_score, edf)`` back to ``(designs, penalties, y, weights)`` using
+    the closed-form Gaussian/identity block REML VJP at the converged
+    log-λ vector.
     """
     import numpy as np
 
@@ -2190,7 +2183,6 @@ def gaussian_reml_fit_blocks_backward(
             glog,
             float(grad_reml_score),
             ge,
-            float(fd_step),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -2205,6 +2197,8 @@ def gaussian_reml_fit_blocks_backward(
         ]
     if "grad_y" in result:
         result["grad_y"] = np.asarray(result["grad_y"], dtype=float)
+    if "grad_weights" in result:
+        result["grad_weights"] = np.asarray(result["grad_weights"], dtype=float)
     return result
 
 
