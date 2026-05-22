@@ -1435,7 +1435,7 @@ impl Clone for OuterEval {
             cost: self.cost,
             gradient: self.gradient.clone(),
             hessian: self.hessian.clone(),
-            inner_beta_hint: None,
+            inner_beta_hint: self.inner_beta_hint.clone(),
         }
     }
 }

@@ -3254,7 +3254,7 @@ where
                     cost,
                     gradient: grad,
                     hessian: HessianResult::Analytic(hessian),
-                    inner_beta_hint: None,
+                    inner_beta_hint: state.current_original_basis_beta(),
                 })
             },
             Some(|state: &mut &mut self::reml::RemlState<'_>| {
