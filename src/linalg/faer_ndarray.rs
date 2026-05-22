@@ -628,64 +628,70 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     // vectorization and cache locality on the per-PIRLS-iter Hessian
     // assembly. faer's matmul handles either layout via FaerArrayView.
     let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
-    let mut out_view = array2_to_matmut(&mut result);
 
     let x_is_row_major = x.is_standard_layout();
     let w_slice_opt = w.as_slice();
 
-    for start in (0..n).step_by(chunk_rows) {
-        let rows = (n - start).min(chunk_rows);
-        {
-            let chunk_slice = wx_chunk
-                .as_slice_mut()
-                .expect("row-major chunk is contiguous");
-            if x_is_row_major && let (Some(x_all), Some(w_all)) = (x.as_slice(), w_slice_opt) {
-                for local in 0..rows {
-                    let src = start + local;
-                    let wi = w_all[src];
-                    let src_off = src * p;
-                    let dst_off = local * p;
-                    let src_row = &x_all[src_off..src_off + p];
-                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                    for col in 0..p {
-                        dst_row[col] = src_row[col] * wi;
+    // Scope the faer mutable view so its borrow on `result` ends before the
+    // symmetric mirror step. A previous `drop(out_view)` tried to terminate
+    // the borrow explicitly, but `Mat<Mut<'_, f64>>` does not implement
+    // `Drop` (clippy::drop_non_drop, denied as suspicious) — the call did
+    // nothing the borrow checker wasn't already doing under NLL.
+    {
+        let mut out_view = array2_to_matmut(&mut result);
+        for start in (0..n).step_by(chunk_rows) {
+            let rows = (n - start).min(chunk_rows);
+            {
+                let chunk_slice = wx_chunk
+                    .as_slice_mut()
+                    .expect("row-major chunk is contiguous");
+                if x_is_row_major && let (Some(x_all), Some(w_all)) = (x.as_slice(), w_slice_opt) {
+                    for local in 0..rows {
+                        let src = start + local;
+                        let wi = w_all[src];
+                        let src_off = src * p;
+                        let dst_off = local * p;
+                        let src_row = &x_all[src_off..src_off + p];
+                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                        for col in 0..p {
+                            dst_row[col] = src_row[col] * wi;
+                        }
                     }
-                }
-            } else {
-                let x_slice = x.slice(s![start..start + rows, ..]);
-                for local in 0..rows {
-                    let wi = w[start + local];
-                    let xrow = x_slice.row(local);
-                    let dst_off = local * p;
-                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                    for (col, xij) in xrow.iter().enumerate() {
-                        dst_row[col] = xij * wi;
+                } else {
+                    let x_slice = x.slice(s![start..start + rows, ..]);
+                    for local in 0..rows {
+                        let wi = w[start + local];
+                        let xrow = x_slice.row(local);
+                        let dst_off = local * p;
+                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                        for (col, xij) in xrow.iter().enumerate() {
+                            dst_row[col] = xij * wi;
+                        }
                     }
                 }
             }
+            let x_slice = x.slice(s![start..start + rows, ..]);
+            let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+            let x_view = FaerArrayView::new(&x_slice);
+            let wx_view = FaerArrayView::new(&wx_slice);
+            // X^T diag(W) X is symmetric; accumulate the lower triangle only, then
+            // mirror once after the chunk loop. ~50% fewer FLOPs vs. full GEMM.
+            tri_matmul(
+                out_view.as_mut(),
+                BlockStructure::TriangularLower,
+                Accum::Add,
+                x_view.as_ref().transpose(),
+                BlockStructure::Rectangular,
+                wx_view.as_ref(),
+                BlockStructure::Rectangular,
+                1.0,
+                par,
+            );
         }
-        let x_slice = x.slice(s![start..start + rows, ..]);
-        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
-        let x_view = FaerArrayView::new(&x_slice);
-        let wx_view = FaerArrayView::new(&wx_slice);
-        // X^T diag(W) X is symmetric; accumulate the lower triangle only, then
-        // mirror once after the chunk loop. ~50% fewer FLOPs vs. full GEMM.
-        tri_matmul(
-            out_view.as_mut(),
-            BlockStructure::TriangularLower,
-            Accum::Add,
-            x_view.as_ref().transpose(),
-            BlockStructure::Rectangular,
-            wx_view.as_ref(),
-            BlockStructure::Rectangular,
-            1.0,
-            par,
-        );
     }
 
     // Mirror the accumulated lower triangle into the upper triangle so callers
     // see the full symmetric matrix.
-    drop(out_view);
     mirror_lower_to_upper(&mut result);
     result
 }
