@@ -2,6 +2,7 @@ use crate::probability::normal_cdf;
 use crate::resource::{ByteLruCache, ResidentBytes};
 use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Typed errors raised by the de-nested cubic transport kernel.
@@ -1242,19 +1243,23 @@ impl Hash for CellFingerprint {
 pub struct CachedCellMoments {
     /// Regular (value) cell moments, populated by
     /// `evaluate_cell_moments_cached`. None when only derivative moments
-    /// have been cached for this cell.
-    state: Option<CellMomentState>,
+    /// have been cached for this cell. Wrapped in `Arc` so `ByteLruCache`
+    /// returns lookups through cheap refcount bumps instead of deep-cloning
+    /// the inline `SmallVec<[f64; 10]>` (which spills on every degree-`>= 10`
+    /// request) on every hot-path LRU hit.
+    state: Option<Arc<CellMomentState>>,
     /// Derivative moments, populated by
     /// `evaluate_cell_derivative_moments_cached`. None when only value
     /// moments have been cached for this cell. Both variants share the
     /// same `CellFingerprint` key so derivative-only callers do not evict
-    /// pre-cached value entries and vice versa.
-    derivative_state: Option<CellDerivativeMomentState>,
+    /// pre-cached value entries and vice versa. Same `Arc` wrapping rationale
+    /// as `state` above.
+    derivative_state: Option<Arc<CellDerivativeMomentState>>,
 }
 
 impl CachedCellMoments {
     #[inline]
-    pub fn new(state: CellMomentState) -> Self {
+    pub fn new(state: Arc<CellMomentState>) -> Self {
         Self {
             state: Some(state),
             derivative_state: None,
@@ -1262,7 +1267,7 @@ impl CachedCellMoments {
     }
 
     #[inline]
-    pub fn new_derivative(state: CellDerivativeMomentState) -> Self {
+    pub fn new_derivative(state: Arc<CellDerivativeMomentState>) -> Self {
         Self {
             state: None,
             derivative_state: Some(state),
@@ -1275,7 +1280,11 @@ impl CachedCellMoments {
         if state.moments.len().saturating_sub(1) < max_degree {
             return None;
         }
-        let mut state = state.clone();
+        // Cached `Arc<CellMomentState>` is shared across LRU hits, so we
+        // cannot reuse the inner vector in place. Clone the underlying state
+        // and (rarely) truncate down to the requested degree to honour the
+        // public moment-length contract.
+        let mut state = (**state).clone();
         state.moments.truncate(max_degree + 1);
         Some(state)
     }
@@ -1289,19 +1298,20 @@ impl CachedCellMoments {
         if state.moments.len().saturating_sub(1) < max_degree {
             return None;
         }
-        let mut state = state.clone();
+        // See `state_for_degree`: shared `Arc` forces an inner clone here.
+        let mut state = (**state).clone();
         state.moments.truncate(max_degree + 1);
         Some(state)
     }
 
     #[inline]
-    pub fn with_value(mut self, state: CellMomentState) -> Self {
+    pub fn with_value(mut self, state: Arc<CellMomentState>) -> Self {
         self.state = Some(state);
         self
     }
 
     #[inline]
-    pub fn with_derivative(mut self, state: CellDerivativeMomentState) -> Self {
+    pub fn with_derivative(mut self, state: Arc<CellDerivativeMomentState>) -> Self {
         self.derivative_state = Some(state);
         self
     }
@@ -1313,6 +1323,7 @@ impl ResidentBytes for CachedCellMoments {
             .state
             .as_ref()
             .map(|s| {
+                let s = s.as_ref();
                 if s.moments.spilled() {
                     s.moments
                         .capacity()
@@ -1326,6 +1337,7 @@ impl ResidentBytes for CachedCellMoments {
             .derivative_state
             .as_ref()
             .map(|s| {
+                let s = s.as_ref();
                 if s.moments.spilled() {
                     s.moments
                         .capacity()
@@ -3324,6 +3336,9 @@ pub fn evaluate_cell_moments_cached(
                 }
                 return Ok(state);
             }
+            // `cached.derivative_state` is `Option<Arc<_>>`; `.clone()` here
+            // is the cheap refcount bump the audit-39 fix targets, not a
+            // full moment-vector deep clone.
             cached.derivative_state.clone()
         }
         None => None,
@@ -3332,12 +3347,17 @@ pub fn evaluate_cell_moments_cached(
         stats.misses.fetch_add(1, Ordering::Relaxed);
     }
     let state = evaluate_cell_moments(cell, max_degree)?;
-    let mut entry = CachedCellMoments::new(state.clone());
+    // Wrap the freshly-computed state in `Arc` once, share it with the cache
+    // through `Arc::clone`, and return the underlying value by unwrapping the
+    // unique-reference (caller-side) `Arc`. This replaces the prior
+    // `state.clone()` deep copy at the insert site.
+    let shared = Arc::new(state);
+    let mut entry = CachedCellMoments::new(Arc::clone(&shared));
     if let Some(derivative) = existing_derivative {
         entry = entry.with_derivative(derivative);
     }
     cache.insert(key, entry);
-    Ok(state)
+    Ok(Arc::try_unwrap(shared).unwrap_or_else(|a| (*a).clone()))
 }
 
 /// Derivative-moment counterpart to [`evaluate_cell_moments_cached`]. Shares
