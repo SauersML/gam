@@ -1554,6 +1554,16 @@ pub(crate) struct BernoulliMarginalLinkMap {
     pub q2: f64,
     pub q3: f64,
     pub q4: f64,
+    /// Precomputed `q1 * q1`. Used in higher-derivative builders so the
+    /// q1² factor is shared with the q1^3 / q1^4 powers below.
+    pub q1_sq: f64,
+    /// Precomputed `q1^3`. Used by `q3`, `f_etaetaeta` in
+    /// `rigid_transformed_third_full`, and `f_eta3g` in
+    /// `rigid_transformed_fourth_full`.
+    pub q1_cu: f64,
+    /// Precomputed `q1^4`. Used by `q4` and `f_eta4` in
+    /// `rigid_transformed_fourth_full`.
+    pub q1_q: f64,
 }
 
 #[inline]
@@ -1597,6 +1607,9 @@ pub(crate) fn bernoulli_marginal_link_map(
             q2: 0.0,
             q3: 0.0,
             q4: 0.0,
+            q1_sq: 0.0,
+            q1_cu: 0.0,
+            q1_q: 0.0,
         });
     }
     let phi_eta = normal_pdf(eta);
@@ -1614,11 +1627,16 @@ pub(crate) fn bernoulli_marginal_link_map(
     let mu3 = (eta * eta - 1.0) * phi_eta;
     let mu4 = -(eta.powi(3) - 3.0 * eta) * phi_eta;
     let q1 = mu1 / phi_q;
-    let q2 = mu2 / phi_q + q * q1 * q1;
-    let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1.powi(3);
-    let q4 =
-        mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1.powi(4) + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
-            - 6.0 * (q * q - 1.0) * q1 * q1 * q2;
+    let q1_sq = q1 * q1;
+    let q1_cu = q1_sq * q1;
+    let q1_q = q1_sq * q1_sq;
+    let q2 = mu2 / phi_q + q * q1_sq;
+    let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1_cu;
+    let q4 = mu4 / phi_q
+        + (q.powi(3) - 3.0 * q) * q1_q
+        + 4.0 * q * q1 * q3
+        + 3.0 * q * q2 * q2
+        - 6.0 * (q * q - 1.0) * q1_sq * q2;
     Ok(BernoulliMarginalLinkMap {
         mu,
         mu1,
@@ -1630,6 +1648,9 @@ pub(crate) fn bernoulli_marginal_link_map(
         q2,
         q3,
         q4,
+        q1_sq,
+        q1_cu,
+        q1_q,
     })
 }
 
@@ -3989,10 +4010,10 @@ fn rigid_transformed_third_full(
     let h_q = kernel.primary_hessian(marginal.q);
     let grad_q = kernel.u1 * kernel.eta_q;
     let (f_qqq, f_qqg, f_qgg, f_ggg) = rigid_internal_third_components(marginal, kernel);
-    let f_etaetaeta = f_qqq * marginal.q1.powi(3)
+    let f_etaetaeta = f_qqq * marginal.q1_cu
         + 3.0 * h_q[0][0] * marginal.q1 * marginal.q2
         + grad_q * marginal.q3;
-    let f_etaetag = f_qqg * marginal.q1 * marginal.q1 + h_q[0][1] * marginal.q2;
+    let f_etaetag = f_qqg * marginal.q1_sq + h_q[0][1] * marginal.q2;
     let f_etagg = f_qgg * marginal.q1;
     third_full_from_symmetric_components(f_etaetaeta, f_etaetag, f_etagg, f_ggg)
 }
@@ -4062,15 +4083,15 @@ fn rigid_transformed_fourth_full(
     let f_qqgg = qq[1][1];
     let f_qggg = qg[1][1];
     let f_gggg = gg[1][1];
-    let f_eta4 = f_qqqq * marginal.q1.powi(4)
-        + 6.0 * f_qqq * marginal.q1 * marginal.q1 * marginal.q2
+    let f_eta4 = f_qqqq * marginal.q1_q
+        + 6.0 * f_qqq * marginal.q1_sq * marginal.q2
         + 3.0 * h_q[0][0] * marginal.q2 * marginal.q2
         + 4.0 * h_q[0][0] * marginal.q1 * marginal.q3
         + grad_q * marginal.q4;
-    let f_eta3g = f_qqqg * marginal.q1.powi(3)
+    let f_eta3g = f_qqqg * marginal.q1_cu
         + 3.0 * f_qqg * marginal.q1 * marginal.q2
         + h_q[0][1] * marginal.q3;
-    let f_eta2g2 = f_qqgg * marginal.q1 * marginal.q1 + f_qgg * marginal.q2;
+    let f_eta2g2 = f_qqgg * marginal.q1_sq + f_qgg * marginal.q2;
     let f_etag3 = f_qggg * marginal.q1;
     fourth_full_from_symmetric_components(f_eta4, f_eta3g, f_eta2g2, f_etag3, f_gggg)
 }
@@ -14615,11 +14636,7 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
-                        if w != 1.0 {
-                            t_arr.mapv_inplace(|v| v * w);
-                        }
-                        acc.add_pullback(self, row, slices, primary, &t_arr);
+                        acc.add_pullback_rigid_2x2(self, row, &t, w);
                         Ok(acc)
                     },
                 )
@@ -14710,11 +14727,7 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
-                        if w != 1.0 {
-                            t_arr.mapv_inplace(|v| v * w);
-                        }
-                        acc.add_pullback(self, row, slices, primary, &t_arr);
+                        acc.add_pullback_rigid_2x2(self, row, &t, w);
                         Ok(acc)
                     },
                 )
@@ -14883,11 +14896,7 @@ impl BernoulliMarginalSlopeFamily {
                             dq,
                             dg,
                         )?;
-                        let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
-                        if w != 1.0 {
-                            t_arr.mapv_inplace(|v| v * w);
-                        }
-                        accs[idx].add_pullback(self, row, slices, primary, &t_arr);
+                        accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                     }
                     bump_progress(&progress);
                 }
@@ -14917,11 +14926,7 @@ impl BernoulliMarginalSlopeFamily {
                                 dq,
                                 dg,
                             )?;
-                            let mut t_arr = Array2::from_shape_fn((2, 2), |(a, b)| t[a][b]);
-                            if w != 1.0 {
-                                t_arr.mapv_inplace(|v| v * w);
-                            }
-                            accs[idx].add_pullback(self, row, slices, primary, &t_arr);
+                            accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                         }
                         bump_progress(&progress);
                         Ok(accs)
