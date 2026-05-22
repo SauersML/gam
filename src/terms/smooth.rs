@@ -14337,6 +14337,12 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     /// Distance matrices are cached here so they're computed once and
     /// reused across repeated `apply_log_kappa_to_term` calls.
     basisworkspace: crate::basis::BasisWorkspace,
+    /// Monotonic counter incremented every time `apply_log_kappa` actually
+    /// rebuilds the realized design / smooth penalties. Read by the
+    /// design-revision-counter fast path in `ExternalJointHyperEvaluator`
+    /// to skip redundant canonical-penalty rebuilds and cache wipes when
+    /// the outer BFGS loop probes the same ψ twice in a row.
+    design_revision: u64,
 }
 
 impl<'d> std::fmt::Debug for FrozenTermCollectionIncrementalRealizer<'d> {
@@ -14435,7 +14441,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             smooth_penalty_ranges,
             full_penalty_ranges,
             basisworkspace: crate::basis::BasisWorkspace::new(),
+            design_revision: 0,
         })
+    }
+
+    fn design_revision(&self) -> u64 {
+        self.design_revision
     }
 
     fn spec(&self) -> &TermCollectionSpec {
@@ -14472,6 +14483,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 &self.dropped_penaltyinfo_by_term,
             )?;
             rebuild_term_collection_auxiliary_state(&self.spec, &mut self.design)?;
+            self.design_revision = self.design_revision.wrapping_add(1);
         }
         Ok(())
     }
