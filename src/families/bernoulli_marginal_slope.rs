@@ -5120,6 +5120,7 @@ impl BernoulliExactNewtonAccumulator {
         add_optional_matrix(&mut self.hess_h, &other.hess_h);
         add_optional_matrix(&mut self.hess_w, &other.hess_w);
     }
+
 }
 
 fn add_weighted_chunk_gradient(
@@ -15327,14 +15328,25 @@ impl BernoulliMarginalSlopeFamily {
         let primary = cache.primary.clone();
         let n = self.y.len();
         let n_chunks = n.div_ceil(ROW_CHUNK_SIZE);
-        let reduced = (0..n_chunks)
-            .into_par_iter()
-            .try_fold(
-                || BernoulliExactNewtonAccumulator::new(slices),
-                |mut acc, chunk_idx| -> Result<_, String> {
-                    let start = chunk_idx * ROW_CHUNK_SIZE;
-                    let end = (start + ROW_CHUNK_SIZE).min(n);
-                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+        // Pool of per-worker accumulators reused across chunks within this
+        // evaluate. The previous implementation seeded a fresh accumulator
+        // per try_fold chunk, paying p_marginal² + p_logslope² (+ optional
+        // p_h², p_w²) dense Hessian allocations per chunk. The pool caps
+        // total allocations at the number of distinct rayon workers that
+        // ever grab a chunk; each chunk reuses the worker's existing
+        // dense buffers via in-place += accumulation.
+        let pool: Mutex<Vec<BernoulliExactNewtonAccumulator>> = Mutex::new(Vec::new());
+        let result: Result<(), String> = (0..n_chunks).into_par_iter().try_for_each(
+            |chunk_idx| -> Result<(), String> {
+                let mut acc = pool
+                    .lock()
+                    .expect("bernoulli exact newton accumulator pool poisoned")
+                    .pop()
+                    .unwrap_or_else(|| BernoulliExactNewtonAccumulator::new(slices));
+                let start = chunk_idx * ROW_CHUNK_SIZE;
+                let end = (start + ROW_CHUNK_SIZE).min(n);
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
+                let chunk_res: Result<(), String> = (|| {
                     for row in start..end {
                         let row_ctx = Self::row_ctx(cache, row);
                         let row_moments = cache
@@ -15354,16 +15366,27 @@ impl BernoulliMarginalSlopeFamily {
                             self, row, &primary, row_neglog, &scratch,
                         )?;
                     }
-                    Ok(acc)
-                },
-            )
-            .try_reduce(
-                || BernoulliExactNewtonAccumulator::new(slices),
-                |mut left, right| -> Result<_, String> {
-                    left.add(&right);
-                    Ok(left)
-                },
-            )?;
+                    Ok(())
+                })();
+                pool.lock()
+                    .expect("bernoulli exact newton accumulator pool poisoned")
+                    .push(acc);
+                chunk_res
+            },
+        );
+        result?;
+        let mut pooled = pool
+            .into_inner()
+            .expect("bernoulli exact newton accumulator pool poisoned");
+        let reduced = match pooled.pop() {
+            Some(mut first) => {
+                for other in &pooled {
+                    first.add(other);
+                }
+                first
+            }
+            None => BernoulliExactNewtonAccumulator::new(slices),
+        };
 
         let BernoulliExactNewtonAccumulator {
             ll,
