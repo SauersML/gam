@@ -49,7 +49,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
 
-use crate::linalg::utils::array_is_finite;
+use crate::linalg::utils::{array_is_finite, inf_norm};
 
 #[inline]
 fn array1_is_finite(values: &Array1<f64>) -> bool {
@@ -4454,7 +4454,7 @@ where
         let current_grad_finite = state.gradient.iter().all(|g| g.is_finite());
         if !current_grad_finite {
             lastgradient_norm = f64::INFINITY;
-            max_abs_eta = state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
+            max_abs_eta = inf_norm(state.eta.iter().copied());
             final_state = Some(state);
             // If deviance changes have been tiny, this is effectively converged.
             if last_deviance_change.abs() < options.convergence_tolerance {
@@ -5097,7 +5097,7 @@ where
                             last_step_size = 0.0;
                             last_step_halving = attempts;
                             max_abs_eta =
-                                state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max);
+                                inf_norm(state.eta.iter().copied());
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
                             final_state = Some(state);
@@ -6659,7 +6659,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
         }
 
         let gradient_norm = array1_l2_norm(&gradient);
-        let max_abs_eta = finalmu.iter().copied().map(f64::abs).fold(0.0, f64::max);
+        let max_abs_eta = inf_norm(finalmu.iter().copied());
         let log_likelihood =
             calculate_loglikelihood_omitting_constants(y, &finalmu, likelihood, priorweights);
 
