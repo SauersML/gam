@@ -939,19 +939,94 @@ def test_duchon_function_norm_penalty_2d_smoke() -> None:
     assert w.min() > -1e-8, f"penalty not PSD; min eigenvalue {w.min()}"
 
 
-def test_duchon_function_norm_penalty_2d_periodic_per_axis() -> None:
-    """Per-axis periodicity for d=2 Duchon: gated by the Rust core (d=1 only)."""
-    centers = np.array(
-        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
-        dtype=float,
-    )
-    # The underlying Rust path `build_periodic_duchon_basis_1d` rejects
-    # ncols != 1, so multi-D periodicity is not yet supported.
-    pytest.skip("Rust core doesn't yet support multi-D periodic Duchon")
-    _ = gamfit.duchon_function_norm_penalty(
+def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
+    """d=2 mixed-periodicity Duchon (cylinder): symmetric, PSD, wraps cleanly."""
+    # Spread centers across the periodic axis [0, 2π] (auto-derived period)
+    # and the non-periodic axis [0, 1].
+    rng = np.random.default_rng(0)
+    # Anchor the periodic axis span to exactly [0, 2π] so the auto-derived
+    # period matches the geometric period; sample the rest inside.
+    theta_inner = rng.uniform(0.0, 2.0 * np.pi, size=10)
+    theta = np.concatenate([[0.0], theta_inner, [2.0 * np.pi]])
+    y = rng.uniform(0.0, 1.0, size=theta.size)
+    centers = np.column_stack([theta, y])
+    K = centers.shape[0]
+
+    s = gamfit.duchon_function_norm_penalty(
         centers=centers,
         m=2,
         periodic_per_axis=(True, False),
+    )
+    s = np.asarray(s, dtype=float)
+    assert s.shape == (K, K), f"expected ({K}, {K}) penalty, got {s.shape}"
+    # Symmetry.
+    assert np.allclose(s, s.T, atol=1e-10), "cylinder penalty must be symmetric"
+    # PSD.
+    w = np.linalg.eigvalsh(0.5 * (s + s.T))
+    assert w.min() > -1e-8, f"cylinder penalty not PSD; min eigenvalue {w.min()}"
+
+    # Periodic identification on the periodic axis: evaluating the basis at
+    # x_1 = 0 and x_1 = 2π (with same x_2) must produce identical basis rows.
+    # Use the design (duchon_basis) to check that.
+    pts_lo = np.array([[0.0, 0.5]], dtype=float)
+    pts_hi = np.array([[2.0 * np.pi, 0.5]], dtype=float)
+    b_lo = np.asarray(
+        gamfit.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, False)),
+        dtype=float,
+    )
+    b_hi = np.asarray(
+        gamfit.duchon_basis(pts_hi, centers, m=2, periodic_per_axis=(True, False)),
+        dtype=float,
+    )
+    assert np.allclose(b_lo, b_hi, atol=1e-9), (
+        "cylinder Duchon design must be periodic on the periodic axis"
+    )
+
+
+def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
+    """d=2 mixed-periodicity Duchon (torus): symmetric, PSD, wraps cleanly."""
+    rng = np.random.default_rng(1)
+    # Anchor BOTH axes' spans to exactly [0, 2π] so each auto-derived period
+    # matches the geometric period.
+    theta_inner = rng.uniform(0.0, 2.0 * np.pi, size=8)
+    theta = np.concatenate([[0.0], theta_inner, [2.0 * np.pi]])
+    phi_inner = rng.uniform(0.0, 2.0 * np.pi, size=8)
+    phi = np.concatenate([[0.0], phi_inner, [2.0 * np.pi]])
+    centers = np.column_stack([theta, phi])
+    K = centers.shape[0]
+
+    s = gamfit.duchon_function_norm_penalty(
+        centers=centers,
+        m=2,
+        periodic_per_axis=(True, True),
+    )
+    s = np.asarray(s, dtype=float)
+    assert s.shape == (K, K)
+    assert np.allclose(s, s.T, atol=1e-10), "torus penalty must be symmetric"
+    w = np.linalg.eigvalsh(0.5 * (s + s.T))
+    assert w.min() > -1e-8, f"torus penalty not PSD; min eigenvalue {w.min()}"
+
+    # Periodic identification on BOTH axes.
+    pts_lo = np.array([[0.0, 1.2]], dtype=float)
+    pts_hi_x = np.array([[2.0 * np.pi, 1.2]], dtype=float)
+    pts_hi_y = np.array([[0.0, 1.2 + 2.0 * np.pi]], dtype=float)
+    b_lo = np.asarray(
+        gamfit.duchon_basis(pts_lo, centers, m=2, periodic_per_axis=(True, True)),
+        dtype=float,
+    )
+    b_hi_x = np.asarray(
+        gamfit.duchon_basis(pts_hi_x, centers, m=2, periodic_per_axis=(True, True)),
+        dtype=float,
+    )
+    b_hi_y = np.asarray(
+        gamfit.duchon_basis(pts_hi_y, centers, m=2, periodic_per_axis=(True, True)),
+        dtype=float,
+    )
+    assert np.allclose(b_lo, b_hi_x, atol=1e-9), (
+        "torus Duchon design must be periodic on axis 0"
+    )
+    assert np.allclose(b_lo, b_hi_y, atol=1e-9), (
+        "torus Duchon design must be periodic on axis 1"
     )
 
 
@@ -1055,6 +1130,91 @@ def test_sphere_torch_fit_smoke_all_kernels() -> None:
         assert np.all(np.isfinite(coef)), f"kernel={kernel}: NaN/Inf in coefficients"
         assert fitted.shape == (n, 2)
         assert np.all(np.isfinite(fitted)), f"kernel={kernel}: NaN/Inf in fitted"
+
+
+def test_torch_monotone_increasing_smooth() -> None:
+    """Constrained BSpline fit through gamfit.torch.fit enforces monotone
+    non-decreasing fitted values on x ∈ [0, 1]."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(0)
+    n = 200
+    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y_np = x_np ** 2 + 0.02 * rng.standard_normal(n)
+
+    x = torch.as_tensor(x_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    spec = BSpline(degree=3, shape_constraint="monotone_increasing")
+    result = torch_fit(x, y, spec)
+    fitted_at_data = result.fitted.detach().cpu().numpy().squeeze()
+    # x_np is sorted, so fitted_at_data should be (numerically) non-decreasing.
+    diffs = np.diff(fitted_at_data)
+    assert (diffs >= -1e-6).all(), (
+        "monotone_increasing fit violates non-decreasing constraint; "
+        f"min diff={diffs.min()}"
+    )
+
+
+def test_torch_convex_smooth() -> None:
+    """Constrained BSpline fit through gamfit.torch.fit enforces convexity
+    (second differences ≥ 0) on x ∈ [0, 1]."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(1)
+    n = 240
+    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y_np = (x_np - 0.5) ** 2 + 0.02 * rng.standard_normal(n)
+
+    x = torch.as_tensor(x_np, dtype=torch.float64)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    spec = BSpline(degree=3, shape_constraint="convex")
+    result = torch_fit(x, y, spec)
+    # Evaluate fitted on a uniform grid via the basis at uniform points to
+    # get a clean second-difference signal.
+    from gamfit.torch._basis import bspline_basis
+    grid = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
+    # Rebuild knots that match the fit's BSpline path. Use the auto-knots
+    # derived from x for consistency.
+    knots = None
+    b_grid = bspline_basis(grid, knots, degree=3, periodic=False).detach().cpu().numpy()
+    coef = result.coefficients.detach().cpu().numpy()
+    # coef may be (M, 1); flatten.
+    coef_flat = coef.reshape(coef.shape[0], -1)
+    f_grid = (b_grid @ coef_flat).squeeze()
+    second_diffs = np.diff(f_grid, n=2)
+    assert (second_diffs >= -1e-5).all(), (
+        f"convex fit violates ≥0 second-diff constraint; min={second_diffs.min()}"
+    )
+
+
+def test_torch_monotone_smooth_backward_finite_gradient() -> None:
+    """Constrained Gaussian REML torch fit is forward-only; calling
+    backward through any output must raise NotImplementedError instead of
+    silently returning incorrect gradients."""
+    torch = pytest.importorskip("torch")
+    from gamfit import BSpline
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(2)
+    n = 80
+    x_np = np.sort(rng.uniform(0.0, 1.0, size=n))
+    y_np = x_np ** 2 + 0.02 * rng.standard_normal(n)
+
+    x = torch.as_tensor(x_np, dtype=torch.float64, requires_grad=True)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    spec = BSpline(degree=3, shape_constraint="monotone_increasing")
+    result = torch_fit(x, y, spec)
+    fitted = result.fitted
+    # Forward outputs must be finite (no NaNs from a degenerate active set).
+    assert torch.isfinite(fitted).all(), "fitted contains NaN/Inf"
+    # Backward through the constrained path is intentionally unsupported;
+    # confirm it raises rather than silently producing wrong gradients.
+    with pytest.raises(NotImplementedError):
+        fitted.sum().backward()
 
 
 def test_torch_additive_recovers_per_smooth_lambda() -> None:
