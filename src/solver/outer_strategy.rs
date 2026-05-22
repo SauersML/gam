@@ -4863,12 +4863,14 @@ fn run_outer(
         let mut prev_attempt_grad_norm: Option<f64> = None;
 
         let outcome = loop {
-            // Bind the active config by cloning into a local owned value so
-            // subsequent retry-config assignment does not collide with the
-            // borrow used inside this iteration body.
-            let active_config_owned: OuterConfig =
-                retry_config.clone().unwrap_or_else(|| config.clone());
-            let active_config: &OuterConfig = &active_config_owned;
+            // Borrow the active config: prefer the prior retry override
+            // (if any) over the caller's config. Cloning `OuterConfig`
+            // here would pull in `heuristic_lambdas: Option<Vec<Array1>>`,
+            // `seed_config`, `bounds`, and mirror-session handles every
+            // iteration of the retry loop — none of which mutate inside
+            // the body. The retry branch below clones explicitly when it
+            // needs to derive a *new* owned config.
+            let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(&config);
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
                 Ok(result) => {
                     if result.converged
@@ -5208,10 +5210,20 @@ fn run_outer_with_plan(
                     // eval. The Hessian translation goes through the
                     // gam->opt operator adapter when the seed Hessian is
                     // an Hv operator; Analytic seeds become Dense.
+                    // Destructure `seed_eval` to move `gradient` /
+                    // `hessian` into the sample instead of cloning the
+                    // length-`p` array and dense `p×p` Hessian — the
+                    // seed eval is not consulted again in this branch.
+                    let OuterEval {
+                        cost: seed_cost,
+                        gradient: seed_gradient,
+                        hessian: seed_hessian_result,
+                        ..
+                    } = seed_eval;
                     let initial_op_sample = OperatorSample {
-                        value: seed_eval.cost,
-                        gradient: seed_eval.gradient.clone(),
-                        hessian: hessian_result_to_value(seed_eval.hessian.clone()),
+                        value: seed_cost,
+                        gradient: seed_gradient,
+                        hessian: hessian_result_to_value(seed_hessian_result),
                     };
 
                     let bridge_obj = OuterOperatorBridge {
@@ -5347,9 +5359,20 @@ fn run_outer_with_plan(
                     // analytic-route contract (no None Hessian on
                     // `HessianSource::Analytic`) applies at seed time
                     // too, not just inside the bridge's live path.
+                    // Destructure `seed_eval` to move `gradient` /
+                    // `hessian` into the bridge translation and sample
+                    // instead of cloning a length-`p` array and a
+                    // dense `p×p` Hessian per seed iteration — the
+                    // seed eval is not consulted again in this branch.
+                    let OuterEval {
+                        cost: seed_cost,
+                        gradient: seed_gradient,
+                        hessian: seed_hessian_result,
+                        ..
+                    } = seed_eval;
                     let seed_hessian = build_bridge_hessian_for_source(
                         hessian_source,
-                        seed_eval.hessian.clone(),
+                        seed_hessian_result,
                         OUTER_HVP_MATERIALIZE_MAX_DIM,
                     )
                     .map_err(|err| match err {
@@ -5359,8 +5382,8 @@ fn run_outer_with_plan(
                         }
                     })?;
                     let initial_sample = SecondOrderSample {
-                        value: seed_eval.cost,
-                        gradient: seed_eval.gradient.clone(),
+                        value: seed_cost,
+                        gradient: seed_gradient,
                         hessian: seed_hessian,
                     };
 
@@ -5487,9 +5510,17 @@ fn run_outer_with_plan(
                 // is one of the cheapest wins available. (opt 0.3.0
                 // API; before that this was implemented via a
                 // gam-side cache on the bridge.)
+                // Destructure `seed_eval` to move `gradient` into the
+                // sample instead of cloning a length-`p` array per seed
+                // iteration — the seed eval is not consulted again.
+                let OuterEval {
+                    cost: seed_cost,
+                    gradient: seed_gradient,
+                    ..
+                } = seed_eval;
                 let initial_sample = FirstOrderSample {
-                    value: seed_eval.cost,
-                    gradient: seed_eval.gradient.clone(),
+                    value: seed_cost,
+                    gradient: seed_gradient,
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_initial_sample(seed.clone(), initial_sample)
