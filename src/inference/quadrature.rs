@@ -5534,4 +5534,115 @@ mod tests {
             );
         }
     }
+
+    /// Reference heap-based Cholesky-with-jitter, kept here as a test oracle
+    /// so we can confirm that the new stack-allocated variant matches it
+    /// bit-for-bit (modulo the bit-identical scalar math, which is by design).
+    fn ref_cholesky_heap(cov: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+        let n = cov.len();
+        if n == 0 || cov.iter().any(|r| r.len() != n) {
+            return None;
+        }
+        let mut base = cov.to_vec();
+        for retry in 0..8 {
+            let jitter = if retry == 0 {
+                0.0
+            } else {
+                1e-12 * 10f64.powi(retry - 1)
+            };
+            if jitter > 0.0 {
+                for i in 0..n {
+                    base[i][i] = cov[i][i] + jitter;
+                }
+            }
+            let mut l = vec![vec![0.0_f64; n]; n];
+            let mut ok = true;
+            for i in 0..n {
+                for j in 0..=i {
+                    let mut sum = base[i][j];
+                    for k in 0..j {
+                        sum -= l[i][k] * l[j][k];
+                    }
+                    if i == j {
+                        if !sum.is_finite() || sum <= 0.0 {
+                            ok = false;
+                            break;
+                        }
+                        l[i][j] = sum.sqrt();
+                    } else {
+                        l[i][j] = sum / l[j][j];
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            if ok {
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn cholesky_static_matches_heap_d2() {
+        // A handful of deterministic PSD 2x2 cases generated from
+        // randomized factors: cov = A A^T + diag(eps).
+        let cases: &[[[f64; 2]; 2]] = &[
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[2.5, 0.3], [0.3, 0.75]],
+            [[1.0, 0.9999], [0.9999, 1.0]],
+            [[1e-10, 0.0], [0.0, 1e-10]],
+            [[4.0, -1.5], [-1.5, 2.25]],
+        ];
+        for cov in cases {
+            let stack = cholesky_static_with_jitter::<2>(cov).expect("stack cholesky");
+            let heap_in: Vec<Vec<f64>> =
+                cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
+            for i in 0..2 {
+                for j in 0..2 {
+                    assert_eq!(
+                        stack[i][j].to_bits(),
+                        heap[i][j].to_bits(),
+                        "mismatch at ({i},{j}) for cov={cov:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cholesky_static_matches_heap_d3() {
+        let cases: &[[[f64; 3]; 3]] = &[
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [[2.0, 0.5, 0.1], [0.5, 1.5, -0.2], [0.1, -0.2, 0.8]],
+            [[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]],
+        ];
+        for cov in cases {
+            let stack = cholesky_static_with_jitter::<3>(cov).expect("stack cholesky");
+            let heap_in: Vec<Vec<f64>> =
+                cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
+            for i in 0..3 {
+                for j in 0..3 {
+                    assert_eq!(
+                        stack[i][j].to_bits(),
+                        heap[i][j].to_bits(),
+                        "mismatch at ({i},{j}) for cov={cov:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cholesky_static_d1() {
+        let l = cholesky_static_with_jitter::<1>(&[[2.25]]).expect("d=1");
+        assert_eq!(l[0][0], 1.5);
+        assert!(cholesky_static_with_jitter::<1>(&[[-1.0]]).is_some());
+        // A negative variance triggers jitter; with jitter <= 1e-6 it still
+        // can't reach positive — should return None.
+        assert!(cholesky_static_with_jitter::<1>(&[[-1.0e3]]).is_none());
+    }
 }
