@@ -4296,14 +4296,13 @@ impl<'a> RemlState<'a> {
         // ones. Similarly the LM-λ hint would clamp to a value
         // calibrated to a curvature that no longer applies.
         //
-        // Wipe everything EXCEPT `warm_start_beta` (which we are
-        // about to replace), then write the new β. The order matters:
-        // `clear_warm_start_predictor_state` clears `warm_start_beta`
-        // too, so we replace afterwards.
-        self.clear_warm_start_predictor_state();
-        self.clear_warm_start_adaptive_signals();
-        match beta_original {
-            Some(beta) if beta.len() == self.p => {
+        // Wipe everything EXCEPT `warm_start_beta` only when an external
+        // caller actually supplies a replacement β. Passing `None` means the
+        // caller has no new seed; preserve the current warm-start state.
+        if let Some(beta) = beta_original {
+            self.clear_warm_start_predictor_state();
+            self.clear_warm_start_adaptive_signals();
+            if beta.len() == self.p {
                 if !beta.iter().all(|v: &f64| v.is_finite()) {
                     // Caller supplied a β with NaN / Inf entries — would
                     // poison the next PIRLS solve immediately. Refuse
@@ -4319,8 +4318,7 @@ impl<'a> RemlState<'a> {
                     .write()
                     .unwrap()
                     .replace(Coefficients::new(beta.to_owned()));
-            }
-            Some(beta) => {
+            } else {
                 // Length mismatch — common bug when a caller forgets to
                 // re-derive β under a basis transformation. Surface it
                 // rather than silently dropping; the slot is already
@@ -4331,10 +4329,16 @@ impl<'a> RemlState<'a> {
                     self.p,
                 );
             }
-            None => {
-                // Caller asked for an explicit clear — already done by
-                // `clear_warm_start_predictor_state`; nothing more to do.
-            }
+        }
+    }
+
+    pub(crate) fn current_original_basis_beta(&self) -> Option<Array1<f64>> {
+        let beta_guard = self.warm_start_beta.read().ok()?;
+        let beta = beta_guard.as_ref()?;
+        if beta.0.len() == self.p && beta.0.iter().all(|v| v.is_finite()) {
+            Some(beta.0.clone())
+        } else {
+            None
         }
     }
 
@@ -7747,7 +7751,7 @@ impl<'a> RemlState<'a> {
             cost: result.cost,
             gradient,
             hessian,
-            inner_beta_hint: None,
+            inner_beta_hint: self.current_original_basis_beta(),
         };
         {
             let gnorm = eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
