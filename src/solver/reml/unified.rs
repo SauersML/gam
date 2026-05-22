@@ -6851,6 +6851,45 @@ fn try_tangent_projected_evaluate(
             p
         ));
     }
+    // Refuse features that would silently lose information under projection.
+    // Each of these has a principled tangent-space variant, but their math
+    // derivation and implementation is independent of this dispatch and
+    // should be added in dedicated patches when those features actually
+    // co-occur with an active constraint set. Until then, surface a typed
+    // error rather than degrade silently.
+    if solution.firth.is_some() {
+        return Err(
+            "constraint-tangent LAML projection is not yet implemented for solutions \
+             carrying a Firth/Jeffreys term: the term's `½ log|J|` would need its own \
+             tangent projection `½ log|ZᵀJZ|`. Drop `firth` from the inner solution \
+             when active constraints are present, or extend `try_tangent_projected_evaluate` \
+             to project the Jeffreys term"
+                .to_string(),
+        );
+    }
+    if !solution.ext_coords.is_empty() {
+        return Err(format!(
+            "constraint-tangent LAML projection is not yet implemented for solutions \
+             with {} extended hyperparameter coordinates (ψ/τ): each ext coord's `g` \
+             (p-vector) and `drift` (∂H/∂ψ_i in p-space) would need projection through \
+             Z, and the pair callbacks would need tangent-projected variants. The AoU \
+             survival marginal-slope path that motivates this dispatch does not use \
+             ext_coords (ext_dim = 0); extend the projection when a use case requires it",
+            solution.ext_coords.len(),
+        ));
+    }
+    if solution.barrier_config.is_some() {
+        return Err(
+            "constraint-tangent LAML projection is not yet implemented for solutions \
+             with an active log-barrier. The barrier contributes a p-space Hessian \
+             correction that is already baked into `hessian_op` (so the tangent H \
+             reconstruction picks it up correctly), but the cost-side barrier term \
+             evaluated at β̂ should be left untouched and the projection above already \
+             does so. Audit `barrier_cost(β̂)` against the tangent objective before \
+             enabling this combination"
+                .to_string(),
+        );
+    }
     let z = match compute_active_constraint_tangent_basis(&block.a) {
         Some(z) => z,
         None => {
@@ -6911,20 +6950,28 @@ fn try_tangent_projected_evaluate(
         deriv_provider: Box::new(BorrowedDerivProvider(solution.deriv_provider.as_ref())),
         tk_correction: solution.tk_correction,
         tk_gradient: solution.tk_gradient.clone(),
-        firth: solution.firth.clone(),
+        // Refused above when present.
+        firth: None,
+        // The full-H reconstruction already absorbs any uniform-rescale
+        // correction the original carried in `hessian_logdet_correction`;
+        // the tangent operator's own `logdet()` is the final value.
         hessian_logdet_correction: 0.0,
+        // Direct tangent-H path; the projected-kernel route is unused here.
         penalty_subspace_trace: None,
         rho_curvature_scale: solution.rho_curvature_scale,
         rho_prior: solution.rho_prior.clone(),
         n_observations: solution.n_observations,
         nullspace_dim: solution.nullspace_dim,
         dispersion: solution.dispersion.clone(),
-        ext_coords: solution.ext_coords.clone(),
+        // Refused above when non-empty.
+        ext_coords: Vec::new(),
         ext_coord_pair_fn: None,
         rho_ext_pair_fn: None,
         fixed_drift_deriv: None,
-        barrier_config: solution.barrier_config.clone(),
+        // Refused above when present.
+        barrier_config: None,
         kkt_residual: projected_kkt,
+        // Prevents recursion via `try_tangent_projected_evaluate`.
         active_constraints: None,
         stochastic_trace_state: solution.stochastic_trace_state.clone(),
     };
