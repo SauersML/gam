@@ -7,6 +7,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
 use crate::estimate::{BlockRole, PredictInput};
+use crate::linalg::utils::inf_norm;
 use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
 use crate::families::survival_predict::{
@@ -417,7 +418,7 @@ pub fn build_predict_input_for_model(
                     let h_lower = lower + offset[i] + response_lower_floor_offset;
                     let h_upper = upper + offset[i] + response_upper_floor_offset;
                     if !h.is_finite() || !h_lower.is_finite() || !h_upper.is_finite() {
-                        let max_abs_cov = cov_row.iter().copied().map(f64::abs).fold(0.0, f64::max);
+                        let max_abs_cov = inf_norm(cov_row.iter().copied());
                         return Err(format!(
                             "prediction failed: transformation-normal finite-support scores at row {i} are not finite: h={h:.6e}, lower={h_lower:.6e}, upper={h_upper:.6e}; max_abs_covariate_basis={max_abs_cov:.6e}, max_abs_gamma={max_abs_gamma:.6e}"
                         ));
