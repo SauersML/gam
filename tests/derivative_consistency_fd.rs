@@ -84,10 +84,7 @@ fn build_gaussian_single_block(
         beta[j] = 0.3 / (j as f64).sqrt();
     }
     let eta = x.dot(&beta);
-    let y = Array1::from_iter(
-        eta.iter()
-            .map(|e| e + rng.random_range(-0.5..0.5)),
-    );
+    let y = Array1::from_iter(eta.iter().map(|e| e + rng.random_range(-0.5..0.5)));
 
     let w = Array1::<f64>::ones(n);
 
@@ -142,8 +139,7 @@ fn build_gaussian_rank_deficient_two_block(
         beta[j] = 0.2 / (j as f64).sqrt();
     }
     let eta = x.dot(&beta);
-    let y =
-        Array1::from_iter(eta.iter().map(|e| e + rng.random_range(-0.4..0.4)));
+    let y = Array1::from_iter(eta.iter().map(|e| e + rng.random_range(-0.4..0.4)));
     let w = Array1::<f64>::ones(n);
 
     let s1 = second_difference_penalty(k1);
@@ -328,8 +324,7 @@ fn analytic_gradient_matches_finite_difference_centered() {
             rel,
         );
         assert!(
-            analytic.iter().all(|v| v.is_finite())
-                && fd.iter().all(|v| v.is_finite()),
+            analytic.iter().all(|v| v.is_finite()) && fd.iter().all(|v| v.is_finite()),
             "non-finite gradient at rho={:?}: analytic={:?} fd={:?}",
             rho,
             analytic,
@@ -415,9 +410,7 @@ fn analytic_gradient_jacobian_is_symmetric_finite_difference_centered() {
 
     let rho = Array1::from(vec![0.2_f64, -0.1_f64]);
     let h = 1e-5_f64;
-    let j_fd = fd_hessian_from_grad_centered(
-        &y, &w, &x, &offset, &s_list, &opts, &rho, h,
-    );
+    let j_fd = fd_hessian_from_grad_centered(&y, &w, &x, &offset, &s_list, &opts, &rho, h);
 
     let mut sym_err = 0.0_f64;
     for i in 0..j_fd.nrows() {
@@ -480,9 +473,7 @@ fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
     let rho = Array1::from(vec![0.3_f64, 0.0_f64]);
     let h = 1e-5_f64;
 
-    let j_fd = fd_hessian_from_grad_centered(
-        &y, &w, &x, &offset, &s_list, &opts, &rho, h,
-    );
+    let j_fd = fd_hessian_from_grad_centered(&y, &w, &x, &offset, &s_list, &opts, &rho, h);
 
     let mut sym_err = 0.0_f64;
     for i in 0..j_fd.nrows() {
