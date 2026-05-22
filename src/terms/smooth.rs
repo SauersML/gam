@@ -14227,11 +14227,12 @@ fn rebuild_term_collection_auxiliary_state(
     }
     if let Some(lin_smooth) = design.smooth.linear_constraints.as_ref() {
         if lin_smooth.a.ncols() != design.smooth.total_smooth_cols() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "smooth linear-constraint width mismatch: cols={}, smooth_cols={}",
                 lin_smooth.a.ncols(),
                 design.smooth.total_smooth_cols()
-            ));
+            ))
+            .into());
         }
         let mut a_global = Array2::<f64>::zeros((lin_smooth.a.nrows(), p_total));
         a_global
@@ -14334,11 +14335,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         design: TermCollectionDesign,
     ) -> Result<Self, String> {
         if spec.smooth_terms.len() != design.smooth.terms.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer smooth term mismatch: spec_terms={}, design_terms={}",
                 spec.smooth_terms.len(),
                 design.smooth.terms.len()
-            ));
+            ))
+            .into());
         }
 
         let mut smooth_cursor = 0usize;
@@ -14349,11 +14351,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             smooth_cursor = next;
         }
         if smooth_cursor != design.smooth.penalties.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer smooth penalty mismatch: ranged={}, actual={}",
                 smooth_cursor,
                 design.smooth.penalties.len()
-            ));
+            ))
+            .into());
         }
 
         let fixed_penalty_offset = design
@@ -14381,22 +14384,24 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 })?;
             let expected_cols = design.smooth.terms[term_idx].coeff_range.len();
             if realization.design_local.ncols() != expected_cols {
-                return Err(format!(
+                return Err(SmoothError::dimension_mismatch(format!(
                     "cached realization width mismatch for term '{}': cached_cols={}, design_cols={}",
                     termspec.name,
                     realization.design_local.ncols(),
                     expected_cols
-                ));
+                ))
+                .into());
             }
             if realization.active_penaltyinfo().len()
                 != design.smooth.terms[term_idx].penalties_local.len()
             {
-                return Err(format!(
+                return Err(SmoothError::dimension_mismatch(format!(
                     "cached realization penalty mismatch for term '{}': cached_penalties={}, design_penalties={}",
                     termspec.name,
                     realization.active_penaltyinfo().len(),
                     design.smooth.terms[term_idx].penalties_local.len()
-                ));
+                ))
+                .into());
             }
             dropped_penaltyinfo_by_term.push(realization.dropped_penaltyinfo);
         }
@@ -14427,11 +14432,12 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         term_indices: &[usize],
     ) -> Result<(), String> {
         if term_indices.len() != log_kappa.dims_per_term().len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer log-kappa term mismatch: term_indices={}, dims_per_term={}",
                 term_indices.len(),
                 log_kappa.dims_per_term().len()
-            ));
+            ))
+            .into());
         }
 
         let mut any_changed = false;
@@ -14452,9 +14458,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
 
     fn apply_log_kappa_to_term(&mut self, term_idx: usize, psi: &[f64]) -> Result<bool, String> {
         if !spatial_term_supports_hyper_optimization(&self.spec, term_idx) {
-            return Err(format!(
+            return Err(SmoothError::invalid_config(format!(
                 "incremental realizer term {term_idx} does not expose spatial hyperparameters"
-            ));
+            ))
+            .into());
         }
         let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
         let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
@@ -14526,20 +14533,22 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             .coeff_range
             .clone();
         if design_local.ncols() != coeff_range.len() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer width mismatch for term {}: rebuilt_cols={}, cached_cols={}",
                 term_idx,
                 design_local.ncols(),
                 coeff_range.len()
-            ));
+            ))
+            .into());
         }
         if design_local.nrows() != self.design.design.nrows() {
-            return Err(format!(
+            return Err(SmoothError::dimension_mismatch(format!(
                 "incremental realizer row mismatch for term {}: rebuilt_rows={}, design_rows={}",
                 term_idx,
                 design_local.nrows(),
                 self.design.design.nrows()
-            ));
+            ))
+            .into());
         }
 
         let active_penaltyinfo = penaltyinfo_local
