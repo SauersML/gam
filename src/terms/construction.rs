@@ -2415,7 +2415,18 @@ impl KroneckerReparamResult {
         let s_transformed = self.materialize_s_transformed(lambdas);
 
         // Transform penalty roots: R_k_transformed = R_k · Qs
-        let rs_transformed: Vec<Array2<f64>> = rs_list.iter().map(|r| r.dot(&qs)).collect();
+        let rs_transformed: Vec<Array2<f64>> = if rs_list.len() >= 2 {
+            use rayon::prelude::*;
+            rs_list
+                .par_iter()
+                .map(|r| crate::faer_ndarray::fast_ab(r, &qs))
+                .collect()
+        } else {
+            rs_list
+                .iter()
+                .map(|r| crate::faer_ndarray::fast_ab(r, &qs))
+                .collect()
+        };
         // rs_transposed removed — canonical_transformed is the single source of truth.
 
         // Build e_transformed: combined penalty square root in transformed coords.
@@ -2612,7 +2623,7 @@ pub fn kronecker_reparameterization_engine(
     let reparameterized_marginals: Vec<Array2<f64>> = marginal_designs
         .iter()
         .zip(marginal_qs.iter())
-        .map(|(b_k, u_k)| b_k.dot(u_k))
+        .map(|(b_k, u_k)| crate::faer_ndarray::fast_ab(b_k, u_k))
         .collect();
 
     // Compute shrinkage ridge from balanced penalty eigenvalue scale.

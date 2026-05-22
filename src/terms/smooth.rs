@@ -31,7 +31,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
@@ -4579,8 +4579,8 @@ fn build_tensor_bspline_basis(
         candidates = candidates
             .into_iter()
             .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                let zt_s = z.t().dot(&candidate.matrix);
-                let matrix = zt_s.dot(z);
+                let zt_s = fast_atb(z, &candidate.matrix);
+                let matrix = fast_ab(&zt_s, z);
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: candidate.nullspace_dim_hint,
@@ -5283,8 +5283,8 @@ fn build_single_local_smooth_term(
             .map(|s_local| {
                 // Congruence transform preserves PSD:
                 //   S_new = T^T S T.
-                let tt_s = t.t().dot(&s_local);
-                tt_s.dot(&t)
+                let tt_s = fast_atb(&t, &s_local);
+                fast_ab(&tt_s, &t)
             })
             .collect();
         // T^T S T invalidates op-form bit-equivalence; drop ops here.
@@ -5402,7 +5402,7 @@ fn build_smooth_design_withworkspace_unvalidated(
         )
     })?;
     let policy = workspace.policy().clone();
-    let mut local_builds: Vec<LocalSmoothTermBuild> = {
+    let local_builds: Vec<LocalSmoothTermBuild> = {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         planned_terms
             .into_par_iter()
@@ -5414,12 +5414,9 @@ fn build_smooth_design_withworkspace_unvalidated(
     };
 
     let local_dims: Vec<usize> = local_builds.iter().map(|built| built.dim).collect();
-    let local_designs: Vec<DesignMatrix> = local_builds
-        .iter()
-        .map(|built| built.design.clone())
-        .collect();
-
     let total_p: usize = local_dims.iter().sum();
+
+    let mut local_designs: Vec<DesignMatrix> = Vec::with_capacity(local_builds.len());
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
     let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
@@ -5427,38 +5424,42 @@ fn build_smooth_design_withworkspace_unvalidated(
     let mut dropped_penaltyinfo_global = Vec::<DroppedPenaltyBlockInfo>::new();
     let mut coefficient_lower_bounds = Array1::<f64>::from_elem(total_p, f64::NEG_INFINITY);
     let mut any_bounds = false;
-    let mut linear_constraintsrows: Vec<Array1<f64>> = Vec::new();
+    // Each linear-constraint row only touches the current term's column slice.
+    // Track `(col_start, col_end, local_row_values)` and assemble the final
+    // dense `Array2` in one pass, avoiding per-row `Array1::zeros(total_p)`
+    // allocation plus a row-by-row copy at the end.
+    let mut linear_constraintsrows: Vec<(usize, usize, Array1<f64>)> = Vec::new();
     let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
-    for (idx, term) in terms.iter().enumerate() {
+    for ((idx, term), mut built) in terms.iter().enumerate().zip(local_builds.into_iter()) {
         let p_local = local_dims[idx];
         let col_end = col_start + p_local;
-        let lb_local = if local_builds[idx].box_reparam {
+        let lb_local = if built.box_reparam {
             shape_lower_bounds_local(term.shape, p_local)
         } else {
             None
         };
 
-        let activeinfos = local_builds[idx]
+        let activeinfos = built
             .penaltyinfo
             .iter()
             .filter(|info| info.active)
             .collect::<Vec<_>>();
-        if activeinfos.len() != local_builds[idx].penalties.len() {
+        if activeinfos.len() != built.penalties.len() {
             return Err(BasisError::InvalidInput(format!(
                 "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
                 term.name,
                 activeinfos.len(),
-                local_builds[idx].penalties.len()
+                built.penalties.len()
             )));
         }
-        for (((s_local, &ns), info), op_local) in local_builds[idx]
+        for (((s_local, &ns), info), op_local) in built
             .penalties
             .iter()
-            .zip(local_builds[idx].nullspaces.iter())
+            .zip(built.nullspaces.iter())
             .zip(activeinfos.into_iter())
-            .zip(local_builds[idx].ops.iter())
+            .zip(built.ops.iter())
         {
             let global_index = penalties_global.len();
             penalties_global.push(
@@ -5474,50 +5475,47 @@ fn build_smooth_design_withworkspace_unvalidated(
                 penalty,
             });
         }
-        for info in local_builds[idx]
-            .penaltyinfo
-            .iter()
-            .filter(|info| !info.active)
-        {
+        for info in built.penaltyinfo.iter().filter(|info| !info.active) {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(term.name.clone()),
                 penalty: info.clone(),
             });
         }
-        for info in &local_builds[idx].pre_dropped_penaltyinfo {
+        for info in &built.pre_dropped_penaltyinfo {
             dropped_penaltyinfo_global.push(DroppedPenaltyBlockInfo {
                 termname: Some(term.name.clone()),
                 penalty: info.clone(),
             });
         }
 
+        if let Some(lin_local) = &built.linear_constraints {
+            for r in 0..lin_local.a.nrows() {
+                linear_constraintsrows.push((col_start, col_end, lin_local.a.row(r).to_owned()));
+                linear_constraints_b.push(lin_local.b[r]);
+            }
+        }
+        if let Some(lb_local) = &lb_local {
+            coefficient_lower_bounds
+                .slice_mut(s![col_start..col_end])
+                .assign(lb_local);
+            any_bounds = true;
+        }
+
+        // Move the per-term design out of `built` rather than cloning it.
+        local_designs.push(built.design);
+
         terms_out.push(SmoothTerm {
             name: term.name.clone(),
             coeff_range: col_start..col_end,
             shape: term.shape,
-            penalties_local: local_builds[idx].penalties.clone(),
-            nullspace_dims: local_builds[idx].nullspaces.clone(),
-            penaltyinfo_local: local_builds[idx].penaltyinfo.clone(),
-            metadata: local_builds[idx].metadata.clone(),
-            lower_bounds_local: lb_local.clone(),
-            linear_constraints_local: local_builds[idx].linear_constraints.clone(),
-            kronecker_factored: local_builds[idx].kronecker_factored.take(),
+            penalties_local: built.penalties,
+            nullspace_dims: built.nullspaces,
+            penaltyinfo_local: built.penaltyinfo,
+            metadata: built.metadata,
+            lower_bounds_local: lb_local,
+            linear_constraints_local: built.linear_constraints,
+            kronecker_factored: built.kronecker_factored.take(),
         });
-        if let Some(lin_local) = &local_builds[idx].linear_constraints {
-            for r in 0..lin_local.a.nrows() {
-                let mut row = Array1::<f64>::zeros(total_p);
-                row.slice_mut(s![col_start..col_end])
-                    .assign(&lin_local.a.row(r));
-                linear_constraintsrows.push(row);
-                linear_constraints_b.push(lin_local.b[r]);
-            }
-        }
-        if let Some(lb_local) = lb_local {
-            coefficient_lower_bounds
-                .slice_mut(s![col_start..col_end])
-                .assign(&lb_local);
-            any_bounds = true;
-        }
 
         col_start = col_end;
     }
@@ -5549,8 +5547,8 @@ fn build_smooth_design_withworkspace_unvalidated(
             None
         } else {
             let mut a = Array2::<f64>::zeros((linear_constraintsrows.len(), total_p));
-            for (i, row) in linear_constraintsrows.iter().enumerate() {
-                a.row_mut(i).assign(row);
+            for (i, (cs, ce, values)) in linear_constraintsrows.iter().enumerate() {
+                a.row_mut(i).slice_mut(s![*cs..*ce]).assign(values);
             }
             Some(LinearInequalityConstraints {
                 a,
@@ -6328,8 +6326,8 @@ fn apply_global_smooth_identifiability(
             .par_iter()
             .map(|s_local| {
                 if let Some(z) = z_opt.as_ref() {
-                    let zt_s = z.t().dot(s_local);
-                    zt_s.dot(z)
+                    let zt_s = fast_atb(z, s_local);
+                    fast_ab(&zt_s, z)
                 } else {
                     s_local.clone()
                 }
@@ -13711,6 +13709,57 @@ fn set_spatial_length_scale(
     }
 }
 
+/// Apply a length scale to a single `SmoothTermSpec` (independent of any
+/// outer `TermCollectionSpec`). Mirrors `set_spatial_length_scale` but on a
+/// term in isolation; used by the incremental realizer's cached planned spec.
+fn set_single_term_spatial_length_scale(
+    term: &mut SmoothTermSpec,
+    length_scale: f64,
+) -> Result<(), EstimationError> {
+    match &mut term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.length_scale = Some(length_scale);
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "term '{}' does not expose a spatial length scale",
+            term.name
+        ))),
+    }
+}
+
+/// Apply anisotropy contrasts to a single `SmoothTermSpec`. Mirrors
+/// `set_spatial_aniso_log_scales` but on a term in isolation; used by the
+/// incremental realizer's cached planned spec.
+fn set_single_term_spatial_aniso_log_scales(
+    term: &mut SmoothTermSpec,
+    eta: Vec<f64>,
+) -> Result<(), EstimationError> {
+    let eta = center_aniso_log_scales(&eta);
+    match &mut term.basis {
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.aniso_log_scales = Some(eta);
+            Ok(())
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.aniso_log_scales = Some(eta);
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "term '{}' does not support aniso_log_scales",
+            term.name
+        ))),
+    }
+}
+
 pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
     spec.smooth_terms
         .get(term_idx)
@@ -14174,6 +14223,149 @@ fn finish_single_smooth_term_realization(
     })
 }
 
+/// Wrap a fresh `LocalSmoothTermBuild` (produced by `build_single_local_smooth_term`)
+/// into a `SingleSmoothTermRealization`. Mirrors the single-term portion of
+/// `build_smooth_design_withworkspace_unvalidated`, but skips the joint center
+/// planner and per-term workspace fork — the realizer drives κ-only rebuilds
+/// directly with its persistent workspace so basis caches survive across BFGS
+/// κ proposals.
+fn wrap_local_build_as_realization(
+    mut local: LocalSmoothTermBuild,
+    termspec: &SmoothTermSpec,
+) -> Result<SingleSmoothTermRealization, String> {
+    let p_local = local.dim;
+    let lb_local = if local.box_reparam {
+        shape_lower_bounds_local(termspec.shape, p_local)
+    } else {
+        None
+    };
+
+    let active_count = local.penaltyinfo.iter().filter(|info| info.active).count();
+    if active_count != local.penalties.len() {
+        return Err(format!(
+            "internal penalty info mismatch for term '{}': active_infos={}, penalties={}",
+            termspec.name,
+            active_count,
+            local.penalties.len()
+        ));
+    }
+
+    let mut dropped_penaltyinfo = Vec::<DroppedPenaltyBlockInfo>::new();
+    for info in local.penaltyinfo.iter().filter(|info| !info.active) {
+        dropped_penaltyinfo.push(DroppedPenaltyBlockInfo {
+            termname: Some(termspec.name.clone()),
+            penalty: info.clone(),
+        });
+    }
+    for info in &local.pre_dropped_penaltyinfo {
+        dropped_penaltyinfo.push(DroppedPenaltyBlockInfo {
+            termname: Some(termspec.name.clone()),
+            penalty: info.clone(),
+        });
+    }
+
+    let smooth_term = SmoothTerm {
+        name: termspec.name.clone(),
+        coeff_range: 0..p_local,
+        shape: termspec.shape,
+        penalties_local: local.penalties.clone(),
+        nullspace_dims: local.nullspaces.clone(),
+        penaltyinfo_local: local.penaltyinfo.clone(),
+        metadata: local.metadata.clone(),
+        lower_bounds_local: lb_local,
+        linear_constraints_local: local.linear_constraints.clone(),
+        kronecker_factored: local.kronecker_factored.take(),
+    };
+
+    Ok(SingleSmoothTermRealization {
+        design_local: local.design,
+        term: smooth_term,
+        dropped_penaltyinfo,
+    })
+}
+
+/// Extract the κ-invariant pieces of a freshly-built spatial basis — center
+/// cloud (in standardized coords) and `input_scales` — and bake them into a
+/// `SmoothTermSpec` whose `center_strategy` becomes `UserProvided` and whose
+/// `input_scales` is `Some`. Subsequent rebuilds driven from this cached spec
+/// will short-circuit `select_centers_by_strategy` (KMeans / FarthestPoint /
+/// EqualMass cluster searches over n×d data) and `compute_spatial_input_scales`
+/// (per-axis variance over n rows), leaving only the κ-dependent kernel
+/// values and basis assembly. Returns `None` for non-spatial families or when
+/// the metadata does not yet expose the required pieces (for instance when a
+/// ThinPlate request was auto-promoted to Duchon during the build).
+fn freeze_geometry_from_metadata(
+    termspec: &SmoothTermSpec,
+    metadata: &BasisMetadata,
+) -> Option<SmoothTermSpec> {
+    let mut frozen = termspec.clone();
+    match (&mut frozen.basis, metadata) {
+        (
+            SmoothBasisSpec::Matern {
+                spec,
+                input_scales: spec_scales,
+                ..
+            },
+            BasisMetadata::Matern {
+                centers,
+                input_scales: meta_scales,
+                ..
+            },
+        ) => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
+            if spec_scales.is_none()
+                && let Some(s) = meta_scales.clone()
+            {
+                *spec_scales = Some(s);
+            }
+            Some(frozen)
+        }
+        (
+            SmoothBasisSpec::Duchon {
+                spec,
+                input_scales: spec_scales,
+                ..
+            },
+            BasisMetadata::Duchon {
+                centers,
+                input_scales: meta_scales,
+                ..
+            },
+        ) => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
+            if spec_scales.is_none()
+                && let Some(s) = meta_scales.clone()
+            {
+                *spec_scales = Some(s);
+            }
+            Some(frozen)
+        }
+        (
+            SmoothBasisSpec::ThinPlate {
+                spec,
+                input_scales: spec_scales,
+                ..
+            },
+            BasisMetadata::ThinPlate {
+                centers,
+                input_scales: meta_scales,
+                ..
+            },
+        ) => {
+            spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
+            if spec_scales.is_none()
+                && let Some(s) = meta_scales.clone()
+            {
+                *spec_scales = Some(s);
+            }
+            Some(frozen)
+        }
+        // Family mismatch (e.g. ThinPlate auto-promotion to Duchon) leaves the
+        // cache empty; we'll retry materialization on the next κ apply.
+        _ => None,
+    }
+}
+
 fn rebuild_smooth_auxiliary_state(
     smooth: &mut SmoothDesign,
     dropped_penaltyinfo_by_term: &[Vec<DroppedPenaltyBlockInfo>],
@@ -14405,6 +14597,19 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     /// Distance matrices are cached here so they're computed once and
     /// reused across repeated `apply_log_kappa_to_term` calls.
     basisworkspace: crate::basis::BasisWorkspace,
+    /// Per-term cached realization geometry for incremental κ updates.
+    ///
+    /// On the first κ-driven rebuild of term `i`, this slot is populated with a
+    /// `SmoothTermSpec` whose κ-invariant geometry — center cloud (as
+    /// `CenterStrategy::UserProvided`) and `input_scales` — has been frozen
+    /// out of the realized basis metadata. Subsequent
+    /// `apply_log_kappa_to_term` calls reuse this spec, mutating only the
+    /// κ / aniso fields. This short-circuits `select_centers_by_strategy`
+    /// (KMeans / FarthestPoint / EqualMass cluster searches over the n×d data
+    /// matrix) and `compute_spatial_input_scales` (per-axis variance pass
+    /// over n rows) on every BFGS κ-eval, leaving the kernel-value pass and
+    /// basis assembly as the only work.
+    spatial_realization_geometry: Vec<Option<SmoothTermSpec>>,
     /// Monotonic counter incremented every time `apply_log_kappa` actually
     /// rebuilds the realized design / smooth penalties. Read by the
     /// design-revision-counter fast path in `ExternalJointHyperEvaluator`
@@ -14500,6 +14705,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             dropped_penaltyinfo_by_term.push(realization.dropped_penaltyinfo);
         }
 
+        let geometry_slots = spec.smooth_terms.len();
         Ok(Self {
             data,
             spec,
@@ -14509,6 +14715,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             smooth_penalty_ranges,
             full_penalty_ranges,
             basisworkspace: crate::basis::BasisWorkspace::new(),
+            spatial_realization_geometry: vec![None; geometry_slots],
             design_revision: 0,
         })
     }

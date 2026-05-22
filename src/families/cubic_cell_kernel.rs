@@ -1575,6 +1575,28 @@ pub fn moment_boundary_term(cell: DenestedCubicCell, n: usize) -> f64 {
     right_term - left_term
 }
 
+/// Same as [`moment_boundary_term`] but takes precomputed `left^n` and
+/// `right^n` so callers can roll the powers across a recurrence — each
+/// iteration becomes one multiply instead of a fresh `powi(n)`.
+#[inline]
+fn moment_boundary_term_with_powers(
+    cell: DenestedCubicCell,
+    left_pow_n: f64,
+    right_pow_n: f64,
+) -> f64 {
+    let left_term = if cell.left.is_infinite() {
+        0.0
+    } else {
+        left_pow_n * (-cell.q(cell.left)).exp()
+    };
+    let right_term = if cell.right.is_infinite() {
+        0.0
+    } else {
+        right_pow_n * (-cell.q(cell.right)).exp()
+    };
+    right_term - left_term
+}
+
 pub fn reduce_quartic_moments(
     cell: DenestedCubicCell,
     base_m0_m2: [f64; 3],
@@ -1595,8 +1617,16 @@ pub fn reduce_quartic_moments(
     moments[0] = base_m0_m2[0];
     moments[1] = base_m0_m2[1];
     moments[2] = base_m0_m2[2];
+    // Roll left^n / right^n across the recurrence rather than calling
+    // `powi(n)` each iteration. Skip the multiply when an endpoint is
+    // infinite — the boundary helper ignores the power in that case, and
+    // ∞·0 would produce a NaN we'd then have to mask off anyway.
+    let left_finite = cell.left.is_finite();
+    let right_finite = cell.right.is_finite();
+    let mut left_pow_n = if left_finite { 1.0 } else { 0.0 };
+    let mut right_pow_n = if right_finite { 1.0 } else { 0.0 };
     for n in 0..=(max_degree - 3) {
-        let b_n = moment_boundary_term(cell, n);
+        let b_n = moment_boundary_term_with_powers(cell, left_pow_n, right_pow_n);
         let mut numer = if n == 0 {
             0.0
         } else {
@@ -1607,6 +1637,12 @@ pub fn reduce_quartic_moments(
         }
         numer -= b_n;
         moments[n + 3] = numer / lead;
+        if left_finite {
+            left_pow_n *= cell.left;
+        }
+        if right_finite {
+            right_pow_n *= cell.right;
+        }
     }
     Ok(moments)
 }
@@ -1653,8 +1689,12 @@ pub fn reduce_sextic_moments(
     for (idx, value) in base_m0_m4.into_iter().enumerate() {
         moments[idx] = value;
     }
+    let left_finite = cell.left.is_finite();
+    let right_finite = cell.right.is_finite();
+    let mut left_pow_n = if left_finite { 1.0 } else { 0.0 };
+    let mut right_pow_n = if right_finite { 1.0 } else { 0.0 };
     for n in 0..=(max_degree - 5) {
-        let b_n = moment_boundary_term(cell, n);
+        let b_n = moment_boundary_term_with_powers(cell, left_pow_n, right_pow_n);
         let mut numer = if n == 0 {
             0.0
         } else {
@@ -1665,6 +1705,12 @@ pub fn reduce_sextic_moments(
         }
         numer -= b_n;
         moments[n + 5] = numer / lead;
+        if left_finite {
+            left_pow_n *= cell.left;
+        }
+        if right_finite {
+            right_pow_n *= cell.right;
+        }
     }
     Ok(moments)
 }
