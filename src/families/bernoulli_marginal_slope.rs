@@ -2641,10 +2641,12 @@ fn pooled_probit_baseline(
     for _ in 0..50 {
         let (obj, g0, g1, h00, h01, h11) = objective_grad_hess(beta0, beta1)?;
         if !obj.is_finite() || !g0.is_finite() || !g1.is_finite() {
-            return Err(
-                "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason:
+                    "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
+                        .to_string(),
+            }
+            .into());
         }
         let grad_max = g0.abs().max(g1.abs());
         if grad_max < BMS_DERIV_TOL {
@@ -2664,9 +2666,11 @@ fn pooled_probit_baseline(
             }
             ridge *= 10.0;
             if ridge > 1e6 {
-                return Err(
-                    "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string()
-                );
+                return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                    reason:
+                        "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string(),
+                }
+                .into());
             }
         };
         let mut accepted = false;
@@ -2688,7 +2692,10 @@ fn pooled_probit_baseline(
             if (obj_prev - obj).abs() < 1e-10 {
                 break;
             }
-            return Err("pooled bernoulli-marginal-slope pilot line search failed".to_string());
+            return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                reason: "pooled bernoulli-marginal-slope pilot line search failed".to_string(),
+            }
+            .into());
         }
     }
     let a = beta0;
@@ -2804,11 +2811,14 @@ fn pilot_eta_for_link_dev_orthogonalisation(
 
     let n = y.len();
     if marginal_design.nrows() != n {
-        return Err(format!(
-            "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
-            marginal_design.nrows(),
-            n,
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
+                marginal_design.nrows(),
+                n,
+            ),
+        }
+        .into());
     }
     let mut working_eta = Array1::<f64>::zeros(n);
     let mut w_irls = Array1::<f64>::zeros(n);
