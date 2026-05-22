@@ -3380,6 +3380,9 @@ pub fn evaluate_cell_derivative_moments_cached(
                 }
                 return Ok(state);
             }
+            // `cached.state` is `Option<Arc<_>>`; `.clone()` here is the cheap
+            // refcount bump the audit-39 fix targets, not a full moment-vector
+            // deep clone.
             cached.state.clone()
         }
         None => None,
@@ -3388,12 +3391,17 @@ pub fn evaluate_cell_derivative_moments_cached(
         stats.misses.fetch_add(1, Ordering::Relaxed);
     }
     let state = evaluate_cell_derivative_moments_uncached(cell, max_degree)?;
-    let mut entry = CachedCellMoments::new_derivative(state.clone());
+    // Wrap the freshly-computed state in `Arc` once, share it with the cache
+    // through `Arc::clone`, and return the underlying value by unwrapping the
+    // unique-reference (caller-side) `Arc`. This replaces the prior
+    // `state.clone()` deep copy at the insert site.
+    let shared = Arc::new(state);
+    let mut entry = CachedCellMoments::new_derivative(Arc::clone(&shared));
     if let Some(value) = existing_value {
         entry = entry.with_value(value);
     }
     cache.insert(key, entry);
-    Ok(state)
+    Ok(Arc::try_unwrap(shared).unwrap_or_else(|a| (*a).clone()))
 }
 
 /// Scratch-backed variant of [`evaluate_cell_moments`].
