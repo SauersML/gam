@@ -4552,19 +4552,15 @@ impl JointBetaRhoPosterior {
             (0.0, Array1::zeros(n_rho))
         } else {
             let rho_hash = Self::hash_rho(rho);
-            let cached = self
-                .penalty_logdet_cache
-                .lock()
-                .ok()
-                .and_then(|guard| {
-                    guard.as_ref().and_then(|(h, v, g)| {
-                        if *h == rho_hash && g.len() == n_rho {
-                            Some((*v, g.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                });
+            let cached = self.penalty_logdet_cache.lock().ok().and_then(|guard| {
+                guard.as_ref().and_then(|(h, v, g)| {
+                    if *h == rho_hash && g.len() == n_rho {
+                        Some((*v, g.clone()))
+                    } else {
+                        None
+                    }
+                })
+            });
             if let Some(hit) = cached {
                 hit
             } else {

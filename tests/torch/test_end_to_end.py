@@ -63,10 +63,11 @@ def test_from_fitted_inside_torch_module() -> None:
 
 
 @pytest.mark.skipif(
-    not _have_ffi("gaussian_reml_fit_positions"),
-    reason="engine missing position REML FFI",
+    not _have_ffi("bspline_basis", "gaussian_reml_fit"),
+    reason="engine missing bspline_basis / gaussian_reml_fit FFI",
 )
-def test_reml_positions_gradients_flow_through_torch_loop() -> None:
+def test_reml_gradients_flow_through_torch_loop() -> None:
+    """Compose bspline_basis + gaussian_reml_fit and check autograd flows back to ``t``."""
     rng = np.random.default_rng(7)
     n = 40
     t_np = np.sort(rng.uniform(0.05, 0.95, size=n))
@@ -80,7 +81,8 @@ def test_reml_positions_gradients_flow_through_torch_loop() -> None:
     k_t = torch.as_tensor(knots, dtype=torch.float64)
     p_t = torch.as_tensor(penalty, dtype=torch.float64)
 
-    out = gt.gaussian_reml_fit_positions(t_param, y_t, "bspline", k_t, p_t)
+    design = gt.bspline_basis(t_param, k_t, degree=3, periodic=False)
+    out = gt.gaussian_reml_fit(design, y_t, p_t)
     loss = (out.fitted - y_t).pow(2).mean() + 0.01 * out.reml_score
     torch.autograd.backward(loss)
     assert t_param.grad is not None

@@ -54,25 +54,13 @@ def test_bspline_basis_derivative_parity() -> None:
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
-def test_duchon_basis_1d_parity() -> None:
+def test_duchon_basis_parity() -> None:
     _require_ffi("duchon_basis_1d")
     rng = np.random.default_rng(2)
     t = rng.uniform(0.0, 1.0, size=20)
     centers = np.linspace(0.0, 1.0, 6)
-    expected = _np_api.duchon_basis_1d(t, centers, m=2, periodic=False)
-    got = gt.duchon_basis_1d(_tensor(t), _tensor(centers), m=2, periodic=False)
-    np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
-
-
-def test_duchon_basis_1d_derivative_parity() -> None:
-    _require_ffi("duchon_basis_1d_derivative")
-    rng = np.random.default_rng(3)
-    t = rng.uniform(0.0, 1.0, size=20)
-    centers = np.linspace(0.0, 1.0, 6)
-    expected = _np_api.duchon_basis_1d_derivative(t, centers, m=2, order=1, periodic=False)
-    got = gt.duchon_basis_1d_derivative(
-        _tensor(t), _tensor(centers), m=2, order=1, periodic=False
-    )
+    expected = _np_api.duchon_basis(t, centers, m=2)
+    got = gt.duchon_basis(_tensor(t), _tensor(centers), m=2)
     np.testing.assert_allclose(got.detach().numpy(), expected, rtol=0, atol=0)
 
 
@@ -170,49 +158,6 @@ def test_gaussian_reml_fit_batched_by_matches_manual_gate() -> None:
         _tensor(penalty),
         by=_tensor(by),
         by_start_col=1,
-    )
-    np.testing.assert_allclose(g.coefficients.detach().numpy(), e["coefficients"], rtol=0, atol=0)
-    np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
-
-
-def test_gaussian_reml_fit_positions_parity() -> None:
-    _require_ffi("gaussian_reml_fit_positions")
-    rng = np.random.default_rng(7)
-    n = 25
-    t = np.sort(rng.uniform(0.0, 1.0, size=n))
-    Y = np.sin(2 * np.pi * t).reshape(-1, 1) + 0.05 * rng.standard_normal((n, 1))
-    knots = np.linspace(0.0, 1.0, 8)
-    M = knots.size - 3 - 1  # degree=3 default in _position_basis_order
-    penalty = np.eye(M)
-    e = _np_api.gaussian_reml_fit_positions(t, Y, "bspline", knots, penalty)
-    g = gt.gaussian_reml_fit_positions(
-        _tensor(t), _tensor(Y), "bspline", _tensor(knots), _tensor(penalty)
-    )
-    np.testing.assert_allclose(g.coefficients.detach().numpy(), e["coefficients"], rtol=0, atol=0)
-    np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
-
-
-def test_gaussian_reml_fit_positions_batched_parity() -> None:
-    _require_ffi("gaussian_reml_fit_positions_batched")
-    rng = np.random.default_rng(8)
-    counts = [15, 18]
-    offsets = np.cumsum([0] + counts).astype(np.uintp)
-    n_total = int(offsets[-1])
-    t = np.concatenate(
-        [np.sort(rng.uniform(0.0, 1.0, size=c)) for c in counts]
-    )
-    Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n_total, 1))
-    knots = np.linspace(0.0, 1.0, 8)
-    M = knots.size - 3 - 1
-    penalty = np.eye(M)
-    e = _np_api.gaussian_reml_fit_positions_batched(t, Y, offsets, "bspline", knots, penalty)
-    g = gt.gaussian_reml_fit_positions_batched(
-        _tensor(t),
-        _tensor(Y),
-        torch.as_tensor(offsets),
-        "bspline",
-        _tensor(knots),
-        _tensor(penalty),
     )
     np.testing.assert_allclose(g.coefficients.detach().numpy(), e["coefficients"], rtol=0, atol=0)
     np.testing.assert_allclose(g.fitted.detach().numpy(), e["fitted"], rtol=0, atol=0)
