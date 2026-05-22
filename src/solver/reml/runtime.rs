@@ -192,6 +192,12 @@ impl HyperGradientBudget {
         if fixed.len() < HGB_WARMUP_ITERS {
             return None;
         }
+        if fixed
+            .iter()
+            .any(|entry| !entry.sigma_sq.is_finite() || entry.sigma_sq < 0.0)
+        {
+            return None;
+        }
         let dim = fixed[0].g_outer.len();
         if dim == 0 || fixed.iter().any(|entry| entry.g_outer.len() != dim) {
             return None;
