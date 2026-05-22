@@ -156,6 +156,11 @@ class TensorBSpline(Smooth):
 class Matern(Smooth):
     """Matérn covariance kernel basis. Multi-d. Optional axis anisotropy.
 
+    As with :class:`Duchon`, the Matérn covariance Gram matrix ``M`` with
+    entries ``M_{ij} = K_ν(‖c_i − c_j‖)`` IS exactly the corresponding
+    function-norm penalty matrix used for REML, by the kernel-Gram identity
+    described in the :class:`Duchon` docstring.
+
     Parameters
     ----------
     centers : array-like ``(K, d)``.
