@@ -36,6 +36,8 @@ use std::time::Instant;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
 use cudarc::driver::CudaContext;
 
+use super::error::GpuError;
+
 /// Measured per-device throughput used by every dispatch threshold.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceCalibration {

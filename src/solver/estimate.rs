@@ -2412,7 +2412,23 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
         warm_start_beta: Option<ArrayView1<'_, f64>>,
         context: &str,
+        design_revision: Option<u64>,
     ) -> Result<(), EstimationError> {
+        // Design-revision fast path: when ψ hasn't moved since the last
+        // full `reset_surface`, the cached surface's X, canonical penalties,
+        // gaussian-fixed cache, and PIRLS cache are all still keyed to the
+        // exact same (X, y, w, offset) — skip the eigendecomp + cache wipe.
+        let fast_path = match (design_revision, self.last_canonical_revision) {
+            (Some(rev), Some(last)) => rev == last,
+            _ => false,
+        };
+        if fast_path {
+            self.reml_state
+                .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
+            self.reml_state.setwarm_start_original_beta(warm_start_beta);
+            return Ok(());
+        }
+
         let p = x.ncols();
         let specs: Vec<PenaltySpec> = s_list.iter().map(PenaltySpec::from_blockwise_ref).collect();
         validate_penalty_specs(&specs, p, context)?;
@@ -2439,6 +2455,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state
             .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
         self.reml_state.setwarm_start_original_beta(warm_start_beta);
+        self.last_canonical_revision = design_revision;
         Ok(())
     }
 
