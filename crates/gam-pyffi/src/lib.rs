@@ -642,32 +642,63 @@ fn bspline_basis_derivative<'py>(
     Ok(basis.into_pyarray(py).unbind())
 }
 
-#[pyfunction(signature = (t, centers, m = 2, periodic = false))]
-fn duchon_basis_1d<'py>(
+/// Evaluate the Duchon m-spline basis at `points` against K `centers`,
+/// for any input dimensionality `d ≥ 1`.
+///
+/// `points` is `(N, d)`, `centers` is `(K, d)`. For 1D smooths, pass
+/// shapes `(N, 1)` and `(K, 1)`.
+///
+/// `periodic_per_axis` is an optional `Vec<bool>` of length `d`. Currently
+/// only the d=1 case supports periodicity (matches the Rust
+/// `build_periodic_duchon_basis_1d` implementation); higher-d periodicity
+/// will be rejected with a clear error.
+#[pyfunction(signature = (points, centers, m = 2, periodic_per_axis = None))]
+fn duchon_basis<'py>(
     py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
-    centers: PyReadonlyArray1<'py, f64>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
     m: usize,
-    periodic: bool,
+    periodic_per_axis: Option<Vec<bool>>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let basis = duchon_basis_1d_impl(t.as_array(), centers.as_array(), m, periodic)
-        .map_err(py_value_error)?;
-    Ok(basis.into_pyarray(py).unbind())
-}
-
-#[pyfunction(signature = (t, centers, m = 2, order = 1, periodic = false))]
-fn duchon_basis_1d_derivative<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
-    centers: PyReadonlyArray1<'py, f64>,
-    m: usize,
-    order: usize,
-    periodic: bool,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let basis =
-        duchon_basis_1d_derivative_impl(t.as_array(), centers.as_array(), m, order, periodic)
-            .map_err(py_value_error)?;
-    Ok(basis.into_pyarray(py).unbind())
+    if m == 0 {
+        return Err(py_value_error("Duchon m must be at least 1".to_string()));
+    }
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != ctrs.ncols() {
+        return Err(py_value_error(format!(
+            "points has d={} but centers has d={}",
+            pts.ncols(),
+            ctrs.ncols()
+        )));
+    }
+    let d = pts.ncols();
+    let periodic_flags = periodic_per_axis.unwrap_or_else(|| vec![false; d]);
+    if periodic_flags.len() != d {
+        return Err(py_value_error(format!(
+            "periodic_per_axis must have length d={}, got {}",
+            d,
+            periodic_flags.len()
+        )));
+    }
+    let any_periodic = periodic_flags.iter().any(|&b| b);
+    if any_periodic && d != 1 {
+        return Err(py_value_error(
+            "periodic Duchon basis only supported in d=1 currently".to_string(),
+        ));
+    }
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_from_m(m),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: any_periodic,
+    };
+    let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    Ok(built.design.into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (t, num_internal_knots, degree = 3))]
