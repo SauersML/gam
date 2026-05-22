@@ -434,9 +434,6 @@ fn build_transformation_row_derived(
     debug_assert_eq!(h_upper.len(), n);
     debug_assert_eq!(weights.len(), n);
 
-    let mut log_likelihood = 0.0;
-    let mut endpoint_q = Vec::with_capacity(n);
-
     if let Some((i, value)) = h
         .iter()
         .copied()
@@ -463,38 +460,79 @@ fn build_transformation_row_derived(
         }
         .into());
     }
-    for i in 0..n {
-        let hp = h_prime[i];
-        let inv_h_prime = 1.0 / hp;
-        let inv_h_prime_sq = inv_h_prime * inv_h_prime;
-        let inv_h_prime_cu = inv_h_prime_sq * inv_h_prime;
-        let inv_h_prime_qu = inv_h_prime_sq * inv_h_prime_sq;
-        let weighted_h = weights[i] * h[i];
-        let weighted_inv_h_prime = weights[i] * inv_h_prime;
-        let weighted_inv_h_prime_sq = weights[i] * inv_h_prime_sq;
-        let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i]).map_err(|e| {
-            format!("TransformationNormalFamily row_quantities: row {i} invalid endpoint normalizer: {e}")
-        })?;
-        let log_z = q.log_z;
-        log_likelihood += weights[i] * (-0.5 * h[i] * h[i] + hp.ln() - log_z);
-        let derived_values = [
-            ("1/h'", inv_h_prime),
-            ("1/h'^2", inv_h_prime_sq),
-            ("1/h'^3", inv_h_prime_cu),
-            ("1/h'^4", inv_h_prime_qu),
-            ("w*h", weighted_h),
-            ("w/h'", weighted_inv_h_prime),
-            ("w/h'^2", weighted_inv_h_prime_sq),
-            ("log normalizer", log_z),
-        ];
-        for (name, value) in derived_values {
-            if !value.is_finite() {
-                return Err(TransformationNormalError::NonFinite { reason: format!(
-                    "TransformationNormalFamily row_quantities: {name} at row {i} is not finite ({value}); h'={} is outside the finite exact-derivative range",
-                    h_prime[i],
-                ) }.into());
+
+    // Parallelize the per-row endpoint-normalizer build: each row runs
+    // `log_normal_cdf_diff_derivatives` (two `normal_logcdf` calls, three
+    // 5x5 truncated polynomial multiplies, 32 `signed_normal_pdf_ratio`
+    // calls) which dominates this function's runtime at biobank scale.
+    // Rows are fully independent — no shared state, no OnceLock guards —
+    // and `LogNormalCdfDiffDerivatives` is a POD struct that's `Send`.
+    // The fast finiteness check rolls all eight derived quantities into
+    // a single short-circuit `||` chain so the named-field error format
+    // only runs on the non-finite slow path.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let rows: Vec<(f64, LogNormalCdfDiffDerivatives)> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, LogNormalCdfDiffDerivatives), String> {
+            let hp = h_prime[i];
+            let inv_h_prime = 1.0 / hp;
+            let inv_h_prime_sq = inv_h_prime * inv_h_prime;
+            let inv_h_prime_cu = inv_h_prime_sq * inv_h_prime;
+            let inv_h_prime_qu = inv_h_prime_sq * inv_h_prime_sq;
+            let w_i = weights[i];
+            let h_i = h[i];
+            let weighted_h = w_i * h_i;
+            let weighted_inv_h_prime = w_i * inv_h_prime;
+            let weighted_inv_h_prime_sq = w_i * inv_h_prime_sq;
+            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i]).map_err(|e| {
+                format!("TransformationNormalFamily row_quantities: row {i} invalid endpoint normalizer: {e}")
+            })?;
+            let log_z = q.log_z;
+            let row_ll = w_i * (-0.5 * h_i * h_i + hp.ln() - log_z);
+            // Fast path: a single short-circuited finiteness check. Only
+            // when something is non-finite do we walk the named-field
+            // table to produce a precise diagnostic.
+            if !(inv_h_prime.is_finite()
+                && inv_h_prime_sq.is_finite()
+                && inv_h_prime_cu.is_finite()
+                && inv_h_prime_qu.is_finite()
+                && weighted_h.is_finite()
+                && weighted_inv_h_prime.is_finite()
+                && weighted_inv_h_prime_sq.is_finite()
+                && log_z.is_finite())
+            {
+                let derived_values = [
+                    ("1/h'", inv_h_prime),
+                    ("1/h'^2", inv_h_prime_sq),
+                    ("1/h'^3", inv_h_prime_cu),
+                    ("1/h'^4", inv_h_prime_qu),
+                    ("w*h", weighted_h),
+                    ("w/h'", weighted_inv_h_prime),
+                    ("w/h'^2", weighted_inv_h_prime_sq),
+                    ("log normalizer", log_z),
+                ];
+                for (name, value) in derived_values {
+                    if !value.is_finite() {
+                        return Err(TransformationNormalError::NonFinite { reason: format!(
+                            "TransformationNormalFamily row_quantities: {name} at row {i} is not finite ({value}); h'={hp} is outside the finite exact-derivative range",
+                        ) }.into());
+                    }
+                }
+                unreachable!("non-finite branch must have produced an error above");
             }
-        }
+            Ok((row_ll, q))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Sum row contributions in index order so the result is bit-identical
+    // to the previous serial accumulation. The parallel section above only
+    // parallelized the independent per-row computation; the final scalar
+    // reduction stays serial to preserve numerical reproducibility against
+    // existing tests.
+    let mut log_likelihood = 0.0;
+    let mut endpoint_q = Vec::with_capacity(n);
+    for (row_ll, q) in rows {
+        log_likelihood += row_ll;
         endpoint_q.push(q);
     }
     if !log_likelihood.is_finite() {
