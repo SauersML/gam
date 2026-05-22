@@ -5621,6 +5621,8 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
             col += n;
         }
     }
+    let (coefficient_provenance, term_blocks) =
+        coefficient_provenance_for_state(payload, fit.beta.len());
     let out = CoefficientStatePayload {
         beta: fit.beta.to_vec(),
         covariance_flat: cov.iter().copied().collect(),
@@ -5630,7 +5632,8 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         schema: payload.data_schema.clone(),
         training_feature_ranges: payload.training_feature_ranges.clone(),
         random_column_ranges: random_ranges,
-        coefficient_provenance: coefficient_provenance_for_state(payload, fit.beta.len()),
+        coefficient_provenance,
+        term_blocks,
         group_metadata: payload.group_metadata.clone(),
     };
     serde_json::to_string(&out)
