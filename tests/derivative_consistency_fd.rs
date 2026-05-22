@@ -290,20 +290,6 @@ fn max_rel_err_vec(a: &Array1<f64>, b: &Array1<f64>, floor: f64) -> f64 {
     worst
 }
 
-fn max_rel_err_mat(a: &Array2<f64>, b: &Array2<f64>, floor: f64) -> f64 {
-    assert_eq!(a.shape(), b.shape(), "shape mismatch in max_rel_err_mat");
-    let (rows, cols) = a.dim();
-    let mut worst = 0.0_f64;
-    for i in 0..rows {
-        for j in 0..cols {
-            let denom = a[[i, j]].abs().max(b[[i, j]].abs()).max(floor);
-            let rel = (a[[i, j]] - b[[i, j]]).abs() / denom;
-            worst = worst.max(rel);
-        }
-    }
-    worst
-}
-
 // -----------------------------------------------------------------------
 // Test 1: analytic ∇V vs centered FD of V
 // -----------------------------------------------------------------------
