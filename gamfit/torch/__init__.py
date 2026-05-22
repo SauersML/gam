@@ -46,6 +46,7 @@ try:
         gaussian_reml_fit,
         gaussian_reml_fit_additive,
         gaussian_reml_fit_batched,
+        gaussian_reml_fit_blocks,
     )
     from .geometry import (
         alr,
@@ -105,6 +106,7 @@ __all__ = [
     "gaussian_reml_fit",
     "gaussian_reml_fit_additive",
     "gaussian_reml_fit_batched",
+    "gaussian_reml_fit_blocks",
     "gaussian_weighted_ridge",
     "gaussian_weighted_ridge_batch",
     "inverse_alr",

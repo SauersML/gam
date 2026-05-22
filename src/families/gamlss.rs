@@ -7589,6 +7589,62 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(ll)
     }
 
+    /// Outer-only log-likelihood with optional row subsample.
+    ///
+    /// When `options.outer_score_subsample` is `Some`, only the sampled rows
+    /// contribute; each row's per-row log-likelihood term is multiplied by
+    /// `WeightedOuterRow.weight`, the Horvitz–Thompson inverse-inclusion
+    /// factor 1/π_i (uniform or stratified sampling both supported), so the
+    /// partial sum is an unbiased estimator of the full-data log-likelihood.
+    /// When `None`, this returns the full-data `log_likelihood_only`. Inner
+    /// PIRLS line searches never install the subsample option, so they
+    /// continue to score the exact full-data log-likelihood.
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        let Some(subsample) = options.outer_score_subsample.as_ref() else {
+            return self.log_likelihood_only(block_states);
+        };
+        if block_states.len() != 2 {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            }
+            .into());
+        }
+        let n = self.y.len();
+        let etamu = &block_states[Self::BLOCK_MU].eta;
+        let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        if etamu.len() != n || eta_log_sigma.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+            }
+            .into());
+        }
+        let ln2pi = (2.0 * std::f64::consts::PI).ln();
+        use rayon::iter::ParallelIterator;
+        let ll: f64 = subsample
+            .rows
+            .par_iter()
+            .map(|row| {
+                let i = row.index;
+                let wi = self.weights[i];
+                if wi == 0.0 {
+                    return 0.0;
+                }
+                let sigma_i = logb_sigma_from_eta_scalar(eta_log_sigma[i]);
+                let inv_s2 = (sigma_i * sigma_i).recip();
+                let r = self.y[i] - etamu[i];
+                row.weight * wi * (-0.5 * (r * r * inv_s2 + ln2pi + 2.0 * sigma_i.ln()))
+            })
+            .sum();
+        Ok(ll)
+    }
+
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
@@ -7832,6 +7888,40 @@ impl CustomFamily for GaussianLocationScaleFamily {
             xmu.into_owned(),
             x_ls.into_owned(),
         )?;
+        Ok(Some(Arc::new(workspace)))
+    }
+
+    /// Outer-aware joint-Hessian workspace with optional row subsample.
+    ///
+    /// When `options.outer_score_subsample` is `None`, this is byte-identical
+    /// to `exact_newton_joint_hessian_workspace`. When `Some`, the precomputed
+    /// per-row coefficient arrays (`coeff_mm`, `coeff_ml`, `coeff_ll`) — which
+    /// every downstream assembly (`hessian_dense`, `hessian_matvec`,
+    /// `hessian_diagonal`) consumes row-linearly via `Xᵀ diag(W) X` — are
+    /// replaced by a Horvitz–Thompson mask: each sampled row's coefficient is
+    /// multiplied by `WeightedOuterRow.weight` (the inverse-inclusion factor
+    /// 1/π_i; uniform or stratified sampling both supported), and non-sampled
+    /// rows are zeroed. The resulting joint Hessian is an unbiased estimator
+    /// of the full-data joint Hessian. Inner PIRLS never installs the option,
+    /// so the inner solve continues to consume the exact full-data Hessian.
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let Some((xmu, x_ls)) = self.exact_joint_dense_block_designs(Some(specs))? else {
+            return Ok(None);
+        };
+        let mut workspace = GaussianLocationScaleHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            xmu.into_owned(),
+            x_ls.into_owned(),
+        )?;
+        if let Some(subsample) = options.outer_score_subsample.as_ref() {
+            workspace.apply_outer_subsample(subsample.rows.as_ref());
+        }
         Ok(Some(Arc::new(workspace)))
     }
 
@@ -8510,6 +8600,7 @@ impl GaussianLocationScaleHessianWorkspace {
     /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
     /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian.
+    #[allow(dead_code)]
     fn apply_outer_subsample(
         &mut self,
         rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],

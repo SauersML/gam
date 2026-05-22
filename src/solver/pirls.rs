@@ -4270,6 +4270,10 @@ where
     struct AndersonOneState {
         prev_beta: Option<Array1<f64>>,
         prev_residual: Option<Array1<f64>>,
+        r_k: Array1<f64>,
+        dr: Array1<f64>,
+        dx: Array1<f64>,
+        beta_accel: Array1<f64>,
         consecutive_accepts: usize,
         consecutive_rejects: usize,
         disabled: bool,
@@ -4281,10 +4285,20 @@ where
             Self {
                 prev_beta: None,
                 prev_residual: None,
+                r_k: Array1::zeros(0),
+                dr: Array1::zeros(0),
+                dx: Array1::zeros(0),
+                beta_accel: Array1::zeros(0),
                 consecutive_accepts: 0,
                 consecutive_rejects: 0,
                 disabled: false,
                 engaged_logged: false,
+            }
+        }
+
+        fn ensure_len(buf: &mut Array1<f64>, len: usize) {
+            if buf.len() != len {
+                *buf = Array1::zeros(len);
             }
         }
 
@@ -4295,7 +4309,11 @@ where
         /// Returns `Some(beta_accel)` when a finite acceleration is available,
         /// `None` when AA should be skipped (no history yet, disabled, or
         /// numerical floor hit).
-        fn aa1_mix(&self, beta_old: &Array1<f64>, beta_new: &Array1<f64>) -> Option<Array1<f64>> {
+        fn aa1_mix(
+            &mut self,
+            beta_old: &Array1<f64>,
+            beta_new: &Array1<f64>,
+        ) -> Option<&Array1<f64>> {
             if self.disabled {
                 return None;
             }
@@ -4304,26 +4322,39 @@ where
             if prev_beta.len() != beta_old.len() || prev_residual.len() != beta_old.len() {
                 return None;
             }
+            let len = beta_old.len();
+            Self::ensure_len(&mut self.r_k, len);
+            Self::ensure_len(&mut self.dr, len);
+            Self::ensure_len(&mut self.dx, len);
+            Self::ensure_len(&mut self.beta_accel, len);
             // r_k = beta_new - beta_old
-            let r_k: Array1<f64> = beta_new - beta_old;
+            Zip::from(&mut self.r_k)
+                .and(beta_new)
+                .and(beta_old)
+                .for_each(|r, &new, &old| *r = new - old);
             // dr = r_k - prev_residual
-            let dr: Array1<f64> = &r_k - prev_residual;
+            Zip::from(&mut self.dr)
+                .and(&self.r_k)
+                .and(prev_residual)
+                .for_each(|dr, &r, &prev| *dr = r - prev);
             // dx = beta_old - prev_beta
-            let dx: Array1<f64> = beta_old - prev_beta;
-            let den = dr.dot(&dr);
+            Zip::from(&mut self.dx)
+                .and(beta_old)
+                .and(prev_beta)
+                .for_each(|dx, &old, &prev| *dx = old - prev);
+            let den = self.dr.dot(&self.dr);
             if !den.is_finite() || den < AA1_DAMPING_FLOOR {
                 return None;
             }
-            let alpha = (dr.dot(&r_k) / den).clamp(-1.0, 1.0);
+            let alpha = (self.dr.dot(&self.r_k) / den).clamp(-1.0, 1.0);
             // beta_accel = beta_new - alpha * (dx + dr)
-            let mut beta_accel = beta_new.clone();
-            for i in 0..beta_accel.len() {
-                beta_accel[i] -= alpha * (dx[i] + dr[i]);
+            for i in 0..len {
+                self.beta_accel[i] = beta_new[i] - alpha * (self.dx[i] + self.dr[i]);
             }
-            if !array1_is_finite(&beta_accel) {
+            if !array1_is_finite(&self.beta_accel) {
                 return None;
             }
-            Some(beta_accel)
+            Some(&self.beta_accel)
         }
 
         fn note_accept(&mut self, iter: usize) {
@@ -4351,8 +4382,31 @@ where
         }
 
         fn update_history(&mut self, beta_old: &Array1<f64>, residual: &Array1<f64>) {
-            self.prev_beta = Some(beta_old.clone());
-            self.prev_residual = Some(residual.clone());
+            // AA history must outlive this LM attempt; assign into retained
+            // buffers so accepted Fisher steps do not allocate two O(p) clones.
+            match self.prev_beta.as_mut() {
+                Some(prev) if prev.len() == beta_old.len() => prev.assign(beta_old),
+                _ => self.prev_beta = Some(beta_old.to_owned()),
+            }
+            match self.prev_residual.as_mut() {
+                Some(prev) if prev.len() == residual.len() => prev.assign(residual),
+                _ => self.prev_residual = Some(residual.to_owned()),
+            }
+        }
+    }
+
+    fn reuse_regularized_hessian_buffer(
+        existing: Option<crate::linalg::matrix::SymmetricMatrix>,
+        source: &crate::linalg::matrix::SymmetricMatrix,
+    ) -> crate::linalg::matrix::SymmetricMatrix {
+        match (existing, source.as_dense()) {
+            (Some(crate::linalg::matrix::SymmetricMatrix::Dense(mut buf)), Some(src))
+                if buf.nrows() == src.nrows() && buf.ncols() == src.ncols() =>
+            {
+                buf.assign(src);
+                crate::linalg::matrix::SymmetricMatrix::Dense(buf)
+            }
+            _ => source.clone(),
         }
     }
 
@@ -5290,10 +5344,8 @@ where
                             state =
                                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                             curvature_total += fisher_fallback_start.elapsed();
-                            regularized = reuse_regularized_hessian_buffer(
-                                Some(regularized),
-                                &state.hessian,
-                            );
+                            regularized =
+                                reuse_regularized_hessian_buffer(Some(regularized), &state.hessian);
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
                             sparse_applied_lambda = 0.0;
