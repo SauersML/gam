@@ -6933,29 +6933,14 @@ fn try_tangent_projected_evaluate(
     // applies `ZᵀMZ` correctly in its trace methods.
     //
     // `firth` and `ext_coords` carry p-space objects (Jeffreys `½ log|J|`,
-    // ext-coord g/drift) whose tangent variants require new math (`½ log|ZᵀJZ|`,
-    // ZᵀgZ-style drift projections, projected pair callbacks).  Surface a
-    // typed error rather than degrade silently.
-    if solution.firth.is_some() {
-        return Err(
-            "constraint-tangent LAML projection: solutions carrying a Firth/Jeffreys \
-             term need a tangent-projected `½ log|ZᵀJZ|` Jeffreys variant, which the \
-             `FirthDenseOperator` does not currently expose. Drop `firth` from the inner \
-             solution when active constraints are present, or extend the operator with \
-             a tangent-projected jeffreys_logdet."
-                .to_string(),
-        );
-    }
-    if !solution.ext_coords.is_empty() {
-        return Err(format!(
-            "constraint-tangent LAML projection: solutions with {} extended \
-             hyperparameter coordinates (ψ/τ) need each ext coord's `g` (p-vector) \
-             projected via Zᵀ and its `drift` (∂H/∂ψ_i in p-space) projected via ZᵀMZ, \
-             plus tangent-projected variants of the pair callbacks. The implicit-operator \
-             drift path makes this nontrivial; extend the projection when needed.",
-            solution.ext_coords.len(),
-        ));
-    }
+    // ext-coord g/drift).  Both are projected here under the same
+    // tangent-projected LAML setup as the rest of this routine
+    // (`½ log|J| → ½ log|ZᵀJZ|`, `g → Zᵀ g`, `drift M → Zᵀ M Z`).  The
+    // only remaining unsupported case is the `ValueGradientHessian`
+    // mode with non-empty `ext_coord_pair_fn` / `rho_ext_pair_fn` —
+    // those callbacks return objects in p-space whose projected form
+    // requires composing with `Z` per-call; for `ValueAndGradient` the
+    // per-coord `g`/`drift` is sufficient.
     let z = match compute_active_constraint_tangent_basis(&block.a) {
         Some(z) => z,
         None => {
