@@ -7197,6 +7197,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
         let mut ll = 0.0;
 
+        const CHUNK: usize = 1024;
         if let (
             Some(y_s),
             Some(w_s),
@@ -7216,57 +7217,66 @@ impl CustomFamily for GaussianLocationScaleFamily {
             z_ls.as_slice_memory_order_mut(),
             w_ls.as_slice_memory_order_mut(),
         ) {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            // Per-row Gaussian LS kernel emits 5 outputs: ll + 4 working
-            // arrays. Independent across rows.
-            let rows: Vec<(f64, f64, f64, f64, f64)> = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let row = gaussian_diagonal_row_kernel(y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi);
-                    (
-                        row.log_likelihood,
-                        row.location_working_weight,
-                        mu_s[i] + row.location_working_shift,
-                        row.log_sigma_working_weight,
-                        row.log_sigma_working_response,
-                    )
+            // Per-row Gaussian LS kernel writes 4 working arrays directly into
+            // the output slices; ll is reduced via Rayon's sum. Independent
+            // across rows.
+            ll += zmu_s
+                .par_chunks_mut(CHUNK)
+                .zip(wmu_s.par_chunks_mut(CHUNK))
+                .zip(zls_s.par_chunks_mut(CHUNK))
+                .zip(wls_s.par_chunks_mut(CHUNK))
+                .enumerate()
+                .map(|(chunk_idx, (((zmu_c, wmu_c), zls_c), wls_c))| {
+                    let start = chunk_idx * CHUNK;
+                    let mut local_ll = 0.0;
+                    for local in 0..zmu_c.len() {
+                        let i = start + local;
+                        let row = gaussian_diagonal_row_kernel(
+                            y_s[i], mu_s[i], ls_s[i], w_s[i], ln2pi,
+                        );
+                        zmu_c[local] = mu_s[i] + row.location_working_shift;
+                        wmu_c[local] = row.location_working_weight;
+                        zls_c[local] = row.log_sigma_working_response;
+                        wls_c[local] = row.log_sigma_working_weight;
+                        local_ll += row.log_likelihood;
+                    }
+                    local_ll
                 })
-                .collect();
-            for (i, (ll_i, w_i, z_i, wl_i, zl_i)) in rows.into_iter().enumerate() {
-                ll += ll_i;
-                wmu_s[i] = w_i;
-                zmu_s[i] = z_i;
-                wls_s[i] = wl_i;
-                zls_s[i] = zl_i;
-            }
+                .sum::<f64>();
         } else {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let rows: Vec<(f64, f64, f64, f64, f64)> = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let row = gaussian_diagonal_row_kernel(
-                        self.y[i],
-                        etamu[i],
-                        eta_log_sigma[i],
-                        self.weights[i],
-                        ln2pi,
-                    );
-                    (
-                        row.log_likelihood,
-                        row.location_working_weight,
-                        etamu[i] + row.location_working_shift,
-                        row.log_sigma_working_weight,
-                        row.log_sigma_working_response,
-                    )
+            // Fallback path: inputs are not contiguous. Outputs (just-allocated
+            // Array1::zeros) always are. Reborrow input views into the closure.
+            let y_view = self.y.view();
+            let w_view = self.weights.view();
+            let mu_view = etamu.view();
+            let ls_view = eta_log_sigma.view();
+            let zmu_s = zmu.as_slice_memory_order_mut().expect("zeros is contiguous");
+            let wmu_s = wmu.as_slice_memory_order_mut().expect("zeros is contiguous");
+            let zls_s = z_ls.as_slice_memory_order_mut().expect("zeros is contiguous");
+            let wls_s = w_ls.as_slice_memory_order_mut().expect("zeros is contiguous");
+            ll += zmu_s
+                .par_chunks_mut(CHUNK)
+                .zip(wmu_s.par_chunks_mut(CHUNK))
+                .zip(zls_s.par_chunks_mut(CHUNK))
+                .zip(wls_s.par_chunks_mut(CHUNK))
+                .enumerate()
+                .map(|(chunk_idx, (((zmu_c, wmu_c), zls_c), wls_c))| {
+                    let start = chunk_idx * CHUNK;
+                    let mut local_ll = 0.0;
+                    for local in 0..zmu_c.len() {
+                        let i = start + local;
+                        let row = gaussian_diagonal_row_kernel(
+                            y_view[i], mu_view[i], ls_view[i], w_view[i], ln2pi,
+                        );
+                        zmu_c[local] = mu_view[i] + row.location_working_shift;
+                        wmu_c[local] = row.location_working_weight;
+                        zls_c[local] = row.log_sigma_working_response;
+                        wls_c[local] = row.log_sigma_working_weight;
+                        local_ll += row.log_likelihood;
+                    }
+                    local_ll
                 })
-                .collect();
-            for (i, (ll_i, w_i, z_i, wl_i, zl_i)) in rows.into_iter().enumerate() {
-                ll += ll_i;
-                wmu[i] = w_i;
-                zmu[i] = z_i;
-                w_ls[i] = wl_i;
-                z_ls[i] = zl_i;
-            }
+                .sum::<f64>();
         }
 
         Ok(FamilyEvaluation {
@@ -10622,47 +10632,65 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         if eta_mu.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
             return Err(GamlssError::DimensionMismatch { reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string() }.into());
         }
-        let q = eta_mu + etaw;
         let ln2pi = (2.0 * std::f64::consts::PI).ln();
-        // Per-row kernel emits 6 outputs (ll contribution + 5 working
-        // arrays). Independent across rows.
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let rows: Vec<(f64, f64, f64, f64, f64, f64)> = (0..n)
-            .into_par_iter()
-            .map(|i| {
-                let row = gaussian_diagonal_row_kernel(
-                    self.y[i],
-                    q[i],
-                    eta_ls[i],
-                    self.weights[i],
-                    ln2pi,
-                );
-                (
-                    row.log_likelihood,
-                    row.location_working_weight,
-                    eta_mu[i] + row.location_working_shift,
-                    etaw[i] + row.location_working_shift,
-                    row.log_sigma_working_weight,
-                    row.log_sigma_working_response,
-                )
-            })
-            .collect();
-        let mut ll = 0.0;
+        // Per-row kernel emits 6 working values into pre-allocated outputs;
+        // ll is reduced via Rayon's sum. Independent across rows. Note
+        // wmu == ww (both equal location_working_weight) and the mean+wiggle
+        // working responses share row.location_working_shift, applied to
+        // eta_mu[i] and etaw[i] respectively. The previous `q = eta_mu + etaw`
+        // intermediate is inlined to avoid an extra n-vector allocation.
         let mut zmu = Array1::<f64>::zeros(n);
         let mut wmu = Array1::<f64>::zeros(n);
         let mut zls = Array1::<f64>::zeros(n);
         let mut wls = Array1::<f64>::zeros(n);
         let mut zw = Array1::<f64>::zeros(n);
         let mut ww = Array1::<f64>::zeros(n);
-        for (i, (ll_i, w_i, zmu_i, zw_i, wls_i, zls_i)) in rows.into_iter().enumerate() {
-            ll += ll_i;
-            wmu[i] = w_i;
-            ww[i] = w_i;
-            zmu[i] = zmu_i;
-            zw[i] = zw_i;
-            wls[i] = wls_i;
-            zls[i] = zls_i;
-        }
+        const CHUNK: usize = 1024;
+        let zmu_s = zmu.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let wmu_s = wmu.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let zls_s = zls.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let wls_s = wls.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let zw_s = zw.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let ww_s = ww.as_slice_memory_order_mut().expect("zeros is contiguous");
+        let y_view = self.y.view();
+        let w_view = self.weights.view();
+        let eta_mu_view = eta_mu.view();
+        let eta_ls_view = eta_ls.view();
+        let etaw_view = etaw.view();
+        let ll: f64 = zmu_s
+            .par_chunks_mut(CHUNK)
+            .zip(wmu_s.par_chunks_mut(CHUNK))
+            .zip(zls_s.par_chunks_mut(CHUNK))
+            .zip(wls_s.par_chunks_mut(CHUNK))
+            .zip(zw_s.par_chunks_mut(CHUNK))
+            .zip(ww_s.par_chunks_mut(CHUNK))
+            .enumerate()
+            .map(|(chunk_idx, (((((zmu_c, wmu_c), zls_c), wls_c), zw_c), ww_c))| {
+                let start = chunk_idx * CHUNK;
+                let mut local_ll = 0.0;
+                for local in 0..zmu_c.len() {
+                    let i = start + local;
+                    let q_i = eta_mu_view[i] + etaw_view[i];
+                    let row = gaussian_diagonal_row_kernel(
+                        y_view[i],
+                        q_i,
+                        eta_ls_view[i],
+                        w_view[i],
+                        ln2pi,
+                    );
+                    let w_i = row.location_working_weight;
+                    let shift = row.location_working_shift;
+                    zmu_c[local] = eta_mu_view[i] + shift;
+                    wmu_c[local] = w_i;
+                    zw_c[local] = etaw_view[i] + shift;
+                    ww_c[local] = w_i;
+                    zls_c[local] = row.log_sigma_working_response;
+                    wls_c[local] = row.log_sigma_working_weight;
+                    local_ll += row.log_likelihood;
+                }
+                local_ll
+            })
+            .sum();
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,

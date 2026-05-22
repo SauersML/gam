@@ -8290,38 +8290,7 @@ impl BernoulliMarginalSlopeFamily {
             && self.effective_flex_active(block_states)?
             && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
         {
-            let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
-            // Per-row dedup: within ONE row's denested-partition output, the
-            // score-warp and link-wiggle bases occasionally produce cells
-            // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
-            // moments once and cloning the result into the other slots is
-            // numerically identical to evaluating each cell independently
-            // (`evaluate_cell_moments_lru` is a pure function of the cell), and
-            // skips redundant work. The dedup is purely intra-row, so it is
-            // orthogonal to the per-family LRU (which is keyed across rows)
-            // and the affine tail-cell memo (a separate mechanism).
-            let mut dedup: HashMap<
-                exact_kernel::CellFingerprint,
-                exact_kernel::CellDerivativeMomentState,
-            > = HashMap::new();
-            let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
-            for partition_cell in cells.into_iter() {
-                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                let state: exact_kernel::CellDerivativeMomentState =
-                    if let Some(existing) = dedup.get(&key) {
-                        existing.clone()
-                    } else {
-                        let computed =
-                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                        dedup.insert(key, computed.clone());
-                        computed
-                    };
-                out.push(CachedDenestedCellMoments {
-                    partition_cell,
-                    state,
-                });
-            }
-            Some(out)
+            Some(self.compute_row_degree9_cells(intercept, slope, beta_h, beta_w)?)
         } else {
             None
         };
