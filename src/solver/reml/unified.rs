@@ -7544,6 +7544,51 @@ pub fn reml_laml_evaluate(
         }
         .into());
     }
+    // Tangent-projection contract. When the inner converged at a constrained-
+    // stationary point with a non-empty active set, the principled LAML outer
+    // objective lives on the constraint tangent space T = null(A_act):
+    //
+    //     V_T(ρ) = -ℓ(β̂) + ½ β̂ᵀ S(λ) β̂ + ½ log|ZᵀHZ| − ½ log|ZᵀS(λ)Z|_+,
+    //     ∂_k V_T = ½ aᵀ_k β̂ + ½ tr((ZᵀHZ)⁻¹ Zᵀ(λ_k S_k) Z) − ½ ∂_k log|ZᵀSZ|_+
+    //
+    // where Z ∈ ℝ^{p × (p − k_act)} is an orthonormal basis for null(A_act).
+    // Refs: Wood 2011; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2.
+    //
+    // The current evaluator computes the full-space `log|H|`, `log|S|_+`,
+    // and `tr(H⁻¹·∂H/∂ρ)`. Under an active constraint whose normal lies
+    // outside `null(S_k)`, these inflate by O(1/σ_min(H_active_normal))
+    // while the tangent-projected formulas stay bounded. The IFT
+    // correction `−aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r_proj` cannot
+    // repair this (it is independent of the envelope trace and is
+    // identically zero at the cert exit where `r_proj ≈ 0`).
+    //
+    // Until the tangent-projection dispatch lands in reml_laml_evaluate
+    // (Z computation, H_T operator over `ZᵀHZ`, per-coord `ZᵀS_kZ`,
+    // tangent-space penalty log-determinant derivatives), refuse to
+    // silently return a wrong derivative: surface a typed contract error
+    // that names what is missing.
+    if !envelope_suppresses_outputs
+        && matches!(mode, EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian)
+        && solution
+            .active_constraints
+            .as_ref()
+            .is_some_and(|block| block.a.nrows() > 0)
+    {
+        return Err(RemlError::ContractViolation {
+            reason: "REML/LAML outer derivative requested under a non-empty active inequality \
+                     constraint set, but constraint-tangent-space projection is not yet \
+                     plumbed through this evaluator. Principled formulas: \
+                     cost = … + ½ log|ZᵀHZ| − ½ log|ZᵀSZ|_+, \
+                     grad_k = … + ½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z) − ½ ∂_k log|ZᵀSZ|_+, \
+                     with Z = orthonormal basis of null(A_act). The full-space formula \
+                     currently in use inflates by O(1/σ_min(H_active_normal)) when the \
+                     constraint normal is not in null(S_k); the IFT residual correction \
+                     cannot repair the envelope trace. Refs: Wood 2011; Wood–Pya–Säfken \
+                     2016 §3; Marra–Wood 2012 §2"
+                .to_string(),
+        }
+        .into());
+    }
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
