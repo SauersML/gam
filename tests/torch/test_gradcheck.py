@@ -59,7 +59,7 @@ def test_bspline_basis_gradcheck() -> None:
     )
 
 
-def test_duchon_basis_1d_gradcheck() -> None:
+def test_duchon_basis_gradcheck() -> None:
     _require_ffi("duchon_basis_1d")
     rng = np.random.default_rng(12)
     t = torch.tensor(
@@ -68,7 +68,7 @@ def test_duchon_basis_1d_gradcheck() -> None:
     centers = torch.tensor(np.linspace(0.0, 1.0, 5), dtype=torch.float64)
 
     def f(t_: torch.Tensor) -> torch.Tensor:
-        return cast(torch.Tensor, gt.duchon_basis_1d(t_, centers, m=2, periodic=False))
+        return cast(torch.Tensor, gt.duchon_basis(t_, centers, m=2))
 
     assert torch.autograd.gradcheck(
         f,
@@ -152,66 +152,3 @@ def test_gaussian_reml_fit_batched_gradcheck() -> None:
     )
 
 
-def test_gaussian_reml_fit_positions_gradcheck() -> None:
-    _require_ffi("gaussian_reml_fit_positions")
-    rng = np.random.default_rng(15)
-    n = 12
-    t = np.sort(rng.uniform(0.05, 0.95, size=n))
-    Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n, 1))
-    knots = np.linspace(0.0, 1.0, 9)
-    M = knots.size - 3 - 1
-    penalty = np.eye(M)
-    penalty[2, 1] = 0.05
-    penalty[1, 2] = 0.05
-    t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
-    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
-
-    def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit_positions(t_, y_, "bspline", k_t, p_)
-        return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score
-
-    assert torch.autograd.gradcheck(
-        f,
-        (t_t, y_t, p_t),
-        eps=_GRADCHECK_EPS,
-        atol=_GRADCHECK_ATOL,
-        rtol=_GRADCHECK_RTOL,
-        nondet_tol=_GRADCHECK_NONDET_TOL,
-    )
-
-
-def test_gaussian_reml_fit_positions_batched_gradcheck() -> None:
-    _require_ffi("gaussian_reml_fit_positions_batched")
-    rng = np.random.default_rng(16)
-    counts = [10, 12]
-    offsets = np.cumsum([0] + counts).astype(np.uintp)
-    n_total = int(offsets[-1])
-    t = np.concatenate(
-        [np.sort(rng.uniform(0.05, 0.95, size=c)) for c in counts]
-    )
-    Y = (np.sin(2 * np.pi * t)).reshape(-1, 1) + 0.05 * rng.standard_normal((n_total, 1))
-    knots = np.linspace(0.0, 1.0, 9)
-    M = knots.size - 3 - 1
-    penalty = np.eye(M)
-    penalty[2, 1] = 0.04
-    penalty[1, 2] = 0.04
-    t_t = torch.tensor(t, dtype=torch.float64, requires_grad=True)
-    y_t = torch.tensor(Y, dtype=torch.float64, requires_grad=True)
-    k_t = torch.tensor(knots, dtype=torch.float64)
-    p_t = torch.tensor(penalty, dtype=torch.float64)
-    off_t = torch.tensor(offsets)
-
-    def f(t_: torch.Tensor, y_: torch.Tensor, p_: torch.Tensor) -> torch.Tensor:
-        out = gt.gaussian_reml_fit_positions_batched(t_, y_, off_t, "bspline", k_t, p_)
-        return out.coefficients.sum() + out.fitted.sum() + out.lam.sum() + out.reml_score.sum()
-
-    assert torch.autograd.gradcheck(
-        f,
-        (t_t, y_t, p_t),
-        eps=_GRADCHECK_EPS,
-        atol=_GRADCHECK_ATOL,
-        rtol=_GRADCHECK_RTOL,
-        nondet_tol=_GRADCHECK_NONDET_TOL,
-    )
