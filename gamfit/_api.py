@@ -1136,26 +1136,68 @@ def _duchon_operator_penalties(
     )
 
 
-def _duchon_function_norm_penalty(
+def duchon_function_norm_penalty(
     centers: Any,
     *,
     m: int = 2,
-    periodic: bool = False,
-    period: float | None = None,
+    periodic_per_axis: Any = None,
 ) -> Any:
-    """Internal Duchon RKHS/function-norm penalty constructor."""
+    """Duchon m-spline RKHS / function-norm penalty matrix.
+
+    Parameters
+    ----------
+    centers : array-like
+        Control points. Shape ``(K,)`` or ``(K, 1)`` for 1D (auto-promoted).
+        Shape ``(K, d)`` for higher dimensions (currently only the 1D path
+        is exposed by the Rust binding — d > 1 will raise an error until
+        the multi-d penalty binding lands).
+    m : int, default 2
+        Spline order.
+    periodic_per_axis : sequence of bool of length d, optional
+        Per-axis periodicity. Currently only d=1 supports periodicity.
+
+    Returns
+    -------
+    ndarray of shape (K, K) — SPD penalty matrix.
+    """
     import numpy as np
+
+    ctrs = np.asarray(centers, dtype=float)
+    if ctrs.ndim == 2:
+        if ctrs.shape[1] != 1:
+            raise NotImplementedError(
+                f"d={ctrs.shape[1]} Duchon penalty not yet exposed; "
+                "Rust binding accepts only 1D centers currently."
+            )
+        ctrs_1d = ctrs[:, 0]
+    elif ctrs.ndim == 1:
+        ctrs_1d = ctrs
+    else:
+        raise ValueError(f"centers must be 1D or 2D, got {ctrs.ndim}D")
+
+    per = False
+    if periodic_per_axis is not None:
+        per_list = [bool(p) for p in periodic_per_axis]
+        if len(per_list) != 1:
+            raise ValueError(
+                f"periodic_per_axis must have length matching centers dim (1), got {len(per_list)}"
+            )
+        per = per_list[0]
 
     try:
         penalty = rust_module().duchon_function_norm_penalty(
-            _numeric_vector(centers, "centers"),
+            ctrs_1d,
             int(m),
-            bool(periodic),
-            None if period is None else float(period),
+            per,
+            None,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
     return np.asarray(penalty, dtype=float)
+
+
+# Backward-compat private alias (callers in this module still reference it)
+_duchon_function_norm_penalty = duchon_function_norm_penalty
 
 
 def _thin_plate_penalty(
