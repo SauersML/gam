@@ -102,16 +102,15 @@ impl EncodedDataset {
             .axis_iter(Axis(1))
             .into_par_iter()
             .map(|col| {
-                let (lo, hi) = col.iter().fold(
-                    (f64::INFINITY, f64::NEG_INFINITY),
-                    |(lo, hi), &v| {
-                        if v.is_finite() {
-                            (lo.min(v), hi.max(v))
-                        } else {
-                            (lo, hi)
-                        }
-                    },
-                );
+                let (lo, hi) =
+                    col.iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                            if v.is_finite() {
+                                (lo.min(v), hi.max(v))
+                            } else {
+                                (lo, hi)
+                            }
+                        });
                 if !lo.is_finite() || !hi.is_finite() {
                     (0.0, 0.0)
                 } else {
@@ -899,11 +898,7 @@ fn load_delimited_with_schema(
             for (i, &v) in col_vec.iter().enumerate() {
                 if !v.is_finite() {
                     return Some(DataError::InvalidValue {
-                        reason: format!(
-                            "non-finite value at row {}, column '{}'",
-                            i + 1,
-                            header
-                        ),
+                        reason: format!("non-finite value at row {}, column '{}'", i + 1, header),
                     });
                 }
                 out_col[i] = v;
