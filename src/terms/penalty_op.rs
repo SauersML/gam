@@ -20,7 +20,7 @@ use std::sync::Arc;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::faer_ndarray::{FaerEigh, fast_av_view_into};
 use crate::terms::closed_form_operator::ClosedFormPenaltyOperator;
 
 /// Square symmetric PSD penalty operator.
@@ -79,8 +79,8 @@ impl PenaltyOp for Array2<f64> {
         self.nrows()
     }
 
-    fn matvec(&self, w: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        out.assign(&self.dot(&w));
+    fn matvec(&self, w: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
+        fast_av_view_into(self, &w, out);
     }
 
     fn diag(&self) -> Array1<f64> {
