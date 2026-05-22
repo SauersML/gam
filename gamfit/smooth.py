@@ -86,6 +86,20 @@ class Duchon(Smooth):
       Duchon m=2 with the function-norm penalty).
     * m=2, d ≥ 3 — Duchon's generalized thin-plate spline.
 
+    Kernel-Gram = function-norm penalty identity
+    --------------------------------------------
+    For a Duchon radial basis with kernel φ and centers c₁, ..., c_K, the
+    (K × K) Gram matrix ``P`` with entries ``P_{ij} = φ(‖c_i − c_j‖)`` is
+    *exactly* the function-norm smoothness penalty matrix used internally.
+    Equivalently, ``P = RᵀR`` where ``R`` is the Cholesky factor stored as
+    the penalty root. Users who construct a radial-basis design ``X`` by
+    hand with rows ``X_{n,k} = φ(‖xₙ − c_k‖)`` and need the matching
+    REML-compatible penalty should pass ``P`` directly — no separate
+    "penalty matrix" construction is needed. The same identity holds for
+    Matérn covariances (``M = KKᵀ`` where ``K`` is the covariance matrix),
+    which is the underlying reason kernel ridge regression and penalized
+    smoothing are the same problem.
+
     Parameters
     ----------
     centers : array-like of shape ``(K, d)`` — control points in ℝ^d.
