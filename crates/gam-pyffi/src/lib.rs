@@ -3624,8 +3624,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
-    module.add_function(wrap_pyfunction!(duchon_basis_1d, module)?)?;
-    module.add_function(wrap_pyfunction!(duchon_basis_1d_derivative, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
