@@ -288,6 +288,32 @@ def fit(
         ...     ],
         ... )
     """
+    # Shape constraints are a Rust-only feature (active-set / interior-
+    # point inner solver). The torch path uses the closed-form Gaussian
+    # REML primitive in gam-pyffi, which has no constraint argument. Reject
+    # constrained smooths up front rather than silently dropping the
+    # constraint and returning a wrong-but-plausible fit. To use shape
+    # constraints, route through ``gamfit.fit(df, formula, constraints=...)``
+    # which dispatches to the constrained inner solver.
+    def _shape_set(s: Smooth) -> bool:
+        sc = getattr(s, "shape_constraint", None)
+        return sc is not None and str(sc).lower() != "none"
+
+    if isinstance(smooths, Smooth):
+        if _shape_set(smooths):
+            raise NotImplementedError(
+                "shape_constraint is not supported on the torch fit path; "
+                "use gamfit.fit(df, formula, constraints={...}) which routes "
+                "through the constrained active-set inner solver."
+            )
+    else:
+        if any(_shape_set(s) for s in smooths if isinstance(s, Smooth)):
+            raise NotImplementedError(
+                "shape_constraint is not supported on the torch fit path; "
+                "use gamfit.fit(df, formula, constraints={...}) which routes "
+                "through the constrained active-set inner solver."
+            )
+
     # Normalize: response always (N, D)
     if response.dim() == 1:
         response = response.unsqueeze(1)

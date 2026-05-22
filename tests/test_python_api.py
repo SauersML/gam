@@ -1011,6 +1011,52 @@ def test_periodic_spline_curve_torch_fit_closes_a_circle_in_r2() -> None:
     assert np.allclose(f0, f1, atol=1e-10)
 
 
+def test_sphere_torch_fit_smoke_all_kernels() -> None:
+    """End-to-end Sphere fit through gamfit.torch.fit on a spherical cap."""
+    torch = pytest.importorskip("torch")
+    from gamfit import Sphere
+    from gamfit.torch import fit as torch_fit
+
+    rng = np.random.default_rng(7)
+    n = 200
+    # Sample (lat, lon) uniformly on a band so we have decent coverage.
+    lat = np.degrees(np.arcsin(rng.uniform(-1.0, 1.0, size=n)))
+    lon = rng.uniform(-180.0, 180.0, size=n)
+    points_np = np.stack([lat, lon], axis=1)
+
+    # Spherical-cap-style synthetic response: cosine of great-circle
+    # distance to (0, 0), plus a small bit of noise. Multi-output (D=2)
+    # to also cover the matrix-response path.
+    lat_r = np.radians(lat)
+    lon_r = np.radians(lon)
+    cap = np.cos(lat_r) * np.cos(lon_r)
+    y_np = np.stack(
+        [cap + 0.05 * rng.standard_normal(n), 0.5 * cap + 0.05 * rng.standard_normal(n)],
+        axis=1,
+    )
+
+    points = torch.as_tensor(points_np, dtype=torch.float64)
+    response = torch.as_tensor(y_np, dtype=torch.float64)
+
+    for kernel in ("sobolev", "pseudo", "harmonic"):
+        n_centers = 20 if kernel != "harmonic" else 5  # harmonic: L → 5*(5+2)=35 cols
+        spec = Sphere(n_centers=n_centers, penalty_order=2, kernel=kernel, radians=False)
+        result = torch_fit(points, response, spec)
+        coef = result.coefficients.detach().cpu().numpy()
+        fitted = result.fitted.detach().cpu().numpy()
+        assert coef.ndim == 2 and coef.shape[1] == 2, (
+            f"kernel={kernel}: coef shape {coef.shape}"
+        )
+        if kernel == "harmonic":
+            assert coef.shape[0] == n_centers * (n_centers + 2), (
+                f"harmonic basis dim mismatch: got {coef.shape[0]}, "
+                f"expected L*(L+2)={n_centers * (n_centers + 2)}"
+            )
+        assert np.all(np.isfinite(coef)), f"kernel={kernel}: NaN/Inf in coefficients"
+        assert fitted.shape == (n, 2)
+        assert np.all(np.isfinite(fitted)), f"kernel={kernel}: NaN/Inf in fitted"
+
+
 def test_per_smooth_lambda_not_in_torch_additive_pending_rust_refactor() -> None:
     # The torch additive REML path is structurally single-λ because the
     # closed-form Gaussian REML kernel in
