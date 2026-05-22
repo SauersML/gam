@@ -2560,6 +2560,10 @@ pub struct BlockwiseFitOptions {
     /// Shared cap engaged during seed screening so cost-only evaluations can
     /// stop inner iterations early without affecting the full solve.
     pub screening_max_inner_iterations: Option<Arc<AtomicUsize>>,
+    /// Shared cap engaged during regular outer iterations. Unlike screening,
+    /// this is only a budget: capped solves still have to earn the ordinary
+    /// KKT certificate before derivatives may be exposed.
+    pub outer_inner_max_iterations: Option<Arc<AtomicUsize>>,
     /// If true, the joint-Newton line search may reuse an exact-Newton
     /// workspace to read trial log-likelihood values. This preserves the
     /// legacy path for A/B regression tests, but defaults to false because
@@ -2658,6 +2662,7 @@ impl Default for BlockwiseFitOptions {
             use_outer_hessian: true,
             compute_covariance: false,
             screening_max_inner_iterations: None,
+            outer_inner_max_iterations: None,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -2665,6 +2670,13 @@ impl Default for BlockwiseFitOptions {
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         }
+    }
+}
+
+impl BlockwiseFitOptions {
+    pub fn with_outer_cap(mut self, outer_inner_max_iterations: Arc<AtomicUsize>) -> Self {
+        self.outer_inner_max_iterations = Some(outer_inner_max_iterations);
+        self
     }
 }
 
@@ -3023,6 +3035,49 @@ fn screened_outer_warm_start<'a>(
     rho: &Array1<f64>,
 ) -> Option<&'a ConstrainedWarmStart> {
     warm_start.filter(|seed| seed.rho.len() == rho.len())
+}
+
+const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
+
+fn update_custom_outer_inner_cap_from_warm_start(
+    options: &BlockwiseFitOptions,
+    warm_start: &ConstrainedWarmStart,
+    gradient_norm: Option<f64>,
+    initial_gradient_norm: &mut Option<f64>,
+) {
+    let Some(outer_cap) = options.outer_inner_max_iterations.as_ref() else {
+        return;
+    };
+    let full_budget = options.inner_max_cycles.max(1);
+    let Some(cached_inner) = warm_start.cached_inner.as_ref() else {
+        outer_cap.store(full_budget, Ordering::Relaxed);
+        return;
+    };
+
+    if let Some(norm) = gradient_norm.filter(|value| value.is_finite() && *value > 0.0) {
+        if initial_gradient_norm.is_none() {
+            *initial_gradient_norm = Some(norm);
+        }
+        if matches!(*initial_gradient_norm, Some(initial) if initial > 0.0 && norm / initial < 0.01)
+        {
+            outer_cap.store(full_budget, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    let next_cap = if cached_inner.converged {
+        cached_inner
+            .cycles
+            .saturating_add(CUSTOM_OUTER_INNER_CAP_MARGIN)
+    } else {
+        cached_inner.cycles.saturating_mul(2).max(
+            cached_inner
+                .cycles
+                .saturating_add(CUSTOM_OUTER_INNER_CAP_MARGIN),
+        )
+    }
+    .clamp(1, full_budget);
+    outer_cap.store(next_cap, Ordering::Relaxed);
 }
 
 fn warm_start_matches_block_log_lambdas(
@@ -6936,16 +6991,17 @@ fn refresh_single_block_eta<F: CustomFamily + Clone + Send + Sync + 'static>(
 
 #[inline]
 fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles: usize) -> usize {
-    let screening_cap = options
-        .screening_max_inner_iterations
-        .as_ref()
-        .map(|cap| cap.load(Ordering::Relaxed))
-        .unwrap_or(0);
-    if screening_cap == 0 {
-        base_cycles
-    } else {
-        base_cycles.min(screening_cap.max(1))
+    let mut cap = base_cycles;
+    if let Some(screening) = options.screening_max_inner_iterations.as_ref() {
+        let screening_cap = screening.load(Ordering::Relaxed);
+        if screening_cap > 0 {
+            cap = cap.min(screening_cap);
+        }
     }
+    if let Some(outer) = options.outer_inner_max_iterations.as_ref() {
+        cap = cap.min(outer.load(Ordering::Relaxed));
+    }
+    cap.max(1)
 }
 
 fn weighted_normal_equations(
