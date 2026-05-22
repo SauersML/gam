@@ -2355,7 +2355,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // BFGS outer descent. Recorded as a trial; `OuterAcceptObserver`
         // promotes the latest trial into the accepted series when BFGS's
         // Wolfe line-search accepts the step. Cheap: throttled internally.
-        crate::solver::visualizer::record_outer_eval(value, g_norm);
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         self.iter_count = self.iter_count.saturating_add(1);
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -2966,7 +2966,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         // the eval_hessian site below; both run once per outer iter, so the
         // chart's x-coord progresses on every accepted-or-rejected eval and
         // the accepted line moves only on rho-acceptance.
-        crate::solver::visualizer::record_outer_eval(value, g_norm);
+        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         Ok(FirstOrderSample {
             value: eval.cost,
             gradient: eval.gradient,
@@ -3456,7 +3456,9 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             && let Ok(mut gate) = gate.lock()
         {
             let ift_residual_energy =
-                crate::solver::reml::runtime::cached_ift_residual_energy_for_outer_theta(x);
+                crate::solver::estimate::reml::runtime::cached_ift_residual_energy_for_outer_theta(
+                    x,
+                );
             gate.reject_if_contaminated(TrustEnergyModel::new(
                 x.clone(),
                 gradient.clone(),
@@ -5380,9 +5382,7 @@ fn run_outer_with_plan(
                             seed.clone(),
                             seed_gradient.clone(),
                             seed_hessian.clone(),
-                            crate::solver::reml::runtime::cached_ift_residual_energy_for_outer_theta(
-                                seed,
-                            ),
+                            crate::solver::estimate::reml::runtime::cached_ift_residual_energy_for_outer_theta(seed),
                         ),
                     )));
                     let initial_op_sample = OperatorSample {
@@ -5566,7 +5566,8 @@ fn run_outer_with_plan(
                     }
                     if let Some(feedback) = config.outer_inner_cap.as_ref() {
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
-                            feedback: feedback.clone(),
+                            feedback: Some(feedback.clone()),
+                            trust_energy_gate: None,
                         });
                     }
                     // On the exact-Hessian ARC route, forbid both (a)
@@ -5721,7 +5722,8 @@ fn run_outer_with_plan(
                 }
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
-                        feedback: feedback.clone(),
+                        feedback: Some(feedback.clone()),
+                        trust_energy_gate: None,
                     });
                 }
                 let bfgs_start = std::time::Instant::now();

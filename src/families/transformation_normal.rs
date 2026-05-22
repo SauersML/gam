@@ -250,10 +250,19 @@ pub struct TransformationWarmStart {
 pub(crate) struct CtnDenseHessianKey {
     pub beta_hash: u64,
     pub row_quantities_version: u64,
+    /// Outer-score subsample identity tag. `None` for full-data builds;
+    /// `Some(hash)` for subsampled fits. Including this in the key prevents
+    /// a subsampled Hessian (which is the HT estimator at this β) from
+    /// aliasing a later full-data probe at the same β.
+    pub outer_subsample_hash: Option<u64>,
 }
 
 impl CtnDenseHessianKey {
-    fn from(beta: &Array1<f64>, row_quantities: &TransformationNormalRowQuantityCache) -> Self {
+    fn from(
+        beta: &Array1<f64>,
+        row_quantities: &TransformationNormalRowQuantityCache,
+        outer_subsample_hash: Option<u64>,
+    ) -> Self {
         let mut hasher = DefaultHasher::new();
         beta.len().hash(&mut hasher);
         for value in beta.iter() {
@@ -263,6 +272,7 @@ impl CtnDenseHessianKey {
         CtnDenseHessianKey {
             beta_hash,
             row_quantities_version: row_quantities.version,
+            outer_subsample_hash,
         }
     }
 }
@@ -392,6 +402,27 @@ pub struct TransformationNormalFamily {
     /// pair. See [`CtnPersistentDenseHessianCache`] for the access-pattern
     /// rationale (single-slot, not LRU).
     persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
+    /// Optional outer-score Horvitz-Thompson per-row weights.
+    ///
+    /// When present, this is an `n`-vector equal to the original `weights`
+    /// pre-multiplied row-wise by the HT inverse-inclusion multiplier `m_i`
+    /// (`m_i = 1/π_i` on sampled rows, `0.0` on unsampled rows). Assembly
+    /// sites read row weights via [`Self::effective_weights`], which returns
+    /// this array when present and `self.weights` otherwise. Because every
+    /// per-row CTN contribution is linear in `w_i`, masking at this site
+    /// gives `E[Σ_i (m_i · w_i) · f(row_i)] = Σ_i w_i · f(row_i) = full-sum`
+    /// — i.e. an unbiased estimator across log-likelihood, gradient, joint
+    /// Hessian (dense / matvec / diagonal), ψ, and ψ-ψ kernels.
+    ///
+    /// `None` preserves byte-identical legacy behavior (`effective_weights`
+    /// returns the original `weights` array).
+    outer_subsample_weights: Option<Arc<Array1<f64>>>,
+    /// Subsample-identity tag used to key the row-quantity and persistent
+    /// dense-Hessian caches when an outer-score subsample is active. `None`
+    /// for the full-data family; `Some(hash)` for subsampled clones. The hash
+    /// is over the HT mask + per-row weight bits so that two subsamples with
+    /// the same β never alias each other's caches.
+    outer_subsample_hash: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1050,6 +1081,8 @@ impl TransformationNormalFamily {
             row_quantity_cache: Arc::new(Mutex::new(None)),
             row_quantity_version: Arc::new(AtomicU64::new(0)),
             persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+            outer_subsample_weights: None,
+            outer_subsample_hash: None,
         })
     }
 
@@ -1239,6 +1272,8 @@ impl TransformationNormalFamily {
             row_quantity_cache: Arc::new(Mutex::new(None)),
             row_quantity_version: Arc::new(AtomicU64::new(0)),
             persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+            outer_subsample_weights: None,
+            outer_subsample_hash: None,
         })
     }
 
@@ -1278,6 +1313,128 @@ impl TransformationNormalFamily {
     /// Number of observations.
     pub fn n_obs(&self) -> usize {
         self.x_val_kron.nrows()
+    }
+
+    /// Per-row weight array used by every row-streaming SCOP assembly site.
+    ///
+    /// Returns the masked HT weights when an outer-score subsample is active
+    /// (`outer_subsample_weights = Some(_)`), else the original `weights`.
+    ///
+    /// Math invariant: every CTN per-row contribution to the gradient,
+    /// negative-Hessian, ψ-term, ψ-ψ-term, and log-likelihood is **linear**
+    /// in this scalar — i.e. each `for i in 0..n` step is of the form
+    /// `wᵢ · g(row_quantities_i, β)` with `wᵢ` appearing to the first power
+    /// only. Replacing `wᵢ` with `wᵢ · m_i` (where `m_i = 1/πᵢ` on sampled
+    /// rows and `0` on unsampled) yields an unbiased Horvitz-Thompson
+    /// estimator: `E[Σᵢ mᵢ wᵢ g(row_i)] = Σᵢ wᵢ g(row_i) = full sum`.
+    #[inline]
+    pub(crate) fn effective_weights(&self) -> &Array1<f64> {
+        match self.outer_subsample_weights.as_ref() {
+            Some(w) => w.as_ref(),
+            None => self.effective_weights(),
+        }
+    }
+
+    /// Subsample-identity tag (`None` for full-data) used to key the
+    /// row-quantity cache and `CtnDenseHessianKey`.
+    #[inline]
+    pub(crate) fn outer_subsample_tag(&self) -> Option<u64> {
+        self.outer_subsample_hash
+    }
+
+    /// Clone the family with an outer-score Horvitz-Thompson mask installed.
+    ///
+    /// The mask `m` (length `n`) is `1/πᵢ` for sampled rows and `0.0` for
+    /// unsampled. The returned family carries `outer_subsample_weights =
+    /// Some(weights ⊙ m)`. The row-quantity cache and persistent dense
+    /// Hessian cache are reset (they were keyed on β alone; the masked
+    /// family's `log_likelihood` and Hessian differ from the full-data
+    /// build at the same β so they must not alias). The subsample hash is
+    /// computed over `m` so that two distinct masks at the same β never
+    /// share a cache entry.
+    fn with_outer_subsample(
+        &self,
+        mask: &Array1<f64>,
+    ) -> Result<Self, TransformationNormalError> {
+        let n = self.weights.len();
+        if mask.len() != n {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: format!(
+                    "outer-score subsample mask length {} != n={}",
+                    mask.len(),
+                    n
+                ),
+            });
+        }
+        let mut effective = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let m = mask[i];
+            if !m.is_finite() || m < 0.0 {
+                return Err(TransformationNormalError::InvalidInput {
+                    reason: format!(
+                        "outer-score subsample mask[{i}] = {m} is invalid (must be finite and >= 0)"
+                    ),
+                });
+            }
+            effective[i] = self.weights[i] * m;
+        }
+        let mut hasher = DefaultHasher::new();
+        n.hash(&mut hasher);
+        for value in mask.iter() {
+            value.to_bits().hash(&mut hasher);
+        }
+        let subsample_hash = hasher.finish();
+        Ok(Self {
+            // Inherit immutable design / response state cheaply via Arc / clone.
+            x_val_kron: self.x_val_kron.clone(),
+            x_deriv_kron: self.x_deriv_kron.clone(),
+            response_val_basis: self.response_val_basis.clone(),
+            response_lower_basis: self.response_lower_basis.clone(),
+            response_upper_basis: self.response_upper_basis.clone(),
+            response_deriv_basis: self.response_deriv_basis.clone(),
+            covariate_design: self.covariate_design.clone(),
+            covariate_dense_cache: Arc::clone(&self.covariate_dense_cache),
+            weights: Arc::clone(&self.weights),
+            offset: Arc::clone(&self.offset),
+            tensor_penalties: self.tensor_penalties.clone(),
+            initial_beta: self.initial_beta.clone(),
+            initial_log_lambdas: self.initial_log_lambdas.clone(),
+            block_name: self.block_name.clone(),
+            response_knots: self.response_knots.clone(),
+            response_transform: self.response_transform.clone(),
+            response_degree: self.response_degree,
+            response_median: self.response_median,
+            response_floor_offset: Arc::clone(&self.response_floor_offset),
+            response_lower_floor_offset: self.response_lower_floor_offset,
+            response_upper_floor_offset: self.response_upper_floor_offset,
+            // Caches must NOT be shared between full-data and subsampled
+            // families: the row-quantity cache stores the LL (mask-dependent),
+            // and the persistent dense Hessian is keyed on β alone.
+            row_quantity_cache: Arc::new(Mutex::new(None)),
+            row_quantity_version: Arc::new(AtomicU64::new(0)),
+            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+            outer_subsample_weights: Some(Arc::new(effective)),
+            outer_subsample_hash: Some(subsample_hash),
+        })
+    }
+
+    /// Build an outer-subsample clone from a `BlockwiseFitOptions` row mask,
+    /// returning `None` when no subsample is requested.
+    fn maybe_with_outer_subsample_from_options(
+        &self,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Self>, TransformationNormalError> {
+        let Some(sub) = options.outer_score_subsample.as_ref() else {
+            return Ok(None);
+        };
+        let n = self.weights.len();
+        let mut mask = Array1::<f64>::zeros(n);
+        for row in sub.rows.iter() {
+            if row.index < n {
+                mask[row.index] = row.weight;
+            }
+        }
+        Ok(Some(self.with_outer_subsample(&mask)?))
     }
 
     // --- Internal helpers ---
@@ -1472,7 +1629,7 @@ impl TransformationNormalFamily {
             &h_prime,
             &h_lower,
             &h_upper,
-            self.weights.as_ref(),
+            self.effective_weights(),
         )?;
         // Stamp this build with a fresh monotonic version so the persistent
         // dense-Hessian cache key advances exactly once per row_quantity
@@ -1529,7 +1686,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let endpoint_q = row_quantities.endpoint_q.as_ref();
@@ -1714,7 +1871,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP gradient requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
@@ -1829,7 +1986,7 @@ impl TransformationNormalFamily {
         let cov = self.covariate_dense_arc().map_err(|e| {
             format!("SCOP Hessian directional derivative requires cached covariate design: {e}")
         })?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
@@ -2062,7 +2219,7 @@ impl TransformationNormalFamily {
                 "SCOP Hessian second directional derivative requires cached covariate design: {e}"
             )
         })?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
@@ -2325,7 +2482,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP Hessian matvec requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
@@ -2486,7 +2643,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP dH matmat requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
@@ -2790,7 +2947,7 @@ impl TransformationNormalFamily {
         let cov = self.covariate_dense_arc().map_err(|e| {
             format!("SCOP dH projected trace requires cached covariate design: {e}")
         })?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let row_gamma = row_quantities.gamma.as_ref();
 
@@ -3003,7 +3160,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP d2H matmat requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut out = Array2::<f64>::zeros((p_total, n_probe));
         let mut gamma = vec![0.0; p_resp];
@@ -3283,7 +3440,7 @@ impl TransformationNormalFamily {
         let cov = self
             .covariate_dense_arc()
             .map_err(|e| format!("SCOP Hessian diagonal requires cached covariate design: {e}"))?;
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
@@ -3417,7 +3574,7 @@ impl TransformationNormalFamily {
             .into());
         }
 
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let mut objective_psi = 0.0;
@@ -3617,7 +3774,7 @@ impl TransformationNormalFamily {
             ) }.into());
         }
 
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let endpoint_basis = [
@@ -3907,7 +4064,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = (0..n)
@@ -4268,7 +4425,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = (0..n)
@@ -4542,7 +4699,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h = row_quantities.h.as_ref();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = (0..n)
@@ -4841,7 +4998,7 @@ impl TransformationNormalFamily {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
         if direction_mat.is_none() {
-            let weights = self.weights.as_ref();
+            let weights = self.effective_weights();
 
             struct PsiPairScoreAccum {
                 objective: f64,
@@ -5041,7 +5198,7 @@ impl TransformationNormalFamily {
             return Ok((accum.objective, accum.score, None));
         }
 
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let direction_mat = direction_mat.expect("directional CTN psi-psi path requires direction");
 
         struct PsiPairDirectionalAccum {
@@ -5524,7 +5681,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let accum = (0..n)
             .into_par_iter()
             .fold(
@@ -6019,7 +6176,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let total = (0..n)
             .into_par_iter()
             .fold(
@@ -6390,7 +6547,7 @@ impl TransformationNormalFamily {
         }
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let total = (0..n)
             .into_par_iter()
             .fold(
@@ -6841,7 +6998,7 @@ impl TransformationNormalFamily {
             .into());
         }
 
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let endpoint_basis = [
             self.response_upper_basis
@@ -7405,7 +7562,7 @@ impl TransformationNormalFamily {
         };
 
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let weights = self.weights.as_ref();
+        let weights = self.effective_weights();
         let h_prime = row_quantities.h_prime.as_ref();
         let accum = (0..n)
             .into_par_iter()
@@ -7897,6 +8054,24 @@ impl CustomFamily for TransformationNormalFamily {
         Ok(row_quantities.log_likelihood)
     }
 
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        // When an outer-score subsample is installed, route through a
+        // mask-aware family clone whose `effective_weights()` returns the
+        // HT-weighted per-row weights. Because every term inside
+        // `build_transformation_row_derived` is linear in `wᵢ`, the row-LL
+        // accumulator yields `Σᵢ (mᵢ · wᵢ) · row_ll_i` — the unbiased
+        // Horvitz-Thompson estimator of the full-data LL.
+        match self.maybe_with_outer_subsample_from_options(options) {
+            Ok(Some(masked)) => masked.log_likelihood_only(block_states),
+            Ok(None) => self.log_likelihood_only(block_states),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Log-likelihood + flat joint gradient without building the dense Hessian.
     ///
     /// The default trait implementation returns `None`, so the joint-Newton
@@ -8019,11 +8194,16 @@ impl CustomFamily for TransformationNormalFamily {
             capability,
             predicted_hessian_work: work_hess,
             predicted_gradient_work: work_grad,
-            // Transformation-normal does not override the outer-only
-            // `_with_options` hooks; its outer eval sums every row
-            // regardless of `outer_score_subsample`. Disable the
-            // κ pilot/polish schedule for this family.
-            subsample_capable: false,
+            // CTN's outer-score reductions are mathematically per-row
+            // sums whose contributions are linear in `wᵢ` at every assembly
+            // site (gradient, joint Hessian dense / matvec / diagonal, ψ,
+            // ψ-ψ, log-likelihood). The `_with_options` overrides install a
+            // mask-aware family clone whose `effective_weights()` returns
+            // `wᵢ · mᵢ` (HT-weighted), yielding an unbiased estimator
+            // `E[score_subsample] = score_full`. The persistent
+            // dense-Hessian cache is keyed on the mask hash so subsampled
+            // and full-data builds at the same β do not alias.
+            subsample_capable: true,
         }
     }
 
@@ -8366,12 +8546,31 @@ impl CustomFamily for TransformationNormalFamily {
         ))))
     }
 
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        // Route through a mask-aware family clone when an outer-score
+        // subsample is active. The cloned family's `effective_weights()`
+        // returns `wᵢ · mᵢ` (`mᵢ = 1/πᵢ` on sampled rows, `0` elsewhere),
+        // and every CTN assembly site reads weights through that accessor.
+        // Each per-row contribution is linear in `wᵢ`, so the workspace's
+        // gradient / dense Hessian / matrix-free HVP / diagonal are exact
+        // Horvitz-Thompson estimators of the full-data quantities.
+        match self.maybe_with_outer_subsample_from_options(options)? {
+            Some(masked) => masked.exact_newton_joint_hessian_workspace(block_states, specs),
+            None => self.exact_newton_joint_hessian_workspace(block_states, specs),
+        }
+    }
+
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
         _specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         // WS4a-CTN structural blocker: CTN's outer-score reductions are mathematically
         // per-row sums (the log-likelihood is `Σ_i row_ll_i` accumulated in
@@ -8535,7 +8734,11 @@ impl TransformationNormalJointHessianWorkspace {
         // Persistent cache hit shortcuts the cost model: reusing the cached
         // matrix is always cheaper than re-streaming. See `dense_hessian()`
         // for the install path that populates this slot.
-        let key = CtnDenseHessianKey::from(&self.beta, &self.row_quantities);
+        let key = CtnDenseHessianKey::from(
+            &self.beta,
+            &self.row_quantities,
+            self.family.outer_subsample_tag(),
+        );
         if self.persistent_dense_hessian.get(&key).is_some() {
             return true;
         }
@@ -8553,7 +8756,11 @@ impl TransformationNormalJointHessianWorkspace {
         //    exactly when consecutive probes share `(β, row_quantities)`,
         //    which is the common pattern inside one trust-region step (β
         //    advances between steps; HVP probes share β within a step).
-        let key = CtnDenseHessianKey::from(&self.beta, &self.row_quantities);
+        let key = CtnDenseHessianKey::from(
+            &self.beta,
+            &self.row_quantities,
+            self.family.outer_subsample_tag(),
+        );
         if let Some(cached) = self.persistent_dense_hessian.get(&key) {
             let _ = self.dense_hessian_cache.set(cached);
             return self
@@ -14028,7 +14235,7 @@ impl TransformationNormalPsiWorkspace {
             );
         };
 
-        let weights = self.family.weights.as_ref();
+        let weights = self.family.effective_weights();
         let h = row.h.as_ref();
         let h_prime = row.h_prime.as_ref();
         let endpoint_q = row.endpoint_q.as_ref();

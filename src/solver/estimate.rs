@@ -6216,11 +6216,7 @@ where
     }
 
     let p = x.ncols();
-    validate_penalty_specs(
-        &specs,
-        p,
-        "evaluate_external_ift_residual_at_perturbed_rho",
-    )?;
+    validate_penalty_specs(&specs, p, "evaluate_external_ift_residual_at_perturbed_rho")?;
     let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
         &specs,
         &opts.nullspace_dims,

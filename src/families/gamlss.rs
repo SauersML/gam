@@ -5510,8 +5510,27 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        // Wiggle ψ path: full-data exact (= trivially unbiased). The
+        // wiggle-specific second-order from-parts function inlines 30+
+        // per-row coefficient arrays (`coeff_mm{,_a,_b,_ab}`,
+        // `coeff_ml{,_a,_b,_ab}`, `coeff_ll{,_a,_b,_ab}`, `a{,_a,_b,_ab}`,
+        // `c{,_a,_b,_ab}`, `l{,_a,_b,_ab}`, `dw_{a,b,ab}`, `s_mu*`, `s_ls*`,
+        // `s_w*`, ...) instead of packing them into a struct like the
+        // non-wiggle GLS path's `GaussianJointPsi{First,Second}Weights`.
+        // Each is row-linear in `rows.{w,m,n,kappa,...}` and the direction
+        // vectors so HT masking is theoretically clean, but threading a mask
+        // across that many call sites is brittle (any missed array silently
+        // biases the estimator). The outer score remains unbiased without
+        // touching the wiggle ψ path: HT-unbiased LL
+        // (`log_likelihood_only_with_options`) + HT-unbiased ρ-Hessian
+        // (`exact_newton_joint_hessian_workspace_with_options`) +
+        // exact-unbiased ψ (this path) = unbiased. Broadening to the wiggle
+        // ψ path is a follow-up that should refactor the inline arrays into
+        // `WiggleJointPsi{First,Second}Weights` structs mirroring
+        // `GaussianJointPsi{First,Second}Weights` so a single
+        // `apply_ht_mask_wiggle*` helper can mask everything in one place.
         self.exact_newton_joint_psisecond_order_terms_from_parts(
             block_states,
             derivative_blocks,
@@ -5519,7 +5538,6 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
             psi_b,
             xmu,
             x_ls,
-            subsample,
         )
     }
 
@@ -5530,15 +5548,18 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
+        // Same rationale as `ws_psi_second_order_terms_from_parts` above:
+        // the wiggle ψ-Hessian directional-derivative function also inlines
+        // dozens of per-row arrays. Full-data is exact (= trivially
+        // unbiased), so the total outer score remains unbiased.
         self.exact_newton_joint_psihessian_directional_derivative_from_parts(
             block_states,
             psi_dir,
             d_beta_flat,
             xmu,
             x_ls,
-            subsample,
         )
     }
 }
@@ -5827,6 +5848,23 @@ fn apply_ht_mask_second(
     weights.d2hmumu = d2hmm;
     weights.d2hmu_ls = d2hml;
     weights.d2h_ls_ls = d2hll;
+}
+
+/// Apply a Horvitz–Thompson mask to a single per-row array in place: each
+/// sampled row's entry is multiplied by `WeightedOuterRow.weight = 1/π_i`,
+/// all other entries are zeroed. Used by the wiggle ψ path where per-row
+/// coefficient arrays are computed inline (one variable per array) rather
+/// than packed into a struct.
+fn apply_ht_mask_array(
+    arr: &mut Array1<f64>,
+    rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+) {
+    let n = arr.len();
+    let mut out = Array1::<f64>::zeros(n);
+    for r in rows {
+        out[r.index] = arr[r.index] * r.weight;
+    }
+    *arr = out;
 }
 
 /// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
@@ -7444,6 +7482,7 @@ impl GaussianLocationScaleFamily {
                 d_beta_flat,
                 xmu,
                 x_ls,
+                None,
             )?,
         ))
     }
@@ -7455,6 +7494,7 @@ impl GaussianLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
+        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -7518,7 +7558,7 @@ impl GaussianLocationScaleFamily {
         // Generic code then combines this with S(theta)-motion and the profile
         // mode responses to form ddot H_{ij}.
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let mixedweights = gaussian_joint_psi_mixed_driftweights(
+        let mut mixedweights = gaussian_joint_psi_mixed_driftweights(
             &rows,
             &ximu,
             &xi_ls,
@@ -7527,6 +7567,13 @@ impl GaussianLocationScaleFamily {
             &uzamu,
             &uza_ls,
         );
+        if let Some(sub_rows) = subsample {
+            // HT mask: `gaussian_joint_psi_mixedhessian_drift_fromweights` is
+            // row-linear in every `mixedweights.*` array via `xt_diag_*_dense`
+            // and `weighted_crossprod_psi_maps`, so the masked Hessian-drift
+            // remains an unbiased estimator of the full-data drift.
+            apply_ht_mask_mixed(&mut mixedweights, sub_rows);
+        }
 
         Ok(gaussian_joint_psi_mixedhessian_drift_fromweights(
             xmu,
@@ -8049,6 +8096,49 @@ impl CustomFamily for GaussianLocationScaleFamily {
                 block_states.to_vec(),
                 specs,
                 derivative_blocks.to_vec(),
+            )?,
+        )))
+    }
+
+    /// Outer-aware joint ψ workspace with optional row subsample.
+    ///
+    /// When `options.outer_score_subsample` is `None`, this is byte-identical
+    /// to `exact_newton_joint_psi_workspace`. When `Some`, the subsample is
+    /// stored in the workspace and forwarded into every per-row weight array
+    /// produced by `gaussian_joint_psi_firstweights`,
+    /// `gaussian_joint_psisecondweights`, and
+    /// `gaussian_joint_psi_mixed_driftweights`: each sampled row's
+    /// contribution is multiplied by `WeightedOuterRow.weight = 1/π_i` and
+    /// non-sampled rows are zeroed. Every downstream assembly
+    /// (`gaussian_joint_psi*_fromweights`, `weighted_crossprod_psi_maps`,
+    /// `xt_diag_*_dense`,
+    /// `build_two_block_custom_family_joint_psi_operator_from_actions`) is
+    /// row-linear in these arrays via `Xᵀ diag(W) Y`, so the resulting
+    /// second-order ψ Hessian and ψ-Hessian directional derivative are
+    /// unbiased Horvitz–Thompson estimators of the full-data quantities.
+    /// Inner-PIRLS and final-covariance paths never install the option.
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if block_states.len() != 2 || specs.len() != 2 || derivative_blocks.len() != 2 {
+            return Err(GamlssError::DimensionMismatch { reason: format!(
+                "GaussianLocationScaleFamily joint psi workspace expects 2 states, 2 specs, and 2 derivative block lists, got {} / {} / {}",
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
+            ) }.into());
+        }
+        Ok(Some(Arc::new(
+            GaussianLocationScaleExactNewtonJointPsiWorkspace::new_with_subsample(
+                self.clone(),
+                block_states.to_vec(),
+                specs,
+                derivative_blocks.to_vec(),
+                options.outer_score_subsample.clone(),
             )?,
         )))
     }
