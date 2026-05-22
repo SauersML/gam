@@ -1081,37 +1081,6 @@ def duchon_basis(
         raise map_exception(exc) from exc
 
 
-def duchon_basis_1d_derivative(
-    t: Any,
-    centers: Any = None,
-    *,
-    m: int = 2,
-    order: int = 1,
-    periodic: bool = False,
-) -> Any:
-    """Evaluate derivatives of the Rust one-dimensional Duchon basis.
-
-    ``centers`` accepts ``None`` / ``int`` / array — see :func:`duchon_basis_1d`.
-    """
-    import numpy as np
-
-    t_np = _numeric_vector(t, "t")
-    centers_np = _resolve_centers(centers, t_np, label="centers")
-    try:
-        return np.asarray(
-            rust_module().duchon_basis_1d_derivative(
-                t_np,
-                centers_np,
-                int(m),
-                int(order),
-                bool(periodic),
-            ),
-            dtype=float,
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-
-
 def smoothness_penalty(
     knots: Any,
     *,
