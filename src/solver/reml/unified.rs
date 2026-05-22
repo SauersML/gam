@@ -5192,14 +5192,7 @@ impl PenaltySubspaceTrace {
         // bounded — same noise-floor strategy as elsewhere in this
         // module).
         let mut m = a_act.dot(&z);
-        let diag_scale = m.diag().iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
-        let ridge = f64::EPSILON * diag_scale.max(1.0);
-        for i in 0..k_active {
-            m[[i, i]] += ridge;
-        }
-        // Symmetrise + invert.  k_active is small (#active inequality rows
-        // at the cert point) so the dense inverse is cheap and saves a
-        // factorisation pass on every per-coordinate apply.
+        // Symmetrise (numerical noise from the matmul leaves small skew).
         for i in 0..k_active {
             for j in 0..i {
                 let avg = 0.5 * (m[[i, j]] + m[[j, i]]);
@@ -5207,11 +5200,52 @@ impl PenaltySubspaceTrace {
                 m[[j, i]] = avg;
             }
         }
-        let m_inv = crate::linalg::utils::matrix_inversewith_regularization(
-            &m,
-            "active-constraint kernel inverse",
-        )
-        .unwrap_or_else(|| Array2::zeros((k_active, k_active)));
+        // Eigendecomposition-based Moore-Penrose pseudo-inverse with a
+        // relative spectral cutoff. This is the principled treatment of
+        // rank deficiency in `A_act` when restricted to `range(S₊)`:
+        // some active constraint rows may be linearly dependent after
+        // projection (e.g. several monotonicity rows pinning the same
+        // flat region all reduce to the same row in `range(S₊)`).
+        // A plain `M⁻¹` then amplifies near-null directions; the
+        // pseudo-inverse drops them at a relative threshold
+        // `tol = eps · k_active · σ_max(M)`, which is the standard
+        // NumPy/LAPACK convention and exactly what Codex flagged as
+        // necessary in the math review.
+        let (evals, evecs) = m
+            .eigh(faer::Side::Lower)
+            .map(|(w, v)| (w, v))
+            .unwrap_or_else(|_| {
+                (
+                    Array1::<f64>::zeros(k_active),
+                    Array2::<f64>::eye(k_active),
+                )
+            });
+        let sigma_max = evals.iter().copied().fold(0.0_f64, f64::max).max(0.0);
+        let tol = f64::EPSILON * (k_active as f64) * sigma_max.max(1.0);
+        let mut m_inv = Array2::<f64>::zeros((k_active, k_active));
+        let mut dropped = 0usize;
+        for q in 0..k_active {
+            if evals[q] > tol {
+                let inv_sigma = 1.0 / evals[q];
+                // Outer product u_q u_qᵀ scaled by 1/σ_q.
+                for i in 0..k_active {
+                    for j in 0..k_active {
+                        m_inv[[i, j]] += inv_sigma * evecs[[i, q]] * evecs[[j, q]];
+                    }
+                }
+            } else {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            log::debug!(
+                "[constrained-subspace kernel] dropped {} of {} active-constraint directions \
+                 (rank-deficient on range(S₊)); pseudo-inverse threshold = {:.3e}",
+                dropped,
+                k_active,
+                tol,
+            );
+        }
         ConstrainedSubspaceKernel {
             kernel: self,
             z,
