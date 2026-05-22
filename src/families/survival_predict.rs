@@ -209,7 +209,7 @@ pub fn predict_survival(req: SurvivalPredictRequest<'_>) -> Result<SurvivalPredi
     }
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let pairs: Result<Vec<(f64, f64)>, SurvivalPredictError> = (0..n)
+    let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
         .collect();
@@ -617,7 +617,7 @@ pub fn predict_competing_risks_survival(
     }
 
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let pairs: Result<Vec<(f64, f64)>, SurvivalPredictError> = (0..n)
+    let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
         .collect();
@@ -686,7 +686,7 @@ pub fn predict_competing_risks_survival(
         eta_exit: f64,
     }
 
-    let rows: Result<Vec<CauseRow>, String> = (0..cause_count * n)
+    let rows: Result<Vec<CauseRow>, SurvivalPredictError> = (0..cause_count * n)
         .into_par_iter()
         .map(|flat| {
             let cause = flat / n;
@@ -792,7 +792,7 @@ fn saved_cause_specific_timewiggles(
     model: &SavedModel,
     fit: &UnifiedFitResult,
     cause_count: usize,
-) -> Result<Vec<Option<SavedBaselineTimeWiggleRuntime>>, String> {
+) -> Result<Vec<Option<SavedBaselineTimeWiggleRuntime>>, SurvivalPredictError> {
     let has_metadata = model.baseline_timewiggle_knots.is_some()
         || model.baseline_timewiggle_degree.is_some()
         || model.baseline_timewiggle_penalty_orders.is_some()
@@ -1119,7 +1119,7 @@ fn evaluate_marginal_slope_row(
 }
 
 #[inline]
-fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f64, f64), String> {
+fn probit_survival_hazard_components(eta: f64, eta_derivative: f64) -> Result<(f64, f64), SurvivalPredictError> {
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
         return Err(SurvivalPredictError::NumericalFailure { reason: format!(
             "saved survival marginal-slope prediction produced invalid survival index derivative: eta={eta}, eta_t={eta_derivative}"
@@ -1265,7 +1265,7 @@ fn evaluate_rp_row_with_beta(
 fn royston_parmar_survival_hazard_components(
     eta: f64,
     eta_derivative: f64,
-) -> Result<(f64, f64), String> {
+) -> Result<(f64, f64), SurvivalPredictError> {
     if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
         return Err(SurvivalPredictError::NumericalFailure { reason: format!(
             "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
@@ -1459,7 +1459,7 @@ fn predict_survival_location_scale_batch(
         x_time_exit_dense
     };
 
-    let repeat_rows = |matrix: &DesignMatrix, label: &str| -> Result<DesignMatrix, String> {
+    let repeat_rows = |matrix: &DesignMatrix, label: &str| -> Result<DesignMatrix, SurvivalPredictError> {
         if per_row_eval {
             return Ok(matrix.clone());
         }
@@ -1865,7 +1865,7 @@ pub fn require_saved_survival_likelihood_mode(
     let raw = model.survival_likelihood.as_deref().ok_or_else(|| {
         "saved survival model is missing survival_likelihood metadata; refit".to_string()
     })?;
-    parse_survival_likelihood_mode(raw)
+    parse_survival_likelihood_mode(raw).map_err(SurvivalPredictError::from)
 }
 
 /// Baseline config with a linear fallback for plain Weibull models that
@@ -1875,9 +1875,10 @@ pub fn saved_survival_runtime_baseline_config(
     likelihood_mode: SurvivalLikelihoodMode,
 ) -> Result<SurvivalBaselineConfig, SurvivalPredictError> {
     if likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle() {
-        return parse_survival_baseline_config("linear", None, None, None, None);
+        return parse_survival_baseline_config("linear", None, None, None, None)
+            .map_err(SurvivalPredictError::from);
     }
-    survival_baseline_config_from_model(model)
+    survival_baseline_config_from_model(model).map_err(SurvivalPredictError::from)
 }
 
 /// Resolve the covariate `TermCollectionSpec` for prediction, remapping
@@ -1911,11 +1912,11 @@ fn remap_term_collectionspec_columns(
     use crate::terms::smooth::SmoothBasisSpec;
 
     let mut remapped = spec.clone();
-    let resolve_training_index = |index: usize| -> Result<usize, String> {
+    let resolve_training_index = |index: usize| -> Result<usize, SurvivalPredictError> {
         let name = training_headers
             .get(index)
             .ok_or_else(|| format!("saved training column index {index} is out of bounds"))?;
-        resolve_role_col(prediction_column_map, name, "prediction")
+        resolve_role_col(prediction_column_map, name, "prediction").map_err(SurvivalPredictError::from)
     };
     for linear_term in &mut remapped.linear_terms {
         linear_term.feature_col = resolve_training_index(linear_term.feature_col)?;
@@ -1981,10 +1982,11 @@ fn remap_term_collectionspec_columns(
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
 ) -> Result<UnifiedFitResult, SurvivalPredictError> {
-    model
-        .fit_result
-        .clone()
-        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
+    model.fit_result.clone().ok_or_else(|| {
+        SurvivalPredictError::MissingFitMetadata {
+            reason: "model is missing canonical fit_result payload; refit".to_string(),
+        }
+    })
 }
 
 /// Resolve the saved survival location-scale fit result.
@@ -2065,7 +2067,7 @@ pub fn saved_baseline_timewiggle_components(
     eta_exit: &Array1<f64>,
     derivative_exit: &Array1<f64>,
     model: &SavedModel,
-) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, String> {
+) -> Result<Option<(Array2<f64>, Array2<f64>, Array2<f64>)>, SurvivalPredictError> {
     match model.saved_baseline_time_wiggle()? {
         None => Ok(None),
         Some(runtime) => {
@@ -2161,7 +2163,7 @@ pub fn build_saved_survival_marginal_slope_predictor(
         PredictInput,
         UnifiedFitResult,
     ),
-    String,
+    SurvivalPredictError,
 > {
     let saved_runtime = model.saved_prediction_runtime()?;
     if saved_runtime.link_wiggle.is_some() {
