@@ -1,6 +1,6 @@
 # Cookbook
 
-Runnable recipes. Each matches a pattern in the test suite.
+Runnable recipes. Each one matches a pattern in the test suite.
 
 ## Fit a Gaussian GAM with intervals
 
@@ -27,10 +27,12 @@ assert v["model_class"] == "standard"
 assert v["family_name"] == "Gaussian Identity"
 ```
 
-## Mix pandas, dicts, list-of-records inputs
+## Mixed input shapes
+
+`fit` and `predict` accept pandas DataFrames, dict-of-columns, and
+list-of-records:
 
 ```python
-# All three are valid inputs to fit() and predict():
 gamfit.fit(train_df, "y ~ s(x)")
 gamfit.fit({"y": [1.0, 2.0], "x": [0.0, 1.0]}, "y ~ x")
 gamfit.fit([{"y": 1.0, "x": 0.0}, {"y": 2.0, "x": 1.0}], "y ~ x")
@@ -50,7 +52,7 @@ est = GAMClassifier(formula="y ~ s(x)", family="binomial")
 est.fit(train)
 
 probs = est.predict_proba([{"x": 1.5}, {"x": 3.5}])   # (2, 2)
-pred  = est.predict([{"x": 1.5}, {"x": 3.5}])         # (2,)
+pred  = est.predict([{"x": 1.5}, {"x": 3.5}])         # (2,) int
 acc   = est.score(train[["x"]], train["y"])
 ```
 
@@ -94,22 +96,21 @@ gamfit.fit(
 )
 ```
 
-## Cyclic 1-D smooth (day-of-week, hour-of-day, angles)
+## Cyclic 1-D smooth
 
 ```python
-# Day-of-week effect on a daily-aggregated outcome (period = 7).
+# Day-of-week (period = 7).
 gamfit.fit(df, "y ~ s(dow, periodic=true, period=7)")
 
 # Hour-of-day with explicit half-open domain.
 gamfit.fit(df, "y ~ cyclic(hour, period_start=0, period_end=24)")
 
-# Angles in radians — the DSL accepts the symbolic `pi` / `tau` constants
-# (case-insensitive), optionally multiplied by a single literal: `2*pi`,
-# `pi*2`, `.5*pi`, `tau`. See formulas.md for the full rule.
+# Angles in radians; the DSL accepts `pi` / `tau` (case-insensitive),
+# optionally multiplied by a single literal (e.g. `2*pi`, `.5*pi`).
 gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
 ```
 
-## Tensor product with a periodic axis (cylinder, day × hour, …)
+## Tensor product with a periodic axis
 
 ```python
 # Cylinder: theta wraps, h is open.
@@ -124,27 +125,27 @@ gamfit.fit(df,
 gamfit.fit(df, "y ~ te(u, v, periodic=[0,1], period=[2*pi, 2*pi])")
 ```
 
-## Intrinsic sphere smooth (lat / lon → scalar)
+## Intrinsic sphere smooth (lat / lon)
 
 ```python
-# Wahba's reproducing kernel — default, isotropic on S², no pole artefacts.
+# Wahba reproducing kernel: isotropic on S^2, no pole artefacts.
 gamfit.fit(df, "y ~ sphere(lat, lon, radians=true)")
 
-# Spherical-harmonic alternative; max_degree=L gives basis dim L(L+2).
+# Spherical harmonics; max_degree=L gives basis dim L(L+2).
 gamfit.fit(df, "y ~ sphere(lat, lon, method=harmonic, max_degree=8, radians=true)")
 
-# Equivalent mgcv-style alias.
+# mgcv-style alias.
 gamfit.fit(df, "y ~ s(lat, lon, bs=sos)")
 ```
 
 ## Manifold-valued response (simplex / sphere)
 
 ```python
-# Simplex response (e.g. soil composition) — predictions are guaranteed
-# to be strictly positive and sum to 1 row-wise.
+# Simplex response (e.g. composition). Predictions are strictly positive
+# and sum to 1 row-wise.
 model = gamfit.fit(
     train,
-    "composition ~ s(x)",          # LHS is just a label; RHS is reused for every coord
+    "composition ~ s(x)",          # LHS is a label; RHS is reused per coord
     response_geometry="simplex",   # or "alr"
     response_columns=["sand", "silt", "clay"],
 )
@@ -152,22 +153,19 @@ pred = model.predict(test)         # columns: sand, silt, clay
 ```
 
 ```python
-# Spherical response (e.g. surface normals, direction-of-travel) —
-# predictions are guaranteed to be unit-norm.
+# Spherical response (e.g. surface normals). Predictions are unit-norm.
 model = gamfit.fit(
     train,
     "direction ~ s(x)",
     response_geometry="spherical",
     response_columns=["nx", "ny", "nz"],
 )
-pred = model.predict(test)         # columns: nx, ny, nz; per row ||(nx,ny,nz)|| == 1
+pred = model.predict(test)         # columns: nx, ny, nz
 ```
 
-See [docs/response-geometry.md](response-geometry.md) for the full
-discussion (Aitchison Fréchet mean, Karcher iteration on S², ALR vs
-CLR coordinates, choice of base point).
+See [response-geometry.md](response-geometry.md) for the full discussion.
 
-## Boundary-conditioned 1-D smooth (clamped endpoint slopes)
+## Boundary-conditioned 1-D smooth
 
 ```python
 # Both endpoints have zero first derivative.
@@ -177,11 +175,7 @@ gamfit.fit(df, "y ~ s(x, bc=clamped)")
 gamfit.fit(df, "y ~ s(x, bc_left=anchored, anchor_left=0)")
 ```
 
-The geometric-smooths gallery in
-[docs/manifold-smooths.md](manifold-smooths.md) shows every formula
-above recovering its underlying manifold from noisy 3-D point clouds.
-
-## Flexible link to correct for misspecification
+## Flexible link
 
 ```python
 gamfit.fit(
@@ -225,7 +219,7 @@ H = pred.cumulative_hazard_at([10])       # (n_rows, 1)
 F = pred.failure_at([10])                 # 1 - S
 ```
 
-## Survival predictions streamed to CSV
+## Stream survival predictions to CSV
 
 ```python
 pred.write_survival_at_csv(
@@ -239,7 +233,7 @@ pred.write_survival_at_csv(
 ## Two-stage marginal-slope pipeline
 
 ```python
-# Stage 1: condition the score on PCs (transformation-normal)
+# Stage 1: condition the score on PCs (transformation-normal).
 calib = gamfit.fit(
     df,
     "PGS ~ matern(pc1, pc2, pc3, pc4, centers=20)",
@@ -248,7 +242,7 @@ calib = gamfit.fit(
 )
 df["pgs_z"] = calib.predict(df)
 
-# Stage 2: Bernoulli marginal-slope
+# Stage 2: Bernoulli marginal-slope.
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3, pc4, centers=20)",
@@ -281,7 +275,6 @@ gamfit.fit(
     "y ~ s(x1) + s(x2)",
     config={"noise_formula": "s(x1)"},
 )
-# predict() returns eta, mean (+ effective_se, mean_lower, mean_upper if interval=)
 ```
 
 ## Pass through an identifier column
@@ -303,7 +296,7 @@ preds = model.predict(
 ```python
 posterior = model.sample(train, seed=42)
 bands = posterior.predict(test, level=0.95)
-# eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper
+# columns: eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper
 ```
 
 ## Posterior of a derived quantity
@@ -312,14 +305,14 @@ bands = posterior.predict(test, level=0.95)
 import numpy as np
 
 posterior = model.sample(train, seed=42)
-beta_t = posterior["beta_treatment"]
+beta_t = posterior["beta_treatment"]      # (n_draws,)
 or_draws = np.exp(beta_t)
 print(f"OR = {or_draws.mean():.2f} "
       f"(95% CI {np.quantile(or_draws, 0.025):.2f}–"
       f"{np.quantile(or_draws, 0.975):.2f})")
 ```
 
-## Save and reload everything
+## Save and reload
 
 ```python
 model.save("model.gam")
@@ -329,7 +322,7 @@ m  = gamfit.load("model.gam")
 ps = gamfit.load_posterior("posterior.npz")
 ```
 
-## Catch schema errors gracefully
+## Catch schema errors
 
 ```python
 def safe_predict(model, data):
@@ -351,7 +344,6 @@ scores = cross_val_score(
     GAMRegressor(formula="y ~ s(x)"),
     X, y, cv=5, scoring="r2",
 )
-print(scores.mean(), "±", scores.std())
 ```
 
 ## sklearn grid search over formulas
@@ -368,47 +360,43 @@ gs = GridSearchCV(
     cv=5,
 )
 gs.fit(X, y)
-print(gs.best_params_, gs.best_score_)
 ```
 
 ## HTML report
 
 ```python
 model.report("report.html")     # writes to disk
-html = model.report()           # returns string for Jupyter / inline display
+html = model.report()           # returns the string for inline display
 ```
 
-## Per-group trajectories (factor `by=` smooth)
+## Factor `by=` smooth (per-group trajectories)
 
-Use a factor `by=` smooth when each group should have its own unpooled curve:
+Each group gets its own unpooled curve. For unseen groups at prediction
+time, the smooth contribution is zero; include `group(subject)` when
+subject-level intercepts matter:
 
 ```text
 y ~ s(time, by=subject) + group(subject)
 ```
 
-The smooth contribution for a previously unseen subject is zero at prediction
-time; include `group(subject)` when subject-level intercepts matter.
+## Hierarchical / partial-pooling smooth (`bs="fs"`)
 
-## Hierarchical / partial-pooling smooths (`bs="fs"`)
-
-Use `bs="fs"` (or `fs(...)`) when group-specific curves should borrow strength:
+Group-specific curves that borrow strength. The term penalises both
+wiggly components and low-order null-space components, so sparse groups
+shrink more strongly than dense groups:
 
 ```text
 y ~ s(time, subject, bs="fs", k=8)
 y ~ fs(time, subject, k=8)
 ```
 
-This term penalizes both wiggly components and low-order null-space components,
-so sparse groups shrink more strongly than dense groups.
+## Treatment-vs-control deviation smooth (`bs="sz"`)
 
-## Treatment vs control difference smooth (`bs="sz"`)
-
-Use `bs="sz"` with a main smooth to model deviations that sum to zero across
-factor levels:
+Use with a main smooth to model factor-level deviations that sum to zero:
 
 ```text
 y ~ s(time) + s(treatment, time, bs="sz", k=10)
 ```
 
-The main `s(time)` captures the population trajectory, while the `sz` term
+The main `s(time)` captures the population trajectory; the `sz` term
 captures level-specific departures.

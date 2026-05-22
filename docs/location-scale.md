@@ -1,19 +1,26 @@
 # Location-scale models
 
-A standard GAM models the **mean** of the response. A *location-scale* GAM
-models the **mean and the variance/scale** jointly — each as its own smooth
-function of covariates.
+A standard GAM models the conditional mean of the response. A
+location-scale GAM additionally models a second parameter — the
+log-scale of the response distribution — as its own smooth function of
+covariates.
 
-This is what `gamlss` calls "distributional regression". Use it when:
+The engine implements two-parameter location-scale fits for Gaussian
+responses (mean and log-σ), Binomial responses (logit-p and a
+variance-modulating log-scale term), and survival responses (log-hazard
+location and log-scale). It is not a full multi-parameter GAMLSS
+implementation: no separate skewness or kurtosis submodels.
 
-- Residual variance is itself a function of covariates (heteroscedasticity).
-- You need prediction intervals that vary with `x`.
-- Survival data has non-proportional shape and you want a flexible scale.
+Use it when:
 
-## Enabling location-scale
+- The residual scale varies with covariates (heteroscedasticity).
+- Prediction intervals need to widen or narrow with `x`.
+- A survival model has a non-proportional shape that benefits from a
+  covariate-dependent scale.
 
-Pass a second formula for the noise / scale submodel via the
-`noise_formula` key in `config`:
+## Specifying the scale submodel
+
+The scale formula is passed via the `noise_formula` key in `config`:
 
 ```python
 gamfit.fit(
@@ -23,21 +30,19 @@ gamfit.fit(
 )
 ```
 
-The main formula models the location (mean). The `noise_formula` models
-log-scale. Both share the same covariate table. From the CLI the same
-submodel is supplied via `--predict-noise`:
+The main formula models the location. `noise_formula` models the
+log-scale. Both formulas refer to columns of the same input table. The
+CLI flag is `--predict-noise`:
 
 ```bash
 gam fit data.csv 'y ~ s(x1) + s(x2)' --predict-noise 's(x1)' --out model.gam
 ```
 
-This works for:
+This is supported for:
 
-- **Gaussian location-scale** — joint mean and log-σ.
-- **Binomial location-scale** — joint logit-p and a variance-modulating
-  log-scale term.
-- **Survival location-scale** — joint log-hazard and log-scale; pair with
-  `survival_likelihood="location-scale"`:
+- Gaussian location-scale: joint mean and log-σ.
+- Binomial location-scale: joint logit-p and a log-scale variance term.
+- Survival location-scale: pair with `survival_likelihood="location-scale"`:
 
 ```python
 gamfit.fit(
@@ -48,10 +53,13 @@ gamfit.fit(
 )
 ```
 
-## Prediction output
+`--predict-noise` cannot be combined with `--logslope-formula` /
+`--z-column`, with `--transformation-normal`, or with `--firth`.
 
-A Gaussian location-scale fit produces the same prediction columns as a
-standard Gaussian fit:
+## Prediction
+
+A Gaussian location-scale fit returns the same columns as a standard
+Gaussian fit:
 
 ```python
 preds = model.predict(test_df, interval=0.95)
@@ -59,40 +67,42 @@ preds = model.predict(test_df, interval=0.95)
 ```
 
 `effective_se` is the delta-method standard error on the linear
-predictor; `mean_lower` / `mean_upper` are response-scale pointwise Wald
+predictor. `mean_lower` / `mean_upper` are response-scale pointwise Wald
 bands at the requested `interval`.
 
-For survival location-scale, predictions are a
-[`SurvivalPrediction`](predictions.md#survivalprediction) object. Pass
-`with_uncertainty=True` to get delta-method standard errors on the survival
-surface and linear predictor:
+For survival location-scale, predictions return a
+[`SurvivalPrediction`](predictions.md#survivalprediction). Pass
+`with_uncertainty=True` to get delta-method standard errors on the
+survival surface and linear predictor:
 
 ```python
 pred = model.predict(test_df, with_uncertainty=True)
 S    = pred.survival_at([1, 5, 10])
-se_S = pred.survival_se_at([1, 5, 10])  # populated for location-scale
+se_S = pred.survival_se_at([1, 5, 10])
 ```
 
 ## Posterior sampling
 
-Location-scale models use the Gaussian Laplace approximation rather than
-NUTS because the predictive linear predictor is non-linear in the joint
-coefficient vector. The returned `PosteriorSamples` object has
-`posterior.method == "laplace"`, `rhat == 1.0`, and predictive
-bands flow through the same `.predict(...)` interface. See
+Location-scale models use the Gaussian Laplace approximation in
+`Model.sample(...)` because the predictive linear predictor is non-linear
+in the joint coefficient vector. The returned `PosteriorSamples` has
+`method == "laplace"`, `rhat == 1.0`, and predictive bands flow through
+the same `.predict(...)` interface. See
 [posterior-sampling.md](posterior-sampling.md).
 
-## Location-scale vs transformation
+## Location-scale versus conditional transformation
 
-For lopsided / skewed residuals, location-scale models the
-heteroscedasticity, but a *conditional transformation* model
-(`transformation_normal=True`) transforms the response so the residual
-structure becomes N(0, 1) conditionally. See
-[marginal-slope.md](marginal-slope.md) for the transformation-normal flow.
+For heteroscedastic but otherwise Gaussian-shaped residuals, use
+location-scale. For residuals whose entire conditional distribution
+deviates from Gaussian (skew, heavy tails), use
+`transformation_normal=True` to fit a conditional transformation model
+that maps the response to `N(0, 1)` given covariates; see
+[marginal-slope.md](marginal-slope.md).
 
-Rule of thumb:
+Guidance:
 
-- **Pure variance heteroscedasticity** → Gaussian location-scale.
-- **Both location *and* scale matter** → location-scale.
-- **The whole conditional distribution is non-Gaussian (skew, heavy tails)**
-  → transformation-normal, then build a marginal-slope model on top.
+- Variance varies with `x`, residuals otherwise Gaussian:
+  Gaussian location-scale.
+- Mean and scale both depend on `x`: location-scale.
+- The whole conditional distribution is non-Gaussian:
+  transformation-normal, optionally combined with marginal-slope.

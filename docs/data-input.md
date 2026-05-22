@@ -1,57 +1,77 @@
 # Data input formats
 
-`gamfit` accepts most rectangular Python objects as `data`. The Rust
-engine works on (headers, rows-of-strings); the Python layer normalises
-the input.
+`gamfit.fit()` and `Model.predict()` accept several rectangular Python
+inputs. The Python layer normalises the input to `(headers, rows)`
+before crossing the Rust FFI boundary.
 
 ## Supported input types
 
 | Input | Notes |
 | --- | --- |
-| `pandas.DataFrame` | Column names are taken from `df.columns`. |
-| `polars.DataFrame` | Column names are taken from `df.columns`. |
-| `pyarrow.Table` | Column names are taken from `table.column_names`. |
-| `numpy.ndarray` (2-D) | Column names are auto-generated as `x0, x1, …`. |
-| `dict[str, sequence]` | Keys are column names, values are 1-D sequences. |
-| `list[dict[str, Any]]` (records) | Each dict is one row; key set must be consistent. |
-| `list[list]` (2-D) | Columns are auto-named `x0, x1, …`. |
+| `pandas.DataFrame` | Columns taken from `df.columns`. |
+| `polars.DataFrame` | Columns taken from `df.columns`. |
+| `pyarrow.Table` | Columns taken from `table.column_names`. |
+| `numpy.ndarray` (1-D or 2-D) | Columns auto-named `x0`, `x1`, …. 1-D becomes a single column `x0`. |
+| `Mapping[str, sequence]` | Keys are column names, values are 1-D sequences. |
+| `list[Mapping[str, Any]]` | List of records. The full set of keys across rows defines the column order; each row must contain every key. |
+| `Sequence[Sequence]` (2-D) | Columns auto-named `x0`, `x1`, …. All rows must have the same width. |
 
-These are all equivalent inputs for a two-column dataset:
+pandas/polars/pyarrow are detected at runtime via `_try_import`. They
+are not required at install time.
+
+Equivalent inputs for a two-column dataset:
 
 ```python
 import pandas as pd
 import numpy as np
-
-# pandas
-pd.DataFrame({"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]})
-
-# pyarrow
 import pyarrow as pa
+
+pd.DataFrame({"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]})
 pa.table({"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]})
-
-# dict of columns
 {"y": [1.0, 2.0, 3.0], "x": [0.0, 1.0, 2.0]}
-
-# list of records
 [{"y": 1.0, "x": 0.0}, {"y": 2.0, "x": 1.0}, {"y": 3.0, "x": 2.0}]
-
-# numpy (column names become x0, x1)
-np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0]])
+np.array([[1.0, 0.0], [2.0, 1.0], [3.0, 2.0]])  # columns become x0, x1
 ```
+
+## Validation rules
+
+Cells are stringified before crossing the FFI boundary. Two hard rules
+enforced in `stringify_cell`:
+
+1. `None` is rejected.
+2. NaN floats and empty strings are rejected.
+
+Booleans become `"1"` / `"0"`. Numbers use `repr()`. Other values are
+passed through `str(...)`. The engine handles numeric coercion from
+strings; explicit casting to float is unnecessary.
+
+Column lengths must agree. Mismatches raise `ValueError` before the
+engine sees the data.
+
+String columns are accepted for terms like `group(site)` and are
+encoded by the engine.
+
+## Missing data
+
+`gamfit` does not impute. Drop or impute rows upstream:
+
+- `df.dropna(subset=[...])` in pandas.
+- `sklearn.impute` or equivalent.
+- For survival, ensure entry/exit/event columns are complete.
 
 ## What `predict()` returns
 
-By default, `predict()` returns the same format used for training, when
-that applies. Override with `return_type=`:
+By default, the return container matches the input kind, falling back to
+the training kind, then to `dict`. Override with `return_type=`:
 
 | `return_type` | Returns |
 | --- | --- |
-| `None` (default) | Match input or training kind (pandas in → pandas out). |
-| `"dict"` | `dict[str, list]` (always available, no optional deps). |
-| `"numpy"` | 2-D `numpy.ndarray` (columns in fixed order). |
-| `"pandas"` | `pandas.DataFrame` (requires `gamfit[pandas]`). |
-| `"polars"` | `polars.DataFrame` (requires polars). |
-| `"pyarrow"` | `pyarrow.Table` (requires pyarrow). |
+| `None` (default) | Input kind, else training kind, else `dict`. |
+| `"dict"` | `dict[str, list]`. |
+| `"numpy"` | 2-D `numpy.ndarray` with columns in fixed order. |
+| `"pandas"` | `pandas.DataFrame`. |
+| `"polars"` | `polars.DataFrame`. |
+| `"pyarrow"` | `pyarrow.Table`. |
 
 ```python
 model.predict(test_df, return_type="dict")
@@ -59,52 +79,30 @@ model.predict(test_df, return_type="numpy")
 model.predict(test_df, return_type="pandas")
 ```
 
-## Validation rules
+## Array-returning model classes
 
-Cells are stringified before they cross the FFI boundary. Two rules:
-
-1. **No `None`, empty strings, or NaN** anywhere in the data. The engine
-   rejects these with an error. Drop or impute first.
-2. **All columns the same length.** Mismatched lengths raise `ValueError`
-   before the engine sees them.
-
-The engine handles numeric coercion; you don't need to cast to float.
-String columns are accepted by terms like `group(site)` and are encoded
-by the engine.
-
-## Missing data
-
-`gamfit` does not impute. If your data has missing values:
-
-- Drop rows: `df.dropna(subset=[…])`.
-- Impute upstream with the tool of your choice (e.g. `sklearn.impute`).
-- For survival, ensure entry/exit/event columns are complete.
-
-## NumPy gotcha (transformation-normal & marginal-slope)
-
-For model classes that return a 1-D z-score or probability rather than a
-two-column table, `predict()` returns a `numpy.ndarray` of shape
-`(n_samples,)` by default. Passing `return_type="pandas"` or an
-`id_column=` returns a two-column table instead. Be careful when
-flattening:
+Transformation-normal models and Bernoulli marginal-slope models return
+a 1-D `numpy.ndarray` of shape `(n_samples,)` by default. Passing
+`id_column=` or `return_type=` switches them to a two-column table.
 
 ```python
-# 1-D numpy (default)
+# 1-D numpy by default
 z = model.predict(test_df)                       # shape (n,)
 
-# 2-column DataFrame (id_column opts in)
+# Two-column table when id_column or return_type is set
 df = model.predict(test_df, id_column="patient", return_type="pandas")
-z = df["z"].to_numpy()                           # transformation-normal column
+z = df["z"].to_numpy()                           # transformation-normal
 ```
 
-The second (value) column is named `z` for transformation-normal output
-and `mean` for Bernoulli marginal-slope output. Use
-`df["mean"].to_numpy()` for the latter.
+The value column is named `z` for transformation-normal output and
+`mean` for Bernoulli marginal-slope output. Flattening the two-column
+table with `np.asarray(...)` produces a shape `(n, 2)` array; extract
+the column explicitly when an array is wanted.
 
-## Passing through identifier columns
+## Identifier columns
 
-If your data has a row-id column that isn't a model feature, name it with
-`id_column=` and it is preserved in the output:
+A column that is not part of the model can be carried through to the
+output by naming it with `id_column=`:
 
 ```python
 preds = model.predict(
@@ -118,4 +116,5 @@ preds = model.predict(
 # preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
 ```
 
-The id column is not used by the model and may be any type.
+The id column is excluded from the model and may be any type that
+`stringify_cell` accepts.
