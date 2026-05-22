@@ -1714,6 +1714,7 @@ fn fit_survival_transformation_model(
                 let opts = crate::pirls::WorkingModelPirlsOptions {
                     max_iterations: 400,
                     convergence_tolerance: 1e-6,
+                    adaptive_kkt_tolerance: None,
                     max_step_halving: 40,
                     min_step_size: 1e-12,
                     firth_bias_reduction: false,
@@ -1755,6 +1756,7 @@ fn fit_survival_transformation_model(
     let opts = crate::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
         convergence_tolerance: 1e-6,
+        adaptive_kkt_tolerance: None,
         max_step_halving: 40,
         min_step_size: 1e-12,
         firth_bias_reduction: false,
