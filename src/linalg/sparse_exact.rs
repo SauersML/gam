@@ -596,6 +596,46 @@ where
     Ok(result)
 }
 
+/// In-place variant of [`solve_sparse_spd`]. Writes the solution directly into
+/// `out`, avoiding the intermediate `Array1` allocation on the hot PIRLS path.
+/// `out` must already be sized to match `factor.n` (typically the reused
+/// Newton-direction buffer).
+pub fn solve_sparse_spd_into<S>(
+    factor: &SparseExactFactor,
+    rhs: &ArrayBase<S, Ix1>,
+    out: &mut Array1<f64>,
+) -> Result<(), EstimationError>
+where
+    S: Data<Elem = f64>,
+{
+    if rhs.len() != factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD solve dimension mismatch: rhs has {}, factor has {}",
+            rhs.len(),
+            factor.n
+        )));
+    }
+    if out.len() != factor.n {
+        return Err(EstimationError::InvalidInput(format!(
+            "sparse SPD solve output dimension mismatch: out has {}, factor has {}",
+            out.len(),
+            factor.n
+        )));
+    }
+    let rhsview = FaerColView::new(rhs);
+    let solved = factor.factor.solve(rhsview.as_ref());
+    for i in 0..factor.n {
+        let value = solved[(i, 0)];
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                "sparse SPD solve produced non-finite values".to_string(),
+            ));
+        }
+        out[i] = value;
+    }
+    Ok(())
+}
+
 pub fn solve_sparse_spdmulti<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix2>,

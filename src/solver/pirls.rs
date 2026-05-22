@@ -3541,6 +3541,42 @@ fn add_diagonal_to_upper_sparse(
     })
 }
 
+/// Add `delta` to every diagonal entry of an already-built sparse CSC matrix,
+/// mutating its value buffer in place. The symbolic structure is reused — no
+/// reallocation occurs. Errors if any diagonal entry is missing from the
+/// sparsity pattern (which would indicate a real bug, not a fallback case;
+/// callers must materialize diagonals before the first call).
+fn update_sparse_diagonal_in_place(
+    m: &mut SparseColMat<usize, f64>,
+    delta: f64,
+) -> Result<(), String> {
+    if delta == 0.0 {
+        return Ok(());
+    }
+    let ncols = m.ncols();
+    let (symbolic, values) = m.parts_mut();
+    let col_ptr = symbolic.col_ptr();
+    let row_idx = symbolic.row_idx();
+    for col in 0..ncols {
+        let start = col_ptr[col];
+        let end = col_ptr[col + 1];
+        let mut found = false;
+        for idx in start..end {
+            if row_idx[idx] == col {
+                values[idx] += delta;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(format!(
+                "update_sparse_diagonal_in_place: diagonal entry missing for column {col}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn solve_subsystem_direction(
     h_sub: &Array2<f64>,
     g_sub: &Array1<f64>,
