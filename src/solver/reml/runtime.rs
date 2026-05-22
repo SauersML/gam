@@ -60,6 +60,15 @@ pub(crate) fn current_outer_iter() -> u64 {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.load(Ordering::Relaxed)
 }
 
+pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
+    if let Some(cache) = OUTER_IFT_RESIDUAL_ENERGY.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.clear();
+    }
+    OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
+}
+
 pub(crate) fn cached_ift_residual_energy_for_outer_theta(
     theta: &Array1<f64>,
 ) -> Option<(f64, u64)> {
@@ -5698,6 +5707,16 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
+                // DESIGN INTENT: EFS single-loop intentionally accepts partial PIRLS
+                // (capped to EFS_SINGLE_LOOP_PIRLS_SWEEPS) and exposes the resulting
+                // (uncertified) gradient to the EFS update. This deviates from the
+                // WS3b hard rule that uncertified inner states must NOT produce
+                // derivative-bearing samples; the deviation is mitigated by the
+                // bias_proxy guard (max(gradient_residual, inner_residual) > 0.10
+                // for K=3 consecutive iters triggers fallback to the standard
+                // two-loop driver). This is the bam (Wood 2015) tradeoff: tolerate
+                // uncertified inner accuracy at biobank n to amortize per-outer-iter
+                // cost, then bail to the certified path if the EFS surrogate drifts.
                 if in_efs_single_loop
                     && pirls_result.deviance.is_finite()
                     && pirls_result.stable_penalty_term.is_finite()

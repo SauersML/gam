@@ -7038,12 +7038,14 @@ fn try_tangent_projected_evaluate(
     // `BorrowedDerivProvider` uses for the deriv-provider corrections.
     //
     // The pair callbacks (`ext_coord_pair_fn`, `rho_ext_pair_fn`) return
-    // `HyperCoordPair` objects with p-space `b_mat` / `b_operator`; the
-    // pass-through is sound for any consumer that contracts those
-    // through the tangent hessian wrapper. They are kept available for
-    // `ValueAndGradient` mode. `ValueGradientHessian` mode additionally
-    // forms explicit p×p second-drift products that the wrapper cannot
-    // re-project a posteriori, so refuse that combination upfront.
+    // `HyperCoordPair` objects with p-space `b_mat` / `b_operator`.
+    // `ValueAndGradient` mode does not contract those pair objects (they
+    // only enter outer-Hessian assembly), so they are dropped (set to
+    // `None`) in the projected inner solution — gradient evaluations are
+    // unaffected. `ValueGradientHessian` mode would actually consume the
+    // pair callbacks; the tangent hessian wrapper cannot re-project
+    // their p-space second-drift outputs a posteriori, so refuse that
+    // combination upfront when callbacks are present.
     if mode == EvalMode::ValueGradientHessian
         && !solution.ext_coords.is_empty()
         && (solution.ext_coord_pair_fn.is_some() || solution.rho_ext_pair_fn.is_some())
