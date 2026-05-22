@@ -5787,6 +5787,10 @@ pub enum EvalMode {
 pub struct RemlLamlResult {
     /// The REML/LAML objective value (to be minimized).
     pub cost: f64,
+    /// Newton-decrement energy `½ rᵀH⁻¹r` for the cost-side IFT residual correction.
+    pub ift_residual_energy: Option<f64>,
+    /// Full-H one-step inner polish vector `H⁻¹r`, when already computed.
+    pub inner_polish_step: Option<Array1<f64>>,
     /// Gradient ∂V/∂ρ (present if mode ≥ ValueAndGradient).
     pub gradient: Option<Array1<f64>>,
     /// Outer Hessian ∂²V/∂ρ² (present if mode = ValueGradientHessian).
@@ -6658,6 +6662,8 @@ pub fn reml_laml_evaluate(
         hop.dim(),
         k,
     );
+    let mut ift_residual_energy: Option<f64> = None;
+    let mut inner_polish_step: Option<Array1<f64>> = None;
     if let Some(r) = kkt_residual_vec.filter(|_| kkt_residual_correction_active) {
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
@@ -6680,6 +6686,7 @@ pub fn reml_laml_evaluate(
                 let w_mat = hop.solve_multi(&rhs);
                 let w: Array1<f64> = w_mat.column(0).to_owned();
                 let cost_correction = -0.5_f64 * r.view().dot(&w);
+                inner_polish_step = Some(w);
                 (cost_correction, "full_h")
             };
         let residual_energy = -cost_correction;
@@ -6690,6 +6697,7 @@ pub fn reml_laml_evaluate(
             branch,
         );
         if cost_correction.is_finite() {
+            ift_residual_energy = Some(residual_energy);
             cost += cost_correction;
         }
     }
@@ -6706,6 +6714,8 @@ pub fn reml_laml_evaluate(
     if mode == EvalMode::ValueOnly {
         return Ok(RemlLamlResult {
             cost,
+            ift_residual_energy,
+            inner_polish_step,
             gradient: None,
             hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
         });
@@ -7578,6 +7588,8 @@ pub fn reml_laml_evaluate(
             );
             return Ok(RemlLamlResult {
                 cost,
+                ift_residual_energy,
+                inner_polish_step,
                 gradient: Some(grad),
                 hessian,
             });
@@ -7768,6 +7780,8 @@ pub fn reml_laml_evaluate(
 
     Ok(RemlLamlResult {
         cost,
+        ift_residual_energy,
+        inner_polish_step,
         gradient: gradient_out,
         hessian,
     })
@@ -16559,10 +16573,7 @@ mod tests {
 
         let a_act = array![[0.0, 0.0, 1.0]];
         let b_act = array![0.5];
-        let active = ActiveLinearConstraintBlock {
-            a: a_act,
-            b: b_act,
-        };
+        let active = ActiveLinearConstraintBlock { a: a_act, b: b_act };
 
         let mut sol = build_gaussian_solution_at_beta(&rho, beta_hat.clone(), true);
         sol.dispersion = DispersionHandling::Fixed {
