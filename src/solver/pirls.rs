@@ -1235,10 +1235,19 @@ impl PirlsWorkspace {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveKktTolerance {
+    pub eta: f64,
+    pub floor: f64,
+    pub ceiling: f64,
+    pub outer_grad_norm: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkingModelPirlsOptions {
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
+    pub adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
     pub max_step_halving: usize,
     pub min_step_size: f64,
     pub firth_bias_reduction: bool,
@@ -1262,6 +1271,25 @@ pub struct WorkingModelPirlsOptions {
     /// have to rediscover problem-specific damping at every accepted
     /// outer iterate.
     pub initial_lm_lambda: Option<f64>,
+}
+
+#[inline]
+fn effective_kkt_tolerance(options: &WorkingModelPirlsOptions) -> f64 {
+    match options.adaptive_kkt_tolerance {
+        Some(adaptive)
+            if adaptive.eta.is_finite()
+                && adaptive.floor.is_finite()
+                && adaptive.ceiling.is_finite()
+                && adaptive.outer_grad_norm.is_finite()
+                && adaptive.eta >= 0.0
+                && adaptive.floor > 0.0
+                && adaptive.ceiling >= adaptive.floor
+                && adaptive.outer_grad_norm >= 0.0 =>
+        {
+            (adaptive.eta * adaptive.outer_grad_norm).clamp(adaptive.floor, adaptive.ceiling)
+        }
+        _ => options.convergence_tolerance,
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3249,17 +3277,18 @@ fn pirls_soft_acceptance(
     projected_grad: f64,
     progress: SoftAcceptProgress,
     max_abs_eta: f64,
-    tol: f64,
+    progress_tol: f64,
+    kkt_tol: f64,
 ) -> Option<PirlsSoftAccept> {
     let objective_scale = state.deviance.abs().max(state.penalty_term.abs()).max(1.0);
-    let scaled_dev_tol = tol * objective_scale;
+    let scaled_dev_tol = progress_tol * objective_scale;
 
     // Near-stationary plateau is eligible in every context. The only
     // thing that varies is which "is the fit still moving?" signal we
     // compare against which floor.
     let near_stationary_plateau = match progress {
         SoftAcceptProgress::Realized { dev_change } => {
-            state.near_stationary_kkt(projected_grad, tol) && dev_change.abs() < scaled_dev_tol
+            state.near_stationary_kkt(projected_grad, kkt_tol) && dev_change.abs() < scaled_dev_tol
         }
         SoftAcceptProgress::Predicted {
             predicted_reduction,
@@ -3272,7 +3301,7 @@ fn pirls_soft_acceptance(
             // for the standard tol=1e-6, so the unified helper does not
             // widen the LM-rejection acceptance set.
             let reduction_noise_floor = current_penalized.abs().max(1.0) * 1e-12;
-            state.near_stationary_kkt(projected_grad, tol)
+            state.near_stationary_kkt(projected_grad, kkt_tol)
                 && predicted_reduction.abs() <= reduction_noise_floor
         }
     };
@@ -3296,7 +3325,7 @@ fn pirls_soft_acceptance(
         return Some(PirlsSoftAccept::BoundarySaturation);
     }
 
-    if projected_grad <= tol.max(1e-6) * objective_scale
+    if projected_grad <= progress_tol.max(1e-6) * objective_scale
         && dev_change.abs() < scaled_dev_tol * 0.1
         && dev_change >= 0.0
     {
@@ -4315,6 +4344,16 @@ where
         .map(|_| Vec::new());
     let mut consecutive_fisher_fallbacks = 0usize;
     let mut force_fisher_for_rest = false;
+    let kkt_tolerance = effective_kkt_tolerance(options);
+    if let Some(adaptive) = options.adaptive_kkt_tolerance {
+        log::info!(
+            "[ADAPTIVE-KKT] outer_g_norm={:.3e} effective_tol={:.3e} floor={:.3e} ceiling={:.3e}",
+            adaptive.outer_grad_norm,
+            kkt_tolerance,
+            adaptive.floor,
+            adaptive.ceiling,
+        );
+    }
     // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<crate::linalg::matrix::SymmetricMatrix> = None;
@@ -4515,7 +4554,7 @@ where
             lastgradient_norm = f64::INFINITY;
             max_abs_eta = inf_norm(state.eta.iter().copied());
             final_state = Some(state);
-            // If deviance changes have been tiny, this is effectively converged.
+            // Non-finite-gradient rescue is deviance-plateau based, not a KKT certificate.
             if last_deviance_change.abs() < options.convergence_tolerance {
                 status = PirlsStatus::StalledAtValidMinimum;
             }
@@ -4969,8 +5008,7 @@ where
                         let lambda_floor = final_state_ref.ridge_used.max(1.0e-12);
                         let nd_correction = 1.0 + loop_lambda / lambda_floor;
                         let newton_decrement_sq_upper = (-lin).max(0.0) * nd_correction;
-                        let nd_threshold =
-                            options.convergence_tolerance * options.convergence_tolerance * f_scale;
+                        let nd_threshold = kkt_tolerance * kkt_tolerance * f_scale;
                         let nd_pass = newton_decrement_sq_upper <= nd_threshold;
 
                         // Strict KKT: scale-invariant under EITHER the
@@ -4981,7 +5019,7 @@ where
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
                         if final_state_ref
-                            .certifies_kkt(convergence_grad_norm, options.convergence_tolerance)
+                            .certifies_kkt(convergence_grad_norm, kkt_tolerance)
                             || nd_pass
                         {
                             status = PirlsStatus::Converged;
@@ -5009,6 +5047,7 @@ where
                             },
                             max_abs_eta,
                             options.convergence_tolerance,
+                            kkt_tolerance,
                         ) {
                             Some(reason) => {
                                 plateau_streak += 1;
@@ -5047,6 +5086,7 @@ where
                             && deviance_change.is_finite()
                             && deviance_change >= 0.0
                             && deviance_change.abs()
+                                // Objective-plateau progress test, not a KKT certificate.
                                 <= options.convergence_tolerance * objective_scale * 0.1
                             && max_abs_eta.is_finite()
                             && max_abs_eta < PIRLS_ETA_ABS_CAP * 0.5;
@@ -5141,9 +5181,10 @@ where
                             // accept-branch below recomputes it when needed.
                             f64::NAN,
                             options.convergence_tolerance,
+                            kkt_tolerance,
                         );
                         let near_stationary_pass = state
-                            .near_stationary_kkt(projected_grad, options.convergence_tolerance);
+                            .near_stationary_kkt(projected_grad, kkt_tolerance);
 
                         if let Some(reason) = lm_rejection_soft {
                             log::debug!(
@@ -5390,7 +5431,6 @@ where
         options.linear_constraints.as_ref(),
     );
     if status.is_failed_max_iterations() {
-        let tol = options.convergence_tolerance;
         // Strict KKT met after the loop bailed: reclassify as a valid
         // (if non-strictly-converged) minimum. The remaining soft-acceptance
         // criteria (near-stationary plateau, boundary saturation, relative
@@ -5399,7 +5439,7 @@ where
         // anything accepted here is also a candidate for early-exit, and
         // anything that meets the early criterion would have been rescued
         // here.
-        if state.certifies_kkt(final_projected_grad, tol) {
+        if state.certifies_kkt(final_projected_grad, kkt_tolerance) {
             log::debug!(
                 "[PIRLS] post-loop rescue: strict KKT after MaxIterations \
                  (‖g‖={final_projected_grad:.3e})"
@@ -5412,7 +5452,8 @@ where
                 dev_change: last_deviance_change,
             },
             max_abs_eta,
-            tol,
+            options.convergence_tolerance,
+            kkt_tolerance,
         ) {
             log::debug!(
                 "[PIRLS] post-loop rescue on soft acceptance: {reason:?} \
@@ -6405,6 +6446,17 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
+    fit_model_for_fixed_rho_with_adaptive_kkt(rho, problem, penalty, config, warm_start_beta, None)
+}
+
+pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
+    rho: LogSmoothingParamsView<'_>,
+    problem: PirlsProblem<'a, X>,
+    penalty: PenaltyConfig<'_>,
+    config: &PirlsConfig,
+    warm_start_beta: Option<&Coefficients>,
+    adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
+) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let PirlsProblem {
         x,
         offset,
@@ -6935,6 +6987,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             config.max_iterations
         },
         convergence_tolerance: config.convergence_tolerance,
+        adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
         // together collapsed step halving to 3 under seed screening (where
@@ -7010,7 +7063,7 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
             summary.last_deviance_change.abs() <= dev_tol || summary.last_step_size <= step_floor;
         let near_stationary = summary
             .state
-            .near_stationary_kkt(summary.lastgradient_norm, options.convergence_tolerance);
+            .near_stationary_kkt(summary.lastgradient_norm, effective_kkt_tolerance(&options));
         progress_stopped && near_stationary
     };
 
@@ -11361,6 +11414,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 3,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -11615,6 +11669,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 5,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -11674,6 +11729,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 5,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -11714,6 +11770,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             min_step_size: 0.0,
             firth_bias_reduction: true,
@@ -11764,6 +11821,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -11797,6 +11855,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 25,
             convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -11833,6 +11892,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 1,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -12307,6 +12367,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             min_step_size: 0.0,
             firth_bias_reduction: false,
@@ -12365,6 +12426,7 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
             convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             min_step_size: 0.0,
             firth_bias_reduction: false,

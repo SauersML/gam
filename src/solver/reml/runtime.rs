@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
 const TK_MAX_COEFFICIENTS: usize = 2_000;
+const ADAPTIVE_KKT_ETA: f64 = 0.1;
+const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 const TK_MAX_DENSE_WORK: usize = 5_000_000;
 
 #[inline]

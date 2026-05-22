@@ -121,6 +121,22 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+trait CliCauseCountResult {
+    fn into_cli_result(self) -> Result<usize, String>;
+}
+
+impl CliCauseCountResult for usize {
+    fn into_cli_result(self) -> Result<usize, String> {
+        Ok(self)
+    }
+}
+
+impl<E: ToString> CliCauseCountResult for Result<usize, E> {
+    fn into_cli_result(self) -> Result<usize, String> {
+        self.map_err(|err| err.to_string())
+    }
+}
+
 type CliResult<T> = Result<T, CliError>;
 
 #[derive(Debug, Error)]
@@ -4249,7 +4265,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         age_exit[i] = t1;
         event_target[i] = survival_event_code_from_value(ev, i)?;
     }
-    let cause_count = gam::survival::cause_count_from_event_codes(event_target.view());
+    let cause_count =
+        gam::survival::cause_count_from_event_codes(event_target.view()).into_cli_result()?;
     if cause_count > 1
         && !matches!(
             likelihood_mode,
