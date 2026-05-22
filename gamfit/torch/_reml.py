@@ -35,9 +35,20 @@ class AdditiveRemlOutput:
     """Forward outputs for the multi-smooth additive REML fit.
 
     ``coefficients`` is a list of per-smooth coefficient blocks (each of
-    shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam`` is
-    the shared scalar smoothing parameter; ``reml_score`` and ``edf`` are
-    scalars from the underlying single-λ fit.
+    shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam``
+    carries the smoothing parameter(s): a length-``F`` 1D tensor when the
+    fit went through the multi-block per-smooth-λ Rust path, or a scalar
+    tensor for the legacy single-λ block-diagonal path; ``reml_score`` is
+    the converged REML criterion; ``edf`` is length-``F`` per-smooth on
+    the multi-block path and a scalar on the legacy path.
+
+    .. note::
+       The multi-block path is forward-only: the underlying Rust
+       ``optimize_external_design`` driver does not yet expose an
+       analytic IFT/envelope VJP through its outer F×F Hessian to
+       Python. See :func:`gaussian_reml_fit_blocks` for the canonical
+       multi-λ entrypoint and its NotImplementedError contract on
+       ``.backward()``.
     """
 
     coefficients: list[torch.Tensor]
@@ -366,6 +377,122 @@ def gaussian_reml_fit_batched(
     return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
 
+def gaussian_reml_fit_blocks(
+    design_blocks: list[torch.Tensor],
+    penalty_blocks: list[torch.Tensor],
+    y: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    init_log_lambdas: torch.Tensor | None = None,
+) -> AdditiveRemlOutput:
+    """Multi-block Gaussian REML forward fit with per-smooth λ.
+
+    Forward-only torch face of the Rust ``optimize_external_design``
+    multi-block outer-loop (Gaussian identity link). Each
+    ``design_blocks[k]`` of shape ``(N, K_k)`` carries its own penalty
+    ``penalty_blocks[k]`` of shape ``(K_k, K_k)`` with its own scalar
+    ``λ_k`` driven by the outer Newton/EFS loop. Returns the per-block
+    smoothing parameters in ``AdditiveRemlOutput.lam`` (1D tensor of
+    length ``F``) together with per-block EDFs in ``.edf``.
+
+    Parameters
+    ----------
+    design_blocks:
+        List of ``F`` per-smooth design matrices, each of shape ``(N, K_k)``.
+    penalty_blocks:
+        List of ``F`` per-smooth penalty matrices, each of shape ``(K_k, K_k)``.
+    y:
+        Response tensor of shape ``(N,)`` or ``(N, 1)``. Multi-output
+        ``(N, D>1)`` is not supported on this path; call this function once
+        per output column or use the legacy single-λ
+        :func:`gaussian_reml_fit_additive` path.
+    weights:
+        Optional row weights of shape ``(N,)``.
+    init_log_lambdas:
+        Optional warm-start log-λ vector of shape ``(F,)`` (one entry per
+        block). When omitted the driver chooses its own seeds.
+
+    Returns
+    -------
+    AdditiveRemlOutput
+        ``coefficients`` is a list of ``F`` per-block ``(K_k, 1)`` tensors;
+        ``fitted`` is ``(N, 1)``; ``lam`` is a length-``F`` 1D tensor of
+        per-smooth λ; ``reml_score`` is the converged REML criterion;
+        ``edf`` is a length-``F`` tensor of per-smooth EDFs.
+
+    Notes
+    -----
+    **Forward only.** ``.backward()`` through this path is currently
+    unsupported and will raise ``NotImplementedError`` if attempted. A
+    differentiable backward needs an analytic IFT through the F×F outer
+    Hessian of the REML criterion plus envelope-theorem VJPs of the
+    per-block penalty derivatives — that work is intentionally deferred
+    to a separate workstream. Tensors returned here are detached.
+    """
+    if len(design_blocks) != len(penalty_blocks):
+        raise ValueError(
+            f"design_blocks and penalty_blocks must have equal length; got "
+            f"{len(design_blocks)} vs {len(penalty_blocks)}"
+        )
+    if len(design_blocks) == 0:
+        raise ValueError("gaussian_reml_fit_blocks requires at least one block")
+
+    designs_np = [to_numpy_f64(d) for d in design_blocks]
+    penalties_np = [to_numpy_f64(p) for p in penalty_blocks]
+
+    if y.dim() == 1:
+        y_mat = y.unsqueeze(1)
+    elif y.dim() == 2:
+        if y.shape[1] != 1:
+            raise NotImplementedError(
+                "gaussian_reml_fit_blocks: multi-output y (D>1) is not supported on "
+                "the multi-block REML path. Call once per output column, or use "
+                "gaussian_reml_fit_additive (single shared λ) for D>1."
+            )
+        y_mat = y
+    else:
+        raise ValueError(f"y must be 1D or 2D; got shape {tuple(y.shape)}")
+
+    y_np = to_numpy_f64(y_mat)
+    weights_np = None if weights is None else to_numpy_f64(weights)
+    rhos_np = None if init_log_lambdas is None else to_numpy_f64(init_log_lambdas)
+
+    out = _np_api.gaussian_reml_fit_blocks_forward(
+        designs_np,
+        penalties_np,
+        y_np,
+        weights=weights_np,
+        init_rhos=rhos_np,
+    )
+
+    ref = design_blocks[0]
+    coefs_full = np.asarray(out["coefficients"], dtype=np.float64)  # (p_total, 1)
+    fitted = np.asarray(out["fitted"], dtype=np.float64)
+    lambdas = np.asarray(out["lambdas"], dtype=np.float64)
+    reml_score = float(out["reml_score"])
+    edf = np.asarray(out["edf"], dtype=np.float64)
+
+    offsets: list[int] = [0]
+    for d in design_blocks:
+        offsets.append(offsets[-1] + int(d.shape[1]))
+    per_block_coefs: list[torch.Tensor] = [
+        from_numpy_like(coefs_full[offsets[i]:offsets[i + 1], :], ref)
+        for i in range(len(design_blocks))
+    ]
+    fitted_t = from_numpy_like(fitted, ref)
+    lam_t = from_numpy_like(lambdas, ref)
+    reml_t = from_numpy_like(np.asarray(reml_score, dtype=np.float64), ref)
+    edf_t = from_numpy_like(edf, ref)
+
+    return AdditiveRemlOutput(
+        coefficients=per_block_coefs,
+        fitted=fitted_t,
+        lam=lam_t,
+        reml_score=reml_t,
+        edf=edf_t,
+    )
+
+
 def gaussian_reml_fit_additive(
     designs: list[torch.Tensor],
     response: torch.Tensor,
@@ -375,7 +502,7 @@ def gaussian_reml_fit_additive(
     weights: torch.Tensor | None = None,
     init_lambda: float | None = None,
 ) -> AdditiveRemlOutput:
-    """Joint multi-smooth additive Gaussian REML fit (single shared λ).
+    """Joint multi-smooth additive Gaussian REML fit.
 
     .. warning::
        **This path fits a single shared smoothing parameter λ across every
