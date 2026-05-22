@@ -45,14 +45,63 @@ use crate::survival_construction::{
 use crate::term_builder::resolve_role_col;
 use crate::types::LikelihoodFamily;
 
+/// Typed errors emitted by the NUTS sampling orchestrator.
+///
+/// Each variant carries a pre-formatted `reason` string so `Display` is
+/// byte-equivalent to the original `format!(...)` outputs the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind without dragging the string apart.
+#[derive(Debug, Clone)]
+pub enum SampleError {
+    /// The requested likelihood family / saved survival spec has no NUTS
+    /// implementation behind this entry point.
+    UnsupportedFamily { reason: String },
+    /// Config-level precondition for sampling is unmet (e.g. zero penalty
+    /// blocks supplied to the weighted-sum builder).
+    InvalidConfig { reason: String },
+    /// Sampler setup failed: shape / dimension mismatches between saved
+    /// fit artifacts and the rebuilt design, Hessian factorisation, or
+    /// pass-through errors from inner builders / refit / NUTS engine.
+    SamplerSetupFailed { reason: String },
+}
+
+impl std::fmt::Display for SampleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SampleError::UnsupportedFamily { reason }
+            | SampleError::InvalidConfig { reason }
+            | SampleError::SamplerSetupFailed { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SampleError {}
+
+impl From<SampleError> for String {
+    fn from(err: SampleError) -> String {
+        err.to_string()
+    }
+}
+
+impl From<String> for SampleError {
+    /// Inbound conversion from the many `Result<_, String>` helpers this
+    /// module calls into (parse_formula, fit_gam, basis builders, saved-model
+    /// metadata accessors). The text is preserved verbatim; we pick
+    /// `SamplerSetupFailed` so external messages flow through `?` without
+    /// per-callsite `.map_err`.
+    fn from(reason: String) -> SampleError {
+        SampleError::SamplerSetupFailed { reason }
+    }
+}
+
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
 /// time-wiggle component. Re-exported because the survival fitter's tests
 /// exercise the spec independently of running NUTS.
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
-) -> Result<Option<LinkWiggleFormulaSpec>, String> {
-    model.saved_baseline_time_wiggle().map_err(String::from).map(|runtime| {
+) -> Result<Option<LinkWiggleFormulaSpec>, SampleError> {
+    model.saved_baseline_time_wiggle().map_err(String::from).map_err(SampleError::from).map(|runtime| {
         runtime.map(|saved| LinkWiggleFormulaSpec {
             degree: saved.degree,
             num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
@@ -65,28 +114,34 @@ pub fn saved_baseline_timewiggle_spec(
 fn weighted_penalty_matrix(
     penalties: &[Array2<f64>],
     lambdas: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f64>, SampleError> {
     if penalties.len() != lambdas.len() {
-        return Err(format!(
-            "penalty/lambda mismatch: {} penalties vs {} lambdas",
-            penalties.len(),
-            lambdas.len()
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "penalty/lambda mismatch: {} penalties vs {} lambdas",
+                penalties.len(),
+                lambdas.len()
+            ),
+        });
     }
     if penalties.is_empty() {
-        return Err("cannot sample without at least one penalty block".to_string());
+        return Err(SampleError::InvalidConfig {
+            reason: "cannot sample without at least one penalty block".to_string(),
+        });
     }
     let p = penalties[0].nrows();
     let mut out = Array2::<f64>::zeros((p, p));
     for (k, s) in penalties.iter().enumerate() {
         if s.nrows() != p || s.ncols() != p {
-            return Err(format!(
-                "penalty block {k} shape mismatch: got {}x{}, expected {}x{}",
-                s.nrows(),
-                s.ncols(),
-                p,
-                p
-            ));
+            return Err(SampleError::SamplerSetupFailed {
+                reason: format!(
+                    "penalty block {k} shape mismatch: got {}x{}, expected {}x{}",
+                    s.nrows(),
+                    s.ncols(),
+                    p,
+                    p
+                ),
+            });
         }
         let lam = lambdas[k];
         out = out + &(s * lam);
@@ -97,15 +152,17 @@ fn weighted_penalty_matrix(
 fn validate_explicit_link_wiggle_joint_hessian(
     hessian: &Array2<f64>,
     expected_dim: usize,
-) -> Result<(), String> {
+) -> Result<(), SampleError> {
     if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
-        return Err(format!(
-            "link-wiggle sample: explicit joint Hessian is {}x{} but expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            expected_dim,
-            expected_dim,
-        ));
+        return Err(SampleError::SamplerSetupFailed {
+            reason: format!(
+                "link-wiggle sample: explicit joint Hessian is {}x{} but expected {}x{}",
+                hessian.nrows(),
+                hessian.ncols(),
+                expected_dim,
+                expected_dim,
+            ),
+        });
     }
     validate_all_finite(
         "link-wiggle explicit joint Hessian",
@@ -117,17 +174,20 @@ fn validate_explicit_link_wiggle_joint_hessian(
             max_abs = max_abs.max(hessian[[r, c]].abs());
             let scale = hessian[[r, c]].abs().max(hessian[[c, r]].abs()).max(1.0);
             if (hessian[[r, c]] - hessian[[c, r]]).abs() > 1e-9 * scale {
-                return Err(format!(
-                    "link-wiggle sample: explicit joint Hessian is not symmetric at ({r},{c})"
-                ));
+                return Err(SampleError::SamplerSetupFailed {
+                    reason: format!(
+                        "link-wiggle sample: explicit joint Hessian is not symmetric at ({r},{c})"
+                    ),
+                });
             }
         }
     }
     if max_abs == 0.0 {
-        return Err(
-            "link-wiggle sample: explicit joint Hessian is all zeros; refit with exact Hessian export"
-                .to_string(),
-        );
+        return Err(SampleError::SamplerSetupFailed {
+            reason:
+                "link-wiggle sample: explicit joint Hessian is all zeros; refit with exact Hessian export"
+                    .to_string(),
+        });
     }
     Ok(())
 }
@@ -163,7 +223,7 @@ pub fn sample_saved_model(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
-) -> Result<NutsResult, String> {
+) -> Result<NutsResult, SampleError> {
     let family = model.likelihood();
     match model.predict_model_class() {
         PredictModelClass::Survival => {

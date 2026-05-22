@@ -17,8 +17,9 @@ use crate::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
     transformation_normal_pit_score,
 };
+use crate::families::survival_predict::SurvivalPredictError;
 use crate::inference::model::{
-    FittedModel, PredictModelClass, append_deployment_extension_columns,
+    FittedModel, FittedModelError, PredictModelClass, append_deployment_extension_columns,
 };
 use crate::matrix::DesignMatrix;
 use crate::smooth::build_term_collection_design;
@@ -72,6 +73,25 @@ impl From<String> for PredictInputError {
     /// `.map_err`.
     fn from(reason: String) -> PredictInputError {
         PredictInputError::InvalidInput { reason }
+    }
+}
+
+impl From<SurvivalPredictError> for PredictInputError {
+    /// Survival-prediction helpers (`resolve_termspec_for_prediction`,
+    /// `fit_result_from_saved_model_for_prediction`) emit their own typed
+    /// errors; flatten them to `InvalidInput` preserving the rendered text.
+    fn from(err: SurvivalPredictError) -> PredictInputError {
+        PredictInputError::InvalidInput { reason: err.to_string() }
+    }
+}
+
+impl From<FittedModelError> for PredictInputError {
+    /// `FittedModel` payload helpers (deployment extension assembly,
+    /// calibration validation) surface model-layer errors that the
+    /// predict-input boundary forwards as `InvalidInput` with the original
+    /// rendered text.
+    fn from(err: FittedModelError) -> PredictInputError {
+        PredictInputError::InvalidInput { reason: err.to_string() }
     }
 }
 
