@@ -2979,6 +2979,7 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 ///
 /// The last term m1·u_αβγδ is nonzero only for (ϑ,s,s,s) and (s,s,s,s).
 /// Without these terms the outer Hessian drift is incomplete.
+#[allow(dead_code)] // Kept for WS4a outer-Hessian consumers that need fourth-order q chain terms.
 #[inline]
 pub(crate) fn q_chain_derivs_fourth_scalar(
     eta_t: f64,
@@ -5872,26 +5873,8 @@ fn survival_wiggle_third_basis(
     monotone_wiggle_basis_with_derivative_order(q0, knots, degree, 3)
 }
 
-fn survival_wiggle_fourth_q(
-    q0: ndarray::ArrayView1<'_, f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    beta_w: ndarray::ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let basis_d4 = monotone_wiggle_basis_with_derivative_order(q0, knots, degree, 4)?;
-    if basis_d4.ncols() != beta_w.len() {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-            "survival linkwiggle fourth-derivative dimension mismatch: basis has {} columns but beta has {} entries",
-            basis_d4.ncols(),
-            beta_w.len()
-        ) }.into());
-    }
-    Ok(fast_av(&basis_d4, &beta_w))
-}
-
 fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
-    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls, q_tl_ls_ls, q_llll) =
-        q_chain_derivs_fourth_scalar(eta_t, eta_ls);
+    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) = q_chain_derivs_scalar(eta_t, eta_ls);
     let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
     SurvivalBaseQScalars {
         eta_t,
@@ -5903,8 +5886,6 @@ fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
         q_ll,
         q_tl_ls,
         q_ll_ls,
-        q_tl_ls_ls,
-        q_llll,
     }
 }
 
@@ -5926,7 +5907,6 @@ fn compose_survival_dynamic_q(
     dq_dq0: f64,
     d2q_dq02: f64,
     d3q_dq03: f64,
-    d4q_dq04: f64,
 ) -> SurvivalDynamicQScalars {
     let a = base.q_t;
     let b = base.q_ls;
@@ -5934,12 +5914,9 @@ fn compose_survival_dynamic_q(
     let d = base.q_ll;
     let e = base.q_tl_ls;
     let f = base.q_ll_ls;
-    let g = base.q_tl_ls_ls;
-    let h = base.q_llll;
     let m1 = dq_dq0;
     let m2 = d2q_dq02;
     let m3 = d3q_dq03;
-    let m4 = d4q_dq04;
     let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
     let r_t = safe_product(c, eta_ls_deriv);
     let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
@@ -5958,38 +5935,6 @@ fn compose_survival_dynamic_q(
         safe_product(m2, 3.0 * safe_product(b, d)),
         safe_product(m1, f),
     );
-    let q_tl_ls_ls = safe_sum3(
-        safe_product(m4, safe_product(a, safe_product(b, safe_product(b, b)))),
-        safe_product(
-            m3,
-            safe_sum2(
-                3.0 * safe_product(safe_product(b, b), c),
-                3.0 * safe_product(safe_product(a, b), d),
-            ),
-        ),
-        safe_sum2(
-            safe_product(
-                m2,
-                safe_sum3(
-                    safe_product(a, f),
-                    3.0 * safe_product(c, d),
-                    3.0 * safe_product(b, e),
-                ),
-            ),
-            safe_product(m1, g),
-        ),
-    );
-    let q_llll = safe_sum3(
-        safe_product(m4, safe_product(safe_product(b, b), safe_product(b, b))),
-        safe_product(m3, 6.0 * safe_product(safe_product(b, b), d)),
-        safe_sum2(
-            safe_product(
-                m2,
-                safe_sum2(3.0 * safe_product(d, d), 4.0 * safe_product(b, f)),
-            ),
-            safe_product(m1, h),
-        ),
-    );
 
     SurvivalDynamicQScalars {
         q: base.q + wiggle_value,
@@ -5999,8 +5944,6 @@ fn compose_survival_dynamic_q(
         q_ll,
         q_tl_ls,
         q_ll_ls,
-        q_tl_ls_ls,
-        q_llll,
         qdot: safe_product(m1, r),
         qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, r_t)),
         qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
@@ -11032,7 +10975,6 @@ mod tests {
         let dq_dq0 = 1.1;
         let d2q_dq02 = -0.7;
         let d3q_dq03 = 0.45;
-        let d4q_dq04 = -0.15;
 
         let dyn_q = compose_survival_dynamic_q(
             base,
@@ -11042,7 +10984,6 @@ mod tests {
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
-            d4q_dq04,
         );
 
         let a = base.q_t;
