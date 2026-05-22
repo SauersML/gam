@@ -3237,7 +3237,7 @@ struct TrustEnergyModel {
     point: Array1<f64>,
     gradient: Array1<f64>,
     hessian: HessianValue,
-    ift_residual_energy: Option<f64>,
+    ift_residual_energy: Option<(f64, u64)>,
 }
 
 impl TrustEnergyModel {
@@ -3245,14 +3245,14 @@ impl TrustEnergyModel {
         point: Array1<f64>,
         gradient: Array1<f64>,
         hessian: HessianValue,
-        ift_residual_energy: Option<f64>,
+        ift_residual_energy: Option<(f64, u64)>,
     ) -> Self {
         Self {
             point,
             gradient,
             hessian,
             ift_residual_energy: ift_residual_energy
-                .filter(|energy| energy.is_finite() && *energy >= 0.0),
+                .filter(|(energy, _)| energy.is_finite() && *energy >= 0.0),
         }
     }
 
@@ -3321,11 +3321,36 @@ impl TrustEnergyGateState {
             return Ok(());
         };
         let energy_contamination = match (accepted.ift_residual_energy, predicted_decrease) {
-            (Some(e), p) if p.abs() > 0.0 && e > TRUST_ENERGY_FACTOR * p.abs() => true,
+            (Some((e, cached_iter)), p) if p.abs() > 0.0 => {
+                let current_iter =
+                    crate::solver::estimate::reml::runtime::current_outer_iter();
+                if cached_iter == 0 || current_iter == 0 {
+                    false
+                } else if current_iter < cached_iter {
+                    let gap = cached_iter - current_iter;
+                    log::info!(
+                        "[TRUST-ENERGY] cache stale (gap={}), skipping gate",
+                        gap
+                    );
+                    false
+                } else if current_iter - cached_iter > 1 {
+                    let gap = current_iter - cached_iter;
+                    log::info!(
+                        "[TRUST-ENERGY] cache stale (gap={}), skipping gate",
+                        gap
+                    );
+                    false
+                } else {
+                    e > TRUST_ENERGY_FACTOR * p.abs()
+                }
+            }
             _ => false,
         };
         if energy_contamination {
-            let energy = accepted.ift_residual_energy.unwrap_or(f64::NAN);
+            let energy = accepted
+                .ift_residual_energy
+                .map(|(energy, _)| energy)
+                .unwrap_or(f64::NAN);
             let step_norm = (&trial.point - &accepted.point)
                 .dot(&(&trial.point - &accepted.point))
                 .sqrt();
@@ -3413,6 +3438,9 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         self.update_inner_cap_from_accepted_iter();
+        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(
+            self.eval_count.saturating_add(1) as u64,
+        );
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
@@ -3447,6 +3475,9 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
     ) -> Result<OperatorSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         self.update_inner_cap_from_accepted_iter();
+        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(
+            self.eval_count.saturating_add(1) as u64,
+        );
         let stage_start = std::time::Instant::now();
         log::info!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
@@ -5275,6 +5306,7 @@ fn run_outer_with_plan(
         if started_seeds == seed_budget {
             break;
         }
+        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
         obj.reset();
         let t_seed_start = std::time::Instant::now();
         let seed_slot;

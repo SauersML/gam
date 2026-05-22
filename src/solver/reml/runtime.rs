@@ -44,27 +44,41 @@ const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
 const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
-static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, f64>>> = OnceLock::new();
+static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> =
+    OnceLock::new();
+static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
-fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, f64>> {
+fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, (f64, u64)>> {
     OUTER_IFT_RESIDUAL_ENERGY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn cached_ift_residual_energy_for_outer_theta(theta: &Array1<f64>) -> Option<f64> {
+pub(crate) fn record_current_outer_iter_for_ift(iter: u64) {
+    OUTER_IFT_RESIDUAL_ENERGY_ITER.store(iter, Ordering::Relaxed);
+}
+
+pub(crate) fn current_outer_iter() -> u64 {
+    OUTER_IFT_RESIDUAL_ENERGY_ITER.load(Ordering::Relaxed)
+}
+
+pub(crate) fn cached_ift_residual_energy_for_outer_theta(
+    theta: &Array1<f64>,
+) -> Option<(f64, u64)> {
     let key = super::cache::sanitized_rhokey(theta)?;
-    let energy = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
+    let (energy, iter) = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
     (energy.is_finite() && energy >= 0.0).then_some(energy)
+        .map(|energy| (energy, iter))
 }
 
 fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
-    let Some(energy) = energy.filter(|energy| energy.is_finite() && *energy >= 0.0) else {
-        return;
-    };
     let Some(key) = super::cache::sanitized_rhokey(theta) else {
         return;
     };
     if let Ok(mut cache) = outer_ift_residual_energy_cache().lock() {
-        cache.insert(key, energy);
+        if let Some(energy) = energy.filter(|energy| energy.is_finite() && *energy >= 0.0) {
+            cache.insert(key, (energy, current_outer_iter()));
+        } else {
+            cache.remove(&key);
+        }
     }
 }
 
