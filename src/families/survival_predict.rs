@@ -2413,7 +2413,7 @@ mod tests {
     fn probit_survival_hazard_rejects_infinite_time_derivative() {
         let err = probit_survival_hazard_components(1.0, f64::INFINITY)
             .expect_err("infinite derivative should be invalid");
-        assert!(err.contains("invalid survival index derivative"));
+        assert!(err.to_string().contains("invalid survival index derivative"));
     }
 
     #[test]
@@ -2425,10 +2425,10 @@ mod tests {
         // zero). Pin both NaN slots so the input gate cannot regress.
         let err_eta =
             probit_survival_hazard_components(f64::NAN, 0.5).expect_err("NaN eta must be rejected");
-        assert!(err_eta.contains("invalid survival index derivative"));
+        assert!(err_eta.to_string().contains("invalid survival index derivative"));
         let err_dt = probit_survival_hazard_components(1.0, f64::NAN)
             .expect_err("NaN eta_derivative must be rejected");
-        assert!(err_dt.contains("invalid survival index derivative"));
+        assert!(err_dt.to_string().contains("invalid survival index derivative"));
     }
 
     #[test]
@@ -2438,7 +2438,7 @@ mod tests {
         // not a valid survival function.
         let err = probit_survival_hazard_components(1.0, -0.5)
             .expect_err("negative derivative should be invalid");
-        assert!(err.contains("invalid survival index derivative"));
+        assert!(err.to_string().contains("invalid survival index derivative"));
     }
 
     #[test]
@@ -2458,7 +2458,7 @@ mod tests {
     fn royston_parmar_hazard_rejects_nonpositive_log_hazard_derivative() {
         let err = royston_parmar_survival_hazard_components(0.0, 0.0)
             .expect_err("zero derivative should be invalid");
-        assert!(err.contains("invalid log-cumulative-hazard derivative"));
+        assert!(err.to_string().contains("invalid log-cumulative-hazard derivative"));
     }
 
     #[test]
@@ -2488,7 +2488,7 @@ mod tests {
     fn royston_parmar_hazard_rejects_nan_eta() {
         let err = royston_parmar_survival_hazard_components(f64::NAN, 0.5)
             .expect_err("NaN eta should be invalid");
-        assert!(err.contains("invalid log-cumulative-hazard derivative"));
+        assert!(err.to_string().contains("invalid log-cumulative-hazard derivative"));
     }
 
     #[test]
