@@ -5004,9 +5004,11 @@ where
                                 predicted_reduction,
                                 current_penalized,
                             },
-                            // max_abs_eta is unused on the Predicted path, but
-                            // still pass the current state's value for symmetry.
-                            state.eta.iter().copied().map(f64::abs).fold(0.0, f64::max),
+                            // `pirls_soft_acceptance` returns early on the
+                            // `Predicted` arm before reading `max_abs_eta`, so
+                            // skip the redundant `O(n)` |η| sweep here. The
+                            // accept-branch below recomputes it when needed.
+                            f64::NAN,
                             options.convergence_tolerance,
                         );
                         let near_stationary_pass = state
