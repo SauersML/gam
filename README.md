@@ -90,9 +90,7 @@ gamfit.fit(df, "z ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 
 Smooths on manifolds. The basis and penalty encode the wrap topology,
 so a fit on `theta ∈ [0, 2π)` has no seam at 0 / 2π, and an `S²` fit
-has no pole artefacts. The Möbius example in the gallery below is a
-4π-periodic double-cover parameterization of a Möbius embedding; the
-predictor basis is not itself twisted.
+has no pole artefacts.
 
 ```python
 gamfit.fit(df, "y ~ s(theta, periodic=true, period=2*pi)")
