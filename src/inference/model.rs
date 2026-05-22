@@ -1716,11 +1716,13 @@ impl SavedAnchoredDeviationRuntime {
     {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
-            return Err(format!(
-                "saved anchored deviation coefficient length mismatch: got {}, expected {}",
-                beta.len(),
-                self.basis_dim
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved anchored deviation coefficient length mismatch: got {}, expected {}",
+                    beta.len(),
+                    self.basis_dim
+                ),
+            });
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
@@ -1763,7 +1765,10 @@ impl SavedAnchoredDeviationRuntime {
         let points = self.breakpoints()?;
         match (points.first(), points.last()) {
             (Some(&left), Some(&right)) => Ok((left, right)),
-            _ => Err("saved anchored deviation runtime is missing support breakpoints".to_string()),
+            _ => Err(FittedModelError::MissingField {
+                reason: "saved anchored deviation runtime is missing support breakpoints"
+                    .to_string(),
+            }),
         }
     }
 
@@ -1808,29 +1813,35 @@ impl SavedAnchoredDeviationRuntime {
         if let Some(m_rows) = self.anchor_residual_coefficients.as_ref() {
             let d = m_rows.len();
             if anchor_rows.nrows() != values.len() {
-                return Err(format!(
-                    "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
-                    anchor_rows.nrows(),
-                    values.len(),
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "design_with_anchor_rows: anchor_rows has {} rows, expected {} (matching values)",
+                        anchor_rows.nrows(),
+                        values.len(),
+                    ),
+                });
             }
             if anchor_rows.ncols() != d {
-                return Err(format!(
-                    "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
-                    anchor_rows.ncols(),
-                    d,
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "design_with_anchor_rows: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                        anchor_rows.ncols(),
+                        d,
+                    ),
+                });
             }
             // Materialise M (d × basis_dim) once.
             let mut m_dense = Array2::<f64>::zeros((d, self.basis_dim));
             for (i, row) in m_rows.iter().enumerate() {
                 if row.len() != self.basis_dim {
-                    return Err(format!(
-                        "design_with_anchor_rows: anchor_residual_coefficients row {} has length {}, expected basis_dim {}",
-                        i,
-                        row.len(),
-                        self.basis_dim,
-                    ));
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: format!(
+                            "design_with_anchor_rows: anchor_residual_coefficients row {} has length {}, expected basis_dim {}",
+                            i,
+                            row.len(),
+                            self.basis_dim,
+                        ),
+                    });
                 }
                 for (j, &v) in row.iter().enumerate() {
                     m_dense[[i, j]] = v;
@@ -1846,10 +1857,12 @@ impl SavedAnchoredDeviationRuntime {
             let subtract = rotated_anchor.dot(&m_dense);
             out = out - subtract;
         } else if anchor_rows.ncols() != 0 {
-            return Err(format!(
-                "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
-                anchor_rows.ncols(),
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "design_with_anchor_rows: runtime has no anchor residual but anchor_rows has {} cols",
+                    anchor_rows.ncols(),
+                ),
+            });
         }
         Ok(out)
     }
@@ -1870,21 +1883,25 @@ impl SavedAnchoredDeviationRuntime {
         };
         let d = m_rows.len();
         if n_anchor_rows.ncols() != d {
-            return Err(format!(
-                "anchor_correction_matrix: anchor_rows has {} cols, expected {} (sum of component ncols)",
-                n_anchor_rows.ncols(),
-                d,
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "anchor_correction_matrix: anchor_rows has {} cols, expected {} (sum of component ncols)",
+                    n_anchor_rows.ncols(),
+                    d,
+                ),
+            });
         }
         let mut m_dense = Array2::<f64>::zeros((d, self.basis_dim));
         for (i, row) in m_rows.iter().enumerate() {
             if row.len() != self.basis_dim {
-                return Err(format!(
-                    "anchor_correction_matrix: M row {} has length {}, expected basis_dim {}",
-                    i,
-                    row.len(),
-                    self.basis_dim,
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "anchor_correction_matrix: M row {} has length {}, expected basis_dim {}",
+                        i,
+                        row.len(),
+                        self.basis_dim,
+                    ),
+                });
             }
             for (j, &v) in row.iter().enumerate() {
                 m_dense[[i, j]] = v;
@@ -1911,21 +1928,25 @@ impl SavedAnchoredDeviationRuntime {
             return Ok(n_anchor_rows.to_owned());
         };
         if rot_rows.len() != d {
-            return Err(format!(
-                "rotated_anchor_rows: rotation has {} rows, expected {}",
-                rot_rows.len(),
-                d,
-            ));
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "rotated_anchor_rows: rotation has {} rows, expected {}",
+                    rot_rows.len(),
+                    d,
+                ),
+            });
         }
         let mut rotation = Array2::<f64>::zeros((d, d));
         for (i, row) in rot_rows.iter().enumerate() {
             if row.len() != d {
-                return Err(format!(
-                    "rotated_anchor_rows: rotation row {} has length {}, expected {}",
-                    i,
-                    row.len(),
-                    d,
-                ));
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: format!(
+                        "rotated_anchor_rows: rotation row {} has length {}, expected {}",
+                        i,
+                        row.len(),
+                        d,
+                    ),
+                });
             }
             for (j, &v) in row.iter().enumerate() {
                 rotation[[i, j]] = v;
