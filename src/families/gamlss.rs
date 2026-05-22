@@ -11654,6 +11654,53 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
             pieces,
         })
     }
+
+    /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
+    /// per-row coefficient arrays in place.
+    ///
+    /// Each sampled row's `coeff_*[i]` is multiplied by its
+    /// `WeightedOuterRow.weight` (the HT inverse-inclusion factor 1/π_i —
+    /// uniform or stratified sampling both supported). All non-sampled rows
+    /// are zeroed. Because every downstream assembly (`hessian_dense`,
+    /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
+    /// via `Xᵀ diag(W) Y`, the resulting joint-Hessian is an unbiased
+    /// estimator of the full-data joint Hessian. The `basis`/`basis_d1`
+    /// matrices are independent of the per-row weights and remain unchanged.
+    /// The Gaussian wiggle has 7 coefficient arrays (no `coeff_lw_d`, unlike
+    /// the binomial wiggle's 8) because the wiggle enters the Gaussian
+    /// likelihood only through `q = η_μ + η_w` (no σ-chain).
+    #[allow(dead_code)]
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.pieces.coeff_mm.len();
+        let mut mask_mm = Array1::<f64>::zeros(n);
+        let mut mask_ml = Array1::<f64>::zeros(n);
+        let mut mask_ll = Array1::<f64>::zeros(n);
+        let mut mask_mw_b = Array1::<f64>::zeros(n);
+        let mut mask_mw_d = Array1::<f64>::zeros(n);
+        let mut mask_lw_b = Array1::<f64>::zeros(n);
+        let mut maskww = Array1::<f64>::zeros(n);
+        for r in rows {
+            let i = r.index;
+            let w = r.weight;
+            mask_mm[i] = self.pieces.coeff_mm[i] * w;
+            mask_ml[i] = self.pieces.coeff_ml[i] * w;
+            mask_ll[i] = self.pieces.coeff_ll[i] * w;
+            mask_mw_b[i] = self.pieces.coeff_mw_b[i] * w;
+            mask_mw_d[i] = self.pieces.coeff_mw_d[i] * w;
+            mask_lw_b[i] = self.pieces.coeff_lw_b[i] * w;
+            maskww[i] = self.pieces.coeff_ww[i] * w;
+        }
+        self.pieces.coeff_mm = mask_mm;
+        self.pieces.coeff_ml = mask_ml;
+        self.pieces.coeff_ll = mask_ll;
+        self.pieces.coeff_mw_b = mask_mw_b;
+        self.pieces.coeff_mw_d = mask_mw_d;
+        self.pieces.coeff_lw_b = mask_lw_b;
+        self.pieces.coeff_ww = maskww;
+    }
 }
 
 impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWorkspace {
