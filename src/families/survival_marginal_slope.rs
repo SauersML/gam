@@ -5163,10 +5163,16 @@ impl SurvivalMarginalSlopeFamily {
 
     fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
         if self.score_warp.is_some() && self.flex_score_beta(block_states)?.is_none() {
-            return Err("missing survival score-warp block state".to_string());
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "missing survival score-warp block state".to_string(),
+            }
+            .into());
         }
         if self.link_dev.is_some() && self.flex_link_beta(block_states)?.is_none() {
-            return Err("missing survival link-deviation block state".to_string());
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "missing survival link-deviation block state".to_string(),
+            }
+            .into());
         }
         Ok(self.flex_active())
     }
@@ -5380,10 +5386,13 @@ impl SurvivalMarginalSlopeFamily {
         let residual = solution.residual;
         let abs_deriv = solution.abs_deriv;
         if !abs_deriv.is_finite() || abs_deriv == 0.0 {
-            return Err(format!(
-                "survival marginal-slope intercept solve failed: \
-                 zero or non-finite derivative at a={a:.6}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope intercept solve failed: \
+                     zero or non-finite derivative at a={a:.6}"
+                ),
+            }
+            .into());
         }
 
         let target_survival = crate::probability::normal_cdf(-q);
@@ -5428,12 +5437,15 @@ impl SurvivalMarginalSlopeFamily {
             let log_tail_detail = log_tail_residual
                 .map(|value| format!(", log_tail_residual={value:.3e}"))
                 .unwrap_or_default();
-            return Err(format!(
-                "survival marginal-slope intercept solve failed: \
-                 residual={residual:.3e} at a={a:.6}, target survival={target_survival:.6e}, \
-                 achieved survival={achieved_survival:.6e}, probability_tol={probability_tol:.3e}\
-                 {log_tail_detail}"
-            ));
+            return Err(SurvivalMarginalSlopeError::IntegrationFailed {
+                reason: format!(
+                    "survival marginal-slope intercept solve failed: \
+                     residual={residual:.3e} at a={a:.6}, target survival={target_survival:.6e}, \
+                     achieved survival={achieved_survival:.6e}, probability_tol={probability_tol:.3e}\
+                     {log_tail_detail}"
+                ),
+            }
+            .into());
         }
 
         // Cache the converged intercept for the next PIRLS iter, if a slot
@@ -5457,21 +5469,27 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(None);
         };
         if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
-            return Err(format!(
-                "survival marginal-slope time-step dimension mismatch: beta={}, delta={}, expected {}",
-                beta.len(),
-                delta.len(),
-                constraints.a.ncols()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope time-step dimension mismatch: beta={}, delta={}, expected {}",
+                    beta.len(),
+                    delta.len(),
+                    constraints.a.ncols()
+                ),
+            }
+            .into());
         }
         let mut alpha = 1.0f64;
         for row in 0..constraints.a.nrows() {
             let a_row = constraints.a.row(row);
             let slack = a_row.dot(beta) - constraints.b[row];
             if slack < -1e-10 {
-                return Err(format!(
-                    "survival marginal-slope current time block violates derivative guard at row {row}: slack={slack:.3e}"
-                ));
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope current time block violates derivative guard at row {row}: slack={slack:.3e}"
+                    ),
+                }
+                .into());
             }
             let drift = a_row.dot(delta);
             if drift < 0.0 {
@@ -5512,10 +5530,13 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(proposed);
         }
         if proposed.len() != p {
-            return Err(format!(
-                "survival marginal-slope time-block projection length mismatch: current={p}, proposed={}",
-                proposed.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope time-block projection length mismatch: current={p}, proposed={}",
+                    proposed.len()
+                ),
+            }
+            .into());
         }
         let n_rows = self.derivative_offset_exit.len();
         if n_rows == 0 {
@@ -5524,10 +5545,13 @@ impl SurvivalMarginalSlopeFamily {
         let qd_design_current = self.design_derivative_exit.matrixvectormultiply(current);
         let qd_design_proposed = self.design_derivative_exit.matrixvectormultiply(&proposed);
         if qd_design_current.len() != n_rows || qd_design_proposed.len() != n_rows {
-            return Err(format!(
-                "survival marginal-slope time-block projection row count mismatch: design rows={} vs offset rows={n_rows}",
-                qd_design_current.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope time-block projection row count mismatch: design rows={} vs offset rows={n_rows}",
+                    qd_design_current.len()
+                ),
+            }
+            .into());
         }
         let guard = self.derivative_guard;
         let mut alpha = 1.0_f64;
@@ -5562,10 +5586,13 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         if survival_derivative_guard_violated(worst_current_qd1, guard) {
-            return Err(format!(
-                "survival marginal-slope time-block current beta violates monotonicity at row {worst_current_row}: \
-                 qd1={worst_current_qd1:.3e} < guard={guard:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope time-block current beta violates monotonicity at row {worst_current_row}: \
+                     qd1={worst_current_qd1:.3e} < guard={guard:.3e}"
+                ),
+            }
+            .into());
         }
         if !violated {
             return Ok(proposed);
@@ -5589,12 +5616,15 @@ impl SurvivalMarginalSlopeFamily {
                 .ok_or_else(|| "missing survival score-warp coefficients".to_string())?;
             let expected = runtime.basis_dim() * self.score_dim();
             if beta_h.len() != expected {
-                return Err(format!(
-                    "survival score-warp beta length mismatch: got {}, expected {expected} for K={} and basis dim {}",
-                    beta_h.len(),
-                    self.score_dim(),
-                    runtime.basis_dim()
-                ));
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "survival score-warp beta length mismatch: got {}, expected {expected} for K={} and basis dim {}",
+                        beta_h.len(),
+                        self.score_dim(),
+                        runtime.basis_dim()
+                    ),
+                }
+                .into());
             }
             for coord in 0..self.score_dim() {
                 let local_beta = self.score_warp_beta_for_coord(beta_h, coord)?;
@@ -5908,9 +5938,12 @@ impl SurvivalMarginalSlopeFamily {
         let (_, f_a, _) = self.evaluate_denested_survival_calibration(a, 0.0, b, beta_h, beta_w)?;
         let d = f_a.abs();
         if !d.is_finite() || d <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope produced non-positive calibration derivative |F'(a)|={d:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope produced non-positive calibration derivative |F'(a)|={d:.3e}"
+                ),
+            }
+            .into());
         }
         Ok(d)
     }
@@ -5940,10 +5973,13 @@ impl SurvivalMarginalSlopeFamily {
         beta_w: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
-                self.derivative_guard
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                    self.derivative_guard
+                ),
+            }
+            .into());
         }
         let (a0, _) = self.solve_row_survival_intercept_with_slot(
             q0,
@@ -5960,17 +5996,23 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
         if !d1.is_finite() || d1 <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive density normalization D1={d1:.3e} (calibration derivative {:.3e})",
-                d1
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive density normalization D1={d1:.3e} (calibration derivative {:.3e})",
+                    d1
+                ),
+            }
+            .into());
         }
         let (eta0, _) = self.observed_denested_eta_chi(row, a0, g, beta_h, beta_w)?;
         let (eta1, chi1) = self.observed_denested_eta_chi(row, a1, g, beta_h, beta_w)?;
         if !chi1.is_finite() || chi1 <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive observed chi1={chi1:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive observed chi1={chi1:.3e}"
+                ),
+            }
+            .into());
         }
         let wi = self.weights[row];
         let di = self.event[row];
@@ -6093,15 +6135,21 @@ impl SurvivalMarginalSlopeFamily {
 
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         if !d_check.is_finite() || d_check <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
+                ),
+            }
+            .into());
         }
         let d_rel_err = (d_check - d_calibration).abs() / d_check.max(d_calibration.abs()).max(1.0);
         if !d_calibration.is_finite() || d_calibration <= 0.0 || d_rel_err > 1e-8 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
+                ),
+            }
+            .into());
         }
 
         let mut a_u = Array1::<f64>::zeros(p);
@@ -6313,15 +6361,21 @@ impl SurvivalMarginalSlopeFamily {
 
         let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
         if !d_check.is_finite() || d_check <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive density normalization D={d_check:.3e}"
+                ),
+            }
+            .into());
         }
         let d_rel_err = (d_check - d_calibration).abs() / d_check.max(d_calibration.abs()).max(1.0);
         if !d_calibration.is_finite() || d_calibration <= 0.0 || d_rel_err > 1e-8 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced inconsistent calibration derivative: solve={d_calibration:.12e}, direct={d_check:.12e}"
+                ),
+            }
+            .into());
         }
 
         let mut a_u = Array1::<f64>::zeros(p);
@@ -6623,10 +6677,13 @@ impl SurvivalMarginalSlopeFamily {
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>), String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
-                self.derivative_guard
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                    self.derivative_guard
+                ),
+            }
+            .into());
         }
 
         let (a0, d0) = self.solve_row_survival_intercept_with_slot(
@@ -6651,10 +6708,13 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
-                exit.chi
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
+                    exit.chi
+                ),
+            }
+            .into());
         }
 
         let wi = self.weights[row];
@@ -6709,10 +6769,13 @@ impl SurvivalMarginalSlopeFamily {
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
-                self.derivative_guard
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: qd1={qd1:.3e} < guard={:.3e}",
+                    self.derivative_guard
+                ),
+            }
+            .into());
         }
 
         let (a0, d0) = self.solve_row_survival_intercept_with_slot(
@@ -6737,10 +6800,13 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
-            return Err(format!(
-                "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
-                exit.chi
-            ));
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival marginal-slope row {row} produced non-positive observed chi1={:.3e}",
+                    exit.chi
+                ),
+            }
+            .into());
         }
 
         let wi = self.weights[row];
@@ -6840,9 +6906,12 @@ impl SurvivalMarginalSlopeFamily {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let k = dirs.len();
         if k > 4 {
-            return Err(format!(
-                "survival marginal-slope row directional expects 0..=4 directions, got {k}"
-            ));
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "survival marginal-slope row directional expects 0..=4 directions, got {k}"
+                ),
+            }
+            .into());
         }
         let wi = self.weights[row];
         let di = self.event[row];
@@ -6989,9 +7058,12 @@ impl SurvivalMarginalSlopeFamily {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let k = dirs.len();
         if k == 0 || k > 8 {
-            return Err(format!(
-                "survival marginal-slope row directional jet expects 1..=8 directions, got {k}"
-            ));
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "survival marginal-slope row directional jet expects 1..=8 directions, got {k}"
+                ),
+            }
+            .into());
         }
         let wi = self.weights[row];
         let di = self.event[row];
@@ -7068,9 +7140,12 @@ impl SurvivalMarginalSlopeFamily {
         let qd1_val_chk = qd1_jet.coeff(0);
         let ad1_val = ad1_jet.coeff(0);
         if survival_derivative_guard_violated(qd1_val_chk, qd1_lower) {
-            return Err(format!(
-                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val_chk:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
-            ));
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={qd1_val_chk:.3e} must be at least derivative_guard={qd1_lower:.3e}; transformed time derivative={ad1_val:.3e}"
+                ),
+            }
+            .into());
         }
         let time_deriv_term = if di > 0.0 {
             ad1_jet
@@ -10367,10 +10442,13 @@ impl SurvivalMarginalSlopeFamily {
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir.len() != p {
-            return Err(format!(
-                "survival third contracted: dir length {} != primary dimension {p}",
-                dir.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival third contracted: dir length {} != primary dimension {p}",
+                    dir.len()
+                ),
+            }
+            .into());
         }
         if dir.iter().all(|v| v.abs() == 0.0) {
             return Ok(Array2::<f64>::zeros((p, p)));

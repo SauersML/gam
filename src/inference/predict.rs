@@ -2157,6 +2157,8 @@ impl BernoulliMarginalSlopePredictor {
                     None
                 };
                 let mut warm_start_buf = Array1::<f64>::zeros(1);
+                let mut f_h_row = vec![0.0; score_warp_dim];
+                let mut f_w_row = vec![0.0; link_dev_dim];
 
                 for local_row in 0..rows {
                     let i = start + local_row;
@@ -2194,8 +2196,8 @@ impl BernoulliMarginalSlopePredictor {
                     let m_a = m_a_raw.max(1e-12);
                     a_q.as_mut().unwrap()[local_row] = marginal_map[i].mu1 / m_a;
                     let mut f_b = 0.0;
-                    let mut f_h_row = vec![0.0; score_warp_dim];
-                    let mut f_w_row = vec![0.0; link_dev_dim];
+                    f_h_row.fill(0.0);
+                    f_w_row.fill(0.0);
                     if let Some(grid) = empirical_grid.as_ref() {
                         for (node, weight) in grid.pairs() {
                             let obs = self.observed_denested_cell_partials_at_z(
