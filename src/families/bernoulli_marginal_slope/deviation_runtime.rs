@@ -471,17 +471,22 @@ impl DeviationRuntime {
         let raw_right_boundary_values =
             create_ispline_derivative_dense(right_endpoint.view(), &knots, internal_degree, 0)
                 .map_err(|e| {
-                    format!("DeviationRuntime cubic I-spline right boundary failed: {e}")
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: format!(
+                            "DeviationRuntime cubic I-spline right boundary failed: {e}"
+                        ),
+                    })
                 })?;
         let raw_right_boundary_value_row = raw_right_boundary_values.row(0).to_owned();
 
         if max_penalty_derivative_order == 0 {
-            return Err(
-                "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
                  drop the corresponding smoothness null space; an order-0 (mass) penalty alone \
                  has no null space and would not require any drop"
                     .to_string(),
-            );
+            }
+            .into());
         }
         if max_penalty_derivative_order > 3 {
             return Err(DeviationRuntimeError::InvalidInput {
@@ -821,11 +826,14 @@ impl DeviationRuntime {
 
     fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
         if beta.len() != self.basis_dim {
-            return Err(format!(
-                "{label} length mismatch: got {}, expected {}",
-                beta.len(),
-                self.basis_dim
-            ));
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: format!(
+                    "{label} length mismatch: got {}, expected {}",
+                    beta.len(),
+                    self.basis_dim
+                ),
+            }
+            .into());
         }
         Ok(())
     }
@@ -843,9 +851,12 @@ impl DeviationRuntime {
         let mut out = Array2::<f64>::zeros((values.len(), self.basis_dim));
         for (row_idx, &value) in values.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!(
-                    "deviation runtime design value at row {row_idx} is non-finite ({value})"
-                ));
+                return Err(DeviationRuntimeError::InvalidInput {
+                    reason: format!(
+                        "deviation runtime design value at row {row_idx} is non-finite ({value})"
+                    ),
+                }
+                .into());
             }
             if value < left_ep {
                 if derivative_order == 0 {
@@ -875,9 +886,12 @@ impl DeviationRuntime {
                     3 => 6.0 * c3,
                     4 => 0.0,
                     other => {
-                        return Err(format!(
-                            "deviation runtime only supports derivative orders up to 4, got {other}"
-                        ));
+                        return Err(DeviationRuntimeError::InvalidInput {
+                            reason: format!(
+                                "deviation runtime only supports derivative orders up to 4, got {other}"
+                            ),
+                        }
+                        .into());
                     }
                 };
             }
@@ -920,19 +934,25 @@ impl DeviationRuntime {
         derivative_order: usize,
     ) -> Result<(Array2<f64>, usize), String> {
         if derivative_order > self.value_span_degree {
-            return Err(format!(
-                "deviation penalty derivative order {derivative_order} exceeds value-basis degree {}",
-                self.value_span_degree
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation penalty derivative order {derivative_order} exceeds value-basis degree {}",
+                    self.value_span_degree
+                ),
+            }
+            .into());
         }
         let mut penalty = Array2::<f64>::zeros((self.basis_dim, self.basis_dim));
         for span_idx in 0..self.span_count() {
             let (left, right) = self.span_interval(span_idx)?;
             let width = right - left;
             if !width.is_finite() || width <= 0.0 {
-                return Err(format!(
-                    "deviation penalty span {span_idx} has invalid width {width}"
-                ));
+                return Err(DeviationRuntimeError::InvalidInput {
+                    reason: format!(
+                        "deviation penalty span {span_idx} has invalid width {width}"
+                    ),
+                }
+                .into());
             }
             for i in 0..self.basis_dim {
                 let ci =
@@ -953,11 +973,19 @@ impl DeviationRuntime {
         }
         let (evals, _) = penalty
             .eigh(faer::Side::Lower)
-            .map_err(|e| format!("deviation integrated penalty eigendecomposition failed: {e}"))?;
+            .map_err(|e| {
+                String::from(DeviationRuntimeError::NumericalFailure {
+                    reason: format!("deviation integrated penalty eigendecomposition failed: {e}"),
+                })
+            })?;
         let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(
             evals
                 .as_slice()
-                .ok_or_else(|| "deviation penalty eigenvalues are not contiguous".to_string())?,
+                .ok_or_else(|| {
+                    String::from(DeviationRuntimeError::NumericalFailure {
+                        reason: "deviation penalty eigenvalues are not contiguous".to_string(),
+                    })
+                })?,
         );
         let rank = evals.iter().filter(|&&value| value > threshold).count();
         let nullity = self.basis_dim.saturating_sub(rank);
@@ -986,11 +1014,14 @@ impl DeviationRuntime {
 
     fn span_interval(&self, span_idx: usize) -> Result<(f64, f64), String> {
         if span_idx >= self.span_count() {
-            return Err(format!(
-                "deviation span index {} out of range for {} spans",
-                span_idx,
-                self.span_count()
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation span index {} out of range for {} spans",
+                    span_idx,
+                    self.span_count()
+                ),
+            }
+            .into());
         }
         Ok((
             self.endpoint_points[span_idx],
@@ -1002,7 +1033,11 @@ impl DeviationRuntime {
         span_index_for_breakpoints(
             self.endpoint_points
                 .as_slice()
-                .ok_or_else(|| "deviation runtime breakpoints are not contiguous".to_string())?,
+                .ok_or_else(|| {
+                    String::from(DeviationRuntimeError::InvalidInput {
+                        reason: "deviation runtime breakpoints are not contiguous".to_string(),
+                    })
+                })?,
             value,
             "deviation span lookup",
         )
@@ -1026,17 +1061,23 @@ impl DeviationRuntime {
         derivative_order: usize,
     ) -> Result<Vec<f64>, String> {
         if span_idx >= self.span_count() {
-            return Err(format!(
-                "deviation span index {} out of range for {} spans",
-                span_idx,
-                self.span_count()
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation span index {} out of range for {} spans",
+                    span_idx,
+                    self.span_count()
+                ),
+            }
+            .into());
         }
         if basis_idx >= self.basis_dim {
-            return Err(format!(
-                "deviation basis index {} out of range for {} coefficients",
-                basis_idx, self.basis_dim
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation basis index {} out of range for {} coefficients",
+                    basis_idx, self.basis_dim
+                ),
+            }
+            .into());
         }
         let c0 = self.span_c0[[span_idx, basis_idx]];
         let c1 = self.span_c1[[span_idx, basis_idx]];
@@ -1047,9 +1088,12 @@ impl DeviationRuntime {
             1 => Ok(vec![c1, 2.0 * c2, 3.0 * c3]),
             2 => Ok(vec![2.0 * c2, 6.0 * c3]),
             3 => Ok(vec![6.0 * c3]),
-            other => Err(format!(
-                "deviation polynomial coefficients only support derivative orders up to 3, got {other}"
-            )),
+            other => Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation polynomial coefficients only support derivative orders up to 3, got {other}"
+                ),
+            }
+            .into()),
         }
     }
 
@@ -1078,10 +1122,13 @@ impl DeviationRuntime {
         basis_idx: usize,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
         if basis_idx >= self.basis_dim {
-            return Err(format!(
-                "deviation basis index {} out of range for {} coefficients",
-                basis_idx, self.basis_dim
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation basis index {} out of range for {} coefficients",
+                    basis_idx, self.basis_dim
+                ),
+            }
+            .into());
         }
         let (left, right) = self.span_interval(span_idx)?;
         Ok(exact_kernel::LocalSpanCubic {
@@ -1104,10 +1151,13 @@ impl DeviationRuntime {
         value: f64,
     ) -> Result<exact_kernel::LocalSpanCubic, String> {
         if basis_idx >= self.basis_dim {
-            return Err(format!(
-                "deviation basis index {} out of range for {} coefficients",
-                basis_idx, self.basis_dim
-            ));
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "deviation basis index {} out of range for {} coefficients",
+                    basis_idx, self.basis_dim
+                ),
+            }
+            .into());
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
@@ -1298,17 +1348,23 @@ impl DeviationRuntime {
     fn support_interval(&self) -> Result<(f64, f64), String> {
         match (self.endpoint_points.first(), self.endpoint_points.last()) {
             (Some(&left), Some(&right)) => Ok((left, right)),
-            _ => Err("deviation runtime is missing monotonicity support points".to_string()),
+            _ => Err(DeviationRuntimeError::InvalidInput {
+                reason: "deviation runtime is missing monotonicity support points".to_string(),
+            }
+            .into()),
         }
     }
 
     pub(crate) fn exact_monotonicity_min_slack(&self, beta: &Array1<f64>) -> Result<f64, String> {
         if beta.len() != self.basis_dim {
-            return Err(format!(
-                "deviation monotonicity length mismatch: got {}, expected {}",
-                beta.len(),
-                self.basis_dim
-            ));
+            return Err(DeviationRuntimeError::DimensionMismatch {
+                reason: format!(
+                    "deviation monotonicity length mismatch: got {}, expected {}",
+                    beta.len(),
+                    self.basis_dim
+                ),
+            }
+            .into());
         }
         if beta.iter().any(|value| !value.is_finite()) {
             let bad = beta
@@ -1317,7 +1373,7 @@ impl DeviationRuntime {
                 .find(|(_, value)| !value.is_finite())
                 .map(|(idx, value)| format!("deviation coefficient {idx} is non-finite ({value})"))
                 .unwrap_or_else(|| "deviation coefficient is non-finite".to_string());
-            return Err(bad);
+            return Err(DeviationRuntimeError::InvalidInput { reason: bad }.into());
         }
 
         let mut min_slack = f64::INFINITY;
@@ -1351,7 +1407,11 @@ impl DeviationRuntime {
         if min_slack.is_finite() {
             Ok(min_slack)
         } else {
-            Err("deviation monotonicity slack computation produced no active spans".to_string())
+            Err(DeviationRuntimeError::NumericalFailure {
+                reason: "deviation monotonicity slack computation produced no active spans"
+                    .to_string(),
+            }
+            .into())
         }
     }
 
@@ -1365,10 +1425,13 @@ impl DeviationRuntime {
             Ok(())
         } else {
             let (left, right) = self.support_interval()?;
-            Err(format!(
-                "{context} violates exact monotonicity on [{left:.6}, {right:.6}] (minimum derivative slack {slack:.3e}, eps={:.3e})",
-                self.monotonicity_eps
-            ))
+            Err(DeviationRuntimeError::NumericalFailure {
+                reason: format!(
+                    "{context} violates exact monotonicity on [{left:.6}, {right:.6}] (minimum derivative slack {slack:.3e}, eps={:.3e})",
+                    self.monotonicity_eps
+                ),
+            }
+            .into())
         }
     }
 }
