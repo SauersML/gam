@@ -146,28 +146,32 @@ impl Drop for DeviceAllocation<'_> {
 }
 
 #[inline]
-pub fn check_cuda(result: CuResult, name: &str) -> Result<(), String> {
+pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
     if result == 0 {
         Ok(())
     } else {
-        Err(format!("{name} failed with CUDA driver error {result}"))
+        Err(GpuError::DriverCallFailed {
+            reason: format!("{name} failed with CUDA driver error {result}"),
+        })
     }
 }
 
-fn load_library(candidates: &[&str]) -> Result<Library, String> {
+fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     for candidate in candidates {
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
         }
     }
-    Err(format!("could not load any of: {}", candidates.join(", ")))
+    Err(GpuError::DriverLibraryUnavailable {
+        reason: format!("could not load any of: {}", candidates.join(", ")),
+    })
 }
 
 /// Like [`load_library`] but `Box::leak`s the result so the dlopen mapping
 /// stays alive for the process. Use this when the caller's fn-pointer
 /// table needs to stay valid forever (i.e. for every library binding we
 /// resolve at startup).
-pub fn load_static_library(candidates: &[&str]) -> Result<&'static Library, String> {
+pub fn load_static_library(candidates: &[&str]) -> Result<&'static Library, GpuError> {
     Ok(Box::leak(Box::new(load_library(candidates)?)))
 }
 

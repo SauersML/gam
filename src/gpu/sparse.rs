@@ -206,14 +206,16 @@ struct CusparseRuntime {
 }
 
 impl CusparseRuntime {
-    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, String> {
+    fn new(cuda: CudaWorkingState, device: GpuDeviceInfo) -> Result<Self, crate::gpu::GpuError> {
         let sparse_lib = load_static_library(cusparse_library_candidates())?;
         let sparse = CusparseApi::load(sparse_lib)?;
         cuda.set_current()?;
         let mut handle = 0_usize;
         let status = unsafe { (sparse.cusparse_create)(&mut handle) };
         if status != CUSPARSE_STATUS_SUCCESS {
-            return Err(format!("cusparseCreate failed with status {status}"));
+            return Err(crate::gpu::GpuError::DriverCallFailed {
+                reason: format!("cusparseCreate failed with status {status}"),
+            });
         }
         Ok(Self {
             cuda,
@@ -441,31 +443,22 @@ struct CusparseApi {
 }
 
 impl CusparseApi {
-    fn load(library: &Library) -> Result<Self, String> {
+    fn load(library: &Library) -> Result<Self, crate::gpu::GpuError> {
+        let sym = |e: libloading::Error| crate::gpu::GpuError::DriverSymbolMissing {
+            reason: e.to_string(),
+        };
         unsafe {
             Ok(Self {
-                cusparse_create: *library
-                    .get(b"cusparseCreate\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_destroy: *library
-                    .get(b"cusparseDestroy\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_create_csr: *library
-                    .get(b"cusparseCreateCsr\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_create_dnvec: *library
-                    .get(b"cusparseCreateDnVec\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_destroy_spmat: *library
-                    .get(b"cusparseDestroySpMat\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_destroy_dnvec: *library
-                    .get(b"cusparseDestroyDnVec\0")
-                    .map_err(|e| e.to_string())?,
+                cusparse_create: *library.get(b"cusparseCreate\0").map_err(sym)?,
+                cusparse_destroy: *library.get(b"cusparseDestroy\0").map_err(sym)?,
+                cusparse_create_csr: *library.get(b"cusparseCreateCsr\0").map_err(sym)?,
+                cusparse_create_dnvec: *library.get(b"cusparseCreateDnVec\0").map_err(sym)?,
+                cusparse_destroy_spmat: *library.get(b"cusparseDestroySpMat\0").map_err(sym)?,
+                cusparse_destroy_dnvec: *library.get(b"cusparseDestroyDnVec\0").map_err(sym)?,
                 cusparse_spmv_buffersize: *library
                     .get(b"cusparseSpMV_bufferSize\0")
-                    .map_err(|e| e.to_string())?,
-                cusparse_spmv: *library.get(b"cusparseSpMV\0").map_err(|e| e.to_string())?,
+                    .map_err(sym)?,
+                cusparse_spmv: *library.get(b"cusparseSpMV\0").map_err(sym)?,
             })
         }
     }
