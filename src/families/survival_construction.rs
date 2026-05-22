@@ -30,6 +30,67 @@ use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, array, s};
 
 // ---------------------------------------------------------------------------
+// Typed error
+// ---------------------------------------------------------------------------
+
+/// Structured failure surface for survival-model construction helpers
+/// (`parse_*`, baseline-config builders, time-basis construction). Every
+/// variant carries a free-form `reason: String` payload; `Display` emits
+/// that payload verbatim, so converting to `String` via the `From` impl
+/// produces text byte-equivalent to the pre-refactor `Err(format!(...))`
+/// call sites that were the only producers in this module.
+///
+/// The public CLI-input parsers (`parse_survival_distribution`,
+/// `parse_survival_likelihood_mode`, `parse_survival_baseline_config`)
+/// keep their `Result<_, String>` signatures — string is the natural
+/// failure type for free-form user input — and route through this enum
+/// internally via `From<SurvivalConstructionError> for String`.
+#[derive(Clone, Debug)]
+pub enum SurvivalConstructionError {
+    /// User-supplied configuration is malformed or out of range (knot
+    /// counts, anchor offsets, derivative guards, ranks).
+    InvalidConfig { reason: String },
+    /// A required column or block of metadata is absent (e.g. saved
+    /// survival ispline keep_cols, baseline target on a saved fit).
+    MissingColumn { reason: String },
+    /// Per-row / per-column shape disagreement (entry/exit lengths,
+    /// penalty rank vs basis width, basis vs coefficient counts).
+    IncompatibleDimensions { reason: String },
+    /// Numeric / domain rejection: non-finite ratios, non-positive
+    /// survival times, monotonicity violations, ispline-derivative
+    /// underflow.
+    DataValidationFailed { reason: String },
+    /// Underlying basis / penalty builder rejected the construction
+    /// request (invalid spline order, ispline keep_cols out of range,
+    /// internal empty ispline time basis).
+    BasisConstructionFailed { reason: String },
+    /// User-named distribution / likelihood-mode / baseline target /
+    /// time-basis kind is not one we recognise.
+    UnsupportedDistribution { reason: String },
+}
+
+impl std::fmt::Display for SurvivalConstructionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidConfig { reason }
+            | Self::MissingColumn { reason }
+            | Self::IncompatibleDimensions { reason }
+            | Self::DataValidationFailed { reason }
+            | Self::BasisConstructionFailed { reason }
+            | Self::UnsupportedDistribution { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for SurvivalConstructionError {}
+
+impl From<SurvivalConstructionError> for String {
+    fn from(err: SurvivalConstructionError) -> Self {
+        err.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -165,13 +226,16 @@ pub fn normalize_survival_time_pair(
     row_index: usize,
 ) -> Result<(f64, f64), String> {
     if !entry_raw.is_finite() || !exit_raw.is_finite() {
-        return Err(format!(
-            "non-finite survival times at row {}",
-            row_index + 1
-        ));
+        return Err(SurvivalConstructionError::DataValidationFailed {
+            reason: format!("non-finite survival times at row {}", row_index + 1),
+        }
+        .into());
     }
     if entry_raw < 0.0 || exit_raw < 0.0 {
-        return Err(format!("negative survival times at row {}", row_index + 1));
+        return Err(SurvivalConstructionError::DataValidationFailed {
+            reason: format!("negative survival times at row {}", row_index + 1),
+        }
+        .into());
     }
 
     let entry = entry_raw.max(SURVIVAL_TIME_FLOOR);
@@ -194,12 +258,15 @@ pub fn require_structural_survival_time_basis(
     if survival_basis_supports_structural_monotonicity(basisname) {
         return Ok(());
     }
-    Err(format!(
-        "{context} requires a structural monotone survival time basis, but got '{basisname}'. \
+    Err(SurvivalConstructionError::UnsupportedDistribution {
+        reason: format!(
+            "{context} requires a structural monotone survival time basis, but got '{basisname}'. \
 Only `ispline` is accepted here because its basis functions enforce a monotone cumulative time effect by construction. \
 `{basisname}` can fit non-monotone shapes, which can break survival semantics. \
 Re-run with `--time-basis ispline`."
-    ))
+        ),
+    }
+    .into())
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +376,12 @@ pub fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMod
         "marginal-slope" => Ok(SurvivalLikelihoodMode::MarginalSlope),
         "latent" => Ok(SurvivalLikelihoodMode::Latent),
         "latent-binary" => Ok(SurvivalLikelihoodMode::LatentBinary),
-        other => Err(format!(
-            "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope|latent|latent-binary"
-        )),
+        other => Err(SurvivalConstructionError::UnsupportedDistribution {
+            reason: format!(
+                "unsupported --survival-likelihood '{other}'; use transformation|weibull|location-scale|marginal-slope|latent|latent-binary"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -331,9 +401,12 @@ pub fn parse_survival_distribution(raw: &str) -> Result<ResidualDistribution, St
         "gaussian" | "probit" => Ok(ResidualDistribution::Gaussian),
         "gumbel" | "cloglog" => Ok(ResidualDistribution::Gumbel),
         "logistic" | "logit" => Ok(ResidualDistribution::Logistic),
-        other => Err(format!(
-            "unsupported survmodel(distribution='{other}'); accepted: gaussian / probit, gumbel / cloglog, logistic / logit"
-        )),
+        other => Err(SurvivalConstructionError::UnsupportedDistribution {
+            reason: format!(
+                "unsupported survmodel(distribution='{other}'); accepted: gaussian / probit, gumbel / cloglog, logistic / logit"
+            ),
+        }
+        .into()),
     }
 }
 
