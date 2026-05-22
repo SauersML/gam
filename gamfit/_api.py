@@ -1140,6 +1140,8 @@ def duchon_function_norm_penalty(
     centers: Any,
     *,
     m: int = 2,
+    periodic: bool = False,
+    period: float | None = None,
     periodic_per_axis: Any = None,
 ) -> Any:
     """Duchon m-spline RKHS / function-norm penalty matrix.
@@ -1147,14 +1149,14 @@ def duchon_function_norm_penalty(
     Parameters
     ----------
     centers : array-like
-        Control points. Shape ``(K,)`` or ``(K, 1)`` for 1D (auto-promoted).
-        Shape ``(K, d)`` for higher dimensions (currently only the 1D path
-        is exposed by the Rust binding — d > 1 will raise an error until
-        the multi-d penalty binding lands).
+        Control points. Shape ``(K,)`` or ``(K, 1)`` for 1D, or ``(K, d)``
+        for d-dimensional centers.
     m : int, default 2
         Spline order.
     periodic_per_axis : sequence of bool of length d, optional
-        Per-axis periodicity. Currently only d=1 supports periodicity.
+        Per-axis periodicity. Currently only d=1 supports periodicity
+        (the underlying Rust core's periodic Duchon path requires d=1);
+        ``periodic_per_axis`` with any True entry for d > 1 will raise.
 
     Returns
     -------
@@ -1163,33 +1165,31 @@ def duchon_function_norm_penalty(
     import numpy as np
 
     ctrs = np.asarray(centers, dtype=float)
-    if ctrs.ndim == 2:
-        if ctrs.shape[1] != 1:
-            raise NotImplementedError(
-                f"d={ctrs.shape[1]} Duchon penalty not yet exposed; "
-                "Rust binding accepts only 1D centers currently."
-            )
-        ctrs_1d = ctrs[:, 0]
-    elif ctrs.ndim == 1:
-        ctrs_1d = ctrs
+    if ctrs.ndim == 1:
+        ctrs_in = ctrs
+        d = 1
+    elif ctrs.ndim == 2:
+        ctrs_in = ctrs
+        d = ctrs.shape[1]
     else:
         raise ValueError(f"centers must be 1D or 2D, got {ctrs.ndim}D")
 
-    per = False
+    per_list: list[bool] | None = None
     if periodic_per_axis is not None:
         per_list = [bool(p) for p in periodic_per_axis]
-        if len(per_list) != 1:
+        if len(per_list) != d:
             raise ValueError(
-                f"periodic_per_axis must have length matching centers dim (1), got {len(per_list)}"
+                f"periodic_per_axis must have length matching centers dim ({d}), "
+                f"got {len(per_list)}"
             )
-        per = per_list[0]
 
     try:
         penalty = rust_module().duchon_function_norm_penalty(
-            ctrs_1d,
+            ctrs_in,
             int(m),
-            per,
+            False,
             None,
+            per_list,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
