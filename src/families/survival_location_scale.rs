@@ -10977,6 +10977,24 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.exact_newton_joint_psi_terms_masked(
+            block_states,
+            specs,
+            derivative_blocks,
+            psi_index,
+            None,
+        )
+    }
+
+    /// HT-mask-aware variant of [`Self::exact_newton_joint_psi_terms`].
+    fn exact_newton_joint_psi_terms_masked(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        row_mask: Option<&Array1<f64>>,
+    ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if specs.len() != self.expected_blocks()
             || derivative_blocks.len() != self.expected_blocks()
         {
@@ -11066,11 +11084,23 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d2q_ls_entry_psi = d3q_tls_ls_entry * z_t_entry_psi + d3q_ls_entry * z_ls_entry_psi;
         let d2q_ls_exit_psi = &q.d3q_tls_ls * z_t_exit_psi + &q.d3q_ls * z_ls_exit_psi;
 
-        let objective_psi = q.d1_q0.dot(&q0_psi) + q.d1_q1.dot(&q1_psi);
+        let objective_psi = if let Some(m) = row_mask {
+            (&(&q.d1_q0 * &q0_psi) * m).sum() + (&(&q.d1_q1 * &q1_psi) * m).sum()
+        } else {
+            q.d1_q0.dot(&q0_psi) + q.d1_q1.dot(&q1_psi)
+        };
 
         let mut score_psi = Array1::<f64>::zeros(p_total);
-        let time_score = dynamic.time_jac_entry.t().dot(&(-&q.d2_q0 * &q0_psi))
-            + dynamic.time_jac_exit.t().dot(&(-&q.d2_q1 * &q1_psi));
+        let time_row_entry = -&q.d2_q0 * &q0_psi;
+        let time_row_exit = -&q.d2_q1 * &q1_psi;
+        let time_score = dynamic
+            .time_jac_entry
+            .t()
+            .dot(&*mask_row_vec(&time_row_entry, row_mask))
+            + dynamic
+                .time_jac_exit
+                .t()
+                .dot(&*mask_row_vec(&time_row_exit, row_mask));
         score_psi
             .slice_mut(s![offsets[0]..offsets[1]])
             .assign(&time_score);
@@ -11080,10 +11110,15 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_threshold_score_row_exit = &q.d2_q1 * &q1_psi * &q.dq_t + &q.d1_q1 * &dq_t_exit_psi;
         let d_threshold_score_row_entry =
             &q.d2_q0 * &q0_psi * dq_t_entry + &q.d1_q0 * &dq_t_entry_psi;
-        let threshold_score = x_t_exit_map.transpose_mul(threshold_score_row_exit.view())
-            + x_threshold_exit.t().dot(&d_threshold_score_row_exit)
-            + x_t_entry_map.transpose_mul(threshold_score_row_entry.view())
-            + x_threshold_entry.t().dot(&d_threshold_score_row_entry);
+        let threshold_score = x_t_exit_map
+            .transpose_mul(mask_row_vec(&threshold_score_row_exit, row_mask).view())
+            + x_threshold_exit
+                .t()
+                .dot(&*mask_row_vec(&d_threshold_score_row_exit, row_mask))
+            + x_t_entry_map.transpose_mul(mask_row_vec(&threshold_score_row_entry, row_mask).view())
+            + x_threshold_entry
+                .t()
+                .dot(&*mask_row_vec(&d_threshold_score_row_entry, row_mask));
         score_psi
             .slice_mut(s![offsets[1]..offsets[2]])
             .assign(&threshold_score);
@@ -11093,23 +11128,30 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let d_log_sigma_score_row_exit = &q.d2_q1 * &q1_psi * &q.dq_ls + &q.d1_q1 * &dq_ls_exit_psi;
         let d_log_sigma_score_row_entry =
             &q.d2_q0 * &q0_psi * dq_ls_entry + &q.d1_q0 * &dq_ls_entry_psi;
-        let log_sigma_score = x_ls_exit_map.transpose_mul(log_sigma_score_row_exit.view())
-            + x_log_sigma_exit.t().dot(&d_log_sigma_score_row_exit)
-            + x_ls_entry_map.transpose_mul(log_sigma_score_row_entry.view())
-            + x_log_sigma_entry.t().dot(&d_log_sigma_score_row_entry);
+        let log_sigma_score = x_ls_exit_map
+            .transpose_mul(mask_row_vec(&log_sigma_score_row_exit, row_mask).view())
+            + x_log_sigma_exit
+                .t()
+                .dot(&*mask_row_vec(&d_log_sigma_score_row_exit, row_mask))
+            + x_ls_entry_map
+                .transpose_mul(mask_row_vec(&log_sigma_score_row_entry, row_mask).view())
+            + x_log_sigma_entry
+                .t()
+                .dot(&*mask_row_vec(&d_log_sigma_score_row_entry, row_mask));
         score_psi
             .slice_mut(s![offsets[2]..offsets[3]])
             .assign(&log_sigma_score);
 
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
-            let wiggle_score = xw_dense.t().dot(&(&q.d2_q0 * &q0_psi + &q.d2_q1 * &q1_psi));
+            let wiggle_row = &q.d2_q0 * &q0_psi + &q.d2_q1 * &q1_psi;
+            let wiggle_score = xw_dense.t().dot(&*mask_row_vec(&wiggle_row, row_mask));
             score_psi
                 .slice_mut(s![w_offset..offsets[4]])
                 .assign(&wiggle_score);
         }
 
-        let h_time_time = safe_fast_xt_diag_x(&dynamic.time_jac_entry, &(-&q.d3_q0 * &q0_psi))
-            + safe_fast_xt_diag_x(&dynamic.time_jac_exit, &(-&q.d3_q1 * &q1_psi));
+        let h_time_time = mxtwxd(&dynamic.time_jac_entry, &(-&q.d3_q0 * &q0_psi), row_mask)
+            + mxtwxd(&dynamic.time_jac_exit, &(-&q.d3_q1 * &q1_psi), row_mask);
 
         let h_tt_entry = -(&q.d2_q0 * &dq_t_entry.mapv(|v| safe_product(v, v)));
         let h_tt_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v)));
