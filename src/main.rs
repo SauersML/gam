@@ -164,6 +164,23 @@ impl From<CliError> for String {
     }
 }
 
+// Cross-module `?` cascade: typed library errors flow into `CliError` directly
+// without losing their structured payload via the legacy `.to_string()` boundary.
+// Each conversion routes the typed error into the most appropriate `CliError`
+// variant. The `reason` text is preserved verbatim so user-visible messages
+// stay byte-equivalent to the pre-cascade shape.
+
+impl From<gam::inference::formula_dsl::FormulaDslError> for CliError {
+    fn from(err: gam::inference::formula_dsl::FormulaDslError) -> Self {
+        // Every formula-DSL failure is, from the CLI's point of view, an
+        // argument-validation failure: the user-supplied formula string did
+        // not parse / type-check / use a supported identifier.
+        Self::ArgumentInvalid {
+            reason: err.to_string(),
+        }
+    }
+}
+
 fn extract_quoted_field(message: &str) -> Option<String> {
     let mut it = message.match_indices('\'');
     let (start_q, _) = it.next()?;
