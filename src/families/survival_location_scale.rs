@@ -1538,6 +1538,7 @@ struct SurvivalJointPsiSecondDrifts {
 struct SurvivalExactNewtonJointPsiWorkspace {
     family: SurvivalLocationScaleFamily,
     block_states: Vec<ParameterBlockState>,
+    specs: Vec<ParameterBlockSpec>,
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     joint_quantities: SurvivalJointQuantities,
     psi_directions: ExactNewtonJointPsiDirectCache<SurvivalJointPsiDirection>,
@@ -10591,6 +10592,7 @@ impl SurvivalExactNewtonJointPsiWorkspace {
     fn new(
         family: SurvivalLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
+        specs: Vec<ParameterBlockSpec>,
         derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     ) -> Result<Self, String> {
         let joint_quantities = family.collect_joint_quantities(&block_states)?;
@@ -10598,10 +10600,26 @@ impl SurvivalExactNewtonJointPsiWorkspace {
         Ok(Self {
             family,
             block_states,
+            specs,
             derivative_blocks,
             joint_quantities,
             psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
+            row_mask: None,
         })
+    }
+
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.family.n;
+        let mut mask = Array1::<f64>::zeros(n);
+        for r in rows {
+            if r.index < n {
+                mask[r.index] = r.weight;
+            }
+        }
+        self.row_mask = Some(Arc::new(mask));
     }
 
     fn psi_direction(
@@ -10619,6 +10637,16 @@ impl SurvivalExactNewtonJointPsiWorkspace {
 }
 
 impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
+    fn first_order_terms(&self, psi_index: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.family.exact_newton_joint_psi_terms_masked(
+            &self.block_states,
+            &self.specs,
+            &self.derivative_blocks,
+            psi_index,
+            self.row_mask.as_deref(),
+        )
+    }
+
     fn second_order_terms(
         &self,
         psi_i: usize,
@@ -10632,12 +10660,13 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         };
         Ok(Some(
             self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
+                .exact_newton_joint_psisecond_order_terms_from_parts_masked(
                     &self.block_states,
                     &self.derivative_blocks,
                     &self.joint_quantities,
                     dir_i.as_ref(),
                     dir_j.as_ref(),
+                    self.row_mask.as_deref(),
                 )?,
         ))
     }
@@ -10653,10 +10682,11 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
                 self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts_masked(
                         &self.joint_quantities,
                         dir.as_ref(),
                         d_beta_flat,
+                        self.row_mask.as_deref(),
                     )?,
             ),
         ))
@@ -10669,69 +10699,15 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
 /// by construction, which is the correct quantity for the outer REML Laplace
 /// approximation (see response.md Section 3). No Fisher surrogate is used here.
 //
-// WS4a-survival-LS deferred — staged outer-score subsampling (Horvitz–Thompson
-// row reweighting) is NOT enabled for this family. The blocker is structural: unlike
-// GaussianLocationScaleFamily — where the joint-Hessian workspace caches three
-// FINAL per-row coefficient arrays (`coeff_mm`, `coeff_ml`, `coeff_ll`) that are
-// consumed directly as `Xᵀ diag(W) X`, so a single `apply_outer_subsample` masks
-// them HT-unbiasedly — the survival-LS workspace
-// (`SurvivalLocationScaleExactNewtonJointHessianWorkspace`) caches only the raw
-// per-row derivative bundle `SurvivalJointQuantities` (`q.d1_q`, `q.d2_q1`,
-// `q.dq_t`, `q.dq_ls`, `q.d_h_h0`, ...) and the geometry bundle
-// `SurvivalDynamicGeometry` (`time_jac_entry/_exit/_deriv`, etc.). The FINAL
-// per-row weight arrays that go into `weighted_crossprod_dense(X, w, X')` are
-// rebuilt INSIDE each assembly call from POLYNOMIAL combinations of these q.*
-// entries — e.g., `assemble_joint_hessian_from_quantities` builds
-//   `h_exit = -(q.d2_q1 * q.dq_t² + q.d2_qdot1 * q.dqdot_t² + q.d1_qdot1 * q.d2qdot_tt)`
-// (degree-3 in q-arrays), and the directional-derivative path
-// `exact_newton_joint_hessian_directional_derivative_rescaled_from_parts` mixes
-// e.g. `d_d2_q_exit * q.dq_t² + 2 q.d2_q1 * delta_q_t_exit * q.dq_t` where
-// `delta_q_t_exit = q.d2q_tls * delta_ls_exit` and `d_d2_q_exit = q.d3_q1 *
-// delta_q_exit + q.d_h_h1 * delta_h1`. Because each row's contribution is a
-// nonlinear (cubic / quartic) polynomial in q.* entries, HT-masking q.* at the
-// source — `q.field[i] *= r.weight` for sampled i, zero otherwise — does NOT
-// yield an unbiased estimator: it scales each row's coefficient by `r.weight^k`
-// (k = 2..4 depending on the term), which only matches E[score_subsample] =
-// score_full at r.weight = 1.
-//
-// To make survival-LS subsampleable, ONE of these refactors is required:
-//   (1) Push the FINAL per-row weight arrays into the workspace cache and apply
-//       HT-masking there. This means precomputing, for each direction-independent
-//       assembly site, the closed-form `w[i]` arrays (`h_time_*`, `h_tt_exit`,
-//       `h_tt_entry`, `h_ll_exit`, `h_ll_entry`, `h_tl_exit`, `h_tl_entry`,
-//       `h_h0_t`, `h_h1_t`, `h_h0_l`, `h_h1_l`, plus their `_deriv` variants
-//       when `x_threshold_deriv` / `x_log_sigma_deriv` are present) AND, for
-//       the directional path, deferring HT until after the direction is folded
-//       in (i.e., a per-direction final `w` mask). The directional path is
-//       called inside `directional_derivative_operator` /
-//       `second_directional_derivative_operator` ≈ O(k²) times per outer-Hessian
-//       evaluation, so masking at the per-direction site is feasible but means
-//       wrapping every `weighted_crossprod_dense` / `safe_fast_xt_diag_x` call
-//       site (currently ~15+ across the base assembly + directional + second-
-//       directional paths) with row-mask plumbing.
-//   (2) Replace each `weighted_crossprod_dense(X, w, X')` with a row-mask-aware
-//       variant `weighted_crossprod_dense_masked(X, w, X', mask)` and thread a
-//       single shared row-mask through the workspace. This is the lighter touch
-//       but still requires editing every assembly site in
-//       `assemble_joint_hessian_from_quantities`,
-//       `exact_newton_joint_hessian_directional_derivative_rescaled_from_parts`,
-//       and `exact_newton_joint_hessiansecond_directional_derivative_from_parts`.
-//
-// Additionally, the gradient path
-// `evaluate_log_likelihood_and_block_gradients` and the ψ-workspace
-// (`SurvivalExactNewtonJointPsiWorkspace`) would need consistent row-mask
-// plumbing for the staged subsample to extend beyond the LL fast path.
-//
-// `log_likelihood_only` IS structurally row-streaming through `exact_row_kernel`
-// (line 10393 — pure per-row reduction with no cross-row coupling), so a
-// `log_likelihood_only_with_options` override that HT-reweights each row's
-// kernel output is the ONLY piece that could be wired today without the
-// Hessian-side refactor. But per the GaussianLS POC's rationale, broadening
-// staged outer-subsampling requires the Hessian path to be subsampled too; an
-// LL-only subsample with an exact-full Hessian degrades to a no-op for the
-// outer-Hessian work that dominates wall clock. Until refactor (1) or (2)
-// lands, `subsample_capable` stays false and the family ignores
-// `options.outer_score_subsample`.
+// WS4a-survival-LS staged outer-score subsampling is enabled through
+// Horvitz-Thompson row reweighting. The log-likelihood override streams the
+// sampled rows through `exact_row_kernel` and multiplies each row contribution by
+// `WeightedOuterRow.weight`. The joint-Hessian and ψ workspaces carry a shared
+// row mask into the `_masked` assembly variants, where every row-additive
+// `Xᵀ diag(W) Y`, `Xᵀ w`, and dot-product site multiplies the final per-row
+// contribution by `mask[i]`. This deliberately masks after each row's nonlinear
+// survival derivative algebra has produced the final row coefficient, preserving
+// the invariant E[Σ_i (mask_i / π_i) contribution_i] = full-data sum.
 impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
@@ -10843,6 +10819,43 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let mut ll = 0.0;
         for chunk_sum in chunk_sums {
             ll += chunk_sum?;
+        }
+        Ok(ll)
+    }
+
+    fn log_likelihood_only_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        options: &BlockwiseFitOptions,
+    ) -> Result<f64, String> {
+        let Some(subsample) = options.outer_score_subsample.as_ref() else {
+            return self.log_likelihood_only(block_states);
+        };
+        let n = self.n;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let mut ll = 0.0;
+        for row in &subsample.rows {
+            let i = row.index;
+            if i >= n {
+                return Err(SurvivalLocationScaleError::DimensionMismatch {
+                    reason: format!(
+                        "SurvivalLocationScaleFamily outer subsample row index {i} out of bounds for n={n}"
+                    ),
+                }
+                .into());
+            }
+            let state = self.row_predictor_state(
+                dynamic.h_entry[i],
+                dynamic.h_exit[i],
+                dynamic.hdot_exit[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
+            );
+            ll += row.weight
+                * self
+                    .exact_row_kernel(i, state)?
+                    .map_or(0.0, SurvivalExactRowKernel::log_likelihood);
         }
         Ok(ll)
     }
@@ -11693,8 +11706,40 @@ impl SurvivalLocationScaleFamily {
         Ok(Some(Arc::new(SurvivalExactNewtonJointPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
+            specs.to_vec(),
             derivative_blocks.to_vec(),
         )?)))
+    }
+
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if block_states.len() != self.expected_blocks()
+            || specs.len() != self.expected_blocks()
+            || derivative_blocks.len() != self.expected_blocks()
+        {
+            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+                "SurvivalLocationScaleFamily joint psi workspace expects {} states, specs, and derivative blocks, got {} / {} / {}",
+                self.expected_blocks(),
+                block_states.len(),
+                specs.len(),
+                derivative_blocks.len()
+            ) }.into());
+        }
+        let mut workspace = SurvivalExactNewtonJointPsiWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+            specs.to_vec(),
+            derivative_blocks.to_vec(),
+        )?;
+        if let Some(subsample) = options.outer_score_subsample.as_ref() {
+            workspace.apply_outer_subsample(subsample.rows.as_ref());
+        }
+        Ok(Some(Arc::new(workspace)))
     }
 
     fn exact_newton_joint_psihessian_directional_derivative(
@@ -11864,6 +11909,43 @@ impl SurvivalLocationScaleFamily {
             )?,
         )))
     }
+
+    fn exact_newton_joint_hessian_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
+            self.clone(),
+            block_states.to_vec(),
+        )?;
+        if let Some(subsample) = options.outer_score_subsample.as_ref() {
+            workspace.apply_outer_subsample(subsample.rows.as_ref());
+        }
+        Ok(Some(Arc::new(workspace)))
+    }
+
+    fn outer_derivative_policy(
+        &self,
+        specs: &[ParameterBlockSpec],
+        psi_dim: usize,
+        options: &BlockwiseFitOptions,
+    ) -> crate::families::custom_family::OuterDerivativePolicy {
+        let capability = self.exact_outer_derivative_order(specs, options);
+        let grad_cost = self.coefficient_gradient_cost(specs);
+        let hess_cost = self.coefficient_hessian_cost(specs);
+        let (predicted_gradient_work, predicted_hessian_work) =
+            crate::families::custom_family::default_outer_derivative_policy_costs(
+                specs, psi_dim, grad_cost, hess_cost,
+            );
+        crate::families::custom_family::OuterDerivativePolicy {
+            capability,
+            predicted_gradient_work,
+            predicted_hessian_work,
+            subsample_capable: true,
+        }
+    }
 }
 
 /// Workspace caching the direction-independent state used by the survival
@@ -11958,11 +12040,12 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         Ok(self
             .family
-            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+            .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts_masked(
                 &self.block_states,
                 d_beta_flat,
                 &self.q,
                 &self.dynamic,
+                self.row_mask.as_deref(),
             )?
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
@@ -11973,12 +12056,13 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
                 &self.block_states,
                 d_beta_u_flat,
                 d_beta_v_flat,
                 &self.q,
                 &self.dynamic,
+                self.row_mask.as_deref(),
             )
     }
 
@@ -11989,12 +12073,13 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         Ok(self
             .family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
                 &self.block_states,
                 d_beta_u_flat,
                 d_beta_v_flat,
                 &self.q,
                 &self.dynamic,
+                self.row_mask.as_deref(),
             )?
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
@@ -12352,11 +12437,9 @@ pub(crate) fn fit_survival_location_scale_terms(
             capability,
             predicted_gradient_work: 0,
             predicted_hessian_work: 0,
-            // Survival location-scale does not consume
-            // `outer_score_subsample` on its outer-only paths; gate the
-            // pilot/polish schedule off so it doesn't allocate masks
-            // that the family will ignore.
-            subsample_capable: false,
+            // Survival location-scale consumes `outer_score_subsample` on its
+            // outer-only LL, joint-Hessian, and ψ workspace paths.
+            subsample_capable: true,
         }
     };
     let solved = optimize_spatial_length_scale_exact_joint(
