@@ -306,6 +306,30 @@ fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRu
     IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Clone)]
+struct IftJointModeResponseRuntimeCache {
+    theta: Array1<f64>,
+    rho_dim: usize,
+    beta_original: Array1<f64>,
+    mode_response_cols: Array2<f64>,
+    active_constraints: bool,
+}
+
+static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
+    Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>>,
+> = OnceLock::new();
+
+fn ift_joint_mode_response_caches(
+) -> &'static Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>> {
+    IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static IFT_PENDING_JOINT_THETAS: OnceLock<Mutex<HashMap<usize, Array1<f64>>>> = OnceLock::new();
+
+fn ift_pending_joint_thetas() -> &'static Mutex<HashMap<usize, Array1<f64>>> {
+    IFT_PENDING_JOINT_THETAS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -2370,6 +2394,43 @@ impl<'a> RemlState<'a> {
         self as *const Self as usize
     }
 
+    fn set_pending_joint_ift_theta(&self, theta: &Array1<f64>) {
+        if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
+            self.clear_pending_joint_ift_theta();
+            return;
+        }
+        ift_pending_joint_thetas()
+            .lock()
+            .unwrap()
+            .insert(self.ift_mode_response_cache_key(), theta.clone());
+    }
+
+    fn pending_joint_ift_theta(&self) -> Option<Array1<f64>> {
+        ift_pending_joint_thetas()
+            .lock()
+            .unwrap()
+            .get(&self.ift_mode_response_cache_key())
+            .cloned()
+    }
+
+    fn clear_pending_joint_ift_theta(&self) {
+        if let Some(pending) = IFT_PENDING_JOINT_THETAS.get() {
+            pending
+                .lock()
+                .unwrap()
+                .remove(&self.ift_mode_response_cache_key());
+        }
+    }
+
+    fn clear_joint_ift_mode_response_cache(&self) {
+        if let Some(caches) = IFT_JOINT_MODE_RESPONSE_CACHES.get() {
+            caches
+                .lock()
+                .unwrap()
+                .remove(&self.ift_mode_response_cache_key());
+        }
+    }
+
     fn clear_ift_mode_response_cache(&self) {
         if let Some(caches) = IFT_MODE_RESPONSE_CACHES.get() {
             caches
@@ -2422,6 +2483,7 @@ impl<'a> RemlState<'a> {
             .and_then(|cols| self.mode_response_cols_for_warm_start(bundle, cols));
         if rho_cols.is_none() && ext_cols.is_none() {
             self.clear_ift_mode_response_cache();
+            self.clear_joint_ift_mode_response_cache();
             return;
         }
         let rho_col_count = rho_cols.as_ref().map_or(0, Array2::ncols);
@@ -2430,12 +2492,86 @@ impl<'a> RemlState<'a> {
             self.ift_mode_response_cache_key(),
             IftModeResponseRuntimeCache {
                 rho: rho.clone(),
-                rho_mode_response_cols: rho_cols,
-                ext_mode_response_cols: ext_cols,
+                rho_mode_response_cols: rho_cols.clone(),
+                ext_mode_response_cols: ext_cols.clone(),
             },
         );
         log::debug!(
             "[IFT-CACHE] outcome=mode_response_store rho_cols={} ext_cols={} p={}",
+            rho_col_count,
+            ext_col_count,
+            self.p,
+        );
+
+        let Some(theta) = self.pending_joint_ift_theta() else {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        };
+        if theta.len() <= rho.len() || theta.len() != rho.len() + ext_col_count {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        }
+        let Some(rho_cols_ref) = rho_cols.as_ref() else {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        };
+        let Some(ext_cols_ref) = ext_cols.as_ref() else {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        };
+        if rho_cols_ref.nrows() != self.p
+            || rho_cols_ref.ncols() != rho.len()
+            || ext_cols_ref.nrows() != self.p
+            || ext_cols_ref.ncols() != ext_col_count
+        {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        }
+        let active_constraints = self
+            .active_constraint_free_basis(bundle.pirls_result.as_ref())
+            .is_some();
+        if active_constraints {
+            self.clear_joint_ift_mode_response_cache();
+            log::info!("[IFT-REJECTED] reason=active_constraints joint_dim={}", theta.len());
+            return;
+        }
+        let beta_original = match bundle.pirls_result.coordinate_frame {
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                bundle.pirls_result.beta_transformed.as_ref().clone()
+            }
+            pirls::PirlsCoordinateFrame::TransformedQs => bundle
+                .pirls_result
+                .reparam_result
+                .qs
+                .dot(bundle.pirls_result.beta_transformed.as_ref()),
+        };
+        if beta_original.len() != self.p || beta_original.iter().any(|v| !v.is_finite()) {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        }
+        let mut mode_response_cols = Array2::<f64>::zeros((self.p, theta.len()));
+        mode_response_cols
+            .slice_mut(s![.., ..rho.len()])
+            .assign(rho_cols_ref);
+        mode_response_cols
+            .slice_mut(s![.., rho.len()..])
+            .assign(ext_cols_ref);
+        if mode_response_cols.iter().any(|v| !v.is_finite()) {
+            self.clear_joint_ift_mode_response_cache();
+            return;
+        }
+        ift_joint_mode_response_caches().lock().unwrap().insert(
+            self.ift_mode_response_cache_key(),
+            IftJointModeResponseRuntimeCache {
+                theta,
+                rho_dim: rho.len(),
+                beta_original,
+                mode_response_cols,
+                active_constraints,
+            },
+        );
+        log::debug!(
+            "[IFT-CACHE] outcome=joint_mode_response_store rho_cols={} ext_cols={} p={}",
             rho_col_count,
             ext_col_count,
             self.p,
