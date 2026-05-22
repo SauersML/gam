@@ -2716,6 +2716,45 @@ pub struct BlockwiseInnerResult {
         Option<Arc<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
+impl BlockwiseInnerResult {
+    /// Debug-time invariant check: per-block parallel vectors must agree in
+    /// length, and finite scalars must remain finite. Cheap (counts +
+    /// finiteness checks), useful at consumer boundaries that want to fail
+    /// loud before propagating a malformed inner result. Returns `Err` with a
+    /// human-readable description on any violation.
+    #[inline]
+    pub fn check_invariants(&self) -> Result<(), String> {
+        let n = self.block_states.len();
+        if self.active_sets.len() != n {
+            return Err(format!(
+                "BlockwiseInnerResult: active_sets has length {}, expected {} (one per block)",
+                self.active_sets.len(),
+                n,
+            ));
+        }
+        if self.s_lambdas.len() != n {
+            return Err(format!(
+                "BlockwiseInnerResult: s_lambdas has length {}, expected {} (one per block)",
+                self.s_lambdas.len(),
+                n,
+            ));
+        }
+        for (label, value) in [
+            ("log_likelihood", self.log_likelihood),
+            ("penalty_value", self.penalty_value),
+            ("block_logdet_h", self.block_logdet_h),
+            ("block_logdet_s", self.block_logdet_s),
+        ] {
+            if !value.is_finite() {
+                return Err(format!(
+                    "BlockwiseInnerResult: {label} must be finite, got {value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for BlockwiseInnerResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BlockwiseInnerResult")
