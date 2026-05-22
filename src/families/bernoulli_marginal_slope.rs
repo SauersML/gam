@@ -18048,10 +18048,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &[&marginalspec_boot, &logslopespec_boot],
     )?;
     if latent_measure.is_empirical() && sigma_learnable {
-        return Err(
-            "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
-                .to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+            reason:
+                "empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
+                    .to_string(),
+        }
+        .into());
     }
 
     let y = Arc::new(spec.y.clone());
@@ -18413,10 +18415,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let analytic_joint_derivatives_available =
         marginal_has_spatial || logslope_has_spatial || setup.log_kappa_dim() == 0;
     if setup.log_kappa_dim() > 0 && !analytic_joint_derivatives_available {
-        return Err(
-            "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
-                .to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+            reason:
+                "exact bernoulli marginal-slope spatial optimization requires analytic joint psi derivatives"
+                    .to_string(),
+        }
+        .into());
     }
     let initial_rho = setup.theta0().slice(s![..setup.rho_dim()]).to_owned();
     let initial_blocks = build_blocks(&initial_rho, &marginal_design, &logslope_design)?;
@@ -18608,18 +18612,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
             )?;
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
-                return Err(
-                    "exact bernoulli marginal-slope inner solve did not converge".to_string(),
-                );
+                return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                    reason: "exact bernoulli marginal-slope inner solve did not converge"
+                        .to_string(),
+                }
+                .into());
             }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
                 && !eval.outer_hessian.is_analytic()
             {
-                return Err(
-                    "exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
-                        .to_string(),
-                );
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason:
+                        "exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
+                            .to_string(),
+                }
+                .into());
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
@@ -18640,9 +18648,11 @@ pub fn fit_bernoulli_marginal_slope_terms(
             )?;
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
-                return Err(
-                    "exact bernoulli marginal-slope EFS inner solve did not converge".to_string(),
-                );
+                return Err(BernoulliMarginalSlopeError::IntegrationFailed {
+                    reason: "exact bernoulli marginal-slope EFS inner solve did not converge"
+                        .to_string(),
+                }
+                .into());
             }
             Ok(eval.efs_eval)
         },
