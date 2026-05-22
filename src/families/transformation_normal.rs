@@ -8373,10 +8373,45 @@ impl CustomFamily for TransformationNormalFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         _options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        // CTN's psi calculus is row-deterministic and does not consume the
-        // outer-only stratified subsample, so the with-options variant simply
-        // forwards to the shared constructor. Keeping this method explicit
-        // matches the survival-marginal-slope override pattern.
+        // WS4a-CTN structural blocker: CTN's outer-score reductions are mathematically
+        // per-row sums (the log-likelihood is `Σ_i row_ll_i` accumulated in
+        // `build_transformation_row_derived` near line 532; the joint Hessian
+        // is assembled by `scop_gradient_and_negative_hessian`, `scop_hessian_
+        // matvec_into`, and `scop_hessian_diagonal` as row-streaming Khatri-Rao
+        // contractions; the ψ first-order block is the per-row reduction in
+        // `TransformationNormalPsiWorkspace::compute_all_axes` near line 13916;
+        // the ψ-ψ pair block is the per-row reduction in `compute_pair_cache`
+        // near line 14263), so in principle Horvitz-Thompson row-mask
+        // reweighting (`w_i ← w_i · 1/π_i` for sampled rows, `0` elsewhere)
+        // is a valid unbiased estimator across every component.
+        //
+        // What blocks wiring `subsample_capable: true` today is that NONE of
+        // those row-streaming SCOP kernels take a row-mask / per-row weight
+        // override argument — every one of them reads `self.weights[i]`
+        // directly from the immutable shared `Arc<TransformationNormalFamily>`.
+        // The persistent dense-Hessian cache (`persistent_dense_hessian`) and
+        // the workspace's `row_quantity_cache` are also keyed on `beta` alone
+        // with no subsample identity, so installing a subsampled Hessian
+        // would corrupt later full-data probes that share `β`. There is no
+        // `apply_outer_subsample` analogue to the Gaussian-LS workspace
+        // (`coeff_mm`/`coeff_ml`/`coeff_ll`) because the CTN workspace does
+        // not precompute per-row coefficient arrays — its matvec streams rows
+        // through the chain rule on every call.
+        //
+        // Making CTN subsample-capable would require (at minimum) plumbing an
+        // `Option<&[WeightedOuterRow]>` (or an effective `Cow<Array1<f64>>`
+        // row weight view) through `scop_gradient_and_negative_hessian`,
+        // `scop_hessian_matvec_into`, `scop_hessian_diagonal`,
+        // `scop_psi_terms`, `scop_psi_psi_value_score_hvp_from_cov`,
+        // `scop_psi_hessian_directional_derivative`,
+        // `TransformationNormalPsiWorkspace::{compute_all_axes,
+        // compute_pair_cache}`, and a subsample-identity tag on
+        // `CtnDenseHessianKey` / the row-quantity cache. Until that refactor
+        // lands, the `_with_options` variant must forward to the full-data
+        // constructor, and `outer_derivative_policy.subsample_capable` stays
+        // `false` so the κ pilot/polish schedule never installs a row mask
+        // that the CTN kernels would silently ignore (which would violate
+        // `E[score_subsample] = score_full`).
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
