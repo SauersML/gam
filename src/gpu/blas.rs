@@ -1019,9 +1019,10 @@ impl CublasRuntime {
         let ctx = cuda_context_for(device.ordinal).ok_or_else(|| GpuError::DriverCallFailed {
             reason: format!("CudaContext unavailable for ordinal {}", device.ordinal),
         })?;
-        ctx.bind_to_thread().map_err(|e| GpuError::DriverCallFailed {
-            reason: e.to_string(),
-        })?;
+        ctx.bind_to_thread()
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: e.to_string(),
+            })?;
         let stream = ctx.new_stream().map_err(|e| GpuError::DriverCallFailed {
             reason: e.to_string(),
         })?;

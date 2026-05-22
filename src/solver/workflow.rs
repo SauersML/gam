@@ -2263,11 +2263,9 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
         FitRequest::SurvivalTransformation(request) => fit_survival_transformation_model(request)
             .map(FitResult::SurvivalTransformation)
             .map_err(wrap_solver_err),
-        FitRequest::BernoulliMarginalSlope(request) => {
-            fit_bernoulli_marginal_slope_model(request)
-                .map(FitResult::BernoulliMarginalSlope)
-                .map_err(wrap_solver_err)
-        }
+        FitRequest::BernoulliMarginalSlope(request) => fit_bernoulli_marginal_slope_model(request)
+            .map(FitResult::BernoulliMarginalSlope)
+            .map_err(wrap_solver_err),
         FitRequest::SurvivalMarginalSlope(request) => fit_survival_marginal_slope_model(request)
             .map(FitResult::SurvivalMarginalSlope)
             .map_err(wrap_solver_err),
@@ -2594,10 +2592,7 @@ pub fn resolve_family(
         if let Some(explicit_family) = explicit {
             if explicit_family != from_link {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "family '{}' conflicts with link",
-                        explicit_family.name()
-                    ),
+                    reason: format!("family '{}' conflicts with link", explicit_family.name()),
                 }
                 .into());
             }
@@ -2657,8 +2652,7 @@ fn resolve_survival_marginal_slope_base_link(
         .ok_or_else(|| "invalid survival marginal-slope link".to_string())?;
     if choice.mixture_components.is_some() {
         return Err(WorkflowError::InvalidConfig {
-            reason: "survival marginal-slope currently supports only link(type=probit)"
-                .to_string(),
+            reason: "survival marginal-slope currently supports only link(type=probit)".to_string(),
         }
         .into());
     }
@@ -4276,7 +4270,10 @@ mod tests {
             .err()
             .expect("main formula should reject z-column reuse");
 
-        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(
+            err.to_string()
+                .contains("survival marginal-slope reserves z column 'z'")
+        );
         assert!(err.to_string().contains("main formula"));
     }
 
@@ -4292,7 +4289,10 @@ mod tests {
             .err()
             .expect("logslope formula should reject z-column reuse");
 
-        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(
+            err.to_string()
+                .contains("survival marginal-slope reserves z column 'z'")
+        );
         assert!(err.to_string().contains("logslope_formula"));
     }
 
@@ -4307,7 +4307,10 @@ mod tests {
             .err()
             .expect("defaulted logslope spec should still reject z-column reuse");
 
-        assert!(err.to_string().contains("survival marginal-slope reserves z column 'z'"));
+        assert!(
+            err.to_string()
+                .contains("survival marginal-slope reserves z column 'z'")
+        );
         assert!(err.to_string().contains("main formula"));
     }
 

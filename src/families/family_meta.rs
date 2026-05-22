@@ -19,9 +19,7 @@ pub fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> Likelihoo
 #[inline]
 pub fn inverse_link_to_binomial_spec(link: &InverseLink) -> LikelihoodSpec {
     let normalized = match link {
-        InverseLink::Standard(LinkFunction::Identity) => {
-            InverseLink::Standard(LinkFunction::Logit)
-        }
+        InverseLink::Standard(LinkFunction::Identity) => InverseLink::Standard(LinkFunction::Logit),
         // Standard SAS / BetaLogistic without parameterized state historically
         // mapped to the parameterized family variant; preserve that here by
         // upgrading to a default-state parameterized link.

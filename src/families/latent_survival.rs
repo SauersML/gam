@@ -1171,11 +1171,12 @@ fn latent_kernel_sum_log_jet(
         .flat_map(|terms| terms.iter().map(|term| term.k))
         .max()
         .unwrap_or(0);
-    let bundle = log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(
-        |e| LatentSurvivalError::NumericalFailure {
-            reason: format!("{context} kernel evaluation failed: {e}"),
-        },
-    )?;
+    let bundle =
+        log_kernel_bundle(quadctx, state.q.exp(), state.mu, state.sigma, max_k).map_err(|e| {
+            LatentSurvivalError::NumericalFailure {
+                reason: format!("{context} kernel evaluation failed: {e}"),
+            }
+        })?;
 
     let evaluate_terms =
         |terms: &[LatentKernelPrimaryTerm]| -> Result<(f64, f64), LatentSurvivalError> {
@@ -1193,24 +1194,24 @@ fn latent_kernel_sum_log_jet(
                         ),
                     });
                 }
-            let log_qdot = if term.qdot_power > 0 {
-                state.qdot.ln()
-            } else {
-                0.0
-            };
-            let log_mag = term.coeff.abs().ln()
-                + term.q_exp as f64 * state.q
-                + term.tau_exp as f64 * state.log_sigma_factor
-                + term.qdot_power as f64 * log_qdot
-                + bundle.get(term.k);
-            log_mags.push(log_mag);
-            signs.push(term.coeff.signum());
-        }
-        if log_mags.is_empty() {
-            return Ok((f64::NEG_INFINITY, 0.0));
-        }
-        Ok(signed_log_sum_exp(&log_mags, &signs))
-    };
+                let log_qdot = if term.qdot_power > 0 {
+                    state.qdot.ln()
+                } else {
+                    0.0
+                };
+                let log_mag = term.coeff.abs().ln()
+                    + term.q_exp as f64 * state.q
+                    + term.tau_exp as f64 * state.log_sigma_factor
+                    + term.qdot_power as f64 * log_qdot
+                    + bundle.get(term.k);
+                log_mags.push(log_mag);
+                signs.push(term.coeff.signum());
+            }
+            if log_mags.is_empty() {
+                return Ok((f64::NEG_INFINITY, 0.0));
+            }
+            Ok(signed_log_sum_exp(&log_mags, &signs))
+        };
 
     let (base_log_sum, base_sign) = evaluate_terms(&term_lists[0])?;
     if !(base_log_sum.is_finite() && base_sign > 0.0) {
@@ -1382,8 +1383,9 @@ fn latent_survival_row_primary_log_jet(
         }
         LatentSurvivalEventType::IntervalCensored => {
             return Err(LatentSurvivalError::UnsupportedConfiguration {
-                reason: "latent survival dynamic time derivatives do not implement interval censoring"
-                    .to_string(),
+                reason:
+                    "latent survival dynamic time derivatives do not implement interval censoring"
+                        .to_string(),
             }
             .into());
         }
@@ -2387,11 +2389,12 @@ fn latent_survival_time_jet(
                 });
             }
             if row.hazard_unloaded > 0.0 {
-                let bundle = log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, 3).map_err(
-                    |e| LatentSurvivalError::NumericalFailure {
-                        reason: format!("latent survival kernel evaluation failed: {e}"),
-                    },
-                )?;
+                let bundle =
+                    log_kernel_bundle(quadctx, row.mass_exit, mu, sigma, 3).map_err(|e| {
+                        LatentSurvivalError::NumericalFailure {
+                            reason: format!("latent survival kernel evaluation failed: {e}"),
+                        }
+                    })?;
                 let (unloaded_d1, unloaded_d2, _) =
                     logk_q_derivatives(quadctx, 0, row.mass_exit, mu, sigma)?;
                 let (loaded_log_d1, loaded_d2, _) =
@@ -2434,8 +2437,9 @@ fn latent_survival_time_jet(
         }
         LatentSurvivalEventType::IntervalCensored => {
             Err(LatentSurvivalError::UnsupportedConfiguration {
-                reason: "latent survival dynamic time derivatives do not implement interval censoring"
-                    .to_string(),
+                reason:
+                    "latent survival dynamic time derivatives do not implement interval censoring"
+                        .to_string(),
             })
         }
     }

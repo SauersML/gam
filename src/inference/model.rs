@@ -240,9 +240,7 @@ impl TransformationScoreCalibration {
     pub fn validate(&self, context: &str) -> Result<(), FittedModelError> {
         if self.score_kind != TransformationScoreKind::FiniteSupportPit {
             return Err(FittedModelError::IncompatibleConfig {
-                reason: format!(
-                    "{context} supports only finite-support CTN PIT score semantics"
-                ),
+                reason: format!("{context} supports only finite-support CTN PIT score semantics"),
             });
         }
         if !(self.clip_eps.is_finite() && self.clip_eps > 0.0 && self.clip_eps < 0.5) {
@@ -522,12 +520,13 @@ pub fn append_deployment_extension_columns(
             ),
         });
     }
-    let spec = model.resolved_termspec.as_ref().ok_or_else(|| {
-        FittedModelError::MissingField {
+    let spec = model
+        .resolved_termspec
+        .as_ref()
+        .ok_or_else(|| FittedModelError::MissingField {
             reason: "deployment extension prediction requires saved resolved_termspec; refit"
                 .to_string(),
-        }
-    })?;
+        })?;
     let n = base_design.nrows();
     let p_old = base_design.ncols();
     let mut extensions: Vec<&SavedDeploymentExtension> =
@@ -1197,7 +1196,10 @@ impl SavedLinkWiggleRuntime {
             .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
     }
 
-    fn validate_monotone_derivative(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
+    fn validate_monotone_derivative(
+        &self,
+        q0: &Array1<f64>,
+    ) -> Result<Array1<f64>, FittedModelError> {
         self.validate_global_monotonicity()?;
         let d_constrained = self.constrained_basis(q0, BasisOptions::first_derivative())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
@@ -1601,8 +1603,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1620,8 +1624,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1666,8 +1672,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1684,8 +1692,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1712,8 +1722,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1756,8 +1768,10 @@ impl SavedAnchoredDeviationRuntime {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic, FittedModelError>
-    {
+    ) -> Result<
+        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
+        FittedModelError,
+    > {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1835,7 +1849,10 @@ impl SavedAnchoredDeviationRuntime {
     /// `correction.dot(beta)` scalar from the linear-predictor contribution
     /// rather than building a full anchor-row matrix). Equivalent to
     /// `design()` when no residual is present.
-    pub fn design_uncorrected(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
+    pub fn design_uncorrected(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, BasisOptions::value().derivative_order)
     }
 
@@ -1999,25 +2016,37 @@ impl SavedAnchoredDeviationRuntime {
         Ok(n_anchor_rows.dot(&rotation))
     }
 
-    pub fn first_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
+    pub fn first_derivative_design(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(
             values,
             BasisOptions::first_derivative().derivative_order,
         )
     }
 
-    pub fn second_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
+    pub fn second_derivative_design(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(
             values,
             BasisOptions::second_derivative().derivative_order,
         )
     }
 
-    pub fn third_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
+    pub fn third_derivative_design(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, 3)
     }
 
-    pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, FittedModelError> {
+    pub fn fourth_derivative_design(
+        &self,
+        values: &Array1<f64>,
+    ) -> Result<Array2<f64>, FittedModelError> {
         self.evaluate_span_polynomial_design(values, 4)
     }
 }
@@ -2526,11 +2555,14 @@ impl FittedModel {
             runtime.model_class,
             PredictModelClass::BernoulliMarginalSlope
         ) {
-            let unified = self.payload().unified.as_ref().ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing unified fit payload; refit".to_string(),
-                }
-            })?;
+            let unified =
+                self.payload()
+                    .unified
+                    .as_ref()
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing unified fit payload; refit"
+                            .to_string(),
+                    })?;
             validate_marginal_slope_saved_fit(
                 unified,
                 runtime.score_warp.as_ref(),
@@ -2546,9 +2578,8 @@ impl FittedModel {
         {
             let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
                 FittedModelError::MissingField {
-                    reason:
-                        "survival marginal-slope model is missing canonical fit_result payload"
-                            .to_string(),
+                    reason: "survival marginal-slope model is missing canonical fit_result payload"
+                        .to_string(),
                 }
             })?;
             validate_survival_marginal_slope_saved_fit(
@@ -2660,7 +2691,9 @@ impl FittedModel {
         }
     }
 
-    pub fn saved_latent_cloglog_state(&self) -> Result<Option<LatentCLogLogState>, FittedModelError> {
+    pub fn saved_latent_cloglog_state(
+        &self,
+    ) -> Result<Option<LatentCLogLogState>, FittedModelError> {
         let payload = self.payload();
         match &payload.family_state {
             FittedFamily::Standard {
@@ -2832,10 +2865,9 @@ impl FittedModel {
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, FittedModelError> {
-        let payload =
-            fs::read_to_string(path).map_err(|e| FittedModelError::PayloadCorrupt {
-                reason: format!("failed to read model '{}': {e}", path.display()),
-            })?;
+        let payload = fs::read_to_string(path).map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("failed to read model '{}': {e}", path.display()),
+        })?;
         let model: Self =
             serde_json::from_str(&payload).map_err(|e| FittedModelError::PayloadCorrupt {
                 reason: format!("failed to parse model json: {e}"),
@@ -2941,18 +2973,19 @@ impl FittedModel {
                     reason: "marginal-slope model is missing z_column; refit".to_string(),
                 });
             }
-            let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing latent_z_normalization; refit"
-                        .to_string(),
-                }
-            })?;
+            let z_normalization =
+                self.latent_z_normalization
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing latent_z_normalization; refit"
+                            .to_string(),
+                    })?;
             z_normalization.validate("marginal-slope model")?;
-            let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing latent_measure; refit".to_string(),
-                }
-            })?;
+            let latent_measure =
+                self.latent_measure
+                    .as_ref()
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing latent_measure; refit".to_string(),
+                    })?;
             latent_measure
                 .validate("marginal-slope model latent_measure")
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
@@ -3021,19 +3054,24 @@ impl FittedModel {
                             .to_string(),
                     });
                 }
-                let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason: "survival marginal-slope model is missing latent_z_normalization; refit"
-                            .to_string(),
+                let z_normalization =
+                    self.latent_z_normalization
+                        .ok_or_else(|| {
+                            FittedModelError::MissingField {
+                        reason:
+                            "survival marginal-slope model is missing latent_z_normalization; refit"
+                                .to_string(),
                     }
-                })?;
+                        })?;
                 z_normalization.validate("survival marginal-slope model")?;
-                let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason: "survival marginal-slope model is missing latent_measure; refit"
-                            .to_string(),
-                    }
-                })?;
+                let latent_measure =
+                    self.latent_measure
+                        .as_ref()
+                        .ok_or_else(|| FittedModelError::MissingField {
+                            reason:
+                                "survival marginal-slope model is missing latent_measure; refit"
+                                    .to_string(),
+                        })?;
                 latent_measure
                     .validate("survival marginal-slope model latent_measure")
                     .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
@@ -3069,8 +3107,9 @@ impl FittedModel {
                 }
             } else if !matches!(frailty, FrailtySpec::None) {
                 return Err(FittedModelError::IncompatibleConfig {
-                    reason: "non-marginal survival models do not currently persist a frailty modifier"
-                        .to_string(),
+                    reason:
+                        "non-marginal survival models do not currently persist a frailty modifier"
+                            .to_string(),
                 });
             }
         }
@@ -3309,11 +3348,13 @@ impl FittedModel {
                 self.link_deviation_runtime.as_ref(),
                 "fit_result",
             )?;
-            let unified = self.unified.as_ref().ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing unified fit payload; refit".to_string(),
-                }
-            })?;
+            let unified = self
+                .unified
+                .as_ref()
+                .ok_or_else(|| FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing unified fit payload; refit"
+                        .to_string(),
+                })?;
             validate_marginal_slope_saved_fit(
                 unified,
                 self.score_warp_runtime.as_ref(),
@@ -3383,7 +3424,8 @@ impl FittedModel {
             validate_all_finite("beta_noise", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.noise_projection.as_ref() {
-            validate_all_finite("noise_projection", v.iter().flatten().copied()).map_err(corrupt)?;
+            validate_all_finite("noise_projection", v.iter().flatten().copied())
+                .map_err(corrupt)?;
         }
         if let Some(v) = self.noise_center.as_ref() {
             validate_all_finite("noise_center", v.iter().copied()).map_err(corrupt)?;
@@ -3395,9 +3437,7 @@ impl FittedModel {
             ensure_finite_scalar("noise_projection_ridge_alpha", v).map_err(corrupt)?;
             if v < 0.0 {
                 return Err(FittedModelError::InvalidInput {
-                    reason: format!(
-                        "noise_projection_ridge_alpha must be non-negative, got {v}"
-                    ),
+                    reason: format!("noise_projection_ridge_alpha must be non-negative, got {v}"),
                 });
             }
         }
@@ -3527,12 +3567,13 @@ pub fn load_survival_time_basis_config_from_model(
         "none" => Ok(SurvivalTimeBasisConfig::None),
         "linear" => Ok(SurvivalTimeBasisConfig::Linear),
         "bspline" => {
-            let degree = model.survival_time_degree.ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "saved survival bspline model missing survival_time_degree"
-                        .to_string(),
-                }
-            })?;
+            let degree =
+                model
+                    .survival_time_degree
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "saved survival bspline model missing survival_time_degree"
+                            .to_string(),
+                    })?;
             let knots = model.survival_time_knots.clone().ok_or_else(|| {
                 FittedModelError::MissingField {
                     reason: "saved survival bspline model missing survival_time_knots".to_string(),
@@ -3551,12 +3592,13 @@ pub fn load_survival_time_basis_config_from_model(
             })
         }
         "ispline" => {
-            let degree = model.survival_time_degree.ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "saved survival ispline model missing survival_time_degree"
-                        .to_string(),
-                }
-            })?;
+            let degree =
+                model
+                    .survival_time_degree
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "saved survival ispline model missing survival_time_degree"
+                            .to_string(),
+                    })?;
             let knots = model.survival_time_knots.clone().ok_or_else(|| {
                 FittedModelError::MissingField {
                     reason: "saved survival ispline model missing survival_time_knots".to_string(),
@@ -3800,7 +3842,10 @@ mod tests {
             .expect_err(
                 "survival marginal-slope link basis mismatch should fail runtime validation",
             );
-        assert!(err.to_string().contains("link-deviation coefficient mismatch"));
+        assert!(
+            err.to_string()
+                .contains("link-deviation coefficient mismatch")
+        );
     }
 
     #[test]

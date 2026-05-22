@@ -499,7 +499,6 @@ impl WarmStartStore {
 /// just means the throttle fires slightly earlier, never later.
 const APPROX_META_BYTES: u64 = 512;
 
-
 /// How [`WarmStartStore::lookup_with`] ranks candidate entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum LookupMode {

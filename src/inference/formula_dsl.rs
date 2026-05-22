@@ -131,11 +131,10 @@ impl From<String> for FormulaDslError {
 
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
     validate_balanced_delimiters(formula, "invalid formula syntax")?;
-    let mut parsed = FormulaParser::parse(Rule::formula, formula).map_err(|e| {
-        FormulaDslError::ParseError {
+    let mut parsed =
+        FormulaParser::parse(Rule::formula, formula).map_err(|e| FormulaDslError::ParseError {
             reason: format!("invalid formula syntax: {e}"),
-        }
-    })?;
+        })?;
     let formula_pair = parsed.next().ok_or_else(|| FormulaDslError::ParseError {
         reason: "invalid formula syntax: empty parse".to_string(),
     })?;
@@ -941,9 +940,7 @@ pub fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Result<Op
         Some(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() => Ok(Some(v)),
             Ok(v) => Err(FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "option `{key}={raw}` parses as {v} which is not a finite number"
-                ),
+                reason: format!("option `{key}={raw}` parses as {v} which is not a finite number"),
             }
             .into()),
             Err(_) => Err(FormulaDslError::InvalidArgument {
@@ -1004,9 +1001,11 @@ fn parse_required_f64_option(
     key: &str,
     raw: &str,
 ) -> Result<f64, String> {
-    let value = options.get(key).ok_or_else(|| FormulaDslError::MalformedConfig {
-        reason: format!("bounded() is missing required '{key}' argument: {raw}"),
-    })?;
+    let value = options
+        .get(key)
+        .ok_or_else(|| FormulaDslError::MalformedConfig {
+            reason: format!("bounded() is missing required '{key}' argument: {raw}"),
+        })?;
     value.parse::<f64>().map_err(|_| {
         FormulaDslError::InvalidArgument {
             reason: format!(
@@ -1046,12 +1045,14 @@ fn parse_optional_f64_option_alias(
     let mut found: Option<(&str, f64)> = None;
     for key in keys {
         if let Some(value) = options.get(*key) {
-            let parsed = value.parse::<f64>().map_err(|_| FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
-                    value
-                ),
-            })?;
+            let parsed = value
+                .parse::<f64>()
+                .map_err(|_| FormulaDslError::InvalidArgument {
+                    reason: format!(
+                        "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
+                        value
+                    ),
+                })?;
             if found.is_some() {
                 return Err(FormulaDslError::IncompatibleTerm {
                     reason: format!(
@@ -1279,9 +1280,7 @@ fn parse_bounded_priorspec(
         })?;
         if !(min < targetvalue && targetvalue < max) {
             return Err(FormulaDslError::InvalidArgument {
-                reason: format!(
-                    "bounded() target must lie strictly inside ({min}, {max}): {raw}"
-                ),
+                reason: format!("bounded() target must lie strictly inside ({min}, {max}): {raw}"),
             }
             .into());
         }
@@ -1315,9 +1314,7 @@ pub fn formula_rhs_text(formula: &str) -> Result<String, String> {
     Ok(parsed.rhs_terms.join(" + "))
 }
 
-pub fn parse_surv_response(
-    lhs: &str,
-) -> Result<Option<(String, String, String)>, FormulaDslError> {
+pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>, FormulaDslError> {
     let trimmed = lhs.trim();
     let call = match parse_function_call(trimmed) {
         Ok(call) => call,
@@ -1428,9 +1425,7 @@ pub fn validate_auxiliary_formula_controls(
     }
     if parsed_formula.linkspec.is_some() {
         return Err(FormulaDslError::IncompatibleTerm {
-            reason: format!(
-                "link(...) is only supported in the main formula, not {flag_name}"
-            ),
+            reason: format!("link(...) is only supported in the main formula, not {flag_name}"),
         }
         .into());
     }
@@ -1454,9 +1449,8 @@ pub fn validate_auxiliary_formula_controls(
 }
 
 pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
-    let parsed_dsl = parse_formula_dsl(formula).map_err(|reason| FormulaDslError::ParseError {
-        reason,
-    })?;
+    let parsed_dsl =
+        parse_formula_dsl(formula).map_err(|reason| FormulaDslError::ParseError { reason })?;
     let lhs = parsed_dsl.response_expr.trim();
     if lhs.is_empty() {
         return Err(FormulaDslError::ParseError {
@@ -1502,8 +1496,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             ParsedTerm::LinkWiggle { options } => {
                 if linkwiggle.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
-                        reason: "formula can include at most one linkwiggle(...) term"
-                            .to_string(),
+                        reason: "formula can include at most one linkwiggle(...) term".to_string(),
                     }
                     .into());
                 }
@@ -1512,8 +1505,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             ParsedTerm::TimeWiggle { options } => {
                 if timewiggle.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
-                        reason: "formula can include at most one timewiggle(...) term"
-                            .to_string(),
+                        reason: "formula can include at most one timewiggle(...) term".to_string(),
                     }
                     .into());
                 }
@@ -1531,8 +1523,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             ParsedTerm::SurvivalConfig { options } => {
                 if survivalspec.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
-                        reason: "formula can include at most one survmodel(...) term"
-                            .to_string(),
+                        reason: "formula can include at most one survmodel(...) term".to_string(),
                     }
                     .into());
                 }

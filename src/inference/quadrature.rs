@@ -3390,9 +3390,7 @@ fn cholesky_static<const D: usize>(cov: &[[f64; D]; D]) -> Option<[[f64; D]; D]>
 /// Stack-allocated Cholesky with a jitter-retry ladder
 /// (0, 1e-12, 1e-11, …, 1e-6 added to diagonal).
 #[inline]
-fn cholesky_static_with_jitter<const D: usize>(
-    cov: &[[f64; D]; D],
-) -> Option<[[f64; D]; D]> {
+fn cholesky_static_with_jitter<const D: usize>(cov: &[[f64; D]; D]) -> Option<[[f64; D]; D]> {
     if D == 0 {
         return None;
     }
@@ -5597,8 +5595,7 @@ mod tests {
         ];
         for cov in cases {
             let stack = cholesky_static_with_jitter::<2>(cov).expect("stack cholesky");
-            let heap_in: Vec<Vec<f64>> =
-                cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.iter().copied().collect()).collect();
             let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
             for i in 0..2 {
                 for j in 0..2 {
@@ -5621,8 +5618,7 @@ mod tests {
         ];
         for cov in cases {
             let stack = cholesky_static_with_jitter::<3>(cov).expect("stack cholesky");
-            let heap_in: Vec<Vec<f64>> =
-                cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.iter().copied().collect()).collect();
             let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
             for i in 0..3 {
                 for j in 0..3 {
