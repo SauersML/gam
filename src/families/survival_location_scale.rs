@@ -1362,16 +1362,12 @@ struct SurvivalRowDerivatives {
     d2_q0: f64,
     /// Entry-only third derivative: d³ ell / dq0³ = w * r''(u0).
     d3_q0: f64,
-    /// Entry-only fourth derivative: d⁴ ell / dq0⁴ = w * r'''(u0).
-    d4_q0: f64,
     /// Exit-only derivative: d ell / dq1.
     d1_q1: f64,
     /// Exit-only second derivative: d² ell / dq1².
     d2_q1: f64,
     /// Exit-only third derivative: d³ ell / dq1³.
     d3_q1: f64,
-    /// Exit-only fourth derivative: d⁴ ell / dq1⁴.
-    d4_q1: f64,
     /// Exit-only derivatives with respect to qdot1 = dq/dt at the event time.
     d1_qdot1: f64,
     d2_qdot1: f64,
@@ -1384,13 +1380,6 @@ struct SurvivalRowDerivatives {
     d_h_h0: f64,
     d_h_h1: f64,
     d_h_d: f64,
-    /// d⁴ ell / d(h0)⁴ — the 4th derivative of ℓ w.r.t. the entry time
-    /// predictor h0. This is the bilinear coefficient for D²H[u,v] in the
-    /// time-time block of the outer Hessian. Previously approximated via
-    /// 3rd-derivative products; now computed exactly.
-    d2_h_h0: f64,
-    /// d⁴ ell / d(h1)⁴ — analogous to d2_h_h0 for the exit side.
-    d2_h_h1: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1446,12 +1435,10 @@ struct SurvivalJointQuantities {
     d1_q0: Array1<f64>,
     d2_q0: Array1<f64>,
     d3_q0: Array1<f64>,
-    d4_q0: Array1<f64>,
     /// Exit-only derivatives of ell w.r.t. q1.
     d1_q1: Array1<f64>,
     d2_q1: Array1<f64>,
     d3_q1: Array1<f64>,
-    d4_q1: Array1<f64>,
     /// Exit-only derivatives of ell w.r.t. qdot1 = dq/dt.
     d1_qdot1: Array1<f64>,
     d2_qdot1: Array1<f64>,
@@ -1461,10 +1448,6 @@ struct SurvivalJointQuantities {
     d_h_h0: Array1<f64>,
     d_h_h1: Array1<f64>,
     d_h_d: Array1<f64>,
-    /// d⁴ℓ/d(h0)⁴ for the exact bilinear D²H[u,v] time-time coefficient.
-    d2_h_h0: Array1<f64>,
-    /// d⁴ℓ/d(h1)⁴ for the exact bilinear D²H[u,v] time-time coefficient.
-    d2_h_h1: Array1<f64>,
     /// Exit-side dq/d(eta_t) = -exp(-eta_ls_exit).
     dq_t: Array1<f64>,
     /// Exit-side dq/d(eta_ls).
@@ -1473,8 +1456,6 @@ struct SurvivalJointQuantities {
     d2q_ls: Array1<f64>,
     d3q_tls_ls: Array1<f64>,
     d3q_ls: Array1<f64>,
-    d4q_tls_ls_ls: Array1<f64>,
-    d4q_ls: Array1<f64>,
     /// Entry-side dq0/d(eta_t_entry) = -exp(-eta_ls_entry) (only for time-varying).
     dq_t_entry: Option<Array1<f64>>,
     /// Entry-side q-chain derivatives at entry (only for time-varying sigma).
@@ -1483,8 +1464,6 @@ struct SurvivalJointQuantities {
     d2q_ls_entry: Option<Array1<f64>>,
     d3q_tls_ls_entry: Option<Array1<f64>>,
     d3q_ls_entry: Option<Array1<f64>>,
-    d4q_tls_ls_ls_entry: Option<Array1<f64>>,
-    d4q_ls_entry: Option<Array1<f64>>,
     dqdot_t: Array1<f64>,
     dqdot_ls: Array1<f64>,
     dqdot_td: Array1<f64>,
@@ -1499,8 +1478,6 @@ struct SurvivalJointQuantities {
 }
 
 struct SurvivalJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
     x_t_exit_psi: Option<Array2<f64>>,
     x_t_entry_psi: Option<Array2<f64>>,
     x_ls_exit_psi: Option<Array2<f64>>,
@@ -1957,11 +1934,9 @@ impl SurvivalLocationScaleFamily {
         let mut d1_q0 = Array1::<f64>::zeros(n);
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d3_q0 = Array1::<f64>::zeros(n);
-        let mut d4_q0 = Array1::<f64>::zeros(n);
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d2_q1 = Array1::<f64>::zeros(n);
         let mut d3_q1 = Array1::<f64>::zeros(n);
-        let mut d4_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot1 = Array1::<f64>::zeros(n);
         let mut d2_qdot1 = Array1::<f64>::zeros(n);
         let mut h_time_h0 = Array1::<f64>::zeros(n);
@@ -1970,8 +1945,6 @@ impl SurvivalLocationScaleFamily {
         let mut d_h_h0 = Array1::<f64>::zeros(n);
         let mut d_h_h1 = Array1::<f64>::zeros(n);
         let mut d_h_d = Array1::<f64>::zeros(n);
-        let mut d2_h_h0 = Array1::<f64>::zeros(n);
-        let mut d2_h_h1 = Array1::<f64>::zeros(n);
 
         // Write each row's 21 derivative scalars directly into the
         // preallocated output arrays in parallel. The previous path collected
@@ -2001,11 +1974,9 @@ impl SurvivalLocationScaleFamily {
         let p_d1_q0 = SendPtr(d1_q0.as_mut_ptr());
         let p_d2_q0 = SendPtr(d2_q0.as_mut_ptr());
         let p_d3_q0 = SendPtr(d3_q0.as_mut_ptr());
-        let p_d4_q0 = SendPtr(d4_q0.as_mut_ptr());
         let p_d1_q1 = SendPtr(d1_q1.as_mut_ptr());
         let p_d2_q1 = SendPtr(d2_q1.as_mut_ptr());
         let p_d3_q1 = SendPtr(d3_q1.as_mut_ptr());
-        let p_d4_q1 = SendPtr(d4_q1.as_mut_ptr());
         let p_d1_qdot1 = SendPtr(d1_qdot1.as_mut_ptr());
         let p_d2_qdot1 = SendPtr(d2_qdot1.as_mut_ptr());
         let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
@@ -2014,8 +1985,6 @@ impl SurvivalLocationScaleFamily {
         let p_d_h_h0 = SendPtr(d_h_h0.as_mut_ptr());
         let p_d_h_h1 = SendPtr(d_h_h1.as_mut_ptr());
         let p_d_h_d = SendPtr(d_h_d.as_mut_ptr());
-        let p_d2_h_h0 = SendPtr(d2_h_h0.as_mut_ptr());
-        let p_d2_h_h1 = SendPtr(d2_h_h1.as_mut_ptr());
 
         let dyn_ref = &dynamic;
         (0..n)
@@ -2041,11 +2010,9 @@ impl SurvivalLocationScaleFamily {
                     p_d1_q0.write(i, row.d1_q0);
                     p_d2_q0.write(i, row.d2_q0);
                     p_d3_q0.write(i, row.d3_q0);
-                    p_d4_q0.write(i, row.d4_q0);
                     p_d1_q1.write(i, row.d1_q1);
                     p_d2_q1.write(i, row.d2_q1);
                     p_d3_q1.write(i, row.d3_q1);
-                    p_d4_q1.write(i, row.d4_q1);
                     p_d1_qdot1.write(i, row.d1_qdot1);
                     p_d2_qdot1.write(i, row.d2_qdot1);
                     p_h_time_h0.write(i, row.h_time_h0);
@@ -2054,8 +2021,6 @@ impl SurvivalLocationScaleFamily {
                     p_d_h_h0.write(i, row.d_h_h0);
                     p_d_h_h1.write(i, row.d_h_h1);
                     p_d_h_d.write(i, row.d_h_d);
-                    p_d2_h_h0.write(i, row.d2_h_h0);
-                    p_d2_h_h1.write(i, row.d2_h_h1);
                 }
                 Ok(())
             })?;
@@ -2067,11 +2032,9 @@ impl SurvivalLocationScaleFamily {
             d1_q0,
             d2_q0,
             d3_q0,
-            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
-            d4_q1,
             d1_qdot1,
             d2_qdot1,
             h_time_h0,
@@ -2080,24 +2043,18 @@ impl SurvivalLocationScaleFamily {
             d_h_h0,
             d_h_h1,
             d_h_d,
-            d2_h_h0,
-            d2_h_h1,
             dq_t: dynamic.dq_t_exit,
             dq_ls: dynamic.dq_ls_exit,
             d2q_tls: dynamic.d2q_tls_exit,
             d2q_ls: dynamic.d2q_ls_exit,
             d3q_tls_ls: dynamic.d3q_tls_ls_exit,
             d3q_ls: dynamic.d3q_ls_exit,
-            d4q_tls_ls_ls: dynamic.d4q_tls_ls_ls_exit,
-            d4q_ls: dynamic.d4q_ls_exit,
             dq_t_entry: Some(dynamic.dq_t_entry),
             dq_ls_entry: Some(dynamic.dq_ls_entry),
             d2q_tls_entry: Some(dynamic.d2q_tls_entry),
             d2q_ls_entry: Some(dynamic.d2q_ls_entry),
             d3q_tls_ls_entry: Some(dynamic.d3q_tls_ls_entry),
             d3q_ls_entry: Some(dynamic.d3q_ls_entry),
-            d4q_tls_ls_ls_entry: Some(dynamic.d4q_tls_ls_ls_entry),
-            d4q_ls_entry: Some(dynamic.d4q_ls_entry),
             dqdot_t: dynamic.dqdot_t,
             dqdot_ls: dynamic.dqdot_ls,
             dqdot_td: dynamic.dqdot_td,
@@ -2376,8 +2333,6 @@ impl SurvivalLocationScaleFamily {
                         _ => return Ok(None),
                     }
                     return Ok(Some(SurvivalJointPsiDirection {
-                        block_idx,
-                        local_idx,
                         x_t_exit_psi,
                         x_t_entry_psi,
                         x_ls_exit_psi,
@@ -2944,20 +2899,14 @@ impl SurvivalLocationScaleFamily {
         //   ell_h0q0 = w r'(u0)
         //   ell_h1q1 = w [ d d²/du² log f(u1) - (1-d) r'(u1) ]
         //
-        // The 4th-order derivatives d4_q0 and d4_q1 are the m4 quantities
-        // needed by the Arbogast chain rule for the outer REML Hessian.
-        // They enter F_αβγδ = m4·u_α·u_β·u_γ·u_δ + ... in the (s,s,s,s)
-        // and (ϑ,s,s,s) blocks. See response.md Section 6.
         // Use `event_mix` for d * (event term) + (1-d) * (censored term) to
         // avoid 0 * Inf = NaN when d ∈ {0, 1} and one branch is non-finite.
         let d1_q0 = kernel.w * kernel.r0;
         let d2_q0 = kernel.w * kernel.dr0;
         let d3_q0 = kernel.w * kernel.ddr0;
-        let d4_q0 = kernel.w * kernel.dddr0;
         let d1_q1 = kernel.w * event_mix(kernel.d, kernel.dlogphi1, -kernel.r1);
         let d2_q1 = kernel.w * event_mix(kernel.d, kernel.d2logphi1, -kernel.dr1);
         let d3_q1 = kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1);
-        let d4_q1 = kernel.w * event_mix(kernel.d, kernel.d4logphi1, -kernel.dddr1);
         let d1_q = d1_q0 + d1_q1;
         let d2_q = d2_q0 + d2_q1;
         let d3_q = d3_q0 + d3_q1;
@@ -2969,11 +2918,9 @@ impl SurvivalLocationScaleFamily {
             d1_q0,
             d2_q0,
             d3_q0,
-            d4_q0,
             d1_q1,
             d2_q1,
             d3_q1,
-            d4_q1,
             d1_qdot1: kernel.w * kernel.d * kernel.d_log_g,
             d2_qdot1: kernel.w * kernel.d * kernel.d2_log_g,
             grad_time_eta_h0: kernel.w * kernel.r0,
@@ -2985,12 +2932,6 @@ impl SurvivalLocationScaleFamily {
             d_h_h0: kernel.w * kernel.ddr0,
             d_h_h1: kernel.w * event_mix(kernel.d, kernel.d3logphi1, -kernel.ddr1),
             d_h_d: -kernel.w * kernel.d * kernel.d3_log_g,
-            // 4th derivatives of ℓ w.r.t. the time predictors h0, h1.
-            // These are the exact bilinear coefficients for D²H[u,v] in the
-            // time-time block. Since u = q + h, d⁴ℓ/dh⁴ = d⁴ℓ/du⁴
-            // (same sign because (+1)⁴ = 1), we have:
-            d2_h_h0: kernel.w * kernel.dddr0,
-            d2_h_h1: kernel.w * event_mix(kernel.d, kernel.d4logphi1, -kernel.dddr1),
         }))
     }
 }

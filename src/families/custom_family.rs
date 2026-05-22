@@ -5049,27 +5049,6 @@ impl CustomFamilyPsiSecondDesignAction {
         self.row_range.end - self.row_range.start
     }
 
-    pub(crate) fn slice_rows(&self, row_range: Range<usize>) -> Result<Self, String> {
-        if row_range.end > self.nrows() {
-            return Err(CustomFamilyError::DimensionMismatch {
-                reason: format!(
-                    "psi second-design row range {}..{} exceeds available rows {}",
-                    row_range.start,
-                    row_range.end,
-                    self.nrows()
-                ),
-            }
-            .into());
-        }
-        Ok(Self {
-            operator: Arc::clone(&self.operator),
-            level: self.level,
-            row_range: (self.row_range.start + row_range.start)
-                ..(self.row_range.start + row_range.end),
-            p: self.p,
-        })
-    }
-
     pub(crate) fn forward_mul(&self, u: ArrayView1<'_, f64>) -> Array1<f64> {
         assert_eq!(u.len(), self.p);
         let out = match self.level {
