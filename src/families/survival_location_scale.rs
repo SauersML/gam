@@ -9057,69 +9057,65 @@ impl SurvivalLocationScaleFamily {
         let mut d1_q1 = Array1::<f64>::zeros(n);
         let mut d1_qdot = Array1::<f64>::zeros(n);
 
-        let assign_row_derivatives =
-            |i: usize,
-             row: SurvivalRowDerivatives,
-             d1_q0: &mut Array1<f64>,
-             d1_q1: &mut Array1<f64>,
-             d1_qdot: &mut Array1<f64>,
-             grad_time_eta_h0: &mut Array1<f64>,
-             grad_time_eta_h1: &mut Array1<f64>,
-             grad_time_eta_d: &mut Array1<f64>| {
-                d1_q0[i] = row.d1_q0;
-                d1_q1[i] = row.d1_q1;
-                d1_qdot[i] = row.d1_qdot1;
-                grad_time_eta_h0[i] = row.grad_time_eta_h0;
-                grad_time_eta_h1[i] = row.grad_time_eta_h1;
-                grad_time_eta_d[i] = row.grad_time_eta_d;
-            };
-
         if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
-            struct RowDerivativeAccumulator {
-                ll: f64,
-                rows: Vec<(usize, SurvivalRowDerivatives)>,
-            }
-
-            let make_acc = || RowDerivativeAccumulator {
-                ll: 0.0,
-                rows: Vec::new(),
-            };
-            let acc = (0..n)
-                .into_par_iter()
-                .try_fold(make_acc, |mut acc, i| -> Result<_, String> {
-                    let state = self.row_predictor_state(
-                        dynamic.h_entry[i],
-                        dynamic.h_exit[i],
-                        dynamic.hdot_exit[i],
-                        dynamic.q_entry[i],
-                        dynamic.q_exit[i],
-                        dynamic.qdot_exit[i],
-                    );
-                    if let Some(row) = self.row_derivatives(i, state)? {
-                        acc.ll += row.ll;
-                        acc.rows.push((i, row));
-                    }
-                    Ok(acc)
-                })
-                .try_reduce(make_acc, |mut a, mut b| {
-                    a.ll += b.ll;
-                    a.rows.append(&mut b.rows);
-                    Ok::<_, String>(a)
-                })?;
-
-            ll = acc.ll;
-            for (i, row) in acc.rows {
-                assign_row_derivatives(
-                    i,
-                    row,
-                    &mut d1_q0,
-                    &mut d1_q1,
-                    &mut d1_qdot,
-                    &mut grad_time_eta_h0,
-                    &mut grad_time_eta_h1,
-                    &mut grad_time_eta_d,
-                );
-            }
+            const CHUNK: usize = 1024;
+            let d1_q0_s = d1_q0
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let d1_q1_s = d1_q1
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let d1_qdot_s = d1_qdot
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let g_h0_s = grad_time_eta_h0
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let g_h1_s = grad_time_eta_h1
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            let g_d_s = grad_time_eta_d
+                .as_slice_memory_order_mut()
+                .expect("zeros is contiguous");
+            ll = d1_q0_s
+                .par_chunks_mut(CHUNK)
+                .zip(d1_q1_s.par_chunks_mut(CHUNK))
+                .zip(d1_qdot_s.par_chunks_mut(CHUNK))
+                .zip(g_h0_s.par_chunks_mut(CHUNK))
+                .zip(g_h1_s.par_chunks_mut(CHUNK))
+                .zip(g_d_s.par_chunks_mut(CHUNK))
+                .enumerate()
+                .try_fold(
+                    || 0.0_f64,
+                    |local_ll,
+                     (chunk_idx, (((((d1q0_c, d1q1_c), d1qd_c), gh0_c), gh1_c), gd_c))|
+                     -> Result<f64, String> {
+                        let start = chunk_idx * CHUNK;
+                        let mut acc = local_ll;
+                        for local in 0..d1q0_c.len() {
+                            let i = start + local;
+                            let state = self.row_predictor_state(
+                                dynamic.h_entry[i],
+                                dynamic.h_exit[i],
+                                dynamic.hdot_exit[i],
+                                dynamic.q_entry[i],
+                                dynamic.q_exit[i],
+                                dynamic.qdot_exit[i],
+                            );
+                            if let Some(row) = self.row_derivatives(i, state)? {
+                                acc += row.ll;
+                                d1q0_c[local] = row.d1_q0;
+                                d1q1_c[local] = row.d1_q1;
+                                d1qd_c[local] = row.d1_qdot1;
+                                gh0_c[local] = row.grad_time_eta_h0;
+                                gh1_c[local] = row.grad_time_eta_h1;
+                                gd_c[local] = row.grad_time_eta_d;
+                            }
+                        }
+                        Ok(acc)
+                    },
+                )
+                .try_reduce(|| 0.0_f64, |a, b| Ok::<_, String>(a + b))?;
         } else {
             for i in 0..n {
                 let state = self.row_predictor_state(
@@ -9134,16 +9130,12 @@ impl SurvivalLocationScaleFamily {
                     continue;
                 };
                 ll += row.ll;
-                assign_row_derivatives(
-                    i,
-                    row,
-                    &mut d1_q0,
-                    &mut d1_q1,
-                    &mut d1_qdot,
-                    &mut grad_time_eta_h0,
-                    &mut grad_time_eta_h1,
-                    &mut grad_time_eta_d,
-                );
+                d1_q0[i] = row.d1_q0;
+                d1_q1[i] = row.d1_q1;
+                d1_qdot[i] = row.d1_qdot1;
+                grad_time_eta_h0[i] = row.grad_time_eta_h0;
+                grad_time_eta_h1[i] = row.grad_time_eta_h1;
+                grad_time_eta_d[i] = row.grad_time_eta_d;
             }
         }
 
@@ -9151,40 +9143,80 @@ impl SurvivalLocationScaleFamily {
             + dynamic.time_jac_exit.t().dot(&grad_time_eta_h1)
             + dynamic.time_jac_deriv.t().dot(&grad_time_eta_d);
 
+        let mut scratch = Array1::<f64>::zeros(n);
+
         let grad_t = if let (Some(x_t_entry), Some(x_t_deriv)) = (
             self.x_threshold_entry.as_ref(),
             self.x_threshold_deriv.as_ref(),
         ) {
-            let grad_exit = &d1_q1 * &dynamic.dq_t_exit + &d1_qdot * &dynamic.dqdot_t;
-            let grad_entry = &d1_q0 * &dynamic.dq_t_entry;
-            let grad_deriv = &d1_qdot * &dynamic.dqdot_td;
-            self.x_threshold.transpose_vector_multiply(&grad_exit)
-                + x_t_entry.transpose_vector_multiply(&grad_entry)
-                + x_t_deriv.transpose_vector_multiply(&grad_deriv)
+            // grad_exit[i] = d1_q1[i] * dq_t_exit[i] + d1_qdot[i] * dqdot_t[i]
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q1)
+                .and(&dynamic.dq_t_exit)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_t)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            let mut out = self.x_threshold.transpose_vector_multiply(&scratch);
+            // grad_entry[i] = d1_q0[i] * dq_t_entry[i]
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q0)
+                .and(&dynamic.dq_t_entry)
+                .for_each(|s, &a, &b| *s = a * b);
+            out = out + x_t_entry.transpose_vector_multiply(&scratch);
+            // grad_deriv[i] = d1_qdot[i] * dqdot_td[i]
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_td)
+                .for_each(|s, &a, &b| *s = a * b);
+            out + x_t_deriv.transpose_vector_multiply(&scratch)
         } else {
-            self.x_threshold.transpose_vector_multiply(
-                &(&d1_q1 * &dynamic.dq_t_exit
-                    + &d1_q0 * &dynamic.dq_t_entry
-                    + &d1_qdot * &dynamic.dqdot_t),
-            )
+            // combined[i] = d1_q1[i]*dq_t_exit[i] + d1_q0[i]*dq_t_entry[i] + d1_qdot[i]*dqdot_t[i]
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q1)
+                .and(&dynamic.dq_t_exit)
+                .and(&d1_q0)
+                .and(&dynamic.dq_t_entry)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_t)
+                .for_each(|s, &a, &b| *s += a * b);
+            self.x_threshold.transpose_vector_multiply(&scratch)
         };
 
         let grad_ls = if let (Some(x_ls_entry), Some(x_ls_deriv)) = (
             self.x_log_sigma_entry.as_ref(),
             self.x_log_sigma_deriv.as_ref(),
         ) {
-            let grad_exit = &d1_q1 * &dynamic.dq_ls_exit + &d1_qdot * &dynamic.dqdot_ls;
-            let grad_entry = &d1_q0 * &dynamic.dq_ls_entry;
-            let grad_deriv = &d1_qdot * &dynamic.dqdot_lsd;
-            self.x_log_sigma.transpose_vector_multiply(&grad_exit)
-                + x_ls_entry.transpose_vector_multiply(&grad_entry)
-                + x_ls_deriv.transpose_vector_multiply(&grad_deriv)
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q1)
+                .and(&dynamic.dq_ls_exit)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_ls)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            let mut out = self.x_log_sigma.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q0)
+                .and(&dynamic.dq_ls_entry)
+                .for_each(|s, &a, &b| *s = a * b);
+            out = out + x_ls_entry.transpose_vector_multiply(&scratch);
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_lsd)
+                .for_each(|s, &a, &b| *s = a * b);
+            out + x_ls_deriv.transpose_vector_multiply(&scratch)
         } else {
-            self.x_log_sigma.transpose_vector_multiply(
-                &(&d1_q1 * &dynamic.dq_ls_exit
-                    + &d1_q0 * &dynamic.dq_ls_entry
-                    + &d1_qdot * &dynamic.dqdot_ls),
-            )
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_q1)
+                .and(&dynamic.dq_ls_exit)
+                .and(&d1_q0)
+                .and(&dynamic.dq_ls_entry)
+                .for_each(|s, &a, &b, &c, &d| *s = a * b + c * d);
+            ndarray::Zip::from(&mut scratch)
+                .and(&d1_qdot)
+                .and(&dynamic.dqdot_ls)
+                .for_each(|s, &a, &b| *s += a * b);
+            self.x_log_sigma.transpose_vector_multiply(&scratch)
         };
 
         let mut block_gradients = vec![grad_time, grad_t, grad_ls];
