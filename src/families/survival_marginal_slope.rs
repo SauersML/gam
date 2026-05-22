@@ -67,6 +67,76 @@ use std::sync::{Arc, Mutex};
 /// fits. Thirty-two inline slots cover every observed shape.
 type PolyVec = SmallVec<[f64; 32]>;
 
+// ── Typed errors ──────────────────────────────────────────────────────
+//
+// Categorizes the failure modes of the survival marginal-slope family so
+// callers can match on the kind without parsing strings. The `reason`
+// fields preserve the original `format!(...)` text byte-for-byte; the
+// `Display` impl prints just the reason, making `e.to_string()` identical
+// to the pre-migration `String` errors that flowed through `?`.
+#[derive(Debug, Clone)]
+pub enum SurvivalMarginalSlopeError {
+    /// Spec, data, or runtime configuration failed input validation
+    /// (finite/non-negative weights, derivative_guard > 0, supported
+    /// base_link, frailty constraints, missing block state, etc.).
+    InvalidInput { reason: String },
+    /// Lengths, row/column counts, basis widths, or coefficient block
+    /// sizes do not agree (covariance dim vs z, design rows vs n,
+    /// basis/beta length mismatch, post-update beta length, time
+    /// constraints A vs b, hessian_matvec dim mismatch, ...).
+    IncompatibleDimensions { reason: String },
+    /// A row's transformed time derivative or structural slack fell
+    /// below `derivative_guard` (`qd1 < guard`), violating the
+    /// monotonicity contract.
+    MonotonicityViolation { reason: String },
+    /// A numerical step produced a non-finite, non-positive, or
+    /// internally inconsistent quantity that downstream code cannot
+    /// consume (e.g. non-positive `D`, non-positive `chi1`, calibration
+    /// derivative disagrees with the direct evaluation, transformed
+    /// derivative not strictly positive).
+    NumericalFailure { reason: String },
+    /// An integration / outer-optimization step failed to converge to
+    /// the requested tolerance (intercept residual, REML outer loop).
+    IntegrationFailed { reason: String },
+    /// The requested combination of options is not implemented (non-
+    /// probit base link, flexible row calculus with K > 1, spatial psi
+    /// for unsupported block roles, ...).
+    UnsupportedConfiguration { reason: String },
+}
+
+impl std::fmt::Display for SurvivalMarginalSlopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SurvivalMarginalSlopeError::InvalidInput { reason }
+            | SurvivalMarginalSlopeError::IncompatibleDimensions { reason }
+            | SurvivalMarginalSlopeError::MonotonicityViolation { reason }
+            | SurvivalMarginalSlopeError::NumericalFailure { reason }
+            | SurvivalMarginalSlopeError::IntegrationFailed { reason }
+            | SurvivalMarginalSlopeError::UnsupportedConfiguration { reason } => {
+                f.write_str(reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SurvivalMarginalSlopeError {}
+
+impl From<SurvivalMarginalSlopeError> for String {
+    fn from(err: SurvivalMarginalSlopeError) -> String {
+        err.to_string()
+    }
+}
+
+impl From<String> for SurvivalMarginalSlopeError {
+    /// Inbound conversion from helpers in this module (and adjacent
+    /// families) that still surface `Result<_, String>`. The text is
+    /// preserved verbatim; `InvalidInput` is the catch-all category for
+    /// strings produced outside this module.
+    fn from(reason: String) -> SurvivalMarginalSlopeError {
+        SurvivalMarginalSlopeError::InvalidInput { reason }
+    }
+}
+
 // ── Spec and result types ─────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -307,11 +377,14 @@ fn score_warp_component_beta<'a>(
 ) -> Result<Array1<f64>, String> {
     let range = score_warp_component_range(runtime, coord);
     if range.end > beta.len() {
-        return Err(format!(
-            "survival score-warp coefficient block is too short for z coordinate {coord}: need {}, got {}",
-            range.end,
-            beta.len()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival score-warp coefficient block is too short for z coordinate {coord}: need {}, got {}",
+                range.end,
+                beta.len()
+            ),
+        }
+        .into());
     }
     Ok(beta.slice(s![range]).to_owned())
 }
@@ -322,7 +395,10 @@ fn build_per_z_score_warp_deviation_block_from_seed(
 ) -> Result<PerZScoreWarpPrepared, String> {
     let score_dim = z.ncols();
     if score_dim == 0 {
-        return Err("survival score-warp requires at least one z coordinate".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival score-warp requires at least one z coordinate".to_string(),
+        }
+        .into());
     }
     let z_primary = z.column(0).to_owned();
     let base = build_score_warp_deviation_block_from_seed(&z_primary, cfg)?;
@@ -352,11 +428,14 @@ fn build_per_z_score_warp_deviation_block_from_seed(
         let z_coord = z.column(coord).to_owned();
         let coord_design = base.runtime.design(&z_coord)?;
         if coord_design.nrows() != n || coord_design.ncols() != p {
-            return Err(format!(
-                "survival score-warp design shape mismatch for z coordinate {coord}: got {}x{}, expected {n}x{p}",
-                coord_design.nrows(),
-                coord_design.ncols()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival score-warp design shape mismatch for z coordinate {coord}: got {}x{}, expected {n}x{p}",
+                    coord_design.nrows(),
+                    coord_design.ncols()
+                ),
+            }
+            .into());
         }
         design
             .slice_mut(s![.., coord * p..(coord + 1) * p])
@@ -417,10 +496,13 @@ fn build_per_z_score_warp_aux_blockspec(
     let total_p = prepared.total_basis_dim();
     let candidate = beta_hint.unwrap_or_else(|| Array1::<f64>::zeros(total_p));
     if candidate.len() != total_p {
-        return Err(format!(
-            "survival score-warp beta hint length mismatch: got {}, expected {total_p}",
-            candidate.len()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival score-warp beta hint length mismatch: got {}, expected {total_p}",
+                candidate.len()
+            ),
+        }
+        .into());
     }
     let mut projected = Array1::<f64>::zeros(total_p);
     for coord in 0..prepared.score_dim {
@@ -445,11 +527,14 @@ fn build_per_z_score_warp_aux_blockspec(
         // penalties can still introduce intentionally shared precision
         // factors without accidentally tying these base smoothness penalties.
         if spec.penalties.len() % prepared.score_dim != 0 {
-            return Err(format!(
-                "survival score-warp penalty count {} is not divisible by K={}",
-                spec.penalties.len(),
-                prepared.score_dim
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival score-warp penalty count {} is not divisible by K={}",
+                    spec.penalties.len(),
+                    prepared.score_dim
+                ),
+            }
+            .into());
         }
         let penalties_per_coord = spec.penalties.len() / prepared.score_dim;
         for coord in 0..prepared.score_dim {
@@ -1011,9 +1096,12 @@ fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f64>, String
     match block_idx {
         1 => Ok(Array1::from_vec(vec![1.0, 1.0, 0.0, 0.0])),
         2 => Ok(Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0])),
-        _ => Err(format!(
-            "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
-        )),
+        _ => Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "survival marginal-slope spatial psi loading requested for unsupported block {block_idx}"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -1159,9 +1247,12 @@ fn spatial_block_primary_loading_flex(
             out[primary.g] = 1.0;
             Ok(out)
         }
-        _ => Err(format!(
-            "survival marginal-slope spatial psi loading requested for unsupported flex block {block_idx}"
-        )),
+        _ => Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "survival marginal-slope spatial psi loading requested for unsupported flex block {block_idx}"
+            ),
+        }
+        .into()),
     }
 }
 
@@ -2885,11 +2976,14 @@ pub fn survival_marginal_slope_vector_eta(
     probit_scale: f64,
 ) -> Result<f64, String> {
     if z.len() != covariance.dim() {
-        return Err(format!(
-            "survival marginal-slope vector eta: score/covariance dimension mismatch: z={}, covariance={}",
-            z.len(),
-            covariance.dim()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope vector eta: score/covariance dimension mismatch: z={}, covariance={}",
+                z.len(),
+                covariance.dim()
+            ),
+        }
+        .into());
     }
     marginal_slope_probit_eta(q, z, slopes, covariance, probit_scale)
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
