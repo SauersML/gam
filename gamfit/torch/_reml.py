@@ -504,47 +504,26 @@ def gaussian_reml_fit_additive(
 ) -> AdditiveRemlOutput:
     """Joint multi-smooth additive Gaussian REML fit.
 
-    .. warning::
-       **This path fits a single shared smoothing parameter λ across every
-       smooth block.** It is *not* the mgcv-style per-smooth λ that most
-       users expect from an additive REML fit. Concretely: the per-smooth
-       design blocks are concatenated into a wide design
-       ``[D_1 | D_2 | ...]`` and the per-smooth ``S_i`` are assembled into
-       a block-diagonal joint penalty, but the combined problem is then
-       handed to the single-λ :func:`gaussian_reml_fit` — so one scalar λ
-       multiplies the entire block-diagonal penalty rather than one λ_k
-       per block.
+    For ``F > 1`` blocks with a single-column response, this routes to the
+    multi-block Rust REML path (see :func:`gaussian_reml_fit_blocks`) so
+    each smooth recovers its own ``λ_k`` from the outer optimisation; the
+    returned ``AdditiveRemlOutput.lam`` is a length-``F`` 1D tensor on
+    that path.
 
-    For per-smooth λ — i.e. the standard ``ŷ ~ s(x1) + s(x2) + ...`` fit
-    with independent smoothing parameters for each term — use the formula
-    API instead::
+    For ``F == 1`` (single block), or for multi-output ``response`` of
+    shape ``(N, D>1)`` where the multi-block driver is not yet
+    multi-response, the call falls back to the legacy single-λ
+    closed-form path: the per-smooth ``S_i`` are assembled into a
+    block-diagonal joint penalty and a single scalar λ multiplies the
+    entire block-diagonal, evaluated through the closed-form Gaussian
+    REML kernel. In that fallback ``AdditiveRemlOutput.lam`` is a scalar.
 
-        model = gamfit.fit(data, 'y ~ s(x1) + s(x2) + ...')
-
-    The formula API drives the PIRLS workflow, which performs the full
-    multi-block REML/LAML outer optimisation (one λ_k per smooth) and
-    returns a serialised :class:`gamfit.Model`. If you only need the
-    final coefficients / λ vector / EDF you can post-process that
-    ``Model``; if you specifically need a differentiable ``torch.Tensor``
-    pipeline you are constrained to the single-λ closed-form here until
-    the Rust kernel grows multi-block support.
-
-    Why this is single-λ (math note)
-    --------------------------------
-    The closed-form Gaussian REML kernel (see
-    ``crates/gam-core/src/solver/gaussian_reml.rs``) exploits the joint
-    generalised eigendecomposition of the pair ``(S, X'WX)`` so that the
-    REML score and its gradient become rational functions of the single
-    scalar λ, evaluated at O(1) per probe after one eigendecomposition.
-    With multiple λ_k the relevant pair is ``(Σ_k λ_k S_k, X'WX)`` and a
-    *single* eigendecomposition no longer diagonalises every λ_k jointly,
-    so the closed-form collapses: the multi-block path needs a fresh
-    per-iteration solve, an outer multi-dimensional optimiser over
-    ``log λ_k``, and an analytic VJP through the F×F Hessian of the
-    REML criterion. That refactor is tracked as a deliberate API
-    limitation; see :mod:`gamfit.torch._multi_lambda_status` and the
-    "True multi-λ in additive REML" feature request. Until then the
-    canonical recommendation for multi-smooth fits is the formula API.
+    .. note::
+       The multi-block path is forward-only. ``.backward()`` through any
+       of its outputs raises ``NotImplementedError`` because the analytic
+       VJP through the F×F outer Hessian is a separate workstream. The
+       legacy single-λ fallback (``F == 1`` or ``D > 1``) remains fully
+       differentiable.
 
     Parameters
     ----------
@@ -600,6 +579,29 @@ def gaussian_reml_fit_additive(
             modulated.append(design * by_i.unsqueeze(1))
         else:
             modulated.append(design)
+
+    # Route to the multi-block per-smooth-λ Rust path when we have
+    # multiple distinct penalties and a single-column response. The
+    # multi-block driver is single-response today, so D > 1 still falls
+    # back to the legacy single-λ closed-form path.
+    response_is_2d = response.dim() == 2 and response.shape[1] > 1
+    if len(designs) > 1 and not response_is_2d:
+        if init_lambda is None:
+            init_log = None
+        else:
+            init_log = torch.full(
+                (len(designs),),
+                float(np.log(max(float(init_lambda), 1e-300))),
+                dtype=torch.float64,
+                device=modulated[0].device,
+            )
+        return gaussian_reml_fit_blocks(
+            modulated,
+            list(penalties),
+            response,
+            weights=weights,
+            init_log_lambdas=init_log,
+        )
 
     joint_design = torch.cat(modulated, dim=1)
     joint_penalty = torch.block_diag(*penalties)

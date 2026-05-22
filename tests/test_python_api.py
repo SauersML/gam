@@ -1057,19 +1057,84 @@ def test_sphere_torch_fit_smoke_all_kernels() -> None:
         assert np.all(np.isfinite(fitted)), f"kernel={kernel}: NaN/Inf in fitted"
 
 
-def test_per_smooth_lambda_not_in_torch_additive_pending_rust_refactor() -> None:
-    # The torch additive REML path is structurally single-λ because the
-    # closed-form Gaussian REML kernel in
-    # crates/gam-core/src/solver/gaussian_reml.rs only handles one scalar λ.
-    # Per-smooth λ requires extending that Rust kernel to multi-block
-    # (multi-d outer optimisation + analytic VJP through the F×F Hessian +
-    # per-block eigendecomposition routing). This test tracks the gap.
-    #
-    # delete this test when the multi-block closed-form REML kernel ships
-    from gamfit.torch._multi_lambda_status import MULTI_LAMBDA_SUPPORTED
+def test_torch_additive_recovers_per_smooth_lambda() -> None:
+    """The torch additive path now routes to the multi-block Rust REML
+    driver, so a fit with one wiggly response component and one smooth
+    one must recover noticeably different per-block λs (ratio > 5)."""
+    torch = pytest.importorskip("torch")
+    from gamfit.torch import Duchon, fit
 
-    assert MULTI_LAMBDA_SUPPORTED is False, (
-        "Torch additive REML now claims per-smooth λ support; "
-        "remove this placeholder test and update the docstrings in "
-        "gamfit/torch/_reml.py and gamfit/torch/_multi_lambda_status.py."
+    rng = np.random.default_rng(42)
+    n = 400
+    x = np.linspace(0.0, 1.0, n)
+    # Wiggly true function on x1, very smooth (near-linear) true function on x2.
+    f_wiggly = np.sin(8.0 * np.pi * x) + 0.5 * np.cos(12.0 * np.pi * x)
+    f_smooth = 1.5 * x + 0.3
+    y_np = f_wiggly + f_smooth + 0.05 * rng.standard_normal(n)
+
+    pts = torch.as_tensor(x, dtype=torch.float64).reshape(-1, 1)
+    y = torch.as_tensor(y_np, dtype=torch.float64)
+    centers = torch.linspace(0.0, 1.0, 25, dtype=torch.float64).reshape(-1, 1)
+
+    result = fit(
+        points=[pts, pts],
+        response=y,
+        smooths=[Duchon(centers=centers, m=2), Duchon(centers=centers, m=2)],
     )
+
+    lambdas = result.lambdas
+    assert lambdas.ndim == 1 and lambdas.shape[0] == 2, (
+        f"expected per-smooth λ of shape (2,); got {tuple(lambdas.shape)}"
+    )
+    lam_vals = lambdas.detach().cpu().numpy().astype(float)
+    assert np.all(np.isfinite(lam_vals)), f"λ has non-finite entries: {lam_vals}"
+    assert np.all(lam_vals > 0.0), f"λ has non-positive entries: {lam_vals}"
+    ratio = float(max(lam_vals) / max(min(lam_vals), 1e-300))
+    assert ratio > 5.0, (
+        f"per-smooth λ should diverge (wiggly vs smooth); got λ = {lam_vals}, "
+        f"ratio max/min = {ratio:.3g}"
+    )
+
+
+def test_partial_dependence_and_variance_share() -> None:
+    """partial_dependence + variance_share on a multi-term GAM (smoke test)."""
+    rng = np.random.default_rng(20260522)
+    n = 200
+    x1 = rng.uniform(0.0, 1.0, n)
+    x2 = rng.uniform(0.0, 1.0, n)
+    x3 = rng.normal(0.0, 1.0, n)
+    y = (
+        np.sin(2.0 * np.pi * x1)
+        + np.cos(2.0 * np.pi * x2)
+        + 0.3 * x3
+        + 0.1 * rng.standard_normal(n)
+    )
+    frame = pd.DataFrame({"y": y, "x1": x1, "x2": x2, "x3": x3})
+
+    model = gamfit.fit(frame, "y ~ s(x1) + s(x2) + x3")
+
+    # term_blocks must include the smooth columns we expect.
+    block_names = {b.name for b in model.term_blocks}
+    assert "intercept" in block_names
+    assert "x3" in block_names
+    assert "s(x1)" in block_names
+    assert "s(x2)" in block_names
+
+    pd_out = model.partial_dependence("s(x1)", frame, n_points=40)
+    assert set(pd_out.keys()) == {"grid", "predicted", "standard_error"}
+    assert pd_out["grid"].shape == (40,)
+    assert pd_out["predicted"].shape == (40,)
+    assert pd_out["standard_error"].shape == (40,)
+    assert np.all(np.isfinite(pd_out["predicted"]))
+    assert np.all(pd_out["standard_error"] >= 0.0)
+
+    shares = model.variance_share(frame)
+    assert isinstance(shares, dict)
+    assert all(0.0 <= float(v) <= 1.0 for v in shares.values())
+    # On the input grid these should not vastly exceed 1; cross-term
+    # cancellation can pull the sum either way but ~1.1 is a generous bound.
+    assert sum(shares.values()) <= 1.1
+
+    s_x1_share = model.variance_share(frame, term="s(x1)")
+    assert isinstance(s_x1_share, float)
+    assert 0.0 <= s_x1_share <= 1.0

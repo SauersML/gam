@@ -2057,6 +2057,60 @@ def gaussian_reml_fit_formula(
     return _coerce_gaussian_reml_payload(out, np)
 
 
+def gaussian_reml_fit_blocks_forward(
+    designs: list[Any],
+    penalties: list[Any],
+    y: Any,
+    *,
+    weights: Any | None = None,
+    init_rhos: Any | None = None,
+) -> dict[str, Any]:
+    """Multi-block Gaussian REML forward fit with per-smooth λ_k.
+
+    Routes per-smooth design/penalty blocks into the Rust joint REML driver
+    (same code path as the formula API) and returns coefficients, per-smooth
+    λ vector, per-smooth EDF, and the converged REML score.
+    """
+    import numpy as np
+
+    if len(designs) != len(penalties):
+        raise ValueError(
+            "designs and penalties must have equal length; "
+            f"got {len(designs)} vs {len(penalties)}"
+        )
+    if len(designs) == 0:
+        raise ValueError("gaussian_reml_fit_blocks_forward requires at least one block")
+
+    designs_np = [_numeric_matrix(d, f"designs[{i}]") for i, d in enumerate(designs)]
+    penalties_np = [
+        _numeric_matrix(p, f"penalties[{i}]") for i, p in enumerate(penalties)
+    ]
+    y_np = _numeric_matrix(y, "y")
+    weights_np = None if weights is None else _numeric_vector(weights, "weights")
+    rhos_np = None if init_rhos is None else _numeric_vector(init_rhos, "init_rhos")
+
+    try:
+        out = rust_module().gaussian_reml_fit_blocks_forward(
+            designs_np,
+            penalties_np,
+            y_np,
+            weights_np,
+            rhos_np,
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("coefficients", "fitted", "lambdas", "edf", "col_offsets"):
+        if key in result:
+            if key == "col_offsets":
+                result[key] = np.asarray(result[key], dtype=np.uintp)
+            else:
+                result[key] = np.asarray(result[key], dtype=float)
+    if "reml_score" in result:
+        result["reml_score"] = float(result["reml_score"])
+    return result
+
+
 def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     out = dict(payload)
     for key in (
