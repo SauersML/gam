@@ -1435,25 +1435,40 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
         match parse_term(t)? {
             ParsedTerm::LinkWiggle { options } => {
                 if linkwiggle.is_some() {
-                    return Err("formula can include at most one linkwiggle(...) term".to_string());
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: "formula can include at most one linkwiggle(...) term"
+                            .to_string(),
+                    }
+                    .into());
                 }
                 linkwiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
             }
             ParsedTerm::TimeWiggle { options } => {
                 if timewiggle.is_some() {
-                    return Err("formula can include at most one timewiggle(...) term".to_string());
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: "formula can include at most one timewiggle(...) term"
+                            .to_string(),
+                    }
+                    .into());
                 }
                 timewiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
             }
             ParsedTerm::LinkConfig { options } => {
                 if linkspec.is_some() {
-                    return Err("formula can include at most one link(...) term".to_string());
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: "formula can include at most one link(...) term".to_string(),
+                    }
+                    .into());
                 }
                 linkspec = Some(parse_link_formulaspec(&options, t)?);
             }
             ParsedTerm::SurvivalConfig { options } => {
                 if survivalspec.is_some() {
-                    return Err("formula can include at most one survmodel(...) term".to_string());
+                    return Err(FormulaDslError::IncompatibleTerm {
+                        reason: "formula can include at most one survmodel(...) term"
+                            .to_string(),
+                    }
+                    .into());
                 }
                 survivalspec = Some(parse_survival_formulaspec(&options, t)?);
             }
@@ -1472,11 +1487,14 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, String> {
         && !lhs.is_empty()
         && parsed_terms_reference_column(&terms, lhs)
     {
-        return Err(format!(
-            "formula `{formula}` uses response column `{lhs}` as its own predictor. \
-             This fits y as a function of itself and is almost certainly a typo. \
-             Drop the term that mentions `{lhs}` from the right-hand side."
-        ));
+        return Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "formula `{formula}` uses response column `{lhs}` as its own predictor. \
+                 This fits y as a function of itself and is almost certainly a typo. \
+                 Drop the term that mentions `{lhs}` from the right-hand side."
+            ),
+        }
+        .into());
     }
     Ok(ParsedFormula {
         response: lhs.to_string(),
@@ -1511,9 +1529,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
         match name.as_str() {
             "constrain" | "constraint" | "box" => {
                 if vars.len() != 1 {
-                    return Err(format!(
-                        "constrain()/constraint()/box() expects exactly one variable: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "constrain()/constraint()/box() expects exactly one variable: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 validate_known_term_options(
                     "constrain",
@@ -1524,9 +1545,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 let (coefficient_min, coefficient_max) =
                     parse_linear_constraint_bounds(&options, raw)?;
                 if coefficient_min.is_none() && coefficient_max.is_none() {
-                    return Err(format!(
-                        "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
-                    ));
+                    return Err(FormulaDslError::MalformedConfig {
+                        reason: format!(
+                            "constrain()/constraint()/box() requires at least one of min/lower/max/upper: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::Linear {
                     name: vars[0].clone(),
@@ -1537,7 +1561,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "nonnegative" | "nonnegative_coef" => {
                 if vars.len() != 1 {
-                    return Err(format!("nonnegative() expects exactly one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("nonnegative() expects exactly one variable: {raw}"),
+                    }
+                    .into());
                 }
                 validate_known_term_options("nonnegative", &options, &[], raw)?;
                 return Ok(ParsedTerm::Linear {
@@ -1549,7 +1576,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "nonpositive" | "nonpositive_coef" => {
                 if vars.len() != 1 {
-                    return Err(format!("nonpositive() expects exactly one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("nonpositive() expects exactly one variable: {raw}"),
+                    }
+                    .into());
                 }
                 validate_known_term_options("nonpositive", &options, &[], raw)?;
                 return Ok(ParsedTerm::Linear {
@@ -1561,7 +1591,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "bounded" => {
                 if vars.len() != 1 {
-                    return Err(format!("bounded() expects exactly one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("bounded() expects exactly one variable: {raw}"),
+                    }
+                    .into());
                 }
                 validate_known_term_options(
                     "bounded",
@@ -1572,9 +1605,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 let min = parse_required_f64_option(&options, "min", raw)?;
                 let max = parse_required_f64_option(&options, "max", raw)?;
                 if !min.is_finite() || !max.is_finite() || min >= max {
-                    return Err(format!(
-                        "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "bounded() requires finite min < max, got min={min}, max={max}: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 let prior = parse_bounded_priorspec(&options, min, max, raw)?;
                 return Ok(ParsedTerm::BoundedLinear {
@@ -1586,10 +1622,13 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "group" | "re" => {
                 if vars.len() != 1 {
-                    return Err(format!(
-                        "group()/re() expects exactly one variable, got '{}': {raw}",
-                        vars.join(",")
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "group()/re() expects exactly one variable, got '{}': {raw}",
+                            vars.join(",")
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::RandomEffect {
                     name: vars[0].clone(),
@@ -1597,9 +1636,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "tensor" | "interaction" | "te" => {
                 if vars.len() < 2 {
-                    return Err(format!(
-                        "tensor()/interaction()/te() requires at least two variables: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "tensor()/interaction()/te() requires at least two variables: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
@@ -1610,7 +1652,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "fs" | "sz" => {
                 if vars.len() != 2 {
-                    return Err(format!("{}() expects exactly two variables: {raw}", name));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("{}() expects exactly two variables: {raw}", name),
+                    }
+                    .into());
                 }
                 options.insert("bs".to_string(), name.clone());
                 return Ok(ParsedTerm::Smooth {
@@ -1628,7 +1673,10 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             // option names.
             "bc" | "boundary" | "boundary_conditioned" => {
                 if vars.is_empty() {
-                    return Err(format!("{name}() requires at least one variable: {raw}"));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("{name}() requires at least one variable: {raw}"),
+                    }
+                    .into());
                 }
                 if !options.contains_key("bc")
                     && !options.contains_key("left_bc")
@@ -1657,9 +1705,12 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             "thinplate" | "thin_plate" | "tps" => {
                 if vars.len() < 2 {
-                    return Err(format!(
-                        "thinplate()/thin_plate()/tps() requires at least two variables: {raw}"
-                    ));
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!(
+                            "thinplate()/thin_plate()/tps() requires at least two variables: {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 options.insert("type".to_string(), "tps".to_string());
                 return Ok(ParsedTerm::Smooth {

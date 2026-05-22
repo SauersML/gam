@@ -366,14 +366,14 @@ impl CoefficientGroupPrior {
             Self::Flat => Ok(()),
             Self::NormalLogPrecision { mean, sd } => {
                 if !mean.is_finite() {
-                    return Err(CustomFamilyError::InvalidInput(format!(
+                    return Err(format!(
                         "{context} Normal log-precision prior requires finite mean, got {mean}"
-                    )).into());
+                    ));
                 }
                 if !sd.is_finite() || sd <= 0.0 {
-                    return Err(CustomFamilyError::InvalidInput(format!(
+                    return Err(format!(
                         "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                    )).into());
+                    ));
                 }
                 Ok(())
             }
@@ -384,9 +384,9 @@ impl CoefficientGroupPrior {
                     ) }.into());
                 }
                 if !rate.is_finite() || rate < 0.0 {
-                    return Err(CustomFamilyError::InvalidInput(format!(
+                    return Err(format!(
                         "{context} Gamma precision prior requires rate >= 0, got {rate}"
-                    )).into());
+                    ));
                 }
                 Ok(())
             }
@@ -455,10 +455,10 @@ fn coefficient_group_block_index(
     match selector {
         CoefficientBlockSelector::Index(index) => {
             if *index >= specs.len() {
-                Err(CustomFamilyError::InvalidInput(format!(
+                Err(format!(
                     "coefficient group references block index {index}, but only {} blocks exist",
                     specs.len()
-                )).into())
+                ))
             } else {
                 Ok(*index)
             }
@@ -478,14 +478,14 @@ fn validate_group_rho_prior_coordinate(
         crate::types::RhoPrior::Flat => Ok(()),
         crate::types::RhoPrior::Normal { mean, sd } => {
             if !mean.is_finite() {
-                return Err(CustomFamilyError::InvalidInput(format!(
+                return Err(format!(
                     "{context} Normal log-precision prior requires finite mean, got {mean}"
-                )).into());
+                ));
             }
             if !sd.is_finite() || *sd <= 0.0 {
-                return Err(CustomFamilyError::InvalidInput(format!(
+                return Err(format!(
                     "{context} Normal log-precision prior requires sd > 0, got {sd}"
-                )).into());
+                ));
             }
             Ok(())
         }
@@ -496,9 +496,9 @@ fn validate_group_rho_prior_coordinate(
                 ) }.into());
             }
             if !rate.is_finite() || *rate < 0.0 {
-                return Err(CustomFamilyError::InvalidInput(format!(
+                return Err(format!(
                     "{context} Gamma precision prior requires rate >= 0, got {rate}"
-                )).into());
+                ));
             }
             Ok(())
         }
@@ -575,10 +575,10 @@ pub fn realize_coefficient_groups_for_custom_family(
             ) }.into());
         }
         if group.coefficients.is_empty() {
-            return Err(CustomFamilyError::InvalidInput(format!(
+            return Err(format!(
                 "coefficient group '{}' contains no coefficients",
                 group.label
-            )).into());
+            ));
         }
         if let Some(prior) = group.prior.as_ref() {
             prior.validate(&format!("coefficient group '{}'", group.label))?;
@@ -601,10 +601,10 @@ pub fn realize_coefficient_groups_for_custom_family(
             let block_idx = coefficient_group_block_index(specs, &label.block)?;
             let p = specs[block_idx].design.ncols();
             if label.column >= p {
-                return Err(CustomFamilyError::InvalidInput(format!(
+                return Err(format!(
                     "coefficient group '{}' references column {} in block '{}' (index {block_idx}), but the block has {p} columns",
                     group.label, label.column, specs[block_idx].name
-                )).into());
+                ));
             }
             coeffs.insert((block_idx, label.column));
         }
@@ -3137,9 +3137,9 @@ fn validate_lambda_pair_consistency(
         let expected = log_lambda.exp();
         let tolerance = 1e-10 * expected.abs().max(1.0);
         if (lambda - expected).abs() > tolerance {
-            return Err(CustomFamilyError::InvalidInput(format!(
+            return Err(format!(
                 "{label}[{idx}] inconsistent with exp(log_lambda): got {lambda}, expected {expected}",
-            )).into());
+            ));
         }
     }
     Ok(())
@@ -6556,9 +6556,9 @@ fn rho_prior_cost_gradient_hessian(
             crate::types::RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
             crate::types::RhoPrior::Normal { mean, sd } => {
                 if !mean.is_finite() || !sd.is_finite() || *sd <= 0.0 {
-                    return Err(CustomFamilyError::InvalidInput(format!(
+                    return Err(format!(
                         "{context} Normal log-precision prior requires finite mean and sd > 0"
-                    )).into());
+                    ));
                 }
                 let inv_var = 1.0 / (*sd * *sd);
                 let delta = r - *mean;
@@ -7944,11 +7944,11 @@ fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
 ) -> Result<Option<Array2<f64>>, String> {
     let evaluation = family.evaluate(block_states)?;
     if evaluation.blockworking_sets.len() != block_states.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact_newton_joint_hessian default: working-set count {} != block count {}",
             evaluation.blockworking_sets.len(),
             block_states.len()
-        )).into());
+        ));
     }
     if evaluation
         .blockworking_sets
@@ -7994,19 +7994,19 @@ fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
 ) -> Result<Option<Array2<f64>>, String> {
     if block_states.len() != specs.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact_newton_joint_hessian_with_specs default: block state count {} != spec count {}",
             block_states.len(),
             specs.len()
-        )).into());
+        ));
     }
     let evaluation = family.evaluate(block_states)?;
     if evaluation.blockworking_sets.len() != block_states.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact_newton_joint_hessian_with_specs default: working-set count {} != block count {}",
             evaluation.blockworking_sets.len(),
             block_states.len()
-        )).into());
+        ));
     }
 
     let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
@@ -8157,11 +8157,11 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
     d_beta_flat: &Array1<f64>,
 ) -> Result<Option<Array2<f64>>, String> {
     if block_states.len() != specs.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact_newton_joint_hessian_directional_derivative_with_specs default: block state count {} != spec count {}",
             block_states.len(),
             specs.len()
-        )).into());
+        ));
     }
     let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     validate_flat_direction_length(
@@ -8175,11 +8175,11 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
 
     let evaluation = family.evaluate(block_states)?;
     if evaluation.blockworking_sets.len() != block_states.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact_newton_joint_hessian_directional_derivative_with_specs default: working-set count {} != block count {}",
             evaluation.blockworking_sets.len(),
             block_states.len()
-        )).into());
+        ));
     }
 
     let mut joint = Array2::<f64>::zeros((total, total));
@@ -8286,13 +8286,13 @@ fn exact_newton_joint_hessian_symmetrized<F: CustomFamily + Clone + Send + Sync 
         return Ok(None);
     };
     if h.nrows() != total || h.ncols() != total {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "{context}: got {}x{}, expected {}x{}",
             h.nrows(),
             h.ncols(),
             total,
             total
-        )).into());
+        ));
     }
     symmetrize_dense_in_place(&mut h);
     Ok(Some(h))
@@ -8595,13 +8595,13 @@ fn symmetrized_square_matrix(
     context: &str,
 ) -> Result<Array2<f64>, String> {
     if matrix.nrows() != expected || matrix.ncols() != expected {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "{context}: got {}x{}, expected {}x{}",
             matrix.nrows(),
             matrix.ncols(),
             expected,
             expected
-        )).into());
+        ));
     }
     if matrix.iter().any(|value| !value.is_finite()) {
         return Err(CustomFamilyError::NumericalFailure { reason: format!("{context}: matrix contains non-finite values") }.into());
@@ -9839,11 +9839,11 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
 
     let eval = family.evaluate(states)?;
     if eval.blockworking_sets.len() != specs.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "family returned {} block working sets, expected {}",
             eval.blockworking_sets.len(),
             specs.len()
-        )).into());
+        ));
     }
 
     let mut logdet_h_total = 0.0;
@@ -13048,11 +13048,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             },
         );
         if cycle_eval.blockworking_sets.len() != specs.len() {
-            return Err(CustomFamilyError::InvalidInput(format!(
+            return Err(format!(
                 "family returned {} block working sets, expected {}",
                 cycle_eval.blockworking_sets.len(),
                 specs.len()
-            )).into());
+            ));
         }
         // Track whether any block was modified this cycle (for dynamic families,
         // we only need to re-evaluate before block b if a previous block changed).
@@ -13065,11 +13065,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 cycle_eval = family.evaluate(&states)?;
                 if cycle_eval.blockworking_sets.len() != specs.len() {
-                    return Err(CustomFamilyError::InvalidInput(format!(
+                    return Err(format!(
                         "family returned {} block working sets, expected {}",
                         cycle_eval.blockworking_sets.len(),
                         specs.len()
-                    )).into());
+                    ));
                 }
             }
 
@@ -14855,11 +14855,11 @@ fn joint_outer_evaluate(
         }
         crate::solver::outer_strategy::HessianResult::Operator(op) => {
             if op.dim() != expected_theta_dim {
-                return Err(CustomFamilyError::InvalidInput(format!(
+                return Err(format!(
                     "joint outer evaluation returned operator Hessian dim {}, expected {}",
                     op.dim(),
                     expected_theta_dim
-                )).into());
+                ));
             }
         }
         crate::solver::outer_strategy::HessianResult::Unavailable => {}
@@ -18489,11 +18489,11 @@ fn exact_newton_joint_gradient_from_eval(
     states: &[ParameterBlockState],
 ) -> Result<Option<Array1<f64>>, String> {
     if eval.blockworking_sets.len() != specs.len() {
-        return Err(CustomFamilyError::InvalidInput(format!(
+        return Err(format!(
             "exact-newton joint gradient extraction: family returned {} block working sets, expected {}",
             eval.blockworking_sets.len(),
             specs.len()
-        )).into());
+        ));
     }
     if states.len() != specs.len() {
         return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -22415,7 +22415,7 @@ mod tests {
 
     impl CustomFamily for OneBlockAlwaysErrorFamily {
         fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-            Err(CustomFamilyError::InvalidInput("synthetic outer objective failure: block[0] evaluate()".to_string()).into())
+            Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
 
@@ -22442,7 +22442,7 @@ mod tests {
             _: &[ParameterBlockState],
             _: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
-            Err(CustomFamilyError::InvalidInput("synthetic covariance assembly failure".to_string()).into())
+            Err("synthetic covariance assembly failure".to_string())
         }
     }
 
