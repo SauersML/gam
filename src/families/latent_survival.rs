@@ -2344,12 +2344,15 @@ fn logk_q_derivatives(
     mass: f64,
     mu: f64,
     sigma: f64,
-) -> Result<(f64, f64, IntegratedExpectationMode), String> {
+) -> Result<(f64, f64, IntegratedExpectationMode), LatentSurvivalError> {
     if mass <= 0.0 {
         return Ok((0.0, 0.0, IntegratedExpectationMode::ExactClosedForm));
     }
-    let bundle = log_kernel_bundle(quadctx, mass, mu, sigma, k + 2)
-        .map_err(|e| format!("latent survival kernel evaluation failed: {e}"))?;
+    let bundle = log_kernel_bundle(quadctx, mass, mu, sigma, k + 2).map_err(|e| {
+        LatentSurvivalError::NumericalFailure {
+            reason: format!("latent survival kernel evaluation failed: {e}"),
+        }
+    })?;
     let r1 = log_kernel_ratio(&bundle, k + 1, k);
     let r2 = log_kernel_ratio(&bundle, k + 2, k);
     let d1 = -mass * r1;
@@ -2496,32 +2499,40 @@ fn build_latent_survival_row(
     unloaded_mass_entry: f64,
     unloaded_mass_exit: f64,
     unloaded_hazard_exit: f64,
-) -> Result<LatentSurvivalRow, String> {
+) -> Result<LatentSurvivalRow, LatentSurvivalError> {
     if !(q_entry.is_finite() && q_exit.is_finite()) {
-        return Err(format!(
-            "latent survival requires finite q_entry and q_exit, got q_entry={q_entry}, q_exit={q_exit}"
-        ));
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent survival requires finite q_entry and q_exit, got q_entry={q_entry}, q_exit={q_exit}"
+            ),
+        });
     }
     if q_exit < q_entry {
-        return Err(format!(
-            "latent survival requires q_exit >= q_entry so cumulative mass is monotone, got q_entry={q_entry}, q_exit={q_exit}"
-        ));
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent survival requires q_exit >= q_entry so cumulative mass is monotone, got q_entry={q_entry}, q_exit={q_exit}"
+            ),
+        });
     }
     if !(unloaded_mass_entry.is_finite()
         && unloaded_mass_exit.is_finite()
         && unloaded_hazard_exit.is_finite())
     {
-        return Err(format!(
-            "latent survival requires finite unloaded components, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent survival requires finite unloaded components, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
+            ),
+        });
     }
     if unloaded_mass_entry < 0.0
         || unloaded_mass_exit < unloaded_mass_entry
         || unloaded_hazard_exit < 0.0
     {
-        return Err(format!(
-            "latent survival requires unloaded masses/hazard to be non-negative and monotone, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent survival requires unloaded masses/hazard to be non-negative and monotone, got entry_mass={unloaded_mass_entry}, exit_mass={unloaded_mass_exit}, exit_hazard={unloaded_hazard_exit}"
+            ),
+        });
     }
     validate_unloaded_components_for_loading(
         "latent-survival",
@@ -2549,9 +2560,11 @@ fn build_latent_survival_row(
                 * if qdot_exit.is_finite() && qdot_exit > 0.0 {
                     qdot_exit
                 } else {
-                    return Err(format!(
-                        "latent survival exact event requires positive finite baseline hazard derivative, got {qdot_exit}"
-                    ));
+                    return Err(LatentSurvivalError::NumericalFailure {
+                        reason: format!(
+                            "latent survival exact event requires positive finite baseline hazard derivative, got {qdot_exit}"
+                        ),
+                    });
                 },
             unloaded_hazard_exit,
         ),
@@ -2559,7 +2572,10 @@ fn build_latent_survival_row(
             "latent survival fit path currently exposes only exact events and right censoring"
         ),
     };
-    row.validate().map_err(|e| e.to_string())?;
+    row.validate()
+        .map_err(|e| LatentSurvivalError::InvalidDataset {
+            reason: e.to_string(),
+        })?;
     Ok(row)
 }
 
@@ -2575,7 +2591,10 @@ struct BinaryFromLogSurvival {
     outer_scale_second: f64,
 }
 
-fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLogSurvival, String> {
+fn binary_from_log_survival(
+    log_survival: f64,
+    event: u8,
+) -> Result<BinaryFromLogSurvival, LatentSurvivalError> {
     if event == 0 {
         return Ok(BinaryFromLogSurvival {
             log_lik: log_survival,
@@ -2589,17 +2608,19 @@ fn binary_from_log_survival(log_survival: f64, event: u8) -> Result<BinaryFromLo
         });
     }
     if event != 1 {
-        return Err(format!(
-            "latent-binary requires event targets in {{0,1}}, got {event}"
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!("latent-binary requires event targets in {{0,1}}, got {event}"),
+        });
     }
     let log_survival = log_survival.min(-1e-15);
     let survival = log_survival.exp();
     let event_prob = 1.0 - survival;
     if !(event_prob.is_finite() && event_prob > 0.0) {
-        return Err(format!(
-            "latent-binary encountered non-positive event probability from log survival {log_survival}"
-        ));
+        return Err(LatentSurvivalError::NumericalFailure {
+            reason: format!(
+                "latent-binary encountered non-positive event probability from log survival {log_survival}"
+            ),
+        });
     }
     let event_prob2 = event_prob * event_prob;
     let event_prob3 = event_prob2 * event_prob;
