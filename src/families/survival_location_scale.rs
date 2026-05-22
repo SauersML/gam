@@ -9757,6 +9757,21 @@ impl SurvivalLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Vec<Array1<f64>>), String> {
+        self.evaluate_log_likelihood_and_block_gradients_masked(block_states, None)
+    }
+
+    /// HT-mask-aware variant of
+    /// [`Self::evaluate_log_likelihood_and_block_gradients`]. `None` is
+    /// byte-identical to the pre-refactor implementation. `Some(m)`
+    /// multiplies each row's likelihood contribution and per-row partial
+    /// derivative contributions by `m[i]` before aggregation: the
+    /// downstream `X.t().dot(...)` / `transpose_vector_multiply` calls
+    /// then automatically produce the HT-weighted gradient.
+    fn evaluate_log_likelihood_and_block_gradients_masked(
+        &self,
+        block_states: &[ParameterBlockState],
+        row_mask: Option<&Array1<f64>>,
+    ) -> Result<(f64, Vec<Array1<f64>>), String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
         let mut ll = 0.0;
