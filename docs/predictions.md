@@ -1,8 +1,8 @@
 # Predictions
 
-`Model.predict(...)` is the single predict entry point. The shape of its
-return value depends on the fitted model class and on a few
-kwargs (`interval`, `id_column`, `return_type`, `with_uncertainty`).
+`Model.predict(...)` is the single prediction entry point. The return
+shape depends on the fitted model class and on the keyword arguments
+`interval`, `id_column`, `return_type`, and `with_uncertainty`.
 
 ## Signature
 
@@ -17,46 +17,41 @@ model.predict(
 )
 ```
 
-| Kwarg | Default | Meaning |
+| Argument | Default | Meaning |
 | --- | --- | --- |
-| `interval` | `None` | Pointwise Wald interval level in `(0, 1)`, e.g. `0.95`. Honoured by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian / binomial location-scale; ignored for survival (use `with_uncertainty=`), transformation-normal, and marginal-slope. |
-| `return_type` | `None` | `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"`, or `None` (infer from input or training kind). |
-| `id_column` | `None` | Name of a column in `data` to preserve in the output. |
-| `with_uncertainty` | `False` | Survival models: delta-method SEs on the survival surface and linear predictor. |
+| `data` | required | Table-like input matching the training schema. |
+| `interval` | `None` | Pointwise Wald-interval coverage probability in `(0, 1)`. Honored by standard GLM families (Gaussian, binomial, Poisson, Gamma) and Gaussian/binomial location-scale models. Ignored by survival, transformation-normal, and bernoulli marginal-slope predictions. |
+| `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"`. Defaults to the input table kind, falling back to the training table kind. |
+| `id_column` | `None` | Name of a column in `data` whose values are carried through into the output. |
+| `with_uncertainty` | `False` | Survival location-scale models only. Populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. |
 
 ## Return value by model class
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| **Standard** (Gaussian, binomial, Poisson, Gamma) | Table | `eta`, `mean` (+ `effective_se`, `mean_lower`, `mean_upper` if `interval`). |
-| **Gaussian / binomial location-scale** | Table | `eta`, `mean` (+ `effective_se`, `mean_lower`, `mean_upper` if `interval`). |
-| **Transformation-normal** | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
-| **Bernoulli marginal-slope** | 1-D `numpy.ndarray` | Per-row probabilities in `(0, 1)`. |
-| **Survival** (any mode) | `SurvivalPrediction` | Object with `hazard_at`, `survival_at`, `cumulative_hazard_at`, `failure_at`. |
+| Gaussian, binomial, Poisson, Gamma | Table | `eta`, `mean`; adds `effective_se`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian / binomial location-scale | Table | `eta`, `mean`; adds `effective_se`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Transformation-normal | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
+| Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. |
+| Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
+| Competing-risks survival | `CompetingRisksPrediction` | Endpoint-stacked hazard, survival, CIF, and overall survival arrays. |
 
-For the 1-D-array classes (transformation-normal, Bernoulli marginal-slope),
-passing `id_column=` or `return_type=` flips the output back to a
-two-column table — see [data-input.md](data-input.md#numpy-gotcha-transformation-normal-marginal-slope).
+For the array-returning classes (transformation-normal and bernoulli
+marginal-slope), passing `id_column=` or `return_type=` switches the
+output to a two-column table: `(id_column, "z")` for transformation-normal
+or `(id_column, "mean")` for bernoulli marginal-slope.
 
-## Wald intervals on standard models
+## Wald intervals
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# Columns: eta, mean, effective_se, mean_lower, mean_upper
+# columns: eta, mean, effective_se, mean_lower, mean_upper
 ```
 
-These intervals come from the asymptotic frequentist covariance of the
-fitted coefficients propagated through the link function. For posterior
-credible bands conditional on the fitted smoothing parameters, use
-[posterior sampling](posterior-sampling.md).
+Intervals are computed from the asymptotic covariance of the fitted
+coefficients propagated through the inverse link.
 
-For a multi-D smooth, calling `predict(interval=0.95)` gives you both the
-fitted mean and a pointwise SE for the fitted mean; the SE is largest where the
-covariates are sparse:
-
-![data → fitted mean → fitted-mean SE](images/surface_fit_hero.png)
-
-## Passing through an identifier column
+## Carrying an identifier column
 
 ```python
 preds = model.predict(
@@ -70,35 +65,39 @@ preds = model.predict(
 # preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
 ```
 
-The id column isn't used by the model and can be of any type. It's
-preserved verbatim in the output.
+The id column is not used by the model. It is copied through verbatim
+and may be of any type.
 
 ## SurvivalPrediction
 
-For any survival model, `predict()` returns a `SurvivalPrediction`.
-It exposes the fitted hazard surface on demand:
+`Model.predict` returns a `SurvivalPrediction` dataclass for survival
+families. The dense hazard/survival surface is evaluated by the Rust
+core on a default time grid (derived from the entry/exit columns in
+`data`) and stored on the returned object; the `*_at` helpers
+interpolate that surface at arbitrary user times.
 
 ```python
 pred = model.predict(test_df)
 
-S   = pred.survival_at([1, 5, 10, 20])         # (n, 4) survival probs
-F   = pred.failure_at([10, 20])                # 1 - S
-h   = pred.hazard_at([1, 5, 10, 20])           # hazard rate
-H   = pred.cumulative_hazard_at([10, 20])      # cumulative hazard
+S = pred.survival_at([1, 5, 10, 20])        # (n_rows, 4) survival probabilities
+F = pred.failure_at([10, 20])               # 1 - S
+h = pred.hazard_at([1, 5, 10, 20])          # hazard rate
+H = pred.cumulative_hazard_at([10, 20])     # cumulative hazard
 ```
 
 ### Attributes
 
 | Attribute | Type | Meaning |
 | --- | --- | --- |
-| `model_class` | `str` | E.g. `"survival marginal-slope"`. |
-| `parameters` | `numpy.ndarray` | `(n, p)` per-row params. Opaque — use the `*_at` helpers. |
-| `parameter_names` | `tuple[str, ...]` | Column names of `parameters`. |
-| `times` | `numpy.ndarray \| None` | Shared time grid (if a dense surface was returned). |
-| `hazard`, `survival`, `cumulative_hazard` | `numpy.ndarray \| None` | Dense surfaces if available. |
-| `linear_predictor` | `numpy.ndarray \| None` | `η` at each row's exit time. |
-| `survival_se`, `eta_se` | `numpy.ndarray \| None` | Delta-method SEs when `with_uncertainty=True`. |
-| `id_column`, `row_ids` | `str \| None`, `tuple[Any, ...] \| None` | Set if `id_column=` was passed. |
+| `model_class` | `str` | Fitted model class string. |
+| `parameters` | `numpy.ndarray` | `(n_rows, n_params)` per-row parameters. Treat as opaque; use the `*_at` helpers. |
+| `parameter_names` | `tuple[str, ...]` | Column labels for `parameters`. |
+| `times` | `numpy.ndarray \| None` | Shared time grid for the dense surfaces. |
+| `hazard`, `survival`, `cumulative_hazard` | `numpy.ndarray \| None` | `(n_rows, len(times))` dense surfaces when produced by the FFI. |
+| `linear_predictor` | `numpy.ndarray \| None` | Linear predictor at each row's exit time. |
+| `survival_se` | `numpy.ndarray \| None` | Delta-method standard error on `S(t)`. Populated only when `with_uncertainty=True` for the location-scale likelihood. |
+| `eta_se` | `numpy.ndarray \| None` | Delta-method standard error on the linear predictor under the same conditions as `survival_se`. |
+| `id_column`, `row_ids` | `str \| None`, `Sequence[str] \| None` | Set when `id_column=` was passed to `predict`. |
 
 ### Methods
 
@@ -106,14 +105,18 @@ H   = pred.cumulative_hazard_at([10, 20])      # cumulative hazard
 pred.hazard_at(times)              # (n_rows, len(times))
 pred.survival_at(times)            # (n_rows, len(times))
 pred.cumulative_hazard_at(times)   # (n_rows, len(times))
-pred.failure_at(times)             # 1 - survival_at(times)
-pred.survival_se_at(times)         # SE on survival; None if not computed
+pred.failure_at(times)             # 1 - survival_at(times), clipped to [0, 1]
+pred.survival_se_at(times)         # SE on S(t), or None if not computed
 ```
 
-### Chunked iteration for large cohorts
+Each `times` argument is coerced to a 1-D array of finite non-negative
+floats; an empty input is rejected.
 
-When `n_rows × len(times)` is too large to hold in memory, iterate in
-chunks:
+### Chunked iteration
+
+When `n_rows * len(times)` exceeds roughly one million cells the dense
+helpers chunk internally before assembling the result. To stream
+without materializing the full matrix, iterate the chunk generators:
 
 ```python
 for row_slice, time_slice, block in pred.survival_at_chunks(
@@ -124,7 +127,8 @@ for row_slice, time_slice, block in pred.survival_at_chunks(
     process(block)  # shape (len(row_slice), len(time_slice))
 ```
 
-Equivalent iterators: `hazard_at_chunks`, `cumulative_hazard_at_chunks`.
+`hazard_at_chunks` and `cumulative_hazard_at_chunks` are equivalent
+generators for the matching surfaces.
 
 ### Stream to CSV
 
@@ -132,13 +136,35 @@ Equivalent iterators: `hazard_at_chunks`, `cumulative_hazard_at_chunks`.
 pred.write_survival_at_csv("surv.csv", times=[1, 5, 10, 20])
 ```
 
-The CSV has columns `row, time, survival` (plus the id column if you set
-`id_column=` on `predict`).
+Writes one row per `(prediction_row, time)` pair. Columns are
+`row, time, survival` when no id column is set, or
+`row, <id_column>, time, survival` when `id_column=` was passed to
+`predict`. The destination is truncated if it exists.
 
-### Competing-risk CIF assembly
+### Survival uncertainty
 
-Fit or predict one cause-specific survival endpoint per event type, then
-assemble Aalen-Johansen cumulative incidence functions on a shared grid:
+For the location-scale survival likelihood, `with_uncertainty=True`
+populates delta-method standard errors:
+
+```python
+pred = model.predict(test_df, with_uncertainty=True)
+S = pred.survival_at([1, 5, 10])
+se = pred.survival_se_at([1, 5, 10])
+
+upper = (S + 1.96 * se).clip(0.0, 1.0)
+lower = (S - 1.96 * se).clip(0.0, 1.0)
+```
+
+Other survival likelihood modes (transformation, Weibull, marginal-slope,
+latent) reject `with_uncertainty=True` at the Rust boundary. For those,
+use `Model.sample(...)` to draw posterior coefficients; note that
+`PosteriorSamples.predict_draws(...)` is restricted to standard
+non-link-wiggle GAMs (see `posterior-sampling.md`).
+
+### Competing-risks CIF
+
+Fit one cause-specific survival endpoint per event type, then assemble
+Aalen-Johansen cumulative incidence functions on a shared grid:
 
 ```python
 cif = gamfit.competing_risks_cif(
@@ -150,34 +176,15 @@ disease_cif = cif.cif[0]              # (n_rows, 4)
 joint_survival = cif.overall_survival # (n_rows, 4)
 ```
 
-`cif.cif` has shape `(n_endpoints, n_rows, n_times)`. Endpoint names are
-preserved from a mapping input or can be supplied with `endpoint_names=`.
+`cif.cif` has shape `(n_endpoints, n_rows, n_times)`. Endpoint names
+are taken from the mapping keys, or supplied via `endpoint_names=` when
+passing a sequence.
 
-### Survival uncertainty
+## Raw design matrix
 
-For location-scale survival models, pass `with_uncertainty=True` to compute
-delta-method standard errors on the survival surface and on the linear
-predictor at each row's exit time:
-
-```python
-pred  = model.predict(test_df, with_uncertainty=True)
-S     = pred.survival_at([1, 5, 10])
-se_S  = pred.survival_se_at([1, 5, 10])
-
-upper = (S + 1.96 * se_S).clip(0.0, 1.0)
-lower = (S - 1.96 * se_S).clip(0.0, 1.0)
-```
-
-For other survival modes (transformation, Weibull, marginal-slope, latent),
-`Model.sample(...)` returns posterior coefficient draws, but
-`PosteriorSamples.predict_draws(...)` is restricted to standard
-non-link-wiggle GAMs. See [posterior-sampling.md](posterior-sampling.md).
-
-## Getting the raw design matrix
-
-For non-link-wiggle standard GAMs, `Model.design_matrix(data)` returns the
-materialised `(n_rows, n_coeffs)` matrix the engine uses internally for
-the linear predictor:
+For standard non-link-wiggle GAMs, `Model.design_matrix(data)` returns
+the `(n_rows, n_coeffs)` matrix the engine uses for the linear
+predictor:
 
 ```python
 X = model.design_matrix(test_df)        # (n_rows, n_coeffs)
@@ -185,8 +192,6 @@ posterior = model.sample(train_df)
 custom_eta = posterior.samples @ X.T    # (n_draws, n_rows)
 ```
 
-Use this to compose your own posterior quantity that
-isn't a straightforward `predict()` call. Restricted to standard
-non-link-wiggle GAMs.
+Other model classes raise a clear FFI error from this call.
 
 * [Difference smooths](difference-smooths.md)
