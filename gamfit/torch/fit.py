@@ -17,6 +17,7 @@ engine's analytic VJP.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -27,11 +28,12 @@ from ..smooth import (
     Categorical,
     Duchon,
     Matern,
+    PeriodicSplineCurve,
     Sphere,
     Smooth,
     TensorBSpline,
 )
-from ._basis import bspline_basis, duchon_basis
+from ._basis import bspline_basis, duchon_basis, periodic_spline_curve_basis, sphere_basis
 from ._reml import (
     AdditiveRemlOutput,
     GaussianRemlOutput,
@@ -169,11 +171,56 @@ def _build_design_penalty(
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty
 
-    if isinstance(smooth, (TensorBSpline, Matern, Sphere, Categorical)):
+    if isinstance(smooth, Sphere):
+        if points.shape[1] != 2:
+            raise ValueError(
+                f"Sphere expects points of shape (N, 2) [lat, lon]; got d={points.shape[1]}"
+            )
+        if not torch.isfinite(points).all():
+            raise ValueError("Sphere: points contains NaN/Inf")
+        lat = points[:, 0]
+        if smooth.radians:
+            import math
+            bound = math.pi / 2.0
+            if (lat.min().item() < -bound - 1e-9) or (lat.max().item() > bound + 1e-9):
+                raise ValueError(
+                    "Sphere(radians=True): latitude must lie in [-π/2, π/2]"
+                )
+        else:
+            if (lat.min().item() < -90.0 - 1e-9) or (lat.max().item() > 90.0 + 1e-9):
+                raise ValueError(
+                    "Sphere(radians=False): latitude must lie in [-90, 90]"
+                )
+        design, penalty = sphere_basis(
+            points,
+            n_centers=smooth.n_centers,
+            penalty_order=smooth.penalty_order,
+            kernel=smooth.kernel,
+            radians=smooth.radians,
+        )
+        return design.to(torch.float64), penalty.to(torch.float64)
+
+    if isinstance(smooth, PeriodicSplineCurve):
+        if points.shape[1] != 1:
+            raise ValueError(
+                f"PeriodicSplineCurve expects 1D parameter t with shape (N,) or "
+                f"(N, 1); got d={points.shape[1]}"
+            )
+        t1d = points.squeeze(1)
+        design, penalty = periodic_spline_curve_basis(
+            t1d,
+            n_knots=smooth.n_knots,
+            degree=smooth.degree,
+            penalty_order=smooth.penalty_order,
+        )
+        return design.to(torch.float64), penalty.to(torch.float64)
+
+    if isinstance(smooth, (TensorBSpline, Matern, Categorical)):
         raise NotImplementedError(
             f"{type(smooth).__name__} not yet wired to gamfit.torch.fit; "
             "needs Rust PyO3 binding for the underlying basis + penalty. "
-            "Currently supported: Duchon (any d for basis; d=1 for penalty), BSpline (d=1)."
+            "Currently supported: Duchon (any d for basis; d=1 for penalty), "
+            "BSpline (d=1), Sphere (S²)."
         )
 
     raise TypeError(f"unknown Smooth subclass: {type(smooth).__name__}")
@@ -306,6 +353,15 @@ def fit(
         bys.append(_to_tensor(s.by, design).reshape(-1) if s.by is not None else None)
 
     init_lam = float(init_lambdas[0]) if init_lambdas is not None else None
+    if len(smooths_list) > 1 and response_f64.shape[1] > 1:
+        warnings.warn(
+            "gamfit.torch.fit: multi-smooth additive fit uses a single shared λ "
+            "across all smooths (closed-form Gaussian REML kernel is single-λ); "
+            "for per-smooth λ (mgcv default) use the formula API "
+            "gamfit.fit(df, 'y ~ s(x1) + s(x2) + ...').",
+            UserWarning,
+            stacklevel=2,
+        )
     add_out: AdditiveRemlOutput = gaussian_reml_fit_additive(
         designs=designs,
         response=response_f64,

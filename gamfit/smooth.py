@@ -17,7 +17,16 @@ Dispatch layers do the appropriate conversion.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
+
+
+ShapeConstraintLiteral = Literal[
+    "none",
+    "monotone_increasing",
+    "monotone_decreasing",
+    "convex",
+    "concave",
+]
 
 
 @dataclass
@@ -38,11 +47,32 @@ class Smooth:
         space of the main penalty (mgcv ``bs="..."`` ``select=TRUE`` style).
         Useful when the smooth might be entirely redundant and you want
         REML to shrink it out.
+    shape_constraint : optional shape constraint on the fitted function.
+        One of ``None`` / ``"none"`` (unconstrained, the default),
+        ``"monotone_increasing"`` (f'(x) ≥ 0 everywhere on the data range),
+        ``"monotone_decreasing"`` (f'(x) ≤ 0), ``"convex"`` (f''(x) ≥ 0),
+        or ``"concave"`` (f''(x) ≤ 0). Shape constraints are enforced by
+        the inner solver as joint linear inequalities ``A·β ≤ b`` on the
+        coefficient vector (the constraint matrix ``A`` is generated from
+        the basis on a dense 1D grid spanning the data range, so the
+        inequality at the grid points implies the constraint on the
+        smooth function under standard B-spline / radial-basis density
+        arguments). The solver is an active-set / interior-point method;
+        when the constraint is active at the cert exit the outer REML
+        score uses the tangent-projected LAML formulation so the smoothing
+        parameter is selected over the working subspace. This mirrors
+        mgcv's ``scop=...`` argument and the ``scam`` R library's shape-
+        constrained smooths. Currently restricted to univariate 1D smooths
+        (B-splines and thin-plate / Duchon with a single feature axis);
+        a multivariate spec on a constrained smooth will be rejected with
+        a clear error from the Rust core. Spherical-harmonic and tensor
+        smooths reject all non-``None`` shape constraints.
     """
 
     name: str | None = None
     by: Any | None = None
     double_penalty: bool = False
+    shape_constraint: ShapeConstraintLiteral | None = None
 
 
 @dataclass
@@ -154,6 +184,27 @@ class Sphere(Smooth):
 
 
 @dataclass
+class PeriodicSplineCurve(Smooth):
+    """Closed parametric curve in R^d, periodic in the parameter t ∈ [0, 1].
+
+    Use case: directly fit closed loops in a high-D space (e.g., a color
+    loop in a language model's residual stream). The fit returns
+    coefficients of shape (K, d) describing the curve's basis representation.
+
+    Parameters
+    ----------
+    n_knots : number of basis knots along the periodic parameter.
+    degree : B-spline degree (default 3 = cubic).
+    output_dim : d, the dimension of the ambient space the curve lives in.
+    """
+
+    n_knots: int = 20
+    degree: int = 3
+    output_dim: int = 1
+    penalty_order: int = 2
+
+
+@dataclass
 class Categorical(Smooth):
     """Sum-to-zero contrast for a categorical predictor.
 
@@ -175,4 +226,5 @@ __all__ = [
     "Matern",
     "Sphere",
     "Categorical",
+    "PeriodicSplineCurve",
 ]
