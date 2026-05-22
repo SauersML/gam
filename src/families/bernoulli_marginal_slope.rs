@@ -13632,9 +13632,12 @@ impl BernoulliMarginalSlopeFamily {
                 "BernoulliMarginalSlopeFamily log-slope",
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi terms only support marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi terms only support marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         };
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
@@ -13828,9 +13831,12 @@ impl BernoulliMarginalSlopeFamily {
                 "BernoulliMarginalSlopeFamily log-slope",
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_i}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_i}"
+                    ),
+                }
+                .into());
             }
         };
         let (p_psi_j, label_j) = match block_j {
@@ -13843,9 +13849,12 @@ impl BernoulliMarginalSlopeFamily {
                 "BernoulliMarginalSlopeFamily log-slope",
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_j}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_j}"
+                    ),
+                }
+                .into());
             }
         };
 
@@ -14183,9 +14192,12 @@ impl BernoulliMarginalSlopeFamily {
                 "BernoulliMarginalSlopeFamily log-slope",
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi hessian only supports marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi hessian only supports marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         };
 
@@ -14318,9 +14330,12 @@ impl BernoulliMarginalSlopeFamily {
                 "BernoulliMarginalSlopeFamily log-slope",
             ),
             _ => {
-                return Err(format!(
-                    "bernoulli marginal-slope psi hessian operator only supports marginal/logslope blocks, got block {block_idx}"
-                ));
+                return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "bernoulli marginal-slope psi hessian operator only supports marginal/logslope blocks, got block {block_idx}"
+                    ),
+                }
+                .into());
             }
         };
 
@@ -15740,11 +15755,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             })?
         };
         if h.nrows() != total || h.ncols() != total {
-            return Err(format!(
-                "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
-                h.nrows(),
-                h.ncols()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
+                    h.nrows(),
+                    h.ncols()
+                ),
+            }
+            .into());
         }
 
         let ridge = options.ridge_floor.max(1e-15);
@@ -16189,10 +16207,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             {
                 return self.sigma_exact_joint_psisecond_order_terms(block_states);
             }
-            return Err(
-                "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason:
+                    "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
+                        .to_string(),
+            }
+            .into());
         }
         let cache = self.build_exact_eval_cache(block_states)?;
         self.exact_newton_joint_psisecond_order_terms_from_cache(
@@ -16271,7 +16291,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             || block_idx == usize::MAX
             || spec.design.ncols() == usize::MAX
         {
-            return Err("unreachable bernoulli marginal-slope constraint state".to_string());
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason: "unreachable bernoulli marginal-slope constraint state".to_string(),
+            }
+            .into());
         }
         if self.score_block_index().is_some_and(|idx| block_idx == idx) {
             return Ok(self
@@ -16297,11 +16320,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     ) -> Result<Array1<f64>, String> {
         self.validate_exact_block_state_shapes(block_states)?;
         if block_idx >= block_states.len() {
-            return Err(format!(
-                "post-update block index {} out of range for {} blocks",
-                block_idx,
-                block_states.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "post-update block index {} out of range for {} blocks",
+                    block_idx,
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         if self.score_block_index().is_some_and(|idx| block_idx == idx) {
             if let (Some(runtime), Some(score)) =
@@ -16309,11 +16335,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             {
                 let current = &score.beta;
                 if current.len() != beta.len() {
-                    return Err(format!(
-                        "score-warp post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "score-warp post-update beta length mismatch: current={}, proposed={}",
+                            current.len(),
+                            beta.len()
+                        ),
+                    }
+                    .into());
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
             }
@@ -16324,11 +16353,14 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             {
                 let current = &link.beta;
                 if current.len() != beta.len() {
-                    return Err(format!(
-                        "link-deviation post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "link-deviation post-update beta length mismatch: current={}, proposed={}",
+                            current.len(),
+                            beta.len()
+                        ),
+                    }
+                    .into());
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
@@ -16362,10 +16394,13 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             Some(&options),
         );
         if cache.fingerprint != expected {
-            return Err(format!(
-                "BernoulliMarginalSlopeExactEvalCache fingerprint mismatch in from_cache: \
-                 cache was built for a different (β, options) than the workspace being constructed"
-            ));
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason: format!(
+                    "BernoulliMarginalSlopeExactEvalCache fingerprint mismatch in from_cache: \
+                     cache was built for a different (β, options) than the workspace being constructed"
+                ),
+            }
+            .into());
         }
         // Materialize per-row primary Hessians at construction time. The
         // matrix-free CG / inner-Newton loops contract these against many
@@ -16692,11 +16727,14 @@ impl BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Array1<f64>, String> {
         if block_states.len() != specs.len() {
-            return Err(format!(
-                "bernoulli marginal-slope batched gradient state/spec mismatch: states={}, specs={}",
-                block_states.len(),
-                specs.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope batched gradient state/spec mismatch: states={}, specs={}",
+                    block_states.len(),
+                    specs.len()
+                ),
+            }
+            .into());
         }
         let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         let mut beta = Array1::<f64>::zeros(total);
@@ -16704,11 +16742,14 @@ impl BernoulliMarginalSlopeFamily {
         for (idx, (state, spec)) in block_states.iter().zip(specs.iter()).enumerate() {
             let width = spec.design.ncols();
             if state.beta.len() != width {
-                return Err(format!(
-                    "bernoulli marginal-slope batched gradient block {idx} beta length {} != spec width {}",
-                    state.beta.len(),
-                    width
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli marginal-slope batched gradient block {idx} beta length {} != spec width {}",
+                        state.beta.len(),
+                        width
+                    ),
+                }
+                .into());
             }
             beta.slice_mut(s![cursor..cursor + width])
                 .assign(&state.beta);
@@ -16727,11 +16768,14 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         let rank = factor.ncols();
         if out.len() != primary.total * rank {
-            return Err(format!(
-                "primary projection scratch length {} != {}",
-                out.len(),
-                primary.total * rank
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "primary projection scratch length {} != {}",
+                    out.len(),
+                    primary.total * rank
+                ),
+            }
+            .into());
         }
         out.fill(0.0);
         for col in 0..rank {
@@ -16853,10 +16897,13 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Vec::new());
         }
         if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
-            return Err(format!(
-                "bernoulli marginal-slope row third direction {idx} length {} != {r}",
-                dir.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope row third direction {idx} length {} != {r}",
+                    dir.len()
+                ),
+            }
+            .into());
         }
         if row_dirs.len() == 1 {
             return Ok(vec![
@@ -16885,9 +16932,11 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in batched third-order contraction".to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: "non-finite flexible row context in batched third-order contraction"
+                    .to_string(),
+            }
+            .into());
         }
 
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
@@ -17407,14 +17456,17 @@ impl BernoulliMarginalSlopeFamily {
         let rank = factor.ncols();
         let n_dirs = directions.ncols();
         if factor.nrows() != slices.total || directions.nrows() != slices.total {
-            return Err(format!(
-                "bernoulli marginal-slope batched trace shape mismatch: factor={}x{}, directions={}x{}, p={}",
-                factor.nrows(),
-                factor.ncols(),
-                directions.nrows(),
-                directions.ncols(),
-                slices.total
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli marginal-slope batched trace shape mismatch: factor={}x{}, directions={}x{}, p={}",
+                    factor.nrows(),
+                    factor.ncols(),
+                    directions.nrows(),
+                    directions.ncols(),
+                    slices.total
+                ),
+            }
+            .into());
         }
         let traces = weighted_rows
             .par_iter()
@@ -17758,10 +17810,12 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
                         &self.options,
                     );
             }
-            return Err(
-                "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
-                    .to_string(),
-            );
+            return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
+                reason:
+                    "bernoulli marginal-slope mixed log-sigma/spatial psi second derivatives require cross auxiliary terms; only pure log-sigma second derivatives are supported"
+                        .to_string(),
+            }
+            .into());
         }
         self.family
             .exact_newton_joint_psisecond_order_terms_from_cache_with_options(
