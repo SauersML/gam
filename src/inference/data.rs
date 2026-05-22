@@ -668,22 +668,28 @@ fn load_delimited_with_schema(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, DataError> {
     let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
         .from_path(path)
-        .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to open '{}': {e}", path.display()),
+        })?;
 
     let all_headers: Vec<String> = rdr
         .headers()
-        .map_err(|e| format!("failed to read headers: {e}"))?
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to read headers: {e}"),
+        })?
         .iter()
         .map(|s| s.trim().to_string())
         .collect();
     if all_headers.is_empty() {
-        return Err("file has no headers".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "file has no headers".to_string(),
+        });
     }
     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
     let headers = projected_headers(&all_headers, &selected_indices);
@@ -758,35 +764,43 @@ fn load_delimited_with_schema(
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)
-        .map_err(|e| format!("failed reading row: {e}"))?
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed reading row: {e}"),
+        })?
     {
         if record.len() != all_headers.len() {
-            return Err(format!(
-                "row width mismatch at row {}: got {} fields, expected {}",
-                total_rows + 1,
-                record.len(),
-                all_headers.len()
-            ));
+            return Err(DataError::SchemaMismatch {
+                reason: format!(
+                    "row width mismatch at row {}: got {} fields, expected {}",
+                    total_rows + 1,
+                    record.len(),
+                    all_headers.len()
+                ),
+            });
         }
         total_rows += 1;
 
         for j in 0..p {
             let raw = record.get(selected_indices[j]).unwrap().trim();
             if raw.is_empty() {
-                return Err(format!(
-                    "empty field at row {}, column '{}'",
-                    total_rows, &headers[j]
-                ));
+                return Err(DataError::EmptyInput {
+                    reason: format!(
+                        "empty field at row {}, column '{}'",
+                        total_rows, &headers[j]
+                    ),
+                });
             }
 
             if needs_inference[j] {
                 // Accumulate inference state.
                 if let Ok(v) = raw.parse::<f64>() {
                     if !v.is_finite() {
-                        return Err(format!(
-                            "non-finite value at row {}, column '{}'",
-                            total_rows, &headers[j]
-                        ));
+                        return Err(DataError::InvalidValue {
+                            reason: format!(
+                                "non-finite value at row {}, column '{}'",
+                                total_rows, &headers[j]
+                            ),
+                        });
                     }
                     if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
                         infer_all_binary[j] = false;
@@ -829,7 +843,9 @@ fn load_delimited_with_schema(
     }
 
     if total_rows == 0 {
-        return Err("file has no rows".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "file has no rows".to_string(),
+        });
     }
 
     let t_finalize = std::time::Instant::now();
@@ -874,11 +890,13 @@ fn load_delimited_with_schema(
     for j in 0..p {
         for (i, &v) in col_vecs[j].iter().enumerate() {
             if !v.is_finite() {
-                return Err(format!(
-                    "non-finite value at row {}, column '{}'",
-                    i + 1,
-                    &headers[j]
-                ));
+                return Err(DataError::InvalidValue {
+                    reason: format!(
+                        "non-finite value at row {}, column '{}'",
+                        i + 1,
+                        &headers[j]
+                    ),
+                });
             }
             values[[i, j]] = v;
         }
@@ -910,26 +928,28 @@ fn parse_cell_with_schema(
     row: usize,
     col_name: &str,
     unseen_policy: UnseenCategoryPolicy,
-) -> Result<f64, String> {
+) -> Result<f64, DataError> {
     let val = match meta.kind {
-        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|_| {
-            format!(
+        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|_| DataError::SchemaMismatch {
+            reason: format!(
                 "column '{}' is continuous in schema but row {} has non-numeric value '{}'",
                 col_name, row, raw
-            )
+            ),
         })?,
         ColumnKindTag::Binary => {
-            let v = raw.parse::<f64>().map_err(|_| {
-                format!(
+            let v = raw.parse::<f64>().map_err(|_| DataError::SchemaMismatch {
+                reason: format!(
                     "column '{}' is binary in schema but row {} has non-numeric value '{}'",
                     col_name, row, raw
-                )
+                ),
             })?;
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                return Err(format!(
-                    "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
-                    col_name, row, v
-                ));
+                return Err(DataError::SchemaMismatch {
+                    reason: format!(
+                        "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
+                        col_name, row, v
+                    ),
+                });
             }
             v
         }
@@ -937,25 +957,31 @@ fn parse_cell_with_schema(
             let map = meta
                 .level_map
                 .as_ref()
-                .ok_or_else(|| "internal categorical schema map missing".to_string())?;
+                .ok_or_else(|| DataError::EncodingFailure {
+                    reason: "internal categorical schema map missing".to_string(),
+                })?;
             match map.get(raw) {
                 Some(v) => *v,
                 None => match unseen_policy {
                     UnseenCategoryPolicy::Error => {
-                        return Err(format!(
-                            "unseen level '{}' in categorical column '{}' at row {}",
-                            raw, col_name, row
-                        ));
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "unseen level '{}' in categorical column '{}' at row {}",
+                                raw, col_name, row
+                            ),
+                        });
                     }
                 },
             }
         }
     };
     if !val.is_finite() {
-        return Err(format!(
-            "non-finite value at row {}, column '{}'",
-            row, col_name
-        ));
+        return Err(DataError::InvalidValue {
+            reason: format!(
+                "non-finite value at row {}, column '{}'",
+                row, col_name
+            ),
+        });
     }
     Ok(val)
 }
@@ -983,7 +1009,7 @@ fn decode_parquet_batch_column(
     base_row: usize,
     header: &str,
     is_string_col: bool,
-) -> Result<ParquetBatchColumn, String> {
+) -> Result<ParquetBatchColumn, DataError> {
     use arrow::array::{
         Array as ArrowArray, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
         Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
@@ -994,11 +1020,13 @@ fn decode_parquet_batch_column(
     if col.null_count() > 0 {
         for i in 0..n_rows {
             if col.is_null(i) {
-                return Err(format!(
-                    "null value at row {}, column '{}'",
-                    base_row + i + 1,
-                    header
-                ));
+                return Err(DataError::InvalidValue {
+                    reason: format!(
+                        "null value at row {}, column '{}'",
+                        base_row + i + 1,
+                        header
+                    ),
+                });
             }
         }
     }
@@ -1018,12 +1046,20 @@ fn decode_parquet_batch_column(
         // Dictionary-encoded strings are not directly a StringArray. Cast only
         // those remaining string-like arrays rather than falling back for every
         // Utf8/LargeUtf8 column.
-        let casted = arrow::compute::cast(col, &DataType::Utf8)
-            .map_err(|e| format!("failed to cast column '{}' to string: {e}", header))?;
+        let casted = arrow::compute::cast(col, &DataType::Utf8).map_err(|e| {
+            DataError::ParseError {
+                reason: format!("failed to cast column '{}' to string: {e}", header),
+            }
+        })?;
         let arr = casted
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| format!("column '{}' could not be read as string after cast", header))?;
+            .ok_or_else(|| DataError::EncodingFailure {
+                reason: format!(
+                    "column '{}' could not be read as string after cast",
+                    header
+                ),
+            })?;
         return Ok(ParquetBatchColumn::Strings(
             (0..n_rows).map(|i| arr.value(i).to_string()).collect(),
         ));
@@ -1076,19 +1112,23 @@ fn decode_parquet_batch_column(
             values.extend((0..n_rows).map(|i| if arr.value(i) { 1.0 } else { 0.0 }));
         }
         other => {
-            return Err(format!(
-                "unsupported parquet column type {:?} for column '{}'",
-                other, header
-            ));
+            return Err(DataError::InvalidValue {
+                reason: format!(
+                    "unsupported parquet column type {:?} for column '{}'",
+                    other, header
+                ),
+            });
         }
     }
 
     if let Some(i) = values.iter().position(|v| !v.is_finite()) {
-        return Err(format!(
-            "non-finite value at row {}, column '{}'",
-            base_row + i + 1,
-            header
-        ));
+        return Err(DataError::InvalidValue {
+            reason: format!(
+                "non-finite value at row {}, column '{}'",
+                base_row + i + 1,
+                header
+            ),
+        });
     }
 
     Ok(ParquetBatchColumn::Numeric(values))
@@ -1097,17 +1137,20 @@ fn decode_parquet_batch_column(
 fn load_parquet_inferred(
     path: &Path,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, DataError> {
     use arrow::datatypes::DataType;
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use rayon::prelude::*;
     use std::fs::File;
 
     let t_open = std::time::Instant::now();
-    let file = File::open(path)
-        .map_err(|e| format!("failed to open parquet '{}': {e}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| format!("failed to read parquet metadata '{}': {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| DataError::ParseError {
+        reason: format!("failed to open parquet '{}': {e}", path.display()),
+    })?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet metadata '{}': {e}", path.display()),
+        })?;
 
     let full_schema = builder.schema().clone();
     let all_headers: Vec<String> = full_schema
@@ -1126,7 +1169,9 @@ fn load_parquet_inferred(
     let reader = builder
         .with_projection(projection)
         .build()
-        .map_err(|e| format!("failed to build parquet reader: {e}"))?;
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to build parquet reader: {e}"),
+        })?;
     let p = headers.len();
     let open_ms = t_open.elapsed().as_secs_f64() * 1000.0;
     if open_ms > 100.0 {
@@ -1157,11 +1202,12 @@ fn load_parquet_inferred(
 
     let mut rows_seen = 0usize;
     for batch_result in reader {
-        let batch =
-            batch_result.map_err(|e| format!("failed to read parquet record batch: {e}"))?;
+        let batch = batch_result.map_err(|e| DataError::ParseError {
+            reason: format!("failed to read parquet record batch: {e}"),
+        })?;
         let n_rows = batch.num_rows();
 
-        let decoded_columns: Vec<Result<ParquetBatchColumn, String>> = (0..p)
+        let decoded_columns: Vec<Result<ParquetBatchColumn, DataError>> = (0..p)
             .into_par_iter()
             .map(|j| {
                 decode_parquet_batch_column(
@@ -1202,7 +1248,9 @@ fn load_parquet_inferred(
         );
     }
     if total_rows == 0 {
-        return Err("parquet file has no rows".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "parquet file has no rows".to_string(),
+        });
     }
 
     let t_schema = std::time::Instant::now();
@@ -1321,7 +1369,7 @@ fn load_parquet_with_schema(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, DataError> {
     // Load with inference first, then validate/re-encode against provided schema.
     let inferred = load_parquet_inferred(path, requested_columns)?;
     let p = inferred.headers.len();
@@ -1361,7 +1409,12 @@ fn load_parquet_with_schema(
                     .iter()
                     .map(|lv| {
                         schema_level_map.get(lv.as_str()).copied().ok_or_else(|| {
-                            format!("unseen level '{}' in categorical column '{}'", lv, name)
+                            DataError::SchemaMismatch {
+                                reason: format!(
+                                    "unseen level '{}' in categorical column '{}'",
+                                    lv, name
+                                ),
+                            }
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1370,11 +1423,13 @@ fn load_parquet_with_schema(
                     if old_code >= inferred_to_schema.len() {
                         match unseen_policy {
                             UnseenCategoryPolicy::Error => {
-                                return Err(format!(
-                                    "unseen categorical code at row {}, column '{}'",
-                                    i + 1,
-                                    name
-                                ));
+                                return Err(DataError::SchemaMismatch {
+                                    reason: format!(
+                                        "unseen categorical code at row {}, column '{}'",
+                                        i + 1,
+                                        name
+                                    ),
+                                });
                             }
                         }
                     }
@@ -1407,11 +1462,14 @@ pub fn encode_recordswith_inferred_schema(
     records: Vec<StringRecord>,
 ) -> Result<EncodedDataset, String> {
     if records.is_empty() {
-        return Err("table data cannot be empty".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "table data cannot be empty".to_string(),
+        }
+        .into());
     }
     let mut schema_cols = Vec::<SchemaColumn>::with_capacity(headers.len());
     for (j, name) in headers.iter().enumerate() {
-        schema_cols.push(infer_schema_column(name, &records, j)?);
+        schema_cols.push(infer_schema_column(name, &records, j).map_err(String::from)?);
     }
     let schema = DataSchema {
         columns: schema_cols,
@@ -1427,7 +1485,10 @@ pub fn encode_recordswith_schema(
 ) -> Result<EncodedDataset, String> {
     let n = records.len();
     if n == 0 {
-        return Err("table data cannot be empty".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "table data cannot be empty".to_string(),
+        }
+        .into());
     }
     let p = headers.len();
     let mut values = Array2::<f64>::zeros((n, p));
@@ -1443,7 +1504,8 @@ pub fn encode_recordswith_schema(
         let col_schema = if let Some(s) = schema_byname.get(name.as_str()) {
             *s
         } else {
-            inferred_for_extra = infer_schema_column(name, &records, j)?;
+            inferred_for_extra =
+                infer_schema_column(name, &records, j).map_err(String::from)?;
             &inferred_for_extra
         };
         column_kinds.push(col_schema.kind);
@@ -1464,65 +1526,87 @@ pub fn encode_recordswith_schema(
         for (i, rec) in records.iter().enumerate() {
             let raw = rec
                 .get(j)
-                .ok_or_else(|| format!("missing field at row {}, col {}", i + 1, j + 1))?
+                .ok_or_else(|| {
+                    String::from(DataError::SchemaMismatch {
+                        reason: format!("missing field at row {}, col {}", i + 1, j + 1),
+                    })
+                })?
                 .trim();
             if raw.is_empty() {
-                return Err(format!("empty field at row {}, column '{}'", i + 1, name));
+                return Err(DataError::EmptyInput {
+                    reason: format!("empty field at row {}, column '{}'", i + 1, name),
+                }
+                .into());
             }
             let val = match col_schema.kind {
                 ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|_| {
-                    format!(
-                        "column '{}' is continuous in schema but row {} has non-numeric value '{}'",
-                        name,
-                        i + 1,
-                        raw
-                    )
-                })?,
-                ColumnKindTag::Binary => {
-                    let v = raw.parse::<f64>().map_err(|_| {
-                        format!(
-                            "column '{}' is binary in schema but row {} has non-numeric value '{}'",
+                    String::from(DataError::SchemaMismatch {
+                        reason: format!(
+                            "column '{}' is continuous in schema but row {} has non-numeric value '{}'",
                             name,
                             i + 1,
                             raw
-                        )
+                        ),
+                    })
+                })?,
+                ColumnKindTag::Binary => {
+                    let v = raw.parse::<f64>().map_err(|_| {
+                        String::from(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is binary in schema but row {} has non-numeric value '{}'",
+                                name,
+                                i + 1,
+                                raw
+                            ),
+                        })
                     })?;
                     if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
-                        return Err(format!(
-                            "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
-                            name,
-                            i + 1,
-                            v
-                        ));
+                        return Err(DataError::SchemaMismatch {
+                            reason: format!(
+                                "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",
+                                name,
+                                i + 1,
+                                v
+                            ),
+                        }
+                        .into());
                     }
                     v
                 }
                 ColumnKindTag::Categorical => {
-                    let map = level_map
-                        .as_ref()
-                        .ok_or_else(|| "internal categorical schema map missing".to_string())?;
+                    let map = level_map.as_ref().ok_or_else(|| {
+                        String::from(DataError::EncodingFailure {
+                            reason: "internal categorical schema map missing".to_string(),
+                        })
+                    })?;
                     match map.get(raw) {
                         Some(v) => *v,
                         None => match unseen_policy {
                             UnseenCategoryPolicy::Error => {
-                                return Err(format!(
-                                    "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
-                                    raw,
-                                    name,
-                                    i + 1,
-                                    col_schema.levels.join(",")
-                                ));
+                                return Err(DataError::SchemaMismatch {
+                                    reason: format!(
+                                        "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
+                                        raw,
+                                        name,
+                                        i + 1,
+                                        col_schema.levels.join(",")
+                                    ),
+                                }
+                                .into());
                             }
                         },
                     }
                 }
             };
             if !val.is_finite() {
-                return Err(format!(
-                    "non-finite value at row {}, column '{}'",
-                    i + 1,
-                    name
-                ));
+                return Err(DataError::InvalidValue {
+                    reason: format!(
+                        "non-finite value at row {}, column '{}'",
+                        i + 1,
+                        name
+                    ),
+                }
+                .into());
             }
             values[[i, j]] = val;
         }
@@ -1540,7 +1624,7 @@ fn infer_schema_column(
     name: &str,
     records: &[StringRecord],
     col_idx: usize,
-) -> Result<SchemaColumn, String> {
+) -> Result<SchemaColumn, DataError> {
     let mut all_numeric = true;
     let mut all_binary = true;
     let mut levels = Vec::<String>::new();
@@ -1548,18 +1632,24 @@ fn infer_schema_column(
     for (i, rec) in records.iter().enumerate() {
         let raw = rec
             .get(col_idx)
-            .ok_or_else(|| format!("missing field at row {}, col {}", i + 1, col_idx + 1))?
+            .ok_or_else(|| DataError::SchemaMismatch {
+                reason: format!("missing field at row {}, col {}", i + 1, col_idx + 1),
+            })?
             .trim();
         if raw.is_empty() {
-            return Err(format!("empty field at row {}, column '{}'", i + 1, name));
+            return Err(DataError::EmptyInput {
+                reason: format!("empty field at row {}, column '{}'", i + 1, name),
+            });
         }
         if let Ok(v) = raw.parse::<f64>() {
             if !v.is_finite() {
-                return Err(format!(
-                    "non-finite value at row {}, column '{}'",
-                    i + 1,
-                    name
-                ));
+                return Err(DataError::InvalidValue {
+                    reason: format!(
+                        "non-finite value at row {}, column '{}'",
+                        i + 1,
+                        name
+                    ),
+                });
             }
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
                 all_binary = false;
