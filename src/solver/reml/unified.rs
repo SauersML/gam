@@ -5470,30 +5470,13 @@ pub struct InnerSolution<'dp> {
 /// Active row block of the joint linear inequality constraint matrix at the
 /// converged inner iterate. Carries the dense rows needed for the
 /// constraint-aware pseudo-inverse `K_T` in
-/// [`PenaltySubspaceTrace::with_active_constraints`].
+/// [`PenaltySubspaceTrace::with_active_constraints`]. Only the `A` rows are
+/// needed by the kernel itself; if a future audit needs the RHS values, add
+/// them back as a typed field then.
 #[derive(Clone, Debug)]
 pub struct ActiveLinearConstraintBlock {
     /// `k_active × p` matrix of active constraint rows.
     pub a: Array2<f64>,
-    /// `k_active` right-hand-side values (active equality targets). The
-    /// kernel itself only needs the `A` rows for its projection — the `b`
-    /// vector is carried alongside for downstream consumers that audit
-    /// constraint satisfaction.
-    #[allow(dead_code)]
-    pub b: Array1<f64>,
-}
-
-impl ActiveLinearConstraintBlock {
-    #[allow(dead_code)]
-    pub fn new(a: Array2<f64>, b: Array1<f64>) -> Self {
-        debug_assert_eq!(a.nrows(), b.len());
-        Self { a, b }
-    }
-
-    #[allow(dead_code)]
-    pub fn k_active(&self) -> usize {
-        self.a.nrows()
-    }
 }
 
 /// Builder for `InnerSolution` that provides sensible defaults and
