@@ -44,6 +44,30 @@ const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
 const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
+static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, f64>>> = OnceLock::new();
+
+fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, f64>> {
+    OUTER_IFT_RESIDUAL_ENERGY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn cached_ift_residual_energy_for_outer_theta(theta: &Array1<f64>) -> Option<f64> {
+    let key = super::cache::sanitized_rhokey(theta)?;
+    let energy = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
+    (energy.is_finite() && energy >= 0.0).then_some(energy)
+}
+
+fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
+    let Some(energy) = energy.filter(|energy| energy.is_finite() && *energy >= 0.0) else {
+        return;
+    };
+    let Some(key) = super::cache::sanitized_rhokey(theta) else {
+        return;
+    };
+    if let Ok(mut cache) = outer_ift_residual_energy_cache().lock() {
+        cache.insert(key, energy);
+    }
+}
+
 pub(crate) struct HyperGradHistoryEntry {
     pub(crate) rho: Array1<f64>,
     pub(crate) g_outer: Array1<f64>,
@@ -319,8 +343,8 @@ static IFT_JOINT_MODE_RESPONSE_CACHES: OnceLock<
     Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>>,
 > = OnceLock::new();
 
-fn ift_joint_mode_response_caches(
-) -> &'static Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>> {
+fn ift_joint_mode_response_caches()
+-> &'static Mutex<HashMap<usize, IftJointModeResponseRuntimeCache>> {
     IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2532,7 +2556,10 @@ impl<'a> RemlState<'a> {
             .is_some();
         if active_constraints {
             self.clear_joint_ift_mode_response_cache();
-            log::info!("[IFT-REJECTED] reason=active_constraints joint_dim={}", theta.len());
+            log::info!(
+                "[IFT-REJECTED] reason=active_constraints joint_dim={}",
+                theta.len()
+            );
             return;
         }
         let beta_original = match bundle.pirls_result.coordinate_frame {
@@ -8110,6 +8137,7 @@ impl<'a> RemlState<'a> {
                 super::unified::EvalMode::ValueAndGradient,
             )?;
             let ift_residual_energy = result.ift_residual_energy;
+            store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
             let grad = result.gradient.unwrap();
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
             log::debug!(
@@ -8124,6 +8152,7 @@ impl<'a> RemlState<'a> {
         let result =
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         let ift_residual_energy = result.ift_residual_energy;
+        store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
         let grad = result.gradient.unwrap();
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         log::debug!(
@@ -8231,6 +8260,7 @@ impl<'a> RemlState<'a> {
         };
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
         let ift_residual_energy = result.ift_residual_energy;
+        store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
 
         let gradient = result.gradient.ok_or_else(|| {
             EstimationError::InvalidInput(format!(
