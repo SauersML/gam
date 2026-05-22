@@ -1058,21 +1058,13 @@ fn parse_bounded_priorspec(
 ) -> Result<BoundedCoefficientPriorSpec, String> {
     let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
     let pull = options.get("pull").map(|s| s.to_ascii_lowercase());
-    let beta_a = parse_optional_f64_option(options, "beta_a", raw)?;
-    let beta_b = parse_optional_f64_option(options, "beta_b", raw)?;
     let target = parse_optional_f64_option(options, "target", raw)?;
     let strength = parse_optional_f64_option(options, "strength", raw)?;
 
-    let explicit_beta = beta_a.is_some() || beta_b.is_some();
     let target_mode = target.is_some() || strength.is_some();
     if prior_mode.is_some() && pull.is_some() {
         return Err(format!(
             "bounded() cannot combine prior=... with pull=...: {raw}"
-        ));
-    }
-    if prior_mode.is_some() && explicit_beta {
-        return Err(format!(
-            "bounded() cannot combine prior=... with beta_a/beta_b: {raw}"
         ));
     }
     if prior_mode.is_some() && target_mode {
@@ -1080,19 +1072,9 @@ fn parse_bounded_priorspec(
             "bounded() cannot combine prior=... with target/strength: {raw}"
         ));
     }
-    if pull.is_some() && explicit_beta {
-        return Err(format!(
-            "bounded() cannot combine pull=... with beta_a/beta_b: {raw}"
-        ));
-    }
     if pull.is_some() && target_mode {
         return Err(format!(
             "bounded() cannot combine pull=... with target/strength: {raw}"
-        ));
-    }
-    if explicit_beta && target_mode {
-        return Err(format!(
-            "bounded() cannot combine beta_a/beta_b with target/strength: {raw}"
         ));
     }
 
@@ -1121,17 +1103,6 @@ fn parse_bounded_priorspec(
                 pull_mode
             )),
         };
-    }
-
-    if explicit_beta {
-        let a = beta_a.ok_or_else(|| format!("bounded() beta_a is required with beta_b: {raw}"))?;
-        let b = beta_b.ok_or_else(|| format!("bounded() beta_b is required with beta_a: {raw}"))?;
-        if !a.is_finite() || !b.is_finite() || a < 1.0 || b < 1.0 {
-            return Err(format!(
-                "bounded() beta_a and beta_b must be finite and >= 1: {raw}"
-            ));
-        }
-        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
     }
 
     if target_mode {
@@ -1448,7 +1419,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 validate_known_term_options(
                     "bounded",
                     &options,
-                    &["min", "max", "prior", "target", "strength"],
+                    &["min", "max", "prior", "pull", "target", "strength"],
                     raw,
                 )?;
                 let min = parse_required_f64_option(&options, "min", raw)?;
