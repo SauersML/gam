@@ -10821,6 +10821,13 @@ fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstrainedStationaryCertificate {
+    NotCandidate,
+    Accept,
+    RefusePhantomMultiplier,
+}
+
 #[derive(Clone, Debug)]
 struct JointNewtonMathDiagnostic {
     old_kkt_inf: f64,
@@ -10840,6 +10847,37 @@ impl JointNewtonMathDiagnostic {
 
     fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
         new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
+    }
+}
+
+fn constrained_stationary_certificate_decision(
+    math: &JointNewtonMathDiagnostic,
+    objective_change: f64,
+    objective_tol: f64,
+    geometric_tail_bound: Option<f64>,
+    residual: f64,
+    residual_tol: f64,
+) -> ConstrainedStationaryCertificate {
+    let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+    let scalar_model_relerr = math.scalar_model_relative_error();
+    let objective_exhausted =
+        objective_change <= objective_tol || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
+
+    if !(objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3) {
+        return ConstrainedStationaryCertificate::NotCandidate;
+    }
+
+    // A large linearized residual can mean either an honest active-set
+    // multiplier or an H-null/rank-deficient direction that Newton cannot
+    // move. Only the projected KKT residual distinguishes those cases. This
+    // small tolerance band is intentionally tied to the inner residual
+    // tolerance, because this branch is allowed to certify convergence only
+    // when the active-set projection has actually captured the multiplier.
+    let cert_residual_factor = 4.0;
+    if residual.is_finite() && residual <= cert_residual_factor * residual_tol {
+        ConstrainedStationaryCertificate::Accept
+    } else {
+        ConstrainedStationaryCertificate::RefusePhantomMultiplier
     }
 }
 
