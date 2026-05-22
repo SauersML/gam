@@ -4905,6 +4905,22 @@ struct BernoulliMarginalSlopeFlexRowScratch {
     du: Array1<f64>,
     grad: Array1<f64>,
     hess: Array2<f64>,
+    // Per-row [f64; 4] coefficient buffers used by the flex analytic path. Owned
+    // by the scratch so the hot path never allocates a fresh `Vec` per row.
+    coeff_u: Vec<[f64; 4]>,
+    coeff_au: Vec<[f64; 4]>,
+    coeff_bu: Vec<[f64; 4]>,
+    g_u_fixed: Vec<[f64; 4]>,
+    g_au_fixed: Vec<[f64; 4]>,
+    g_bu_fixed: Vec<[f64; 4]>,
+    // Per-cell eta_u buffer for the empirical-grid branch; reused across cells
+    // and rows. `Vec<f64>` rather than `Array1` because indexing as
+    // `eta_u[idx]` after a `clear()`/`resize()` matches the previous code path.
+    eta_u_cell: Vec<f64>,
+    // Constant zero coeff slice shared by every SparsePrimaryCoeffJetView call
+    // that needs `aa_first..bbb_first`. Sized to `primary_dim` once and never
+    // mutated thereafter.
+    zero_family: Vec<[f64; 4]>,
 }
 
 impl BernoulliMarginalSlopeFlexRowScratch {
@@ -4920,6 +4936,14 @@ impl BernoulliMarginalSlopeFlexRowScratch {
             du: Array1::zeros(primary_dim),
             grad: Array1::zeros(primary_dim),
             hess: Array2::zeros((primary_dim, primary_dim)),
+            coeff_u: vec![[0.0; 4]; primary_dim],
+            coeff_au: vec![[0.0; 4]; primary_dim],
+            coeff_bu: vec![[0.0; 4]; primary_dim],
+            g_u_fixed: vec![[0.0; 4]; primary_dim],
+            g_au_fixed: vec![[0.0; 4]; primary_dim],
+            g_bu_fixed: vec![[0.0; 4]; primary_dim],
+            eta_u_cell: vec![0.0; primary_dim],
+            zero_family: vec![[0.0; 4]; primary_dim],
         }
     }
 
@@ -9100,6 +9124,19 @@ impl BernoulliMarginalSlopeFamily {
 
         let r = primary.total;
         scratch.reset(need_hessian);
+        // Reusable per-row coefficient buffers live on the scratch. Resize once
+        // if the scratch was constructed for a different primary dimension; the
+        // common case is `len == r` so this is a no-op.
+        if scratch.coeff_u.len() != r {
+            scratch.coeff_u.resize(r, [0.0; 4]);
+            scratch.coeff_au.resize(r, [0.0; 4]);
+            scratch.coeff_bu.resize(r, [0.0; 4]);
+            scratch.g_u_fixed.resize(r, [0.0; 4]);
+            scratch.g_au_fixed.resize(r, [0.0; 4]);
+            scratch.g_bu_fixed.resize(r, [0.0; 4]);
+            scratch.eta_u_cell.resize(r, 0.0);
+            scratch.zero_family.resize(r, [0.0; 4]);
+        }
         let a = row_ctx.intercept;
         let f_a = row_ctx.m_a;
         let y_i = self.y[row];
@@ -9112,15 +9149,22 @@ impl BernoulliMarginalSlopeFamily {
         let score_runtime = self.score_warp.as_ref();
         let link_runtime = self.link_dev.as_ref();
         let scale = self.probit_frailty_scale();
-        let zero_family = vec![[0.0; 4]; r];
 
+        // Split-borrow the scratch into disjoint mutable references; the
+        // borrow checker permits this because every field access goes through
+        // `scratch.<field>` directly rather than through `&mut scratch`.
         let f_u = &mut scratch.m_u;
         let f_au = &mut scratch.m_au;
         let f_uv = &mut scratch.m_uv;
+        let coeff_u = &mut scratch.coeff_u;
+        let coeff_au = &mut scratch.coeff_au;
+        let coeff_bu = &mut scratch.coeff_bu;
+        let g_u_fixed = &mut scratch.g_u_fixed;
+        let g_au_fixed = &mut scratch.g_au_fixed;
+        let g_bu_fixed = &mut scratch.g_bu_fixed;
+        let eta_u_cell = &mut scratch.eta_u_cell;
+        let zero_family: &[[f64; 4]] = scratch.zero_family.as_slice();
         let mut f_aa = 0.0f64;
-        let mut coeff_u = vec![[0.0; 4]; r];
-        let mut coeff_au = vec![[0.0; 4]; r];
-        let mut coeff_bu = vec![[0.0; 4]; r];
 
         if let Some(empirical_grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
             for (&node, &weight) in empirical_grid
@@ -9192,14 +9236,14 @@ impl BernoulliMarginalSlopeFamily {
                     )?;
                 }
 
-                let eta_u = (0..r)
-                    .map(|idx| eval_coeff4_at(&coeff_u[idx], node))
-                    .collect::<Vec<_>>();
+                for idx in 0..r {
+                    eta_u_cell[idx] = eval_coeff4_at(&coeff_u[idx], node);
+                }
                 for u in 1..r {
-                    f_u[u] += weight * phi * eta_u[u];
+                    f_u[u] += weight * phi * eta_u_cell[u];
                     if need_hessian {
                         let eta_au = eval_coeff4_at(&coeff_au[u], node);
-                        f_au[u] += weight * phi * (eta_au - eta * eta_a * eta_u[u]);
+                        f_au[u] += weight * phi * (eta_au - eta * eta_a * eta_u_cell[u]);
                     }
                 }
 
@@ -9208,16 +9252,16 @@ impl BernoulliMarginalSlopeFamily {
                         1,
                         h_range,
                         w_range,
-                        &coeff_u,
-                        &coeff_au,
-                        &coeff_bu,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
+                        coeff_u.as_slice(),
+                        coeff_au.as_slice(),
+                        coeff_bu.as_slice(),
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
                     );
                     for u in 1..r {
                         for v in u..r {
@@ -9228,7 +9272,7 @@ impl BernoulliMarginalSlopeFamily {
                                 COEFF_SUPPORT_BHW,
                             );
                             let eta_uv = eval_coeff4_at(&second_coeff, node);
-                            let val = weight * phi * (eta_uv - eta * eta_u[u] * eta_u[v]);
+                            let val = weight * phi * (eta_uv - eta * eta_u_cell[u] * eta_u_cell[v]);
                             f_uv[[u, v]] += val;
                             if u != v {
                                 f_uv[[v, u]] += val;
@@ -9385,16 +9429,16 @@ impl BernoulliMarginalSlopeFamily {
                         1,
                         h_range,
                         w_range,
-                        &coeff_u,
-                        &coeff_au,
-                        &coeff_bu,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
-                        &zero_family,
+                        coeff_u.as_slice(),
+                        coeff_au.as_slice(),
+                        coeff_bu.as_slice(),
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
+                        zero_family,
                     );
                     for u in 1..r {
                         for v in u..r {
@@ -9453,9 +9497,9 @@ impl BernoulliMarginalSlopeFamily {
         let eta_aa_obs = eval_coeff4_at(&obs.dc_daa, z_obs);
         let eta_val = eval_coeff4_at(&obs.coeff, z_obs);
 
-        let mut g_u_fixed = vec![[0.0; 4]; r];
-        let mut g_au_fixed = vec![[0.0; 4]; r];
-        let mut g_bu_fixed = vec![[0.0; 4]; r];
+        g_u_fixed.fill([0.0; 4]);
+        g_au_fixed.fill([0.0; 4]);
+        g_bu_fixed.fill([0.0; 4]);
         g_u_fixed[1] = obs.dc_db;
         g_au_fixed[1] = obs.dc_dab;
         g_bu_fixed[1] = obs.dc_dbb;
@@ -9495,16 +9539,16 @@ impl BernoulliMarginalSlopeFamily {
             1,
             h_range,
             w_range,
-            &g_u_fixed,
-            &g_au_fixed,
-            &g_bu_fixed,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
-            &zero_family,
+            g_u_fixed.as_slice(),
+            g_au_fixed.as_slice(),
+            g_bu_fixed.as_slice(),
+            zero_family,
+            zero_family,
+            zero_family,
+            zero_family,
+            zero_family,
+            zero_family,
+            zero_family,
         );
 
         let rho = &mut scratch.rho;
