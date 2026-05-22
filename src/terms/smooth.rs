@@ -14780,32 +14780,74 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             return Ok(false);
         }
 
-        if let Some(length_scale) = next_length_scale {
+        if let Some(length_scale) = next_length_scale.clone() {
             set_spatial_length_scale(&mut self.spec, term_idx, length_scale)
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(eta) = next_aniso {
+        if let Some(eta) = next_aniso.clone() {
             set_spatial_aniso_log_scales(&mut self.spec, term_idx, eta)
                 .map_err(|e| e.to_string())?;
         }
 
-        let termspec = self
-            .spec
-            .smooth_terms
+        // Pick the spec to drive the rebuild. If the per-term geometry cache
+        // is populated, it carries already-resolved centers
+        // (`CenterStrategy::UserProvided`) and frozen `input_scales`; reusing
+        // it short-circuits `select_centers_by_strategy` (KMeans /
+        // FarthestPoint / EqualMass cluster searches) and
+        // `compute_spatial_input_scales` (per-axis variance over n rows) in
+        // the family builders. Centers in the cached spec live in
+        // standardized coordinates (matching the cached `input_scales`), so
+        // the same standardization + kernel path runs without recomputation
+        // of the geometry.
+        let geometry_slot = self
+            .spatial_realization_geometry
             .get(term_idx)
-            .ok_or_else(|| format!("incremental realizer smooth term {term_idx} out of range"))?
-            .clone();
-        let realization = build_single_smooth_term_realization_withworkspace(
+            .ok_or_else(|| {
+                format!("incremental realizer geometry slot {term_idx} out of range")
+            })?;
+        let mut build_spec = match geometry_slot {
+            Some(cached) => cached.clone(),
+            None => self
+                .spec
+                .smooth_terms
+                .get(term_idx)
+                .ok_or_else(|| {
+                    format!("incremental realizer smooth term {term_idx} out of range")
+                })?
+                .clone(),
+        };
+        if let Some(length_scale) = next_length_scale {
+            set_single_term_spatial_length_scale(&mut build_spec, length_scale)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(eta) = next_aniso {
+            set_single_term_spatial_aniso_log_scales(&mut build_spec, eta)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let termname = build_spec.name.clone();
+        let local = build_single_local_smooth_term(
             self.data,
-            &termspec,
+            &build_spec,
             &mut self.basisworkspace,
         )
         .map_err(|e| {
             format!(
-                "failed to rebuild smooth term '{}' during incremental κ realization: {e}",
-                termspec.name
+                "failed to rebuild smooth term '{termname}' during incremental κ realization: {e}"
             )
         })?;
+
+        // Populate the geometry cache from the realized metadata on first use.
+        // Family auto-promotion (ThinPlate -> Duchon) is detected as a basis /
+        // metadata mismatch in `freeze_geometry_from_metadata` and leaves the
+        // cache empty so the next call re-tries with the (now stable) family.
+        if self.spatial_realization_geometry[term_idx].is_none()
+            && let Some(frozen) = freeze_geometry_from_metadata(&build_spec, &local.metadata)
+        {
+            self.spatial_realization_geometry[term_idx] = Some(frozen);
+        }
+
+        let realization = wrap_local_build_as_realization(local, &build_spec)?;
         self.replace_term_realization(term_idx, realization)?;
         Ok(true)
     }
