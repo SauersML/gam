@@ -645,6 +645,56 @@ impl FirthDenseOperator {
         self.half_log_det
     }
 
+    /// Tangent-projected Jeffreys/Firth log-determinant `½ log|Zᵀ J Z|_+`,
+    /// where `J = Xᵀ A W(η) X` is the full p-space Fisher information at
+    /// the current `η` and `Z` is the `p × m` orthonormal basis of
+    /// `null(A_act)` produced by the active-constraint tangent projector.
+    ///
+    /// Identity: `Zᵀ J Z = (X̃ Z)ᵀ W (X̃ Z)` with `X̃ = A^{1/2} X` when
+    /// fixed observation weights are present, `X̃ = X` otherwise. The
+    /// projected log-pseudo-det uses the same positive-eigenvalue
+    /// threshold convention as the rest of the tangent-projected LAML
+    /// (`positive_eigenvalue_threshold` / `exact_pseudo_logdet`) so the
+    /// kernel that defines "active subspace" is consistent across the
+    /// objective, its gradient, and the Firth contribution.
+    pub(crate) fn jeffreys_logdet_projected(&self, z: ndarray::ArrayView2<'_, f64>) -> f64 {
+        use crate::faer_ndarray::{fast_ab, fast_xt_diag_x};
+        let p = self.x_dense.ncols();
+        debug_assert_eq!(
+            z.nrows(),
+            p,
+            "jeffreys_logdet_projected: Z must have {} rows (β-space dim), got {}",
+            p,
+            z.nrows()
+        );
+        let m = z.ncols();
+        if m == 0 {
+            return 0.0;
+        }
+        // X·Z, then optional sqrt(A) row-scale → X̃·Z.
+        let z_owned = z.to_owned();
+        let xz = fast_ab(&self.x_dense, &z_owned);
+        let xtz = if let Some(scale) = self.observation_weight_sqrt.as_ref() {
+            crate::solver::reml::RemlState::row_scale(&xz, scale)
+        } else {
+            xz
+        };
+        // J_T = (X̃ Z)ᵀ W (X̃ Z), symmetric m × m PSD.
+        let mut j_t = fast_xt_diag_x(&xtz, &self.w);
+        enforce_symmetry(&mut j_t);
+        let (evals, _) = match j_t.eigh(Side::Lower) {
+            Ok(pair) => pair,
+            Err(_) => return f64::NEG_INFINITY,
+        };
+        let evals_slice = match evals.as_slice() {
+            Some(s) => s,
+            None => return f64::NEG_INFINITY,
+        };
+        let threshold =
+            crate::solver::reml::unified::positive_eigenvalue_threshold(evals_slice);
+        0.5 * crate::solver::reml::unified::exact_pseudo_logdet(evals_slice, threshold)
+    }
+
     #[inline]
     pub(crate) fn jeffreys_beta_gradient(&self) -> Array1<f64> {
         // For I(β) = Xᵀ A W(η) X with fixed observation weights A,
