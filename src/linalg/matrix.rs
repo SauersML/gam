@@ -4304,27 +4304,6 @@ impl SymmetricMatrix {
         }
     }
 
-    /// Side length `p` of a square symmetric matrix. Panics in debug if the
-    /// matrix is not square — `SymmetricMatrix` only stores square matrices
-    /// by contract, so this is a cheap convenience over `nrows()`/`ncols()`.
-    #[inline]
-    pub fn dim(&self) -> usize {
-        debug_assert_eq!(
-            self.nrows(),
-            self.ncols(),
-            "SymmetricMatrix must be square"
-        );
-        self.nrows()
-    }
-
-    /// Whether the underlying representation is square. Cheap; used by
-    /// `BlockWorkingSet::check_invariants` and similar callers that don't
-    /// want to debug-panic on a malformed value.
-    #[inline]
-    pub fn is_square(&self) -> bool {
-        self.nrows() == self.ncols()
-    }
-
     pub fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match self {
             Self::Dense(mat) => mat.dot(rhs),
