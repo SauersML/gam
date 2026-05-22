@@ -5137,7 +5137,7 @@ impl<'a> RemlState<'a> {
                                 );
                                 self.last_ift_prediction_residual
                                     .store(quality.to_bits(), Ordering::Relaxed);
-                            };
+                            }
                         }
                     }
                     self.updatewarm_start_from(pirls_result.as_ref());
@@ -5301,6 +5301,7 @@ impl<'a> RemlState<'a> {
                     // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
                     self.last_ift_prediction_residual
                         .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
+                    self.clear_ift_quality_runtime_state();
                 }
                 Err(EstimationError::PirlsDidNotConverge {
                     max_iterations: pirls_result.iteration,
