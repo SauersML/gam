@@ -245,32 +245,51 @@ impl HyperGradientBudget {
         let mut estimates = Vec::new();
         for i in 0..pairs.len() {
             let (drho_i, dg_i, left_idx) = &pairs[i];
-            let mut predicted = Array1::<f64>::zeros(dg_i.len());
-            let mut total_weight = 0.0;
-            for (j, (drho_j, dg_j, _)) in pairs.iter().enumerate() {
-                if i == j || dg_j.len() != dg_i.len() {
-                    continue;
-                }
-                let norm_squared = drho_j.dot(drho_j);
-                if !norm_squared.is_finite() || norm_squared <= 0.0 {
-                    continue;
-                }
-                let denom = norm_squared + HGB_REGRESSION_RIDGE;
-                if !denom.is_finite() || denom <= 0.0 {
-                    continue;
-                }
-                let alpha = drho_i.dot(drho_j) / denom;
-                if !alpha.is_finite() {
-                    continue;
-                }
-                let weight = 1.0 / (1.0 + norm_squared.sqrt());
-                predicted.scaled_add(weight * alpha, dg_j);
-                total_weight += weight;
-            }
-            if total_weight <= 0.0 {
+            let rho_dim = drho_i.len();
+            let grad_dim = dg_i.len();
+            if rho_dim == 0 || grad_dim == 0 {
                 continue;
             }
-            predicted /= total_weight;
+            let mut xtx = Array2::<f64>::zeros((rho_dim, rho_dim));
+            for d in 0..rho_dim {
+                xtx[[d, d]] = HGB_REGRESSION_RIDGE;
+            }
+            let mut xty = Array2::<f64>::zeros((rho_dim, grad_dim));
+            let mut fit_pairs = 0usize;
+            for (j, (drho_j, dg_j, _)) in pairs.iter().enumerate() {
+                if i == j || drho_j.len() != rho_dim || dg_j.len() != grad_dim {
+                    continue;
+                }
+                if drho_j.iter().any(|v| !v.is_finite())
+                    || dg_j.iter().any(|v| !v.is_finite())
+                {
+                    continue;
+                }
+                for row in 0..rho_dim {
+                    for col in 0..rho_dim {
+                        xtx[[row, col]] += drho_j[row] * drho_j[col];
+                    }
+                    for grad in 0..grad_dim {
+                        xty[[row, grad]] += drho_j[row] * dg_j[grad];
+                    }
+                }
+                fit_pairs += 1;
+            }
+            if fit_pairs == 0 {
+                continue;
+            }
+            let Ok(chol) = xtx.cholesky(Side::Lower) else {
+                continue;
+            };
+            chol.solve_mat_in_place(&mut xty);
+            let mut predicted = Array1::<f64>::zeros(grad_dim);
+            for grad in 0..grad_dim {
+                let mut value = 0.0;
+                for rho in 0..rho_dim {
+                    value += drho_i[rho] * xty[[rho, grad]];
+                }
+                predicted[grad] = value;
+            }
             let residual = dg_i - &predicted;
             let e0 = energy(&self.history[*left_idx]);
             let e1 = energy(&self.history[*left_idx + 1]);
@@ -346,10 +365,6 @@ impl HyperGradientBudget {
         let denom = ((fixed.len() - 1) * dim) as f64;
         let std = (variance_sum / denom).max(0.0).sqrt();
         (std.is_finite() && std > 0.0).then_some(std)
-    }
-
-    fn allocate(&self) -> (f64, f64, f64, [bool; 3]) {
-        self.allocate_with_sensitivities(self.s_inner, self.s_linear, self.s_trace)
     }
 
     fn allocate_with_sensitivities(
@@ -700,6 +715,8 @@ struct DerivativeContext {
 }
 
 impl<'a> RemlState<'a> {
+    const POLISH_NORM_RATIO: f64 = 0.25;
+
     fn hypergradient_owner_key(&self) -> usize {
         self as *const _ as usize
     }
@@ -843,7 +860,28 @@ impl<'a> RemlState<'a> {
             k,
         });
 
-        if state.budget.history.len() <= HGB_WARMUP_ITERS {
+        let sensitivity_estimate = state.budget.reestimate_sensitivities();
+        let sensitivity_stable = state.budget.sensitivities_stable();
+        let force_engage = state.budget.history.len() >= HGB_WARMUP_ITERS_MAX;
+        if !state.budget.warmup_engaged
+            && state.budget.history.len() >= HGB_WARMUP_ITERS_MIN
+            && (sensitivity_stable || force_engage)
+        {
+            if sensitivity_stable {
+                log::info!(
+                    "[HGB] engage after {} iters (sensitivity stable)",
+                    state.budget.history.len()
+                );
+            } else {
+                log::info!(
+                    "[HGB] engage after {} iters (max warmup reached)",
+                    state.budget.history.len()
+                );
+            }
+            state.budget.warmup_engaged = true;
+        }
+
+        if !state.budget.warmup_engaged {
             state.adaptive_kkt_override = None;
             match state.trace_state.lock() {
                 Ok(mut trace) => trace.solve_rel_tol_override = None,
@@ -855,21 +893,23 @@ impl<'a> RemlState<'a> {
             return;
         }
 
-        if !state.budget.reestimate_sensitivities() {
+        let [s_inner, s_linear, s_trace] = if let Some(sensitivities) = sensitivity_estimate {
+            sensitivities
+        } else {
             log::warn!("[HGB] sensitivity_unavailable falling_back_to_per_channel");
-            state.budget.s_inner = S_INNER_INIT;
-            state.budget.s_linear = S_LINEAR_INIT;
-            state.budget.s_trace = S_TRACE_INIT;
-        }
+            [S_INNER_INIT, S_LINEAR_INIT, S_TRACE_INIT]
+        };
 
         let previous_grad_norm = state.budget.previous_gradient_norm().max(1e-12);
         state.budget.target_mse = (HGB_TARGET_FRACTION * previous_grad_norm).powi(2);
-        let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state.budget.allocate();
+        let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state
+            .budget
+            .allocate_with_sensitivities(s_inner, s_linear, s_trace);
 
         let ceiling = self.config.pirls_convergence_tolerance;
         let pirls_floor =
             (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
-        let tau_raw = eps2_inner.sqrt() / state.budget.s_inner;
+        let tau_raw = eps2_inner.sqrt() / s_inner;
         let tau_inner = if pirls_floor > 0.0 && ceiling >= pirls_floor {
             tau_raw.clamp(pirls_floor, ceiling)
         } else {
@@ -879,7 +919,7 @@ impl<'a> RemlState<'a> {
         state.adaptive_kkt_override =
             (tau_inner.is_finite() && tau_inner > 0.0).then_some(tau_inner);
 
-        let rel_tol = eps2_linear.sqrt() / state.budget.s_linear;
+        let rel_tol = eps2_linear.sqrt() / s_linear;
         let k_target = if eps2_trace > 0.0 && sigma_sq.is_finite() && sigma_sq > 0.0 {
             (sigma_sq / eps2_trace).ceil().clamp(0.0, usize::MAX as f64) as usize
         } else {
@@ -907,9 +947,9 @@ impl<'a> RemlState<'a> {
         log::info!(
             "[HGB] target_mse={:.3e} s_i={:.3e} s_l={:.3e} s_t={:.3e} eps²_i={:.3e} eps²_l={:.3e} eps²_t={:.3e} τ={:.3e} rtol={:.3e} k={} floor_active=[{}]",
             state.budget.target_mse,
-            state.budget.s_inner,
-            state.budget.s_linear,
-            state.budget.s_trace,
+            s_inner,
+            s_linear,
+            s_trace,
             eps2_inner,
             eps2_linear,
             eps2_trace,
@@ -929,6 +969,19 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed)
             || solution_beta.len() != polish_step.len()
         {
+            return;
+        }
+        let polish_norm_squared = polish_step.dot(polish_step);
+        let beta_norm_squared = solution_beta.dot(solution_beta);
+        if !polish_norm_squared.is_finite()
+            || !beta_norm_squared.is_finite()
+            || polish_norm_squared > Self::POLISH_NORM_RATIO * beta_norm_squared
+        {
+            log::info!(
+                "[POLISH-SKIP] reason=large_step polish_norm²={} beta_norm²={}",
+                polish_norm_squared,
+                beta_norm_squared
+            );
             return;
         }
         let polished_solution_beta = solution_beta - polish_step;
