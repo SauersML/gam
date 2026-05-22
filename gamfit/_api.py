@@ -2337,6 +2337,10 @@ def gaussian_reml_fit_with_constraints_backward(
             float(grad_reml_score),
             float(grad_edf),
         )
+    except NotImplementedError:
+        # Preserve the contract surface from Rust: callers can rely on
+        # ``NotImplementedError`` for the deferred active-cert backward path.
+        raise
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
