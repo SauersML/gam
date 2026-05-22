@@ -4,6 +4,78 @@ use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Typed errors raised by the de-nested cubic transport kernel.
+///
+/// Sibling families (`bernoulli_marginal_slope`, `survival_marginal_slope`,
+/// `marginal_slope_shared`) currently consume the kernel's public surface via
+/// `Result<_, String>`. To stay source-compatible, the kernel converts errors
+/// to `String` at the boundary via `From<CubicCellKernelError> for String` and
+/// keeps the public function signatures returning `Result<_, String>`.
+/// `Display` is exact-byte-equivalent to the previous `format!(...)` strings.
+#[derive(Clone, Debug)]
+pub enum CubicCellKernelError {
+    /// Interval probe / cell-bounds preconditions (ordered bounds, supported
+    /// infinity patterns, positive finite width).
+    InvalidInterval { reason: String },
+    /// Cell-shape / branch-classification failure: tail cells not affine,
+    /// finite cells with non-positive width, non-finite affine coefficients,
+    /// non-affine cell with infinite bounds, leading-coefficient degeneracy
+    /// in the moment recurrence, etc.
+    InvalidCellShape { reason: String },
+    /// Reduced moment vector (or polynomial-convolution scratch) is shorter
+    /// than the polynomial degree the leaf needs to evaluate.
+    InsufficientMoments { reason: String },
+    /// Bivariate-normal CDF domain validation (non-finite/non-infinite
+    /// argument, non-finite correlation).
+    BivariateNormalDomain { reason: String },
+}
+
+impl std::fmt::Display for CubicCellKernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CubicCellKernelError::InvalidInterval { reason }
+            | CubicCellKernelError::InvalidCellShape { reason }
+            | CubicCellKernelError::InsufficientMoments { reason }
+            | CubicCellKernelError::BivariateNormalDomain { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for CubicCellKernelError {}
+
+impl From<CubicCellKernelError> for String {
+    fn from(err: CubicCellKernelError) -> String {
+        err.to_string()
+    }
+}
+
+impl CubicCellKernelError {
+    #[inline]
+    fn invalid_interval(reason: impl Into<String>) -> Self {
+        CubicCellKernelError::InvalidInterval {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn invalid_cell_shape(reason: impl Into<String>) -> Self {
+        CubicCellKernelError::InvalidCellShape {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn insufficient_moments(reason: impl Into<String>) -> Self {
+        CubicCellKernelError::InsufficientMoments {
+            reason: reason.into(),
+        }
+    }
+    #[inline]
+    fn bivariate_normal_domain(reason: impl Into<String>) -> Self {
+        CubicCellKernelError::BivariateNormalDomain {
+            reason: reason.into(),
+        }
+    }
+}
+
 // De-nested cubic transport kernel.
 //
 // This module implements the de-nested flexible-link/score-warp model
@@ -1433,9 +1505,10 @@ fn dedup_sorted_breakpoints(points: &mut Vec<f64>) {
 #[inline]
 pub fn interval_probe_point(left: f64, right: f64) -> Result<f64, String> {
     if !(left < right) {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_interval(format!(
             "interval probe requires ordered bounds, got [{left}, {right}]"
-        ));
+        ))
+        .into());
     }
     if left.is_finite() && right.is_finite() {
         Ok(0.5 * (left + right))
@@ -1446,9 +1519,10 @@ pub fn interval_probe_point(left: f64, right: f64) -> Result<f64, String> {
     } else if left.is_finite() && right == f64::INFINITY {
         Ok(left + 1.0)
     } else {
-        Err(format!(
+        Err(CubicCellKernelError::invalid_interval(format!(
             "interval probe requires finite bounds or full infinities, got [{left}, {right}]"
         ))
+        .into())
     }
 }
 
@@ -1500,9 +1574,10 @@ pub fn reduce_quartic_moments(
     let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
     let lead = d[3];
     if !lead.is_finite() || lead.abs() <= 1e-18 {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "quartic moment reduction requires nonzero leading coefficient, got {lead:.3e}"
-        ));
+        ))
+        .into());
     }
     let mut moments = vec![0.0; max_degree + 1];
     moments[0] = base_m0_m2[0];
@@ -1535,9 +1610,10 @@ pub fn reduce_sextic_moments(
     let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
     let lead = d[5];
     if !lead.is_finite() {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "sextic moment reduction encountered non-finite leading coefficient: {lead:.3e}"
-        ));
+        ))
+        .into());
     }
     if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
         if lower_branch == ExactCellBranch::Quartic {
@@ -1623,11 +1699,12 @@ pub fn cell_second_derivative_from_moments(
         + 3;
     let needed = second_degree.max(product_degree) + 1;
     if needed > moments.len() {
-        return Err(format!(
+        return Err(CubicCellKernelError::insufficient_moments(format!(
             "insufficient reduced moments for second derivative: need {}, have {}",
             needed,
             moments.len()
-        ));
+        ))
+        .into());
     }
     let second_term = moment_dot_with_coefficients_unchecked(second_coefficients_rs, moments);
     // Fold `Σ_{e,i,j} eta[e]·r[i]·s[j]·moments[e+i+j]` into a single dot
@@ -1659,11 +1736,12 @@ fn moment_dot_with_coefficients(
     label: &str,
 ) -> Result<f64, String> {
     if coefficients.len() > moments.len() {
-        return Err(format!(
+        return Err(CubicCellKernelError::insufficient_moments(format!(
             "insufficient reduced moments for {label}: need {}, have {}",
             coefficients.len(),
             moments.len()
-        ));
+        ))
+        .into());
     }
     Ok(moment_dot_with_coefficients_unchecked(
         coefficients,
@@ -1714,11 +1792,12 @@ fn require_moments_degree(
     label: &str,
 ) -> Result<(), String> {
     if required_degree >= moments.len() {
-        return Err(format!(
+        return Err(CubicCellKernelError::insufficient_moments(format!(
             "insufficient reduced moments for {label}: need {}, have {}",
             required_degree + 1,
             moments.len()
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
