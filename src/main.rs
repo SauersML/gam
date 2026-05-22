@@ -7885,11 +7885,17 @@ fn required_columns_for_survival(
     Ok(required.into_iter().collect())
 }
 
-fn load_dataset_projected(path: &Path, requested_columns: &[String]) -> Result<Dataset, String> {
+fn load_dataset_projected(
+    path: &Path,
+    requested_columns: &[String],
+) -> Result<Dataset, gam::inference::data::DataError> {
     load_dataset_auto_projected(path, requested_columns)
 }
 
-fn load_datasetwith_schema(path: &Path, schema: &DataSchema) -> Result<Dataset, String> {
+fn load_datasetwith_schema(
+    path: &Path,
+    schema: &DataSchema,
+) -> Result<Dataset, gam::inference::data::DataError> {
     load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
 }
 
