@@ -1,11 +1,12 @@
 """Differentiable basis, penalty, and closed-form ridge primitives for torch.
 
 These wrappers mirror the NumPy entry points in :mod:`gamfit._api`. The
-basis evaluators ``bspline_basis`` and ``duchon_basis_1d`` carry an analytic
-backward with respect to ``t`` implemented through :class:`torch.autograd.Function`
-subclasses; the derivative evaluators, penalty constructor, and closed-form
-ridge solves are forward-only and produced via the detach-cast-call-numpy-wrap
-path in :mod:`gamfit.torch._coerce`.
+basis evaluators ``bspline_basis`` and ``duchon_basis`` carry an analytic
+backward with respect to ``t`` (resp. ``points``) implemented through
+:class:`torch.autograd.Function` subclasses; the derivative evaluators,
+penalty constructor, and closed-form ridge solves are forward-only and
+produced via the detach-cast-call-numpy-wrap path in
+:mod:`gamfit.torch._coerce`.
 """
 
 from __future__ import annotations
@@ -86,12 +87,12 @@ class _BsplineBasisFn(torch.autograd.Function):
 
 
 class _DuchonBasisFn(torch.autograd.Function):
-    """Autograd Function evaluating the Rust multi-dim Duchon basis with grad wrt ``points``.
+    """Autograd Function evaluating the Rust multi-dim Duchon basis.
 
-    For 1D inputs (``points.shape == (N,)`` or ``(N, 1)``), the backward uses
-    the same `duchon_basis_1d_derivative` engine path the legacy 1D Function
-    used. For d > 1, gradient wrt points is not implemented yet (will route
-    through the engine VJP once the multi-dim derivative is exposed).
+    Forward-only with respect to ``points``: the multi-dim derivative basis
+    is not yet exposed by the Rust binding, so backward returns ``None`` for
+    every input. Callers needing gradients through ``points`` should compose
+    with autograd-supported primitives upstream.
     """
 
     @staticmethod
@@ -107,33 +108,12 @@ class _DuchonBasisFn(torch.autograd.Function):
         basis_np = _api.duchon_basis(
             pts_np, centers_np, m=m, periodic_per_axis=periodic_per_axis,
         )
-        ctx.save_for_backward(points, centers)
-        ctx.m = m
-        ctx.periodic_per_axis = periodic_per_axis
-        ctx.input_d = pts_np.shape[1] if pts_np.ndim == 2 else 1
         return from_numpy_like(basis_np, points)
 
     @staticmethod
     def backward(
         ctx: Any, *grad_outputs: torch.Tensor
-    ) -> tuple[torch.Tensor | None, None, None, None]:
-        (grad_basis,) = grad_outputs
-        points, centers = ctx.saved_tensors
-        if ctx.input_d == 1:
-            # 1D path uses the analytic derivative basis.
-            per = bool(ctx.periodic_per_axis[0]) if ctx.periodic_per_axis else False
-            pts_1d = points.reshape(-1) if points.dim() == 2 else points
-            ctrs_1d = centers.reshape(-1) if centers.dim() == 2 else centers
-            deriv_np = _api.duchon_basis_1d_derivative(
-                to_numpy_f64(pts_1d), to_numpy_f64(ctrs_1d),
-                m=ctx.m, order=1, periodic=per,
-            )
-            deriv = from_numpy_like(deriv_np, points)
-            grad_t = (grad_basis.to(dtype=deriv.dtype) * deriv).sum(dim=-1)
-            if points.dim() == 2:
-                grad_t = grad_t.reshape(points.shape)
-            return grad_t, None, None, None
-        # Multi-dim grad-through-points not yet implemented.
+    ) -> tuple[None, None, None, None]:
         return None, None, None, None
 
 
@@ -266,49 +246,6 @@ def duchon_basis(
     apply = cast(Callable[..., torch.Tensor], _DuchonBasisFn.apply)
     periodic_tuple = None if periodic_per_axis is None else tuple(bool(p) for p in periodic_per_axis)
     return apply(points, centers_t, int(m), periodic_tuple)
-
-
-def duchon_basis_1d_derivative(
-    t: torch.Tensor,
-    centers: Any = None,
-    *,
-    m: int = 2,
-    order: int = 1,
-    periodic: bool = False,
-) -> torch.Tensor:
-    """Evaluate derivatives of the 1-D Duchon basis at ``t``.
-
-    Forward-only: the returned tensor does not carry a backward through ``t``.
-    Callers needing a differentiable basis should use ``duchon_basis_1d`` and
-    rely on autograd.
-
-    Parameters
-    ----------
-    t : torch.Tensor
-        Evaluation locations of shape ``(n_t,)``.
-    centers : torch.Tensor
-        Center locations.
-    m : int, optional
-        Duchon smoothness order. Default ``2``.
-    order : int, optional
-        Derivative order. Default ``1``.
-    periodic : bool, optional
-        Whether to evaluate the periodic variant. Default ``False``.
-
-    Returns
-    -------
-    torch.Tensor
-        Derivative basis matrix of shape ``(n_t, n_basis)``.
-    """
-    centers_t = _resolve_centers_tensor(t, centers)
-    deriv = _api.duchon_basis_1d_derivative(
-        to_numpy_f64(t),
-        to_numpy_f64(centers_t),
-        m=int(m),
-        order=int(order),
-        periodic=bool(periodic),
-    )
-    return from_numpy_like(deriv, t)
 
 
 def smoothness_penalty(
