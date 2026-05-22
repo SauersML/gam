@@ -1429,7 +1429,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         compute_inference: true,
         max_iter: 200,
         tol: 1e-7,
-        nullspace_dims: vec![],
+        nullspace_dims: vec![0; s_list.len()],
         linear_constraints: None,
         firth_bias_reduction: false,
         adaptive_regularization: None,
@@ -1477,7 +1477,9 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     let out = PyDict::new(py);
     out.set_item("coefficients", coefficients_2d.into_pyarray(py))?;
     out.set_item("fitted", fitted_2d.into_pyarray(py))?;
+    let log_lambdas_arr: ndarray::Array1<f64> = lambdas.mapv(|v| v.max(1e-300).ln());
     out.set_item("lambdas", lambdas.into_pyarray(py))?;
+    out.set_item("log_lambdas", log_lambdas_arr.into_pyarray(py))?;
     out.set_item("reml_score", fit.reml_score)?;
     out.set_item("edf", edf_arr.into_pyarray(py))?;
     out.set_item(
