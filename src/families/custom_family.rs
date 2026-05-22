@@ -15529,6 +15529,7 @@ fn joint_outer_evaluate(
             .as_ref()
             .map(|bundle| bundle.coords.len())
             .unwrap_or(0);
+    let has_penalty_subspace_trace = penalty_subspace_trace.is_some();
 
     let (objective, grad, outer_hessian) = unified_joint_cost_gradient(
         inner,
@@ -15556,11 +15557,7 @@ fn joint_outer_evaluate(
         // soon-discarded first-order trace calls. The projected-subspace
         // trace path is left untouched because the Hessian shares that
         // kernel and it is not routed through HessianOperator trace methods.
-        if penalty_subspace_trace.is_none() {
-            first_order_trace_skip
-        } else {
-            None
-        },
+        if has_penalty_subspace_trace { None } else { first_order_trace_skip },
     )?;
     if !objective.is_finite() {
         log::warn!(
@@ -17537,6 +17534,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             Some(owned_compute_d2h),
             None,
             ext_bundle,
+            None,
             custom_family_batched_outer_hessian_operator(
                 family,
                 synced_joint_states.as_ref(),
@@ -17570,6 +17568,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // replaced. See `BatchedOuterGradientTerms`.
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let mut batched_gradient_override: Option<Array1<f64>> = None;
+    let mut batched_first_order_trace_skip: Option<Array1<f64>> = None;
     if !has_configured_rho_prior
         && (eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian)
     {
@@ -17662,6 +17661,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             None,
                             None,
                             None,
+                            None,
                         )?;
                         // Assemble the gradient via the universal three-term formula:
                         //   grad[k] = obj_θ[k] + 0.5 * tr(H⁻¹ Ḣ_k) - 0.5 * tr(S⁺ Ṡ_k).
@@ -17713,6 +17713,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         gradient[j] = batch.objective_theta[j] + trace_term - det_term;
                     }
                     batched_gradient_override = Some(gradient);
+                    batched_first_order_trace_skip =
+                        include_logdet_h.then(|| batch.trace_h_inv_hdot.clone());
                 }
             }
         }
@@ -17774,6 +17776,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             owned_compute_d2h,
             owned_compute_d2h_many,
             None, // no ext_coords when psi_dim == 0
+            if batched_gradient_override.is_some() && eval_mode == EvalMode::ValueGradientHessian {
+                batched_first_order_trace_skip.take()
+            } else {
+                None
+            },
             custom_family_batched_outer_hessian_operator(
                 family,
                 &inner.block_states,
@@ -18083,6 +18090,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         None,
         None,
         None, // no ext_coords for generic single-block fallback
+        None,
         custom_family_batched_outer_hessian_operator(
             family,
             &inner.block_states,

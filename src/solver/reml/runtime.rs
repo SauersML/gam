@@ -36,6 +36,8 @@ const HGB_TRACE_FLOOR: f64 = 1e-12;
 const HGB_HISTORY_CAP: usize = 10;
 const HGB_WARMUP_ITERS: usize = 3;
 const HGB_TARGET_FRACTION: f64 = 0.1;
+// Treat log-lambda finite differences as local only up to a 1.0 log-scale step.
+const HGB_FD_DRHO_MAX_SQUARED: f64 = 1.0;
 const S_INNER_INIT: f64 = 1.0;
 const S_LINEAR_INIT: f64 = 1.0;
 const S_TRACE_INIT: f64 = 1.0;
@@ -169,9 +171,11 @@ impl HyperGradientBudget {
             }
             let drho = &b.rho - &a.rho;
             let dg = &b.g_outer - &a.g_outer;
+            let drho_norm_squared = drho.dot(&drho);
             if drho.iter().all(|v| v.is_finite())
                 && dg.iter().all(|v| v.is_finite())
-                && drho.dot(&drho) > 0.0
+                && drho_norm_squared > 0.0
+                && drho_norm_squared <= HGB_FD_DRHO_MAX_SQUARED
             {
                 pairs.push((drho, dg, i));
             }
@@ -714,7 +718,12 @@ impl<'a> RemlState<'a> {
         let polished_solution_beta = solution_beta - polish_step;
         let pirls_result = bundle.pirls_result.as_ref();
         let beta_original = match pirls_result.coordinate_frame {
-            pirls::PirlsCoordinateFrame::OriginalSparseNative => polished_solution_beta,
+            pirls::PirlsCoordinateFrame::OriginalSparseNative => {
+                if self.active_constraint_free_basis(pirls_result).is_some() {
+                    return;
+                }
+                polished_solution_beta
+            }
             pirls::PirlsCoordinateFrame::TransformedQs => {
                 if self.active_constraint_free_basis(pirls_result).is_some()
                     || polished_solution_beta.len() != self.p

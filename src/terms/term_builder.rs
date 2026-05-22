@@ -283,6 +283,35 @@ pub fn build_termspec(
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut inner_options = options.clone();
                 let by_name = inner_options.remove("by");
+                // Pop shape= before passing options to build_smooth_basis so
+                // the per-type validate_known_options doesn't reject it. The
+                // formula DSL accepts `s(x, shape=<kind>)` where <kind> is one
+                // of monotone_increasing / monotone_decreasing / convex /
+                // concave (case-insensitive, hyphens or underscores accepted).
+                let shape = match inner_options.remove("shape") {
+                    None => ShapeConstraint::None,
+                    Some(raw) => {
+                        let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
+                        match norm.as_str() {
+                            "none" | "" => ShapeConstraint::None,
+                            "monotone_increasing" | "increasing" | "mono_inc" | "mpi" => {
+                                ShapeConstraint::MonotoneIncreasing
+                            }
+                            "monotone_decreasing" | "decreasing" | "mono_dec" | "mpd" => {
+                                ShapeConstraint::MonotoneDecreasing
+                            }
+                            "convex" | "cvx" => ShapeConstraint::Convex,
+                            "concave" | "ccv" => ShapeConstraint::Concave,
+                            other => {
+                                return Err(TermBuilderError::invalid_option(format!(
+                                    "smooth option `shape={other}` is not recognized; expected one of \
+                                     monotone_increasing, monotone_decreasing, convex, concave, none"
+                                ))
+                                .to_string());
+                            }
+                        }
+                    }
+                };
                 let mut basis = build_smooth_basis(
                     *kind,
                     vars,
@@ -336,7 +365,7 @@ pub fn build_termspec(
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
-                    shape: ShapeConstraint::None,
+                    shape,
                 });
             }
             ParsedTerm::LinkWiggle { .. }

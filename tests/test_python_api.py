@@ -921,3 +921,53 @@ def test_geometric_smooths_round_trip_via_python_binding(formula: str) -> None:
         f"NaN/Inf in interval for {formula!r}"
     assert (lo <= mean + 1e-9).all() and (mean <= hi + 1e-9).all(), \
         f"point estimate outside CI for {formula!r}"
+
+
+def test_duchon_function_norm_penalty_2d_smoke() -> None:
+    """Multi-D (d=2) Duchon function-norm penalty matrix builds + is symmetric PSD."""
+    centers = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+        dtype=float,
+    )
+    s = gamfit.duchon_function_norm_penalty(centers=centers, m=2)
+    s = np.asarray(s, dtype=float)
+    assert s.shape == (3, 3), f"expected (3, 3) penalty, got {s.shape}"
+    # Symmetry.
+    assert np.allclose(s, s.T, atol=1e-10), "penalty must be symmetric"
+    # PSD: smallest eigenvalue is >= ~0 (small slack for floating point).
+    w = np.linalg.eigvalsh(0.5 * (s + s.T))
+    assert w.min() > -1e-8, f"penalty not PSD; min eigenvalue {w.min()}"
+
+
+def test_duchon_function_norm_penalty_2d_periodic_per_axis() -> None:
+    """Per-axis periodicity for d=2 Duchon: gated by the Rust core (d=1 only)."""
+    centers = np.array(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=float,
+    )
+    # The underlying Rust path `build_periodic_duchon_basis_1d` rejects
+    # ncols != 1, so multi-D periodicity is not yet supported.
+    pytest.skip("Rust core doesn't yet support multi-D periodic Duchon")
+    _ = gamfit.duchon_function_norm_penalty(
+        centers=centers,
+        m=2,
+        periodic_per_axis=(True, False),
+    )
+
+
+def test_per_smooth_lambda_not_in_torch_additive_pending_rust_refactor() -> None:
+    # The torch additive REML path is structurally single-λ because the
+    # closed-form Gaussian REML kernel in
+    # crates/gam-core/src/solver/gaussian_reml.rs only handles one scalar λ.
+    # Per-smooth λ requires extending that Rust kernel to multi-block
+    # (multi-d outer optimisation + analytic VJP through the F×F Hessian +
+    # per-block eigendecomposition routing). This test tracks the gap.
+    #
+    # delete this test when the multi-block closed-form REML kernel ships
+    from gamfit.torch._multi_lambda_status import MULTI_LAMBDA_SUPPORTED
+
+    assert MULTI_LAMBDA_SUPPORTED is False, (
+        "Torch additive REML now claims per-smooth λ support; "
+        "remove this placeholder test and update the docstrings in "
+        "gamfit/torch/_reml.py and gamfit/torch/_multi_lambda_status.py."
+    )
