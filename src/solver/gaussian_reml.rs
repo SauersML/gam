@@ -16,10 +16,8 @@ use std::sync::Once;
 /// gradients of the correct shape: this is the statistically correct
 /// "shrink-out" gradient — when `λ` has saturated, the atom is unused, so
 /// every input's contribution to the loss is zero in the limit.
-#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
 static ILL_CONDITIONED_BACKWARD_WARNED: Once = Once::new();
 
-#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
 fn warn_ill_conditioned_backward_once(p: usize, d: usize, condition_number: f64) {
     ILL_CONDITIONED_BACKWARD_WARNED.call_once(|| {
         eprintln!(
@@ -31,7 +29,6 @@ fn warn_ill_conditioned_backward_once(p: usize, d: usize, condition_number: f64)
     });
 }
 
-#[allow(dead_code, reason = "graceful-degradation backward helper, not yet wired")]
 fn zero_backward_result(n: usize, p: usize, d: usize) -> GaussianRemlBackwardResult {
     GaussianRemlBackwardResult {
         grad_x: Array2::<f64>::zeros((n, p)),
