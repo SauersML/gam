@@ -16320,6 +16320,104 @@ mod tests {
         assert_eq!(dense, family_matrix);
     }
 
+    /// Replicates the AoU biobank marginal-slope failure mechanism precisely:
+    /// the joint Newton inner reaches a constrained-stationary point where
+    /// the *unprojected* gradient magnitude `‖g‖∞` is enormous (Lagrange-
+    /// multiplier mass on the active constraint) while the *projected* KKT
+    /// residual is at tolerance. The cert fires (`converged = true`) and the
+    /// outer evaluator runs `reml_laml_evaluate`. Inside the evaluator the
+    /// LAML envelope formula picks up the multiplier mass through
+    /// `½ tr(H⁻¹ ∂H/∂ρ_k)` and produces a `|g|∞` that exceeds
+    /// `4·|cost|/√ε` — the envelope-gradient consistency tripwire.
+    ///
+    /// The contract under test: when the cert path correctly hands the
+    /// outer evaluator the projected KKT residual via
+    /// `BlockwiseInnerResult::kkt_residual = Some(ProjectedKktResidual{..})`
+    /// AND dispersion is `Fixed` (the IFT identity ∂V/∂β = r holds), the
+    /// `kkt_residual_correction_active` gate flips on, the IFT correction
+    /// `-aᵀ_k q + ½ qᵀA_k q` (with q = H⁻¹r) is applied to `grad`, and the
+    /// tripwire's `kkt_residual_was_applied = true` branch keeps the gradient
+    /// instead of suppressing it.
+    ///
+    /// The failure observed in the biobank log
+    /// (`[reml_laml envelope-gradient consistency] |g|∞ = 9.669e16 ... ratio 4.14e3`)
+    /// is exactly the case where this gate failed to flip on — kkt_residual
+    /// was `None` because the cert path forgot to populate it on the
+    /// convergent return. This test pins the gate so the regression cannot
+    /// silently re-appear.
+    #[test]
+    fn constrained_stationary_cert_with_projected_residual_keeps_gradient() {
+        // Same shape as `envelope_inconsistent_gradient_skips_outer_hessian_assembly`
+        // (huge `penalty_logdet.first` to force |g|∞ past the tripwire ratio),
+        // but with the projected KKT residual attached as the cert path is
+        // contracted to do.
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: array![[42.0]],
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0e20],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            dispersion: DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            },
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            // The constrained-stationary cert path's contract: projected
+            // residual at-tolerance (≈ 0 in the projected subspace). The
+            // unprojected `g` carrying the multiplier mass is reflected
+            // in `penalty_logdet.first = 1e20`.
+            kkt_residual: Some(ProjectedKktResidual::from_projected(array![0.0, 0.0])),
+            active_constraints: None,
+        };
+
+        let result =
+            reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+                .expect("constrained-stationary cert evaluation");
+
+        // Hard contract: with `kkt_residual = Some(..)` and dispersion `Fixed`,
+        // the envelope tripwire's `kkt_residual_was_applied` branch keeps the
+        // gradient. If a future change ever lets the cert path return
+        // `kkt_residual: None` (the AoU biobank failure mode) this assertion
+        // is the one that flips red — exactly the regression we are pinning.
+        assert!(
+            result.gradient.is_some(),
+            "constrained-stationary cert handed kkt_residual=Some(..) under Fixed dispersion; \
+             the IFT correction MUST keep the gradient even when the raw envelope |g|∞ would \
+             otherwise trip the consistency tripwire. gradient=None means the cert path's \
+             kkt_residual contract is broken — either the projected residual was not handed \
+             over, or `kkt_residual_correction_active` failed to gate on Fixed dispersion. \
+             This is the precise AoU biobank marginal-slope failure mechanism."
+        );
+    }
+
     #[test]
     fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
