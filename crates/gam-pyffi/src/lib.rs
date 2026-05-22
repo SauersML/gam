@@ -5589,9 +5589,12 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
             ("Survival location-scale", "survival location-scale", true)
         }
         FitRequest::SurvivalTransformation(request) => {
-            let cause_count =
-                gam::survival::cause_count_from_event_codes(request.spec.event_target.view())
-                    .map_err(|err| py_value_error(err.to_string()))?;
+            // cause_count is Result<usize, SurvivalError>; on error fall through
+            // to the non-competing-risks branches (display-only path).
+            let cause_count = gam::survival::cause_count_from_event_codes(
+                request.spec.event_target.view(),
+            )
+            .unwrap_or(1);
             if cause_count > 1 {
                 ("Cause-specific survival", "competing risks survival", true)
             } else {
