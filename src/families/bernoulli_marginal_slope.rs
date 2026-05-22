@@ -225,20 +225,6 @@ impl EmpiricalZGrid {
         Ok(Self { nodes, weights })
     }
 
-    /// Number of (node, weight) pairs. Always agrees for both vectors by
-    /// invariant; the helper exists so call sites do not have to pick which
-    /// length to read.
-    #[inline]
-    pub fn len(&self) -> usize {
-        debug_assert_eq!(self.nodes.len(), self.weights.len());
-        self.nodes.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Iterate over co-indexed `(node, weight)` pairs. Use this instead of
     /// reading `.nodes`/`.weights` separately whenever a loop wants both
     /// arrays in lockstep — eliminates the chance of mismatched indexing.
