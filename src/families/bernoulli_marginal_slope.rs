@@ -9377,53 +9377,21 @@ impl BernoulliMarginalSlopeFamily {
             // derivative order. Degree-9 moments are exact for gradient-only
             // calls too, and avoiding a second degree-3 cell sweep preserves
             // the same calculus with less work.
-            let owned_cells;
-            let cached_cells: Vec<(
-                exact::DenestedPartitionCell,
-                std::borrow::Cow<'_, exact::CellDerivativeMomentState>,
-            )> = if let Some(cached) = row_cell_moments {
-                debug_assert!(
-                    !cached.is_empty(),
-                    "row cell moments bundle was selected but row {row} has no cells"
-                );
-                cached
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state),
-                        )
-                    })
-                    .collect()
-            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
-                cached
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state),
-                        )
-                    })
-                    .collect()
-            } else {
-                owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-                owned_cells
-                    .into_iter()
-                    .map(|partition_cell| {
-                        let degree = if need_hessian { 9 } else { 3 };
-                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, degree)
-                            .map(|state| (partition_cell, std::borrow::Cow::Owned(state)))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?
-            };
-            for (partition_cell, state) in cached_cells {
+            //
+            // Three source arms (bundle / per-row degree-9 cache / on-demand
+            // build) feed the same per-cell body. To avoid materialising a
+            // `Vec<(PartitionCell, Cow<...>)>` just to iterate it once, the
+            // body is hoisted into a closure and each arm dispatches the
+            // closure across its own iterator in place.
+            let mut process_cell = |partition_cell: exact::DenestedPartitionCell,
+                                    state: &exact::CellDerivativeMomentState|
+             -> Result<(), String> {
                 coeff_u.fill([0.0; 4]);
                 coeff_au.fill([0.0; 4]);
                 coeff_bu.fill([0.0; 4]);
                 let cell = partition_cell.cell;
                 let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
                 let u_mid = a + b * z_mid;
-                let state: &exact::CellDerivativeMomentState = &state;
                 let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
@@ -9552,6 +9520,29 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                     }
+                }
+                Ok(())
+            };
+
+            if let Some(cached) = row_cell_moments {
+                debug_assert!(
+                    !cached.is_empty(),
+                    "row cell moments bundle was selected but row {row} has no cells"
+                );
+                for entry in cached.iter() {
+                    process_cell(entry.partition_cell, &entry.state)?;
+                }
+            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
+                for entry in cached.iter() {
+                    process_cell(entry.partition_cell, &entry.state)?;
+                }
+            } else {
+                let owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+                let degree = if need_hessian { 9 } else { 3 };
+                for partition_cell in owned_cells {
+                    let state =
+                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, degree)?;
+                    process_cell(partition_cell, &state)?;
                 }
             }
         }

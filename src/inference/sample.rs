@@ -211,12 +211,13 @@ fn validate_explicit_link_wiggle_joint_hessian(
 }
 
 fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> Option<f64> {
-    match family {
-        LikelihoodFamily::GammaLog => fit
-            .likelihood_scale
+    let spec: crate::types::LikelihoodSpec = family.into();
+    if matches!(spec.response, crate::types::ResponseFamily::Gamma) {
+        fit.likelihood_scale
             .gamma_shape()
-            .or(Some(fit.standard_deviation)),
-        _ => Some(fit.standard_deviation),
+            .or(Some(fit.standard_deviation))
+    } else {
+        Some(fit.standard_deviation)
     }
 }
 

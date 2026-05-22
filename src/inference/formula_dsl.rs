@@ -766,13 +766,11 @@ pub fn require_linkchoice_supports_joint_wiggle(
 }
 
 pub fn likelihood_family_supports_joint_wiggle(family: LikelihoodFamily) -> bool {
-    !matches!(
-        family,
-        LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-    )
+    let spec: crate::types::LikelihoodSpec = family.into();
+    !(spec.is_latent_cloglog()
+        || spec.is_binomial_sas()
+        || spec.is_binomial_beta_logistic()
+        || spec.is_binomial_mixture())
 }
 
 pub fn require_likelihood_family_supports_joint_wiggle(
