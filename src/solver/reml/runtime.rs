@@ -13,8 +13,8 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
 use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const TK_BLOCK_SIZE: usize = 128;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
@@ -22,10 +22,37 @@ const TK_MAX_COEFFICIENTS: usize = 2_000;
 const ADAPTIVE_KKT_ETA: f64 = 0.1;
 const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
 const TK_MAX_DENSE_WORK: usize = 5_000_000;
+// `n * p` catches bam-shaped tall designs while avoiding small-n wide problems.
+const LARGE_N_EFS_THRESHOLD: f64 = 1.0e8;
+const EFS_SINGLE_LOOP_PIRLS_SWEEPS: usize = 2;
+const EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL: usize = usize::MAX / 4;
+// Bail after 3 consecutive iterations whose surrogate/partial-inner drift is >= 10%.
+const EFS_SINGLE_LOOP_BIAS_THRESHOLD: f64 = 0.10;
+const EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT: usize = 3;
+
+#[derive(Default)]
+struct EfsSingleLoopBiasGuardState {
+    owner: usize,
+    consecutive: usize,
+}
+
+static EFS_SINGLE_LOOP_BIAS_GUARD: OnceLock<Mutex<EfsSingleLoopBiasGuardState>> = OnceLock::new();
 
 #[inline]
 fn compute_gradient_for_tk(mode: super::unified::EvalMode) -> bool {
     mode != super::unified::EvalMode::ValueOnly
+}
+
+#[inline]
+fn efs_single_loop_encoded_cap() -> usize {
+    EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL + EFS_SINGLE_LOOP_PIRLS_SWEEPS
+}
+
+#[inline]
+fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
+    (raw_cap >= EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
+        .then_some(raw_cap - EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
+        .filter(|cap| *cap > 0)
 }
 
 /// Apply the screening residual penalty to a cost.
@@ -182,7 +209,85 @@ struct DerivativeContext {
 }
 
 impl<'a> RemlState<'a> {
+    #[inline]
+    fn large_n_efs_single_loop_lane(&self) -> bool {
+        (self.x.nrows() as f64) * (self.x.ncols() as f64) > LARGE_N_EFS_THRESHOLD
+    }
+
+    #[inline]
+    fn efs_single_loop_cap_active(&self) -> bool {
+        decode_efs_single_loop_cap(self.outer_inner_cap.load(Ordering::Relaxed)).is_some()
+    }
+
+    fn record_efs_single_loop_bias(
+        &self,
+        rho: &Array1<f64>,
+        diagnostics: super::unified::EfsSingleLoopDiagnostics,
+    ) -> Result<(), EstimationError> {
+        if !self.efs_single_loop_cap_active() {
+            return Ok(());
+        }
+
+        let owner = self as *const _ as usize;
+        let guard = EFS_SINGLE_LOOP_BIAS_GUARD
+            .get_or_init(|| Mutex::new(EfsSingleLoopBiasGuardState::default()));
+        let mut state = guard.lock().unwrap();
+        if state.owner != owner {
+            state.owner = owner;
+            state.consecutive = 0;
+        }
+
+        if diagnostics.bias_proxy >= EFS_SINGLE_LOOP_BIAS_THRESHOLD {
+            state.consecutive = state.consecutive.saturating_add(1);
+        } else {
+            state.consecutive = 0;
+        }
+
+        log::info!(
+            "[EFS-single-loop] bias_proxy={:.3e} gradient_residual={:.3e} inner_residual={:.3e} \
+             |g|={:.3e} |step|inf={:.3e} consecutive={}/{} rho[..4]=[{}]",
+            diagnostics.bias_proxy,
+            diagnostics.gradient_residual,
+            diagnostics.inner_residual,
+            diagnostics.gradient_norm,
+            diagnostics.step_inf_norm,
+            state.consecutive,
+            EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT,
+            rho.iter()
+                .take(4)
+                .map(|v| format!("{v:.3}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+
+        if state.consecutive >= EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT {
+            state.consecutive = 0;
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "{} EFS single-loop bias guard fired: bias_proxy={:.3e} \
+                 threshold={:.3e} consecutive_limit={} rho_dim={}",
+                crate::solver::outer_strategy::EFS_FIRST_ORDER_FALLBACK_MARKER,
+                diagnostics.bias_proxy,
+                EFS_SINGLE_LOOP_BIAS_THRESHOLD,
+                EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT,
+                rho.len(),
+            )));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
+        if self.large_n_efs_single_loop_lane() {
+            log::info!(
+                "[EFS-single-loop] large-n lane engaged: n={} p={} n*p={:.3e} threshold={:.3e}; \
+                 declining analytic outer Hessian so the EFS fixed-point route runs first",
+                self.x.nrows(),
+                self.x.ncols(),
+                (self.x.nrows() as f64) * (self.x.ncols() as f64),
+                LARGE_N_EFS_THRESHOLD,
+            );
+            return false;
+        }
         // The Tierney-Kadane fallback gate is no longer needed: the analytic
         // TK value, first ρ-derivative, AND second ρ-derivative paths are
         // implemented in `tierney_kadane_terms`, which now populates the
@@ -4224,7 +4329,10 @@ impl<'a> RemlState<'a> {
         // a budget. Driven by the outer optimizer to coarsen early-iter
         // inner solves when ρ is far from converged. Both caps are honored
         // jointly via `min` when both are nonzero.
-        let outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
+        let raw_outer_cap = self.outer_inner_cap.load(Ordering::Relaxed);
+        let efs_single_loop_cap = decode_efs_single_loop_cap(raw_outer_cap);
+        let in_efs_single_loop = efs_single_loop_cap.is_some();
+        let outer_cap = efs_single_loop_cap.unwrap_or(raw_outer_cap);
 
         // Run P-IRLS with original matrices to perform fresh reparameterization
         // The returned result will include the transformation matrix qs.
@@ -4409,7 +4517,7 @@ impl<'a> RemlState<'a> {
         // partial mode. Skip the certificate so the seed can still be ranked
         // by an approximate cost; the actual fit (full inner budget) will
         // certify KKT later.
-        if !in_screening {
+        if !in_screening && !in_efs_single_loop {
             self.enforce_constraint_kkt(pirls_result.as_ref())?;
         }
 
@@ -4633,6 +4741,32 @@ impl<'a> RemlState<'a> {
                     pirls::PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
                     _ => "max iterations reached",
                 };
+                if in_efs_single_loop
+                    && pirls_result.deviance.is_finite()
+                    && pirls_result.stable_penalty_term.is_finite()
+                    && pirls_result.gradient_natural_scale.is_finite()
+                    && pirls_result.lastgradient_norm.is_finite()
+                    && pirls_result
+                        .beta_transformed
+                        .0
+                        .iter()
+                        .all(|v| v.is_finite())
+                {
+                    log::info!(
+                        "[EFS-single-loop] accepted partial PIRLS sweep: {kind} \
+                         (cap={} |g_beta|={:.3e} r_g={:.3e} iter={})",
+                        efs_single_loop_cap.unwrap_or(outer_cap),
+                        pirls_result.lastgradient_norm,
+                        pirls_result.relative_gradient_norm(),
+                        pirls_result.iteration,
+                    );
+                    self.updatewarm_start_from(pirls_result.as_ref());
+                    self.record_warm_start_rho(rho);
+                    self.last_inner_iters
+                        .store(pirls_result.iteration, Ordering::Relaxed);
+                    self.last_inner_converged.store(false, Ordering::Relaxed);
+                    return Ok(pirls_result);
+                }
                 // Seed screening's purpose is to rank candidate seeds by an
                 // approximate cost. Requiring full KKT-style convergence under
                 // a 3-iteration cap would discard all informative seeds, so
@@ -6637,6 +6771,14 @@ impl<'a> RemlState<'a> {
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
             );
+            let diagnostics = super::unified::efs_single_loop_diagnostics(
+                &inner_solution,
+                rho.as_slice().unwrap(),
+                gradient.as_slice().unwrap(),
+                &hybrid.steps,
+                bundle.pirls_result.relative_gradient_norm(),
+            );
+            self.record_efs_single_loop_bias(rho, diagnostics)?;
             let psi_gradient = if hybrid.psi_indices.is_empty() {
                 None
             } else {
@@ -6661,6 +6803,14 @@ impl<'a> RemlState<'a> {
                 rho.as_slice().unwrap(),
                 gradient.as_slice().unwrap(),
             );
+            let diagnostics = super::unified::efs_single_loop_diagnostics(
+                &inner_solution,
+                rho.as_slice().unwrap(),
+                gradient.as_slice().unwrap(),
+                &steps,
+                bundle.pirls_result.relative_gradient_norm(),
+            );
+            self.record_efs_single_loop_bias(rho, diagnostics)?;
             crate::solver::outer_strategy::EfsEval {
                 cost: cost_result.cost,
                 steps,
@@ -6809,6 +6959,24 @@ impl<'a> RemlState<'a> {
     /// This is the entry point called by the EFS branch of `run_outer` via
     /// the `OuterObjective::eval_efs` method.
     pub fn compute_efs_steps(
+        &self,
+        p: &Array1<f64>,
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        if self.large_n_efs_single_loop_lane() {
+            self.cache_manager.invalidate_eval_bundle();
+            let previous_cap = self
+                .outer_inner_cap
+                .swap(efs_single_loop_encoded_cap(), Ordering::Relaxed);
+            let result = self.compute_efs_steps_inner(p);
+            self.outer_inner_cap.store(previous_cap, Ordering::Relaxed);
+            self.cache_manager.invalidate_eval_bundle();
+            return result;
+        }
+
+        self.compute_efs_steps_inner(p)
+    }
+
+    fn compute_efs_steps_inner(
         &self,
         p: &Array1<f64>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
