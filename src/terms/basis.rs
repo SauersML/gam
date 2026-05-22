@@ -19298,6 +19298,324 @@ fn build_periodic_duchon_basis_1d(
     })
 }
 
+/// Per-pair generalized distance for the mixed-periodicity Duchon basis.
+///
+/// For each axis ``j``:
+///   * **periodic** axis with period ``P_j``: ``d_j(x, y) = (P_j / π) · sin(π·(x − y)/P_j)``,
+///     the chord distance on the circle of circumference ``P_j``. The chord
+///     metric recovers the Euclidean limit ``d_j → x − y`` as ``P_j → ∞`` and
+///     is invariant under the periodic identification ``x ≡ x + P_j``.
+///   * **non-periodic** axis: ``d_j(x, y) = x − y``.
+///
+/// Then ``r = sqrt(Σ d_j²)``. This is the cylinder/torus "extrinsic chord"
+/// distance — the same metric used implicitly by the spherical S² basis when
+/// embedding in ℝ³. The radial polyharmonic kernel φ(r) defined on this
+/// distance yields a positive-definite kernel on the mixed-periodicity
+/// product manifold whose nullspace contains the constant function.
+#[inline]
+fn duchon_mixed_periodicity_distance(
+    x: ArrayView1<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+) -> f64 {
+    let d = x.len();
+    debug_assert_eq!(d, y.len());
+    debug_assert_eq!(d, periodic_per_axis.len());
+    debug_assert_eq!(d, periods.len());
+    let mut acc = 0.0_f64;
+    for j in 0..d {
+        let delta = if periodic_per_axis[j] {
+            let p = periods[j];
+            // Chord distance on circle of circumference P_j.
+            (p / std::f64::consts::PI) * (std::f64::consts::PI * (x[j] - y[j]) / p).sin()
+        } else {
+            x[j] - y[j]
+        };
+        acc += delta * delta;
+    }
+    acc.sqrt()
+}
+
+/// Build a multi-dimensional Duchon basis with per-axis periodicity.
+///
+/// Generalizes the 1D `build_periodic_duchon_basis_1d` to mixed-periodicity
+/// settings (cylinder ``(True, False)``, torus ``(True, True)``, etc.) by:
+///
+///   1. Replacing the Euclidean per-pair distance with a generalized
+///      cylinder/torus distance: for periodic axes use the chord distance
+///      on the circle ``(P_j/π) · sin(π·(x−y)/P_j)``; for non-periodic axes
+///      use the plain difference (see [`duchon_mixed_periodicity_distance`]).
+///   2. Evaluating the radial polyharmonic Duchon kernel
+///      ``φ(r) = c · r^(2m − d)`` (or ``r^(2m−d) · log r`` in the log case)
+///      at the generalized distance. The polyharmonic coefficient ``c`` is
+///      computed by [`PolyharmonicBlockCoeff::new(m, d)`].
+///   3. Forcing the constraint nullspace to ``{constants}`` (the only
+///      polynomial that is periodic on every periodic axis). This mirrors
+///      the 1D periodic path.
+///   4. Returning a single Primary penalty matrix
+///      ``Ω = Zᵀ · K_centers · Z`` (the kernel-Gram identity).
+///
+/// Notes
+/// -----
+/// * **Math (1D match)**: for ``d = 1`` and one periodic axis, the new path
+///   uses the polyharmonic-of-chord-distance kernel
+///   ``c · |(P/π) sin(π Δ/P)|^(2m − 1)``. The legacy 1D path uses the
+///   Bernoulli Green's function ``B_{2m}(Δ/P)`` of the iterated 1D
+///   Laplacian on the circle. These are *different kernels* (both PSD
+///   on the circle), so a 1D run via the new path is **not** expected to
+///   numerically match the legacy 1D periodic builder. The pyffi
+///   dispatcher keeps the legacy Bernoulli builder for the ``d = 1`` case
+///   so existing 1D users see no behavioral change; this builder is the
+///   principled generalization for ``d ≥ 2``.
+/// * **Nullspace audit**: a more principled choice for the cylinder
+///   (``d = 2``, axis 0 periodic, axis 1 non-periodic) is the polynomial
+///   nullspace ``{1, x_1, x_1², …, x_1^{m−1}}`` — polynomials in the
+///   non-periodic axes only, of total degree ``< m``. We keep
+///   ``{constants}`` here to match the existing periodic-Duchon convention
+///   and avoid widening the polynomial-block construction; users who need
+///   richer null spaces on the non-periodic factor can layer a separate
+///   tensor smooth.
+fn build_duchon_basis_mixed_periodicity(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    centers: Array2<f64>,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
+    let d = data.ncols();
+    if d == 0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if periodic_per_axis.len() != d {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic_per_axis must have length d={d}, got {}",
+            periodic_per_axis.len()
+        )));
+    }
+    if periods.len() != d {
+        return Err(BasisError::InvalidInput(format!(
+            "periods must have length d={d}, got {}",
+            periods.len()
+        )));
+    }
+    for (j, (&per, &period)) in periodic_per_axis.iter().zip(periods.iter()).enumerate() {
+        if per && !(period.is_finite() && period > 0.0) {
+            return Err(BasisError::InvalidInput(format!(
+                "axis {j} is periodic but period={period} is not finite & positive"
+            )));
+        }
+    }
+    if centers.ncols() != d {
+        return Err(BasisError::InvalidInput(format!(
+            "centers ncols={} does not match data ncols={d}",
+            centers.ncols()
+        )));
+    }
+
+    // Hybrid Matérn (length_scale = Some) is not supported on the
+    // cylinder/torus path yet; the generalized chord distance plus the
+    // partial-fraction Matérn chain has not been validated for periodic
+    // axes. Surface a clear error instead of silently producing nonsense.
+    if spec.length_scale.is_some() {
+        return Err(BasisError::InvalidInput(
+            "mixed-periodicity Duchon basis currently only supports the pure polyharmonic spectrum (length_scale=None)".to_string(),
+        ));
+    }
+    // s_order > 0 (the Sobolev tail) is similarly unvalidated for periodic
+    // axes — gate to s = 0 (pure polyharmonic).
+    if spec.power != 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "mixed-periodicity Duchon basis currently requires power = 0 (pure polyharmonic); got power={}",
+            spec.power
+        )));
+    }
+
+    let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
+    // Force constant-only nullspace (only periodic-in-every-axis polynomial).
+    let effective_nullspace_order = DuchonNullspaceOrder::Zero;
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    let s_order_int = 0usize;
+    validate_duchon_kernel_orders(None, p_order, s_order_int as f64, d)?;
+
+    let z = kernel_constraint_nullspace(
+        centers.view(),
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
+    let kernel_cols = z.ncols();
+
+    // Polyharmonic kernel coefficient for radial order ``m_kernel`` in
+    // ``d`` dimensions. We use ``m_kernel = user_m`` so the kernel
+    // smoothness order tracks the user's requested ``m``, not the
+    // (forced-to-constant) nullspace order.
+    let m_kernel = pure_duchon_block_order(user_m, s_order_int as f64);
+    let ppc = PolyharmonicBlockCoeff::new(m_kernel, d);
+
+    let centers_owned = centers.clone();
+    let k_centers = centers_owned.nrows();
+    let n_data = data.nrows();
+
+    // Row-parallel raw kernel: K[i, j] = φ(r_mixed(x_i, c_j)).
+    let mut raw_kernel = Array2::<f64>::zeros((n_data, k_centers));
+    raw_kernel
+        .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 1024;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let x_row = data.row(i);
+                for j in 0..k_centers {
+                    let c_row = centers_owned.row(j);
+                    let r = duchon_mixed_periodicity_distance(
+                        x_row,
+                        c_row,
+                        periodic_per_axis,
+                        periods,
+                    );
+                    out_row[j] = ppc.eval(r);
+                }
+            }
+        });
+
+    // Design = [raw_kernel @ z, ones] (constant column carries the
+    // constant-only nullspace).
+    let design_kernel = fast_ab(&raw_kernel, &z);
+    let mut basis = Array2::<f64>::zeros((n_data, kernel_cols + 1));
+    basis
+        .slice_mut(s![.., 0..kernel_cols])
+        .assign(&design_kernel);
+    basis.column_mut(kernel_cols).fill(1.0);
+
+    // Penalty: Ω = Zᵀ K_centers Z (kernel-Gram identity in the projected
+    // basis), padded with a zero row/col for the constant column.
+    let mut center_kernel = Array2::<f64>::zeros((k_centers, k_centers));
+    fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
+        let r = duchon_mixed_periodicity_distance(
+            centers_owned.row(i),
+            centers_owned.row(j),
+            periodic_per_axis,
+            periods,
+        );
+        Ok(ppc.eval(r))
+    })?;
+    let omega = fast_ab(&fast_atb(&z, &center_kernel), &z);
+    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+    penalty
+        .slice_mut(s![0..kernel_cols, 0..kernel_cols])
+        .assign(&omega);
+
+    let base_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(basis));
+    let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
+        data,
+        &base_design,
+        &spec.identifiability,
+        "mixed-periodicity Duchon",
+    )?;
+    let (design, primary) = if let Some(transform) = identifiability_transform.as_ref() {
+        let design = wrap_dense_design_with_transform(
+            base_design,
+            transform,
+            "mixed-periodicity Duchon",
+        )?;
+        let transformed = fast_ab(&fast_atb(transform, &penalty), transform);
+        (design, transformed)
+    } else {
+        (base_design, penalty)
+    };
+    let candidates = vec![normalize_penalty_candidate(
+        primary,
+        1,
+        PenaltySource::Primary,
+    )];
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok(BasisBuildResult {
+        design,
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        ops,
+        metadata: BasisMetadata::Duchon {
+            centers: centers_owned,
+            length_scale: None,
+            power: spec.power,
+            nullspace_order: effective_nullspace_order,
+            identifiability_transform,
+            input_scales: None,
+            aniso_log_scales: None,
+        },
+        kronecker_factored: None,
+    })
+}
+
+/// Public driver for the mixed-periodicity Duchon basis: derives per-axis
+/// ``(left_j, period_j)`` from the supplied centers (mirroring how the 1D
+/// periodic path infers the period from min/max), then dispatches into
+/// [`build_duchon_basis_mixed_periodicity`].
+///
+/// `periods` may be `None` (auto-derive from centers along every periodic
+/// axis) or `Some(vec![...])` (length == data.ncols(); entries for
+/// non-periodic axes are ignored).
+pub fn build_duchon_basis_mixed_periodicity_auto(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    periodic_per_axis: &[bool],
+    periods: Option<&[f64]>,
+) -> Result<BasisBuildResult, BasisError> {
+    let mut workspace = BasisWorkspace::default();
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    let d = data.ncols();
+    if periodic_per_axis.len() != d {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic_per_axis must have length d={d}, got {}",
+            periodic_per_axis.len()
+        )));
+    }
+    let resolved_periods: Vec<f64> = match periods {
+        Some(p) => {
+            if p.len() != d {
+                return Err(BasisError::InvalidInput(format!(
+                    "periods must have length d={d}, got {}",
+                    p.len()
+                )));
+            }
+            p.to_vec()
+        }
+        None => {
+            // Auto-derive: along each periodic axis use (max - min) over centers.
+            // Non-periodic axes get a placeholder 1.0 (unused).
+            let mut out = vec![1.0_f64; d];
+            for j in 0..d {
+                if periodic_per_axis[j] {
+                    let col = centers.column(j);
+                    let left = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                    let right = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                    if !left.is_finite() || !right.is_finite() || left >= right {
+                        return Err(BasisError::InvalidRange(left, right));
+                    }
+                    out[j] = right - left;
+                }
+            }
+            out
+        }
+    };
+    build_duchon_basis_mixed_periodicity(
+        data,
+        spec,
+        centers,
+        periodic_per_axis,
+        &resolved_periods,
+        &mut workspace,
+    )
+}
+
 pub fn build_duchon_basiswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
