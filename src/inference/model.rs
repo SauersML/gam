@@ -3311,45 +3311,51 @@ impl FittedModel {
             validate_all_finite(
                 "beta_baseline_timewiggle_by_cause",
                 v.iter().flatten().copied(),
-            )?;
+            )
+            .map_err(corrupt)?;
         }
         if let Some(v) = self.latent_z_normalization {
             v.validate("latent_z_normalization")?;
         }
         if let Some(v) = self.latent_measure.as_ref() {
-            v.validate("latent_measure")?;
+            v.validate("latent_measure").map_err(corrupt)?;
         }
         if let Some(v) = self.survival_beta_time.as_ref() {
-            validate_all_finite("survival_beta_time", v.iter().copied())?;
+            validate_all_finite("survival_beta_time", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.survival_beta_threshold.as_ref() {
-            validate_all_finite("survival_beta_threshold", v.iter().copied())?;
+            validate_all_finite("survival_beta_threshold", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
-            validate_all_finite("survival_beta_log_sigma", v.iter().copied())?;
+            validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.survival_noise_projection.as_ref() {
-            validate_all_finite("survival_noise_projection", v.iter().flatten().copied())?;
+            validate_all_finite("survival_noise_projection", v.iter().flatten().copied())
+                .map_err(corrupt)?;
         }
         if let Some(v) = self.survival_noise_center.as_ref() {
-            validate_all_finite("survival_noise_center", v.iter().copied())?;
+            validate_all_finite("survival_noise_center", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.survival_noise_projection_ridge_alpha {
-            ensure_finite_scalar("survival_noise_projection_ridge_alpha", v)?;
+            ensure_finite_scalar("survival_noise_projection_ridge_alpha", v).map_err(corrupt)?;
             if v < 0.0 {
-                return Err(format!(
-                    "survival_noise_projection_ridge_alpha must be non-negative, got {v}"
-                ));
+                return Err(FittedModelError::InvalidInput {
+                    reason: format!(
+                        "survival_noise_projection_ridge_alpha must be non-negative, got {v}"
+                    ),
+                });
             }
         }
         if let Some(v) = self.survival_noise_scale.as_ref() {
-            validate_all_finite("survival_noise_scale", v.iter().copied())?;
+            validate_all_finite("survival_noise_scale", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.mixture_link_param_covariance.as_ref() {
-            validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())?;
+            validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())
+                .map_err(corrupt)?;
         }
         if let Some(v) = self.sas_param_covariance.as_ref() {
-            validate_all_finite("sas_param_covariance", v.iter().flatten().copied())?;
+            validate_all_finite("sas_param_covariance", v.iter().flatten().copied())
+                .map_err(corrupt)?;
         }
         Ok(())
     }
@@ -3366,6 +3372,7 @@ fn validate_frozen_term_collectionspec(
     label: &str,
 ) -> Result<(), FittedModelError> {
     spec.validate_frozen(label)
+        .map_err(|reason| FittedModelError::SchemaMismatch { reason })
 }
 
 impl Deref for FittedModel {
@@ -3399,6 +3406,7 @@ pub fn survival_baseline_config_from_model(
         model.survival_baseline_rate,
         model.survival_baseline_makeham,
     )
+    .map_err(|reason| FittedModelError::IncompatibleConfig { reason })
 }
 
 pub fn load_survival_time_basis_config_from_model(
@@ -3407,7 +3415,9 @@ pub fn load_survival_time_basis_config_from_model(
     match model
         .survival_time_basis
         .as_deref()
-        .ok_or_else(|| "saved survival model missing survival_time_basis".to_string())?
+        .ok_or_else(|| FittedModelError::MissingField {
+            reason: "saved survival model missing survival_time_basis".to_string(),
+        })?
         .to_ascii_lowercase()
         .as_str()
     {
@@ -3415,14 +3425,21 @@ pub fn load_survival_time_basis_config_from_model(
         "linear" => Ok(SurvivalTimeBasisConfig::Linear),
         "bspline" => {
             let degree = model.survival_time_degree.ok_or_else(|| {
-                "saved survival bspline model missing survival_time_degree".to_string()
+                FittedModelError::MissingField {
+                    reason: "saved survival bspline model missing survival_time_degree"
+                        .to_string(),
+                }
             })?;
             let knots = model.survival_time_knots.clone().ok_or_else(|| {
-                "saved survival bspline model missing survival_time_knots".to_string()
+                FittedModelError::MissingField {
+                    reason: "saved survival bspline model missing survival_time_knots".to_string(),
+                }
             })?;
             let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
             if degree < 1 || knots.is_empty() {
-                return Err("saved survival bspline time basis metadata is invalid".to_string());
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "saved survival bspline time basis metadata is invalid".to_string(),
+                });
             }
             Ok(SurvivalTimeBasisConfig::BSpline {
                 degree,
@@ -3432,17 +3449,27 @@ pub fn load_survival_time_basis_config_from_model(
         }
         "ispline" => {
             let degree = model.survival_time_degree.ok_or_else(|| {
-                "saved survival ispline model missing survival_time_degree".to_string()
+                FittedModelError::MissingField {
+                    reason: "saved survival ispline model missing survival_time_degree"
+                        .to_string(),
+                }
             })?;
             let knots = model.survival_time_knots.clone().ok_or_else(|| {
-                "saved survival ispline model missing survival_time_knots".to_string()
+                FittedModelError::MissingField {
+                    reason: "saved survival ispline model missing survival_time_knots".to_string(),
+                }
             })?;
             let keep_cols = model.survival_time_keep_cols.clone().ok_or_else(|| {
-                "saved survival ispline model missing survival_time_keep_cols".to_string()
+                FittedModelError::MissingField {
+                    reason: "saved survival ispline model missing survival_time_keep_cols"
+                        .to_string(),
+                }
             })?;
             let smooth_lambda = model.survival_time_smooth_lambda.unwrap_or(1e-2);
             if degree < 1 || knots.is_empty() || keep_cols.is_empty() {
-                return Err("saved survival ispline time basis metadata is invalid".to_string());
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "saved survival ispline time basis metadata is invalid".to_string(),
+                });
             }
             Ok(SurvivalTimeBasisConfig::ISpline {
                 degree,
@@ -3451,7 +3478,9 @@ pub fn load_survival_time_basis_config_from_model(
                 smooth_lambda,
             })
         }
-        other => Err(format!("unsupported saved survival_time_basis '{other}'")),
+        other => Err(FittedModelError::IncompatibleConfig {
+            reason: format!("unsupported saved survival_time_basis '{other}'"),
+        }),
     }
 }
 
