@@ -2348,34 +2348,52 @@ fn validate_spec(
         || spec.marginal_offset.len() != n
         || spec.logslope_offset.len() != n
     {
-        return Err(format!(
-            "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
-            n,
-            spec.y.len(),
-            spec.weights.len(),
-            spec.z.len(),
-            spec.marginal_offset.len(),
-            spec.logslope_offset.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
+                n,
+                spec.y.len(),
+                spec.weights.len(),
+                spec.z.len(),
+                spec.marginal_offset.len(),
+                spec.logslope_offset.len()
+            ),
+        }
+        .into());
     }
     if spec
         .y
         .iter()
         .any(|&yi| !yi.is_finite() || ((yi - 0.0).abs() > 1e-9 && (yi - 1.0).abs() > 1e-9))
     {
-        return Err("bernoulli-marginal-slope requires binary y in {0,1}".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "bernoulli-marginal-slope requires binary y in {0,1}".to_string(),
+        }
+        .into());
     }
     if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return Err("bernoulli-marginal-slope requires finite non-negative weights".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "bernoulli-marginal-slope requires finite non-negative weights".to_string(),
+        }
+        .into());
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
-        return Err("bernoulli-marginal-slope requires finite z values".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "bernoulli-marginal-slope requires finite z values".to_string(),
+        }
+        .into());
     }
     if spec.marginal_offset.iter().any(|&value| !value.is_finite()) {
-        return Err("bernoulli-marginal-slope requires finite marginal offsets".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "bernoulli-marginal-slope requires finite marginal offsets".to_string(),
+        }
+        .into());
     }
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
-        return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "bernoulli-marginal-slope requires finite logslope offsets".to_string(),
+        }
+        .into());
     }
     require_probit_marginal_slope_link(&spec.base_link, "bernoulli-marginal-slope")?;
     spec.frailty.validate_for_marginal_slope()?;
@@ -2385,9 +2403,12 @@ fn validate_spec(
             if let Some(sigma) = sigma_fixed
                 && (!sigma.is_finite() || *sigma < 0.0)
             {
-                return Err(format!(
-                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
+                return Err(BernoulliMarginalSlopeError::InvalidInput {
+                    reason: format!(
+                        "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                    ),
+                }
+                .into());
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
@@ -2402,11 +2423,14 @@ pub(crate) fn standardize_latent_z_with_policy(
     policy: &LatentZPolicy,
 ) -> Result<(Array1<f64>, LatentZNormalization), String> {
     if z.len() != weights.len() {
-        return Err(format!(
-            "{context} latent-score normalization length mismatch: z={}, weights={}",
-            z.len(),
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "{context} latent-score normalization length mismatch: z={}, weights={}",
+                z.len(),
+                weights.len()
+            ),
+        }
+        .into());
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
@@ -2415,13 +2439,19 @@ pub(crate) fn standardize_latent_z_with_policy(
         && weight_sq_sum.is_finite()
         && weight_sq_sum > 0.0)
     {
-        return Err(format!("{context} requires positive finite total weight"));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!("{context} requires positive finite total weight"),
+        }
+        .into());
     }
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     if !(effective_n.is_finite() && effective_n > 1.0) {
-        return Err(format!(
-            "{context} requires at least two effective observations for latent-score normalization"
-        ));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "{context} requires at least two effective observations for latent-score normalization"
+            ),
+        }
+        .into());
     }
     let mean = z
         .iter()
@@ -2437,9 +2467,12 @@ pub(crate) fn standardize_latent_z_with_policy(
         / weight_sum;
     let sd = var.sqrt();
     if !(sd.is_finite() && sd > BMS_VARIANCE_FLOOR) {
-        return Err(format!(
-            "{context} requires z with positive finite weighted standard deviation"
-        ));
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "{context} requires z with positive finite weighted standard deviation"
+            ),
+        }
+        .into());
     }
     let target_norm = match policy.normalization {
         LatentZNormalizationMode::None => LatentZNormalization { mean: 0.0, sd: 1.0 },
@@ -2526,19 +2559,24 @@ fn pooled_probit_baseline(
     weights: &Array1<f64>,
 ) -> Result<(f64, f64), String> {
     if y.len() != z.len() || y.len() != weights.len() {
-        return Err(format!(
-            "pooled bernoulli-marginal-slope pilot length mismatch: y={}, z={}, weights={}",
-            y.len(),
-            z.len(),
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "pooled bernoulli-marginal-slope pilot length mismatch: y={}, z={}, weights={}",
+                y.len(),
+                z.len(),
+                weights.len()
+            ),
+        }
+        .into());
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
-        return Err(
-            "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
-                .to_string(),
-        );
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason:
+                "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
+                    .to_string(),
+        }
+        .into());
     }
     let prevalence = y
         .iter()
