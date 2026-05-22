@@ -1894,8 +1894,9 @@ mod tests {
         // (should_use_faer_matmul threshold is MIN_DIM=32, MIN_FLOP_SCALE=64*64).
         let n = 200;
         let p = 40;
-        let a: Array2<f64> =
-            Array2::from_shape_fn((n, p), |(i, j)| ((i * 7 + j * 3) as f64).sin() + 0.1 * j as f64);
+        let a: Array2<f64> = Array2::from_shape_fn((n, p), |(i, j)| {
+            ((i * 7 + j * 3) as f64).sin() + 0.1 * j as f64
+        });
         let expected = a.t().dot(&a);
         let got = fast_ata(&a);
         let max_err = (&got - &expected)

@@ -2216,26 +2216,27 @@ impl BernoulliMarginalSlopePredictor {
             // stays inside the row loop. Computed at the top level so no
             // OnceLock / lazy init lives inside the par closure (per the
             // OnceLock + nested rayon deadlock rule).
-            let global_score_basis_table: Option<Vec<Vec<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic>>> =
-                if let (LatentMeasureKind::GlobalEmpirical { grid }, Some(runtime)) =
-                    (&self.latent_measure, self.score_warp_runtime.as_ref())
-                {
-                    let mut table = Vec::with_capacity(score_warp_dim);
-                    for j in 0..score_warp_dim {
-                        let mut row = Vec::with_capacity(grid.nodes.len());
-                        for &node in &grid.nodes {
-                            row.push(
-                                runtime
-                                    .basis_cubic_at(j, node)
-                                    .map_err(EstimationError::from)?,
-                            );
-                        }
-                        table.push(row);
+            let global_score_basis_table: Option<
+                Vec<Vec<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic>>,
+            > = if let (LatentMeasureKind::GlobalEmpirical { grid }, Some(runtime)) =
+                (&self.latent_measure, self.score_warp_runtime.as_ref())
+            {
+                let mut table = Vec::with_capacity(score_warp_dim);
+                for j in 0..score_warp_dim {
+                    let mut row = Vec::with_capacity(grid.nodes.len());
+                    for &node in &grid.nodes {
+                        row.push(
+                            runtime
+                                .basis_cubic_at(j, node)
+                                .map_err(EstimationError::from)?,
+                        );
                     }
-                    Some(table)
-                } else {
-                    None
-                };
+                    table.push(row);
+                }
+                Some(table)
+            } else {
+                None
+            };
             let global_score_basis_table = global_score_basis_table.as_ref();
 
             sinks

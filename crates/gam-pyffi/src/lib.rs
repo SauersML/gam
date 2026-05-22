@@ -4754,8 +4754,7 @@ fn paired_sample_table_impl(
 ) -> Result<String, String> {
     let target_model = load_model_impl(target_model_bytes)?;
     let competing_model = load_model_impl(competing_model_bytes)?;
-    let target_dataset =
-        dataset_with_model_schema(&target_model, &target_headers, &target_rows)?;
+    let target_dataset = dataset_with_model_schema(&target_model, &target_headers, &target_rows)?;
     drop(target_rows);
     drop(target_headers);
     let competing_dataset =
