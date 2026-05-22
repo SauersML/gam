@@ -324,12 +324,6 @@ fn ift_joint_mode_response_caches(
     IFT_JOINT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static IFT_PENDING_JOINT_THETAS: OnceLock<Mutex<HashMap<usize, Array1<f64>>>> = OnceLock::new();
-
-fn ift_pending_joint_thetas() -> &'static Mutex<HashMap<usize, Array1<f64>>> {
-    IFT_PENDING_JOINT_THETAS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
 
 pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
@@ -2416,33 +2410,8 @@ impl<'a> RemlState<'a> {
         self as *const Self as usize
     }
 
-    fn set_pending_joint_ift_theta(&self, theta: &Array1<f64>) {
-        if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
-            self.clear_pending_joint_ift_theta();
-            return;
-        }
-        ift_pending_joint_thetas()
-            .lock()
-            .unwrap()
-            .insert(self.ift_mode_response_cache_key(), theta.clone());
-    }
-
     fn pending_joint_ift_theta(&self) -> Option<Array1<f64>> {
-        ift_pending_joint_thetas()
-            .lock()
-            .unwrap()
-            .get(&self.ift_mode_response_cache_key())
-            .cloned()
-            .or_else(latest_outer_theta_for_ift)
-    }
-
-    fn clear_pending_joint_ift_theta(&self) {
-        if let Some(pending) = IFT_PENDING_JOINT_THETAS.get() {
-            pending
-                .lock()
-                .unwrap()
-                .remove(&self.ift_mode_response_cache_key());
-        }
+        latest_outer_theta_for_ift()
     }
 
     fn clear_joint_ift_mode_response_cache(&self) {
