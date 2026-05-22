@@ -110,6 +110,57 @@ use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::linalg::matrix::DesignMatrix;
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Typed errors for the unified REML/LAML evaluator.
+//
+//  The evaluator and its helpers historically returned `Result<_, String>`.
+//  Internally we now build typed errors at the leaves and convert at the
+//  boundary via `From<RemlError> for String`, which is byte-equivalent to
+//  the previous `format!(...)` strings so external callers continue to see
+//  the same diagnostic text.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Typed failure categories raised by the unified REML/LAML evaluator and
+/// its outer-Hessian / penalty-root helpers.
+///
+/// Each variant carries a pre-formatted `reason` string so that the
+/// `Display` impl is byte-equivalent to the original `format!(...)` text the
+/// module emitted before the typed-error migration. External signatures
+/// remain `Result<_, String>`; the boundary conversion goes through
+/// `From<RemlError> for String`.
+#[derive(Debug, Clone)]
+pub enum RemlError {
+    /// A length / shape disagreement between two views that should match
+    /// (penalty coords vs Hessian dim, residual length vs operator dim,
+    /// precomputed-correction count vs total, etc.).
+    DimensionMismatch { reason: String },
+    /// A scalar / vector / matrix entry that must be finite came back NaN
+    /// or ±∞ (cost, gradient entry, Hessian entry, cross-trace entry).
+    NonFiniteValue { reason: String },
+    /// A correction path was invoked against an operator kernel that does
+    /// not support it (scalar-only correction on a non-scalar kernel,
+    /// callback correction on a non-callback kernel).
+    InvalidKernelMode { reason: String },
+}
+
+impl std::fmt::Display for RemlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemlError::DimensionMismatch { reason }
+            | RemlError::NonFiniteValue { reason }
+            | RemlError::InvalidKernelMode { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for RemlError {}
+
+impl From<RemlError> for String {
+    fn from(err: RemlError) -> String {
+        err.to_string()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Debug stash: thread-local capture of (op_total, U) from the ext-grad path,
 //  used by the iso-κ Duchon FD investigation test. Empty in production runs.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6575,11 +6626,14 @@ pub fn reml_laml_evaluate(
         Some(residual) => {
             let r = residual.as_array();
             if r.len() != hop.dim() {
-                return Err(format!(
-                    "projected KKT residual length mismatch: got {}, expected {}",
-                    r.len(),
-                    hop.dim()
-                ));
+                return Err(RemlError::DimensionMismatch {
+                    reason: format!(
+                        "projected KKT residual length mismatch: got {}, expected {}",
+                        r.len(),
+                        hop.dim()
+                    ),
+                }
+                .into());
             }
             Some(r)
         }
@@ -6630,9 +6684,12 @@ pub fn reml_laml_evaluate(
     }
 
     if !cost.is_finite() {
-        return Err(format!(
-            "REML/LAML cost is non-finite ({cost}); check inner solver convergence"
-        ));
+        return Err(RemlError::NonFiniteValue {
+            reason: format!(
+                "REML/LAML cost is non-finite ({cost}); check inner solver convergence"
+            ),
+        }
+        .into());
     }
 
     if mode == EvalMode::ValueOnly {
@@ -6864,11 +6921,14 @@ pub fn reml_laml_evaluate(
         (0..(k + ext_dim)).map(|_| None).collect()
     };
     if coord_corrections.len() != k + ext_dim {
-        return Err(format!(
-            "REML/LAML derivative correction count mismatch: got {}, expected {}",
-            coord_corrections.len(),
-            k + ext_dim
-        ));
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "REML/LAML derivative correction count mismatch: got {}, expected {}",
+                coord_corrections.len(),
+                k + ext_dim
+            ),
+        }
+        .into());
     }
     let rho_corrections = &coord_corrections[..k];
     let ext_corrections = &coord_corrections[k..];
@@ -7380,9 +7440,12 @@ pub fn reml_laml_evaluate(
     }
 
     if let Some((idx, value)) = grad.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-        return Err(format!(
-            "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
-        ));
+        return Err(RemlError::NonFiniteValue {
+            reason: format!(
+                "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
+            ),
+        }
+        .into());
     }
 
     // Run the envelope-gradient sanity check *before* the outer-Hessian
@@ -7443,11 +7506,14 @@ pub fn reml_laml_evaluate(
                 subspace = solution.penalty_subspace_trace.is_some(),
             );
             if family_op.dim() != k_outer {
-                return Err(format!(
-                    "family outer Hessian operator dimension mismatch: got {}, expected {}",
-                    family_op.dim(),
-                    k_outer
-                ));
+                return Err(RemlError::DimensionMismatch {
+                    reason: format!(
+                        "family outer Hessian operator dimension mismatch: got {}, expected {}",
+                        family_op.dim(),
+                        k_outer
+                    ),
+                }
+                .into());
             }
             let assembly_start = std::time::Instant::now();
             let mut hessian = crate::solver::outer_strategy::HessianResult::Operator(family_op);
@@ -7988,22 +8054,28 @@ fn compute_fourth_derivative_trace_matrix(
         return Ok(Some(Array2::zeros((0, 0))));
     }
     if d_array.len() != n || leverage.len() != n {
-        return Err(format!(
-            "fourth-derivative trace shape mismatch: c={}, d={}, leverage={}",
-            n,
-            d_array.len(),
-            leverage.len()
-        ));
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "fourth-derivative trace shape mismatch: c={}, d={}, leverage={}",
+                n,
+                d_array.len(),
+                leverage.len()
+            ),
+        }
+        .into());
     }
 
     let mut x_modes = Array2::<f64>::zeros((n, t));
     for (j, mode) in modes.iter().enumerate() {
         let x_v = ing.x.matrixvectormultiply(mode);
         if x_v.len() != n {
-            return Err(format!(
-                "fourth-derivative trace Xv length mismatch for mode {j}: got {}, expected {n}",
-                x_v.len()
-            ));
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "fourth-derivative trace Xv length mismatch for mode {j}: got {}, expected {n}",
+                    x_v.len()
+                ),
+            }
+            .into());
         }
         x_modes.column_mut(j).assign(&x_v);
     }
@@ -8408,19 +8480,25 @@ fn compute_kkt_residual_rho_corrections(
         });
     }
     if lambdas.len() != k || solution.penalty_coords.len() != k {
-        return Err(format!(
-            "KKT rho correction dimension mismatch: lambdas={} coords={} rhs={}",
-            lambdas.len(),
-            solution.penalty_coords.len(),
-            k
-        ));
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "KKT rho correction dimension mismatch: lambdas={} coords={} rhs={}",
+                lambdas.len(),
+                solution.penalty_coords.len(),
+                k
+            ),
+        }
+        .into());
     }
     if residual.len() != hop.dim() {
-        return Err(format!(
-            "KKT residual dimension mismatch: residual={} Hessian dim={}",
-            residual.len(),
-            hop.dim()
-        ));
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "KKT residual dimension mismatch: residual={} Hessian dim={}",
+                residual.len(),
+                hop.dim()
+            ),
+        }
+        .into());
     }
 
     let subspace = solution.penalty_subspace_trace.as_deref();
@@ -8434,10 +8512,13 @@ fn compute_kkt_residual_rho_corrections(
         let linear = penalty_a_k_betas[idx].dot(&q);
         let quadratic = q.dot(&a_i_q);
         if !linear.is_finite() || !quadratic.is_finite() {
-            return Err(format!(
-                "KKT rho correction produced non-finite gradient ingredients at coord {idx}: \
-                 linear={linear} quadratic={quadratic}"
-            ));
+            return Err(RemlError::NonFiniteValue {
+                reason: format!(
+                    "KKT rho correction produced non-finite gradient ingredients at coord {idx}: \
+                     linear={linear} quadratic={quadratic}"
+                ),
+            }
+            .into());
         }
         a_i_dot_q.push(linear);
         q_a_i_q.push(quadratic);
@@ -8482,9 +8563,12 @@ fn compute_kkt_residual_rho_corrections(
                     0.5 * (entry(i, j) + entry(j, i))
                 };
                 if !raw.is_finite() {
-                    return Err(format!(
-                        "KKT rho correction produced non-finite Hessian entry ({i}, {j}): {raw}"
-                    ));
+                    return Err(RemlError::NonFiniteValue {
+                        reason: format!(
+                            "KKT rho correction produced non-finite Hessian entry ({i}, {j}): {raw}"
+                        ),
+                    }
+                    .into());
                 }
                 h[[i, j]] = raw;
                 if i != j {
@@ -9802,7 +9886,10 @@ impl UnifiedOuterHessianOperator {
             x,
         } = &self.kernel
         else {
-            return Err("scalar correction requested for non-scalar kernel".to_string());
+            return Err(RemlError::InvalidKernelMode {
+                reason: "scalar correction requested for non-scalar kernel".to_string(),
+            }
+            .into());
         };
 
         // Cheap adjoint shortcut: works for both full-Hessian and projected
@@ -9848,7 +9935,10 @@ impl UnifiedOuterHessianOperator {
         neg_m_alpha: &Array1<f64>,
     ) -> Result<f64, String> {
         let OuterHessianDerivativeKernel::Callback { first, second } = &self.kernel else {
-            return Err("callback correction requested for non-callback kernel".to_string());
+            return Err(RemlError::InvalidKernelMode {
+                reason: "callback correction requested for non-callback kernel".to_string(),
+            }
+            .into());
         };
         let u = self.hop.solve(rhs);
         let Some(term1) = first(&u)? else {
@@ -9877,11 +9967,14 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
 
     fn matvec(&self, alpha: &Array1<f64>) -> Result<Array1<f64>, String> {
         if alpha.len() != self.coords.len() {
-            return Err(format!(
-                "outer Hessian alpha length mismatch: got {}, expected {}",
-                alpha.len(),
-                self.coords.len()
-            ));
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "outer Hessian alpha length mismatch: got {}, expected {}",
+                    alpha.len(),
+                    self.coords.len()
+                ),
+            }
+            .into());
         }
         let mut a_alpha = 0.0;
         for (idx, coord) in self.coords.iter().enumerate() {
@@ -10024,11 +10117,14 @@ fn build_outer_hessian_operator(
     let coord_vs_storage;
     let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
         if precomputed.len() != total {
-            return Err(format!(
-                "outer Hessian precomputed mode-response count mismatch: got {}, expected {}",
-                precomputed.len(),
-                total
-            ));
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "outer Hessian precomputed mode-response count mismatch: got {}, expected {}",
+                    precomputed.len(),
+                    total
+                ),
+            }
+            .into());
         }
         precomputed
     } else {
@@ -10052,11 +10148,14 @@ fn build_outer_hessian_operator(
         precomputed_coord_corrections
     {
         if precomputed.len() != total {
-            return Err(format!(
-                "outer Hessian precomputed correction count mismatch: got {}, expected {}",
-                precomputed.len(),
-                total
-            ));
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "outer Hessian precomputed correction count mismatch: got {}, expected {}",
+                    precomputed.len(),
+                    total
+                ),
+            }
+            .into());
         }
         precomputed
     } else if effective_deriv.has_corrections() {
@@ -10369,9 +10468,12 @@ fn build_outer_hessian_operator(
             let mut ct = Array2::<f64>::zeros((total, total));
             for ((ii, jj), value) in pair_values {
                 if !value.is_finite() {
-                    return Err(format!(
-                        "outer Hessian operator projected cross_trace[{ii}, {jj}] is non-finite ({value})"
-                    ));
+                    return Err(RemlError::NonFiniteValue {
+                        reason: format!(
+                            "outer Hessian operator projected cross_trace[{ii}, {jj}] is non-finite ({value})"
+                        ),
+                    }
+                    .into());
                 }
                 ct[[ii, jj]] = value;
                 if ii != jj {
@@ -10458,9 +10560,12 @@ fn build_outer_hessian_operator(
                     let value =
                         dense_hop.trace_logdet_hessian_cross_rotated(&rotated[ii], &rotated[jj]);
                     if !value.is_finite() {
-                        return Err(format!(
-                            "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
-                        ));
+                        return Err(RemlError::NonFiniteValue {
+                            reason: format!(
+                                "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
+                            ),
+                        }
+                        .into());
                     }
                     ct[[ii, jj]] = value;
                     if ii != jj {
@@ -10538,9 +10643,12 @@ fn build_outer_hessian_operator(
             let mut ct = Array2::<f64>::zeros((total, total));
             for ((ii, jj), value) in pair_values {
                 if !value.is_finite() {
-                    return Err(format!(
-                        "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
-                    ));
+                    return Err(RemlError::NonFiniteValue {
+                        reason: format!(
+                            "outer Hessian operator cross_trace[{ii}, {jj}] is non-finite ({value})"
+                        ),
+                    }
+                    .into());
                 }
                 ct[[ii, jj]] = value;
                 if ii != jj {
@@ -12141,11 +12249,14 @@ impl DenseSpectralOperator {
 
         let n = h.nrows();
         if n != h.ncols() {
-            return Err(format!(
-                "HessianOperator: expected square matrix, got {}×{}",
-                n,
-                h.ncols()
-            ));
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "HessianOperator: expected square matrix, got {}×{}",
+                    n,
+                    h.ncols()
+                ),
+            }
+            .into());
         }
 
         let (eigenvalues, eigenvectors) = h
@@ -13884,11 +13995,14 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
     use faer::Side;
     let n = s.nrows();
     if n != s.ncols() {
-        return Err(format!(
-            "penalty_matrix_root: expected square matrix, got {}×{}",
-            n,
-            s.ncols()
-        ));
+        return Err(RemlError::DimensionMismatch {
+            reason: format!(
+                "penalty_matrix_root: expected square matrix, got {}×{}",
+                n,
+                s.ncols()
+            ),
+        }
+        .into());
     }
     if n == 0 {
         return Ok(Array2::zeros((0, 0)));
@@ -17685,11 +17799,14 @@ mod tests {
 
         fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
             if v.len() != self.dim() {
-                return Err(format!(
-                    "fixed test outer Hessian dimension mismatch: got {}, expected {}",
-                    v.len(),
-                    self.dim()
-                ));
+                return Err(RemlError::DimensionMismatch {
+                    reason: format!(
+                        "fixed test outer Hessian dimension mismatch: got {}, expected {}",
+                        v.len(),
+                        self.dim()
+                    ),
+                }
+                .into());
             }
             Ok(self.matrix.dot(v))
         }

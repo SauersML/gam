@@ -3,7 +3,62 @@ use csv::{ReaderBuilder, StringRecord};
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::Path;
+
+// ---------------------------------------------------------------------------
+// Typed error
+// ---------------------------------------------------------------------------
+
+/// Typed error variants for the data-loading module.
+///
+/// Public entry points continue to return `Result<_, String>`; this enum is
+/// materialized at leaf sites and converted at the boundary via
+/// `From<DataError> for String` so error text remains byte-identical to the
+/// previous ad-hoc `format!(...)` output.
+#[derive(Debug, Clone)]
+pub enum DataError {
+    /// Schema/column shape disagrees with the file: row width mismatch,
+    /// requested column missing from headers, schema-declared kind violated by
+    /// a row, or an unseen categorical level encountered under
+    /// `UnseenCategoryPolicy::Error`.
+    SchemaMismatch { reason: String },
+    /// Failed to open, decode, or read structural bytes of the source
+    /// (CSV/TSV row read, parquet metadata, file extension detection, parquet
+    /// arrow-cast for string columns).
+    ParseError { reason: String },
+    /// Internal encoding bookkeeping failed: a categorical map expected by the
+    /// schema path was missing, or a level expected to be present in the
+    /// per-column inference state was not found during fix-up.
+    EncodingFailure { reason: String },
+    /// The source has no headers, no rows, or contains an empty / missing
+    /// field at a row that requires a value.
+    EmptyInput { reason: String },
+    /// A cell value cannot be used as a feature: non-finite float, null in a
+    /// numeric parquet column, or an unsupported parquet data type for the
+    /// column.
+    InvalidValue { reason: String },
+}
+
+impl fmt::Display for DataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataError::SchemaMismatch { reason }
+            | DataError::ParseError { reason }
+            | DataError::EncodingFailure { reason }
+            | DataError::EmptyInput { reason }
+            | DataError::InvalidValue { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for DataError {}
+
+impl From<DataError> for String {
+    fn from(err: DataError) -> String {
+        err.to_string()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -132,7 +187,7 @@ enum DataFormat {
     Parquet,
 }
 
-fn detect_format(path: &Path) -> Result<DataFormat, String> {
+fn detect_format(path: &Path) -> Result<DataFormat, DataError> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
@@ -142,10 +197,12 @@ fn detect_format(path: &Path) -> Result<DataFormat, String> {
         "csv" => Ok(DataFormat::Csv),
         "tsv" | "txt" | "tab" => Ok(DataFormat::Tsv),
         "parquet" | "pq" | "pqt" => Ok(DataFormat::Parquet),
-        other => Err(format!(
-            "unsupported data file extension '.{other}'; expected csv, tsv, txt, parquet, or pq: '{}'",
-            path.display()
-        )),
+        other => Err(DataError::ParseError {
+            reason: format!(
+                "unsupported data file extension '.{other}'; expected csv, tsv, txt, parquet, or pq: '{}'",
+                path.display()
+            ),
+        }),
     }
 }
 
@@ -157,10 +214,13 @@ pub fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
-    match detect_format(path)? {
-        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns),
-        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns),
-        DataFormat::Parquet => load_parquet_inferred(path, requested_columns),
+    match detect_format(path).map_err(String::from)? {
+        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns)
+            .map_err(String::from),
+        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns)
+            .map_err(String::from),
+        DataFormat::Parquet => load_parquet_inferred(path, requested_columns)
+            .map_err(String::from),
     }
 }
 
@@ -178,15 +238,18 @@ pub fn load_datasetwith_schema_projected(
     unseen_policy: UnseenCategoryPolicy,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, String> {
-    match detect_format(path)? {
+    match detect_format(path).map_err(String::from)? {
         DataFormat::Csv => {
             load_delimited_with_schema(path, b',', schema, unseen_policy, requested_columns)
+                .map_err(String::from)
         }
         DataFormat::Tsv => {
             load_delimited_with_schema(path, b'\t', schema, unseen_policy, requested_columns)
+                .map_err(String::from)
         }
         DataFormat::Parquet => {
             load_parquet_with_schema(path, schema, unseen_policy, requested_columns)
+                .map_err(String::from)
         }
     }
 }
@@ -196,7 +259,7 @@ pub fn load_datasetwith_schema_projected(
 // ---------------------------------------------------------------------------
 
 pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, String> {
-    load_delimited_inferred(path, b',', &[])
+    load_delimited_inferred(path, b',', &[]).map_err(String::from)
 }
 
 pub fn load_csvwith_schema(
@@ -204,7 +267,7 @@ pub fn load_csvwith_schema(
     schema: &DataSchema,
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<EncodedDataset, String> {
-    load_delimited_with_schema(path, b',', schema, unseen_policy, &[])
+    load_delimited_with_schema(path, b',', schema, unseen_policy, &[]).map_err(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +280,7 @@ const SCHEMA_SAMPLE_ROWS: usize = 1024;
 fn resolve_requested_columns(
     all_headers: &[String],
     requested_columns: &[String],
-) -> Result<Vec<usize>, String> {
+) -> Result<Vec<usize>, DataError> {
     if requested_columns.is_empty() {
         return Ok((0..all_headers.len()).collect());
     }
@@ -241,7 +304,9 @@ fn resolve_requested_columns(
             .filter(|name| !available_map.contains_key(name.as_str()))
             .map(|name| missing_column_message(&available_map, name, Some("requested")))
             .collect::<Vec<_>>();
-        return Err(missing.join("; "));
+        return Err(DataError::SchemaMismatch {
+            reason: missing.join("; "),
+        });
     }
 
     Ok(selected)
@@ -258,22 +323,28 @@ fn load_delimited_inferred(
     path: &Path,
     delimiter: u8,
     requested_columns: &[String],
-) -> Result<EncodedDataset, String> {
+) -> Result<EncodedDataset, DataError> {
     let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .delimiter(delimiter)
         .from_path(path)
-        .map_err(|e| format!("failed to open '{}': {e}", path.display()))?;
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to open '{}': {e}", path.display()),
+        })?;
 
     let all_headers: Vec<String> = rdr
         .headers()
-        .map_err(|e| format!("failed to read headers: {e}"))?
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed to read headers: {e}"),
+        })?
         .iter()
         .map(|s| s.trim().to_string())
         .collect();
     if all_headers.is_empty() {
-        return Err("file has no headers".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "file has no headers".to_string(),
+        });
     }
     let selected_indices = resolve_requested_columns(&all_headers, requested_columns)?;
     let headers = projected_headers(&all_headers, &selected_indices);
@@ -297,21 +368,25 @@ fn load_delimited_inferred(
     // serial row-major error precedence.
     let mut raw_fields = Vec::<String>::new();
     let mut total_rows: usize = 0;
-    let mut stream_error: Option<String> = None;
+    let mut stream_error: Option<DataError> = None;
 
     let t_stream = std::time::Instant::now();
     let mut record = StringRecord::new();
     while rdr
         .read_record(&mut record)
-        .map_err(|e| format!("failed reading row: {e}"))?
+        .map_err(|e| DataError::ParseError {
+            reason: format!("failed reading row: {e}"),
+        })?
     {
         if record.len() != all_headers.len() {
-            stream_error = Some(format!(
-                "row width mismatch at row {}: got {} fields, expected {}",
-                total_rows + 1,
-                record.len(),
-                all_headers.len()
-            ));
+            stream_error = Some(DataError::SchemaMismatch {
+                reason: format!(
+                    "row width mismatch at row {}: got {} fields, expected {}",
+                    total_rows + 1,
+                    record.len(),
+                    all_headers.len()
+                ),
+            });
             break;
         }
         total_rows += 1;
@@ -336,7 +411,9 @@ fn load_delimited_inferred(
         if let Some(err) = stream_error {
             return Err(err);
         }
-        return Err("file has no rows".to_string());
+        return Err(DataError::EmptyInput {
+            reason: "file has no rows".to_string(),
+        });
     }
 
     let t_schema = std::time::Instant::now();
@@ -351,7 +428,7 @@ fn load_delimited_inferred(
         .filter_map(|result| result.as_ref().err())
         .min_by_key(|err| (err.row, err.col));
     if let Some(err) = first_error {
-        return Err(err.message.clone());
+        return Err(err.error.clone());
     }
     if let Some(err) = stream_error {
         return Err(err);
@@ -434,7 +511,7 @@ struct InferredDelimitedColumn {
 struct DelimitedInferenceError {
     row: usize,
     col: usize,
-    message: String,
+    error: DataError,
 }
 
 fn infer_delimited_column(
@@ -458,7 +535,13 @@ fn infer_delimited_column(
             return Err(DelimitedInferenceError {
                 row: row_idx + 1,
                 col,
-                message: format!("empty field at row {}, column '{}'", row_idx + 1, header),
+                error: DataError::EmptyInput {
+                    reason: format!(
+                        "empty field at row {}, column '{}'",
+                        row_idx + 1,
+                        header
+                    ),
+                },
             });
         }
 
@@ -469,11 +552,13 @@ fn infer_delimited_column(
                     return Err(DelimitedInferenceError {
                         row: row_idx + 1,
                         col,
-                        message: format!(
-                            "non-finite value at row {}, column '{}'",
-                            row_idx + 1,
-                            header
-                        ),
+                        error: DataError::InvalidValue {
+                            reason: format!(
+                                "non-finite value at row {}, column '{}'",
+                                row_idx + 1,
+                                header
+                            ),
+                        },
                     });
                 }
                 if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
@@ -500,11 +585,13 @@ fn infer_delimited_column(
                 return Err(DelimitedInferenceError {
                     row: row_idx + 1,
                     col,
-                    message: format!(
-                        "non-finite value at row {}, column '{}'",
-                        row_idx + 1,
-                        header
-                    ),
+                    error: DataError::InvalidValue {
+                        reason: format!(
+                            "non-finite value at row {}, column '{}'",
+                            row_idx + 1,
+                            header
+                        ),
+                    },
                 });
             }
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
@@ -540,10 +627,12 @@ fn infer_delimited_column(
                 let code = *level_index.get(raw).ok_or_else(|| DelimitedInferenceError {
                     row: row_idx + 1,
                     col,
-                    message: format!(
-                        "internal error: sample string '{}' missing from level map for column '{}'",
-                        raw, header
-                    ),
+                    error: DataError::EncodingFailure {
+                        reason: format!(
+                            "internal error: sample string '{}' missing from level map for column '{}'",
+                            raw, header
+                        ),
+                    },
                 })?;
                 values[row_idx] = code as f64;
             }
@@ -555,11 +644,13 @@ fn infer_delimited_column(
             return Err(DelimitedInferenceError {
                 row: row_idx + 1,
                 col,
-                message: format!(
-                    "non-finite value at row {}, column '{}'",
-                    row_idx + 1,
-                    header
-                ),
+                error: DataError::InvalidValue {
+                    reason: format!(
+                        "non-finite value at row {}, column '{}'",
+                        row_idx + 1,
+                        header
+                    ),
+                },
             });
         }
     }
