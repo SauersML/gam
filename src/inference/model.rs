@@ -2537,9 +2537,9 @@ impl FittedModel {
                 ..
             } => mixture_state
                 .clone()
-                .ok_or_else(|| {
-                    "binomial-mixture model is missing state in family_state.mixture_state"
-                        .to_string()
+                .ok_or_else(|| FittedModelError::MissingField {
+                    reason: "binomial-mixture model is missing state in family_state.mixture_state"
+                        .to_string(),
                 })
                 .map(Some),
             FittedFamily::LocationScale {
@@ -2547,10 +2547,11 @@ impl FittedModel {
                 base_link,
             } => match base_link {
                 Some(InverseLink::Mixture(state)) => Ok(Some(state.clone())),
-                _ => Err(
-                    "binomial-mixture location-scale model is missing mixture base_link state"
-                        .to_string(),
-                ),
+                _ => Err(FittedModelError::MissingField {
+                    reason:
+                        "binomial-mixture location-scale model is missing mixture base_link state"
+                            .to_string(),
+                }),
             },
             _ => Ok(None),
         }
@@ -2564,9 +2565,10 @@ impl FittedModel {
                 latent_cloglog_state,
                 ..
             } => latent_cloglog_state
-                .ok_or_else(|| {
-                    "latent-cloglog-binomial model is missing state in family_state.latent_cloglog_state"
-                        .to_string()
+                .ok_or_else(|| FittedModelError::MissingField {
+                    reason:
+                        "latent-cloglog-binomial model is missing state in family_state.latent_cloglog_state"
+                            .to_string(),
                 })
                 .map(Some),
             _ => Ok(None),
@@ -2727,10 +2729,14 @@ impl FittedModel {
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self, FittedModelError> {
-        let payload = fs::read_to_string(path)
-            .map_err(|e| format!("failed to read model '{}': {e}", path.display()))?;
-        let model: Self = serde_json::from_str(&payload)
-            .map_err(|e| format!("failed to parse model json: {e}"))?;
+        let payload =
+            fs::read_to_string(path).map_err(|e| FittedModelError::PayloadCorrupt {
+                reason: format!("failed to read model '{}': {e}", path.display()),
+            })?;
+        let model: Self =
+            serde_json::from_str(&payload).map_err(|e| FittedModelError::PayloadCorrupt {
+                reason: format!("failed to parse model json: {e}"),
+            })?;
         let model = model.with_synchronized_stateful_link_metadata();
         model.validate_for_persistence()?;
         model.validate_numeric_finiteness()?;
@@ -2741,20 +2747,27 @@ impl FittedModel {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
-        let file = fs::File::create(path)
-            .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
+        let file = fs::File::create(path).map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("failed to write model '{}': {e}", path.display()),
+        })?;
         let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, &normalized)
-            .map_err(|e| format!("failed to serialize model: {e}"))?;
-        std::io::Write::flush(&mut writer)
-            .map_err(|e| format!("failed to write model '{}': {e}", path.display()))?;
+        serde_json::to_writer(&mut writer, &normalized).map_err(|e| {
+            FittedModelError::PayloadCorrupt {
+                reason: format!("failed to serialize model: {e}"),
+            }
+        })?;
+        std::io::Write::flush(&mut writer).map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("failed to write model '{}': {e}", path.display()),
+        })?;
         Ok(())
     }
 
     pub fn require_data_schema(&self) -> Result<&DataSchema, FittedModelError> {
         self.data_schema
             .as_ref()
-            .ok_or_else(|| "model is missing data_schema; refit".to_string())
+            .ok_or_else(|| FittedModelError::MissingField {
+                reason: "model is missing data_schema; refit".to_string(),
+            })
     }
 
     pub fn validate_for_persistence(&self) -> Result<(), FittedModelError> {
@@ -2773,62 +2786,83 @@ impl FittedModel {
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
         if self.fit_result.is_none() {
-            return Err("model is missing canonical fit_result payload; refit".to_string());
+            return Err(FittedModelError::MissingField {
+                reason: "model is missing canonical fit_result payload; refit".to_string(),
+            });
         }
         if self.data_schema.is_none() {
-            return Err("model is missing data_schema; refit".to_string());
+            return Err(FittedModelError::MissingField {
+                reason: "model is missing data_schema; refit".to_string(),
+            });
         }
         if self.training_headers.is_none() {
-            return Err(
-                "model is missing training_headers; refit to guarantee stable feature mapping at prediction time"
+            return Err(FittedModelError::MissingField {
+                reason: "model is missing training_headers; refit to guarantee stable feature mapping at prediction time"
                     .to_string(),
-            );
+            });
         }
         let spec = self.resolved_termspec.as_ref().ok_or_else(|| {
-            "model is missing resolved_termspec; refit to guarantee train/predict design consistency"
-                .to_string()
+            FittedModelError::MissingField {
+                reason: "model is missing resolved_termspec; refit to guarantee train/predict design consistency"
+                    .to_string(),
+            }
         })?;
         validate_frozen_term_collectionspec(spec, "resolved_termspec")?;
 
         if self.formula_noise.is_some() && self.resolved_termspec_noise.is_none() {
-            return Err(
-                "model defines formula_noise but is missing resolved_termspec_noise; refit"
+            return Err(FittedModelError::MissingField {
+                reason: "model defines formula_noise but is missing resolved_termspec_noise; refit"
                     .to_string(),
-            );
+            });
         }
         if let Some(spec_noise) = self.resolved_termspec_noise.as_ref() {
             validate_frozen_term_collectionspec(spec_noise, "resolved_termspec_noise")?;
         }
         if matches!(self.family_state, FittedFamily::TransformationNormal { .. }) {
             let score = self.transformation_score_calibration.ok_or_else(|| {
-                "transformation-normal model is missing transformation_score_calibration; refit"
-                    .to_string()
+                FittedModelError::MissingField {
+                    reason: "transformation-normal model is missing transformation_score_calibration; refit"
+                        .to_string(),
+                }
             })?;
             score.validate("transformation-normal model")?;
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
-                return Err("marginal-slope model is missing formula_logslope; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing formula_logslope; refit".to_string(),
+                });
             }
             if self.z_column.is_none() {
-                return Err("marginal-slope model is missing z_column; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing z_column; refit".to_string(),
+                });
             }
             let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                "marginal-slope model is missing latent_z_normalization; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing latent_z_normalization; refit"
+                        .to_string(),
+                }
             })?;
             z_normalization.validate("marginal-slope model")?;
             let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing latent_measure; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing latent_measure; refit".to_string(),
+                }
             })?;
-            latent_measure.validate("marginal-slope model latent_measure")?;
+            latent_measure
+                .validate("marginal-slope model latent_measure")
+                .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
-                return Err("marginal-slope model is missing baseline offsets; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing baseline offsets; refit".to_string(),
+                });
             }
             if self.resolved_termspec_logslope.as_ref().is_none() {
-                return Err(
-                    "marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                         .to_string(),
-                );
+                });
             }
             match self.family_state.frailty() {
                 Some(FrailtySpec::None)
@@ -2836,21 +2870,22 @@ impl FittedModel {
                     sigma_fixed: Some(_),
                 }) => {}
                 Some(FrailtySpec::GaussianShift { sigma_fixed: None }) => {
-                    return Err(
-                        "marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
                             .to_string(),
-                    );
+                    });
                 }
                 Some(FrailtySpec::HazardMultiplier { .. }) => {
-                    return Err(
-                        "marginal-slope model does not support HazardMultiplier frailty"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "marginal-slope model does not support HazardMultiplier frailty"
                             .to_string(),
-                    );
+                    });
                 }
                 None => {
-                    return Err(
-                        "marginal-slope model is missing family_state.frailty; refit".to_string(),
-                    );
+                    return Err(FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing family_state.frailty; refit"
+                            .to_string(),
+                    });
                 }
             }
         }
@@ -2865,43 +2900,51 @@ impl FittedModel {
                 survival_likelihood.as_deref(),
                 Some("latent") | Some("latent-binary")
             ) {
-                return Err(
-                    "latent hazard-window models must persist explicit family_state metadata, not generic survival metadata"
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "latent hazard-window models must persist explicit family_state metadata, not generic survival metadata"
                         .to_string(),
-                );
+                });
             }
             if survival_likelihood.as_deref() == Some("marginal-slope") {
                 if self.formula_logslope.is_none() {
-                    return Err(
-                        "survival marginal-slope model is missing formula_logslope; refit"
+                    return Err(FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing formula_logslope; refit"
                             .to_string(),
-                    );
+                    });
                 }
                 if self.z_column.is_none() {
-                    return Err(
-                        "survival marginal-slope model is missing z_column; refit".to_string()
-                    );
+                    return Err(FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing z_column; refit"
+                            .to_string(),
+                    });
                 }
                 let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                    "survival marginal-slope model is missing latent_z_normalization; refit"
-                        .to_string()
+                    FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing latent_z_normalization; refit"
+                            .to_string(),
+                    }
                 })?;
                 z_normalization.validate("survival marginal-slope model")?;
                 let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                    "survival marginal-slope model is missing latent_measure; refit".to_string()
-                })?;
-                latent_measure.validate("survival marginal-slope model latent_measure")?;
-                if self.logslope_baseline.is_none() {
-                    return Err(
-                        "survival marginal-slope model is missing logslope_baseline; refit"
+                    FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing latent_measure; refit"
                             .to_string(),
-                    );
+                    }
+                })?;
+                latent_measure
+                    .validate("survival marginal-slope model latent_measure")
+                    .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
+                if self.logslope_baseline.is_none() {
+                    return Err(FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing logslope_baseline; refit"
+                            .to_string(),
+                    });
                 }
                 if self.resolved_termspec_logslope.as_ref().is_none() {
-                    return Err(
-                        "survival marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
+                    return Err(FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing resolved_termspec_logslope for the logslope surface"
                             .to_string(),
-                    );
+                    });
                 }
                 match frailty {
                     FrailtySpec::None
@@ -2909,23 +2952,23 @@ impl FittedModel {
                         sigma_fixed: Some(_),
                     } => {}
                     FrailtySpec::GaussianShift { sigma_fixed: None } => {
-                        return Err(
-                            "survival marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
+                        return Err(FittedModelError::IncompatibleConfig {
+                            reason: "survival marginal-slope model requires a fixed GaussianShift sigma in family_state.frailty"
                                 .to_string(),
-                        );
+                        });
                     }
                     FrailtySpec::HazardMultiplier { .. } => {
-                        return Err(
-                            "survival marginal-slope model does not support HazardMultiplier frailty"
-                            .to_string(),
-                        );
+                        return Err(FittedModelError::IncompatibleConfig {
+                            reason: "survival marginal-slope model does not support HazardMultiplier frailty"
+                                .to_string(),
+                        });
                     }
                 }
             } else if !matches!(frailty, FrailtySpec::None) {
-                return Err(
-                    "non-marginal survival models do not currently persist a frailty modifier"
+                return Err(FittedModelError::IncompatibleConfig {
+                    reason: "non-marginal survival models do not currently persist a frailty modifier"
                         .to_string(),
-                );
+                });
             }
         }
         if let FittedFamily::LatentSurvival { frailty } = &self.family_state {
@@ -2937,22 +2980,23 @@ impl FittedModel {
                 FrailtySpec::HazardMultiplier {
                     sigma_fixed: None, ..
                 } => {
-                    return Err(
-                        "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "latent survival model requires a fixed HazardMultiplier sigma in family_state.frailty"
                             .to_string(),
-                    );
+                    });
                 }
                 FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
-                    return Err(
-                        "latent survival model requires a fixed HazardMultiplier frailty specification"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "latent survival model requires a fixed HazardMultiplier frailty specification"
                             .to_string(),
-                    );
+                    });
                 }
             }
             if self.survival_likelihood.as_deref() != Some("latent") {
-                return Err(
-                    "latent survival model must persist survival_likelihood=latent".to_string(),
-                );
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "latent survival model must persist survival_likelihood=latent"
+                        .to_string(),
+                });
             }
         }
         if let FittedFamily::LatentBinary { frailty } = &self.family_state {
@@ -2964,23 +3008,23 @@ impl FittedModel {
                 FrailtySpec::HazardMultiplier {
                     sigma_fixed: None, ..
                 } => {
-                    return Err(
-                        "latent binary model requires a fixed HazardMultiplier sigma in family_state.frailty"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "latent binary model requires a fixed HazardMultiplier sigma in family_state.frailty"
                             .to_string(),
-                    );
+                    });
                 }
                 FrailtySpec::GaussianShift { .. } | FrailtySpec::None => {
-                    return Err(
-                        "latent binary model requires a fixed HazardMultiplier frailty specification"
+                    return Err(FittedModelError::IncompatibleConfig {
+                        reason: "latent binary model requires a fixed HazardMultiplier frailty specification"
                             .to_string(),
-                    );
+                    });
                 }
             }
             if self.survival_likelihood.as_deref() != Some("latent-binary") {
-                return Err(
-                    "latent binary model must persist survival_likelihood=latent-binary"
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "latent binary model must persist survival_likelihood=latent-binary"
                         .to_string(),
-                );
+                });
             }
         }
 
@@ -3045,24 +3089,26 @@ impl FittedModel {
                 ..
             }
         ) {
-            return Err(
-                "latent-cloglog-binomial is not supported for location-scale saved models"
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: "latent-cloglog-binomial is not supported for location-scale saved models"
                     .to_string(),
-            );
+            });
         }
         if matches!(self.family_state, FittedFamily::Survival { .. })
             && self.survival_likelihood.is_none()
         {
-            return Err(
-                "saved survival model is missing survival_likelihood metadata; refit".to_string(),
-            );
+            return Err(FittedModelError::MissingField {
+                reason: "saved survival model is missing survival_likelihood metadata; refit"
+                    .to_string(),
+            });
         }
         if matches!(self.family_state, FittedFamily::Survival { .. })
             && self.survival_time_basis.is_none()
         {
-            return Err(
-                "saved survival model is missing survival_time_basis metadata; refit".to_string(),
-            );
+            return Err(FittedModelError::MissingField {
+                reason: "saved survival model is missing survival_time_basis metadata; refit"
+                    .to_string(),
+            });
         }
         if matches!(self.family_state, FittedFamily::Survival { .. })
             && self.survival_time_anchor.is_none()
@@ -3073,9 +3119,10 @@ impl FittedModel {
             // serialized without it would fail at the first predict call.
             // Catching it here makes save fail fast — the same defence the
             // basis check provides for the basisname field.
-            return Err(
-                "saved survival model is missing survival_time_anchor metadata; refit".to_string(),
-            );
+            return Err(FittedModelError::MissingField {
+                reason: "saved survival model is missing survival_time_anchor metadata; refit"
+                    .to_string(),
+            });
         }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
@@ -3087,10 +3134,10 @@ impl FittedModel {
                 .is_some();
         let saved_link_wiggle = self.saved_link_wiggle()?;
         if has_any_saved_link_wiggle && saved_link_wiggle.is_none() {
-            return Err(
-                "saved model has incomplete link-wiggle state; expected metadata and coefficients"
+            return Err(FittedModelError::SchemaMismatch {
+                reason: "saved model has incomplete link-wiggle state; expected metadata and coefficients"
                     .to_string(),
-            );
+            });
         }
         let has_any_saved_baseline_time_wiggle = self.baseline_timewiggle_knots.is_some()
             || self.baseline_timewiggle_degree.is_some()
@@ -3109,16 +3156,16 @@ impl FittedModel {
                     && self.baseline_timewiggle_double_penalty.is_some()
                     && self.beta_baseline_timewiggle_by_cause.is_some();
                 if !complete {
-                    return Err(
-                        "saved joint cause-specific survival model has incomplete baseline-timewiggle state; expected metadata and per-cause coefficients"
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason: "saved joint cause-specific survival model has incomplete baseline-timewiggle state; expected metadata and per-cause coefficients"
                             .to_string(),
-                    );
+                    });
                 }
             } else if self.saved_baseline_time_wiggle()?.is_none() {
-                return Err(
-                    "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
+                return Err(FittedModelError::SchemaMismatch {
+                    reason: "saved model has incomplete baseline-timewiggle state; expected metadata and coefficients"
                         .to_string(),
-                );
+                });
             }
         }
         if self
@@ -3139,13 +3186,17 @@ impl FittedModel {
         // diagnostic: `gam fit` catches its own bad output at save, and
         // `gam predict` catches bad input at load rather than mid-pipeline.
         if let Some(runtime) = self.score_warp_runtime.as_ref() {
-            runtime
-                .validate_exact_replay_contract()
-                .map_err(|err| format!("saved anchored score-warp runtime is invalid: {err}"))?;
+            runtime.validate_exact_replay_contract().map_err(|err| {
+                FittedModelError::PayloadCorrupt {
+                    reason: format!("saved anchored score-warp runtime is invalid: {err}"),
+                }
+            })?;
         }
         if let Some(runtime) = self.link_deviation_runtime.as_ref() {
             runtime.validate_exact_replay_contract().map_err(|err| {
-                format!("saved anchored link-deviation runtime is invalid: {err}")
+                FittedModelError::PayloadCorrupt {
+                    reason: format!("saved anchored link-deviation runtime is invalid: {err}"),
+                }
             })?;
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
@@ -3156,7 +3207,9 @@ impl FittedModel {
                 "fit_result",
             )?;
             let unified = self.unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing unified fit payload; refit".to_string(),
+                }
             })?;
             validate_marginal_slope_saved_fit(
                 unified,
@@ -3200,9 +3253,10 @@ impl FittedModel {
     }
 
     pub fn validate_numeric_finiteness(&self) -> Result<(), FittedModelError> {
+        let corrupt = |reason: String| FittedModelError::PayloadCorrupt { reason };
         if let Some(fit) = self.fit_result.as_ref() {
             fit.validate_numeric_finiteness()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| corrupt(e.to_string()))?;
         }
 
         for (name, opt) in [
@@ -3218,38 +3272,40 @@ impl FittedModel {
             ("survivalridge_lambda", self.survivalridge_lambda),
         ] {
             if let Some(v) = opt {
-                ensure_finite_scalar(name, v)?;
+                ensure_finite_scalar(name, v).map_err(corrupt)?;
             }
         }
 
         if let Some(v) = self.beta_noise.as_ref() {
-            validate_all_finite("beta_noise", v.iter().copied())?;
+            validate_all_finite("beta_noise", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.noise_projection.as_ref() {
-            validate_all_finite("noise_projection", v.iter().flatten().copied())?;
+            validate_all_finite("noise_projection", v.iter().flatten().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.noise_center.as_ref() {
-            validate_all_finite("noise_center", v.iter().copied())?;
+            validate_all_finite("noise_center", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.noise_scale.as_ref() {
-            validate_all_finite("noise_scale", v.iter().copied())?;
+            validate_all_finite("noise_scale", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.noise_projection_ridge_alpha {
-            ensure_finite_scalar("noise_projection_ridge_alpha", v)?;
+            ensure_finite_scalar("noise_projection_ridge_alpha", v).map_err(corrupt)?;
             if v < 0.0 {
-                return Err(format!(
-                    "noise_projection_ridge_alpha must be non-negative, got {v}"
-                ));
+                return Err(FittedModelError::InvalidInput {
+                    reason: format!(
+                        "noise_projection_ridge_alpha must be non-negative, got {v}"
+                    ),
+                });
             }
         }
         if let Some(v) = self.gaussian_response_scale {
-            ensure_finite_scalar("gaussian_response_scale", v)?;
+            ensure_finite_scalar("gaussian_response_scale", v).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
-            validate_all_finite("beta_link_wiggle", v.iter().copied())?;
+            validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_baseline_timewiggle.as_ref() {
-            validate_all_finite("beta_baseline_timewiggle", v.iter().copied())?;
+            validate_all_finite("beta_baseline_timewiggle", v.iter().copied()).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_baseline_timewiggle_by_cause.as_ref() {
             validate_all_finite(
