@@ -56,6 +56,7 @@ from ._api import (
     loads,
     periodic_spline_curve_basis,
     smoothness_penalty,
+    sphere_basis,
     validate_formula,
 )
 from ._binding import RustExtensionUnavailableError
@@ -191,6 +192,7 @@ __all__ = [
     "load_posterior",
     "loads",
     "periodic_spline_curve_basis",
+    "sphere_basis",
     "simplex_frechet_mean",
     "smoothness_penalty",
     "sphere_frechet_mean",
