@@ -6890,6 +6890,34 @@ fn try_tangent_projected_evaluate(
                 .to_string(),
         );
     }
+    if solution.hessian_logdet_correction != 0.0 {
+        // Non-zero correction means the operator encodes a uniformly rescaled
+        // curvature `H' = αH` and the correction restores `log|H| = log|H'| − p·log α`.
+        // Under tangent projection the equivalent correction is `−m·log α` (not
+        // `−p·log α`), with `m = p − rank(A_act)`. Recovering `α` from the
+        // current scalar correction `−p·log α` and re-applying it as `−m·log α`
+        // is a clean fix, but the scalar API only carries the product, not `α`
+        // separately. Until callers pass `α` (or a tangent-aware correction)
+        // explicitly, surface the gap rather than silently dropping the term.
+        return Err(format!(
+            "constraint-tangent LAML projection cannot honor a non-zero \
+             `hessian_logdet_correction` (= {:.3e}): the correction encodes a \
+             p-space uniform rescale that becomes `m·log α` in tangent space (m = \
+             p − rank(A_act)), not `p·log α`. Pass a rank-aware correction (or \
+             store the rescale factor `α` separately on `InnerSolution`) when \
+             active constraints co-occur with operator rescaling",
+            solution.hessian_logdet_correction
+        ));
+    }
+    if solution.tk_correction != 0.0 || solution.tk_gradient.is_some() {
+        return Err(
+            "constraint-tangent LAML projection is not yet implemented for solutions \
+             carrying a non-zero Tierney-Kadane frozen-curvature correction. The TK \
+             surrogate's `log|H_frozen|` term would need its tangent projection \
+             `log|Zᵀ H_frozen Z|`; pass through unchanged is incorrect"
+                .to_string(),
+        );
+    }
     let z = match compute_active_constraint_tangent_basis(&block.a) {
         Some(z) => z,
         None => {
