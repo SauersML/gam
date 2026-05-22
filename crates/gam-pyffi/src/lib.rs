@@ -39,7 +39,10 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
-use gam::smooth::{TermCollectionDesign, TermCollectionSpec, freeze_term_collection_from_design};
+use gam::smooth::{
+    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    freeze_term_collection_from_design,
+};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
@@ -47,7 +50,8 @@ use gam::terms::basis::{
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
     build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
     build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
-    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
+    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
@@ -727,6 +731,37 @@ fn auto_centers_1d<'py>(
     let centers = auto_centers_1d_equal_mass(t.as_array(), num_centers)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(centers.into_pyarray(py).unbind())
+}
+
+/// Build a closed cyclic uniform B-spline basis and its cyclic difference
+/// penalty on the periodic parameter `t`.
+///
+/// Inputs are reduced into the canonical `[0, 1)` domain (rem_euclid). The
+/// returned `(basis, penalty)` pair lives in the same `K = n_knots` cyclic
+/// control-point space: rows of `basis` are periodic with period 1, and
+/// `penalty` is the cyclic second-difference penalty `D'D` (default
+/// `penalty_order=2`).
+///
+/// To fit a closed parametric curve `t -> R^d`, regress the response `(N, d)`
+/// against `basis` (shape `(N, K)`) with `penalty` and stack the per-column
+/// coefficient vectors into a `(K, d)` control point matrix.
+#[pyfunction(signature = (t, n_knots, degree = 3, penalty_order = 2))]
+fn periodic_spline_curve_basis<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    n_knots: usize,
+    degree: usize,
+    penalty_order: usize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let basis =
+        create_periodic_bspline_basis_dense(t.as_array(), (0.0, 1.0), degree, n_knots)
+            .map_err(|err| py_value_error(err.to_string()))?;
+    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok((
+        basis.into_pyarray(py).unbind(),
+        penalty.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
@@ -3755,6 +3790,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
+    module.add_function(wrap_pyfunction!(periodic_spline_curve_basis, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;

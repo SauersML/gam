@@ -248,6 +248,79 @@ def duchon_basis(
     return apply(points, centers_t, int(m), periodic_tuple)
 
 
+def sphere_basis(
+    points: torch.Tensor,
+    n_centers: int,
+    *,
+    penalty_order: int = 2,
+    kernel: str = "sobolev",
+    radians: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the spherical-spline (S²) design and penalty matrices.
+
+    Forward-only: there is no analytic VJP through ``points``. The
+    returned tensors are detached float64 copies on ``points``' device.
+
+    Parameters
+    ----------
+    points : torch.Tensor of shape ``(N, 2)`` (latitude, longitude).
+    n_centers : Wahba center count for ``kernel='sobolev' | 'pseudo'`` or
+        truncation degree ``L`` for ``kernel='harmonic'``.
+    penalty_order : roughness order ``m ∈ {1, 2, 3, 4}``. Default ``2``.
+    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    radians : default ``False`` (degrees). True for radians.
+
+    Returns
+    -------
+    (design (N, K), penalty (K, K)) as float64 torch tensors.
+    """
+    design_np, penalty_np = _api.sphere_basis(
+        to_numpy_f64(points),
+        int(n_centers),
+        penalty_order=int(penalty_order),
+        kernel=str(kernel),
+        radians=bool(radians),
+    )
+    design = from_numpy_like(design_np, points).to(torch.float64)
+    penalty = from_numpy_like(penalty_np, points).to(torch.float64)
+    return design, penalty
+
+
+def periodic_spline_curve_basis(
+    t: torch.Tensor,
+    n_knots: int,
+    *,
+    degree: int = 3,
+    penalty_order: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Evaluate the closed cyclic B-spline basis and its cyclic penalty.
+
+    Forward-only: ``t`` is structural here (the basis is periodic uniform on
+    ``[0, 1)``); no autograd path is exposed since gamfit's ``_api`` has no
+    derivative primitive for this basis.
+
+    Parameters
+    ----------
+    t : torch.Tensor of shape ``(N,)``. Values are reduced modulo 1.
+    n_knots : number of cyclic control-point basis columns.
+    degree : B-spline degree. Default 3.
+    penalty_order : cyclic difference penalty order. Default 2.
+
+    Returns
+    -------
+    (torch.Tensor, torch.Tensor)
+        ``basis`` of shape ``(N, n_knots)`` and ``penalty`` of shape
+        ``(n_knots, n_knots)``.
+    """
+    basis_np, penalty_np = _api.periodic_spline_curve_basis(
+        to_numpy_f64(t),
+        int(n_knots),
+        degree=int(degree),
+        penalty_order=int(penalty_order),
+    )
+    return from_numpy_like(basis_np, t).to(torch.float64), from_numpy_like(penalty_np, t).to(torch.float64)
+
+
 def smoothness_penalty(
     knots: torch.Tensor,
     *,

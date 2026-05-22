@@ -19,6 +19,9 @@ Quick start::
     print(posterior)                         # one-line convergence summary
     model.save("model.gam")
 
+For multi-smooth fits with per-smooth λ (the mgcv default), use the formula
+API ``gamfit.fit(df, 'y ~ s(x1) + s(x2)')``.
+
 See https://github.com/SauersML/gam for the full guide.
 """
 
@@ -51,6 +54,7 @@ from ._api import (
     gaussian_weighted_ridge_batch,
     load,
     loads,
+    periodic_spline_curve_basis,
     smoothness_penalty,
     validate_formula,
 )
@@ -61,6 +65,7 @@ from .smooth import (
     Categorical,
     Duchon,
     Matern,
+    PeriodicSplineCurve,
     Smooth,
     Sphere,
     TensorBSpline,
@@ -159,6 +164,7 @@ __all__ = [
     "Categorical",
     "Duchon",
     "Matern",
+    "PeriodicSplineCurve",
     "Smooth",
     "Sphere",
     "TensorBSpline",
@@ -182,6 +188,7 @@ __all__ = [
     "load",
     "load_posterior",
     "loads",
+    "periodic_spline_curve_basis",
     "simplex_frechet_mean",
     "smoothness_penalty",
     "sphere_frechet_mean",

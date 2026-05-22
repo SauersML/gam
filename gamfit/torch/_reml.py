@@ -375,14 +375,49 @@ def gaussian_reml_fit_additive(
     weights: torch.Tensor | None = None,
     init_lambda: float | None = None,
 ) -> AdditiveRemlOutput:
-    """Joint multi-smooth additive Gaussian REML fit (single-λ approximation).
+    """Joint multi-smooth additive Gaussian REML fit (single shared λ).
 
-    Concatenates the per-smooth design blocks (with optional per-smooth
-    ``by`` modulation applied to each block) into a wide design ``[D_1 |
-    D_2 | ...]`` and assembles a block-diagonal joint penalty from the
-    per-smooth ``S_i``. The combined problem is solved by the single-λ
-    :func:`gaussian_reml_fit` and the resulting joint coefficient block is
-    split back per-smooth at the boundary offsets.
+    .. warning::
+       **This path fits a single shared smoothing parameter λ across every
+       smooth block.** It is *not* the mgcv-style per-smooth λ that most
+       users expect from an additive REML fit. Concretely: the per-smooth
+       design blocks are concatenated into a wide design
+       ``[D_1 | D_2 | ...]`` and the per-smooth ``S_i`` are assembled into
+       a block-diagonal joint penalty, but the combined problem is then
+       handed to the single-λ :func:`gaussian_reml_fit` — so one scalar λ
+       multiplies the entire block-diagonal penalty rather than one λ_k
+       per block.
+
+    For per-smooth λ — i.e. the standard ``ŷ ~ s(x1) + s(x2) + ...`` fit
+    with independent smoothing parameters for each term — use the formula
+    API instead::
+
+        model = gamfit.fit(data, 'y ~ s(x1) + s(x2) + ...')
+
+    The formula API drives the PIRLS workflow, which performs the full
+    multi-block REML/LAML outer optimisation (one λ_k per smooth) and
+    returns a serialised :class:`gamfit.Model`. If you only need the
+    final coefficients / λ vector / EDF you can post-process that
+    ``Model``; if you specifically need a differentiable ``torch.Tensor``
+    pipeline you are constrained to the single-λ closed-form here until
+    the Rust kernel grows multi-block support.
+
+    Why this is single-λ (math note)
+    --------------------------------
+    The closed-form Gaussian REML kernel (see
+    ``crates/gam-core/src/solver/gaussian_reml.rs``) exploits the joint
+    generalised eigendecomposition of the pair ``(S, X'WX)`` so that the
+    REML score and its gradient become rational functions of the single
+    scalar λ, evaluated at O(1) per probe after one eigendecomposition.
+    With multiple λ_k the relevant pair is ``(Σ_k λ_k S_k, X'WX)`` and a
+    *single* eigendecomposition no longer diagonalises every λ_k jointly,
+    so the closed-form collapses: the multi-block path needs a fresh
+    per-iteration solve, an outer multi-dimensional optimiser over
+    ``log λ_k``, and an analytic VJP through the F×F Hessian of the
+    REML criterion. That refactor is tracked as a deliberate API
+    limitation; see :mod:`gamfit.torch._multi_lambda_status` and the
+    "True multi-λ in additive REML" feature request. Until then the
+    canonical recommendation for multi-smooth fits is the formula API.
 
     Parameters
     ----------
@@ -407,7 +442,8 @@ def gaussian_reml_fit_additive(
         ``coefficients`` is a list of length ``F`` with the per-smooth
         blocks; ``fitted`` is the joint ``(N, D)`` reconstruction;
         ``lam``/``reml_score``/``edf`` are the shared scalar outputs of the
-        underlying single-λ REML fit.
+        underlying single-λ REML fit. Note ``lam`` is a single scalar
+        applied across all smooths, *not* a length-``F`` vector.
     """
     if len(designs) != len(penalties):
         raise ValueError(
