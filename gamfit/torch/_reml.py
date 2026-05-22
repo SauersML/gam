@@ -780,8 +780,8 @@ def gaussian_reml_fit_additive(
     multi-block Rust REML path (see :func:`gaussian_reml_fit_blocks`) so
     each smooth recovers its own ``λ_k`` from the outer optimisation. The
     multi-block path is now fully differentiable: backward composes the
-    envelope-theorem VJPs and the IFT through the F×F outer Hessian by
-    central FD on the warm-started forward fit.
+    closed-form Gaussian VJPs and the IFT through the F×F smoothing
+    adjoint system.
 
     Two cases use the closed-form block-diagonal kernel instead:
 

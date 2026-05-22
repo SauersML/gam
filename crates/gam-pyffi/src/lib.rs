@@ -1479,7 +1479,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         linear_constraints: None,
         firth_bias_reduction: false,
         adaptive_regularization: None,
-        penalty_shrinkage_floor: Some(1e-6),
+        penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
@@ -1598,7 +1598,10 @@ fn block_penalty_rank_and_pinv(
     Ok((rank, scaled.dot(&vecs.t())))
 }
 
-fn invert_spd_with_ridge(matrix: &Array2<f64>, ridge_rel: f64) -> Result<Array2<f64>, EstimationError> {
+fn invert_spd_with_ridge(
+    matrix: &Array2<f64>,
+    ridge_rel: f64,
+) -> Result<Array2<f64>, EstimationError> {
     let n = matrix.nrows();
     let eye = identity_matrix(n);
     let scale = (0..n)
@@ -1627,35 +1630,27 @@ fn solve_spd_vector_with_ridge(
     ridge_rel: f64,
 ) -> Result<Array1<f64>, EstimationError> {
     let n = matrix.nrows();
-    let mut rhs_mat = Array2::<f64>::zeros((n, 1));
+    let sym = symmetrized_matrix(matrix);
+    let (eigs, vecs) = sym.eigh(Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
+    let projected = vecs.t().dot(rhs);
+    let mut scaled = Array1::<f64>::zeros(n);
     for i in 0..n {
-        rhs_mat[[i, 0]] = rhs[i];
+        scaled[i] = projected[i] / eigs[i].max(floor);
     }
-    let scale = (0..n)
-        .map(|i| matrix[[i, i]].abs())
-        .fold(1.0_f64, f64::max);
-    let ridges = [0.0, ridge_rel, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
-    for rel in ridges {
-        let mut candidate = matrix.clone();
-        if rel > 0.0 {
-            for i in 0..n {
-                candidate[[i, i]] += rel * scale;
-            }
-        }
-        let candidate_view = FaerArrayView::new(&candidate);
-        if let Ok(factor) = factorize_symmetricwith_fallback(candidate_view.as_ref(), Side::Lower) {
-            let mut solved = rhs_mat.clone();
-            let solved_view = array2_to_matmut(&mut solved);
-            factor.solve_in_place(solved_view);
-            let out = solved.column(0).to_owned();
-            if out.iter().all(|value| value.is_finite()) {
-                return Ok(out);
-            }
-        }
+    let out = vecs.dot(&scaled);
+    if out.iter().all(|value| value.is_finite()) {
+        Ok(out)
+    } else {
+        Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })
     }
-    Err(EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
-    })
 }
 
 fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
@@ -1717,18 +1712,28 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             )));
         }
     }
-    for (name, maybe) in [
-        ("grad_lambdas", grad_lambdas),
-        ("grad_log_lambdas", grad_log_lambdas),
-        ("grad_edf", grad_edf),
-    ] {
-        if let Some(vec) = maybe {
-            if vec.len() != f_blocks {
-                return Err(EstimationError::InvalidInput(format!(
-                    "{name} length mismatch: expected {f_blocks}, got {}",
-                    vec.len()
-                )));
-            }
+    if let Some(vec) = grad_lambdas {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_lambdas length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
+        }
+    }
+    if let Some(vec) = grad_log_lambdas {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_log_lambdas length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
+        }
+    }
+    if let Some(vec) = grad_edf {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_edf length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
         }
     }
 
@@ -1780,6 +1785,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         .iter()
         .map(|p| Array2::<f64>::zeros(p.dim()))
         .collect();
+    let v_bar = -grad_reml_score;
 
     let mut beta_bar = Array1::<f64>::zeros(p_total);
     if let Some(gc) = grad_coefficients {
@@ -1799,12 +1805,12 @@ fn gaussian_reml_fit_blocks_backward_analytic(
     let zu = z.dot(&u);
     let wzu = &zu * &weights;
     for row in 0..n {
-        grad_y[[row, 0]] += wzu[row] - grad_reml_score * weighted_residual[row];
+        grad_y[[row, 0]] += wzu[row] - v_bar * weighted_residual[row];
         grad_weights[row] += residual[row] * zu[row];
         for col in 0..p_total {
             grad_z[[row, col]] += weighted_residual[row] * u[col]
                 - weights[row] * zu[row] * beta[col]
-                + grad_reml_score * weighted_residual[row] * beta[col];
+                + v_bar * weighted_residual[row] * beta[col];
         }
     }
     let za = z.dot(&a);
@@ -1812,10 +1818,9 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         let mut diag_za = 0.0;
         for col in 0..p_total {
             diag_za += z[[row, col]] * za[[row, col]];
-            grad_z[[row, col]] -= grad_reml_score * weights[row] * za[[row, col]];
+            grad_z[[row, col]] -= v_bar * weights[row] * za[[row, col]];
         }
-        grad_weights[row] +=
-            grad_reml_score * (-0.5 * residual[row] * residual[row] - 0.5 * diag_za);
+        grad_weights[row] += v_bar * (-0.5 * residual[row] * residual[row] - 0.5 * diag_za);
     }
 
     let mut h_values = Array1::<f64>::zeros(f_blocks);
@@ -1846,7 +1851,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         h_values[block] = beta_s_beta + trace_a_s;
         score_g[block] = 0.5 * (ranks[block] as f64 - lambdas[block] * h_values[block]);
         eta[block] += -lambdas[block] * u_k.dot(&s_beta);
-        eta[block] += grad_reml_score * score_g[block];
+        eta[block] += v_bar * score_g[block];
 
         let a_block_s = a.slice(s![.., start..end]).dot(&penalties[block]);
         let c_i = a_block_s.dot(&beta_k);
@@ -1864,7 +1869,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         for i in 0..(end - start) {
             for j in 0..(end - start) {
                 grad_penalties[block][[i, j]] += -lambdas[block] * sym_u_beta[[i, j]]
-                    + grad_reml_score
+                    + v_bar
                         * (-0.5
                             * lambdas[block]
                             * (beta_k[i] * beta_k[j] + a_kk[[i, j]])
@@ -1893,7 +1898,8 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             for row in 0..n {
                 let mut diag = 0.0;
                 for col in 0..p_total {
-                    grad_z[[row, col]] += 2.0 * scale * lambda_l * weights[row] * zt[[row, col]];
+                    grad_z[[row, col]] +=
+                        2.0 * scale * lambda_l * weights[row] * zt[[row, col]];
                     diag += z[[row, col]] * zt[[row, col]];
                 }
                 grad_weights[row] += scale * lambda_l * diag;
@@ -2009,7 +2015,11 @@ fn gaussian_reml_fit_blocks_backward_analytic(
 
     let mut grad_designs = Vec::with_capacity(f_blocks);
     for block in 0..f_blocks {
-        grad_designs.push(grad_z.slice(s![.., offsets[block]..offsets[block + 1]]).to_owned());
+        grad_designs.push(
+            grad_z
+                .slice(s![.., offsets[block]..offsets[block + 1]])
+                .to_owned(),
+        );
         symmetrize_in_place(&mut grad_penalties[block]);
     }
 
@@ -9965,6 +9975,174 @@ mod tests {
             previous = Some(estimate);
         }
         (best, best_delta)
+    }
+
+    fn blocks_reml_sign_inputs() -> (Vec<Array2<f64>>, Vec<Array2<f64>>, Array1<f64>, Array1<f64>) {
+        let n = 18;
+        let x1 = Array2::from_shape_fn((n, 3), |(row, col)| {
+            let t = (row as f64 + 0.5) / n as f64;
+            match col {
+                0 => 1.0,
+                1 => t - 0.45,
+                2 => (4.3 * t).sin() + 0.2 * t,
+                _ => unreachable!(),
+            }
+        });
+        let x2 = Array2::from_shape_fn((n, 2), |(row, col)| {
+            let t = (row as f64 + 0.5) / n as f64;
+            match col {
+                0 => (2.1 * t).cos() - 0.1,
+                1 => (7.7 * t + 0.3).sin(),
+                _ => unreachable!(),
+            }
+        });
+        let s1 = array![
+            [0.7, 0.08, 0.02],
+            [0.08, 1.3, -0.04],
+            [0.02, -0.04, 2.1],
+        ];
+        let s2 = array![[0.9, -0.06], [-0.06, 1.8]];
+        let y = Array1::from_shape_fn(n, |row| {
+            let t = (row as f64 + 0.5) / n as f64;
+            0.25 + 0.35 * t + 0.18 * (5.0 * t).sin() + 0.09 * (11.0 * t + 0.2).cos()
+        });
+        let weights = Array1::from_shape_fn(n, |row| {
+            let t = (row as f64 + 0.5) / n as f64;
+            0.9 + 0.16 * (1.7 * t).cos()
+        });
+        (vec![x1, x2], vec![s1, s2], y, weights)
+    }
+
+    fn blocks_profile_reml_score(
+        designs: &[Array2<f64>],
+        penalties: &[Array2<f64>],
+        y: ArrayView1<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        init_rhos: &[f64],
+    ) -> f64 {
+        let (_, _, _, _, reml_score, _) =
+            gaussian_reml_fit_blocks_forward_native(designs, penalties, y, weights, init_rhos)
+                .expect("multi-block Gaussian REML profile score");
+        reml_score
+    }
+
+    #[test]
+    fn blocks_negative_reml_score_backward_sign_matches_profile_perturbations() {
+        let (designs, penalties, y, weights) = blocks_reml_sign_inputs();
+        let init_rhos = vec![0.2, -0.4];
+        let (_, _, _, log_lambdas, _, _) = gaussian_reml_fit_blocks_forward_native(
+            &designs,
+            &penalties,
+            y.view(),
+            weights.view(),
+            init_rhos.as_slice(),
+        )
+        .expect("base multi-block Gaussian REML fit");
+        let rhos = log_lambdas.to_vec();
+        let backward = gaussian_reml_fit_blocks_backward_analytic(
+            &designs,
+            &penalties,
+            y.view(),
+            weights.view(),
+            rhos.as_slice(),
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            None,
+        )
+        .expect("negative REML score analytic VJP");
+        let eps = 1.0e-5;
+
+        for row in [2_usize, 11] {
+            let (fd, fd_error) = adaptive_finite_difference(y[row], eps, |candidate| {
+                let mut yp = y.clone();
+                yp[row] = candidate;
+                blocks_profile_reml_score(
+                    &designs,
+                    &penalties,
+                    yp.view(),
+                    weights.view(),
+                    rhos.as_slice(),
+                )
+            });
+            assert_fd_estimate_close(
+                &format!("negative REML y[{row}] sign"),
+                backward.grad_y[[row, 0]],
+                fd,
+                fd_error,
+            );
+        }
+
+        for (block, row, col) in [(0_usize, 5_usize, 2_usize), (1, 12, 1)] {
+            let center = designs[block][[row, col]];
+            let (fd, fd_error) = adaptive_finite_difference(center, eps, |candidate| {
+                let mut xp = designs.clone();
+                xp[block][[row, col]] = candidate;
+                blocks_profile_reml_score(
+                    &xp,
+                    &penalties,
+                    y.view(),
+                    weights.view(),
+                    rhos.as_slice(),
+                )
+            });
+            assert_fd_estimate_close(
+                &format!("negative REML X{block}[{row},{col}] sign"),
+                backward.grad_designs[block][[row, col]],
+                fd,
+                fd_error,
+            );
+        }
+
+        for (block, row, col) in [(0_usize, 1_usize, 1_usize), (1, 0, 1)] {
+            let center = penalties[block][[row, col]];
+            let (fd, fd_error) = adaptive_finite_difference(center, eps, |candidate| {
+                let mut sp = penalties.clone();
+                sp[block][[row, col]] = candidate;
+                sp[block][[col, row]] = candidate;
+                blocks_profile_reml_score(
+                    &designs,
+                    &sp,
+                    y.view(),
+                    weights.view(),
+                    rhos.as_slice(),
+                )
+            });
+            let analytic = if row == col {
+                backward.grad_penalties[block][[row, col]]
+            } else {
+                backward.grad_penalties[block][[row, col]]
+                    + backward.grad_penalties[block][[col, row]]
+            };
+            assert_fd_estimate_close(
+                &format!("negative REML S{block}[{row},{col}] sign"),
+                analytic,
+                fd,
+                fd_error,
+            );
+        }
+
+        for row in [3_usize, 14] {
+            let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
+                let mut wp = weights.clone();
+                wp[row] = candidate;
+                blocks_profile_reml_score(
+                    &designs,
+                    &penalties,
+                    y.view(),
+                    wp.view(),
+                    rhos.as_slice(),
+                )
+            });
+            assert_fd_estimate_close(
+                &format!("negative REML weight[{row}] sign"),
+                backward.grad_weights[row],
+                fd,
+                fd_error,
+            );
+        }
     }
 
     fn position_fd_inputs() -> (
