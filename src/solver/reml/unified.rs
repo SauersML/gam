@@ -8739,7 +8739,12 @@ fn compute_ift_correction_trace(
         };
         Ok(c_trace + d_trace)
     } else {
-        let u = hop.solve(rhs);
+        // WS1a fallback: projected kernel for rank-deficient LAML path.
+        let u = if let Some(kernel) = subspace {
+            kernel.apply_pseudo_inverse(rhs)
+        } else {
+            hop.solve(rhs)
+        };
         if let Some(correction) =
             effective_deriv.hessian_second_derivative_correction_result(v_i, v_j, &u)?
         {
@@ -9289,12 +9294,36 @@ fn compute_outer_hessian(
 
     let v_ks_storage: Option<Vec<Array1<f64>>> = match workspace.and_then(|ws| ws.rho_v_ks) {
         Some(_) => None,
-        None => Some(
-            curvature_a_k_betas
-                .iter()
-                .map(|a_k_beta| hop.solve(a_k_beta))
-                .collect(),
-        ),
+        None => {
+            let subspace = solution.penalty_subspace_trace.as_deref();
+            if let Some(kernel) = subspace {
+                let constrained = solution
+                    .active_constraints
+                    .as_ref()
+                    .map(|block| kernel.with_active_constraints(block.a.view()));
+                Some(
+                    curvature_a_k_betas
+                        .iter()
+                        .map(|a_k_beta| {
+                            // WS1a fallback: projected kernel for rank-deficient LAML path.
+                            match constrained.as_ref() {
+                                Some(ck) if ck.has_active_constraints() => {
+                                    ck.apply_pseudo_inverse(a_k_beta)
+                                }
+                                _ => kernel.apply_pseudo_inverse(a_k_beta),
+                            }
+                        })
+                        .collect(),
+                )
+            } else {
+                Some(
+                    curvature_a_k_betas
+                        .iter()
+                        .map(|a_k_beta| hop.solve(a_k_beta))
+                        .collect(),
+                )
+            }
+        }
     };
     let v_ks: &[Array1<f64>] = match workspace.and_then(|ws| ws.rho_v_ks) {
         Some(vs) => vs,
@@ -9678,7 +9707,19 @@ fn compute_outer_hessian(
             let rhs = build_rho_pair_rhs(kk, ll);
             rhs_matrix.column_mut(pair_idx).assign(&rhs);
         }
-        let solved = hop.solve_multi(&rhs_matrix);
+        // WS1a fallback: projected kernel for rank-deficient LAML path.
+        let solved = if let Some(kernel) = subspace {
+            let mut projected = Array2::<f64>::zeros((hop.dim(), rho_pair_count));
+            for pair_idx in 0..rho_pair_count {
+                let rhs = rhs_matrix.column(pair_idx).to_owned();
+                projected
+                    .column_mut(pair_idx)
+                    .assign(&kernel.apply_pseudo_inverse(&rhs));
+            }
+            projected
+        } else {
+            hop.solve_multi(&rhs_matrix)
+        };
         let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = rho_pair_indices
             .iter()
             .enumerate()
