@@ -481,9 +481,6 @@ fn analytic_gradient_jacobian_is_symmetric_finite_difference_centered() {
 // lands. Run with `cargo test -- --ignored`.
 
 #[test]
-#[ignore = "WS1a oracle: rank-deficient penalty path; expected to FAIL before WS1a fix, PASS after. \
-            Once `evaluate_externalhessian` is exposed publicly, promote this to a direct \
-            FD-vs-analytic Hessian comparison instead of the symmetry proxy."]
 fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
     let (x, y, w, s_list) = build_gaussian_rank_deficient_two_block(17);
     let offset = Array1::<f64>::zeros(y.len());
@@ -523,33 +520,9 @@ fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Test 4: IFT predictor residual order
-// -----------------------------------------------------------------------
-//
-// NOTE on public-API limitation: the ρ-only IFT predictor
-// `RemlState::predict_warm_start_beta_ift_with_outcome` is
-// `pub(crate)` (see `src/solver/reml/runtime.rs:3915`) and there is
-// no public shim that returns the predicted β at a perturbed ρ. We
-// cannot write a `pub`-only integration test for the predictor's
-// residual order. This stub documents the limitation; promote to a
-// real test once the predictor (or a "predict-and-evaluate-residual"
-// helper) is exposed publicly.
-
-#[test]
-#[ignore = "predict_warm_start_beta_ift_with_outcome is pub(crate); add a public test shim \
-            (e.g. `evaluate_external_ift_residual_at_perturbed_rho`) before this can run."]
-fn ift_predictor_residual_is_quadratic_in_delta_rho() {
-    // Intent (once a public predictor shim exists):
-    //   1. Build a converged β̂(ρ₀) on a small Gaussian fixture.
-    //   2. For a sequence of Δρ scales (e.g. 1e-2, 5e-3, 2.5e-3, …),
-    //      let β_pred = predict_warm_start_beta_ift(ρ₀, ρ₀ + Δρ).
-    //   3. Compute ‖r(β_pred, ρ₀ + Δρ)‖ where r is the PIRLS residual.
-    //   4. Compute the flat-start residual ‖r(β̂(ρ₀), ρ₀ + Δρ)‖.
-    //   5. Assert the IFT residual decays at least quadratically in
-    //      ‖Δρ‖ AND that ift_resid / flat_resid → 0 as Δρ → 0.
-    panic!(
-        "see test docstring: requires a public predictor shim that \
-         evaluates ‖r(β_pred, ρ + Δρ)‖ for an externally specified ρ, Δρ"
-    );
-}
+// IFT predictor residual-order test deferred: requires public shim for
+// `RemlState::predict_warm_start_beta_ift_with_outcome` (currently pub(crate)
+// in src/solver/reml/runtime.rs). Re-add once a `pub fn
+// evaluate_external_ift_residual_at_perturbed_rho(...)` exists. The intent:
+// for a sequence of Δρ, assert ‖r(β_pred, ρ + Δρ)‖ = O(‖Δρ‖²) and
+// ift_resid / flat_resid → 0 as Δρ → 0.
