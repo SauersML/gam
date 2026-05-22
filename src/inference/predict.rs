@@ -5084,7 +5084,7 @@ where
     }
 
     let (observation_lower, observation_upper) = if options.includeobservation_interval
-        && matches!(family, crate::types::LikelihoodFamily::GaussianIdentity)
+        && family.is_gaussian_identity()
     {
         let obsvar = fit.standard_deviation.max(0.0).powi(2);
         let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());

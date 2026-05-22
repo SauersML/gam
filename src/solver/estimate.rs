@@ -1826,7 +1826,7 @@ fn resolve_external_family(
     family: crate::types::LikelihoodFamily,
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
-    if matches!(family, crate::types::LikelihoodFamily::RoystonParmar) {
+    if family.is_royston_parmar() {
         return Err(EstimationError::InvalidInput(
             "optimize_external_design does not support RoystonParmar; use survival training APIs"
                 .to_string(),
@@ -2627,7 +2627,7 @@ fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
 where
     X: Into<DesignMatrix>,
 {
-    if matches!(opts.family, crate::types::LikelihoodFamily::BinomialMixture)
+    if opts.family.is_binomial_mixture()
         && opts.mixture_link.is_none()
     {
         return Err(EstimationError::InvalidInput(

@@ -6290,7 +6290,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 n_obs = Some(y.len());
 
                 // R-squared for Gaussian
-                if matches!(family, LikelihoodFamily::GaussianIdentity) {
+                if family.is_gaussian_identity() {
                     let y_mean = y.mean().unwrap_or(0.0);
                     let ss_tot: f64 = y.iter().map(|&yi| (yi - y_mean).powi(2)).sum();
                     let ss_res: f64 = y
