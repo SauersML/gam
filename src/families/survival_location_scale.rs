@@ -1909,6 +1909,12 @@ impl SurvivalLocationScaleFamily {
         struct SendPtr(*mut f64);
         unsafe impl Send for SendPtr {}
         unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            #[inline(always)]
+            unsafe fn write(self, i: usize, v: f64) {
+                unsafe { *self.0.add(i) = v };
+            }
+        }
 
         let p_d1_q = SendPtr(d1_q.as_mut_ptr());
         let p_d2_q = SendPtr(d2_q.as_mut_ptr());
@@ -1932,14 +1938,15 @@ impl SurvivalLocationScaleFamily {
         let p_d2_h_h0 = SendPtr(d2_h_h0.as_mut_ptr());
         let p_d2_h_h1 = SendPtr(d2_h_h1.as_mut_ptr());
 
-        (0..n).into_par_iter().try_for_each(|i| -> Result<(), String> {
+        let dyn_ref = &dynamic;
+        (0..n).into_par_iter().try_for_each(move |i| -> Result<(), String> {
             let state = self.row_predictor_state(
-                dynamic.h_entry[i],
-                dynamic.h_exit[i],
-                dynamic.hdot_exit[i],
-                dynamic.q_entry[i],
-                dynamic.q_exit[i],
-                dynamic.qdot_exit[i],
+                dyn_ref.h_entry[i],
+                dyn_ref.h_exit[i],
+                dyn_ref.hdot_exit[i],
+                dyn_ref.q_entry[i],
+                dyn_ref.q_exit[i],
+                dyn_ref.qdot_exit[i],
             );
             let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
                 return Ok(());
@@ -1947,27 +1954,27 @@ impl SurvivalLocationScaleFamily {
             // SAFETY: `i` is unique across the parallel iter; each pointer
             // targets a distinct preallocated buffer of length `n`.
             unsafe {
-                *p_d1_q.0.add(i) = row.d1_q;
-                *p_d2_q.0.add(i) = row.d2_q;
-                *p_d3_q.0.add(i) = row.d3_q;
-                *p_d1_q0.0.add(i) = row.d1_q0;
-                *p_d2_q0.0.add(i) = row.d2_q0;
-                *p_d3_q0.0.add(i) = row.d3_q0;
-                *p_d4_q0.0.add(i) = row.d4_q0;
-                *p_d1_q1.0.add(i) = row.d1_q1;
-                *p_d2_q1.0.add(i) = row.d2_q1;
-                *p_d3_q1.0.add(i) = row.d3_q1;
-                *p_d4_q1.0.add(i) = row.d4_q1;
-                *p_d1_qdot1.0.add(i) = row.d1_qdot1;
-                *p_d2_qdot1.0.add(i) = row.d2_qdot1;
-                *p_h_time_h0.0.add(i) = row.h_time_h0;
-                *p_h_time_h1.0.add(i) = row.h_time_h1;
-                *p_h_time_d.0.add(i) = row.h_time_d;
-                *p_d_h_h0.0.add(i) = row.d_h_h0;
-                *p_d_h_h1.0.add(i) = row.d_h_h1;
-                *p_d_h_d.0.add(i) = row.d_h_d;
-                *p_d2_h_h0.0.add(i) = row.d2_h_h0;
-                *p_d2_h_h1.0.add(i) = row.d2_h_h1;
+                p_d1_q.write(i, row.d1_q);
+                p_d2_q.write(i, row.d2_q);
+                p_d3_q.write(i, row.d3_q);
+                p_d1_q0.write(i, row.d1_q0);
+                p_d2_q0.write(i, row.d2_q0);
+                p_d3_q0.write(i, row.d3_q0);
+                p_d4_q0.write(i, row.d4_q0);
+                p_d1_q1.write(i, row.d1_q1);
+                p_d2_q1.write(i, row.d2_q1);
+                p_d3_q1.write(i, row.d3_q1);
+                p_d4_q1.write(i, row.d4_q1);
+                p_d1_qdot1.write(i, row.d1_qdot1);
+                p_d2_qdot1.write(i, row.d2_qdot1);
+                p_h_time_h0.write(i, row.h_time_h0);
+                p_h_time_h1.write(i, row.h_time_h1);
+                p_h_time_d.write(i, row.h_time_d);
+                p_d_h_h0.write(i, row.d_h_h0);
+                p_d_h_h1.write(i, row.d_h_h1);
+                p_d_h_d.write(i, row.d_h_d);
+                p_d2_h_h0.write(i, row.d2_h_h0);
+                p_d2_h_h1.write(i, row.d2_h_h1);
             }
             Ok(())
         })?;
