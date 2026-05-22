@@ -10441,6 +10441,23 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
+fn joint_pcg_eisenstat_walker_forcing(prev_kkt_norm: Option<f64>, current_kkt_norm: f64) -> f64 {
+    if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    let Some(prev_kkt_norm) = prev_kkt_norm else {
+        return PCG_ETA_MAX;
+    };
+    if !prev_kkt_norm.is_finite() || prev_kkt_norm <= 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    let ratio = current_kkt_norm / prev_kkt_norm;
+    if !ratio.is_finite() || ratio < 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
+}
+
 /// Solve the dense trust-region Newton subproblem with Hebden damping instead
 /// of rescaling the unconstrained Newton direction. Rescaling preserves
 /// near-null components of `H + S` and can leave the iterate objective-flat
@@ -11335,6 +11352,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
+        let mut prev_kkt_norm: Option<f64> = None;
+        let mut ew_pcg_log_emitted = false;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
         // the constrained-stationary certificate below. When the cycles
@@ -11478,6 +11497,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 trace_diagonal_ridge,
                 options.ridge_floor,
             );
+            let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
+                &grad_joint,
+                &states,
+                specs,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                &block_constraints,
+                Some(cached_active_sets.as_slice()),
+            )?;
+            let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
             let solve_joint_constraints_dense =
                 !matrix_free_joint_requested || joint_hessian_is_dense;
@@ -11562,6 +11592,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let pcg_started = std::time::Instant::now();
                 let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
                 let mut delta = if pcg_requested {
+                    if !ew_pcg_log_emitted
+                        && let Some(prev_kkt) = prev_kkt_norm
+                    {
+                        log::info!(
+                            "[EW-PCG] eta={:.3e} prev_kkt={:.3e} cur_kkt={:.3e}",
+                            pcg_rel_tol,
+                            prev_kkt,
+                            current_kkt_norm,
+                        );
+                        ew_pcg_log_emitted = true;
+                    }
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -11608,7 +11649,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 },
                                 &rhs,
                                 &preconditioner_diag,
-                                JOINT_PCG_REL_TOL,
+                                pcg_rel_tol,
                                 JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
                             )
                             .map(|(solution, info)| {
@@ -11644,7 +11685,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 },
                                 &rhs,
                                 &preconditioner_diag,
-                                JOINT_PCG_REL_TOL,
+                                pcg_rel_tol,
                                 JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1),
                             )
                             .map(|(solution, info)| {
@@ -11823,17 +11864,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|x: &f64| x.abs())
                 .fold(0.0_f64, f64::max);
             let residual_tol = inner_tol * (1.0 + grad_inf.max(penalty_inf));
-            let current_stationarity_residual =
-                exact_newton_joint_stationarity_inf_norm_from_gradient(
-                    &grad_joint,
-                    &states,
-                    specs,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                    &block_constraints,
-                    Some(cached_active_sets.as_slice()),
-                )?;
+            let current_stationarity_residual = current_kkt_norm;
             // KKT certificate: ‖∇L − Sβ‖_∞ ≤ residual_tol together with
             // ‖δ‖_∞ ≤ step_tol is sufficient first-order optimality of the
             // penalized objective; no descent direction exists from the
@@ -18327,6 +18358,10 @@ const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 128;
 const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
 const JOINT_PCG_REL_TOL: f64 = 1e-8;
+const PCG_ETA_MAX: f64 = 1.0e-1;
+const PCG_ETA_MIN: f64 = 1.0e-8;
+const PCG_GAMMA: f64 = 0.9;
+const PCG_ALPHA: f64 = 1.6180339887498949;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
 
 pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
