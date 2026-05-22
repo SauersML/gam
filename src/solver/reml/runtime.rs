@@ -40,6 +40,7 @@ const S_INNER_INIT: f64 = 1.0;
 const S_LINEAR_INIT: f64 = 1.0;
 const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
+const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
 pub(crate) struct HyperGradHistoryEntry {
     pub(crate) rho: Array1<f64>,
@@ -272,6 +273,20 @@ fn hypergradient_budgets() -> &'static Mutex<HashMap<usize, HyperGradientRuntime
     HYPERGRADIENT_BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Default)]
+struct IftQualityRuntimeState {
+    quality_history: Vec<f64>,
+    next_step_cap: Option<f64>,
+    fallback_next_flat: bool,
+}
+
+static IFT_QUALITY_STATES: OnceLock<Mutex<HashMap<usize, IftQualityRuntimeState>>> =
+    OnceLock::new();
+
+fn ift_quality_states() -> &'static Mutex<HashMap<usize, IftQualityRuntimeState>> {
+    IFT_QUALITY_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -469,6 +484,56 @@ struct DerivativeContext {
 impl<'a> RemlState<'a> {
     fn hypergradient_owner_key(&self) -> usize {
         self as *const _ as usize
+    }
+
+    fn ift_quality_step_cap(&self, default_cap: f64) -> f64 {
+        let states = ift_quality_states().lock().unwrap();
+        states
+            .get(&self.hypergradient_owner_key())
+            .and_then(|state| state.next_step_cap)
+            .filter(|cap| cap.is_finite() && *cap > 0.0)
+            .unwrap_or(default_cap)
+    }
+
+    fn take_ift_quality_flat_override(&self) -> bool {
+        let mut states = ift_quality_states().lock().unwrap();
+        let Some(state) = states.get_mut(&self.hypergradient_owner_key()) else {
+            return false;
+        };
+        let fallback = state.fallback_next_flat;
+        state.fallback_next_flat = false;
+        fallback
+    }
+
+    fn clear_ift_quality_runtime_state(&self) {
+        let mut states = ift_quality_states().lock().unwrap();
+        states.remove(&self.hypergradient_owner_key());
+    }
+
+    fn record_ift_prediction_quality(&self, quality: f64, current_cap: f64) -> Option<f64> {
+        if !quality.is_finite() || quality < 0.0 || !current_cap.is_finite() || current_cap <= 0.0 {
+            return None;
+        }
+        let mut states = ift_quality_states().lock().unwrap();
+        let state = states
+            .entry(self.hypergradient_owner_key())
+            .or_insert_with(IftQualityRuntimeState::default);
+        state.quality_history.push(quality);
+        while state.quality_history.len() > IFT_QUALITY_HISTORY_CAP {
+            state.quality_history.remove(0);
+        }
+        let rolling_quality =
+            state.quality_history.iter().sum::<f64>() / state.quality_history.len() as f64;
+        let next_step_cap = if rolling_quality < 1e-3 {
+            current_cap * 1.5
+        } else if rolling_quality < 1e-1 {
+            current_cap
+        } else {
+            current_cap * 0.5
+        };
+        state.next_step_cap = Some(next_step_cap);
+        state.fallback_next_flat = rolling_quality >= 0.5;
+        Some(next_step_cap)
     }
 
     fn reset_hypergradient_budget_controller(&self) {
@@ -2303,6 +2368,7 @@ impl<'a> RemlState<'a> {
         // for noise-floor steps) must not collide with "no signal yet".
         self.last_pirls_accept_rho
             .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
+        self.clear_ift_quality_runtime_state();
     }
 
     pub(crate) fn set_link_states(
@@ -3933,6 +3999,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let current_ift_step_cap =
+            self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
         // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
@@ -3982,7 +4050,7 @@ impl<'a> RemlState<'a> {
             // function emits so the rejection-rate aggregator
             // (`_IFT_REJECTED_PATTERN` in runner.py) is preserved
             // across both paths.
-            let max_drho_cap = adaptive_ift_max_drho(last_residual);
+            let max_drho_cap = current_ift_step_cap;
             if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
                 log::info!(
                     "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
@@ -4056,6 +4124,7 @@ impl<'a> RemlState<'a> {
             new_rho,
             self.p,
             last_residual,
+            Some(current_ift_step_cap),
             Some(factor_arc.as_ref()),
         )
     }
@@ -4086,6 +4155,11 @@ impl<'a> RemlState<'a> {
     ) -> Option<(Coefficients, WarmStartPredictionSource)> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
+        }
+        if self.take_ift_quality_flat_override() {
+            if let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone() {
+                return Some((cur_beta, WarmStartPredictionSource::Flat));
+            }
         }
         // Try the IFT-based predictor first. It uses the exact first-order
         // Jacobian of β(ρ) at the cached solve and beats the tangent-line
@@ -5015,47 +5089,8 @@ impl<'a> RemlState<'a> {
         // Check the status returned by the P-IRLS routine.
         match pirls_result.status {
             pirls::PirlsStatus::Converged | pirls::PirlsStatus::StalledAtValidMinimum => {
-                // IFT-quality probe: when the predictor produced a β
-                // (any non-screening solve after the first cache fill
-                // typically does), measure how close the prediction was
-                // to the converged β. Logged as
-                // `[IFT-QUALITY] residual=X converged_norm=Y predicted_norm=Z iters=K`
-                // so the bench runner / scaling-law analyzer can
-                // empirically validate the IFT linearization at biobank
-                // scale. A residual ≪ 1 means the linear predictor is
-                // faithful (warm-start is paying off); a residual ≈ 1
-                // means the prediction was no better than flat (and
-                // the adaptive cap / next outer iter should treat the
-                // hint as unreliable). Only emitted outside screening
-                // because screening's intentionally-truncated PIRLS
-                // does not reflect production solve geometry.
                 if !in_screening {
                     if let Some(predicted) = predicted_warm_start.as_ref() {
-                        // Detect noop predictions (predictor returned the
-                        // cached β unchanged because all Δρ were below the
-                        // numerical floor). On noop the residual measures
-                        // inner-Newton movement after a zero-step seed,
-                        // NOT predictor faithfulness, and including it in
-                        // the IFT-QUALITY residual distribution biases
-                        // the percentiles toward whatever β-shift PIRLS
-                        // produced from a free warm-start. The [IFT-NOOP]
-                        // marker (commit d437aed1) already counts these
-                        // calls separately, so we skip the [IFT-QUALITY]
-                        // emission here for cleanliness.
-                        // Noop detection: the predictor's source enum
-                        // already marks Flat returns unambiguously
-                        // (commit 1b77588b for tangent-line + this
-                        // commit's IFT alignment). When source=Flat,
-                        // the predictor returned the cached β unchanged
-                        // — the QUALITY block would emit a residual
-                        // that measures inner-Newton β movement at a
-                        // zero-step seed, NOT predictor faithfulness.
-                        // Skip the emission entirely on Flat. Older
-                        // array-comparison `was_noop` check is now
-                        // redundant; the source enum is the single
-                        // source of truth.
-                        let was_noop =
-                            matches!(prediction_source, Some(WarmStartPredictionSource::Flat),);
                         let converged_original = match pirls_result.coordinate_frame {
                             pirls::PirlsCoordinateFrame::OriginalSparseNative => {
                                 pirls_result.beta_transformed.as_ref().clone()
@@ -5065,104 +5100,44 @@ impl<'a> RemlState<'a> {
                                 .qs
                                 .dot(pirls_result.beta_transformed.as_ref()),
                         };
-                        if !was_noop && predicted.0.len() == converged_original.len() {
+                        if matches!(prediction_source, Some(WarmStartPredictionSource::Ift))
+                            && predicted.0.len() == converged_original.len()
+                        {
                             let mut diff_sq = 0.0_f64;
                             let mut conv_sq = 0.0_f64;
-                            let mut pred_sq = 0.0_f64;
                             for (p_val, c_val) in predicted.0.iter().zip(converged_original.iter())
                             {
                                 let d = c_val - p_val;
                                 diff_sq += d * d;
                                 conv_sq += c_val * c_val;
-                                pred_sq += p_val * p_val;
                             }
                             let conv_norm = conv_sq.sqrt();
-                            let pred_norm = pred_sq.sqrt();
-                            let residual = if conv_norm > 0.0 {
-                                diff_sq.sqrt() / conv_norm
-                            } else {
-                                f64::NAN
-                            };
-                            // Δρ-step magnitude the predictor handled
-                            // here. Pulled from the OLD IFT cache (the
-                            // one the prediction was made against) BEFORE
-                            // updatewarm_start_from replaces it. Lets the
-                            // bench runner correlate residual quality
-                            // with step size — a small step that still
-                            // produced a large residual is a stronger
-                            // indictment of the linearization than a
-                            // large step at the same residual.
-                            let drho_norm = match self.ift_warm_start_cache.read() {
-                                Ok(guard) => match guard.as_ref() {
-                                    Some(c) if c.rho.len() == rho.len() => {
-                                        let mut sq = 0.0_f64;
-                                        for (n, o) in rho.iter().zip(c.rho.iter()) {
-                                            let d = n - o;
-                                            sq += d * d;
-                                        }
-                                        sq.sqrt()
-                                    }
-                                    _ => f64::NAN,
-                                },
-                                Err(_) => f64::NAN,
-                            };
-                            // Hessian conditioning indicator. log|H_pen|
-                            // tracks how the penalized curvature matrix
-                            // shifts across solves; sudden jumps signal
-                            // a flat direction opening up or a near-
-                            // singular geometry (the kind that often
-                            // precedes a PIRLS failure or a large IFT
-                            // residual). Read from the cached factor
-                            // when present (commit ec18559d), or NaN
-                            // when it hasn't been populated yet (first
-                            // solve at this surface).
-                            let h_pen_logdet = match self.ift_cached_factor.read() {
-                                Ok(guard) => guard.as_ref().map(|f| f.logdet()).unwrap_or(f64::NAN),
-                                Err(_) => f64::NAN,
-                            };
-                            // Route the marker by predictor source so the
-                            // bench runner's residual percentile aggregation
-                            // is correctly attributed: tangent-line predictions
-                            // get [TANGENT-QUALITY] rather than mistakenly
-                            // landing in [IFT-QUALITY] stats. The Flat
-                            // case is already short-circuited by the
-                            // was_noop check above (the source enum is
-                            // the single source of truth), so we
-                            // shouldn't reach this dispatch with
-                            // source=Flat. The Flat arm here is
-                            // defensive — the marker name match is
-                            // exhaustive because the enum is closed,
-                            // and emitting under [IFT-QUALITY] for an
-                            // unexpected Flat would surface as a
-                            // residual entry that the bench runner
-                            // could investigate.
-                            let marker = match prediction_source {
-                                Some(WarmStartPredictionSource::Ift) => "[IFT-QUALITY]",
-                                Some(WarmStartPredictionSource::TangentLine) => "[TANGENT-QUALITY]",
-                                Some(WarmStartPredictionSource::Flat) | None => "[IFT-QUALITY]",
-                            };
-                            log::info!(
-                                "{} residual={:.3e} converged_norm={:.3e} predicted_norm={:.3e} drho_norm={:.3e} h_pen_logdet={:.3e} iters={}",
-                                marker,
-                                residual,
-                                conv_norm,
-                                pred_norm,
-                                drho_norm,
-                                h_pen_logdet,
-                                pirls_result.iteration,
-                            );
-                            // Feed the residual back into the adaptive
-                            // |Δρ| cap so the next predict call reflects
-                            // the empirical faithfulness of the linearization
-                            // at this surface's scale. Only stash finite
-                            // non-negative values; anything else (NaN
-                            // from divide-by-zero, e.g. trivial β) leaves
-                            // the cache untouched so the predictor falls
-                            // back to its default 2.0 cap.
-                            if residual.is_finite() && residual >= 0.0 {
+                            let pred_residual = diff_sq.sqrt();
+                            let quality = pred_residual / (1.0 + conv_norm);
+                            if quality.is_finite() && quality >= 0.0 {
+                                let last_residual_bits =
+                                    self.last_ift_prediction_residual.load(Ordering::Relaxed);
+                                let r = f64::from_bits(last_residual_bits);
+                                let last_residual = if r.is_finite() && r >= 0.0 {
+                                    Some(r)
+                                } else {
+                                    None
+                                };
+                                let current_cap =
+                                    self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+                                let cap_predicted = self
+                                    .record_ift_prediction_quality(quality, current_cap)
+                                    .unwrap_or(current_cap);
+                                log::info!(
+                                    "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e}",
+                                    quality,
+                                    current_cap,
+                                    pred_residual,
+                                    cap_predicted,
+                                );
                                 self.last_ift_prediction_residual
-                                    .store(residual.to_bits(), Ordering::Relaxed);
-                            }
+                                    .store(quality.to_bits(), Ordering::Relaxed);
+                            };
                         }
                     }
                     self.updatewarm_start_from(pirls_result.as_ref());
@@ -5568,6 +5543,7 @@ pub(crate) fn predict_warm_start_beta_ift_with_factor(
         new_rho,
         p,
         last_ift_residual,
+        None,
         Some(factor_override),
     )
     .map(|(coef, _outcome)| coef)
@@ -5579,6 +5555,7 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     new_rho: &Array1<f64>,
     p: usize,
     last_ift_residual: Option<f64>,
+    max_drho_cap_override: Option<f64>,
     factor_override: Option<&dyn crate::linalg::matrix::FactorizedSystem>,
 ) -> Option<(Coefficients, IftPredictionOutcome)> {
     // Cache populated but ρ not yet stamped (happens between
@@ -5639,7 +5616,9 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
             d
         })
         .collect();
-    let max_drho_cap = adaptive_ift_max_drho(last_ift_residual);
+    let max_drho_cap = max_drho_cap_override
+        .filter(|cap| cap.is_finite() && *cap > 0.0)
+        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
     if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
         // Emit a structured reject marker so the bench runner can
         // count predictor rejections alongside accepts (the
@@ -8683,6 +8662,7 @@ mod ift_warm_start_tests {
             new_rho,
             p,
             last_ift_residual,
+            None,
             None,
         )
         .map(|(coef, _outcome)| coef)
