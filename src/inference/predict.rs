@@ -5488,7 +5488,7 @@ mod tests {
             .unwrap()
             .design(&array![0.0])
             .unwrap_err();
-        assert!(err.contains("DenestedCubicTransport"));
+        assert!(err.to_string().contains("DenestedCubicTransport"));
 
         let err =
             crate::families::bernoulli_marginal_slope::build_score_warp_deviation_block_from_seed(
@@ -5505,7 +5505,7 @@ mod tests {
         let mut structurally_invalid = production_runtime.clone();
         structurally_invalid.span_c0[0].pop();
         let err = structurally_invalid.design(&array![0.0]).unwrap_err();
-        assert!(err.contains("c0 row 0 has width"));
+        assert!(err.to_string().contains("c0 row 0 has width"));
 
         let cubic = production_runtime;
         assert!(cubic.design(&array![0.0]).is_ok());

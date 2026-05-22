@@ -3887,7 +3887,7 @@ mod tests {
         let err = FittedModel::from_payload(payload)
             .validate_for_persistence()
             .expect_err("survival model without time-anchor metadata should fail validation");
-        assert!(err.contains("missing survival_time_anchor"));
+        assert!(err.to_string().contains("missing survival_time_anchor"));
     }
 
     #[test]
@@ -3917,7 +3917,7 @@ mod tests {
         let err = FittedModel::from_payload(payload)
             .validate_for_persistence()
             .expect_err("survival model without time-basis metadata should fail validation");
-        assert!(err.contains("missing survival_time_basis"));
+        assert!(err.to_string().contains("missing survival_time_basis"));
     }
 
     #[test]
@@ -3941,6 +3941,6 @@ mod tests {
         let err = FittedModel::from_payload(payload)
             .saved_prediction_runtime()
             .expect_err("stale payload version should fail before runtime assembly");
-        assert!(err.contains("payload schema mismatch"));
+        assert!(err.to_string().contains("payload schema mismatch"));
     }
 }
