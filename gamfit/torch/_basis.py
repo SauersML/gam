@@ -85,37 +85,56 @@ class _BsplineBasisFn(torch.autograd.Function):
         return grad_t, None, None, None
 
 
-class _DuchonBasis1dFn(torch.autograd.Function):
-    """Autograd Function evaluating the Rust 1-D Duchon basis with grad wrt ``t``."""
+class _DuchonBasisFn(torch.autograd.Function):
+    """Autograd Function evaluating the Rust multi-dim Duchon basis with grad wrt ``points``.
+
+    For 1D inputs (``points.shape == (N,)`` or ``(N, 1)``), the backward uses
+    the same `duchon_basis_1d_derivative` engine path the legacy 1D Function
+    used. For d > 1, gradient wrt points is not implemented yet (will route
+    through the engine VJP once the multi-dim derivative is exposed).
+    """
 
     @staticmethod
     def forward(
-        ctx: Any, t: torch.Tensor, centers: torch.Tensor, m: int, periodic: bool
+        ctx: Any,
+        points: torch.Tensor,
+        centers: torch.Tensor,
+        m: int,
+        periodic_per_axis: tuple[bool, ...] | None,
     ) -> torch.Tensor:
-        t_np = to_numpy_f64(t)
+        pts_np = to_numpy_f64(points)
         centers_np = to_numpy_f64(centers)
-        basis_np = _api.duchon_basis_1d(t_np, centers_np, m=m, periodic=periodic)
-        ctx.save_for_backward(t, centers)
+        basis_np = _api.duchon_basis(
+            pts_np, centers_np, m=m, periodic_per_axis=periodic_per_axis,
+        )
+        ctx.save_for_backward(points, centers)
         ctx.m = m
-        ctx.periodic = periodic
-        return from_numpy_like(basis_np, t)
+        ctx.periodic_per_axis = periodic_per_axis
+        ctx.input_d = pts_np.shape[1] if pts_np.ndim == 2 else 1
+        return from_numpy_like(basis_np, points)
 
     @staticmethod
     def backward(
         ctx: Any, *grad_outputs: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None, None]:
+    ) -> tuple[torch.Tensor | None, None, None, None]:
         (grad_basis,) = grad_outputs
-        t, centers = ctx.saved_tensors
-        deriv_np = _api.duchon_basis_1d_derivative(
-            to_numpy_f64(t),
-            to_numpy_f64(centers),
-            m=ctx.m,
-            order=1,
-            periodic=ctx.periodic,
-        )
-        deriv = from_numpy_like(deriv_np, t)
-        grad_t = (grad_basis.to(dtype=deriv.dtype) * deriv).sum(dim=-1)
-        return grad_t, None, None, None
+        points, centers = ctx.saved_tensors
+        if ctx.input_d == 1:
+            # 1D path uses the analytic derivative basis.
+            per = bool(ctx.periodic_per_axis[0]) if ctx.periodic_per_axis else False
+            pts_1d = points.reshape(-1) if points.dim() == 2 else points
+            ctrs_1d = centers.reshape(-1) if centers.dim() == 2 else centers
+            deriv_np = _api.duchon_basis_1d_derivative(
+                to_numpy_f64(pts_1d), to_numpy_f64(ctrs_1d),
+                m=ctx.m, order=1, periodic=per,
+            )
+            deriv = from_numpy_like(deriv_np, points)
+            grad_t = (grad_basis.to(dtype=deriv.dtype) * deriv).sum(dim=-1)
+            if points.dim() == 2:
+                grad_t = grad_t.reshape(points.shape)
+            return grad_t, None, None, None
+        # Multi-dim grad-through-points not yet implemented.
+        return None, None, None, None
 
 
 def bspline_basis(

@@ -1020,33 +1020,61 @@ def bspline_basis_derivative(
         raise map_exception(exc) from exc
 
 
-def duchon_basis_1d(
-    t: Any,
+def duchon_basis(
+    points: Any,
     centers: Any = None,
     *,
     m: int = 2,
-    periodic: bool = False,
+    periodic_per_axis: Any = None,
 ) -> Any:
-    """Evaluate the Rust one-dimensional Duchon basis as a NumPy array.
+    """Evaluate the Duchon m-spline basis at ``points`` against ``centers``.
 
-    ``centers`` may be:
+    Works for any input dimensionality ``d`` ≥ 1.
 
-    * ``None`` — auto-derive ``K = 10`` centers at empirical quantiles of ``t``.
-    * an ``int`` ``K`` — auto-derive ``K`` quantile centers.
-    * an array-like — used verbatim.
+    Parameters
+    ----------
+    points : array-like of shape (N, d) — N evaluation points in d-dim.
+        For 1D, pass shape (N, 1) or a 1D array (auto-promoted).
+    centers : array-like of shape (K, d), or ``None`` (auto: K=10 quantile
+        centers for d=1), or an ``int`` K (auto-quantile centers, d=1 only).
+    m : int, default 2 — spline order.
+    periodic_per_axis : sequence of bool of length d, optional. Currently
+        only ``d=1`` supports periodicity.
+
+    Returns
+    -------
+    ndarray of shape (N, K)
     """
     import numpy as np
 
-    t_np = _numeric_vector(t, "t")
-    centers_np = _resolve_centers(centers, t_np, label="centers")
+    pts_np = np.asarray(points, dtype=float)
+    if pts_np.ndim == 1:
+        pts_np = pts_np.reshape(-1, 1)
+    if pts_np.ndim != 2:
+        raise ValueError(f"points must be 1D or 2D, got {pts_np.ndim}D")
+    d = pts_np.shape[1]
+    if centers is None or isinstance(centers, int):
+        if d != 1:
+            raise ValueError(f"auto centers only supported for d=1, got d={d}")
+        ctrs_np = _resolve_centers(centers, pts_np[:, 0], label="centers").reshape(-1, 1)
+    else:
+        ctrs_np = np.asarray(centers, dtype=float)
+        if ctrs_np.ndim == 1:
+            ctrs_np = ctrs_np.reshape(-1, 1)
+        if ctrs_np.ndim != 2:
+            raise ValueError(f"centers must be 1D or 2D, got {ctrs_np.ndim}D")
+        if ctrs_np.shape[1] != d:
+            raise ValueError(
+                f"points has d={d} but centers has d={ctrs_np.shape[1]}"
+            )
+
+    periodic_arg = (
+        None if periodic_per_axis is None
+        else [bool(p) for p in periodic_per_axis]
+    )
     try:
         return np.asarray(
-            rust_module().duchon_basis_1d(
-                t_np,
-                centers_np,
-                int(m),
-                bool(periodic),
-            ),
+            rust_module().duchon_basis(pts_np, ctrs_np, int(m), periodic_arg),
             dtype=float,
         )
     except Exception as exc:
