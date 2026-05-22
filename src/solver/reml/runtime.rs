@@ -382,8 +382,11 @@ fn efs_single_loop_encoded_cap() -> usize {
 
 #[inline]
 fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
+    // `.then_some` evaluates its argument eagerly, so the subtraction must be
+    // guarded by `.then(|| ...)` to avoid usize underflow when raw_cap <
+    // SENTINEL (the common path for non-EFS-single-loop iterates).
     (raw_cap >= EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
-        .then_some(raw_cap - EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
+        .then(|| raw_cap - EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL)
         .filter(|cap| *cap > 0)
 }
 
