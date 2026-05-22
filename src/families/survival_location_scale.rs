@@ -11019,13 +11019,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )
     }
 
-    // (Inherent `exact_newton_joint_psi_terms_masked` is defined in the
-    // `impl SurvivalLocationScaleFamily` block above. It is invoked directly
+    // Inherent `exact_newton_joint_psi_terms_masked` is defined in the
+    // `impl SurvivalLocationScaleFamily` block below. It is invoked directly
     // by both this trait method and the ψ workspace's `first_order_terms`
     // override to thread the Horvitz-Thompson row mask through the staged
-    // outer-score subsample.)
-    #[allow(dead_code)]
-    fn _ws4a_psi_terms_marker(&self) {}
+    // outer-score subsample.
 }
 
 impl SurvivalLocationScaleFamily {
