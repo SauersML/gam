@@ -77,14 +77,60 @@ pub(crate) struct HyperGradHistoryEntry {
     pub(crate) k: usize,
 }
 
+/// Online controller that allocates a target hypergradient-MSE budget across
+/// the inner-PIRLS, linear-solve, and trace-probe channels using sensitivity
+/// estimates derived from the observed `(Δρ, Δg_outer, E_inner, E_linear)`
+/// history.
+///
+/// # Math
+///
+/// The mean-square error of the outer gradient `∇V` is decomposed by
+/// channel as
+///
+/// ```text
+///   MSE(∇V) ≈ s_inner²  · 2·E_inner
+///           + s_linear² · 2·E_linear
+///           + s_trace² / k,
+/// ```
+///
+/// where `E_inner = ½ rᵀH⁻¹r` is the Newton-decrement energy of the inner
+/// residual, `E_linear` is the analogous energy for the linear-solve
+/// residual on the IFT mode-response system, and `k` is the trace-probe
+/// count. The sensitivities `s_inner`, `s_linear`, `s_trace` are
+/// re-estimated each outer iteration from finite-difference pairs of
+/// `(Δρ, Δg_outer)` against per-channel energy proxies, then used to pick
+/// per-channel tolerances/probe counts that hit `target_mse` while
+/// respecting per-channel floors.
+///
+/// # Warmup
+///
+/// During the first `HGB_WARMUP_ITERS` (= 3) outer iterations the history
+/// has too few finite-difference pairs to identify sensitivities reliably;
+/// the controller falls back to the per-channel default tolerances and
+/// only switches to budgeted allocation once enough pairs accumulate.
 pub(crate) struct HyperGradientBudget {
+    /// Target MSE on `∇V` that the budgeted allocation aims to achieve.
     pub(crate) target_mse: f64,
+    /// Minimum inner-channel energy `E_inner` the controller will request,
+    /// guarding against unreachable inner tolerances.
     pub(crate) inner_floor: f64,
+    /// Minimum linear-solve-channel energy `E_linear` the controller will
+    /// request on the IFT mode-response system.
     pub(crate) linear_floor: f64,
+    /// Minimum reciprocal trace-probe count (i.e., max `1/k`) the
+    /// controller will request, capping the trace-probe budget.
     pub(crate) trace_floor: f64,
+    /// Current sensitivity of `MSE(∇V)` with respect to inner-channel
+    /// energy `E_inner`; re-estimated each iteration from history.
     pub(crate) s_inner: f64,
+    /// Current sensitivity of `MSE(∇V)` with respect to linear-solve
+    /// energy `E_linear` on the mode-response system.
     pub(crate) s_linear: f64,
+    /// Current sensitivity of `MSE(∇V)` with respect to trace-probe
+    /// variance (per-probe contribution).
     pub(crate) s_trace: f64,
+    /// Bounded history of `(ρ, g_outer, E_inner, E_linear, σ², k)`
+    /// observations used to fit `s_*` via finite differences.
     pub(crate) history: VecDeque<HyperGradHistoryEntry>,
 }
 

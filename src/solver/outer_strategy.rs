@@ -29,7 +29,29 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Trigger ratio for the IFT-energy trust gate.
+///
+/// The gate fires (and shrinks the current trust radius) when the
+/// Newton-decrement energy bound on the accepted point exceeds
+/// `TRUST_ENERGY_FACTOR × |predicted_decrease|` for the trial step. The
+/// energy `½ rᵀH⁻¹r` upper-bounds `|V(β̂) − V(β*)|`, so when it dwarfs the
+/// model's predicted improvement the trial is dominated by inner-solve
+/// noise rather than real curvature signal.
+///
+/// `10.0` is deliberately conservative — roughly one decade above the
+/// observed noise floor of `½ rᵀH⁻¹r` for converged inner solves, so the
+/// gate rarely fires on well-behaved fits and only kicks in when the inner
+/// solve is grossly under-converged relative to the outer step.
+///
+/// Independent from the HyperGradientBudget (HGB) controller: HGB allocates
+/// *future* inner accuracy across channels by adjusting target MSE; this
+/// gate adjusts the *current* outer trust radius without changing inner
+/// tolerances.
 const TRUST_ENERGY_FACTOR: f64 = 10.0;
+
+/// Multiplicative shrink applied to the trust radius when the IFT-energy
+/// gate fires. Chosen conservatively at `0.5` — one octave per rejection —
+/// so a single noisy step does not collapse the radius and stall progress.
 const TRUST_ENERGY_SHRINK_FACTOR: f64 = 0.5;
 
 /// Bidirectional inner-PIRLS feedback channel.
