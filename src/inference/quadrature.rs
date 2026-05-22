@@ -5636,7 +5636,16 @@ mod tests {
     fn cholesky_static_d1() {
         let l = cholesky_static_with_jitter::<1>(&[[2.25]]).expect("d=1");
         assert_eq!(l[0][0], 1.5);
-        assert!(cholesky_static_with_jitter::<1>(&[[-1.0]]).is_some());
+        // Tiny negative diagonal (roundoff-scale) is rescued by the
+        // additive jitter ladder (1e-12 … 1e-6). At retry 1 the diagonal
+        // becomes -1e-13 + 1e-12 ≈ 9e-13 > 0, so Cholesky succeeds.
+        // The original assertion here used `-1.0`, but additive jitter
+        // capped at 1e-6 cannot recover a diagonal of -1.0 → -1.0+1e-6
+        // < 0 for every retry, so that assertion was unsatisfiable under
+        // the function's documented jitter ladder. The intent of the
+        // assertion was clearly to cover the "rescued by jitter" path,
+        // which is what a roundoff-scale negative diagonal exercises.
+        assert!(cholesky_static_with_jitter::<1>(&[[-1.0e-13]]).is_some());
         // A negative variance triggers jitter; with jitter <= 1e-6 it still
         // can't reach positive — should return None.
         assert!(cholesky_static_with_jitter::<1>(&[[-1.0e3]]).is_none());
