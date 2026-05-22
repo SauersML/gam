@@ -2511,6 +2511,7 @@ pub fn materialize<'a>(
         materialize_survival(
             &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
         )
+        .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.transformation_normal {
         if config.noise_formula.is_some() {
             return Err(WorkflowError::InvalidConfig {
@@ -2519,12 +2520,16 @@ pub fn materialize<'a>(
             .into());
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.logslope_formula.is_some() || config.z_column.is_some() {
         materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else if config.noise_formula.is_some() {
         materialize_location_scale(&parsed, data, &col_map, config)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     } else {
         materialize_standard(&parsed, data, &col_map, config)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason })
     }
 }
 
