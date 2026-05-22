@@ -3454,22 +3454,27 @@ fn materialize_survival<'a>(
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
             if config.frailty.is_some() =>
         {
-            return Err(
-                "frailty is not supported for transformation/weibull survival models".to_string(),
-            );
+            return Err(WorkflowError::InvalidConfig {
+                reason: "frailty is not supported for transformation/weibull survival models"
+                    .to_string(),
+            }
+            .into());
         }
         SurvivalLikelihoodMode::LocationScale if config.frailty.is_some() => {
-            return Err(
-                "config.frailty is not implemented for survival-likelihood=location-scale"
+            return Err(WorkflowError::InvalidConfig {
+                reason: "config.frailty is not implemented for survival-likelihood=location-scale"
                     .to_string(),
-            );
+            }
+            .into());
         }
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary
             if effective_timewiggle.is_some() =>
         {
-            return Err(
-                "timewiggle is not implemented for latent survival/binary likelihoods".to_string(),
-            );
+            return Err(WorkflowError::InvalidConfig {
+                reason: "timewiggle is not implemented for latent survival/binary likelihoods"
+                    .to_string(),
+            }
+            .into());
         }
         _ => {}
     }
@@ -3868,13 +3873,16 @@ fn materialize_survival<'a>(
                 let profile_cost = -fit_result.fit.fit.log_likelihood
                     + 0.5 * fit_result.fit.fit.stable_penalty_term;
                 if !profile_cost.is_finite() {
-                    return Err(format!(
-                        "workflow survival location-scale baseline: non-finite profile cost \
-                         (log_likelihood={}, stable_penalty_term={}, cost={})",
-                        fit_result.fit.fit.log_likelihood,
-                        fit_result.fit.fit.stable_penalty_term,
-                        profile_cost
-                    ));
+                    return Err(WorkflowError::IntegrationFailed {
+                        reason: format!(
+                            "workflow survival location-scale baseline: non-finite profile cost \
+                             (log_likelihood={}, stable_penalty_term={}, cost={})",
+                            fit_result.fit.fit.log_likelihood,
+                            fit_result.fit.fit.stable_penalty_term,
+                            profile_cost
+                        ),
+                    }
+                    .into());
                 }
                 Ok((profile_cost, gradient))
             },
@@ -3932,10 +3940,12 @@ fn materialize_survival<'a>(
     let request = match survival_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
             if config.noise_offset_column.is_some() {
-                return Err(
-                    "noise_offset_column is supported only for survival location-scale or marginal-slope"
-                        .to_string(),
-                );
+                return Err(WorkflowError::InvalidConfig {
+                    reason:
+                        "noise_offset_column is supported only for survival location-scale or marginal-slope"
+                            .to_string(),
+                }
+                .into());
             }
             let weibull_seed = if survival_mode == SurvivalLikelihoodMode::Weibull
                 && effective_timewiggle.is_none()
@@ -3945,10 +3955,12 @@ fn materialize_survival<'a>(
                     .unwrap_or_else(|| positive_survival_time_seed(&age_exit));
                 let shape = config.baseline_shape.unwrap_or(1.0);
                 if !scale.is_finite() || scale <= 0.0 || !shape.is_finite() || shape <= 0.0 {
-                    return Err(
-                        "weibull survival fit requires finite positive baseline_scale and baseline_shape"
-                            .to_string(),
-                    );
+                    return Err(WorkflowError::InvalidConfig {
+                        reason:
+                            "weibull survival fit requires finite positive baseline_scale and baseline_shape"
+                                .to_string(),
+                    }
+                    .into());
                 }
                 Some((scale, shape))
             } else {
@@ -4002,20 +4014,30 @@ fn materialize_transformation_normal<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
     if parsed.linkspec.is_some() {
-        return Err("link(...) is not supported for the transformation-normal family".to_string());
+        return Err(WorkflowError::InvalidConfig {
+            reason: "link(...) is not supported for the transformation-normal family".to_string(),
+        }
+        .into());
     }
     if parsed.linkwiggle.is_some() {
-        return Err(
-            "linkwiggle(...) is not supported for the transformation-normal family".to_string(),
-        );
+        return Err(WorkflowError::InvalidConfig {
+            reason: "linkwiggle(...) is not supported for the transformation-normal family"
+                .to_string(),
+        }
+        .into());
     }
     if config.noise_offset_column.is_some() {
-        return Err(
-            "noise_offset_column is not supported for transformation-normal models".to_string(),
-        );
+        return Err(WorkflowError::InvalidConfig {
+            reason: "noise_offset_column is not supported for transformation-normal models"
+                .to_string(),
+        }
+        .into());
     }
     if config.frailty.is_some() {
-        return Err("frailty is not supported for transformation-normal models".to_string());
+        return Err(WorkflowError::InvalidConfig {
+            reason: "frailty is not supported for transformation-normal models".to_string(),
+        }
+        .into());
     }
 
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
@@ -4098,9 +4120,11 @@ fn materialize_location_scale<'a>(
     });
 
     if family.is_latent_cloglog() {
-        return Err(
-            "latent-cloglog-binomial is not implemented for location-scale fitting".to_string(),
-        );
+        return Err(WorkflowError::InvalidConfig {
+            reason: "latent-cloglog-binomial is not implemented for location-scale fitting"
+                .to_string(),
+        }
+        .into());
     }
 
     if family.is_binomial() {
