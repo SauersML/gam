@@ -11,7 +11,7 @@ use faer::Par;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use ndarray::{
-    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, ShapeBuilder, s,
+    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
@@ -1033,6 +1033,31 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         None
     }
 
+    /// Batched column extraction: returns an `nrows × cols.len()` dense block
+    /// whose k-th column is `apply(e_{cols[k]})`.
+    ///
+    /// Default impl loops over columns and applies a unit vector per call. Operator
+    /// types like `ReparamOperator` that can express the batch as a single GEMM
+    /// (`X · Qs[:, cols]`) should override this — it avoids re-walking the inner
+    /// matvec for every column.
+    fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+        let n = self.nrows();
+        let p = self.ncols();
+        let mut out = Array2::<f64>::zeros((n, cols.len()));
+        let mut e = Array1::<f64>::zeros(p);
+        for (k, &j) in cols.iter().enumerate() {
+            assert!(
+                j < p,
+                "DenseDesignOperator::apply_columns: column index {j} out of bounds (ncols={p})"
+            );
+            e[j] = 1.0;
+            let col = self.apply(&e);
+            e[j] = 0.0;
+            out.column_mut(k).assign(&col);
+        }
+        out
+    }
+
     /// Materialize the full dense matrix. Operators that exist precisely to
     /// avoid materialization should still support this for fallback paths,
     /// diagnostics, and prediction.
@@ -1664,6 +1689,38 @@ impl DenseDesignOperator for ReparamOperator {
 
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         None
+    }
+
+    fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+        // (X · Qs)[:, cols] = X · Qs[:, cols] — one batched matvec over the inner
+        // design instead of one-per-column dispatch on a unit vector.
+        let qs_cols = self.qs.select(Axis(1), cols);
+        match &self.x_original {
+            DesignMatrix::Dense(x) => match x.as_dense_ref() {
+                Some(x_dense) => fast_ab(x_dense, &qs_cols),
+                None => {
+                    let n = self.n;
+                    let mut out = Array2::<f64>::zeros((n, cols.len()));
+                    for k in 0..cols.len() {
+                        let col = qs_cols.column(k).to_owned();
+                        let xc = self.x_original.apply(&col);
+                        out.column_mut(k).assign(&xc);
+                    }
+                    out
+                }
+            },
+            DesignMatrix::Sparse(_) => {
+                // Sparse X: apply column-by-column over the small qs_cols block.
+                let n = self.n;
+                let mut out = Array2::<f64>::zeros((n, cols.len()));
+                for k in 0..cols.len() {
+                    let col = qs_cols.column(k).to_owned();
+                    let xc = self.x_original.apply(&col);
+                    out.column_mut(k).assign(&xc);
+                }
+                out
+            }
+        }
     }
 
     fn row_chunk_into(
@@ -6395,6 +6452,37 @@ impl DesignMatrix {
                     col[row_idx[idx]] = values[idx];
                 }
                 col
+            }
+        }
+    }
+
+    /// Batched column extraction: returns an `nrows × cols.len()` dense block
+    /// whose k-th column equals `extract_column(cols[k])`.
+    ///
+    /// For lazy operator-backed designs this routes through the operator's
+    /// `apply_columns`, which `ReparamOperator` implements as a single GEMM
+    /// (`X · Qs[:, cols]`) instead of one matvec dispatch per column.
+    pub fn extract_columns(&self, cols: &[usize]) -> Array2<f64> {
+        match self {
+            Self::Dense(m) => match m {
+                DenseDesignMatrix::Materialized(mat) => mat.select(Axis(1), cols),
+                DenseDesignMatrix::Lazy(op) => op.apply_columns(cols),
+            },
+            Self::Sparse(sp) => {
+                let n = sp.nrows();
+                let mut out = Array2::<f64>::zeros((n, cols.len()));
+                let (symbolic, values) = sp.parts();
+                let col_ptr = symbolic.col_ptr();
+                let row_idx = symbolic.row_idx();
+                for (k, &j) in cols.iter().enumerate() {
+                    let start = col_ptr[j];
+                    let end = col_ptr[j + 1];
+                    let mut out_col = out.column_mut(k);
+                    for idx in start..end {
+                        out_col[row_idx[idx]] = values[idx];
+                    }
+                }
+                out
             }
         }
     }
