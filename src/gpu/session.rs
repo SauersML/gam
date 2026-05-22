@@ -446,8 +446,8 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
 
     // Pack X column-major on the host then ship in one memcpy.
     let upload_start = std::time::Instant::now();
-    let host_col_major: Vec<f64> = to_col_major(&x.view());
-    let x_dev: CudaSlice<f64> = stream.clone_htod(&host_col_major).ok()?;
+    let host_col_major = to_col_major(x.as_ref());
+    let x_dev: CudaSlice<f64> = stream.clone_htod(&*host_col_major).ok()?;
     let wy_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows.checked_mul(cols)?).ok()?;
     let w_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(rows).ok()?;
     let out_pp_dev: CudaSlice<f64> = stream.alloc_zeros::<f64>(cols.checked_mul(cols)?).ok()?;

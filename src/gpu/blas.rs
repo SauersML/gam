@@ -1307,7 +1307,7 @@ impl CublasRuntime {
         // strideB = 0 broadcasts B across all batch elements.
         self.run_strided_batched(
             &a_host,
-            &b_host,
+            &*b_host,
             transpose_a,
             transpose_b,
             batch,
@@ -1345,7 +1345,7 @@ impl CublasRuntime {
         let b_host = pack_a3_col_major(b);
         // strideA = 0 broadcasts A across all batch elements.
         self.run_strided_batched(
-            &a_host,
+            &*a_host,
             &b_host,
             transpose_a,
             transpose_b,
@@ -1460,7 +1460,7 @@ mod tests {
     #[test]
     fn column_major_round_trip_preserves_values() {
         let a = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
-        let packed = to_col_major(&a);
+        let packed = to_col_major(&a).into_owned();
         assert_eq!(packed, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
         assert_eq!(from_col_major(&packed, 2, 3), a);
     }
