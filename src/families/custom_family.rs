@@ -7081,10 +7081,6 @@ fn scatter_joint_active_set(
 ///
 /// Returns `None` when no block has any active constraints — the caller
 /// can then skip the constraint-aware kernel entirely.
-#[allow(dead_code)] // Wired in by the constraint-aware kernel path; called by
-                    // BlockwiseInnerResult assembly when active inequality
-                    // constraints are present. Stays defined unconditionally
-                    // so the cert-point pseudo-inverse helper is one grep away.
 fn assemble_active_constraint_block(
     block_constraints: &[Option<LinearInequalityConstraints>],
     block_active_sets: &[Option<Vec<usize>>],
@@ -10670,6 +10666,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 kkt_residual
             };
+            let active_constraints = {
+                let local_ranges = block_param_ranges(specs);
+                let local_total_p = local_ranges
+                    .last()
+                    .map(|(_, end)| *end)
+                    .unwrap_or(0);
+                let block_constraints =
+                    collect_block_linear_constraints(family, &states, specs)?;
+                assemble_active_constraint_block(
+                    &block_constraints,
+                    &cached_active_sets,
+                    &local_ranges,
+                    local_total_p,
+                )
+                .map(std::sync::Arc::new)
+            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -10682,17 +10694,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
                 kkt_residual,
-                active_constraints: {
-                    let block_constraints =
-                        collect_block_linear_constraints(family, &states, specs)?;
-                    assemble_active_constraint_block(
-                        &block_constraints,
-                        &cached_active_sets,
-                        &ranges,
-                        total_p,
-                    )
-                    .map(std::sync::Arc::new)
-                },
+                active_constraints,
             });
         }
         // Soft warm-start across rho changes.
