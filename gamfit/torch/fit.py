@@ -17,7 +17,6 @@ engine's analytic VJP.
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -39,6 +38,7 @@ from ._reml import (
     GaussianRemlOutput,
     gaussian_reml_fit,
     gaussian_reml_fit_additive,
+    gaussian_reml_fit_with_constraints,
 )
 
 
@@ -227,6 +227,163 @@ def _build_design_penalty(
 
 
 # ---------------------------------------------------------------------------
+# Shape constraints — build A from the smooth's design on a 1D grid
+# ---------------------------------------------------------------------------
+
+
+def _shape_constraint_grid_1d(x: torch.Tensor) -> torch.Tensor:
+    """Replicate the Rust grid for 1D shape constraints.
+
+    Build a uniform grid of ``clamp(unique_count, 96, 320)`` points spanning
+    ``[min(x), max(x)]``. Constraint feasibility on this grid implies the
+    shape constraint on the smooth's image under the usual B-spline / RBF
+    density argument.
+    """
+    if x.dim() != 1:
+        raise ValueError(
+            f"shape constraint grid requires a 1D location tensor; got shape "
+            f"{tuple(x.shape)}"
+        )
+    if not torch.isfinite(x).all():
+        raise ValueError("shape constraint requires finite covariate values")
+    x_min = float(x.min().item())
+    x_max = float(x.max().item())
+    if x_max - x_min <= 1e-12 * max(abs(x_min), abs(x_max), 1.0):
+        raise ValueError(
+            "shape-constrained smooth requires a non-degenerate covariate range"
+        )
+    # Match Rust: clamp(unique_count, 96, 320). Approximate unique-count with
+    # nunique via torch.unique for the common case; cheap on the small N
+    # we see in 1D smooth fits.
+    unique_count = int(torch.unique(x).numel())
+    target = max(96, min(320, unique_count))
+    grid = torch.linspace(x_min, x_max, target, dtype=torch.float64, device=x.device)
+    return grid
+
+
+def _build_shape_constraint_inequality(
+    smooth: Smooth, points: torch.Tensor, shape_kind: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ``(A, b)`` for the inequality system ``A·β ≥ b`` enforcing
+    ``shape_kind`` on ``smooth``'s 1D basis at a dense grid over the data
+    range. Returns finite-difference rows on the grid:
+
+    * ``monotone_increasing``  → ``(B_grid[i+1] - B_grid[i]) · β ≥ 0``
+    * ``monotone_decreasing``  → negation of the above
+    * ``convex``               → ``(B_grid[i+2] - 2 B_grid[i+1] + B_grid[i]) · β ≥ 0``
+    * ``concave``              → negation of the above
+    """
+    points = _coerce_2d(points, "points")
+    if points.shape[1] != 1:
+        raise NotImplementedError(
+            "shape_constraint on the torch path requires a 1D covariate (d==1); "
+            f"got d={points.shape[1]}. Multidimensional shape constraints are "
+            "not supported on the torch path."
+        )
+    grid_1d = _shape_constraint_grid_1d(points.squeeze(1))
+
+    if isinstance(smooth, BSpline):
+        knots = (
+            _to_tensor(smooth.knots, points).reshape(-1)
+            if smooth.knots is not None
+            else None
+        )
+        b_grid = bspline_basis(
+            grid_1d, knots, degree=smooth.degree, periodic=smooth.periodic,
+        ).to(torch.float64).detach()
+    elif isinstance(smooth, Duchon):
+        if isinstance(smooth, Duchon) and (
+            (hasattr(smooth, "centers") and _to_tensor(smooth.centers, points).reshape(
+                _to_tensor(smooth.centers, points).shape[0], -1).shape[1] != 1)
+        ):
+            raise NotImplementedError(
+                "shape_constraint on torch Duchon path requires 1D centers."
+            )
+        centers = _coerce_2d(_to_tensor(smooth.centers, points), "Duchon.centers")
+        per = (
+            tuple(bool(p) for p in smooth.periodic_per_axis)
+            if smooth.periodic_per_axis is not None
+            else None
+        )
+        b_grid = duchon_basis(
+            grid_1d.unsqueeze(1), centers, m=smooth.m, periodic_per_axis=per,
+        ).to(torch.float64).detach()
+    else:
+        raise NotImplementedError(
+            f"shape_constraint not supported on the torch path for "
+            f"{type(smooth).__name__}; supported: BSpline, Duchon (d=1)."
+        )
+
+    sk = shape_kind.lower()
+    if sk in ("monotone_increasing", "monotone_decreasing"):
+        diff = b_grid[1:] - b_grid[:-1]
+        if sk == "monotone_decreasing":
+            diff = -diff
+        a = diff
+    elif sk in ("convex", "concave"):
+        d2 = b_grid[2:] - 2.0 * b_grid[1:-1] + b_grid[:-2]
+        if sk == "concave":
+            d2 = -d2
+        a = d2
+    else:
+        raise ValueError(
+            f"unknown shape_constraint kind {shape_kind!r}; expected one of "
+            "monotone_increasing, monotone_decreasing, convex, concave"
+        )
+
+    # Drop near-zero rows (matches Rust's norm>1e-12 cull).
+    row_norms = a.norm(dim=1)
+    keep = row_norms > 1e-12
+    a = a[keep].contiguous()
+    b = torch.zeros(a.shape[0], dtype=torch.float64, device=a.device)
+    return a, b
+
+
+def _fit_single_constrained(
+    smooth: Smooth,
+    points: torch.Tensor,
+    response: torch.Tensor,
+    *,
+    weights: torch.Tensor | None,
+    shape_kind: str,
+    init_lambdas: torch.Tensor | None,
+) -> "FitResult":
+    design, penalty = _build_design_penalty(smooth, points)
+    a_ineq, b_ineq = _build_shape_constraint_inequality(
+        smooth, points, shape_kind,
+    )
+    if smooth.by is not None:
+        raise NotImplementedError(
+            "shape_constraint combined with `by` modulation is not supported "
+            "on the torch path."
+        )
+    weights_f64 = (
+        weights.to(torch.float64).reshape(-1) if weights is not None else None
+    )
+    init_log = None
+    if init_lambdas is not None:
+        import math as _math
+        init_log = _math.log(max(float(init_lambdas), 1e-300))
+    out = gaussian_reml_fit_with_constraints(
+        design.to(torch.float64),
+        response.to(torch.float64),
+        penalty.to(torch.float64),
+        weights=weights_f64,
+        init_log_lambda=init_log,
+        a_inequality=a_ineq,
+        b_inequality=b_ineq,
+    )
+    return FitResult(
+        coefficients=out.coefficients,
+        fitted=out.fitted,
+        lambdas=out.lam,
+        reml_score=out.reml_score,
+        edf=out.edf,
+        smooths=[smooth],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public: fit()
 # ---------------------------------------------------------------------------
 
@@ -288,31 +445,51 @@ def fit(
         ...     ],
         ... )
     """
-    # Shape constraints are a Rust-only feature (active-set / interior-
-    # point inner solver). The torch path uses the closed-form Gaussian
-    # REML primitive in gam-pyffi, which has no constraint argument. Reject
-    # constrained smooths up front rather than silently dropping the
-    # constraint and returning a wrong-but-plausible fit. To use shape
-    # constraints, route through ``gamfit.fit(df, formula, constraints=...)``
-    # which dispatches to the constrained inner solver.
-    def _shape_set(s: Smooth) -> bool:
+    # Shape constraints route through the constrained Gaussian REML driver
+    # in gam-pyffi (active-set + tangent-projected outer REML). Supported on
+    # the torch path only for a single 1D smooth (BSpline / Duchon with
+    # d==1); a multi-smooth list with constraints, or constrained
+    # multivariate smooths, are rejected with a clear error.
+    def _shape_kind(s: Smooth) -> str | None:
         sc = getattr(s, "shape_constraint", None)
-        return sc is not None and str(sc).lower() != "none"
+        if sc is None:
+            return None
+        sc_str = str(sc).lower()
+        return None if sc_str == "none" else sc_str
 
     if isinstance(smooths, Smooth):
-        if _shape_set(smooths):
-            raise NotImplementedError(
-                "shape_constraint is not supported on the torch fit path; "
-                "use gamfit.fit(df, formula, constraints={...}) which routes "
-                "through the constrained active-set inner solver."
-            )
+        _shape = _shape_kind(smooths)
     else:
-        if any(_shape_set(s) for s in smooths if isinstance(s, Smooth)):
+        kinds = [_shape_kind(s) for s in smooths if isinstance(s, Smooth)]
+        if any(k is not None for k in kinds):
             raise NotImplementedError(
-                "shape_constraint is not supported on the torch fit path; "
-                "use gamfit.fit(df, formula, constraints={...}) which routes "
-                "through the constrained active-set inner solver."
+                "shape_constraint on the torch fit path is currently only "
+                "supported for a single Smooth (not a list). For joint "
+                "multi-smooth additive fits with shape constraints use "
+                "gamfit.fit(df, formula, constraints={...})."
             )
+        _shape = None
+
+    if isinstance(smooths, Smooth) and _shape is not None:
+        if isinstance(points, (list, tuple)):
+            raise ValueError(
+                "got a list of points but a single smooth; pass one points tensor."
+            )
+        if response.dim() == 1:
+            response_in = response.unsqueeze(1)
+        else:
+            response_in = response
+        if response_in.dim() != 2 or response_in.shape[1] != 1:
+            raise NotImplementedError(
+                "shape_constraint on the torch fit path requires a single-"
+                "column response of shape (N,) or (N, 1); got shape "
+                f"{tuple(response_in.shape)}. Multi-output responses with "
+                "constraints are not yet supported."
+            )
+        return _fit_single_constrained(
+            smooths, points, response_in, weights=weights, shape_kind=_shape,
+            init_lambdas=init_lambdas,
+        )
 
     # Normalize: response always (N, D)
     if response.dim() == 1:
@@ -379,20 +556,10 @@ def fit(
         bys.append(_to_tensor(s.by, design).reshape(-1) if s.by is not None else None)
 
     init_lam = float(init_lambdas[0]) if init_lambdas is not None else None
-    # Multi-output (D > 1) still falls back to the single-λ closed-form
-    # because the multi-block REML driver is single-response; surface that
-    # to the user when it matters. The scalar/single-column case now uses
-    # the multi-block per-smooth-λ Rust path automatically.
-    if len(smooths_list) > 1 and response_f64.shape[1] > 1:
-        warnings.warn(
-            "gamfit.torch.fit: multi-smooth additive fit with multi-output (D>1) "
-            "response falls back to the single shared λ closed-form path because "
-            "the multi-block REML driver is single-response. For per-smooth λ on "
-            "a scalar response use response of shape (N,) or (N, 1); for multi-output "
-            "fits with per-smooth λ use the formula API gamfit.fit(df, 'y ~ s(x1) + ...').",
-            UserWarning,
-            stacklevel=2,
-        )
+    # `gaussian_reml_fit_additive` routes single-response (D == 1, F > 1)
+    # to the multi-block per-smooth-λ Rust path automatically; multi-output
+    # responses (D > 1) use the closed-form block-diagonal kernel because
+    # the multi-block driver is single-response.
     add_out: AdditiveRemlOutput = gaussian_reml_fit_additive(
         designs=designs,
         response=response_f64,

@@ -2118,6 +2118,96 @@ def gaussian_reml_fit_blocks_forward(
     return result
 
 
+def gaussian_reml_fit_blocks_backward(
+    designs: list[Any],
+    penalties: list[Any],
+    y: Any,
+    log_lambdas: Any,
+    *,
+    weights: Any | None = None,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_lambdas: Any | None = None,
+    grad_log_lambdas: Any | None = None,
+    grad_reml_score: float = 0.0,
+    grad_edf: Any | None = None,
+    fd_step: float = 1.0e-5,
+) -> dict[str, Any]:
+    """Analytic backward for the multi-block per-smooth-λ Gaussian REML fit.
+
+    Computes VJPs of ``(coefficients, fitted, lambdas, log_lambdas,
+    reml_score, edf)`` back to ``(designs, penalties, y)``. The Rust kernel
+    applies central finite differences to the forward fit warm-started at
+    the converged log-λ\\*: each perturbed fit re-converges to the new
+    outer optimum, implicitly composing both the direct
+    ``∂(output)/∂p|_ρ*`` term and the indirect
+    ``∂(output)/∂ρ · ∂ρ*/∂p`` term through the F×F outer Hessian
+    ``H_joint(ρ*)``. The outer Hessian is never explicitly assembled — its
+    inverse is applied implicitly by the warm-started outer Newton loop
+    snapping to the new optimum after each perturbation.
+    """
+    import numpy as np
+
+    if len(designs) != len(penalties):
+        raise ValueError(
+            "designs and penalties must have equal length; "
+            f"got {len(designs)} vs {len(penalties)}"
+        )
+    if len(designs) == 0:
+        raise ValueError("gaussian_reml_fit_blocks_backward requires at least one block")
+
+    designs_np = [_numeric_matrix(d, f"designs[{i}]") for i, d in enumerate(designs)]
+    penalties_np = [
+        _numeric_matrix(p, f"penalties[{i}]") for i, p in enumerate(penalties)
+    ]
+    y_np = _numeric_matrix(y, "y")
+    weights_np = None if weights is None else _numeric_vector(weights, "weights")
+    log_lambdas_np = _numeric_vector(log_lambdas, "log_lambdas")
+    gc = (
+        None
+        if grad_coefficients is None
+        else _numeric_matrix(grad_coefficients, "grad_coefficients")
+    )
+    gf = None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted")
+    gl = None if grad_lambdas is None else _numeric_vector(grad_lambdas, "grad_lambdas")
+    glog = (
+        None
+        if grad_log_lambdas is None
+        else _numeric_vector(grad_log_lambdas, "grad_log_lambdas")
+    )
+    ge = None if grad_edf is None else _numeric_vector(grad_edf, "grad_edf")
+
+    try:
+        out = rust_module().gaussian_reml_fit_blocks_backward(
+            designs_np,
+            penalties_np,
+            y_np,
+            weights_np,
+            log_lambdas_np,
+            gc,
+            gf,
+            gl,
+            glog,
+            float(grad_reml_score),
+            ge,
+            float(fd_step),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    if "grad_designs" in result:
+        result["grad_designs"] = [
+            np.asarray(g, dtype=float) for g in result["grad_designs"]
+        ]
+    if "grad_penalties" in result:
+        result["grad_penalties"] = [
+            np.asarray(g, dtype=float) for g in result["grad_penalties"]
+        ]
+    if "grad_y" in result:
+        result["grad_y"] = np.asarray(result["grad_y"], dtype=float)
+    return result
+
+
 def gaussian_reml_fit_with_constraints_forward(
     x: Any,
     y: Any,
