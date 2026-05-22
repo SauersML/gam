@@ -699,7 +699,7 @@ fn duchon_basis<'py>(
         periodic: any_periodic,
     };
     let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
-    Ok(built.design.into_pyarray(py).unbind())
+    Ok(built.design.to_dense().into_pyarray(py).unbind())
 }
 
 #[pyfunction(signature = (t, num_internal_knots, degree = 3))]
@@ -7248,7 +7248,7 @@ fn build_gaussian_location_scale_ffi_payload(
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some("identity".to_string());
+    payload.link = Some(InverseLink::Standard(LinkFunction::Identity));
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = scale_beta;
     payload.gaussian_response_scale = Some(response_scale);
@@ -7826,7 +7826,7 @@ fn predict_competing_risks_survival_result(
         time_grid: time_grid_slice,
         with_uncertainty: options.with_uncertainty,
     };
-    predict_competing_risks_survival(request)
+    Ok(predict_competing_risks_survival(request)?)
 }
 
 fn predict_survival_result(
@@ -7862,7 +7862,7 @@ fn predict_survival_result(
         time_grid: time_grid_slice,
         with_uncertainty: options.with_uncertainty,
     };
-    predict_survival(request)
+    Ok(predict_survival(request)?)
 }
 
 fn serialize_survival_prediction_payload(
