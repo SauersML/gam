@@ -11592,9 +11592,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let pcg_started = std::time::Instant::now();
                 let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
                 let mut delta = if pcg_requested {
-                    if !ew_pcg_log_emitted
-                        && let Some(prev_kkt) = prev_kkt_norm
-                    {
+                    if !ew_pcg_log_emitted && let Some(prev_kkt) = prev_kkt_norm {
                         log::info!(
                             "[EW-PCG] eta={:.3e} prev_kkt={:.3e} cur_kkt={:.3e}",
                             pcg_rel_tol,
@@ -12227,6 +12225,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 };
                 if floor_reached || secondary_ok {
                     let old_kkt_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    // With EW-PCG, the linear residual is η_k·‖r‖ by design;
+                    // do NOT certify on it. It is diagnostic/context only:
+                    // convergence certificates below remain gated by the
+                    // actual projected KKT residual at the accepted β.
                     let linearized_next_kkt_inf = hpen_delta
                         .iter()
                         .zip(rhs.iter())
@@ -12520,6 +12522,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     converged = true;
                 }
                 cycles_done = cycle + 1;
+                prev_kkt_norm = Some(current_kkt_norm);
                 if converged {
                     break;
                 }
@@ -13150,6 +13153,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     break;
                 }
             }
+            prev_kkt_norm = Some(current_kkt_norm);
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
