@@ -66,8 +66,7 @@ impl LinearInequalityConstraints {
 /// Constraints are represented as `A * beta >= b` in the same coefficient
 /// coordinate system as the returned `beta`.
 ///
-/// **Invariants** (debug-checked by [`Self::check_invariants`], surfaced by
-/// the smart constructor [`Self::new`]):
+/// **Invariants** (held by all producers; not enforced at consumer boundary):
 /// - `n_active <= n_constraints` (a row cannot be active twice).
 /// - All four residual components (`primal_feasibility`, `dual_feasibility`,
 ///   `complementarity`, `stationarity`) are `>= 0.0` and finite.
@@ -88,35 +87,6 @@ pub struct ConstraintKktDiagnostics {
     pub stationarity: f64,
     /// Tolerance used to classify active constraints from slacks.
     pub active_tolerance: f64,
-}
-
-impl ConstraintKktDiagnostics {
-    /// Debug-only invariant check. Cheap; cost is a handful of comparisons.
-    /// Cooperators that read these diagnostics may opt into a hard check by
-    /// calling this method directly.
-    #[inline]
-    pub fn check_invariants(&self) -> Result<(), String> {
-        if self.n_active > self.n_constraints {
-            return Err(format!(
-                "ConstraintKktDiagnostics: n_active ({}) exceeds n_constraints ({})",
-                self.n_active, self.n_constraints
-            ));
-        }
-        for (label, value) in [
-            ("primal_feasibility", self.primal_feasibility),
-            ("dual_feasibility", self.dual_feasibility),
-            ("complementarity", self.complementarity),
-            ("stationarity", self.stationarity),
-            ("active_tolerance", self.active_tolerance),
-        ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(format!(
-                    "ConstraintKktDiagnostics: {label} must be finite and non-negative, got {value}",
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 use crate::linalg::utils::array_is_finite;

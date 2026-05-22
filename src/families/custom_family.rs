@@ -895,38 +895,6 @@ impl BlockWorkingSet {
         })
     }
 
-    /// Validate that an existing `BlockWorkingSet` satisfies its internal
-    /// invariants. Cheap (one length comparison for the diagonal case);
-    /// useful as a debug-assert at consumer boundaries.
-    #[inline]
-    pub fn check_invariants(&self) -> Result<(), String> {
-        match self {
-            Self::Diagonal {
-                working_response,
-                working_weights,
-            } => {
-                if working_response.len() != working_weights.len() {
-                    return Err(format!(
-                        "BlockWorkingSet::Diagonal invariant violated: z.len()={}, w.len()={}",
-                        working_response.len(),
-                        working_weights.len(),
-                    ));
-                }
-            }
-            Self::ExactNewton { gradient, hessian } => {
-                let p = gradient.len();
-                if !hessian.is_square() || hessian.nrows() != p {
-                    return Err(format!(
-                        "BlockWorkingSet::ExactNewton dim mismatch: gradient.len()={p}, \
-                         hessian shape=({}, {})",
-                        hessian.nrows(),
-                        hessian.ncols(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2714,45 +2682,6 @@ pub struct BlockwiseInnerResult {
     /// `log|U_Tᵀ H U_T|`.
     pub active_constraints:
         Option<Arc<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock>>,
-}
-
-impl BlockwiseInnerResult {
-    /// Debug-time invariant check: per-block parallel vectors must agree in
-    /// length, and finite scalars must remain finite. Cheap (counts +
-    /// finiteness checks), useful at consumer boundaries that want to fail
-    /// loud before propagating a malformed inner result. Returns `Err` with a
-    /// human-readable description on any violation.
-    #[inline]
-    pub fn check_invariants(&self) -> Result<(), String> {
-        let n = self.block_states.len();
-        if self.active_sets.len() != n {
-            return Err(format!(
-                "BlockwiseInnerResult: active_sets has length {}, expected {} (one per block)",
-                self.active_sets.len(),
-                n,
-            ));
-        }
-        if self.s_lambdas.len() != n {
-            return Err(format!(
-                "BlockwiseInnerResult: s_lambdas has length {}, expected {} (one per block)",
-                self.s_lambdas.len(),
-                n,
-            ));
-        }
-        for (label, value) in [
-            ("log_likelihood", self.log_likelihood),
-            ("penalty_value", self.penalty_value),
-            ("block_logdet_h", self.block_logdet_h),
-            ("block_logdet_s", self.block_logdet_s),
-        ] {
-            if !value.is_finite() {
-                return Err(format!(
-                    "BlockwiseInnerResult: {label} must be finite, got {value}"
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
