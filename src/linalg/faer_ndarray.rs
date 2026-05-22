@@ -1916,7 +1916,7 @@ mod tests {
         let n = 400;
         let p = 36;
         let x: Array2<f64> =
-            Array2::from_shape_fn((n, p), |(i, j)| ((i as f64 * 0.1).cos() + j as f64 * 0.05));
+            Array2::from_shape_fn((n, p), |(i, j)| (i as f64 * 0.1).cos() + j as f64 * 0.05);
         let w: Array1<f64> = Array1::from_shape_fn(n, |i| (i as f64 * 0.03).sin());
         // Naive reference: X^T diag(w) X.
         let wx = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
