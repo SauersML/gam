@@ -217,11 +217,7 @@ pub fn to_col_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a
     let strides = a.strides();
     // F-order contiguous: column stride == 1, row stride == rows.
     // `as_slice_memory_order` confirms the buffer is contiguous in memory.
-    if rows > 0
-        && cols > 0
-        && strides[0] == 1
-        && strides[1] == rows as isize
-    {
+    if rows > 0 && cols > 0 && strides[0] == 1 && strides[1] == rows as isize {
         if let Some(slice) = a.as_slice_memory_order() {
             return Cow::Borrowed(slice);
         }

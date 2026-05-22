@@ -10860,8 +10860,8 @@ fn constrained_stationary_certificate_decision(
 ) -> ConstrainedStationaryCertificate {
     let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
     let scalar_model_relerr = math.scalar_model_relative_error();
-    let objective_exhausted =
-        objective_change <= objective_tol || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
+    let objective_exhausted = objective_change <= objective_tol
+        || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
 
     if !(objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3) {
         return ConstrainedStationaryCertificate::NotCandidate;
@@ -12879,9 +12879,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
-                let objective_exhausted = objective_change <= objective_tol
-                    || geometric_tail_bound.is_some_and(|tail| tail <= objective_tol);
-                if objective_exhausted && linearized_rel >= 0.5 && scalar_model_relerr <= 1e-3 {
+                let certificate_decision = constrained_stationary_certificate_decision(
+                    math,
+                    objective_change,
+                    objective_tol,
+                    geometric_tail_bound,
+                    residual,
+                    residual_tol,
+                );
+                if !matches!(
+                    certificate_decision,
+                    ConstrainedStationaryCertificate::NotCandidate
+                ) {
                     // The `linearized_rel >= 0.5` signal is necessary but not
                     // sufficient. It proves either (a) g carries a Lagrange
                     // multiplier of an active constraint that the QP's active
@@ -12910,9 +12919,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // the outer optimizer rejects this ρ cleanly, exactly
                     // as it would on any other non-converged inner exit.
                     let cert_residual_factor = 4.0;
-                    let projected_residual_at_kkt =
-                        residual.is_finite() && residual <= cert_residual_factor * residual_tol;
-                    if projected_residual_at_kkt {
+                    if matches!(
+                        certificate_decision,
+                        ConstrainedStationaryCertificate::Accept
+                    ) {
                         log::info!(
                             "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary certificate: \
                              linear-solve neutralised {:.1}% of g (the remaining {:.1}% is a Lagrange multiplier \
@@ -25787,6 +25797,94 @@ mod tests {
             "AoU exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
             objective_change,
             objective_tol,
+        );
+    }
+
+    /// Reproduces the specific seed-rejection mechanism from the biobank
+    /// trace: the scalar Newton model and plateau tests alone look like a
+    /// constrained-stationary point, but the projected KKT residual is still
+    /// hundreds of times above tolerance. Older code accepted this as
+    /// convergence, populated the downstream inner result as if the remaining
+    /// gradient were pure multiplier mass, and the REML envelope-gradient
+    /// consistency gate later rejected every seed after the IFT correction
+    /// input was missing or contaminated.
+    #[test]
+    fn constrained_stationary_certificate_rejects_aou_phantom_multiplier() {
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 2.708e4,
+            linearized_next_kkt_inf: 2.707e4,
+            predicted_reduction: 3.421e-1,
+            actual_reduction: 3.421e-1,
+            trust_ratio: 1.0,
+            step_inf: 2.891e-2,
+            proposal_inf: 2.891e-2,
+        };
+        let objective_change = 3.421e-1;
+        let objective_tol = 3.479e-1;
+        let residual = 8.102;
+        let residual_tol = 2.707e-2;
+
+        // These are the three conditions the buggy certificate used. They all
+        // hold for the failure log at cycle 303.
+        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
+        assert!(linearized_rel >= 0.5);
+        assert!(math.scalar_model_relative_error() <= 1e-3);
+        assert!(objective_change <= objective_tol);
+
+        // The missing fourth condition: after active-set projection, the KKT
+        // residual must actually be at the inner tolerance scale. In the
+        // failure trace it is ~300x tolerance, so treating the leftover
+        // gradient as multiplier mass is the bug.
+        assert!(residual > 4.0 * residual_tol);
+        assert_eq!(
+            constrained_stationary_certificate_decision(
+                &math,
+                objective_change,
+                objective_tol,
+                None,
+                residual,
+                residual_tol,
+            ),
+            ConstrainedStationaryCertificate::RefusePhantomMultiplier,
+        );
+    }
+
+    #[test]
+    fn constrained_stationary_certificate_accepts_only_projected_residual_band() {
+        let math = JointNewtonMathDiagnostic {
+            old_kkt_inf: 2.708e4,
+            linearized_next_kkt_inf: 2.707e4,
+            predicted_reduction: 3.421e-1,
+            actual_reduction: 3.421e-1,
+            trust_ratio: 1.0,
+            step_inf: 2.891e-2,
+            proposal_inf: 2.891e-2,
+        };
+        let objective_change = 3.421e-1;
+        let objective_tol = 3.479e-1;
+        let residual_tol = 2.707e-2;
+
+        assert_eq!(
+            constrained_stationary_certificate_decision(
+                &math,
+                objective_change,
+                objective_tol,
+                None,
+                4.0 * residual_tol,
+                residual_tol,
+            ),
+            ConstrainedStationaryCertificate::Accept,
+        );
+        assert_eq!(
+            constrained_stationary_certificate_decision(
+                &math,
+                objective_change,
+                objective_tol,
+                None,
+                4.0 * residual_tol + 1.0e-12,
+                residual_tol,
+            ),
+            ConstrainedStationaryCertificate::RefusePhantomMultiplier,
         );
     }
 
