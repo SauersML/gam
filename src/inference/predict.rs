@@ -3309,10 +3309,10 @@ impl PredictableModel for BinomialLocationScalePredictor {
             Some(linear_predictor_se_from_backend(&backend, n, |rows| {
                 let x_t = design_row_chunk(&input.design, rows.clone())?;
                 let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
+                let eta_chunk = eta.slice(ndarray::s![rows.clone()]);
                 let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
-                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
-                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
+                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
+                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
                 let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                     Some(runtime.design(&q0_chunk)?)
                 } else {
@@ -3447,10 +3447,10 @@ impl PredictableModel for BinomialLocationScalePredictor {
         let eta_se = linear_predictor_se_from_backend(&backend, eta_t.len(), |rows| {
             let x_t = design_row_chunk(&input.design, rows.clone())?;
             let x_s = design_row_chunk(design_noise, rows.clone())?;
-            let eta_chunk = eta.slice(ndarray::s![rows.clone()]).to_owned();
+            let eta_chunk = eta.slice(ndarray::s![rows.clone()]);
             let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
-            let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]).to_owned();
-            let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]).to_owned();
+            let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
+            let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
             let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
                 Some(runtime.design(&q0_chunk)?)
             } else {
