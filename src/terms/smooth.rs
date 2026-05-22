@@ -12685,6 +12685,10 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         })
     }
 
+    fn design_revision(&self) -> u64 {
+        self.realizer.design_revision()
+    }
+
     fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
         if self
             .current_theta
@@ -18758,6 +18762,7 @@ mod tests {
                 hyper_dirs,
                 None,
                 order,
+                None,
             )
             .expect("outer eval")
         };
@@ -18906,6 +18911,7 @@ mod tests {
                     rho_dim,
                     None,
                     "iso-kappa Duchon FD cost-only",
+                    None,
                 )
                 .expect("cost-only eval")
         };
@@ -18931,6 +18937,7 @@ mod tests {
                 hyper_dirs,
                 None,
                 crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                None,
             )
             .expect("outer eval");
             (cost, grad)
@@ -19162,6 +19169,7 @@ mod tests {
                     rho_dim,
                     None,
                     "iso-κ variant FD cost-only",
+                    None,
                 )
                 .expect("cost-only eval")
         };
@@ -19187,6 +19195,7 @@ mod tests {
                 hyper_dirs,
                 None,
                 crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                None,
             )
             .expect("outer eval");
             (cost, grad)
@@ -19463,6 +19472,7 @@ mod tests {
             hyper_dirs,
             None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            None,
         )
         .expect("analytic outer eval");
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
@@ -19758,6 +19768,7 @@ mod tests {
             hyper_dirs,
             None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            None,
         )
         .expect("analytic outer eval");
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
@@ -20894,6 +20905,7 @@ mod tests {
                     build_hyper_dirs(),
                     None,
                     crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                    None,
                 )
                 .expect("reused eval");
 
@@ -20920,6 +20932,7 @@ mod tests {
                     build_hyper_dirs(),
                     None,
                     crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian,
+                    None,
                 )
                 .expect("fresh eval");
 
@@ -20954,6 +20967,7 @@ mod tests {
                     rho_dim,
                     build_hyper_dirs(),
                     None,
+                    None,
                 )
                 .expect("reused EFS eval");
 
@@ -20973,6 +20987,7 @@ mod tests {
                     theta,
                     rho_dim,
                     build_hyper_dirs(),
+                    None,
                     None,
                 )
                 .expect("fresh EFS eval");
