@@ -583,16 +583,12 @@ pub fn build_smooth_basis(
                 ))
                 .to_string());
             }
-            let k0 = ds
-                .column_kinds
-                .get(cols[0])
-                .copied()
-                .ok_or_else(|| TermBuilderError::missing_column("column-kind lookup failed").to_string())?;
-            let k1 = ds
-                .column_kinds
-                .get(cols[1])
-                .copied()
-                .ok_or_else(|| TermBuilderError::missing_column("column-kind lookup failed").to_string())?;
+            let k0 = ds.column_kinds.get(cols[0]).copied().ok_or_else(|| {
+                TermBuilderError::missing_column("column-kind lookup failed").to_string()
+            })?;
+            let k1 = ds.column_kinds.get(cols[1]).copied().ok_or_else(|| {
+                TermBuilderError::missing_column("column-kind lookup failed").to_string()
+            })?;
             // Binary columns are 2-level discrete variables and are valid as
             // the grouping factor here. We require one column to be a discrete
             // grouping variable (Categorical or Binary) and the other to be
@@ -612,8 +608,8 @@ pub fn build_smooth_basis(
             };
             let group_col = cols[group_idx];
             let cont_col = cols[cont_idx];
-            let levels = sorted_levels_for_column(ds.values.column(group_col))
-                .map_err(|e| e.to_string())?;
+            let levels =
+                sorted_levels_for_column(ds.values.column(group_col)).map_err(|e| e.to_string())?;
             let degree = option_usize(options, "degree").unwrap_or(3);
             let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
             let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
@@ -1614,7 +1610,9 @@ pub fn heuristic_centers(n: usize, d: usize) -> usize {
 fn parse_math_f64(raw: &str) -> Result<f64, TermBuilderError> {
     let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
     if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
-        return Err(TermBuilderError::invalid_option("None/null is not a number"));
+        return Err(TermBuilderError::invalid_option(
+            "None/null is not a number",
+        ));
     }
     let lower = t
         .to_ascii_lowercase()
@@ -2216,11 +2214,11 @@ fn parse_tensor_identifiability(
     match raw.trim().to_ascii_lowercase().as_str() {
         "none" => Ok(TensorBSplineIdentifiability::None),
         "sum_tozero" | "sum-to-zero" | "centered" => Ok(TensorBSplineIdentifiability::SumToZero),
-        "frozen" | "frozen_transform" | "frozen-transform" => Err(
-            TermBuilderError::unsupported_feature(
+        "frozen" | "frozen_transform" | "frozen-transform" => {
+            Err(TermBuilderError::unsupported_feature(
                 "tensor identifiability 'frozen' is internal-only; use none or sum_tozero",
-            ),
-        ),
+            ))
+        }
         other => Err(TermBuilderError::unsupported_feature(format!(
             "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
         ))),

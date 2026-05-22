@@ -2711,9 +2711,7 @@ fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
 where
     X: Into<DesignMatrix>,
 {
-    if opts.family.is_binomial_mixture()
-        && opts.mixture_link.is_none()
-    {
+    if opts.family.is_binomial_mixture() && opts.mixture_link.is_none() {
         return Err(EstimationError::InvalidInput(
             "BinomialMixture requires mixture_link specification".to_string(),
         ));

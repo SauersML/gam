@@ -5265,12 +5265,7 @@ impl PenaltySubspaceTrace {
         let (evals, evecs) = m
             .eigh(faer::Side::Lower)
             .map(|(w, v)| (w, v))
-            .unwrap_or_else(|_| {
-                (
-                    Array1::<f64>::zeros(k_active),
-                    Array2::<f64>::eye(k_active),
-                )
-            });
+            .unwrap_or_else(|_| (Array1::<f64>::zeros(k_active), Array2::<f64>::eye(k_active)));
         let sigma_max = evals.iter().copied().fold(0.0_f64, f64::max).max(0.0);
         let tol = f64::EPSILON * (k_active as f64) * sigma_max.max(1.0);
         let mut m_inv = Array2::<f64>::zeros((k_active, k_active));
@@ -5726,10 +5721,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
     /// inner solution. Used by `PenaltySubspaceTrace::with_active_constraints`
     /// at REML/LAML evaluation time to form the constraint-aware kernel
     /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`.
-    pub fn active_constraints(
-        mut self,
-        block: Option<Arc<ActiveLinearConstraintBlock>>,
-    ) -> Self {
+    pub fn active_constraints(mut self, block: Option<Arc<ActiveLinearConstraintBlock>>) -> Self {
         self.active_constraints = block;
         self
     }
@@ -7441,9 +7433,7 @@ pub fn reml_laml_evaluate(
 
     if let Some((idx, value)) = grad.iter().enumerate().find(|(_, v)| !v.is_finite()) {
         return Err(RemlError::NonFiniteValue {
-            reason: format!(
-                "REML/LAML gradient contains non-finite entry at index {idx}: {value}"
-            ),
+            reason: format!("REML/LAML gradient contains non-finite entry at index {idx}: {value}"),
         }
         .into());
     }

@@ -644,9 +644,7 @@ impl PredictableModel for StandardPredictor {
     ) -> Result<PredictResult, EstimationError> {
         let eta_base = input.design.dot(&self.beta) + &input.offset;
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            runtime
-                .apply(&eta_base)
-                .map_err(EstimationError::from)?
+            runtime.apply(&eta_base).map_err(EstimationError::from)?
         } else {
             eta_base
         };
@@ -1378,16 +1376,12 @@ impl BernoulliMarginalSlopePredictor {
         EstimationError,
     > {
         let score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
-            runtime
-                .breakpoints()
-                .map_err(EstimationError::from)?
+            runtime.breakpoints().map_err(EstimationError::from)?
         } else {
             Vec::new()
         };
         let link_breaks = if let Some(runtime) = self.link_deviation_runtime.as_ref() {
-            runtime
-                .breakpoints()
-                .map_err(EstimationError::from)?
+            runtime.breakpoints().map_err(EstimationError::from)?
         } else {
             Vec::new()
         };
@@ -2197,10 +2191,18 @@ impl BernoulliMarginalSlopePredictor {
             for _ in 0..num_chunks {
                 sinks.push(FlexSolveSink {
                     intercepts: intercepts_iter.next().expect("chunk count matches"),
-                    a_q: a_q_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
-                    a_b: a_b_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
-                    a_h: a_h_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
-                    a_w: a_w_iter.as_mut().map(|it| it.next().expect("chunk count matches")),
+                    a_q: a_q_iter
+                        .as_mut()
+                        .map(|it| it.next().expect("chunk count matches")),
+                    a_b: a_b_iter
+                        .as_mut()
+                        .map(|it| it.next().expect("chunk count matches")),
+                    a_h: a_h_iter
+                        .as_mut()
+                        .map(|it| it.next().expect("chunk count matches")),
+                    a_w: a_w_iter
+                        .as_mut()
+                        .map(|it| it.next().expect("chunk count matches")),
                 });
             }
 
@@ -2434,9 +2436,7 @@ impl BernoulliMarginalSlopePredictor {
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?
             } else {
-                runtime
-                    .design(&eta_base)
-                    .map_err(EstimationError::from)?
+                runtime.design(&eta_base).map_err(EstimationError::from)?
             };
             let dev = basis.dot(beta_owned);
             if need_gradient {
@@ -2802,9 +2802,7 @@ impl BernoulliMarginalSlopePredictor {
                     .design_with_anchor_rows(&eta_base, anchor_rows)
                     .map_err(EstimationError::from)?
             } else {
-                runtime
-                    .design(&eta_base)
-                    .map_err(EstimationError::from)?
+                runtime.design(&eta_base).map_err(EstimationError::from)?
             };
             let dev = basis.dot(beta);
             let d1 = runtime
@@ -3079,9 +3077,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
     ) -> Result<PredictResult, EstimationError> {
         let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            runtime
-                .apply(&eta_base)
-                .map_err(EstimationError::from)?
+            runtime.apply(&eta_base).map_err(EstimationError::from)?
         } else {
             eta_base
         };
@@ -3185,10 +3181,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
             let z = standard_normal_quantile(0.5 + 0.5 * level)
                 .map_err(EstimationError::InvalidInput)?;
             let z_se = eta_se.mapv(|s| z * s);
-            (
-                Some(&result.eta - &z_se),
-                Some(&result.eta + &z_se),
-            )
+            (Some(&result.eta - &z_se), Some(&result.eta + &z_se))
         } else {
             (None, None)
         };
@@ -5132,27 +5125,26 @@ where
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
     }
 
-    let (observation_lower, observation_upper) = if options.includeobservation_interval
-        && family.is_gaussian_identity()
-    {
-        let obsvar = fit.standard_deviation.max(0.0).powi(2);
-        let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
-        let lower = Array1::from_iter(
-            eta.iter()
-                .zip(obs_se.iter())
-                .zip(z_lower_per_row.iter())
-                .map(|((&e, &s), &zl)| e - zl * s),
-        );
-        let upper = Array1::from_iter(
-            eta.iter()
-                .zip(obs_se.iter())
-                .zip(z_upper_per_row.iter())
-                .map(|((&e, &s), &zu)| e + zu * s),
-        );
-        (Some(lower), Some(upper))
-    } else {
-        (None, None)
-    };
+    let (observation_lower, observation_upper) =
+        if options.includeobservation_interval && family.is_gaussian_identity() {
+            let obsvar = fit.standard_deviation.max(0.0).powi(2);
+            let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
+            let lower = Array1::from_iter(
+                eta.iter()
+                    .zip(obs_se.iter())
+                    .zip(z_lower_per_row.iter())
+                    .map(|((&e, &s), &zl)| e - zl * s),
+            );
+            let upper = Array1::from_iter(
+                eta.iter()
+                    .zip(obs_se.iter())
+                    .zip(z_upper_per_row.iter())
+                    .map(|((&e, &s), &zu)| e + zu * s),
+            );
+            (Some(lower), Some(upper))
+        } else {
+            (None, None)
+        };
 
     Ok(PredictUncertaintyResult {
         eta,

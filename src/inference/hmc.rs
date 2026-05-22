@@ -4320,8 +4320,9 @@ impl JointBetaRhoPosterior {
             LikelihoodFamily::BinomialLatentCLogLog => {
                 if !matches!(&inverse_link, InverseLink::LatentCLogLog(_)) {
                     return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
-                            .to_string(),
+                        reason:
+                            "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
+                                .to_string(),
                     }
                     .into());
                 }
@@ -4376,7 +4377,8 @@ impl JointBetaRhoPosterior {
             }
         }
 
-        validate_firth_likelihood_support(likelihood_family, firth_enabled).map_err(String::from)?;
+        validate_firth_likelihood_support(likelihood_family, firth_enabled)
+            .map_err(String::from)?;
 
         // Cholesky of H for β-whitening (same as NutsPosterior)
         let hessian_owned = hessian.to_owned();
@@ -4507,9 +4509,7 @@ impl JointBetaRhoPosterior {
 
             // Accumulate S(ρ)β for β-gradient — block-local
             for a in 0..cp.block_dim() {
-                let val: f64 = (0..rank_k)
-                    .map(|row| cp.root[[row, a]] * r_beta[row])
-                    .sum();
+                let val: f64 = (0..rank_k).map(|row| cp.root[[row, a]] * r_beta[row]).sum();
                 s_beta[r.start + a] += lambdas[k] * val;
             }
 
