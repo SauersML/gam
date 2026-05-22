@@ -36,6 +36,8 @@ use std::time::Instant;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as cublas_sys};
 use cudarc::driver::CudaContext;
 
+use super::error::GpuError;
+
 /// Measured per-device throughput used by every dispatch threshold.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceCalibration {
@@ -70,12 +72,13 @@ impl DeviceCalibration {
 /// device under test (typically the runtime probe via
 /// `runtime::cuda_context_for`). Calibration uses the context's default
 /// stream and creates its own `CudaBlas` handle scoped to that stream.
-pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, String> {
+pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuError> {
+    let driver_err = |reason: String| GpuError::DriverCallFailed { reason };
     // Bind the calling thread to this context so allocations and copies
     // land on the right device when the runtime drives multiple GPUs from
     // a single probe thread.
     ctx.bind_to_thread()
-        .map_err(|e| format!("bind_to_thread: {e}"))?;
+        .map_err(|e| driver_err(format!("bind_to_thread: {e}")))?;
 
     // Use a *created* (non-blocking) stream rather than `default_stream()`'s
     // legacy null stream. cudarc routes `alloc_zeros` through `cuMemAllocAsync`
@@ -321,13 +324,13 @@ fn bytes_per_sec(bytes: usize, seconds: f64) -> f64 {
 /// Best-of-N: run `f` `n` times, return the maximum result. The fastest
 /// run is closest to the un-throttled peak; slower runs include thermal
 /// dips, OS preemption, and host-side scheduler noise.
-fn best_of_n_transfer<F>(n: usize, mut f: F) -> Result<f64, String>
+fn best_of_n_transfer<F>(n: usize, mut f: F) -> Result<f64, GpuError>
 where
-    F: FnMut() -> Result<f64, String>,
+    F: FnMut() -> Result<f64, GpuError>,
 {
     let mut best = f64::NEG_INFINITY;
     let mut any = false;
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<GpuError> = None;
     for _ in 0..n {
         match f() {
             Ok(value) if value.is_finite() && value > best => {
@@ -341,7 +344,9 @@ where
     if any {
         Ok(best)
     } else {
-        Err(last_err.unwrap_or_else(|| format!("no usable sample across {n} iterations")))
+        Err(last_err.unwrap_or_else(|| GpuError::CalibrationFailed {
+            reason: format!("no usable sample across {n} iterations"),
+        }))
     }
 }
 

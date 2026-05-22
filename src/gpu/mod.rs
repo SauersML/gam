@@ -19,8 +19,8 @@
 mod blas;
 pub mod calibration;
 pub mod device;
-mod error;
 pub mod diagnostics;
+mod error;
 pub mod dispatch;
 mod driver;
 pub mod policy;
