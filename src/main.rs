@@ -2192,7 +2192,7 @@ fn run_fitwith_predict_noise(
         }
         Err(e) => {
             emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
-            return Err(e);
+            return Err(e.to_string());
         }
     };
     progress.advance_workflow(3);
@@ -8981,7 +8981,7 @@ fn write_prediction_csv(
     eta_se: Option<ArrayView1<'_, f64>>,
     mean_lower: Option<ArrayView1<'_, f64>>,
     mean_upper: Option<ArrayView1<'_, f64>>,
-) -> Result<(), String> {
+) -> CliResult<()> {
     // Materialise views into contiguous vecs so we can pass &[f64] slices.
     let eta_v: Vec<f64> = eta.to_vec();
     let mean_v: Vec<f64> = mean.to_vec();
@@ -9012,12 +9012,16 @@ fn write_prediction_csv(
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if mean_lower.is_some() {
-        return Err("internal error: mean_upper missing while mean_lower is present".to_string());
+        return Err(CliError::Internal {
+            reason: "internal error: mean_upper missing while mean_lower is present".to_string(),
+        });
     } else if mean_upper.is_some() {
-        return Err("internal error: mean_lower missing while mean_upper is present".to_string());
+        return Err(CliError::Internal {
+            reason: "internal error: mean_lower missing while mean_upper is present".to_string(),
+        });
     }
 
-    write_prediction_csv_unified(path, &cols)
+    write_prediction_csv_unified(path, &cols).map_err(|reason| CliError::FileWriteFailed { reason })
 }
 
 /// Convenience wrapper for Gaussian location-scale predictions (always
