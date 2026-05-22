@@ -646,7 +646,7 @@ impl PredictableModel for StandardPredictor {
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
             runtime
                 .apply(&eta_base)
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             eta_base
         };
@@ -1033,7 +1033,7 @@ impl BernoulliMarginalSlopePredictor {
                 .as_ref()
                 .unwrap()
                 .anchor_correction_matrix(n_anchor_rows.view())
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             None
         };
@@ -1042,7 +1042,7 @@ impl BernoulliMarginalSlopePredictor {
                 .as_ref()
                 .unwrap()
                 .anchor_correction_matrix(n_anchor_rows.view())
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             None
         };
@@ -1329,7 +1329,7 @@ impl BernoulliMarginalSlopePredictor {
             // different scalar than eta0).
             let basis = runtime
                 .design_uncorrected(eta0)
-                .map_err(EstimationError::InvalidInput)?;
+                .map_err(EstimationError::from)?;
             let mut value = &basis.dot(beta) + eta0;
             if let Some(corr) = link_dev_correction_for_row {
                 let offset = corr.dot(beta);
@@ -1345,7 +1345,7 @@ impl BernoulliMarginalSlopePredictor {
             }
             let d1 = runtime
                 .first_derivative_design(eta0)
-                .map_err(EstimationError::InvalidInput)?;
+                .map_err(EstimationError::from)?;
             Ok((value, d1.dot(beta) + 1.0))
         } else {
             Ok((eta0.clone(), Array1::ones(eta0.len())))
@@ -1367,14 +1367,14 @@ impl BernoulliMarginalSlopePredictor {
         let score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
             runtime
                 .breakpoints()
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             Vec::new()
         };
         let link_breaks = if let Some(runtime) = self.link_deviation_runtime.as_ref() {
             runtime
                 .breakpoints()
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             Vec::new()
         };
@@ -1532,7 +1532,7 @@ impl BernoulliMarginalSlopePredictor {
         {
             let mut span = runtime
                 .local_cubic_at(beta, z_value)
-                .map_err(EstimationError::InvalidInput)?;
+                .map_err(EstimationError::from)?;
             if let Some(corr) = score_warp_correction_for_row {
                 span.c0 -= corr.dot(beta);
             }
@@ -1545,7 +1545,7 @@ impl BernoulliMarginalSlopePredictor {
         {
             let mut span = runtime
                 .local_cubic_at(beta, u_value)
-                .map_err(EstimationError::InvalidInput)?;
+                .map_err(EstimationError::from)?;
             if let Some(corr) = link_dev_correction_for_row {
                 span.c0 -= corr.dot(beta);
             }
@@ -1917,7 +1917,7 @@ impl BernoulliMarginalSlopePredictor {
         let z_normalized = self
             .latent_z_normalization
             .apply(z_raw, "bernoulli marginal-slope prediction")
-            .map_err(EstimationError::InvalidInput)?;
+            .map_err(EstimationError::from)?;
         // P4: when training applied a rank-INT calibration to the latent
         // z (so the BMS rigid kernel could use the closed-form
         // standard-normal path), the predictor MUST apply the same
@@ -2113,9 +2113,9 @@ impl BernoulliMarginalSlopePredictor {
                     })?;
                     runtime
                         .design_with_anchor_rows(&z, anchor_rows)
-                        .map_err(EstimationError::InvalidInput)
+                        .map_err(EstimationError::from)
                 } else {
-                    runtime.design(&z).map_err(EstimationError::InvalidInput)
+                    runtime.design(&z).map_err(EstimationError::from)
                 }
             })
             .transpose()?;
@@ -2219,7 +2219,7 @@ impl BernoulliMarginalSlopePredictor {
                                 for j in 0..score_warp_dim {
                                     let mut basis_span = runtime
                                         .basis_cubic_at(j, node)
-                                        .map_err(EstimationError::InvalidInput)?;
+                                        .map_err(EstimationError::from)?;
                                     // `basis_cubic_at` returns the j-th basis
                                     // function's local cubic; the residual
                                     // subtracts `correction[j]` from the
@@ -2242,7 +2242,7 @@ impl BernoulliMarginalSlopePredictor {
                                 for j in 0..link_dev_dim {
                                     let mut basis_span = runtime
                                         .basis_cubic_at(j, intercept + slope * node)
-                                        .map_err(EstimationError::InvalidInput)?;
+                                        .map_err(EstimationError::from)?;
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
@@ -2293,7 +2293,7 @@ impl BernoulliMarginalSlopePredictor {
                                 for j in 0..score_warp_dim {
                                     let mut basis_span = runtime
                                         .basis_cubic_at(j, mid)
-                                        .map_err(EstimationError::InvalidInput)?;
+                                        .map_err(EstimationError::from)?;
                                     if let Some(corr) = score_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
@@ -2313,7 +2313,7 @@ impl BernoulliMarginalSlopePredictor {
                                 for j in 0..link_dev_dim {
                                     let mut basis_span = runtime
                                         .basis_cubic_at(j, intercept + slope * mid)
-                                        .map_err(EstimationError::InvalidInput)?;
+                                        .map_err(EstimationError::from)?;
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
@@ -2418,17 +2418,17 @@ impl BernoulliMarginalSlopePredictor {
                 })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
-                    .map_err(EstimationError::InvalidInput)?
+                    .map_err(EstimationError::from)?
             } else {
                 runtime
                     .design(&eta_base)
-                    .map_err(EstimationError::InvalidInput)?
+                    .map_err(EstimationError::from)?
             };
             let dev = basis.dot(beta_owned);
             if need_gradient {
                 let d1 = runtime
                     .first_derivative_design(&eta_base)
-                    .map_err(EstimationError::InvalidInput)?;
+                    .map_err(EstimationError::from)?;
                 let mut c_obs = d1.dot(beta_owned);
                 c_obs.mapv_inplace(|v| v + 1.0);
                 link_c_obs = Some(c_obs);
@@ -2610,7 +2610,7 @@ impl BernoulliMarginalSlopePredictor {
         let z_normalized = self
             .latent_z_normalization
             .apply(z_raw, "bernoulli marginal-slope prediction")
-            .map_err(EstimationError::InvalidInput)?;
+            .map_err(EstimationError::from)?;
         // P4: see `final_eta_and_gradient_from_theta` for the rationale.
         // The rank-INT calibration is a mathematically exact monotone
         // transform; both the rigid standard-normal kernel and the
@@ -2767,9 +2767,9 @@ impl BernoulliMarginalSlopePredictor {
                 })?;
                 runtime
                     .design_with_anchor_rows(&z, anchor_rows)
-                    .map_err(EstimationError::InvalidInput)?
+                    .map_err(EstimationError::from)?
             } else {
-                runtime.design(&z).map_err(EstimationError::InvalidInput)?
+                runtime.design(&z).map_err(EstimationError::from)?
             };
             design.dot(beta)
         } else {
@@ -2790,16 +2790,16 @@ impl BernoulliMarginalSlopePredictor {
                 })?;
                 runtime
                     .design_with_anchor_rows(&eta_base, anchor_rows)
-                    .map_err(EstimationError::InvalidInput)?
+                    .map_err(EstimationError::from)?
             } else {
                 runtime
                     .design(&eta_base)
-                    .map_err(EstimationError::InvalidInput)?
+                    .map_err(EstimationError::from)?
             };
             let dev = basis.dot(beta);
             let d1 = runtime
                 .first_derivative_design(&eta_base)
-                .map_err(EstimationError::InvalidInput)?;
+                .map_err(EstimationError::from)?;
             let mut c_obs = d1.dot(beta);
             c_obs.mapv_inplace(|v| v + 1.0);
             (dev, c_obs)
@@ -3071,7 +3071,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
             runtime
                 .apply(&eta_base)
-                .map_err(EstimationError::InvalidInput)?
+                .map_err(EstimationError::from)?
         } else {
             eta_base
         };
@@ -3252,7 +3252,7 @@ impl BinomialLocationScalePredictor {
     /// Apply the saved wiggle (if present) and then the inverse link to q0.
     fn apply_link(&self, q0: &Array1<f64>) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
         let eta = if let Some(runtime) = self.link_wiggle.as_ref() {
-            runtime.apply(q0).map_err(EstimationError::InvalidInput)?
+            runtime.apply(q0).map_err(EstimationError::from)?
         } else {
             q0.clone()
         };
@@ -3616,7 +3616,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
                             let q0 = -t * (-ls).exp();
                             let xw = runtime
                                 .basis_row_scalar(q0)
-                                .map_err(EstimationError::InvalidInput)?;
+                                .map_err(EstimationError::from)?;
                             let dt = t - eta_t[i];
                             let dls = ls - eta_s[i];
                             let meanw = q0 + xw.dot(&betaw) + dt * xw.dot(&k0) + dls * xw.dot(&k1);
