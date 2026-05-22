@@ -3140,6 +3140,63 @@ fn evaluate_affine_cell_derivative_state(
     })
 }
 
+/// Accumulate `moment_weight * z^k` into `moments[k]` for `k = 0..moments.len()`
+/// using a 4-way unrolled slab that breaks the `z_pow *= z` serial dependency
+/// chain of the naive formulation. Each group of four FMAs is independent
+/// (they share only the multiplicative power `z^(4j)`), letting the backend
+/// issue them in parallel.
+///
+/// Numerical contract: each slot still receives exactly one FMA per call,
+/// with operands `(mw, z^k, *slot)`. The per-iteration powers `z^k,
+/// z^(k+1), z^(k+2), z^(k+3)` are formed via `z_pow`, `z·z_pow`,
+/// `z²·z_pow`, `z³·z_pow` with `z_pow` advanced by `*= z^4` between blocks;
+/// this is a different multiplication tree than the scalar `z_pow *= z`
+/// chain, so individual `z^k` values can differ in the last ULP, but the
+/// downstream moment is a smooth function of those powers and the resulting
+/// drift is well within the GL quadrature error.
+#[inline(always)]
+fn accumulate_moments_unrolled4(moments: &mut [f64], moment_weight: f64, z: f64) {
+    let n = moments.len();
+    let z2 = z * z;
+    let z3 = z2 * z;
+    let z4 = z2 * z2;
+    let mut z_pow = 1.0_f64;
+    let chunks = n / 4;
+    let tail = n % 4;
+    let mut idx = 0;
+    for _ in 0..chunks {
+        let p0 = z_pow;
+        let p1 = z * z_pow;
+        let p2 = z2 * z_pow;
+        let p3 = z3 * z_pow;
+        // SAFETY: idx + 3 < n because idx advances in steps of 4 over
+        // `chunks` blocks, with chunks = n / 4.
+        unsafe {
+            let s0 = moments.get_unchecked_mut(idx);
+            *s0 = moment_weight.mul_add(p0, *s0);
+            let s1 = moments.get_unchecked_mut(idx + 1);
+            *s1 = moment_weight.mul_add(p1, *s1);
+            let s2 = moments.get_unchecked_mut(idx + 2);
+            *s2 = moment_weight.mul_add(p2, *s2);
+            let s3 = moments.get_unchecked_mut(idx + 3);
+            *s3 = moment_weight.mul_add(p3, *s3);
+        }
+        z_pow *= z4;
+        idx += 4;
+    }
+    // Scalar tail (0..=3 remaining slots).
+    for j in 0..tail {
+        let slot = &mut moments[idx + j];
+        let p = match j {
+            0 => 1.0,
+            1 => z,
+            2 => z2,
+            _ => z3,
+        } * z_pow;
+        *slot = moment_weight.mul_add(p, *slot);
+    }
+}
+
 fn evaluate_non_affine_cell_state(
     cell: DenestedCubicCell,
     branch: ExactCellBranch,
@@ -3186,7 +3243,6 @@ fn evaluate_non_affine_cell_state(
     let c1_v = f64x4::splat(c1);
     let c2_v = f64x4::splat(c2);
     let c3_v = f64x4::splat(c3);
-    let half_v = f64x4::splat(0.5);
     let neg_half_v = f64x4::splat(-0.5);
     let n_total = GL_NODES.len();
     let n_simd = n_total - (n_total % 4);
