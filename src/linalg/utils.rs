@@ -88,6 +88,20 @@ impl<'a> StableSolver<'a> {
         factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
     }
 
+    /// Generic factorize accepting any 2-D ndarray storage (owned or view).
+    /// Useful for hot loops that solve a contiguous subblock of a hoisted
+    /// workspace buffer without reallocating an owned `Array2`.
+    pub(crate) fn factorize_any<S>(
+        &self,
+        matrix: &ArrayBase<S, ndarray::Ix2>,
+    ) -> Result<crate::faer_ndarray::FaerSymmetricFactor, FaerLinalgError>
+    where
+        S: Data<Elem = f64>,
+    {
+        let view = FaerArrayView::new(matrix);
+        factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
+    }
+
     pub(crate) fn inversewith_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
         let p = matrix.nrows();
         if p == 0 || matrix.ncols() != p {

@@ -3178,53 +3178,49 @@ impl TransformationNormalFamily {
             let inv_hp = 1.0 / hp;
             let inv_hp_sq = inv_hp * inv_hp;
             let q = row_quantities.endpoint_q[i];
-            for k in 0..p_resp {
-                let h_factor = if k == 0 {
-                    rv[0]
-                } else {
-                    2.0 * rv[k] * gamma[k]
-                };
-                let hp_factor = if k == 0 {
-                    rd[0]
-                } else {
-                    2.0 * rd[k] * gamma[k]
-                };
-                let second = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * (hi * rv[k] - rd[k] * inv_hp)
-                };
-                let lower_factor = if k == 0 {
-                    self.response_lower_basis[0]
-                } else {
-                    2.0 * self.response_lower_basis[k] * gamma[k]
-                };
-                let upper_factor = if k == 0 {
-                    self.response_upper_basis[0]
-                } else {
-                    2.0 * self.response_upper_basis[k] * gamma[k]
-                };
-                let lower_second = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_lower_basis[k]
-                };
-                let upper_second = if k == 0 {
-                    0.0
-                } else {
-                    2.0 * self.response_upper_basis[k]
-                };
+
+            // k = 0 prologue: second / lower_second / upper_second vanish.
+            {
+                let h_factor = rv[0];
+                let hp_factor = rd[0];
+                let lower_factor = self.response_lower_basis[0];
+                let upper_factor = self.response_upper_basis[0];
+                let normalizer_second = q.second[0][0] * upper_factor * upper_factor
+                    + (q.second[0][1] + q.second[1][0]) * upper_factor * lower_factor
+                    + q.second[1][1] * lower_factor * lower_factor;
+                let coeff = wi
+                    * (h_factor * h_factor
+                        + hp_factor * hp_factor * inv_hp_sq
+                        + normalizer_second);
+                for c in 0..p_cov {
+                    let cc = cov_row[c] * cov_row[c];
+                    diag[c] += coeff * cc;
+                }
+            }
+
+            for k in 1..p_resp {
+                let two_gamma_k = 2.0 * gamma[k];
+                let h_factor = rv[k] * two_gamma_k;
+                let hp_factor = rd[k] * two_gamma_k;
+                let second = 2.0 * (hi * rv[k] - rd[k] * inv_hp);
+                let lower_factor = self.response_lower_basis[k] * two_gamma_k;
+                let upper_factor = self.response_upper_basis[k] * two_gamma_k;
+                let lower_second = 2.0 * self.response_lower_basis[k];
+                let upper_second = 2.0 * self.response_upper_basis[k];
                 let normalizer_second = q.first[0] * upper_second
                     + q.first[1] * lower_second
                     + q.second[0][0] * upper_factor * upper_factor
                     + (q.second[0][1] + q.second[1][0]) * upper_factor * lower_factor
                     + q.second[1][1] * lower_factor * lower_factor;
+                let coeff = wi
+                    * (h_factor * h_factor
+                        + hp_factor * hp_factor * inv_hp_sq
+                        + second
+                        + normalizer_second);
+                let row_offset = k * p_cov;
                 for c in 0..p_cov {
                     let cc = cov_row[c] * cov_row[c];
-                    diag[k * p_cov + c] += wi
-                        * ((h_factor * h_factor + hp_factor * hp_factor * inv_hp_sq) * cc
-                            + second * cc
-                            + normalizer_second * cc);
+                    diag[row_offset + c] += coeff * cc;
                 }
             }
         }
