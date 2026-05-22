@@ -21,6 +21,36 @@ use crate::quadrature::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// ─── Typed errors ────────────────────────────────────────────────────────────
+
+/// Errors produced by the lognormal-kernel frailty/marginal-slope validators.
+///
+/// Public boundaries that historically returned `Result<_, String>` continue to
+/// do so via `.map_err(|e| e.to_string())`; the `Display` impl reproduces the
+/// original error strings byte-for-byte.
+#[derive(Debug, Clone)]
+pub enum LognormalKernelError {
+    /// The chosen frailty modifier is not finite-state exact with the
+    /// requested marginal-slope family.
+    InvalidSpec { reason: String },
+}
+
+impl fmt::Display for LognormalKernelError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LognormalKernelError::InvalidSpec { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for LognormalKernelError {}
+
+impl From<LognormalKernelError> for String {
+    fn from(err: LognormalKernelError) -> String {
+        err.to_string()
+    }
+}
+
 // ─── Frailty specification ───────────────────────────────────────────────────
 
 /// How the hazard multiplier frailty loads onto the hazard components.
@@ -84,14 +114,23 @@ impl FrailtySpec {
     ///
     /// Returns an error if the combination is not exactly integrable.
     pub fn validate_for_marginal_slope(&self) -> Result<(), String> {
+        self.validate_for_marginal_slope_typed()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Typed variant of [`Self::validate_for_marginal_slope`] used internally;
+    /// the `String`-returning entry point above is preserved as a one-line
+    /// shim for external callers.
+    pub fn validate_for_marginal_slope_typed(&self) -> Result<(), LognormalKernelError> {
         match self {
             Self::None | Self::GaussianShift { .. } => Ok(()),
-            Self::HazardMultiplier { .. } => Err(
-                "HazardMultiplier frailty is not finite-state exact with score_warp/linkwiggle \
-                 cubic marginal-slope families. Use GaussianShift frailty (exact probit scaling) \
-                 or use the standalone latent-cloglog/latent-survival families instead."
-                    .to_string(),
-            ),
+            Self::HazardMultiplier { .. } => Err(LognormalKernelError::InvalidSpec {
+                reason:
+                    "HazardMultiplier frailty is not finite-state exact with score_warp/linkwiggle \
+                     cubic marginal-slope families. Use GaussianShift frailty (exact probit scaling) \
+                     or use the standalone latent-cloglog/latent-survival families instead."
+                        .to_string(),
+            }),
         }
     }
 }
