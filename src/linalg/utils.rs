@@ -18,6 +18,17 @@ where
     values.iter().all(|v| v.is_finite())
 }
 
+/// Infinity norm of an `f64` iterator: `max |x|`. Centralises the
+/// `iter().fold(0.0, |a, b| a.max(b.abs()))` idiom that appeared in
+/// multiple call sites across `solver/pirls.rs`, `inference/predict_input.rs`,
+/// and `terms/construction.rs`. Returns `0.0` for an empty iterator.
+#[inline]
+pub(crate) fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+    values
+        .into_iter()
+        .fold(0.0_f64, |acc, x| acc.max(x.abs()))
+}
+
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 const MAX_SOLVE_RETRIES: usize = 8;
