@@ -5004,7 +5004,10 @@ struct CoefficientStatePayload {
     beta: Vec<f64>,
     covariance_flat: Vec<f64>,
     covariance_n: usize,
-    covariance_corrected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_corrected_flat: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_corrected_n: Option<usize>,
     schema: Option<DataSchema>,
     training_feature_ranges: Option<Vec<(f64, f64)>>,
     random_column_ranges: Vec<(usize, usize)>,
@@ -5115,12 +5118,14 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let payload = model.payload();
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
-    let covariance = fit
-        .beta_covariance_corrected()
-        .map(|c| (c, true))
-        .or_else(|| fit.beta_covariance().map(|c| (c, false)))
+    let cov = fit
+        .beta_covariance()
         .ok_or_else(|| "model does not contain coefficient covariance; refit with covariance-saving inference enabled".to_string())?;
-    let (cov, corrected) = covariance;
+    let (covariance_corrected_flat, covariance_corrected_n) =
+        match fit.beta_covariance_corrected() {
+            Some(c) => (Some(c.iter().copied().collect()), Some(c.nrows())),
+            None => (None, None),
+        };
     let mut random_ranges = Vec::<(usize, usize)>::new();
     if let Some(spec) = payload.resolved_termspec.as_ref() {
         let mut col = 1 + spec.linear_terms.len();
@@ -5134,7 +5139,8 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         beta: fit.beta.to_vec(),
         covariance_flat: cov.iter().copied().collect(),
         covariance_n: cov.nrows(),
-        covariance_corrected: corrected,
+        covariance_corrected_flat,
+        covariance_corrected_n,
         schema: payload.data_schema.clone(),
         training_feature_ranges: payload.training_feature_ranges.clone(),
         random_column_ranges: random_ranges,
