@@ -48,6 +48,7 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
+    build_duchon_basis_mixed_periodicity_auto,
     build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
     build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
     create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
@@ -400,6 +401,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_positions_batched",
             "gaussian_reml_fit_positions_batched_backward",
             "gaussian_reml_fit_formula_table",
+            "gaussian_reml_fit_with_constraints_forward",
         ],
     )?;
     info.set_item(
@@ -654,10 +656,12 @@ fn bspline_basis_derivative<'py>(
 /// `points` is `(N, d)`, `centers` is `(K, d)`. For 1D smooths, pass
 /// shapes `(N, 1)` and `(K, 1)`.
 ///
-/// `periodic_per_axis` is an optional `Vec<bool>` of length `d`. Currently
-/// only the d=1 case supports periodicity (matches the Rust
-/// `build_periodic_duchon_basis_1d` implementation); higher-d periodicity
-/// will be rejected with a clear error.
+/// `periodic_per_axis` is an optional `Vec<bool>` of length `d`. For `d=1`
+/// with a single periodic axis, the legacy Bernoulli-Green builder is used
+/// (true periodic Green's function on the circle). For `d ≥ 2` with any
+/// periodic axis, the multi-D mixed-periodicity radial polyharmonic builder
+/// is used (cylinder/torus chord distance); per-axis periods are auto-derived
+/// from the centers' span along each periodic axis.
 #[pyfunction(signature = (points, centers, m = 2, periodic_per_axis = None))]
 fn duchon_basis<'py>(
     py: Python<'py>,
@@ -688,13 +692,22 @@ fn duchon_basis<'py>(
         )));
     }
     let any_periodic = periodic_flags.iter().any(|&b| b);
-    if any_periodic && d != 1 {
-        // Underlying `build_periodic_duchon_basis_1d` in src/terms/basis.rs
-        // rejects ncols != 1 with "periodic Duchon smooths currently require
-        // exactly one covariate"; surface a clearer FFI-level error.
-        return Err(py_value_error(
-            "periodic Duchon basis only supported in d=1 currently".to_string(),
-        ));
+    // Multi-D periodic: route through the mixed-periodicity builder
+    // (cylinder/torus chord-distance polyharmonic).
+    if any_periodic && d > 1 {
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+            length_scale: None,
+            power: 0.0,
+            nullspace_order: duchon_nullspace_from_m(m),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: Default::default(),
+            periodic: false,
+        };
+        let built = build_duchon_basis_mixed_periodicity_auto(pts, &spec, &periodic_flags, None)
+            .map_err(|err| py_value_error(err.to_string()))?;
+        return Ok(built.design.to_dense().into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
@@ -868,22 +881,53 @@ fn duchon_function_norm_penalty<'py>(
         vec![false; d]
     };
     let any_periodic = periodic_flags.iter().any(|&b| b);
-    // Underlying Rust `build_periodic_duchon_basis_1d` only supports d=1.
-    if any_periodic && d != 1 {
-        return Err(py_value_error(
-            "periodic Duchon basis only supported in d=1 currently".to_string(),
-        ));
-    }
     // Validate period only for the 1D periodic case (matches the legacy
-    // 1D validator's contract).
+    // 1D validator's contract). For d > 1 mixed-periodicity, per-axis
+    // periods are auto-derived from the centers in the Rust core; the
+    // scalar `period` is only meaningful in the 1D legacy path.
     if d == 1 {
         let col = center_matrix.column(0);
         validate_position_period("duchon", col, any_periodic, period)
             .map_err(py_value_error)?;
     } else if period.is_some() {
         return Err(py_value_error(
-            "duchon period is only valid when periodic=true".to_string(),
+            "duchon scalar `period` is only valid for d=1 (multi-D periodic axes auto-derive period from centers)".to_string(),
         ));
+    }
+    // Multi-D periodic: route through the mixed-periodicity builder
+    // (cylinder/torus chord-distance polyharmonic).
+    if any_periodic && d > 1 {
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
+            length_scale: None,
+            power: 0.0,
+            nullspace_order: duchon_nullspace_from_m(m),
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: Default::default(),
+            periodic: false,
+        };
+        let built = build_duchon_basis_mixed_periodicity_auto(
+            center_matrix.view(),
+            &spec,
+            &periodic_flags,
+            None,
+        )
+        .map_err(|err| py_value_error(err.to_string()))?;
+        // Mixed-periodicity builder emits a single Primary candidate (the
+        // function-norm Gram). Look it up by source for parity with the
+        // 1D periodic fallback below.
+        let idx = built
+            .penaltyinfo
+            .iter()
+            .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
+            .ok_or_else(|| {
+                py_value_error(
+                    "mixed-periodicity Duchon function-norm penalty was not built".to_string(),
+                )
+            })?;
+        let penalty = built.penalties[idx].clone();
+        return Ok(penalty.into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
@@ -1487,6 +1531,227 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         ndarray::Array1::from_iter(col_offsets.into_iter().map(|v| v as u64))
             .into_pyarray(py),
     )?;
+    Ok(out.unbind())
+}
+
+/// Constrained Gaussian REML forward fit with a single penalty block and an
+/// optional linear inequality system `A·β ≤ b`.
+///
+/// Wraps the same constrained PIRLS+REML driver (`fit_gam` with
+/// `FitOptions.linear_constraints`) that backs the formula-API shape
+/// constraints. Forward-only: no analytic VJP through the active-set
+/// inner solver is exposed here (the BUG-3 tangent-projection backward
+/// is implemented inside the REML driver but not yet plumbed out as a
+/// reusable Python VJP — see `gaussian_reml_fit_blocks_forward` for the
+/// equivalent forward-only contract).
+///
+/// Inputs:
+/// * `x` — design matrix `(N, M)` (single block).
+/// * `y` — response `(N, 1)`.
+/// * `penalty` — `(M, M)` smoothing penalty for the single block.
+/// * `weights` — optional row weights `(N,)`; defaults to ones.
+/// * `init_log_lambda` — optional scalar warm-start in log-λ.
+/// * `a_inequality` — `(R, M)` inequality matrix; pass an empty (0×M)
+///   array (or `None`) for the unconstrained case.
+/// * `b_inequality` — `(R,)` inequality RHS; same length as `a_inequality.nrows()`.
+///
+/// Outputs (dict): `coefficients (M, 1)`, `fitted (N, 1)`,
+/// `lambda` (scalar), `log_lambda` (scalar), `reml_score` (scalar),
+/// `edf` (scalar), `active_indices` (`(K,)` uint64 row indices of `A` at
+/// the converged β).
+#[pyfunction(signature = (
+    x,
+    y,
+    penalty,
+    weights = None,
+    init_log_lambda = None,
+    a_inequality = None,
+    b_inequality = None,
+))]
+fn gaussian_reml_fit_with_constraints_forward<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_log_lambda: Option<f64>,
+    a_inequality: Option<PyReadonlyArray2<'py, f64>>,
+    b_inequality: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    let x_view = x.as_array();
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+
+    let n_rows = x_view.nrows();
+    let p_cols = x_view.ncols();
+
+    if y_view.nrows() != n_rows {
+        return Err(py_value_error(format!(
+            "gaussian_reml_fit_with_constraints_forward: y has {} rows but X has {}",
+            y_view.nrows(),
+            n_rows,
+        )));
+    }
+    if y_view.ncols() != 1 {
+        return Err(py_value_error(format!(
+            "gaussian_reml_fit_with_constraints_forward requires y of shape (N, 1); got (N, {})",
+            y_view.ncols(),
+        )));
+    }
+    if penalty_view.nrows() != p_cols || penalty_view.ncols() != p_cols {
+        return Err(py_value_error(format!(
+            "penalty shape mismatch: expected {p_cols}x{p_cols}, got {}x{}",
+            penalty_view.nrows(),
+            penalty_view.ncols(),
+        )));
+    }
+
+    let y_col: Array1<f64> = y_view.column(0).to_owned();
+    let weights_owned: Array1<f64> = match weights.as_ref() {
+        Some(w) => {
+            let wa = w.as_array();
+            if wa.len() != n_rows {
+                return Err(py_value_error(format!(
+                    "weights.len={} does not match N={}",
+                    wa.len(),
+                    n_rows,
+                )));
+            }
+            wa.to_owned()
+        }
+        None => Array1::from_elem(n_rows, 1.0),
+    };
+    let offset_zero: Array1<f64> = Array1::zeros(n_rows);
+
+    // Build the constraint payload. An empty A (0 rows) is treated as "no
+    // constraint" — same convention used internally when no shape constraint
+    // is active.
+    let constraints_opt: Option<gam::pirls::LinearInequalityConstraints> =
+        match (a_inequality.as_ref(), b_inequality.as_ref()) {
+            (Some(a_arr), Some(b_arr)) => {
+                let a_view = a_arr.as_array();
+                let b_view = b_arr.as_array();
+                if a_view.nrows() == 0 {
+                    None
+                } else {
+                    if a_view.ncols() != p_cols {
+                        return Err(py_value_error(format!(
+                            "a_inequality has {} cols; expected {p_cols} to match X columns",
+                            a_view.ncols(),
+                        )));
+                    }
+                    if b_view.len() != a_view.nrows() {
+                        return Err(py_value_error(format!(
+                            "b_inequality length {} does not match a_inequality rows {}",
+                            b_view.len(),
+                            a_view.nrows(),
+                        )));
+                    }
+                    Some(
+                        gam::pirls::LinearInequalityConstraints::new(
+                            a_view.to_owned(),
+                            b_view.to_owned(),
+                        )
+                        .map_err(py_value_error)?,
+                    )
+                }
+            }
+            (None, None) => None,
+            _ => {
+                return Err(py_value_error(
+                    "a_inequality and b_inequality must both be provided or both omitted"
+                        .to_string(),
+                ));
+            }
+        };
+
+    let s_list: Vec<gam::smooth::BlockwisePenalty> = vec![
+        gam::smooth::BlockwisePenalty::new(0..p_cols, penalty_view.to_owned()),
+    ];
+
+    let opts = gam::estimate::FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 200,
+        tol: 1e-7,
+        nullspace_dims: vec![0; s_list.len()],
+        linear_constraints: constraints_opt.clone(),
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: Some(1e-6),
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+
+    let heuristic_owned: Option<Vec<f64>> =
+        init_log_lambda.map(|rho| vec![rho.exp()]);
+
+    let x_owned = x_view.to_owned();
+    let x_for_active = x_owned.clone();
+    let fit = py
+        .detach(move || {
+            let heuristic_slice = heuristic_owned.as_ref().map(|v| v.as_slice());
+            gam::estimate::fit_gamwith_heuristic_lambdas(
+                x_owned,
+                y_col.view(),
+                weights_owned.view(),
+                offset_zero.view(),
+                &s_list,
+                heuristic_slice,
+                gam::types::LikelihoodFamily::GaussianIdentity,
+                &opts,
+            )
+        })
+        .map_err(|e| py_value_error(e.to_string()))?;
+
+    let beta = fit.beta.clone();
+    let coefficients_2d = beta.clone().insert_axis(Axis(1));
+    let fitted_vec: Array1<f64> = x_for_active.dot(&beta);
+    let fitted_2d = fitted_vec.insert_axis(Axis(1));
+
+    let lambdas: Array1<f64> = fit.lambdas.clone();
+    let lambda_scalar = lambdas.iter().copied().next().unwrap_or(0.0);
+    let log_lambda_scalar = lambda_scalar.max(1e-300).ln();
+
+    let edf_total: f64 = fit
+        .inference
+        .as_ref()
+        .map(|inf| inf.edf_total)
+        .unwrap_or(0.0);
+
+    // Recompute active set from final β: row i is active iff a_i·β >= b_i - tol.
+    let active_indices: Vec<u64> = match constraints_opt.as_ref() {
+        Some(c) if c.a.nrows() > 0 => {
+            let beta_scale = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+            let mut out: Vec<u64> = Vec::new();
+            let ab: Array1<f64> = c.a.dot(&beta);
+            for i in 0..c.a.nrows() {
+                let row_scale =
+                    c.a.row(i).iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+                let tol = 1e-8 * row_scale * beta_scale.max(c.b[i].abs().max(1.0));
+                if ab[i] >= c.b[i] - tol {
+                    out.push(i as u64);
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    };
+    let active_indices_arr: Array1<u64> = Array1::from_vec(active_indices);
+
+    let out = PyDict::new(py);
+    out.set_item("coefficients", coefficients_2d.into_pyarray(py))?;
+    out.set_item("fitted", fitted_2d.into_pyarray(py))?;
+    out.set_item("lambda", lambda_scalar)?;
+    out.set_item("log_lambda", log_lambda_scalar)?;
+    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("edf", edf_total)?;
+    out.set_item("active_indices", active_indices_arr.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -4012,6 +4277,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_with_constraints_forward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_batched, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_batched_backward,

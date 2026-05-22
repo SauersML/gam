@@ -6870,72 +6870,39 @@ fn try_tangent_projected_evaluate(
             p
         ));
     }
-    // Refuse features that would silently lose information under projection.
-    // Each of these has a principled tangent-space variant, but their math
-    // derivation and implementation is independent of this dispatch and
-    // should be added in dedicated patches when those features actually
-    // co-occur with an active constraint set. Until then, surface a typed
-    // error rather than degrade silently.
+    // Principled pass-through / projection of optional `InnerSolution`
+    // features.  The cost-side scalars (`tk_correction`, barrier cost at β̂)
+    // are not in β-space and require no projection.  `tk_gradient` is a
+    // ρ-vector and also passes through unchanged.  `hessian_logdet_correction`
+    // encodes a p-space uniform rescale `−p·log α`; under projection the
+    // equivalent correction is `−m·log α`, recovered by the scalar factor
+    // `m/p`.  `barrier_config` propagates to the projected solution so the
+    // barrier-derivative wrapper still augments dH/dρ; the tangent operator
+    // applies `ZᵀMZ` correctly in its trace methods.
+    //
+    // `firth` and `ext_coords` carry p-space objects (Jeffreys `½ log|J|`,
+    // ext-coord g/drift) whose tangent variants require new math (`½ log|ZᵀJZ|`,
+    // ZᵀgZ-style drift projections, projected pair callbacks).  Surface a
+    // typed error rather than degrade silently.
     if solution.firth.is_some() {
         return Err(
-            "constraint-tangent LAML projection is not yet implemented for solutions \
-             carrying a Firth/Jeffreys term: the term's `½ log|J|` would need its own \
-             tangent projection `½ log|ZᵀJZ|`. Drop `firth` from the inner solution \
-             when active constraints are present, or extend `try_tangent_projected_evaluate` \
-             to project the Jeffreys term"
+            "constraint-tangent LAML projection: solutions carrying a Firth/Jeffreys \
+             term need a tangent-projected `½ log|ZᵀJZ|` Jeffreys variant, which the \
+             `FirthDenseOperator` does not currently expose. Drop `firth` from the inner \
+             solution when active constraints are present, or extend the operator with \
+             a tangent-projected jeffreys_logdet."
                 .to_string(),
         );
     }
     if !solution.ext_coords.is_empty() {
         return Err(format!(
-            "constraint-tangent LAML projection is not yet implemented for solutions \
-             with {} extended hyperparameter coordinates (ψ/τ): each ext coord's `g` \
-             (p-vector) and `drift` (∂H/∂ψ_i in p-space) would need projection through \
-             Z, and the pair callbacks would need tangent-projected variants. The AoU \
-             survival marginal-slope path that motivates this dispatch does not use \
-             ext_coords (ext_dim = 0); extend the projection when a use case requires it",
+            "constraint-tangent LAML projection: solutions with {} extended \
+             hyperparameter coordinates (ψ/τ) need each ext coord's `g` (p-vector) \
+             projected via Zᵀ and its `drift` (∂H/∂ψ_i in p-space) projected via ZᵀMZ, \
+             plus tangent-projected variants of the pair callbacks. The implicit-operator \
+             drift path makes this nontrivial; extend the projection when needed.",
             solution.ext_coords.len(),
         ));
-    }
-    if solution.barrier_config.is_some() {
-        return Err(
-            "constraint-tangent LAML projection is not yet implemented for solutions \
-             with an active log-barrier. The barrier contributes a p-space Hessian \
-             correction that is already baked into `hessian_op` (so the tangent H \
-             reconstruction picks it up correctly), but the cost-side barrier term \
-             evaluated at β̂ should be left untouched and the projection above already \
-             does so. Audit `barrier_cost(β̂)` against the tangent objective before \
-             enabling this combination"
-                .to_string(),
-        );
-    }
-    if solution.hessian_logdet_correction != 0.0 {
-        // Non-zero correction means the operator encodes a uniformly rescaled
-        // curvature `H' = αH` and the correction restores `log|H| = log|H'| − p·log α`.
-        // Under tangent projection the equivalent correction is `−m·log α` (not
-        // `−p·log α`), with `m = p − rank(A_act)`. Recovering `α` from the
-        // current scalar correction `−p·log α` and re-applying it as `−m·log α`
-        // is a clean fix, but the scalar API only carries the product, not `α`
-        // separately. Until callers pass `α` (or a tangent-aware correction)
-        // explicitly, surface the gap rather than silently dropping the term.
-        return Err(format!(
-            "constraint-tangent LAML projection cannot honor a non-zero \
-             `hessian_logdet_correction` (= {:.3e}): the correction encodes a \
-             p-space uniform rescale that becomes `m·log α` in tangent space (m = \
-             p − rank(A_act)), not `p·log α`. Pass a rank-aware correction (or \
-             store the rescale factor `α` separately on `InnerSolution`) when \
-             active constraints co-occur with operator rescaling",
-            solution.hessian_logdet_correction
-        ));
-    }
-    if solution.tk_correction != 0.0 || solution.tk_gradient.is_some() {
-        return Err(
-            "constraint-tangent LAML projection is not yet implemented for solutions \
-             carrying a non-zero Tierney-Kadane frozen-curvature correction. The TK \
-             surrogate's `log|H_frozen|` term would need its tangent projection \
-             `log|Zᵀ H_frozen Z|`; pass through unchanged is incorrect"
-                .to_string(),
-        );
     }
     let z = match compute_active_constraint_tangent_basis(&block.a) {
         Some(z) => z,
@@ -6977,16 +6944,30 @@ fn try_tangent_projected_evaluate(
         .kkt_residual
         .as_ref()
         .map(|r| ProjectedKktResidual::from_projected(r.as_array().clone()));
+    let m_tangent = z.ncols();
     let wrapper = TangentProjectedHessianOperator {
         z: z.clone(),
         h_t_op,
     };
+    // Rank-aware projection of a uniform-rescale correction:
+    //   the p-space correction encodes `−p·log α` so that
+    //   `log|H| = log|H'| − p·log α`. Under tangent projection the
+    //   correction becomes `−m·log α = (m/p) · (−p·log α)`, i.e. the
+    //   same scalar scaled by the rank ratio m/p.
+    let projected_hlogdet_correction = if p == 0 {
+        0.0
+    } else {
+        solution.hessian_logdet_correction * (m_tangent as f64 / p as f64)
+    };
     // Construct the projected InnerSolution. The fields that must be
     // overridden are: hessian_op (now tangent-wrapped), penalty_logdet
-    // (now in tangent space), hessian_logdet_correction (0; folded into
-    // tangent logdet already), penalty_subspace_trace (None; direct
+    // (now in tangent space), hessian_logdet_correction (rank-ratio
+    // rescaled to tangent space), penalty_subspace_trace (None; direct
     // tangent-H path replaces the kernel route), active_constraints
-    // (None; prevents recursion). Everything else passes through.
+    // (None; prevents recursion). `tk_*` (ρ-/scalar-space) and
+    // `barrier_config` (cost evaluated at β̂ in p-space; barrier-derivative
+    // wrapper produces p-space drift that the tangent operator projects
+    // via ZᵀMZ in its trace methods) pass through unchanged.
     let projected = InnerSolution {
         log_likelihood: solution.log_likelihood,
         penalty_quadratic: solution.penalty_quadratic,
@@ -6999,10 +6980,7 @@ fn try_tangent_projected_evaluate(
         tk_gradient: solution.tk_gradient.clone(),
         // Refused above when present.
         firth: None,
-        // The full-H reconstruction already absorbs any uniform-rescale
-        // correction the original carried in `hessian_logdet_correction`;
-        // the tangent operator's own `logdet()` is the final value.
-        hessian_logdet_correction: 0.0,
+        hessian_logdet_correction: projected_hlogdet_correction,
         // Direct tangent-H path; the projected-kernel route is unused here.
         penalty_subspace_trace: None,
         rho_curvature_scale: solution.rho_curvature_scale,
@@ -7015,8 +6993,7 @@ fn try_tangent_projected_evaluate(
         ext_coord_pair_fn: None,
         rho_ext_pair_fn: None,
         fixed_drift_deriv: None,
-        // Refused above when present.
-        barrier_config: None,
+        barrier_config: solution.barrier_config.clone(),
         kkt_residual: projected_kkt,
         // Prevents recursion via `try_tangent_projected_evaluate`.
         active_constraints: None,
@@ -17535,11 +17512,12 @@ mod tests {
     //   At the cert's r_proj=0 contract that routed an inflated meaningless
     //   gradient through the "applied" arm.
     //
-    // BUG-3 (math, envelope ½ tr(H⁻¹·∂H/∂ρ) at near-singular H):
-    //   Without penalty_subspace_trace, the trace uses full H⁻¹ which
-    //   blows up as σ_min(H)⁻¹. The cert's projected residual contract
-    //   addresses the inner-stationarity correction term but does nothing
-    //   about the LAML envelope trace itself.
+    // BUG-3 (math, envelope ½ tr(H⁻¹·∂H/∂ρ) at near-singular H — FIXED):
+    //   Resolved by the tangent-space dispatch at the top of
+    //   `reml_laml_evaluate` (`try_tangent_projected_evaluate`): when
+    //   `solution.active_constraints` is non-empty the evaluator recurses
+    //   on the tangent-projected `(ZᵀHZ, ZᵀSZ)` so the trace stays
+    //   bounded by σ_min(ZᵀHZ)⁻¹ instead of σ_min(H)⁻¹.
     //
     // Each test below isolates one of these bugs.
     // ───────────────────────────────────────────────────────────────────────
@@ -17663,29 +17641,22 @@ mod tests {
         );
     }
 
-    /// BUG-3 (hard failing): with an active linear inequality constraint
-    /// pinning a parameter at its bound, the principled REML/LAML outer
-    /// cost lives on the *constraint tangent space* `T = null(A_act)`. The
-    /// correct formulas use a basis `Z ∈ ℝ^{p × (p−k_act)}` for T:
+    /// Regression test for the constraint-tangent LAML projection
+    /// (Wood 2011 §4; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2).
+    ///
+    /// With an active linear inequality constraint pinning a parameter at
+    /// its bound, the principled REML/LAML outer cost lives on the
+    /// constraint tangent space `T = null(A_act)`:
     ///
     ///   cost   = … + ½ log|Zᵀ H Z|  − ½ log|Zᵀ S(λ) Z|_+
     ///   grad_k = … + ½ tr((Zᵀ H Z)⁻¹ Zᵀ (λ_k S_k) Z) − ½ ∂_k log|Zᵀ S Z|_+
     ///
-    /// (see Wood 2011, Wood–Pya–Säfken 2016 §3 for the smooth-models
-    /// derivation; Marra–Wood 2012 §2 for the active-constraint quotient).
-    ///
-    /// The current implementation evaluates the full-space `log|H|` and
-    /// `tr(H⁻¹ ∂H/∂ρ)`. When `eᵀ S_k e > 0` for the active-constraint
-    /// normal `e` (the generic case for a bound on a coefficient that the
-    /// penalty does not annihilate), the trace inflates as O(1/σ_min(H))
-    /// while the tangent-projected trace stays bounded. The IFT correction
-    /// `−aᵀ_k q + ½ qᵀA_k q` is r-only and cannot repair this — confirmed
-    /// in `ift_gradient_correction_with_zero_projected_residual_is_zero`.
-    ///
-    /// This test FAILS until the unified evaluator routes through
-    /// `ZᵀHZ` and `ZᵀSZ` when `solution.active_constraints.is_some()`.
-    /// It is the math statement of the AoU |g|∞ = 9.669e16 vs |cost| =
-    /// 3.480e5 outer divergence.
+    /// The unified evaluator dispatches to `try_tangent_projected_evaluate`
+    /// at the top of `reml_laml_evaluate`, so this test verifies that under
+    /// an active constraint set the returned gradient stays bounded
+    /// independent of σ_min(H) — the unprojected full-space trace
+    /// `½ tr(H⁻¹·∂H/∂ρ_k)` would blow up as 1/σ_min(H) here while the
+    /// projected trace `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is O(1).
     #[test]
     fn envelope_gradient_uses_constraint_tangent_projection() {
         use crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock;
@@ -17727,40 +17698,26 @@ mod tests {
 
         let result = reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None);
 
-        // Until the principled tangent-projection is wired through the
-        // cost/gradient/trace path, the evaluator either (a) returns an
-        // inflated O(1/σ_min) gradient that trips the suppression — gradient =
-        // None — or (b) returns a finite but mathematically wrong gradient
-        // computed in the full p-space. Both outcomes are bugs. The
-        // principled contract is: under an active constraint set, the
-        // evaluator must produce a gradient whose magnitude is bounded
-        // independently of σ_min(H) (it should be bounded by
-        // O(σ_min(ZᵀHZ)⁻¹) which is O(1) by construction here).
+        // Under the active constraint set the projected gradient must be
+        // bounded independent of σ_min(H). σ_min(ZᵀHZ) is O(1) by
+        // construction here (the active normal e = [0,0,1] aligns with the
+        // ill-conditioned direction in H), so the tangent-projected gradient
+        // is finite and O(1).
         match result {
             Ok(r) => {
-                let grad = r.gradient.expect(
-                    "BUG-3: under active constraints the evaluator must emit a tangent-\
-                     projected gradient (Wood et al. 2016, eq. for projected LAML), not \
-                     suppress. Current implementation suppresses because the unprojected \
-                     trace blows up — which is the bug.",
-                );
+                let grad = r
+                    .gradient
+                    .expect("tangent dispatch must emit a finite projected gradient");
                 let max_abs = grad.iter().map(|g| g.abs()).fold(0.0_f64, f64::max);
                 assert!(
                     max_abs.is_finite() && max_abs < 1.0e6,
-                    "BUG-3 PINPOINTED: active-constraint gradient |grad|∞ = {:.3e}, must be \
-                     O(1) under tangent projection. The current full-space \
-                     `½ tr(H⁻¹·∂H/∂ρ_k)` with σ_min(H) ≈ 1e-10 inflates by 1/σ_min while \
-                     the principled tangent-projected formula \
-                     `½ tr((ZᵀHZ)⁻¹·Zᵀ·λ_k S_k·Z)` is bounded. \
-                     Principled fix (Wood 2011, Wood–Pya–Säfken 2016): route the evaluator \
-                     through `solution.active_constraints` Z-basis when computing `log|H|`, \
-                     `log|S|_+`, and the trace term.",
+                    "projected gradient must be bounded by σ_min(ZᵀHZ)⁻¹ (O(1) here); \
+                     got |grad|∞ = {:.3e}",
                     max_abs,
                 );
             }
             Err(err) => panic!(
-                "BUG-3: evaluator failed under active constraints — {err}. The principled \
-                 fix is to compute on the tangent space `null(A_act)`, not to error out."
+                "tangent-projected evaluator must succeed under active constraints, got: {err}"
             ),
         }
     }

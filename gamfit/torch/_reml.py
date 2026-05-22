@@ -36,11 +36,13 @@ class AdditiveRemlOutput:
 
     ``coefficients`` is a list of per-smooth coefficient blocks (each of
     shape ``(K_i, D)``); ``fitted`` is the joint fit ``(N, D)``; ``lam``
-    carries the smoothing parameter(s): a length-``F`` 1D tensor when the
-    fit went through the multi-block per-smooth-λ Rust path, or a scalar
-    tensor for the legacy single-λ block-diagonal path; ``reml_score`` is
-    the converged REML criterion; ``edf`` is length-``F`` per-smooth on
-    the multi-block path and a scalar on the legacy path.
+    carries the smoothing parameter(s): a length-``F`` 1D tensor on the
+    multi-block per-smooth-λ Rust path, or a scalar tensor on the
+    block-diagonal multi-output path (``D > 1``), which is single-λ
+    because the multi-block REML driver is single-response;
+    ``reml_score`` is the converged REML criterion; ``edf`` is
+    length-``F`` per-smooth on the multi-block path and a scalar on the
+    multi-output path.
 
     .. note::
        The multi-block path is forward-only: the underlying Rust
