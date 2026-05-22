@@ -288,6 +288,15 @@ pub trait HessianOperator: Send + Sync {
         None
     }
 
+    /// Assemble the raw dense Hessian represented by this backend for
+    /// active-constraint tangent projection.
+    ///
+    /// Backends that do not store either a dense spectral decomposition or an
+    /// explicit factorization should keep the default error.
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        Err("backend does not support tangent projection".to_string())
+    }
+
     /// tr(H₊⁻¹ B) for an operator-backed Hessian drift.
     ///
     /// Default implementation materializes `B` densely. Backends with
@@ -6968,15 +6977,9 @@ fn try_tangent_projected_evaluate(
             ));
         }
     };
-    let ds = solution
+    let h_full = solution
         .hessian_op
-        .as_exact_dense_spectral()
-        .ok_or_else(|| {
-            "tangent-space projection requires a `DenseSpectralOperator` backend; \
-             other backends do not yet expose the raw H needed to form ZᵀHZ"
-                .to_string()
-        })?;
-    let h_full = assemble_h_raw_dense(ds);
+        .assemble_h_dense_for_tangent_projection()?;
     let h_t = z.t().dot(&h_full).dot(&z);
     let h_t_op = DenseSpectralOperator::from_symmetric(&h_t)
         .map_err(|e| format!("tangent H eigendecomposition failed: {e}"))?;
@@ -13516,6 +13519,10 @@ impl HessianOperator for DenseSpectralOperator {
         Some(self)
     }
 
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        Ok(assemble_h_raw_dense(self))
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         // tr(H_reg⁻¹ A) = Σ_j (1/r_ε(σ_j)) uⱼᵀAuⱼ
         // Computed as Σ (AW ⊙ W) where W = U diag(1/√r_ε(σ)).
@@ -14360,6 +14367,21 @@ impl HessianOperator for SparseCholeskyOperator {
         self.cached_logdet
     }
 
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        let h = crate::linalg::sparse_exact::assemble_sparse_factor_h_dense(&self.factor)
+            .map_err(|e| e.to_string())?;
+        if h.nrows() != self.n_dim || h.ncols() != self.n_dim {
+            return Err(format!(
+                "sparse Cholesky tangent projection dense H has shape {}x{}, expected {}x{}",
+                h.nrows(),
+                h.ncols(),
+                self.n_dim,
+                self.n_dim
+            ));
+        }
+        Ok(h)
+    }
+
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
         // When Takahashi is available, use direct entry lookup for tr(H^{-1} A).
         // This is O(p^2) via dense A iteration but avoids p column solves.
@@ -14587,6 +14609,10 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn as_exact_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         self.inner.as_exact_dense_spectral()
+    }
+
+    fn assemble_h_dense_for_tangent_projection(&self) -> Result<Array2<f64>, String> {
+        self.inner.assemble_h_dense_for_tangent_projection()
     }
 
     fn trace_hinv_product(&self, a: &Array2<f64>) -> f64 {
