@@ -2206,6 +2206,38 @@ impl BernoulliMarginalSlopePredictor {
                 });
             }
 
+            // Precompute the score-warp basis cubic table once when the latent
+            // grid is row-constant (`GlobalEmpirical`). The per-row inner loop
+            // calls `basis_cubic_at(j, node)` with `node` taken from the grid,
+            // which is identical for every row in this code path, so the
+            // n_rows × n_nodes × score_warp_dim table can be hoisted out of
+            // the parallel chunk dispatch. Per-row work only touches the
+            // basis-function-specific `c0` shift via `score_corr_row`, which
+            // stays inside the row loop. Computed at the top level so no
+            // OnceLock / lazy init lives inside the par closure (per the
+            // OnceLock + nested rayon deadlock rule).
+            let global_score_basis_table: Option<Vec<Vec<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic>>> =
+                if let (LatentMeasureKind::GlobalEmpirical { grid }, Some(runtime)) =
+                    (&self.latent_measure, self.score_warp_runtime.as_ref())
+                {
+                    let mut table = Vec::with_capacity(score_warp_dim);
+                    for j in 0..score_warp_dim {
+                        let mut row = Vec::with_capacity(grid.nodes.len());
+                        for &node in &grid.nodes {
+                            row.push(
+                                runtime
+                                    .basis_cubic_at(j, node)
+                                    .map_err(EstimationError::from)?,
+                            );
+                        }
+                        table.push(row);
+                    }
+                    Some(table)
+                } else {
+                    None
+                };
+            let global_score_basis_table = global_score_basis_table.as_ref();
+
             sinks
                 .into_par_iter()
                 .enumerate()
@@ -2265,7 +2297,7 @@ impl BernoulliMarginalSlopePredictor {
                     f_h_row.fill(0.0);
                     f_w_row.fill(0.0);
                     if let Some(grid) = empirical_grid.as_ref() {
-                        for (node, weight) in grid.pairs() {
+                        for (node_idx, (node, weight)) in grid.pairs().enumerate() {
                             let obs = self.observed_denested_cell_partials_at_z(
                                 node,
                                 intercept,
@@ -2281,9 +2313,22 @@ impl BernoulliMarginalSlopePredictor {
 
                             if let Some(runtime) = self.score_warp_runtime.as_ref() {
                                 for j in 0..score_warp_dim {
-                                    let mut basis_span = runtime
-                                        .basis_cubic_at(j, node)
-                                        .map_err(EstimationError::from)?;
+                                    // When the latent grid is row-constant
+                                    // (`GlobalEmpirical`), the per-(j, node)
+                                    // basis cubic is identical for every row
+                                    // and lives in `global_score_basis_table`.
+                                    // Otherwise (`LocalEmpirical`) the grid
+                                    // varies per row and we fall back to a
+                                    // direct `basis_cubic_at` call.
+                                    let mut basis_span = if let Some(table) =
+                                        global_score_basis_table
+                                    {
+                                        table[j][node_idx]
+                                    } else {
+                                        runtime
+                                            .basis_cubic_at(j, node)
+                                            .map_err(EstimationError::from)?
+                                    };
                                     // `basis_cubic_at` returns the j-th basis
                                     // function's local cubic; the residual
                                     // subtracts `correction[j]` from the
