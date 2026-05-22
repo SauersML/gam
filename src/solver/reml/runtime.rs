@@ -330,6 +330,28 @@ fn ift_pending_joint_thetas() -> &'static Mutex<HashMap<usize, Array1<f64>>> {
     IFT_PENDING_JOINT_THETAS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+static IFT_LATEST_OUTER_THETA: OnceLock<Mutex<Option<Array1<f64>>>> = OnceLock::new();
+
+pub(crate) fn record_current_outer_theta_for_ift(theta: &Array1<f64>) {
+    let value = if theta.is_empty() || theta.iter().any(|v| !v.is_finite()) {
+        None
+    } else {
+        Some(theta.clone())
+    };
+    *IFT_LATEST_OUTER_THETA
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap() = value;
+}
+
+fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
+    IFT_LATEST_OUTER_THETA
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
@@ -2411,6 +2433,7 @@ impl<'a> RemlState<'a> {
             .unwrap()
             .get(&self.ift_mode_response_cache_key())
             .cloned()
+            .or_else(latest_outer_theta_for_ift)
     }
 
     fn clear_pending_joint_ift_theta(&self) {
@@ -2482,6 +2505,9 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .and_then(|cols| self.mode_response_cols_for_warm_start(bundle, cols));
         if rho_cols.is_none() && ext_cols.is_none() {
+            if result.gradient.is_none() {
+                return;
+            }
             self.clear_ift_mode_response_cache();
             self.clear_joint_ift_mode_response_cache();
             return;
