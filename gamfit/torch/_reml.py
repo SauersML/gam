@@ -634,13 +634,19 @@ def gaussian_reml_fit_blocks(
 
 
 class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
-    """Forward-only autograd Function for the constrained Gaussian REML fit.
+    """Autograd Function for the constrained Gaussian REML fit.
 
-    The Rust active-set + REML driver handles the inner constrained PIRLS
-    and the outer (tangent-projected) REML score for the smoothing
-    parameter. No analytic VJP is exposed through this path yet — backward
-    raises ``NotImplementedError`` so callers can rely on a clear contract
-    rather than silently incorrect gradients.
+    Backward uses the envelope-theorem-based analytic VJP exposed by Rust:
+
+    * **Interior cert (empty active set):** the constrained fit coincides
+      with the unconstrained one and the VJP is the closed-form Gaussian
+      REML backward in full p-space.
+    * **Active cert (non-empty active set):** the math identity is
+      ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ`` with ``Z = null(A_act)``,
+      but the Rust closed-form backward stack is not yet refactored to
+      consume these projected operators. The Rust binding raises
+      ``NotImplementedError`` in that branch and the error propagates
+      verbatim.
     """
 
     @staticmethod
@@ -680,6 +686,20 @@ class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
         )
 
         _save_diff_tensors(ctx, x, y, penalty, weights, a_inequality, b_inequality)
+        # Cache numpy aliases and converged-state for the analytic VJP.
+        ctx.x_np = x_np
+        ctx.y_np = y_np
+        ctx.penalty_np = penalty_np
+        ctx.weights_np = weights_np
+        ctx.a_np = a_np
+        ctx.b_np = b_np
+        ctx.has_weights = weights is not None
+        ctx.coefficients_np = np.asarray(out["coefficients"], dtype=np.float64)
+        ctx.fitted_np = np.asarray(out["fitted"], dtype=np.float64)
+        ctx.log_lambda_at_optimum = float(out["log_lambda"])
+        ctx.active_indices_np = np.asarray(out["active_indices"], dtype=np.uint64)
+        ctx.ref = x
+        ctx.penalty_ref = penalty
 
         coefficients = from_numpy_like(out["coefficients"], x)
         fitted = from_numpy_like(out["fitted"], x)
@@ -699,12 +719,56 @@ class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        raise NotImplementedError(
-            "gaussian_reml_fit_with_constraints is forward-only. The "
-            "analytic VJP through the active-set + REML driver (BUG-3 "
-            "tangent projection at active cert exits, envelope at "
-            "empty-active-set exits) is not yet wired through to Python."
+        (
+            grad_coefficients,
+            grad_fitted,
+            grad_lam,
+            grad_log_lambda,
+            grad_reml_score,
+            grad_edf,
+            _grad_active_indices,  # int64 indices — not differentiable
+        ) = grad_outputs
+        _check_saved_versions(ctx)
+
+        grad_coef_np = (
+            None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
         )
+        grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
+        grad_lambda_scalar = _scalar_grad(grad_lam)
+        grad_log_lambda_scalar = _scalar_grad(grad_log_lambda)
+        grad_reml_scalar = _scalar_grad(grad_reml_score)
+        grad_edf_scalar = _scalar_grad(grad_edf)
+
+        result = _np_api.gaussian_reml_fit_with_constraints_backward(
+            ctx.x_np,
+            ctx.y_np,
+            ctx.penalty_np,
+            weights=ctx.weights_np,
+            a_inequality=ctx.a_np,
+            b_inequality=ctx.b_np,
+            log_lambda_at_optimum=ctx.log_lambda_at_optimum,
+            coefficients_at_optimum=ctx.coefficients_np,
+            fitted_at_optimum=ctx.fitted_np,
+            active_indices=ctx.active_indices_np,
+            grad_coefficients=grad_coef_np,
+            grad_fitted=grad_fitted_np,
+            grad_lambda=grad_lambda_scalar,
+            grad_log_lambda=grad_log_lambda_scalar,
+            grad_reml_score=grad_reml_scalar,
+            grad_edf=grad_edf_scalar,
+        )
+
+        ref = ctx.ref
+        grad_x = _wrap_optional(result.get("grad_x"), ref)
+        grad_y = _wrap_optional(result.get("grad_y"), ref)
+        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
+        grad_weights = (
+            _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
+        )
+        # Order matches forward(...) positional args: x, y, penalty, weights,
+        # a_inequality, b_inequality, init_log_lambda. The constraint
+        # geometry (A, b) and the init are non-differentiable.
+        return grad_x, grad_y, grad_penalty, grad_weights, None, None, None
 
 
 class ConstrainedRemlOutput(NamedTuple):
