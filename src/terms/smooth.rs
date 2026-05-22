@@ -15071,6 +15071,21 @@ impl<'d> ExactJointDesignCache<'d> {
     fn designs(&self) -> Vec<&TermCollectionDesign> {
         self.realizers.iter().map(|r| r.design()).collect()
     }
+
+    /// Combined monotonic design revision across all per-block realizers.
+    ///
+    /// Mirrors `SingleBlockExactJointDesignCache::design_revision` for the
+    /// n-block exact-joint path. Each realizer's `design_revision` counter
+    /// advances iff `apply_log_kappa` actually rebuilt that block's realized
+    /// design / smooth penalties; the wrapping sum therefore changes iff
+    /// *any* block rebuilt. Equal values across two calls imply no realizer
+    /// has been rebuilt in between, which is the invariant the
+    /// `ExternalJointHyperEvaluator` canonical-penalty fast path needs.
+    fn design_revision(&self) -> u64 {
+        self.realizers
+            .iter()
+            .fold(0u64, |acc, r| acc.wrapping_add(r.design_revision()))
+    }
 }
 
 pub(crate) fn seed_risk_profile_for_likelihood_family(
@@ -15522,6 +15537,7 @@ where
                 );
                 return Ok(OuterEval::infeasible(theta.len()));
             }
+            let design_revision = Some(ctx.cache.design_revision());
             let specs = collect_specs(&ctx.cache);
             let designs = collect_designs(&ctx.cache);
             // Clamp the requested order against the realized outer
@@ -15554,9 +15570,10 @@ where
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
             log::info!(
-                "[KAPPA-PHASE] phase=eval_outer call={} order={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                "[KAPPA-PHASE] phase=eval_outer call={} order={:?} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                 kphase_eval_calls.get(),
                 order,
+                design_revision,
                 theta_norm,
                 log_kappa_norm,
                 elapsed_s,
@@ -15600,6 +15617,7 @@ where
                     );
                     return Ok(f64::INFINITY);
                 }
+                let design_revision = Some(ctx.cache.design_revision());
                 let specs = collect_specs(&ctx.cache);
                 let designs = collect_designs(&ctx.cache);
                 // Cost-only line-search probe: pass `ValueOnly` so the closure
@@ -15623,8 +15641,9 @@ where
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
                 let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
                 log::info!(
-                    "[KAPPA-PHASE] phase=cost call={} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                    "[KAPPA-PHASE] phase=cost call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                     kphase_cost_calls.get(),
+                    design_revision,
                     theta_norm,
                     log_kappa_norm,
                     elapsed_s,
@@ -15667,6 +15686,7 @@ where
                     ctx.cache
                         .ensure_theta(theta)
                         .map_err(EstimationError::InvalidInput)?;
+                    let design_revision = Some(ctx.cache.design_revision());
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
                     let _t0 = std::time::Instant::now();
@@ -15680,8 +15700,9 @@ where
                     kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
                     let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
                     log::info!(
-                        "[KAPPA-PHASE] phase=efs call={} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
+                        "[KAPPA-PHASE] phase=efs call={} design_revision={:?} theta_norm={:.4e} log_kappa_norm={:.4e} elapsed_s={:.4}",
                         kphase_efs_calls.get(),
+                        design_revision,
                         theta_norm,
                         log_kappa_norm,
                         elapsed_s,
