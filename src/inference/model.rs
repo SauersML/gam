@@ -3761,7 +3761,7 @@ mod tests {
         let err = FittedModel::from_payload(payload)
             .validate_for_persistence()
             .expect_err("marginal-slope score-warp basis mismatch should fail validation");
-        assert!(err.contains("score-warp coefficient mismatch"));
+        assert!(err.to_string().contains("score-warp coefficient mismatch"));
     }
 
     #[test]
@@ -3800,7 +3800,7 @@ mod tests {
             .expect_err(
                 "survival marginal-slope link basis mismatch should fail runtime validation",
             );
-        assert!(err.contains("link-deviation coefficient mismatch"));
+        assert!(err.to_string().contains("link-deviation coefficient mismatch"));
     }
 
     #[test]
