@@ -652,9 +652,9 @@ fn build_scale_deviation_transform_impl(
     weights: &Array1<f64>,
     non_intercept_start: usize,
     row_mismatch_error: &str,
-) -> Result<ScaleDeviationTransform, String> {
+) -> Result<ScaleDeviationTransform, ScaleDesignError> {
     if primary_design.nrows() != noise_design.nrows() || weights.len() != noise_design.nrows() {
-        return Err(row_mismatch_error.to_string());
+        return Err(dim_err(row_mismatch_error.to_string()));
     }
     validate_scale_weights(weights)?;
 
@@ -710,7 +710,9 @@ fn build_scale_deviation_transform_impl(
         }
 
         if !w_sum.is_finite() || w_sum <= 0.0 {
-            return Err("scale deviation requires positive finite total weight".to_string());
+            return Err(ScaleDesignError::InvalidWeights {
+                reason: "scale deviation requires positive finite total weight".to_string(),
+            });
         }
 
         let resid_center = w_resid_sum.mapv(|sum| sum / w_sum);
@@ -845,23 +847,32 @@ pub fn build_scale_deviation_operator(
     rawnoise_design: DesignMatrix,
     transform: &ScaleDeviationTransform,
 ) -> Result<DesignMatrix, String> {
+    build_scale_deviation_operator_typed(primary_design, rawnoise_design, transform)
+        .map_err(|e| e.to_string())
+}
+
+fn build_scale_deviation_operator_typed(
+    primary_design: DesignMatrix,
+    rawnoise_design: DesignMatrix,
+    transform: &ScaleDeviationTransform,
+) -> Result<DesignMatrix, ScaleDesignError> {
     if primary_design.nrows() != rawnoise_design.nrows() {
-        return Err(format!(
+        return Err(dim_err(format!(
             "scale deviation operator row mismatch: primary rows={}, noise rows={}",
             primary_design.nrows(),
             rawnoise_design.nrows()
-        ));
+        )));
     }
     if primary_design.ncols() != transform.projection_coef.nrows()
         || rawnoise_design.ncols() != transform.projection_coef.ncols()
     {
-        return Err(format!(
+        return Err(dim_err(format!(
             "scale deviation operator column mismatch: primary cols={}, noise cols={}, transform is {}x{}",
             primary_design.ncols(),
             rawnoise_design.ncols(),
             transform.projection_coef.nrows(),
             transform.projection_coef.ncols()
-        ));
+        )));
     }
     let n = rawnoise_design.nrows();
     let p_primary = primary_design.ncols();
