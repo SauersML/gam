@@ -8206,20 +8206,24 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// Outer-derivative policy: declare HT-subsample capability.
     ///
     /// GaussianLocationScaleFamily overrides
-    /// `log_likelihood_only_with_options` and
-    /// `exact_newton_joint_hessian_workspace_with_options` to consume
+    /// `log_likelihood_only_with_options`,
+    /// `exact_newton_joint_hessian_workspace_with_options`, and
+    /// `exact_newton_joint_psi_workspace_with_options` to consume
     /// `options.outer_score_subsample` with per-row Horvitz–Thompson weights
     /// (each sampled row's contribution is multiplied by
     /// `WeightedOuterRow.weight = 1/π_i`; non-sampled rows are zeroed),
-    /// yielding unbiased estimators of the full-data log-likelihood and
-    /// joint Hessian. The ψ-workspace path is not yet subsample-aware in
-    /// this POC: it builds the exact full-data ψ Hessian blocks, which are
-    /// trivially unbiased; so the outer-score components are a sum of
-    /// HT-unbiased and exact-unbiased pieces and the total remains an
-    /// unbiased estimator of the full-data outer score. Wall-clock savings
-    /// here come from the LL and ρ-Hessian paths; broadening to ψ is a
-    /// follow-up. Inner-PIRLS and final-covariance paths never install the
-    /// option, so they continue to consume the exact full-data quantities.
+    /// yielding unbiased estimators of the full-data log-likelihood, joint
+    /// Hessian, and second-order ψ Hessian / ψ-Hessian directional
+    /// derivative. The ψ-workspace masking happens inside
+    /// `apply_ht_mask_first`, `apply_ht_mask_second`, and
+    /// `apply_ht_mask_mixed` on the `GaussianJointPsi{First,Second,
+    /// MixedDrift}Weights` per-row arrays, immediately after the row-scalar
+    /// reductions and before the row-linear `weighted_crossprod_psi_maps` /
+    /// `xt_diag_*_dense` assemblies, so the masked outputs remain unbiased.
+    /// First-order ψ terms remain full-data exact (= trivially unbiased), so
+    /// the total outer score is still unbiased. Inner-PIRLS and final-
+    /// covariance paths never install the option, so they continue to
+    /// consume the exact full-data quantities.
     fn outer_derivative_policy(
         &self,
         specs: &[ParameterBlockSpec],
@@ -11732,6 +11736,43 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                 block_states.to_vec(),
                 specs,
                 derivative_blocks.to_vec(),
+            )?,
+        )))
+    }
+
+    /// Outer-aware joint ψ workspace with optional row subsample.
+    ///
+    /// The wiggle ψ workspace shares `GaussianLocationScaleJointPsiWorkspace`
+    /// with the non-wiggle GLS family, and the subsample is plumbed through
+    /// the trait. The wiggle's `ws_psi_*_from_parts` impls currently drop the
+    /// subsample and fall back to the full-data exact wiggle ψ path; see
+    /// their inline rationale and the `apply_ht_mask_*` helpers used by the
+    /// non-wiggle GLS family. Storing the subsample here keeps the workspace
+    /// signature uniform across both families and leaves a hook for the
+    /// follow-up that refactors the wiggle inline arrays into a weights
+    /// struct so HT masking can be applied in one place. Even without that
+    /// refactor, the total outer score under subsampling remains an unbiased
+    /// estimator of the full-data outer score: HT-unbiased LL
+    /// (`log_likelihood_only_with_options`) + HT-unbiased ρ-Hessian
+    /// (`exact_newton_joint_hessian_workspace_with_options`) + exact-unbiased
+    /// ψ (the wiggle workspace path) = unbiased.
+    fn exact_newton_joint_psi_workspace_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.exact_joint_supported() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace::new_with_subsample(
+                self.clone(),
+                block_states.to_vec(),
+                specs,
+                derivative_blocks.to_vec(),
+                options.outer_score_subsample.clone(),
             )?,
         )))
     }

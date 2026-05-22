@@ -2880,18 +2880,10 @@ impl<'a> RemlState<'a> {
             InverseLink::Standard(link_function)
         };
 
-        // Saturation guard mirrors `eta_for_observed_hessian_jet` in pirls:
-        // for non-Logit / non-Log links eta is clamped to ±30 to keep the
-        // jets within numerically tractable territory; outside that window
-        // we report 0 to match the c/d saturation policy.
-        let (clamp_lo, clamp_hi) = match link_function {
-            LinkFunction::Logit | LinkFunction::Log => (-700.0_f64, 700.0_f64),
-            LinkFunction::Identity => (f64::NEG_INFINITY, f64::INFINITY),
-            LinkFunction::Probit
-            | LinkFunction::CLogLog
-            | LinkFunction::Sas
-            | LinkFunction::BetaLogistic => (-30.0_f64, 30.0_f64),
-        };
+        // Use the same saturation contract as PIRLS observed-Hessian
+        // assembly.  If PIRLS evaluated W_obs at a clamped eta, the
+        // derivative wrt the unclamped eta is zero; higher curvature carriers
+        // must be zero on that branch as well.
 
         // Canonical-Logit fast path: W = h'(η), so ∂³W/∂η³ = h''''(η)
         // taken from the dedicated 5-jet (no variance-jet machinery).
@@ -2910,11 +2902,10 @@ impl<'a> RemlState<'a> {
             let e_s = e_array.as_slice_mut().expect("e_array must be contiguous");
             e_s.par_iter_mut().enumerate().for_each(|(i, e_o)| {
                 let eta_raw = final_eta[i];
-                let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
-                if eta_raw != eta_used {
+                if pirls::eta_clamp_active(&inverse_link, eta_raw) {
                     *e_o = 0.0;
                 } else {
-                    let jet = crate::mixture_link::logit_inverse_link_jet5(eta_used);
+                    let jet = crate::mixture_link::logit_inverse_link_jet5(eta_raw);
                     *e_o = weights[i].max(0.0) * jet.d4;
                 }
             });
@@ -2962,8 +2953,7 @@ impl<'a> RemlState<'a> {
             .enumerate()
             .try_for_each(|(i, e_o)| -> Result<(), EstimationError> {
                 let eta_raw = final_eta[i];
-                let eta_used = eta_raw.clamp(clamp_lo, clamp_hi);
-                if eta_raw != eta_used {
+                if pirls::eta_clamp_active(inverse_link_ref, eta_raw) {
                     *e_o = 0.0;
                     return Ok(());
                 }
@@ -2972,11 +2962,11 @@ impl<'a> RemlState<'a> {
                 let h3 = d3mu_deta3[i];
                 let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
                     inverse_link_ref,
-                    eta_used,
+                    eta_raw,
                 )?;
                 let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
                     inverse_link_ref,
-                    eta_used,
+                    eta_raw,
                 )?;
                 if !h1.is_finite()
                     || !h2.is_finite()
