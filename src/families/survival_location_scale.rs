@@ -10320,6 +10320,70 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
 /// (-nabla^2 log L) from the survival likelihood. This is the **observed** Hessian
 /// by construction, which is the correct quantity for the outer REML Laplace
 /// approximation (see response.md Section 3). No Fisher surrogate is used here.
+//
+// WS4a-survival-LS deferred — staged outer-score subsampling (Horvitz–Thompson
+// row reweighting) is NOT enabled for this family. The blocker is structural: unlike
+// GaussianLocationScaleFamily — where the joint-Hessian workspace caches three
+// FINAL per-row coefficient arrays (`coeff_mm`, `coeff_ml`, `coeff_ll`) that are
+// consumed directly as `Xᵀ diag(W) X`, so a single `apply_outer_subsample` masks
+// them HT-unbiasedly — the survival-LS workspace
+// (`SurvivalLocationScaleExactNewtonJointHessianWorkspace`) caches only the raw
+// per-row derivative bundle `SurvivalJointQuantities` (`q.d1_q`, `q.d2_q1`,
+// `q.dq_t`, `q.dq_ls`, `q.d_h_h0`, ...) and the geometry bundle
+// `SurvivalDynamicGeometry` (`time_jac_entry/_exit/_deriv`, etc.). The FINAL
+// per-row weight arrays that go into `weighted_crossprod_dense(X, w, X')` are
+// rebuilt INSIDE each assembly call from POLYNOMIAL combinations of these q.*
+// entries — e.g., `assemble_joint_hessian_from_quantities` builds
+//   `h_exit = -(q.d2_q1 * q.dq_t² + q.d2_qdot1 * q.dqdot_t² + q.d1_qdot1 * q.d2qdot_tt)`
+// (degree-3 in q-arrays), and the directional-derivative path
+// `exact_newton_joint_hessian_directional_derivative_rescaled_from_parts` mixes
+// e.g. `d_d2_q_exit * q.dq_t² + 2 q.d2_q1 * delta_q_t_exit * q.dq_t` where
+// `delta_q_t_exit = q.d2q_tls * delta_ls_exit` and `d_d2_q_exit = q.d3_q1 *
+// delta_q_exit + q.d_h_h1 * delta_h1`. Because each row's contribution is a
+// nonlinear (cubic / quartic) polynomial in q.* entries, HT-masking q.* at the
+// source — `q.field[i] *= r.weight` for sampled i, zero otherwise — does NOT
+// yield an unbiased estimator: it scales each row's coefficient by `r.weight^k`
+// (k = 2..4 depending on the term), which only matches E[score_subsample] =
+// score_full at r.weight = 1.
+//
+// To make survival-LS subsampleable, ONE of these refactors is required:
+//   (1) Push the FINAL per-row weight arrays into the workspace cache and apply
+//       HT-masking there. This means precomputing, for each direction-independent
+//       assembly site, the closed-form `w[i]` arrays (`h_time_*`, `h_tt_exit`,
+//       `h_tt_entry`, `h_ll_exit`, `h_ll_entry`, `h_tl_exit`, `h_tl_entry`,
+//       `h_h0_t`, `h_h1_t`, `h_h0_l`, `h_h1_l`, plus their `_deriv` variants
+//       when `x_threshold_deriv` / `x_log_sigma_deriv` are present) AND, for
+//       the directional path, deferring HT until after the direction is folded
+//       in (i.e., a per-direction final `w` mask). The directional path is
+//       called inside `directional_derivative_operator` /
+//       `second_directional_derivative_operator` ≈ O(k²) times per outer-Hessian
+//       evaluation, so masking at the per-direction site is feasible but means
+//       wrapping every `weighted_crossprod_dense` / `safe_fast_xt_diag_x` call
+//       site (currently ~15+ across the base assembly + directional + second-
+//       directional paths) with row-mask plumbing.
+//   (2) Replace each `weighted_crossprod_dense(X, w, X')` with a row-mask-aware
+//       variant `weighted_crossprod_dense_masked(X, w, X', mask)` and thread a
+//       single shared row-mask through the workspace. This is the lighter touch
+//       but still requires editing every assembly site in
+//       `assemble_joint_hessian_from_quantities`,
+//       `exact_newton_joint_hessian_directional_derivative_rescaled_from_parts`,
+//       and `exact_newton_joint_hessiansecond_directional_derivative_from_parts`.
+//
+// Additionally, the gradient path
+// `evaluate_log_likelihood_and_block_gradients` and the ψ-workspace
+// (`SurvivalExactNewtonJointPsiWorkspace`) would need consistent row-mask
+// plumbing for the staged subsample to extend beyond the LL fast path.
+//
+// `log_likelihood_only` IS structurally row-streaming through `exact_row_kernel`
+// (line 10393 — pure per-row reduction with no cross-row coupling), so a
+// `log_likelihood_only_with_options` override that HT-reweights each row's
+// kernel output is the ONLY piece that could be wired today without the
+// Hessian-side refactor. But per the GaussianLS POC's rationale, broadening
+// staged outer-subsampling requires the Hessian path to be subsampled too; an
+// LL-only subsample with an exact-full Hessian degrades to a no-op for the
+// outer-Hessian work that dominates wall clock. Until refactor (1) or (2)
+// lands, `subsample_capable` stays false and the family ignores
+// `options.outer_score_subsample`.
 impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
