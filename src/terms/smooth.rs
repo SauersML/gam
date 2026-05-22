@@ -15173,11 +15173,12 @@ where
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
-        return Err(format!(
+        return Err(SmoothError::dimension_mismatch(format!(
             "block_specs ({}) and block_term_indices ({}) length mismatch",
             n_blocks,
             block_term_indices.len()
-        ));
+        ))
+        .into());
     }
 
     let log_kappa_dim = joint_setup.log_kappa_dim();
@@ -15212,13 +15213,14 @@ where
     let lower = joint_setup.lower();
     let upper = joint_setup.upper();
     if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
-        return Err(format!(
+        return Err(SmoothError::dimension_mismatch(format!(
             "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_log_kappa_dim={}",
             theta0.len(),
             lower.len(),
             upper.len(),
             log_kappa_dim
-        ));
+        ))
+        .into());
     }
     let rho_dim = joint_setup.rho_dim();
     let all_dims = joint_setup.log_kappa_dims_per_term();

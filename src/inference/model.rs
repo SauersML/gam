@@ -2223,10 +2223,11 @@ impl FittedModel {
             (None, None) => return Ok(None),
             (Some(knots), Some(degree)) => (knots.clone(), degree),
             _ => {
-                return Err(
-                    "saved model has partial link-wiggle metadata; expected linkwiggle_knots and linkwiggle_degree together"
-                        .to_string(),
-                )
+                return Err(FittedModelError::SchemaMismatch {
+                    reason:
+                        "saved model has partial link-wiggle metadata; expected linkwiggle_knots and linkwiggle_degree together"
+                            .to_string(),
+                })
             }
         };
         let resolved_link = self.resolved_inverse_link()?;
@@ -2238,40 +2239,53 @@ impl FittedModel {
                 .as_ref()
                 .is_some_and(|link| !inverse_link_supports_joint_wiggle(link));
         if saved_link_disallows_wiggle {
-            return Err(joint_wiggle_unsupported_link_message("link wiggle"));
+            return Err(FittedModelError::IncompatibleConfig {
+                reason: joint_wiggle_unsupported_link_message("link wiggle"),
+            });
         }
         let beta = match self.predict_model_class() {
             PredictModelClass::Standard => {
                 if payload.beta_link_wiggle.is_some() {
-                    return Err(
-                        "standard link-wiggle coefficients must be stored in fit_result LinkWiggle block, not payload.beta_link_wiggle"
-                            .to_string(),
-                    );
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason:
+                            "standard link-wiggle coefficients must be stored in fit_result LinkWiggle block, not payload.beta_link_wiggle"
+                                .to_string(),
+                    });
                 }
                 let fit = payload.fit_result.as_ref().ok_or_else(|| {
-                    "standard link-wiggle model is missing canonical fit_result payload".to_string()
+                    FittedModelError::MissingField {
+                        reason:
+                            "standard link-wiggle model is missing canonical fit_result payload"
+                                .to_string(),
+                    }
                 })?;
                 if fit.blocks.len() != 2
                     || fit.blocks[0].role != BlockRole::Mean
                     || fit.blocks[1].role != BlockRole::LinkWiggle
                 {
-                    return Err(
-                        "standard link-wiggle models must store blocks in [Mean, LinkWiggle] order"
-                            .to_string(),
-                    );
+                    return Err(FittedModelError::SchemaMismatch {
+                        reason:
+                            "standard link-wiggle models must store blocks in [Mean, LinkWiggle] order"
+                                .to_string(),
+                    });
                 }
                 fit.block_by_role(BlockRole::LinkWiggle)
-                    .ok_or_else(|| {
-                        "standard link-wiggle model is missing LinkWiggle coefficient block"
-                            .to_string()
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason:
+                            "standard link-wiggle model is missing LinkWiggle coefficient block"
+                                .to_string(),
                     })?
                     .beta
                     .to_vec()
             }
-            _ => payload.beta_link_wiggle.clone().ok_or_else(|| {
-                "saved model has link-wiggle metadata but is missing payload.beta_link_wiggle"
-                    .to_string()
-            })?,
+            _ => payload
+                .beta_link_wiggle
+                .clone()
+                .ok_or_else(|| FittedModelError::MissingField {
+                    reason:
+                        "saved model has link-wiggle metadata but is missing payload.beta_link_wiggle"
+                            .to_string(),
+                })?,
         };
         Ok(Some(SavedLinkWiggleRuntime {
             knots,
@@ -2290,10 +2304,11 @@ impl FittedModel {
             && payload.beta_baseline_timewiggle.is_none()
             && payload.beta_baseline_timewiggle_by_cause.is_some()
         {
-            return Err(
-                "joint cause-specific survival stores baseline-timewiggle coefficients per cause"
-                    .to_string(),
-            );
+            return Err(FittedModelError::SchemaMismatch {
+                reason:
+                    "joint cause-specific survival stores baseline-timewiggle coefficients per cause"
+                        .to_string(),
+            });
         }
         match (
             payload.baseline_timewiggle_knots.as_ref(),
@@ -2312,10 +2327,11 @@ impl FittedModel {
                     beta: beta.clone(),
                 }))
             }
-            _ => Err(
-                "saved model has partial baseline-timewiggle metadata; expected knots+degree+penalty_order+double_penalty+beta_baseline_timewiggle together"
-                    .to_string(),
-            ),
+            _ => Err(FittedModelError::SchemaMismatch {
+                reason:
+                    "saved model has partial baseline-timewiggle metadata; expected knots+degree+penalty_order+double_penalty+beta_baseline_timewiggle together"
+                        .to_string(),
+            }),
         }
     }
 
@@ -2354,12 +2370,16 @@ impl FittedModel {
         ) {
             if let Some(runtime) = self.payload().score_warp_runtime.as_ref() {
                 runtime.validate_exact_replay_contract().map_err(|err| {
-                    format!("saved anchored score-warp runtime is invalid: {err}")
+                    FittedModelError::PayloadCorrupt {
+                        reason: format!("saved anchored score-warp runtime is invalid: {err}"),
+                    }
                 })?;
             }
             if let Some(runtime) = self.payload().link_deviation_runtime.as_ref() {
                 runtime.validate_exact_replay_contract().map_err(|err| {
-                    format!("saved anchored link-deviation runtime is invalid: {err}")
+                    FittedModelError::PayloadCorrupt {
+                        reason: format!("saved anchored link-deviation runtime is invalid: {err}"),
+                    }
                 })?;
             }
         }
@@ -2378,7 +2398,10 @@ impl FittedModel {
             PredictModelClass::GaussianLocationScale | PredictModelClass::BinomialLocationScale
         ) {
             let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
-                "location-scale model is missing canonical fit_result payload".to_string()
+                FittedModelError::MissingField {
+                    reason: "location-scale model is missing canonical fit_result payload"
+                        .to_string(),
+                }
             })?;
             validate_location_scale_saved_fit(
                 fit,
@@ -2401,7 +2424,9 @@ impl FittedModel {
             PredictModelClass::BernoulliMarginalSlope
         ) {
             let unified = self.payload().unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing unified fit payload; refit".to_string(),
+                }
             })?;
             validate_marginal_slope_saved_fit(
                 unified,
@@ -2417,7 +2442,11 @@ impl FittedModel {
                 .is_some_and(|value| value.eq_ignore_ascii_case("marginal-slope"))
         {
             let fit = self.payload().fit_result.as_ref().ok_or_else(|| {
-                "survival marginal-slope model is missing canonical fit_result payload".to_string()
+                FittedModelError::MissingField {
+                    reason:
+                        "survival marginal-slope model is missing canonical fit_result payload"
+                            .to_string(),
+                }
             })?;
             validate_survival_marginal_slope_saved_fit(
                 fit,
@@ -2436,8 +2465,8 @@ impl FittedModel {
                 likelihood: LikelihoodFamily::BinomialSas,
                 sas_state,
                 ..
-            } => (*sas_state).ok_or_else(|| {
-                "binomial-sas model is missing state in family_state.sas_state".to_string()
+            } => (*sas_state).ok_or_else(|| FittedModelError::MissingField {
+                reason: "binomial-sas model is missing state in family_state.sas_state".to_string(),
             })?,
             FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialSas,
@@ -2445,10 +2474,10 @@ impl FittedModel {
             } => match base_link {
                 Some(InverseLink::Sas(state)) => *state,
                 _ => {
-                    return Err(
-                        "binomial-sas location-scale model is missing SAS base_link state"
+                    return Err(FittedModelError::MissingField {
+                        reason: "binomial-sas location-scale model is missing SAS base_link state"
                             .to_string(),
-                    );
+                    });
                 }
             },
             _ => return Ok(None),
@@ -2458,7 +2487,9 @@ impl FittedModel {
             initial_log_delta: raw.log_delta,
         })
         .map(Some)
-        .map_err(|e| format!("invalid saved SAS link state: {e}"))
+        .map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("invalid saved SAS link state: {e}"),
+        })
     }
 
     pub fn saved_beta_logistic_state(&self) -> Result<Option<SasLinkState>, FittedModelError> {
@@ -2468,9 +2499,9 @@ impl FittedModel {
                 likelihood: LikelihoodFamily::BinomialBetaLogistic,
                 sas_state,
                 ..
-            } => (*sas_state).ok_or_else(|| {
-                "binomial-beta-logistic model is missing state in family_state.sas_state"
-                    .to_string()
+            } => (*sas_state).ok_or_else(|| FittedModelError::MissingField {
+                reason: "binomial-beta-logistic model is missing state in family_state.sas_state"
+                    .to_string(),
             })?,
             FittedFamily::LocationScale {
                 likelihood: LikelihoodFamily::BinomialBetaLogistic,
@@ -2478,10 +2509,11 @@ impl FittedModel {
             } => match base_link {
                 Some(InverseLink::BetaLogistic(state)) => *state,
                 _ => {
-                    return Err(
-                        "binomial-beta-logistic location-scale model is missing beta-logistic base_link state"
-                            .to_string(),
-                    );
+                    return Err(FittedModelError::MissingField {
+                        reason:
+                            "binomial-beta-logistic location-scale model is missing beta-logistic base_link state"
+                                .to_string(),
+                    });
                 }
             },
             _ => return Ok(None),
@@ -2491,7 +2523,9 @@ impl FittedModel {
             initial_log_delta: raw.log_delta,
         })
         .map(Some)
-        .map_err(|e| format!("invalid saved Beta-Logistic link state: {e}"))
+        .map_err(|e| FittedModelError::PayloadCorrupt {
+            reason: format!("invalid saved Beta-Logistic link state: {e}"),
+        })
     }
 
     pub fn saved_mixture_state(&self) -> Result<Option<MixtureLinkState>, FittedModelError> {

@@ -2989,9 +2989,12 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
         return Ok((0.0, 0.0, 0.0, 0.0));
     }
     if !signed_margin.is_finite() {
-        return Err(format!(
-            "non-finite signed margin in exact probit derivative helper: {signed_margin}"
-        ));
+        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+            reason: format!(
+                "non-finite signed margin in exact probit derivative helper: {signed_margin}"
+            ),
+        }
+        .into());
     }
     Ok(signed_probit_neglog_derivatives_up_to_fourth_numeric(
         signed_margin,
@@ -3135,53 +3138,74 @@ impl MarginalSlopeCovariance {
         match self {
             Self::Diagonal(diag) => {
                 if diag.is_empty() {
-                    return Err(format!("{context} diagonal covariance is empty"));
+                    return Err(BernoulliMarginalSlopeError::InvalidInput {
+                        reason: format!("{context} diagonal covariance is empty"),
+                    }
+                    .into());
                 }
                 for (idx, &value) in diag.iter().enumerate() {
                     if !(value.is_finite() && value >= 0.0) {
-                        return Err(format!(
-                            "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
-                        ));
+                        return Err(BernoulliMarginalSlopeError::InvalidInput {
+                            reason: format!(
+                                "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
+                            ),
+                        }
+                        .into());
                     }
                 }
             }
             Self::Full(cov) => {
                 if cov.nrows() == 0 || cov.nrows() != cov.ncols() {
-                    return Err(format!(
-                        "{context} full covariance must be non-empty and square, got {}x{}",
-                        cov.nrows(),
-                        cov.ncols()
-                    ));
+                    return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "{context} full covariance must be non-empty and square, got {}x{}",
+                            cov.nrows(),
+                            cov.ncols()
+                        ),
+                    }
+                    .into());
                 }
                 for i in 0..cov.nrows() {
                     for j in 0..cov.ncols() {
                         let value = cov[[i, j]];
                         if !value.is_finite() {
-                            return Err(format!(
-                                "{context} full covariance entry ({i},{j}) is non-finite"
-                            ));
+                            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                                reason: format!(
+                                    "{context} full covariance entry ({i},{j}) is non-finite"
+                                ),
+                            }
+                            .into());
                         }
                         if (value - cov[[j, i]]).abs()
                             > 1e-10 * (1.0 + value.abs().max(cov[[j, i]].abs()))
                         {
-                            return Err(format!(
-                                "{context} full covariance must be symmetric at ({i},{j})"
-                            ));
+                            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                                reason: format!(
+                                    "{context} full covariance must be symmetric at ({i},{j})"
+                                ),
+                            }
+                            .into());
                         }
                     }
                 }
             }
             Self::LowRank(factor) => {
                 if factor.nrows() == 0 {
-                    return Err(format!(
-                        "{context} low-rank covariance factor has zero rows"
-                    ));
+                    return Err(BernoulliMarginalSlopeError::InvalidInput {
+                        reason: format!(
+                            "{context} low-rank covariance factor has zero rows"
+                        ),
+                    }
+                    .into());
                 }
                 for ((i, j), &value) in factor.indexed_iter() {
                     if !value.is_finite() {
-                        return Err(format!(
-                            "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
-                        ));
+                        return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                            reason: format!(
+                                "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
+                            ),
+                        }
+                        .into());
                     }
                 }
             }
@@ -3192,14 +3216,20 @@ impl MarginalSlopeCovariance {
     pub fn quadratic_form(&self, vector: &[f64]) -> Result<f64, String> {
         self.validate("marginal-slope covariance")?;
         if vector.len() != self.dim() {
-            return Err(format!(
-                "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
-                vector.len(),
-                self.dim()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
+                    vector.len(),
+                    self.dim()
+                ),
+            }
+            .into());
         }
         if vector.iter().any(|value| !value.is_finite()) {
-            return Err("marginal-slope covariance vector contains non-finite values".to_string());
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: "marginal-slope covariance vector contains non-finite values".to_string(),
+            }
+            .into());
         }
         let value = match self {
             Self::Diagonal(diag) => vector
@@ -3238,9 +3268,12 @@ impl MarginalSlopeCovariance {
         if value.is_finite() && value >= -1e-10 {
             Ok(value.max(0.0))
         } else {
-            Err(format!(
-                "marginal-slope covariance quadratic form must be non-negative, got {value}"
-            ))
+            Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "marginal-slope covariance quadratic form must be non-negative, got {value}"
+                ),
+            }
+            .into())
         }
     }
 }
@@ -3277,32 +3310,47 @@ pub fn marginal_slope_covariance_from_scores(
 ) -> Result<MarginalSlopeCovariance, String> {
     let (n, k) = scores.dim();
     if k == 0 {
-        return Err("marginal-slope score matrix must have at least one column".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "marginal-slope score matrix must have at least one column".to_string(),
+        }
+        .into());
     }
     if weights.len() != n {
-        return Err(format!(
-            "marginal-slope covariance weight length mismatch: weights={}, rows={n}",
-            weights.len()
-        ));
+        return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "marginal-slope covariance weight length mismatch: weights={}, rows={n}",
+                weights.len()
+            ),
+        }
+        .into());
     }
     let total_weight = weights.iter().copied().sum::<f64>();
     if !(total_weight.is_finite() && total_weight > 0.0) {
-        return Err("marginal-slope covariance needs positive finite total weight".to_string());
+        return Err(BernoulliMarginalSlopeError::InvalidInput {
+            reason: "marginal-slope covariance needs positive finite total weight".to_string(),
+        }
+        .into());
     }
     let mut mean = Array1::<f64>::zeros(k);
     for i in 0..n {
         let weight = weights[i];
         if !(weight.is_finite() && weight >= 0.0) {
-            return Err(format!(
-                "marginal-slope covariance weight {i} must be finite and non-negative, got {weight}"
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "marginal-slope covariance weight {i} must be finite and non-negative, got {weight}"
+                ),
+            }
+            .into());
         }
         for j in 0..k {
             let score = scores[[i, j]];
             if !score.is_finite() {
-                return Err(format!(
-                    "marginal-slope covariance score ({i},{j}) is non-finite"
-                ));
+                return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "marginal-slope covariance score ({i},{j}) is non-finite"
+                    ),
+                }
+                .into());
             }
             mean[j] += weight * score;
         }
@@ -5882,21 +5930,30 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<MultiDirJet, String> {
         let n_dirs = directions.len();
         if n_dirs > 6 {
-            return Err(format!(
-                "bernoulli empirical flex jet supports at most 6 directions, got {n_dirs}"
-            ));
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "bernoulli empirical flex jet supports at most 6 directions, got {n_dirs}"
+                ),
+            }
+            .into());
         }
         for dir in directions {
             if dir.len() != primary.total {
-                return Err(format!(
-                    "bernoulli empirical flex direction length {} != primary dimension {}",
-                    dir.len(),
-                    primary.total
-                ));
+                return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "bernoulli empirical flex direction length {} != primary dimension {}",
+                        dir.len(),
+                        primary.total
+                    ),
+                }
+                .into());
             }
         }
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
-            return Err("non-finite empirical flexible row context in jet contraction".to_string());
+            return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                reason: "non-finite empirical flexible row context in jet contraction".to_string(),
+            }
+            .into());
         }
 
         let marginal = self.marginal_link_map(q)?;
@@ -5916,10 +5973,13 @@ impl BernoulliMarginalSlopeFamily {
                 primary, &a_jet, &mu_jet, &b_jet, beta_h, beta_w, directions, grid,
             )?;
             if !(f_a.coeff(0).is_finite() && f_a.coeff(0) > 0.0) {
-                return Err(format!(
-                    "empirical flex calibration jet has invalid F_a={}",
-                    f_a.coeff(0)
-                ));
+                return Err(BernoulliMarginalSlopeError::NumericalFailure {
+                    reason: format!(
+                        "empirical flex calibration jet has invalid F_a={}",
+                        f_a.coeff(0)
+                    ),
+                }
+                .into());
             }
             let inv_f_a = f_a.compose_unary(unary_derivatives_reciprocal(f_a.coeff(0)));
             a_jet = a_jet.add(&f.mul(&inv_f_a).scale(-1.0));
@@ -5962,10 +6022,13 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Array2<f64>, String> {
         let r = primary.total;
         if dir.len() != r {
-            return Err(format!(
-                "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
-                dir.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
+                    dir.len()
+                ),
+            }
+            .into());
         }
         if dir.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
@@ -6016,11 +6079,14 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Array2<f64>, String> {
         let r = primary.total;
         if dir_u.len() != r || dir_v.len() != r {
-            return Err(format!(
-                "bernoulli empirical flex fourth contraction direction lengths ({},{}) != primary dimension {r}",
-                dir_u.len(),
-                dir_v.len()
-            ));
+            return Err(BernoulliMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "bernoulli empirical flex fourth contraction direction lengths ({},{}) != primary dimension {r}",
+                    dir_u.len(),
+                    dir_v.len()
+                ),
+            }
+            .into());
         }
         if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
