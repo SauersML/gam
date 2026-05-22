@@ -1390,17 +1390,14 @@ struct SurvivalExactRowKernel {
     r0: f64,
     dr0: f64,
     ddr0: f64,
-    dddr0: f64,
     log_s1: f64,
     r1: f64,
     dr1: f64,
     ddr1: f64,
-    dddr1: f64,
     logphi1: f64,
     dlogphi1: f64,
     d2logphi1: f64,
     d3logphi1: f64,
-    d4logphi1: f64,
     log_g: f64,
     d_log_g: f64,
     d2_log_g: f64,
@@ -1721,7 +1718,6 @@ impl SurvivalLocationScaleFamily {
         let dq_dq0 = fast_av(&basis_d1, &beta_w) + 1.0;
         let d2q_dq02 = fast_av(&basis_d2, &beta_w);
         let d3q_dq03 = fast_av(&basis_d3, &beta_w);
-        let d4q_dq04 = survival_wiggle_fourth_q(q0, knots, degree, beta_w)?;
         Ok(Some(SurvivalWiggleGeometry {
             basis,
             basis_d1,
@@ -1729,7 +1725,6 @@ impl SurvivalLocationScaleFamily {
             dq_dq0,
             d2q_dq02,
             d3q_dq03,
-            d4q_dq04,
         }))
     }
 
@@ -1774,7 +1769,6 @@ impl SurvivalLocationScaleFamily {
             dq_dq0: dq,
             d2q_dq02: d2,
             d3q_dq03: d3,
-            d4q_dq04: Array1::zeros(h0.len()),
         }))
     }
 
@@ -2227,7 +2221,7 @@ impl SurvivalLocationScaleFamily {
 
         let mut global = 0usize;
         for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            for deriv in block_derivs {
                 if global == psi_index {
                     let mut x_t_exit_psi = None;
                     let mut x_t_entry_psi = None;
@@ -2807,17 +2801,14 @@ impl SurvivalLocationScaleFamily {
             r0,
             dr0,
             ddr0,
-            dddr0,
             log_s1,
             r1,
             dr1,
             ddr1,
-            dddr1,
             logphi1,
             dlogphi1,
             d2logphi1,
             d3logphi1,
-            d4logphi1,
             log_g,
             d_log_g,
             d2_log_g,
@@ -5484,7 +5475,6 @@ struct SurvivalWiggleGeometry {
     dq_dq0: Array1<f64>,
     d2q_dq02: Array1<f64>,
     d3q_dq03: Array1<f64>,
-    d4q_dq04: Array1<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -5498,8 +5488,6 @@ struct SurvivalBaseQScalars {
     q_ll: f64,
     q_tl_ls: f64,
     q_ll_ls: f64,
-    q_tl_ls_ls: f64,
-    q_llll: f64,
 }
 
 struct SurvivalDynamicGeometryRowsMut<'a> {
@@ -5518,10 +5506,6 @@ struct SurvivalDynamicGeometryRowsMut<'a> {
     d3q_tls_ls_entry: &'a mut [f64],
     d3q_ls_exit: &'a mut [f64],
     d3q_ls_entry: &'a mut [f64],
-    d4q_tls_ls_ls_exit: &'a mut [f64],
-    d4q_tls_ls_ls_entry: &'a mut [f64],
-    d4q_ls_exit: &'a mut [f64],
-    d4q_ls_entry: &'a mut [f64],
     dqdot_t: &'a mut [f64],
     dqdot_ls: &'a mut [f64],
     dqdot_td: &'a mut [f64],
@@ -5557,12 +5541,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
         let (d3q_tls_ls_entry_l, d3q_tls_ls_entry_r) = self.d3q_tls_ls_entry.split_at_mut(mid);
         let (d3q_ls_exit_l, d3q_ls_exit_r) = self.d3q_ls_exit.split_at_mut(mid);
         let (d3q_ls_entry_l, d3q_ls_entry_r) = self.d3q_ls_entry.split_at_mut(mid);
-        let (d4q_tls_ls_ls_exit_l, d4q_tls_ls_ls_exit_r) =
-            self.d4q_tls_ls_ls_exit.split_at_mut(mid);
-        let (d4q_tls_ls_ls_entry_l, d4q_tls_ls_ls_entry_r) =
-            self.d4q_tls_ls_ls_entry.split_at_mut(mid);
-        let (d4q_ls_exit_l, d4q_ls_exit_r) = self.d4q_ls_exit.split_at_mut(mid);
-        let (d4q_ls_entry_l, d4q_ls_entry_r) = self.d4q_ls_entry.split_at_mut(mid);
         let (dqdot_t_l, dqdot_t_r) = self.dqdot_t.split_at_mut(mid);
         let (dqdot_ls_l, dqdot_ls_r) = self.dqdot_ls.split_at_mut(mid);
         let (dqdot_td_l, dqdot_td_r) = self.dqdot_td.split_at_mut(mid);
@@ -5592,10 +5570,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 d3q_tls_ls_entry: d3q_tls_ls_entry_l,
                 d3q_ls_exit: d3q_ls_exit_l,
                 d3q_ls_entry: d3q_ls_entry_l,
-                d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit_l,
-                d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry_l,
-                d4q_ls_exit: d4q_ls_exit_l,
-                d4q_ls_entry: d4q_ls_entry_l,
                 dqdot_t: dqdot_t_l,
                 dqdot_ls: dqdot_ls_l,
                 dqdot_td: dqdot_td_l,
@@ -5624,10 +5598,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 d3q_tls_ls_entry: d3q_tls_ls_entry_r,
                 d3q_ls_exit: d3q_ls_exit_r,
                 d3q_ls_entry: d3q_ls_entry_r,
-                d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit_r,
-                d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry_r,
-                d4q_ls_exit: d4q_ls_exit_r,
-                d4q_ls_entry: d4q_ls_entry_r,
                 dqdot_t: dqdot_t_r,
                 dqdot_ls: dqdot_ls_r,
                 dqdot_td: dqdot_td_r,
@@ -5694,7 +5664,6 @@ fn fill_survival_dynamic_geometry_rows_serial(
                 wig.dq_dq0[i],
                 wig.d2q_dq02[i],
                 wig.d3q_dq03[i],
-                wig.d4q_dq04[i],
             )
         } else {
             compose_survival_dynamic_q(
@@ -5703,7 +5672,6 @@ fn fill_survival_dynamic_geometry_rows_serial(
                 inputs.eta_ls_deriv_exit[i],
                 0.0,
                 1.0,
-                0.0,
                 0.0,
                 0.0,
             )
@@ -5717,10 +5685,9 @@ fn fill_survival_dynamic_geometry_rows_serial(
                 wig.dq_dq0[i],
                 wig.d2q_dq02[i],
                 wig.d3q_dq03[i],
-                wig.d4q_dq04[i],
             )
         } else {
-            compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+            compose_survival_dynamic_q(base_entry, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
         };
         rows.q_exit[offset] = exit_dyn.q;
         rows.q_entry[offset] = entry_dyn.q;
@@ -5737,10 +5704,6 @@ fn fill_survival_dynamic_geometry_rows_serial(
         rows.d3q_tls_ls_entry[offset] = entry_dyn.q_tl_ls;
         rows.d3q_ls_exit[offset] = exit_dyn.q_ll_ls;
         rows.d3q_ls_entry[offset] = entry_dyn.q_ll_ls;
-        rows.d4q_tls_ls_ls_exit[offset] = exit_dyn.q_tl_ls_ls;
-        rows.d4q_tls_ls_ls_entry[offset] = entry_dyn.q_tl_ls_ls;
-        rows.d4q_ls_exit[offset] = exit_dyn.q_llll;
-        rows.d4q_ls_entry[offset] = entry_dyn.q_llll;
         rows.dqdot_t[offset] = exit_dyn.qdot_t;
         rows.dqdot_ls[offset] = exit_dyn.qdot_ls;
         rows.dqdot_td[offset] = exit_dyn.qdot_td;
@@ -5764,8 +5727,6 @@ struct SurvivalDynamicQScalars {
     q_ll: f64,
     q_tl_ls: f64,
     q_ll_ls: f64,
-    q_tl_ls_ls: f64,
-    q_llll: f64,
     qdot: f64,
     qdot_t: f64,
     qdot_ls: f64,
@@ -5814,10 +5775,6 @@ struct SurvivalDynamicGeometry {
     d3q_tls_ls_entry: Array1<f64>,
     d3q_ls_exit: Array1<f64>,
     d3q_ls_entry: Array1<f64>,
-    d4q_tls_ls_ls_exit: Array1<f64>,
-    d4q_tls_ls_ls_entry: Array1<f64>,
-    d4q_ls_exit: Array1<f64>,
-    d4q_ls_entry: Array1<f64>,
     dqdot_t: Array1<f64>,
     dqdot_ls: Array1<f64>,
     dqdot_td: Array1<f64>,
@@ -6249,10 +6206,6 @@ impl SurvivalLocationScaleFamily {
         let mut d3q_tls_ls_entry = Array1::<f64>::zeros(n);
         let mut d3q_ls_exit = Array1::<f64>::zeros(n);
         let mut d3q_ls_entry = Array1::<f64>::zeros(n);
-        let mut d4q_tls_ls_ls_exit = Array1::<f64>::zeros(n);
-        let mut d4q_tls_ls_ls_entry = Array1::<f64>::zeros(n);
-        let mut d4q_ls_exit = Array1::<f64>::zeros(n);
-        let mut d4q_ls_entry = Array1::<f64>::zeros(n);
         let mut dqdot_t = Array1::<f64>::zeros(n);
         let mut dqdot_ls = Array1::<f64>::zeros(n);
         let mut dqdot_td = Array1::<f64>::zeros(n);
@@ -6318,18 +6271,6 @@ impl SurvivalLocationScaleFamily {
             d3q_ls_entry: d3q_ls_entry
                 .as_slice_mut()
                 .expect("d3q_ls_entry must be contiguous"),
-            d4q_tls_ls_ls_exit: d4q_tls_ls_ls_exit
-                .as_slice_mut()
-                .expect("d4q_tls_ls_ls_exit must be contiguous"),
-            d4q_tls_ls_ls_entry: d4q_tls_ls_ls_entry
-                .as_slice_mut()
-                .expect("d4q_tls_ls_ls_entry must be contiguous"),
-            d4q_ls_exit: d4q_ls_exit
-                .as_slice_mut()
-                .expect("d4q_ls_exit must be contiguous"),
-            d4q_ls_entry: d4q_ls_entry
-                .as_slice_mut()
-                .expect("d4q_ls_entry must be contiguous"),
             dqdot_t: dqdot_t.as_slice_mut().expect("dqdot_t must be contiguous"),
             dqdot_ls: dqdot_ls
                 .as_slice_mut()
@@ -6427,10 +6368,6 @@ impl SurvivalLocationScaleFamily {
             d3q_tls_ls_entry,
             d3q_ls_exit,
             d3q_ls_entry,
-            d4q_tls_ls_ls_exit,
-            d4q_tls_ls_ls_entry,
-            d4q_ls_exit,
-            d4q_ls_entry,
             dqdot_t,
             dqdot_ls,
             dqdot_td,
