@@ -7601,7 +7601,10 @@ pub fn reml_laml_evaluate(
     // silently return a wrong derivative: surface a typed contract error
     // that names what is missing.
     if !envelope_suppresses_outputs
-        && matches!(mode, EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian)
+        && matches!(
+            mode,
+            EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian
+        )
         && solution
             .active_constraints
             .as_ref()
@@ -14106,6 +14109,149 @@ impl MatrixFreeSpdOperator {
             "MatrixFreeSpdOperator exact REML algebra requires dense spectral materialization within the configured budget",
         )
     }
+
+    fn use_trace_cg(&self, rel_tol: f64) -> bool {
+        rel_tol.is_finite()
+            && rel_tol > 0.0
+            && self.prefers_stochastic_trace_estimation()
+            && self.has_matrix_free_trace_cg_operator()
+    }
+
+    fn cg_trace_solve(
+        &self,
+        rhs: &Array1<f64>,
+        rel_tol: f64,
+        probe_id: Option<u64>,
+        trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
+    ) -> Array1<f64> {
+        let dim = rhs.len();
+        if dim != self.n_dim {
+            return self.solve(rhs);
+        }
+
+        let (initial, warm_start_used) = match (probe_id, trace_state) {
+            (Some(id), Some(state)) => {
+                let cached = match state.lock() {
+                    Ok(guard) => guard.cg_warm_starts.get(&id).cloned(),
+                    Err(poisoned) => poisoned.into_inner().cg_warm_starts.get(&id).cloned(),
+                };
+                match cached {
+                    Some(x) if x.len() == dim => (x, true),
+                    _ => (Array1::<f64>::zeros(dim), false),
+                }
+            }
+            _ => (Array1::<f64>::zeros(dim), false),
+        };
+
+        let (solution, iters) =
+            match conjugate_gradient_trace_solve(rhs, rel_tol, initial, |v| (self.apply)(v)) {
+                Some(result) => result,
+                None => return self.solve(rhs),
+            };
+
+        if let (Some(id), Some(state)) = (probe_id, trace_state) {
+            let mut guard = match state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.cg_warm_starts.insert(id, solution.clone());
+        }
+
+        let probe_label = probe_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "untracked".to_string());
+        log::info!(
+            "[CG-TRACE] probe_id={} iters={} rel_tol={} warm_start_used={}",
+            probe_label,
+            iters,
+            rel_tol,
+            warm_start_used
+        );
+
+        solution
+    }
+}
+
+fn conjugate_gradient_trace_solve<F>(
+    rhs: &Array1<f64>,
+    rel_tol: f64,
+    mut x: Array1<f64>,
+    apply: F,
+) -> Option<(Array1<f64>, usize)>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let dim = rhs.len();
+    if x.len() != dim {
+        return None;
+    }
+
+    let rhs_norm_sq = rhs.dot(rhs);
+    if !rhs_norm_sq.is_finite() {
+        return None;
+    }
+    if rhs_norm_sq <= f64::MIN_POSITIVE {
+        return Some((Array1::<f64>::zeros(dim), 0));
+    }
+
+    let target_sq = (rel_tol * rel_tol * rhs_norm_sq).max(f64::MIN_POSITIVE);
+    let mut r = rhs.clone();
+    if x.iter().any(|value| *value != 0.0) {
+        let ax = apply(&x);
+        if ax.len() != dim || !ax.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        r.scaled_add(-1.0, &ax);
+    }
+
+    let mut rs_old = r.dot(&r);
+    if !rs_old.is_finite() {
+        return None;
+    }
+    if rs_old <= target_sq {
+        return Some((x, 0));
+    }
+
+    let mut p = r.clone();
+    let mut iters = 0usize;
+    for k in 0..dim.max(1) {
+        let ap = apply(&p);
+        if ap.len() != dim || !ap.iter().all(|value| value.is_finite()) {
+            return None;
+        }
+        let denom = p.dot(&ap);
+        if !denom.is_finite() || denom <= 0.0 {
+            log::warn!(
+                "[CG-TRACE] non-positive curvature in trace CG at iter={} denom={}",
+                k + 1,
+                denom
+            );
+            break;
+        }
+        let alpha = rs_old / denom;
+        if !alpha.is_finite() {
+            return None;
+        }
+        x.scaled_add(alpha, &p);
+        r.scaled_add(-alpha, &ap);
+        let rs_new = r.dot(&r);
+        if !rs_new.is_finite() {
+            return None;
+        }
+        iters = k + 1;
+        if rs_new <= target_sq {
+            break;
+        }
+        let beta = rs_new / rs_old;
+        if !beta.is_finite() {
+            return None;
+        }
+        p.mapv_inplace(|value| beta * value);
+        p += &r;
+        rs_old = rs_new;
+    }
+
+    Some((x, iters))
 }
 
 impl HessianOperator for MatrixFreeSpdOperator {
@@ -14170,12 +14316,34 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
-        let _ = rel_tol;
+        if self.use_trace_cg(rel_tol) {
+            return self.cg_trace_solve(rhs, rel_tol, None, None);
+        }
+        self.solve(rhs)
+    }
+
+    fn stochastic_trace_solve_for_probe(
+        &self,
+        rhs: &Array1<f64>,
+        rel_tol: f64,
+        probe_id: u64,
+        trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
+    ) -> Array1<f64> {
+        if self.use_trace_cg(rel_tol) {
+            return self.cg_trace_solve(rhs, rel_tol, Some(probe_id), trace_state);
+        }
         self.solve(rhs)
     }
 
     fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
-        let _ = rel_tol;
+        if self.use_trace_cg(rel_tol) {
+            let mut out = Array2::<f64>::zeros(rhs.raw_dim());
+            for j in 0..rhs.ncols() {
+                let solved = self.cg_trace_solve(&rhs.column(j).to_owned(), rel_tol, None, None);
+                out.column_mut(j).assign(&solved);
+            }
+            return out;
+        }
         self.solve_multi(rhs)
     }
 
@@ -14220,15 +14388,19 @@ impl HessianOperator for MatrixFreeSpdOperator {
     }
 
     fn prefers_stochastic_trace_estimation(&self) -> bool {
-        false
+        true
     }
 
     fn logdet_traces_match_hinv_kernel(&self) -> bool {
-        false
+        true
     }
 
     fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
         self.dense_spectral()
+    }
+
+    fn has_matrix_free_trace_cg_operator(&self) -> bool {
+        true
     }
 }
 

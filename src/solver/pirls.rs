@@ -4295,11 +4295,7 @@ where
         /// Returns `Some(beta_accel)` when a finite acceleration is available,
         /// `None` when AA should be skipped (no history yet, disabled, or
         /// numerical floor hit).
-        fn aa1_mix(
-            &self,
-            beta_old: &Array1<f64>,
-            beta_new: &Array1<f64>,
-        ) -> Option<Array1<f64>> {
+        fn aa1_mix(&self, beta_old: &Array1<f64>, beta_new: &Array1<f64>) -> Option<Array1<f64>> {
             if self.disabled {
                 return None;
             }
@@ -4895,10 +4891,16 @@ where
             // this attempt so that — on acceptance — we can refresh the AA
             // history with the *plain* fixed-point step regardless of
             // whether the accelerated or plain candidate ended up accepted.
-            let beta_old_snapshot: Option<Array1<f64>> =
-                if force_fisher_for_rest { Some(beta.as_ref().clone()) } else { None };
-            let plain_residual_snapshot: Option<Array1<f64>> =
-                if force_fisher_for_rest { Some(direction.clone()) } else { None };
+            let beta_old_snapshot: Option<Array1<f64>> = if force_fisher_for_rest {
+                Some(beta.as_ref().clone())
+            } else {
+                None
+            };
+            let plain_residual_snapshot: Option<Array1<f64>> = if force_fisher_for_rest {
+                Some(direction.clone())
+            } else {
+                None
+            };
             if force_fisher_for_rest && !aa_state.disabled {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(mut beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {

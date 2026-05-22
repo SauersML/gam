@@ -5591,10 +5591,9 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::SurvivalTransformation(request) => {
             // cause_count is Result<usize, SurvivalError>; on error fall through
             // to the non-competing-risks branches (display-only path).
-            let cause_count = gam::survival::cause_count_from_event_codes(
-                request.spec.event_target.view(),
-            )
-            .unwrap_or(1);
+            let cause_count =
+                gam::survival::cause_count_from_event_codes(request.spec.event_target.view())
+                    .unwrap_or(1);
             if cause_count > 1 {
                 ("Cause-specific survival", "competing risks survival", true)
             } else {
