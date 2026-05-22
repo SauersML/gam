@@ -4354,6 +4354,7 @@ where
             if !array1_is_finite(&self.beta_accel) {
                 return None;
             }
+            // The caller copies this borrow into its candidate buffer before the next AA mutation.
             Some(&self.beta_accel)
         }
 
@@ -5551,18 +5552,21 @@ where
         // dominates because of the O(p³) Cholesky in the LM solve.
         // Knowing which path is hot tells us where the next principled
         // optimization should land.
-        let timed_total = curvature_total + lm_solve_total + lm_predred_total + lm_candidate_total;
-        let other_total = iter_elapsed.saturating_sub(timed_total);
-        log::info!(
-            "[PIRLS iter-breakdown] iter={:>3} attempts={} curvature={:.3}s solve={:.3}s predred={:.3}s candidate={:.3}s other={:.3}s",
-            iter,
-            lm_attempts_done,
-            curvature_total.as_secs_f64(),
-            lm_solve_total.as_secs_f64(),
-            lm_predred_total.as_secs_f64(),
-            lm_candidate_total.as_secs_f64(),
-            other_total.as_secs_f64(),
-        );
+        if log::log_enabled!(log::Level::Info) {
+            let timed_total =
+                curvature_total + lm_solve_total + lm_predred_total + lm_candidate_total;
+            let other_total = iter_elapsed.saturating_sub(timed_total);
+            log::info!(
+                "[PIRLS iter-breakdown] iter={:>3} attempts={} curvature={:.3}s solve={:.3}s predred={:.3}s candidate={:.3}s other={:.3}s",
+                iter,
+                lm_attempts_done,
+                curvature_total.as_secs_f64(),
+                lm_solve_total.as_secs_f64(),
+                lm_predred_total.as_secs_f64(),
+                lm_candidate_total.as_secs_f64(),
+                other_total.as_secs_f64(),
+            );
+        }
         // Per-iter LM trajectory: validates that the textbook Madsen
         // accept (commit 58ae42d1) and reject (d37626e6) updates plus
         // the runtime adaptive λ clamp (43be42be) are moving the trust
@@ -5581,21 +5585,23 @@ where
         //                   the quadratic model was faithful; <0.5
         //                   means it overstated the predicted
         //                   reduction. NaN on rejection-exhausted.
-        let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
-            (lambda / lm_start_lambda).log10()
-        } else {
-            f64::NAN
-        };
-        log::info!(
-            "[PIRLS lm-trajectory] iter={:>3} start_lambda={:.3e} final_lambda={:.3e} \
-             log10_ratio={:.3} accept_rho={:.3} attempts={}",
-            iter,
-            lm_start_lambda,
-            lambda,
-            lambda_ratio_log10,
-            lm_accept_rho.unwrap_or(f64::NAN),
-            lm_attempts_done,
-        );
+        if log::log_enabled!(log::Level::Info) {
+            let lambda_ratio_log10 = if lm_start_lambda > 0.0 && lambda > 0.0 {
+                (lambda / lm_start_lambda).log10()
+            } else {
+                f64::NAN
+            };
+            log::info!(
+                "[PIRLS lm-trajectory] iter={:>3} start_lambda={:.3e} final_lambda={:.3e} \
+                 log10_ratio={:.3} accept_rho={:.3} attempts={}",
+                iter,
+                lm_start_lambda,
+                lambda,
+                lambda_ratio_log10,
+                lm_accept_rho.unwrap_or(f64::NAN),
+                lm_attempts_done,
+            );
+        }
     }
 
     // Solve-end summary: one line per accepted (or rescued) PIRLS solve
@@ -5605,23 +5611,25 @@ where
     // Newton convergence health: rate < 0.5 = healthy Newton; rate ≥ 0.7
     // = struggling (likely stuck near singular geometry or a
     // flat-warm-start that the predictor failed to refine).
-    let total_iters = iterations.max(1) as f64;
-    let convergence_rate = match initial_gradient_norm {
-        Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
-            let ratio = (lastgradient_norm / g0).max(1e-30);
-            ratio.powf(1.0 / total_iters)
-        }
-        _ => f64::NAN,
-    };
-    log::info!(
-        "[PIRLS solve-end] iters={} elapsed={:.4}s g_norm_initial={:.3e} g_norm_final={:.3e} convergence_rate={:.3e} status={:?}",
-        iterations,
-        inner_solve_start.elapsed().as_secs_f64(),
-        initial_gradient_norm.unwrap_or(f64::NAN),
-        lastgradient_norm,
-        convergence_rate,
-        status,
-    );
+    if log::log_enabled!(log::Level::Info) {
+        let total_iters = iterations.max(1) as f64;
+        let convergence_rate = match initial_gradient_norm {
+            Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
+                let ratio = (lastgradient_norm / g0).max(1e-30);
+                ratio.powf(1.0 / total_iters)
+            }
+            _ => f64::NAN,
+        };
+        log::info!(
+            "[PIRLS solve-end] iters={} elapsed={:.4}s g_norm_initial={:.3e} g_norm_final={:.3e} convergence_rate={:.3e} status={:?}",
+            iterations,
+            inner_solve_start.elapsed().as_secs_f64(),
+            initial_gradient_norm.unwrap_or(f64::NAN),
+            lastgradient_norm,
+            convergence_rate,
+            status,
+        );
+    }
 
     let mut state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
         max_iterations: options.max_iterations,

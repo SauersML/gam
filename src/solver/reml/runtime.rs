@@ -5967,6 +5967,7 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
     ))
 }
 
+#[allow(dead_code)]
 fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,
     new_rho: &Array1<f64>,
