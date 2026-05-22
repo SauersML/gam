@@ -2647,7 +2647,7 @@ impl SavedLatentWindowKind {
         mean: ArrayView1<'_, f64>,
         mean_lower: Option<ArrayView1<'_, f64>>,
         mean_upper: Option<ArrayView1<'_, f64>>,
-    ) -> Result<(), String> {
+    ) -> CliResult<()> {
         match self {
             SavedLatentWindowKind::Survival => {
                 write_survival_prediction_csv(path, eta, mean, None, mean_lower, mean_upper)
@@ -9147,7 +9147,7 @@ fn write_survival_binary_prediction_csv(
     eta_se: Option<ArrayView1<'_, f64>>,
     event_lower: Option<ArrayView1<'_, f64>>,
     event_upper: Option<ArrayView1<'_, f64>>,
-) -> Result<(), String> {
+) -> CliResult<()> {
     let eta_v: Vec<f64> = eta.to_vec();
     let event_v: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
     let risk_v: Vec<f64> = eta_v.clone();
@@ -9168,13 +9168,15 @@ fn write_survival_binary_prediction_csv(
     if let Some(se) = eta_se {
         se_v = se.to_vec();
         lo_v = event_lower
-            .ok_or_else(|| {
-                "internal error: event_lower missing while effective_se is present".to_string()
+            .ok_or_else(|| CliError::Internal {
+                reason: "internal error: event_lower missing while effective_se is present"
+                    .to_string(),
             })?
             .to_vec();
         hi_v = event_upper
-            .ok_or_else(|| {
-                "internal error: event_upper missing while effective_se is present".to_string()
+            .ok_or_else(|| CliError::Internal {
+                reason: "internal error: event_upper missing while effective_se is present"
+                    .to_string(),
             })?
             .to_vec();
         cols.push(("effective_se", &se_v));
@@ -9186,9 +9188,13 @@ fn write_survival_binary_prediction_csv(
         cols.push(("mean_lower", &lo_v));
         cols.push(("mean_upper", &hi_v));
     } else if event_lower.is_some() {
-        return Err("internal error: event_upper missing while event_lower is present".to_string());
+        return Err(CliError::Internal {
+            reason: "internal error: event_upper missing while event_lower is present".to_string(),
+        });
     } else if event_upper.is_some() {
-        return Err("internal error: event_lower missing while event_upper is present".to_string());
+        return Err(CliError::Internal {
+            reason: "internal error: event_lower missing while event_upper is present".to_string(),
+        });
     }
 
     write_prediction_csv_unified(path, &cols)
