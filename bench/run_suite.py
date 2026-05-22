@@ -19,6 +19,17 @@ from pathlib import Path
 from shutil import disk_usage
 from time import monotonic, perf_counter
 
+# Statistical-regression gate (opt-in). Lives in bench/gate.py so it can
+# be invoked stand-alone post-hoc as well. Imported lazily-safely: if the
+# module is unavailable for any reason the gate just stays quiet.
+try:
+    from gate import extract_fit_quality as _gate_extract_fit_quality
+    from gate import cmd_check_results as _gate_cmd_check_results
+except Exception:  # pragma: no cover - bench infra only
+    _gate_extract_fit_quality = None
+    _gate_cmd_check_results = None
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -2974,7 +2985,44 @@ def _finalize_cv_result(
     }
     result.update(metrics)
     result["evaluation"] = _evaluation_label_for_n_folds(n_folds)
+    # Aggregate per-fold fit_quality (final_neg_v, edf_per_term) for the
+    # statistical-regression gate. Lanes without it (R / non-rust / paths
+    # that don't load model.json) leave the field at None and the gate
+    # skips them.
+    fit_quality_aggr = _aggregate_fit_quality_rows(cv_rows)
+    if fit_quality_aggr is not None:
+        result["fit_quality"] = fit_quality_aggr
     return result
+
+
+def _aggregate_fit_quality_rows(cv_rows: list[dict[str, typing.Any]]) -> dict[str, typing.Any] | None:
+    """Mean-aggregate per-fold ``fit_quality`` into a lane-level summary.
+
+    Each fold's ``fit_quality`` is either ``None`` or
+    ``{"final_neg_v": float, "edf_per_term": {name: float}}``. The
+    lane-level result reports unweighted means across folds plus a
+    ``per_fold`` array so the gate can drill in if needed.
+    """
+    fqs = [r.get("fit_quality") for r in cv_rows if isinstance(r.get("fit_quality"), dict)]
+    if not fqs:
+        return None
+    neg_vs = [float(fq["final_neg_v"]) for fq in fqs if isinstance(fq.get("final_neg_v"), (int, float))]
+    edf_acc: dict[str, list[float]] = {}
+    for fq in fqs:
+        edf = fq.get("edf_per_term")
+        if not isinstance(edf, dict):
+            continue
+        for k, v in edf.items():
+            if not isinstance(v, (int, float)):
+                continue
+            edf_acc.setdefault(str(k), []).append(float(v))
+    out: dict[str, typing.Any] = {"n_folds_with_quality": int(len(fqs))}
+    if neg_vs:
+        out["final_neg_v"] = float(sum(neg_vs) / len(neg_vs))
+    if edf_acc:
+        out["edf_per_term"] = {k: float(sum(vs) / len(vs)) for k, vs in edf_acc.items()}
+    out["per_fold"] = fqs
+    return out if ("final_neg_v" in out or "edf_per_term" in out) else None
 
 
 def _normalize_result_metadata(results: list[dict[str, typing.Any]]) -> None:
@@ -4254,6 +4302,15 @@ def run_rust_scenario_cv(
                     model_payload = model_payload.get("payload", {})
             except Exception:
                 model_payload = None
+            # Gate: extract REML score + per-term edf from the rust model.json
+            # while it is already in memory. Goes into the cv row and is
+            # aggregated lane-wide by _finalize_cv_result.
+            fit_quality_row: dict[str, typing.Any] | None = None
+            if model_payload is not None and _gate_extract_fit_quality is not None:
+                try:
+                    fit_quality_row = _gate_extract_fit_quality({"payload": model_payload})
+                except Exception:
+                    fit_quality_row = None
             if collect_continuous_order and model_payload is not None:
                 lambdas = model_payload.get("fit_result", {}).get("lambdas", [])
                 if isinstance(lambdas, list) and len(lambdas) >= 3:
@@ -4309,6 +4366,7 @@ def run_rust_scenario_cv(
                         "nagelkerke_r2": nagelkerke_r2_score(y_test, pred, null_mean=float(np.mean(y_train))),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": f"{fitted_formula} via release binary {eval_suffix}",
+                        "fit_quality": fit_quality_row,
                     }
                 )
                 if eval_ood and smooth_cols:
@@ -4397,6 +4455,7 @@ def run_rust_scenario_cv(
                         "r2": r2_score(y_test, pred),
                         "n_test": int(len(fold.test_idx)),
                         "model_spec": f"{fitted_formula} via release binary {eval_suffix}",
+                        "fit_quality": fit_quality_row,
                     }
                 )
             else:
@@ -4456,6 +4515,7 @@ def run_rust_scenario_cv(
                             "survival model via release binary "
                             f"(c-index on risk score from '{score_src}'; native survival curve scoring) {eval_suffix}"
                         ),
+                        "fit_quality": fit_quality_row,
                     }
                 )
 
@@ -8344,6 +8404,22 @@ def main() -> None:
         dest="scenario_names",
         help="Run only the named scenario(s). Can be passed multiple times.",
     )
+    parser.add_argument(
+        "--gate",
+        choices=["report", "strict", "off"],
+        default=None,
+        help=(
+            "Statistical-regression gate mode. 'report' (default unless BENCH_GATE is "
+            "set) prints findings without failing. 'strict' fails the run on a "
+            "tolerance-breaking delta in final_neg_v or edf_per_term. 'off' skips "
+            "the gate entirely. Falls back to BENCH_GATE env var when not given."
+        ),
+    )
+    parser.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="Write/refresh the per-lane baselines under bench/baselines/ from this run.",
+    )
     args = parser.parse_args()
     print(
         "bench runtime config | "
@@ -8765,6 +8841,27 @@ def main() -> None:
     }
     args.out.write_text(json.dumps(payload, indent=2))
     print(f"Wrote {args.out}")
+
+    # ---- Statistical-regression gate (opt-in) -----------------------------
+    # See bench/gate.py for tolerances and rationale. Default mode is
+    # 'report' so the gate is non-blocking until CI flips it to 'strict'
+    # via BENCH_GATE=strict or --gate strict.
+    gate_mode = args.gate or os.environ.get("BENCH_GATE", "").strip().lower() or "report"
+    if gate_mode not in ("report", "strict", "off"):
+        gate_mode = "report"
+    if gate_mode != "off" and _gate_cmd_check_results is not None:
+        gate_args = argparse.Namespace(
+            results=str(args.out),
+            gate=gate_mode,
+            update_baseline=bool(args.update_baseline),
+        )
+        try:
+            gate_rc = int(_gate_cmd_check_results(gate_args))
+        except Exception as e:  # pragma: no cover - bench infra only
+            print(f"[gate] error: {e}", file=sys.stderr)
+            gate_rc = 0
+        if gate_rc != 0 and gate_mode == "strict":
+            raise SystemExit(f"benchmark statistical-regression gate failed (rc={gate_rc})")
 
     # Generate per-scenario comparison figures and bundle into a .zip.
     fig_dir = args.out.parent / "figures"
