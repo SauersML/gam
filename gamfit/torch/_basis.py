@@ -214,34 +214,58 @@ def bspline_basis_derivative(
     return from_numpy_like(deriv, t)
 
 
-def duchon_basis_1d(
-    t: torch.Tensor,
+def duchon_basis(
+    points: torch.Tensor,
     centers: Any = None,
     *,
     m: int = 2,
-    periodic: bool = False,
+    periodic_per_axis: tuple[bool, ...] | None = None,
 ) -> torch.Tensor:
-    """Evaluate the one-dimensional Duchon basis at ``t`` with grad wrt ``t``.
+    """Evaluate the Duchon m-spline basis at ``points`` with grad wrt ``points``.
+
+    Multi-dimensional: ``points`` is ``(N, d)``, ``centers`` is ``(K, d)``.
+    For 1D, pass shape ``(N,)`` or ``(N, 1)`` — auto-promoted.
 
     Parameters
     ----------
-    t : torch.Tensor
-        Evaluation locations, shape ``(n_t,)``. Differentiable input.
-    centers : torch.Tensor
-        Center locations. Treated as structural; no gradient is propagated.
+    points : torch.Tensor
+        Evaluation locations, shape ``(N, d)`` or ``(N,)`` for d=1.
+        Differentiable input (backward via the analytic derivative basis
+        in 1D; not yet exposed for d > 1).
+    centers : torch.Tensor or int or None
+        Center locations, shape ``(K, d)``. Auto-derived from ``points``
+        for d=1 if None or an int.
     m : int, optional
         Duchon smoothness order. Default ``2``.
-    periodic : bool, optional
-        Whether to evaluate the periodic variant. Default ``False``.
+    periodic_per_axis : sequence of bool of length d, optional.
+        Currently only d=1 supports periodicity.
 
     Returns
     -------
     torch.Tensor
-        Basis matrix of shape ``(n_t, n_basis)``.
+        Basis matrix of shape ``(N, K)``.
     """
-    centers_t = _resolve_centers_tensor(t, centers)
-    apply = cast(Callable[..., torch.Tensor], _DuchonBasis1dFn.apply)
-    return apply(t, centers_t, int(m), bool(periodic))
+    if points.dim() == 1:
+        points = points.unsqueeze(1)
+    if points.dim() != 2:
+        raise ValueError(f"points must be 1D or 2D, got {points.dim()}D")
+    d = points.shape[1]
+    # Resolve centers: 1D-tensor → promote; int/None → auto-quantile (d=1 only).
+    if centers is None or isinstance(centers, int):
+        if d != 1:
+            raise ValueError(f"auto centers only supported for d=1, got d={d}")
+        centers_t = _resolve_centers_tensor(points[:, 0], centers).unsqueeze(1)
+    else:
+        centers_t = centers if isinstance(centers, torch.Tensor) else torch.as_tensor(centers)
+        if centers_t.dim() == 1:
+            centers_t = centers_t.unsqueeze(1)
+        if centers_t.dim() != 2 or centers_t.shape[1] != d:
+            raise ValueError(
+                f"centers must have shape (K, d={d}); got {tuple(centers_t.shape)}"
+            )
+    apply = cast(Callable[..., torch.Tensor], _DuchonBasisFn.apply)
+    periodic_tuple = None if periodic_per_axis is None else tuple(bool(p) for p in periodic_per_axis)
+    return apply(points, centers_t, int(m), periodic_tuple)
 
 
 def duchon_basis_1d_derivative(
