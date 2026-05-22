@@ -6299,6 +6299,16 @@ pub enum CustomFamilyError {
     InvalidInput(String),
     #[error("custom-family optimization error: {0}")]
     Optimization(String),
+    #[error("{reason}")]
+    DimensionMismatch { reason: String },
+    #[error("{reason}")]
+    NumericalFailure { reason: String },
+    #[error("{reason}")]
+    ConstraintViolation { reason: String },
+    #[error("{reason}")]
+    UnsupportedConfiguration { reason: String },
+    #[error("{reason}")]
+    BasisDecompositionFailed { reason: String },
 }
 
 impl From<String> for CustomFamilyError {
