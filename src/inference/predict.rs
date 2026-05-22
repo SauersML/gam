@@ -768,10 +768,12 @@ impl PredictableModel for StandardPredictor {
         })?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(EstimationError::InvalidInput)?;
-        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
-        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
-        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
-        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
+        let eta_z_se = eta_se.mapv(|s| z * s);
+        let mean_z_se = mean_se.mapv(|s| z * s);
+        let eta_lower = &pred.eta - &eta_z_se;
+        let eta_upper = &pred.eta + &eta_z_se;
+        let mut mean_lower = &pred.mean - &mean_z_se;
+        let mut mean_upper = &pred.mean + &mean_z_se;
         let (lo, hi) = match self.family {
             crate::types::LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
             crate::types::LikelihoodFamily::PoissonLog
@@ -3137,8 +3139,9 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(|e| EstimationError::InvalidInput(e))?;
-        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
-        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
+        let z_se = eta_se.mapv(|s| z * s);
+        let eta_lower = &pred.eta - &z_se;
+        let eta_upper = &pred.eta + &z_se;
         Ok(PredictUncertaintyResult {
             eta: pred.eta.clone(),
             mean: pred.mean.clone(),
@@ -3171,9 +3174,10 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
             let z = standard_normal_quantile(0.5 + 0.5 * level)
                 .map_err(EstimationError::InvalidInput)?;
+            let z_se = eta_se.mapv(|s| z * s);
             (
-                Some(&result.eta - &eta_se.mapv(|s| z * s)),
-                Some(&result.eta + &eta_se.mapv(|s| z * s)),
+                Some(&result.eta - &z_se),
+                Some(&result.eta + &z_se),
             )
         } else {
             (None, None)
@@ -3875,8 +3879,8 @@ impl PredictableModel for SurvivalPredictor {
             let mean_se_vec = linear_predictor_se_from_backend(&backend, n, |rows| {
                 let x_t = design_row_chunk(&input.design, rows.clone())?;
                 let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]).to_owned();
-                let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]).to_owned();
+                let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]);
+                let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]);
                 let rows_in_chunk = eta_t_chunk.len();
                 let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
                 for i in 0..rows_in_chunk {
@@ -3940,10 +3944,12 @@ impl PredictableModel for SurvivalPredictor {
             )
         })?;
 
-        let eta_lower = &pred.eta - &eta_se.mapv(|s| z * s);
-        let eta_upper = &pred.eta + &eta_se.mapv(|s| z * s);
-        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
-        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
+        let eta_z_se = eta_se.mapv(|s| z * s);
+        let mean_z_se = mean_se.mapv(|s| z * s);
+        let eta_lower = &pred.eta - &eta_z_se;
+        let eta_upper = &pred.eta + &eta_z_se;
+        let mut mean_lower = &pred.mean - &mean_z_se;
+        let mut mean_upper = &pred.mean + &mean_z_se;
         // Clamp survival probabilities to [0, 1].
         mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
         mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
@@ -4226,8 +4232,9 @@ pub fn enrich_posterior_mean_bounds(
     let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * confidence_level)
         .map_err(EstimationError::InvalidInput)?;
 
-    let eta_lower = &result.eta - &result.eta_standard_error.mapv(|s| z * s);
-    let eta_upper = &result.eta + &result.eta_standard_error.mapv(|s| z * s);
+    let z_se = result.eta_standard_error.mapv(|s| z * s);
+    let eta_lower = &result.eta - &z_se;
+    let eta_upper = &result.eta + &z_se;
 
     let transformed_lower = apply_family_inverse_link(&eta_lower, family, link_kind)?;
     let transformed_upper = apply_family_inverse_link(&eta_upper, family, link_kind)?;
