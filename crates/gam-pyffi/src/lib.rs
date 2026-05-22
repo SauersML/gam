@@ -1534,6 +1534,511 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     Ok(out.unbind())
 }
 
+/// Helper: run the multi-block Gaussian REML forward at the given inputs,
+/// warm-started from `init_rhos` (log-λ), and return (β, fitted, λ, log_λ, V,
+/// edf). Used by the analytic backward to apply central FD on the warm-started
+/// outer optimum; not exposed to Python.
+fn gaussian_reml_fit_blocks_forward_native(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    init_rhos: &[f64],
+) -> Result<
+    (
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        f64,
+        Array1<f64>,
+    ),
+    EstimationError,
+> {
+    let n_rows = designs[0].nrows();
+    let mut col_offsets: Vec<usize> = vec![0];
+    for d in designs {
+        col_offsets.push(col_offsets.last().unwrap() + d.ncols());
+    }
+    let p_total = *col_offsets.last().unwrap();
+
+    let mut joint_x: Array2<f64> = Array2::zeros((n_rows, p_total));
+    for (i, d) in designs.iter().enumerate() {
+        let mut block = joint_x.slice_mut(s![.., col_offsets[i]..col_offsets[i + 1]]);
+        block.assign(d);
+    }
+
+    let s_list: Vec<gam::smooth::BlockwisePenalty> = penalties
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            gam::smooth::BlockwisePenalty::new(
+                col_offsets[i]..col_offsets[i + 1],
+                p.clone(),
+            )
+        })
+        .collect();
+
+    let heuristic_lambdas: Vec<f64> = init_rhos.iter().map(|r| r.exp()).collect();
+    let offset_zero = Array1::<f64>::zeros(n_rows);
+
+    let opts = gam::estimate::FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 200,
+        tol: 1e-9,
+        nullspace_dims: vec![0; s_list.len()],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: Some(1e-6),
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+
+    let joint_x_for_fit = joint_x.clone();
+    let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+        joint_x_for_fit,
+        y,
+        weights,
+        offset_zero.view(),
+        &s_list,
+        Some(heuristic_lambdas.as_slice()),
+        gam::types::LikelihoodFamily::GaussianIdentity,
+        &opts,
+    )?;
+
+    let beta = fit.beta.clone();
+    let fitted = joint_x.dot(&beta);
+    let lambdas = fit.lambdas.clone();
+    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    let edf_vec: Vec<f64> = fit
+        .inference
+        .as_ref()
+        .map(|inf| inf.edf_by_block.clone())
+        .unwrap_or_else(|| vec![0.0; lambdas.len()]);
+    let edf = if edf_vec.len() == lambdas.len() {
+        Array1::from_vec(edf_vec)
+    } else {
+        Array1::zeros(lambdas.len())
+    };
+
+    Ok((beta, fitted, lambdas, log_lambdas, fit.reml_score, edf))
+}
+
+/// Scalar `<grad, output(p)>` used by the FD backward.
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_blocks_loss(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    init_rhos: &[f64],
+    grad_coefficients: Option<ArrayView2<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_lambdas: Option<ArrayView1<'_, f64>>,
+    grad_log_lambdas: Option<ArrayView1<'_, f64>>,
+    grad_reml_score: f64,
+    grad_edf: Option<ArrayView1<'_, f64>>,
+) -> Result<f64, EstimationError> {
+    let (beta, fitted, lambdas, log_lambdas, reml_score, edf) =
+        gaussian_reml_fit_blocks_forward_native(designs, penalties, y, weights, init_rhos)?;
+    let mut loss = 0.0_f64;
+    if let Some(gc) = grad_coefficients {
+        let col = gc.column(0);
+        for i in 0..beta.len() {
+            loss += col[i] * beta[i];
+        }
+    }
+    if let Some(gf) = grad_fitted {
+        let col = gf.column(0);
+        for i in 0..fitted.len() {
+            loss += col[i] * fitted[i];
+        }
+    }
+    if let Some(gl) = grad_lambdas {
+        for i in 0..lambdas.len() {
+            loss += gl[i] * lambdas[i];
+        }
+    }
+    if let Some(gr) = grad_log_lambdas {
+        for i in 0..log_lambdas.len() {
+            loss += gr[i] * log_lambdas[i];
+        }
+    }
+    loss += grad_reml_score * reml_score;
+    if let Some(ge) = grad_edf {
+        for i in 0..edf.len() {
+            loss += ge[i] * edf[i];
+        }
+    }
+    Ok(loss)
+}
+
+/// Analytic backward for the multi-block per-smooth-λ Gaussian REML forward.
+///
+/// Computes VJPs of (coefficients, fitted, lambdas, log_lambdas, reml_score,
+/// edf) back to (design_blocks, penalty_blocks, y). The implementation applies
+/// central finite differences to the warm-started forward fit: each perturbed
+/// fit re-converges to the new outer-optimum from the saved ρ\*, which
+/// implicitly composes both the direct `∂(output)/∂p|_ρ*` term and the
+/// indirect `∂(output)/∂ρ · ∂ρ*/∂p` term through the F×F outer Hessian
+/// `H_joint(ρ*)`. H_joint itself is never explicitly assembled: its inverse
+/// is applied implicitly by the outer Newton loop snapping to the new
+/// optimum.
+///
+/// Cost scales as ``2·(∑|X_k| + ∑|S_k| + |y|)·T_fit`` where ``T_fit`` is one
+/// warm-started Gaussian REML fit. This makes the path suitable for autograd
+/// verification and small/medium problems; a true closed-form analytic IFT
+/// VJP (which would avoid the per-element refit) is a separate workstream.
+#[pyfunction(signature = (
+    designs,
+    penalties,
+    y,
+    weights,
+    log_lambdas,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_lambdas = None,
+    grad_log_lambdas = None,
+    grad_reml_score = 0.0,
+    grad_edf = None,
+    fd_step = 1.0e-5,
+))]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_blocks_backward<'py>(
+    py: Python<'py>,
+    designs: Vec<PyReadonlyArray2<'py, f64>>,
+    penalties: Vec<PyReadonlyArray2<'py, f64>>,
+    y: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    log_lambdas: PyReadonlyArray1<'py, f64>,
+    grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_lambdas: Option<PyReadonlyArray1<'py, f64>>,
+    grad_log_lambdas: Option<PyReadonlyArray1<'py, f64>>,
+    grad_reml_score: f64,
+    grad_edf: Option<PyReadonlyArray1<'py, f64>>,
+    fd_step: f64,
+) -> PyResult<Py<PyDict>> {
+    if designs.is_empty() {
+        return Err(py_value_error(
+            "gaussian_reml_fit_blocks_backward requires at least one block".to_string(),
+        ));
+    }
+    if designs.len() != penalties.len() {
+        return Err(py_value_error(format!(
+            "designs and penalties must have equal length; got {} vs {}",
+            designs.len(),
+            penalties.len(),
+        )));
+    }
+
+    let n_rows = designs[0].as_array().nrows();
+    let designs_owned: Vec<Array2<f64>> = designs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let v = d.as_array();
+            if v.nrows() != n_rows {
+                return Err(py_value_error(format!(
+                    "designs[{}].nrows={} does not match designs[0].nrows={}",
+                    i,
+                    v.nrows(),
+                    n_rows,
+                )));
+            }
+            Ok(v.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let penalties_owned: Vec<Array2<f64>> = penalties
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let v = p.as_array();
+            let k = designs_owned[i].ncols();
+            if v.nrows() != k || v.ncols() != k {
+                return Err(py_value_error(format!(
+                    "penalties[{}] shape {}x{} does not match design block size {}",
+                    i,
+                    v.nrows(),
+                    v.ncols(),
+                    k,
+                )));
+            }
+            Ok(v.to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let y_arr = y.as_array();
+    if y_arr.nrows() != n_rows {
+        return Err(py_value_error(format!(
+            "y.nrows={} does not match design N={}",
+            y_arr.nrows(),
+            n_rows,
+        )));
+    }
+    if y_arr.ncols() != 1 {
+        return Err(py_value_error(format!(
+            "gaussian_reml_fit_blocks_backward requires y of shape (N, 1); got (N, {})",
+            y_arr.ncols(),
+        )));
+    }
+    let y_owned: Array1<f64> = y_arr.column(0).to_owned();
+
+    let weights_owned: Array1<f64> = match weights.as_ref() {
+        Some(w) => {
+            let wa = w.as_array();
+            if wa.len() != n_rows {
+                return Err(py_value_error(format!(
+                    "weights.len={} does not match N={}",
+                    wa.len(),
+                    n_rows,
+                )));
+            }
+            wa.to_owned()
+        }
+        None => Array1::from_elem(n_rows, 1.0),
+    };
+
+    let rhos_view = log_lambdas.as_array();
+    if rhos_view.len() != designs_owned.len() {
+        return Err(py_value_error(format!(
+            "log_lambdas.len={} does not match F={}",
+            rhos_view.len(),
+            designs_owned.len(),
+        )));
+    }
+    let init_rhos: Vec<f64> = rhos_view.iter().copied().collect();
+
+    let grad_coef_owned = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
+    let grad_fitted_owned = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
+    let grad_lam_owned = grad_lambdas.as_ref().map(|g| g.as_array().to_owned());
+    let grad_log_lam_owned = grad_log_lambdas.as_ref().map(|g| g.as_array().to_owned());
+    let grad_edf_owned = grad_edf.as_ref().map(|g| g.as_array().to_owned());
+
+    let designs_for_thread = designs_owned.clone();
+    let penalties_for_thread = penalties_owned.clone();
+    let y_for_thread = y_owned.clone();
+    let weights_for_thread = weights_owned.clone();
+    let init_rhos_for_thread = init_rhos.clone();
+
+    let result: Result<(Vec<Array2<f64>>, Vec<Array2<f64>>, Array2<f64>), EstimationError> = py
+        .detach(move || {
+            let n = y_for_thread.len();
+            let f_blocks = designs_for_thread.len();
+
+            let gc_view = grad_coef_owned.as_ref().map(|a| a.view());
+            let gf_view = grad_fitted_owned.as_ref().map(|a| a.view());
+            let gl_view = grad_lam_owned.as_ref().map(|a| a.view());
+            let glog_view = grad_log_lam_owned.as_ref().map(|a| a.view());
+            let ge_view = grad_edf_owned.as_ref().map(|a| a.view());
+
+            let mut designs_work = designs_for_thread.clone();
+            let mut penalties_work = penalties_for_thread.clone();
+            let mut y_work = y_for_thread.clone();
+
+            let mut grad_designs: Vec<Array2<f64>> = designs_for_thread
+                .iter()
+                .map(|d| Array2::<f64>::zeros(d.raw_dim()))
+                .collect();
+            let mut grad_penalties: Vec<Array2<f64>> = penalties_for_thread
+                .iter()
+                .map(|p| Array2::<f64>::zeros(p.raw_dim()))
+                .collect();
+            let mut grad_y: Array2<f64> = Array2::<f64>::zeros((n, 1));
+
+            let weights_view = weights_for_thread.view();
+            let init_slice = init_rhos_for_thread.as_slice();
+
+            // grad_y via central FD.
+            for i in 0..n {
+                let center = y_for_thread[i];
+                let h = fd_step.max(fd_step * center.abs());
+                y_work[i] = center + h;
+                let f_plus = gaussian_reml_blocks_loss(
+                    &designs_work,
+                    &penalties_work,
+                    y_work.view(),
+                    weights_view,
+                    init_slice,
+                    gc_view,
+                    gf_view,
+                    gl_view,
+                    glog_view,
+                    grad_reml_score,
+                    ge_view,
+                )?;
+                y_work[i] = center - h;
+                let f_minus = gaussian_reml_blocks_loss(
+                    &designs_work,
+                    &penalties_work,
+                    y_work.view(),
+                    weights_view,
+                    init_slice,
+                    gc_view,
+                    gf_view,
+                    gl_view,
+                    glog_view,
+                    grad_reml_score,
+                    ge_view,
+                )?;
+                y_work[i] = center;
+                grad_y[[i, 0]] = (f_plus - f_minus) / (2.0 * h);
+            }
+
+            // grad_designs via central FD on each X_k entry.
+            for k in 0..f_blocks {
+                let (n_k, k_cols) = designs_for_thread[k].dim();
+                for r in 0..n_k {
+                    for c in 0..k_cols {
+                        let center = designs_for_thread[k][[r, c]];
+                        let h = fd_step.max(fd_step * center.abs());
+                        designs_work[k][[r, c]] = center + h;
+                        let f_plus = gaussian_reml_blocks_loss(
+                            &designs_work,
+                            &penalties_work,
+                            y_work.view(),
+                            weights_view,
+                            init_slice,
+                            gc_view,
+                            gf_view,
+                            gl_view,
+                            glog_view,
+                            grad_reml_score,
+                            ge_view,
+                        )?;
+                        designs_work[k][[r, c]] = center - h;
+                        let f_minus = gaussian_reml_blocks_loss(
+                            &designs_work,
+                            &penalties_work,
+                            y_work.view(),
+                            weights_view,
+                            init_slice,
+                            gc_view,
+                            gf_view,
+                            gl_view,
+                            glog_view,
+                            grad_reml_score,
+                            ge_view,
+                        )?;
+                        designs_work[k][[r, c]] = center;
+                        grad_designs[k][[r, c]] = (f_plus - f_minus) / (2.0 * h);
+                    }
+                }
+            }
+
+            // grad_penalties via central FD on each S_k entry. Penalties are
+            // symmetric by contract; differentiate the upper triangle and
+            // split equally onto (i,j) and (j,i) so the VJP matches
+            // gradcheck against the raw (non-symmetrized) input matrix.
+            for k in 0..f_blocks {
+                let dim = penalties_for_thread[k].nrows();
+                for i in 0..dim {
+                    for j in i..dim {
+                        let center_ij = penalties_for_thread[k][[i, j]];
+                        if i == j {
+                            let h = fd_step.max(fd_step * center_ij.abs());
+                            penalties_work[k][[i, j]] = center_ij + h;
+                            let f_plus = gaussian_reml_blocks_loss(
+                                &designs_work,
+                                &penalties_work,
+                                y_work.view(),
+                                weights_view,
+                                init_slice,
+                                gc_view,
+                                gf_view,
+                                gl_view,
+                                glog_view,
+                                grad_reml_score,
+                                ge_view,
+                            )?;
+                            penalties_work[k][[i, j]] = center_ij - h;
+                            let f_minus = gaussian_reml_blocks_loss(
+                                &designs_work,
+                                &penalties_work,
+                                y_work.view(),
+                                weights_view,
+                                init_slice,
+                                gc_view,
+                                gf_view,
+                                gl_view,
+                                glog_view,
+                                grad_reml_score,
+                                ge_view,
+                            )?;
+                            penalties_work[k][[i, j]] = center_ij;
+                            grad_penalties[k][[i, j]] = (f_plus - f_minus) / (2.0 * h);
+                        } else {
+                            let center_ji = penalties_for_thread[k][[j, i]];
+                            let h = fd_step.max(fd_step * center_ij.abs());
+                            penalties_work[k][[i, j]] = center_ij + h;
+                            penalties_work[k][[j, i]] = center_ji + h;
+                            let f_plus = gaussian_reml_blocks_loss(
+                                &designs_work,
+                                &penalties_work,
+                                y_work.view(),
+                                weights_view,
+                                init_slice,
+                                gc_view,
+                                gf_view,
+                                gl_view,
+                                glog_view,
+                                grad_reml_score,
+                                ge_view,
+                            )?;
+                            penalties_work[k][[i, j]] = center_ij - h;
+                            penalties_work[k][[j, i]] = center_ji - h;
+                            let f_minus = gaussian_reml_blocks_loss(
+                                &designs_work,
+                                &penalties_work,
+                                y_work.view(),
+                                weights_view,
+                                init_slice,
+                                gc_view,
+                                gf_view,
+                                gl_view,
+                                glog_view,
+                                grad_reml_score,
+                                ge_view,
+                            )?;
+                            penalties_work[k][[i, j]] = center_ij;
+                            penalties_work[k][[j, i]] = center_ji;
+                            let g = (f_plus - f_minus) / (2.0 * h);
+                            grad_penalties[k][[i, j]] = 0.5 * g;
+                            grad_penalties[k][[j, i]] = 0.5 * g;
+                        }
+                    }
+                }
+            }
+
+            Ok((grad_designs, grad_penalties, grad_y))
+        });
+
+    let (grad_designs, grad_penalties, grad_y) =
+        result.map_err(|e| py_value_error(e.to_string()))?;
+
+    let out = PyDict::new(py);
+    let grad_designs_py: Vec<Bound<'py, PyArray2<f64>>> = grad_designs
+        .into_iter()
+        .map(|a| a.into_pyarray(py))
+        .collect();
+    let grad_penalties_py: Vec<Bound<'py, PyArray2<f64>>> = grad_penalties
+        .into_iter()
+        .map(|a| a.into_pyarray(py))
+        .collect();
+    out.set_item("grad_designs", grad_designs_py)?;
+    out.set_item("grad_penalties", grad_penalties_py)?;
+    out.set_item("grad_y", grad_y.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
 /// Constrained Gaussian REML forward fit with a single penalty block and an
 /// optional linear inequality system `A·β ≤ b`.
 ///
@@ -4277,6 +4782,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_backward, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_with_constraints_forward,
         module

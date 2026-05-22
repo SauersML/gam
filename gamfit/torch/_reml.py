@@ -495,6 +495,138 @@ def gaussian_reml_fit_blocks(
     )
 
 
+class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
+    """Forward-only autograd Function for the constrained Gaussian REML fit.
+
+    The Rust active-set + REML driver handles the inner constrained PIRLS
+    and the outer (tangent-projected) REML score for the smoothing
+    parameter. No analytic VJP is exposed through this path yet — backward
+    raises ``NotImplementedError`` so callers can rely on a clear contract
+    rather than silently incorrect gradients.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        penalty: torch.Tensor,
+        weights: torch.Tensor | None,
+        a_inequality: torch.Tensor | None,
+        b_inequality: torch.Tensor | None,
+        init_log_lambda: float | None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        x_np = to_numpy_f64(x)
+        y_np = to_numpy_f64(y)
+        penalty_np = to_numpy_f64(penalty)
+        weights_np = None if weights is None else to_numpy_f64(weights)
+        a_np = None if a_inequality is None else to_numpy_f64(a_inequality)
+        b_np = None if b_inequality is None else to_numpy_f64(b_inequality)
+
+        out = _np_api.gaussian_reml_fit_with_constraints_forward(
+            x_np,
+            y_np,
+            penalty_np,
+            weights=weights_np,
+            init_log_lambda=init_log_lambda,
+            a_inequality=a_np,
+            b_inequality=b_np,
+        )
+
+        _save_diff_tensors(ctx, x, y, penalty, weights, a_inequality, b_inequality)
+
+        coefficients = from_numpy_like(out["coefficients"], x)
+        fitted = from_numpy_like(out["fitted"], x)
+        lam = from_numpy_like(np.asarray(out["lambda"], dtype=np.float64), x)
+        log_lambda = from_numpy_like(
+            np.asarray(out["log_lambda"], dtype=np.float64), x
+        )
+        reml_score = from_numpy_like(
+            np.asarray(out["reml_score"], dtype=np.float64), x
+        )
+        edf = from_numpy_like(np.asarray(out["edf"], dtype=np.float64), x)
+        active_indices_np = np.asarray(out["active_indices"], dtype=np.int64)
+        active_indices = torch.as_tensor(
+            active_indices_np, dtype=torch.int64, device=x.device
+        )
+        return coefficients, fitted, lam, log_lambda, reml_score, edf, active_indices
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
+        raise NotImplementedError(
+            "gaussian_reml_fit_with_constraints is forward-only. The "
+            "analytic VJP through the active-set + REML driver (BUG-3 "
+            "tangent projection at active cert exits, envelope at "
+            "empty-active-set exits) is not yet wired through to Python."
+        )
+
+
+class ConstrainedRemlOutput(NamedTuple):
+    """Forward outputs for the constrained Gaussian REML fit."""
+
+    coefficients: torch.Tensor
+    fitted: torch.Tensor
+    lam: torch.Tensor
+    log_lambda: torch.Tensor
+    reml_score: torch.Tensor
+    edf: torch.Tensor
+    active_indices: torch.Tensor
+
+
+def gaussian_reml_fit_with_constraints(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    penalty: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    init_log_lambda: float | None = None,
+    a_inequality: torch.Tensor | None = None,
+    b_inequality: torch.Tensor | None = None,
+) -> ConstrainedRemlOutput:
+    """Forward-only constrained Gaussian REML fit.
+
+    Routes a single-block design ``x``/penalty ``penalty`` with an optional
+    linear inequality system ``A·β ≥ b`` through the same Rust active-set
+    + REML driver used by the formula-API shape constraints. ``.backward()``
+    on any returned tensor raises :class:`NotImplementedError`.
+    """
+    apply = cast(
+        Callable[
+            ...,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ],
+        _GaussianRemlFitWithConstraintsFn.apply,
+    )
+    coefficients, fitted, lam, log_lambda, reml_score, edf, active_indices = apply(
+        x, y, penalty, weights, a_inequality, b_inequality, init_log_lambda,
+    )
+    return ConstrainedRemlOutput(
+        coefficients=coefficients,
+        fitted=fitted,
+        lam=lam,
+        log_lambda=log_lambda,
+        reml_score=reml_score,
+        edf=edf,
+        active_indices=active_indices,
+    )
+
+
 def gaussian_reml_fit_additive(
     designs: list[torch.Tensor],
     response: torch.Tensor,
@@ -512,19 +644,23 @@ def gaussian_reml_fit_additive(
     returned ``AdditiveRemlOutput.lam`` is a length-``F`` 1D tensor on
     that path.
 
-    For ``F == 1`` (single block), or for multi-output ``response`` of
-    shape ``(N, D>1)`` where the multi-block driver is not yet
-    multi-response, the call falls back to the legacy single-λ
-    closed-form path: the per-smooth ``S_i`` are assembled into a
-    block-diagonal joint penalty and a single scalar λ multiplies the
-    entire block-diagonal, evaluated through the closed-form Gaussian
-    REML kernel. In that fallback ``AdditiveRemlOutput.lam`` is a scalar.
+    Two cases use the closed-form block-diagonal kernel instead:
+
+    * ``F == 1`` — the single-smooth case has no per-smooth-vs-shared λ
+      distinction, so the closed-form kernel produces the exact same fit
+      as multi-block would with one block, with strictly less overhead
+      and full backward differentiability.
+    * Multi-output response (``D > 1``) — the multi-block driver is
+      single-response, so the per-smooth penalties are assembled into a
+      block-diagonal joint penalty and a single scalar λ multiplies the
+      entire block-diagonal. ``AdditiveRemlOutput.lam`` is a scalar in
+      this case.
 
     .. note::
        The multi-block path is forward-only. ``.backward()`` through any
        of its outputs raises ``NotImplementedError`` because the analytic
        VJP through the F×F outer Hessian is a separate workstream. The
-       legacy single-λ fallback (``F == 1`` or ``D > 1``) remains fully
+       closed-form paths (``F == 1`` and ``D > 1``) remain fully
        differentiable.
 
     Parameters

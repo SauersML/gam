@@ -8,13 +8,15 @@ function here is a thin wrapper over the corresponding NumPy entry point in
 Layout:
 
 - Closed-form Gaussian REML fits — :func:`gaussian_reml_fit`, its batched
-  variant :func:`gaussian_reml_fit_batched`, and the multi-smooth additive
-  wrapper :func:`gaussian_reml_fit_additive` (single-λ block-diagonal
-  composition). Forward and backward both go through Rust.
+  variant :func:`gaussian_reml_fit_batched`, the multi-smooth additive
+  wrapper :func:`gaussian_reml_fit_additive`, and the multi-block
+  per-smooth-λ entrypoint :func:`gaussian_reml_fit_blocks`. The
+  closed-form paths have analytic forward and backward through Rust;
+  the multi-block per-smooth-λ path is forward-only.
 - Basis evaluations — :func:`bspline_basis` and :func:`duchon_basis`. The
   B-spline backward routes through the Rust derivative primitive (chain
-  rule applied at the boundary); the multi-dim Duchon basis is currently
-  forward-only with respect to its points input.
+  rule applied at the boundary); the Duchon basis (any dimensionality)
+  is currently forward-only with respect to its points input.
 - Penalty matrix construction and the closed-form ridge solver — forward-only.
 - Response-geometry transforms — forward-only numpy passthrough; for
   differentiable variants compose the underlying torch ops directly.
