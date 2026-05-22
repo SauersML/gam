@@ -416,6 +416,25 @@ fn mask_row_vec<'a>(
     }
 }
 
+/// HT-mask-aware variant of [`weighted_crossprod_psi_maps`]. `None` is
+/// byte-identical to the pre-refactor call. `Some(m)` multiplies the
+/// per-row weight view by `m` before the cross product.
+#[inline]
+fn mxtwx_psi(
+    left: crate::families::custom_family::CustomFamilyPsiLinearMapRef<'_>,
+    weights: ArrayView1<'_, f64>,
+    right: crate::families::custom_family::CustomFamilyPsiLinearMapRef<'_>,
+    mask: Option<&Array1<f64>>,
+) -> Result<Array2<f64>, String> {
+    match mask {
+        Some(m) => {
+            let masked = &weights * m;
+            weighted_crossprod_psi_maps(left, masked.view(), right)
+        }
+        None => weighted_crossprod_psi_maps(left, weights, right),
+    }
+}
+
 /// Layer 2 defense: compute q0 = -eta_t * exp(-eta_ls) with log-space
 /// overflow detection.  When log|q0| = ln|eta_t| + (-eta_ls) exceeds the
 /// clamp ceiling, the product would overflow; we saturate to ±MAX instead.
@@ -8735,20 +8754,29 @@ impl SurvivalLocationScaleFamily {
             + &(&q.d3q_tls_ls * &exit_cross)
             + &(&q.d3q_ls * &(&dir_i.z_ls_exit_psi * &dir_j.z_ls_exit_psi));
 
-        let objective_psi_psi = (&q.d2_q0 * &(&q0_i * &q0_j)).sum()
-            + q.d1_q0.dot(&q0_ab)
-            + (&q.d2_q1 * &(&q1_i * &q1_j)).sum()
-            + q.d1_q1.dot(&q1_ab);
+        let objective_psi_psi = if let Some(m) = row_mask {
+            (&(&q.d2_q0 * &(&q0_i * &q0_j)) * m).sum()
+                + (&(&q.d1_q0 * &q0_ab) * m).sum()
+                + (&(&q.d2_q1 * &(&q1_i * &q1_j)) * m).sum()
+                + (&(&q.d1_q1 * &q1_ab) * m).sum()
+        } else {
+            (&q.d2_q0 * &(&q0_i * &q0_j)).sum()
+                + q.d1_q0.dot(&q0_ab)
+                + (&q.d2_q1 * &(&q1_i * &q1_j)).sum()
+                + q.d1_q1.dot(&q1_ab)
+        };
 
         let mut score_psi_psi = Array1::<f64>::zeros(p_total);
+        let time_row_entry = -(&q.d3_q0 * &(&q0_i * &q0_j) + &q.d2_q0 * &q0_ab);
+        let time_row_exit = -(&q.d3_q1 * &(&q1_i * &q1_j) + &q.d2_q1 * &q1_ab);
         let time_score = self
             .x_time_entry
             .t()
-            .dot(&(-(&q.d3_q0 * &(&q0_i * &q0_j) + &q.d2_q0 * &q0_ab)))
+            .dot(&*mask_row_vec(&time_row_entry, row_mask))
             + self
                 .x_time_exit
                 .t()
-                .dot(&(-(&q.d3_q1 * &(&q1_i * &q1_j) + &q.d2_q1 * &q1_ab)));
+                .dot(&*mask_row_vec(&time_row_exit, row_mask));
         score_psi_psi
             .slice_mut(s![offsets[0]..offsets[1]])
             .assign(&time_score);
@@ -8769,14 +8797,24 @@ impl SurvivalLocationScaleFamily {
             + &(&q.d2_q0 * &q0_ab * dq_t_entry)
             + &(&q.d2_q0 * &(&q0_i * &dq_t_entry_j + &q0_j * &dq_t_entry_i))
             + &(&q.d1_q0 * dq_t_entry_ab);
-        let threshold_score = x_t_exit_ab_map.transpose_mul(threshold_score_row_exit.view())
-            + x_t_exit_i_map.transpose_mul(d_threshold_score_row_exit_j.view())
-            + x_t_exit_j_map.transpose_mul(d_threshold_score_row_exit_i.view())
-            + x_threshold_exit.t().dot(&d2_threshold_score_row_exit)
-            + x_t_entry_ab_map.transpose_mul(threshold_score_row_entry.view())
-            + x_t_entry_i_map.transpose_mul(d_threshold_score_row_entry_j.view())
-            + x_t_entry_j_map.transpose_mul(d_threshold_score_row_entry_i.view())
-            + x_threshold_entry.t().dot(&d2_threshold_score_row_entry);
+        let threshold_score = x_t_exit_ab_map
+            .transpose_mul(mask_row_vec(&threshold_score_row_exit, row_mask).view())
+            + x_t_exit_i_map
+                .transpose_mul(mask_row_vec(&d_threshold_score_row_exit_j, row_mask).view())
+            + x_t_exit_j_map
+                .transpose_mul(mask_row_vec(&d_threshold_score_row_exit_i, row_mask).view())
+            + x_threshold_exit
+                .t()
+                .dot(&*mask_row_vec(&d2_threshold_score_row_exit, row_mask))
+            + x_t_entry_ab_map
+                .transpose_mul(mask_row_vec(&threshold_score_row_entry, row_mask).view())
+            + x_t_entry_i_map
+                .transpose_mul(mask_row_vec(&d_threshold_score_row_entry_j, row_mask).view())
+            + x_t_entry_j_map
+                .transpose_mul(mask_row_vec(&d_threshold_score_row_entry_i, row_mask).view())
+            + x_threshold_entry
+                .t()
+                .dot(&*mask_row_vec(&d2_threshold_score_row_entry, row_mask));
         score_psi_psi
             .slice_mut(s![offsets[1]..offsets[2]])
             .assign(&threshold_score);
@@ -8797,25 +8835,34 @@ impl SurvivalLocationScaleFamily {
             + &(&q.d2_q0 * &q0_ab * dq_ls_entry)
             + &(&q.d2_q0 * &(&q0_i * &dq_ls_entry_j + &q0_j * &dq_ls_entry_i))
             + &(&q.d1_q0 * dq_ls_entry_ab);
-        let log_sigma_score = x_ls_exit_ab_map.transpose_mul(log_sigma_score_row_exit.view())
-            + x_ls_exit_i_map.transpose_mul(d_log_sigma_score_row_exit_j.view())
-            + x_ls_exit_j_map.transpose_mul(d_log_sigma_score_row_exit_i.view())
-            + x_log_sigma_exit.t().dot(&d2_log_sigma_score_row_exit)
-            + x_ls_entry_ab_map.transpose_mul(log_sigma_score_row_entry.view())
-            + x_ls_entry_i_map.transpose_mul(d_log_sigma_score_row_entry_j.view())
-            + x_ls_entry_j_map.transpose_mul(d_log_sigma_score_row_entry_i.view())
-            + x_log_sigma_entry.t().dot(&d2_log_sigma_score_row_entry);
+        let log_sigma_score = x_ls_exit_ab_map
+            .transpose_mul(mask_row_vec(&log_sigma_score_row_exit, row_mask).view())
+            + x_ls_exit_i_map
+                .transpose_mul(mask_row_vec(&d_log_sigma_score_row_exit_j, row_mask).view())
+            + x_ls_exit_j_map
+                .transpose_mul(mask_row_vec(&d_log_sigma_score_row_exit_i, row_mask).view())
+            + x_log_sigma_exit
+                .t()
+                .dot(&*mask_row_vec(&d2_log_sigma_score_row_exit, row_mask))
+            + x_ls_entry_ab_map
+                .transpose_mul(mask_row_vec(&log_sigma_score_row_entry, row_mask).view())
+            + x_ls_entry_i_map
+                .transpose_mul(mask_row_vec(&d_log_sigma_score_row_entry_j, row_mask).view())
+            + x_ls_entry_j_map
+                .transpose_mul(mask_row_vec(&d_log_sigma_score_row_entry_i, row_mask).view())
+            + x_log_sigma_entry
+                .t()
+                .dot(&*mask_row_vec(&d2_log_sigma_score_row_entry, row_mask));
         score_psi_psi
             .slice_mut(s![offsets[2]..offsets[3]])
             .assign(&log_sigma_score);
 
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
-            let wiggle_score = xw_dense.t().dot(
-                &(&q.d3_q0 * &(&q0_i * &q0_j)
-                    + &q.d2_q0 * &q0_ab
-                    + &q.d3_q1 * &(&q1_i * &q1_j)
-                    + &q.d2_q1 * &q1_ab),
-            );
+            let wiggle_row = &q.d3_q0 * &(&q0_i * &q0_j)
+                + &q.d2_q0 * &q0_ab
+                + &q.d3_q1 * &(&q1_i * &q1_j)
+                + &q.d2_q1 * &q1_ab;
+            let wiggle_score = xw_dense.t().dot(&*mask_row_vec(&wiggle_row, row_mask));
             score_psi_psi
                 .slice_mut(s![w_offset..offsets[4]])
                 .assign(&wiggle_score);
@@ -8843,7 +8890,7 @@ impl SurvivalLocationScaleFamily {
             + &(2.0 * &q.d2_q0 * dq_t_entry * &dq_t_entry_j));
         let dh_tt_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_t.mapv(|v| safe_product(v, v))
             + &(2.0 * &q.d2_q1 * &q.dq_t * &dq_t_exit_j));
-        let h_threshold_threshold = weighted_crossprod_psi_maps(
+        let h_threshold_threshold = mxtwx_psi(
             x_t_exit_ab_map,
             h_tt_exit.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_threshold_exit),
@@ -8907,6 +8954,7 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
             dh_tt_entry_i.view(),
             x_t_entry_j_map,
+            row_mask,
         )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
@@ -8935,7 +8983,7 @@ impl SurvivalLocationScaleFamily {
             + &(2.0 * &q.d2_q1 * &q.dq_ls * &dq_ls_exit_j)
             + &(&q.d2_q1 * &q1_j * &q.d2q_ls)
             + &(&q.d1_q1 * &d2q_ls_exit_j));
-        let h_log_sigma_log_sigma = weighted_crossprod_psi_maps(
+        let h_log_sigma_log_sigma = mxtwx_psi(
             x_ls_exit_ab_map,
             h_ll_exit.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_exit),
@@ -8999,6 +9047,7 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_entry),
             dh_ll_entry_i.view(),
             x_ls_entry_j_map,
+            row_mask,
         )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
@@ -9025,7 +9074,7 @@ impl SurvivalLocationScaleFamily {
             + &(&q.d2_q1 * &(&dq_t_exit_j * &q.dq_ls + &q.dq_t * &dq_ls_exit_j))
             + &(&q.d2_q1 * &q1_j * &q.d2q_tls)
             + &(&q.d1_q1 * &d2q_tls_exit_j));
-        let h_threshold_log_sigma = weighted_crossprod_psi_maps(
+        let h_threshold_log_sigma = mxtwx_psi(
             x_t_exit_ab_map,
             h_tl_exit.view(),
             CustomFamilyPsiLinearMapRef::Dense(x_log_sigma_exit),
@@ -9089,6 +9138,7 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(x_threshold_entry),
             dh_tl_entry_i.view(),
             x_ls_entry_j_map,
+            row_mask,
         )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
@@ -9103,7 +9153,7 @@ impl SurvivalLocationScaleFamily {
         let dh_h1_t_i = &q.d3_q1 * &q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i;
         let dh_h0_t_j = &q.d3_q0 * &q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j;
         let dh_h1_t_j = &q.d3_q1 * &q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j;
-        let h_time_threshold = weighted_crossprod_psi_maps(
+        let h_time_threshold = mxtwx_psi(
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
             dh_h0_t_j.view(),
             x_t_entry_i_map,
@@ -9127,6 +9177,7 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
             h_h1_t.view(),
             x_t_exit_ab_map,
+            row_mask,
         )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
@@ -9141,7 +9192,7 @@ impl SurvivalLocationScaleFamily {
         let dh_h1_ls_i = &q.d3_q1 * &q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i;
         let dh_h0_ls_j = &q.d3_q0 * &q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j;
         let dh_h1_ls_j = &q.d3_q1 * &q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j;
-        let h_time_log_sigma = weighted_crossprod_psi_maps(
+        let h_time_log_sigma = mxtwx_psi(
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
             dh_h0_ls_j.view(),
             x_ls_entry_i_map,
@@ -9165,6 +9216,7 @@ impl SurvivalLocationScaleFamily {
             CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
             h_h1_ls.view(),
             x_ls_exit_ab_map,
+            row_mask,
         )?;
         assign_symmetric_block(
             &mut hessian_psi_psi,
@@ -9175,7 +9227,7 @@ impl SurvivalLocationScaleFamily {
 
         if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
             let h_ww = -(&q.d3_q0 * &q0_ab + &q.d3_q1 * &q1_ab);
-            let h_wiggle_wiggle = weighted_crossprod_dense(xw_dense, &h_ww, xw_dense)?;
+            let h_wiggle_wiggle = mxtwx(xw_dense, &h_ww, xw_dense, row_mask)?;
             assign_symmetric_block(&mut hessian_psi_psi, w_offset, w_offset, &h_wiggle_wiggle);
 
             let h_tw_entry = -(&q.d2_q0 * dq_t_entry);
@@ -9184,7 +9236,7 @@ impl SurvivalLocationScaleFamily {
             let dh_tw_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_t + &q.d2_q1 * &dq_t_exit_i);
             let dh_tw_entry_j = -(&q.d3_q0 * &q0_j * dq_t_entry + &q.d2_q0 * &dq_t_entry_j);
             let dh_tw_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_t + &q.d2_q1 * &dq_t_exit_j);
-            let h_threshold_wiggle = weighted_crossprod_psi_maps(
+            let h_threshold_wiggle = mxtwx_psi(
                 x_t_exit_i_map,
                 dh_tw_exit_j.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
@@ -9208,6 +9260,7 @@ impl SurvivalLocationScaleFamily {
                 x_t_entry_ab_map,
                 h_tw_entry.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+                row_mask,
             )?;
             assign_symmetric_block(
                 &mut hessian_psi_psi,
@@ -9222,7 +9275,7 @@ impl SurvivalLocationScaleFamily {
             let dh_lw_exit_i = -(&q.d3_q1 * &q1_i * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_i);
             let dh_lw_entry_j = -(&q.d3_q0 * &q0_j * dq_ls_entry + &q.d2_q0 * &dq_ls_entry_j);
             let dh_lw_exit_j = -(&q.d3_q1 * &q1_j * &q.dq_ls + &q.d2_q1 * &dq_ls_exit_j);
-            let h_log_sigma_wiggle = weighted_crossprod_psi_maps(
+            let h_log_sigma_wiggle = mxtwx_psi(
                 x_ls_exit_i_map,
                 dh_lw_exit_j.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
@@ -9246,6 +9299,7 @@ impl SurvivalLocationScaleFamily {
                 x_ls_entry_ab_map,
                 h_lw_entry.view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+                row_mask,
             )?;
             assign_symmetric_block(
                 &mut hessian_psi_psi,
@@ -9254,7 +9308,7 @@ impl SurvivalLocationScaleFamily {
                 &h_log_sigma_wiggle,
             );
 
-            let h_time_wiggle = weighted_crossprod_psi_maps(
+            let h_time_wiggle = mxtwx_psi(
                 CustomFamilyPsiLinearMapRef::Dense(&self.x_time_entry),
                 (&q.d3_q0 * &q0_ab).view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
@@ -9262,6 +9316,7 @@ impl SurvivalLocationScaleFamily {
                 CustomFamilyPsiLinearMapRef::Dense(&self.x_time_exit),
                 (&q.d3_q1 * &q1_ab).view(),
                 CustomFamilyPsiLinearMapRef::Dense(xw_dense),
+                row_mask,
             )?;
             assign_symmetric_block(&mut hessian_psi_psi, offsets[0], w_offset, &h_time_wiggle);
         }
