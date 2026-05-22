@@ -8741,8 +8741,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         // at `max_iter`, so unconverged divergent runs (which have large |g|)
         // still surface as errors.
         let final_grad = outer_result.final_grad_norm_or_nan();
-        let rel_to_cost_threshold =
-            options.tol * (1.0_f64 + outer_result.final_value.abs());
+        let rel_to_cost_threshold = options.tol * (1.0_f64 + outer_result.final_value.abs());
         if final_grad.is_finite() && final_grad <= rel_to_cost_threshold {
             log::info!(
                 "[spatial-adaptive] outer optimization hit max_iter={} but \
