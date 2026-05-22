@@ -46,7 +46,10 @@ use gam::terms::basis::{
     create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, LikelihoodFamily};
+use gam::families::survival_location_scale::{
+    ResidualDistribution, residual_distribution_from_inverse_link,
+};
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
@@ -4672,6 +4675,7 @@ fn design_matrix_dense(
         training_headers,
         dense,
     )
+    .map_err(|err| err.to_string())
 }
 
 #[derive(Serialize)]
@@ -5159,7 +5163,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         .collect();
     let payload = SummaryPayload {
         formula: model.payload().formula.clone(),
-        family_name: pretty_familyname(model.likelihood()).to_string(),
+        family_name: model.likelihood().pretty_name().to_string(),
         model_class: prediction_model_class_label(&model),
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
@@ -5214,7 +5218,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         .collect::<Vec<_>>();
     let report_input = ReportInput {
         model_path: "<in-memory>".to_string(),
-        family_name: pretty_familyname(model.likelihood()).to_string(),
+        family_name: model.likelihood().pretty_name().to_string(),
         model_class: prediction_model_class_label(&model),
         formula: model.payload().formula.clone(),
         n_obs: None,
@@ -5567,7 +5571,7 @@ fn group_metadata_from_groups(groups: serde_json::Value) -> Result<Option<GroupM
 fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bool) {
     match request {
         FitRequest::Standard(standard_request) => {
-            (pretty_familyname(standard_request.family), "standard", true)
+            (standard_request.family.pretty_name(), "standard", true)
         }
         FitRequest::GaussianLocationScale(_) => {
             ("Gaussian location-scale", "gaussian location-scale", true)
@@ -6811,7 +6815,7 @@ fn build_standard_payload(
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: family,
-            link: Some(family_to_link(family)),
+            link: Some(family.link_function()),
             latent_cloglog_state,
             mixture_state: saved_mixture_state_from_fit(saved_fit),
             sas_state: saved_sas_state_from_fit(saved_fit),
@@ -6821,7 +6825,7 @@ fn build_standard_payload(
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit.clone());
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(family_to_link(family).name().to_string());
+    payload.link = Some(InverseLink::Standard(family.link_function()));
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
@@ -6932,7 +6936,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
     payload.latent_z_rank_int_calibration = ms_result.latent_z_rank_int_calibration.clone();
     payload.marginal_baseline = Some(ms_result.baseline_marginal);
     payload.logslope_baseline = Some(ms_result.baseline_logslope);
-    payload.link = Some(base_link.saved_string());
+    payload.link = Some(base_link.clone());
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
@@ -7045,7 +7049,7 @@ fn build_survival_marginal_slope_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodFamily::RoystonParmar,
             survival_likelihood: Some("marginal-slope".to_string()),
-            survival_distribution: Some("probit".to_string()),
+            survival_distribution: Some(ResidualDistribution::Gaussian),
             frailty,
         },
         "royston-parmar".to_string(),
@@ -7069,8 +7073,8 @@ fn build_survival_marginal_slope_ffi_payload(
     ));
     payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
     payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
-    payload.survival_distribution = Some("probit".to_string());
-    payload.link = Some("probit".to_string());
+    payload.survival_distribution = Some(ResidualDistribution::Gaussian);
+    payload.link = Some(InverseLink::Standard(LinkFunction::Probit));
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(frozen_marginal);
     payload.resolved_termspec_logslope = Some(frozen_logslope);
@@ -7331,7 +7335,7 @@ fn build_binomial_location_scale_ffi_payload(
     payload.unified = Some(fit.clone());
     payload.fit_result = Some(fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(link_kind.saved_string());
+    payload.link = Some(link_kind.clone());
     payload.formula_noise = Some(noise_formula);
     payload.beta_noise = scale_beta;
     payload.noise_projection = Some(
@@ -7498,7 +7502,7 @@ fn build_survival_location_scale_ffi_payload(
         FittedFamily::Survival {
             likelihood: LikelihoodFamily::RoystonParmar,
             survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
-            survival_distribution: Some(fitted_inverse_link.saved_string()),
+            survival_distribution: residual_distribution_from_inverse_link(&fitted_inverse_link),
             frailty: gam::families::lognormal_kernel::FrailtySpec::None,
         },
         "royston-parmar".to_string(),
@@ -7506,7 +7510,7 @@ fn build_survival_location_scale_ffi_payload(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(fitted_inverse_link.saved_string());
+    payload.link = Some(fitted_inverse_link.clone());
     payload.linkwiggle_degree = ls_result.wiggle_degree;
     payload.beta_link_wiggle = ls_result
         .fit
@@ -7545,7 +7549,7 @@ fn build_survival_location_scale_ffi_payload(
     payload.survival_noise_center = Some(survival_noise_transform.weighted_column_mean.to_vec());
     payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
     payload.survival_noise_non_intercept_start = Some(survival_noise_transform.non_intercept_start);
-    payload.survival_distribution = Some(fitted_inverse_link.saved_string());
+    payload.survival_distribution = residual_distribution_from_inverse_link(&fitted_inverse_link);
     payload.training_headers = Some(dataset.headers.clone());
     payload.resolved_termspec = Some(
         freeze_term_collection_from_design(
@@ -8328,7 +8332,7 @@ mod tests {
             ModelKind::Standard,
             FittedFamily::Standard {
                 likelihood: LikelihoodFamily::GaussianIdentity,
-                link: Some(family_to_link(LikelihoodFamily::GaussianIdentity)),
+                link: Some(LikelihoodFamily::GaussianIdentity.link_function()),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
