@@ -42,6 +42,64 @@ use std::sync::Arc;
 
 const MIN_WEIGHT: f64 = 1e-12;
 
+/// Typed error for the latent-survival / latent-binary family kernels and
+/// their fit-time and per-row validation helpers. Variants pick the semantic
+/// bucket while the inner `reason` carries the original byte-equivalent
+/// message so external callers that previously consumed `String` errors keep
+/// the same diagnostic text via `Display`.
+#[derive(Debug, Clone)]
+pub enum LatentSurvivalError {
+    /// The frailty spec supplied to a latent-survival or latent-binary
+    /// helper is incompatible (wrong variant, missing fixed sigma, non-finite
+    /// or negative fixed sigma).
+    InvalidFrailty { reason: String },
+    /// Per-row dataset validation failed: empty input, size mismatch across
+    /// the spec vectors, or invalid age / event / weight / unloaded-mass
+    /// values for an individual row.
+    InvalidDataset { reason: String },
+    /// A parameter-block state, eta vector, or directional-derivative
+    /// argument supplied to a family entry point has the wrong length.
+    BlockMismatch { reason: String },
+    /// A runtime numerical value (sigma, baseline hazard derivative, kernel
+    /// sum, event probability) became non-finite or out-of-domain.
+    NumericalFailure { reason: String },
+    /// The requested combination of time-block structure or event type is
+    /// not implemented (non-structural monotonicity, interval-censored rows
+    /// on the dynamic-derivative path).
+    UnsupportedConfiguration { reason: String },
+}
+
+impl std::fmt::Display for LatentSurvivalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LatentSurvivalError::InvalidFrailty { reason }
+            | LatentSurvivalError::InvalidDataset { reason }
+            | LatentSurvivalError::BlockMismatch { reason }
+            | LatentSurvivalError::NumericalFailure { reason }
+            | LatentSurvivalError::UnsupportedConfiguration { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for LatentSurvivalError {}
+
+impl From<LatentSurvivalError> for String {
+    fn from(err: LatentSurvivalError) -> String {
+        err.to_string()
+    }
+}
+
+impl From<String> for LatentSurvivalError {
+    /// Inbound conversion for the many `Result<_, String>` helpers this
+    /// module still calls into (term-collection design assembly, dense
+    /// chunk conversion, sparse linear constraints). The text is preserved
+    /// verbatim; we only pick a category so external messages flow through
+    /// `?` without per-callsite `.map_err`.
+    fn from(reason: String) -> LatentSurvivalError {
+        LatentSurvivalError::InvalidDataset { reason }
+    }
+}
+
 #[derive(Clone)]
 pub struct LatentSurvivalTermSpec {
     pub age_entry: Array1<f64>,
@@ -157,27 +215,33 @@ impl LatentSurvivalFamily {
             ArrayView1<'a, f64>,
             &'a Array1<f64>,
         ),
-        String,
+        LatentSurvivalError,
     > {
         let expected_blocks = if self.latent_sd_fixed.is_some() { 2 } else { 3 };
         if block_states.len() != expected_blocks {
-            return Err(format!(
-                "LatentSurvivalFamily expects {expected_blocks} blocks, got {}",
-                block_states.len(),
-            ));
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: format!(
+                    "LatentSurvivalFamily expects {expected_blocks} blocks, got {}",
+                    block_states.len(),
+                ),
+            });
         }
         let n = self.event_target.len();
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
         let eta_mean = &block_states[Self::BLOCK_MEAN].eta;
         if eta_time.len() != 3 * n {
-            return Err(format!(
-                "latent survival time eta length mismatch: got {}, expected {}",
-                eta_time.len(),
-                3 * n
-            ));
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: format!(
+                    "latent survival time eta length mismatch: got {}, expected {}",
+                    eta_time.len(),
+                    3 * n
+                ),
+            });
         }
         if eta_mean.len() != n || self.weights.len() != n {
-            return Err("latent survival mean eta dimension mismatch".to_string());
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: "latent survival mean eta dimension mismatch".to_string(),
+            });
         }
         Ok((
             eta_time.slice(s![0..n]),
@@ -187,19 +251,23 @@ impl LatentSurvivalFamily {
         ))
     }
 
-    fn latent_sd(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
+    fn latent_sd(&self, block_states: &[ParameterBlockState]) -> Result<f64, LatentSurvivalError> {
         if let Some(sigma) = self.latent_sd_fixed {
             return Ok(sigma);
         }
         let eta = *block_states
             .get(Self::BLOCK_LOG_SIGMA)
             .and_then(|state| state.eta.get(0))
-            .ok_or_else(|| "latent survival learnable log_sigma block is missing".to_string())?;
+            .ok_or_else(|| LatentSurvivalError::BlockMismatch {
+                reason: "latent survival learnable log_sigma block is missing".to_string(),
+            })?;
         let sigma = exp_sigma_from_eta_scalar(eta);
         if !(sigma.is_finite() && sigma > 0.0) {
-            return Err(format!(
-                "latent survival learnable sigma became invalid: log_sigma={eta}, sigma={sigma}"
-            ));
+            return Err(LatentSurvivalError::NumericalFailure {
+                reason: format!(
+                    "latent survival learnable sigma became invalid: log_sigma={eta}, sigma={sigma}"
+                ),
+            });
         }
         Ok(sigma)
     }
@@ -212,25 +280,32 @@ impl LatentBinaryFamily {
     fn split_time_eta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
-    ) -> Result<(ArrayView1<'a, f64>, ArrayView1<'a, f64>, &'a Array1<f64>), String> {
+    ) -> Result<(ArrayView1<'a, f64>, ArrayView1<'a, f64>, &'a Array1<f64>), LatentSurvivalError>
+    {
         if block_states.len() != 2 {
-            return Err(format!(
-                "LatentBinaryFamily expects 2 blocks, got {}",
-                block_states.len()
-            ));
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: format!(
+                    "LatentBinaryFamily expects 2 blocks, got {}",
+                    block_states.len()
+                ),
+            });
         }
         let n = self.event_target.len();
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
         let eta_mean = &block_states[Self::BLOCK_MEAN].eta;
         if eta_time.len() != 3 * n {
-            return Err(format!(
-                "latent binary time eta length mismatch: got {}, expected {}",
-                eta_time.len(),
-                3 * n
-            ));
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: format!(
+                    "latent binary time eta length mismatch: got {}, expected {}",
+                    eta_time.len(),
+                    3 * n
+                ),
+            });
         }
         if eta_mean.len() != n || self.weights.len() != n {
-            return Err("latent binary mean eta dimension mismatch".to_string());
+            return Err(LatentSurvivalError::BlockMismatch {
+                reason: "latent binary mean eta dimension mismatch".to_string(),
+            });
         }
         Ok((
             eta_time.slice(s![0..n]),
@@ -244,6 +319,13 @@ pub fn fixed_latent_hazard_frailty(
     frailty: &FrailtySpec,
     context: &str,
 ) -> Result<(f64, HazardLoading), String> {
+    fixed_latent_hazard_frailty_typed(frailty, context).map_err(Into::into)
+}
+
+fn fixed_latent_hazard_frailty_typed(
+    frailty: &FrailtySpec,
+    context: &str,
+) -> Result<(f64, HazardLoading), LatentSurvivalError> {
     match frailty {
         FrailtySpec::HazardMultiplier {
             sigma_fixed: Some(sigma),
@@ -252,20 +334,22 @@ pub fn fixed_latent_hazard_frailty(
         FrailtySpec::HazardMultiplier {
             sigma_fixed: Some(sigma),
             ..
-        } => Err(format!(
-            "{context} requires a finite fixed hazard-multiplier sigma >= 0, got {sigma}"
-        )),
+        } => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!(
+                "{context} requires a finite fixed hazard-multiplier sigma >= 0, got {sigma}"
+            ),
+        }),
         FrailtySpec::HazardMultiplier {
             sigma_fixed: None, ..
-        } => Err(format!(
-            "{context} currently requires a fixed hazard-multiplier sigma"
-        )),
-        FrailtySpec::GaussianShift { .. } => Err(format!(
-            "{context} requires HazardMultiplier frailty, not GaussianShift"
-        )),
-        FrailtySpec::None => Err(format!(
-            "{context} requires a fixed HazardMultiplier frailty specification"
-        )),
+        } => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!("{context} currently requires a fixed hazard-multiplier sigma"),
+        }),
+        FrailtySpec::GaussianShift { .. } => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!("{context} requires HazardMultiplier frailty, not GaussianShift"),
+        }),
+        FrailtySpec::None => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!("{context} requires a fixed HazardMultiplier frailty specification"),
+        }),
     }
 }
 
@@ -273,14 +357,21 @@ pub fn latent_hazard_loading(
     frailty: &FrailtySpec,
     context: &str,
 ) -> Result<HazardLoading, String> {
+    latent_hazard_loading_typed(frailty, context).map_err(Into::into)
+}
+
+fn latent_hazard_loading_typed(
+    frailty: &FrailtySpec,
+    context: &str,
+) -> Result<HazardLoading, LatentSurvivalError> {
     match frailty {
         FrailtySpec::HazardMultiplier { loading, .. } => Ok(*loading),
-        FrailtySpec::GaussianShift { .. } => Err(format!(
-            "{context} requires HazardMultiplier frailty, not GaussianShift"
-        )),
-        FrailtySpec::None => Err(format!(
-            "{context} requires a HazardMultiplier frailty specification"
-        )),
+        FrailtySpec::GaussianShift { .. } => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!("{context} requires HazardMultiplier frailty, not GaussianShift"),
+        }),
+        FrailtySpec::None => Err(LatentSurvivalError::InvalidFrailty {
+            reason: format!("{context} requires a HazardMultiplier frailty specification"),
+        }),
     }
 }
 
@@ -383,7 +474,7 @@ fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentSurvivalTermSpec,
     frailty: &FrailtySpec,
-) -> Result<Option<f64>, String> {
+) -> Result<Option<f64>, LatentSurvivalError> {
     let (sigma, hazard_loading) = match frailty {
         FrailtySpec::HazardMultiplier {
             sigma_fixed,
@@ -392,26 +483,32 @@ fn validate_latent_survival_inputs(
             if let Some(sigma) = sigma_fixed
                 && (!sigma.is_finite() || *sigma < 0.0)
             {
-                return Err(format!(
-                    "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
-                ));
+                return Err(LatentSurvivalError::InvalidFrailty {
+                    reason: format!(
+                        "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
+                    ),
+                });
             }
             (*sigma_fixed, *loading)
         }
         FrailtySpec::GaussianShift { .. } => {
-            return Err(
-                "latent-survival requires HazardMultiplier frailty, not GaussianShift".to_string(),
-            );
+            return Err(LatentSurvivalError::InvalidFrailty {
+                reason: "latent-survival requires HazardMultiplier frailty, not GaussianShift"
+                    .to_string(),
+            });
         }
         FrailtySpec::None => {
-            return Err(
-                "latent-survival requires a HazardMultiplier frailty specification".to_string(),
-            );
+            return Err(LatentSurvivalError::InvalidFrailty {
+                reason: "latent-survival requires a HazardMultiplier frailty specification"
+                    .to_string(),
+            });
         }
     };
     let n = data.nrows();
     if n == 0 {
-        return Err("latent-survival requires a non-empty dataset".to_string());
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: "latent-survival requires a non-empty dataset".to_string(),
+        });
     }
     if spec.age_entry.len() != n
         || spec.age_exit.len() != n
@@ -422,23 +519,27 @@ fn validate_latent_survival_inputs(
         || spec.unloaded_hazard_exit.len() != n
         || spec.mean_offset.len() != n
     {
-        return Err(format!(
-            "latent-survival size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, unloaded_hazard={}, offset={}",
-            spec.age_entry.len(),
-            spec.age_exit.len(),
-            spec.event_target.len(),
-            spec.weights.len(),
-            spec.unloaded_mass_entry.len(),
-            spec.unloaded_mass_exit.len(),
-            spec.unloaded_hazard_exit.len(),
-            spec.mean_offset.len()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-survival size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, unloaded_hazard={}, offset={}",
+                spec.age_entry.len(),
+                spec.age_exit.len(),
+                spec.event_target.len(),
+                spec.weights.len(),
+                spec.unloaded_mass_entry.len(),
+                spec.unloaded_mass_exit.len(),
+                spec.unloaded_hazard_exit.len(),
+                spec.mean_offset.len()
+            ),
+        });
     }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard < 0.0 {
-        return Err(format!(
-            "latent-survival derivative_guard must be finite and >= 0, got {}",
-            spec.derivative_guard
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-survival derivative_guard must be finite and >= 0, got {}",
+                spec.derivative_guard
+            ),
+        });
     }
     for i in 0..n {
         let entry = spec.age_entry[i];
@@ -449,34 +550,42 @@ fn validate_latent_survival_inputs(
         let unloaded_exit = spec.unloaded_mass_exit[i];
         let unloaded_hazard = spec.unloaded_hazard_exit[i];
         if !entry.is_finite() || !exit.is_finite() {
-            return Err(format!(
-                "latent-survival row {} has non-finite entry/exit ages: entry={}, exit={}",
-                i + 1,
-                entry,
-                exit
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-survival row {} has non-finite entry/exit ages: entry={}, exit={}",
+                    i + 1,
+                    entry,
+                    exit
+                ),
+            });
         }
         if entry < 0.0 || exit < entry {
-            return Err(format!(
-                "latent-survival row {} has invalid delayed-entry bounds: entry={}, exit={}",
-                i + 1,
-                entry,
-                exit
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-survival row {} has invalid delayed-entry bounds: entry={}, exit={}",
+                    i + 1,
+                    entry,
+                    exit
+                ),
+            });
         }
         if event > 1 {
-            return Err(format!(
-                "latent-survival row {} has invalid event target {}; expected 0 or 1",
-                i + 1,
-                event
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-survival row {} has invalid event target {}; expected 0 or 1",
+                    i + 1,
+                    event
+                ),
+            });
         }
         if !weight.is_finite() || weight < 0.0 {
-            return Err(format!(
-                "latent-survival row {} has invalid weight {}; expected a finite non-negative weight",
-                i + 1,
-                weight
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-survival row {} has invalid weight {}; expected a finite non-negative weight",
+                    i + 1,
+                    weight
+                ),
+            });
         }
         if !unloaded_entry.is_finite()
             || !unloaded_exit.is_finite()
@@ -485,13 +594,15 @@ fn validate_latent_survival_inputs(
             || unloaded_exit < unloaded_entry
             || unloaded_hazard < 0.0
         {
-            return Err(format!(
-                "latent-survival row {} has invalid unloaded hazard decomposition: entry_mass={}, exit_mass={}, exit_hazard={}",
-                i + 1,
-                unloaded_entry,
-                unloaded_exit,
-                unloaded_hazard
-            ));
+            return Err(LatentSurvivalError::InvalidDataset {
+                reason: format!(
+                    "latent-survival row {} has invalid unloaded hazard decomposition: entry_mass={}, exit_mass={}, exit_hazard={}",
+                    i + 1,
+                    unloaded_entry,
+                    unloaded_exit,
+                    unloaded_hazard
+                ),
+            });
         }
         validate_unloaded_components_for_loading(
             "latent-survival",
@@ -508,35 +619,41 @@ fn validate_latent_survival_inputs(
         || time_block.design_exit.nrows() != n
         || time_block.design_derivative_exit.nrows() != n
     {
-        return Err(format!(
-            "latent-survival time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
-            n,
-            time_block.design_entry.nrows(),
-            time_block.design_exit.nrows(),
-            time_block.design_derivative_exit.nrows()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-survival time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
+                n,
+                time_block.design_entry.nrows(),
+                time_block.design_exit.nrows(),
+                time_block.design_derivative_exit.nrows()
+            ),
+        });
     }
     if time_block.design_entry.ncols() != p_time
         || time_block.design_derivative_exit.ncols() != p_time
     {
-        return Err(format!(
-            "latent-survival time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
-            time_block.design_entry.ncols(),
-            time_block.design_exit.ncols(),
-            time_block.design_derivative_exit.ncols()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-survival time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
+                time_block.design_entry.ncols(),
+                time_block.design_exit.ncols(),
+                time_block.design_derivative_exit.ncols()
+            ),
+        });
     }
     if time_block.offset_entry.len() != n
         || time_block.offset_exit.len() != n
         || time_block.derivative_offset_exit.len() != n
     {
-        return Err(format!(
-            "latent-survival time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
-            n,
-            time_block.offset_entry.len(),
-            time_block.offset_exit.len(),
-            time_block.derivative_offset_exit.len()
-        ));
+        return Err(LatentSurvivalError::InvalidDataset {
+            reason: format!(
+                "latent-survival time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
+                n,
+                time_block.offset_entry.len(),
+                time_block.offset_exit.len(),
+                time_block.derivative_offset_exit.len()
+            ),
+        });
     }
     Ok(sigma)
 }
@@ -548,20 +665,22 @@ fn validate_unloaded_components_for_loading(
     unloaded_entry: f64,
     unloaded_exit: f64,
     unloaded_hazard: Option<f64>,
-) -> Result<(), String> {
+) -> Result<(), LatentSurvivalError> {
     match loading {
         HazardLoading::Full => {
             if unloaded_entry != 0.0
                 || unloaded_exit != 0.0
                 || unloaded_hazard.is_some_and(|hazard| hazard != 0.0)
             {
-                return Err(format!(
-                    "{context} row {} uses full hazard loading, so unloaded components must be exactly zero; got entry_mass={}, exit_mass={}, exit_hazard={}",
-                    row_index + 1,
-                    unloaded_entry,
-                    unloaded_exit,
-                    unloaded_hazard.unwrap_or(0.0)
-                ));
+                return Err(LatentSurvivalError::InvalidDataset {
+                    reason: format!(
+                        "{context} row {} uses full hazard loading, so unloaded components must be exactly zero; got entry_mass={}, exit_mass={}, exit_hazard={}",
+                        row_index + 1,
+                        unloaded_entry,
+                        unloaded_exit,
+                        unloaded_hazard.unwrap_or(0.0)
+                    ),
+                });
             }
         }
         HazardLoading::LoadedVsUnloaded => {}
