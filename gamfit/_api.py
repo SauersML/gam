@@ -2252,6 +2252,100 @@ def gaussian_reml_fit_with_constraints_forward(
     return result
 
 
+def gaussian_reml_fit_with_constraints_backward(
+    x: Any,
+    y: Any,
+    penalty: Any,
+    *,
+    weights: Any | None = None,
+    a_inequality: Any | None = None,
+    b_inequality: Any | None = None,
+    log_lambda_at_optimum: float | None = None,
+    coefficients_at_optimum: Any | None = None,
+    fitted_at_optimum: Any | None = None,
+    active_indices: Any | None = None,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_lambda: float = 0.0,
+    grad_log_lambda: float = 0.0,
+    grad_reml_score: float = 0.0,
+    grad_edf: float = 0.0,
+) -> dict[str, Any]:
+    """Analytic VJP for ``gaussian_reml_fit_with_constraints_forward``.
+
+    At an interior cert (``active_indices`` is empty), the envelope theorem
+    applies in full p-space and this delegates to the closed-form Gaussian
+    REML backward (``H`` unprojected). At an active cert (non-empty active
+    set), the tangent-projected variant is not yet implemented and the call
+    raises ``NotImplementedError``.
+
+    Math identity: at the constrained cert, the backward through the joint
+    REML is the unconstrained backward formula applied to the tangent-
+    projected operator — ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ``, with
+    ``Z = null(A_act)``.
+    """
+    import numpy as np
+
+    x_np = _numeric_matrix(x, "x")
+    y_np = _numeric_matrix(y, "y")
+    penalty_np = _numeric_matrix(penalty, "penalty")
+    weights_np = None if weights is None else _numeric_vector(weights, "weights")
+    a_np = None if a_inequality is None else _numeric_matrix(a_inequality, "a_inequality")
+    b_np = None if b_inequality is None else _numeric_vector(b_inequality, "b_inequality")
+    coef_np = (
+        None
+        if coefficients_at_optimum is None
+        else _numeric_matrix(coefficients_at_optimum, "coefficients_at_optimum")
+    )
+    fitted_np = (
+        None
+        if fitted_at_optimum is None
+        else _numeric_matrix(fitted_at_optimum, "fitted_at_optimum")
+    )
+    if active_indices is None:
+        active_np = None
+    else:
+        active_np = np.asarray(active_indices).astype(np.uint64, copy=False).ravel()
+    grad_coef_np = (
+        None
+        if grad_coefficients is None
+        else _numeric_matrix(grad_coefficients, "grad_coefficients")
+    )
+    grad_fitted_np = (
+        None
+        if grad_fitted is None
+        else _numeric_matrix(grad_fitted, "grad_fitted")
+    )
+    log_lambda_val = None if log_lambda_at_optimum is None else float(log_lambda_at_optimum)
+
+    try:
+        out = rust_module().gaussian_reml_fit_with_constraints_backward(
+            x_np,
+            y_np,
+            penalty_np,
+            weights_np,
+            a_np,
+            b_np,
+            log_lambda_val,
+            coef_np,
+            fitted_np,
+            active_np,
+            grad_coef_np,
+            grad_fitted_np,
+            float(grad_lambda),
+            float(grad_log_lambda),
+            float(grad_reml_score),
+            float(grad_edf),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
     out = dict(payload)
     for key in (

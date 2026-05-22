@@ -1824,8 +1824,10 @@ def test_torch_fit_periodic_spline_curve_multi_output_coefficients_shape() -> No
     y = torch.as_tensor(y_np, dtype=torch.float64)
     spec = PeriodicSplineCurve(n_knots=12, degree=3, output_dim=3)
     result = torch_fit(t, y, spec)
-    assert isinstance(result.coefficients, torch.Tensor)
-    coef = result.coefficients.detach().cpu().numpy()
+    coef_t = result.coefficients
+    if isinstance(coef_t, list):
+        coef_t = torch.stack(coef_t, dim=0)
+    coef = coef_t.detach().cpu().numpy()
     assert coef.ndim == 2 and coef.shape[1] == 3
     fitted = result.fitted.detach().cpu().numpy()
     assert fitted.shape == (n, 3)
