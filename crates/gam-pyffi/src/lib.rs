@@ -5384,8 +5384,17 @@ struct CoefficientStatePayload {
     training_feature_ranges: Option<Vec<(f64, f64)>>,
     random_column_ranges: Vec<(usize, usize)>,
     coefficient_provenance: Vec<CoefficientProvenancePayload>,
+    term_blocks: Vec<TermBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group_metadata: Option<GroupMetadata>,
+}
+
+#[derive(Serialize, Clone)]
+struct TermBlock {
+    name: String,
+    kind: String,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Serialize)]
@@ -5427,10 +5436,62 @@ fn categorical_level_name_for_bits(
         .cloned()
 }
 
+fn smooth_basis_kind_label(basis: &gam::smooth::SmoothBasisSpec) -> &'static str {
+    use gam::smooth::SmoothBasisSpec as S;
+    match basis {
+        S::BSpline1D { .. } => "smooth_bspline1d",
+        S::TensorBSpline { .. } => "tensor",
+        S::ThinPlate { .. } => "thin_plate",
+        S::Sphere { .. } => "sphere",
+        S::Matern { .. } => "matern",
+        S::Duchon { .. } => "duchon",
+        S::FactorSmooth { .. } => "factor_smooth",
+        S::BySmooth { .. } => "by_smooth",
+    }
+}
+
+/// Try to derive per-smooth-term column ranges by building a synthetic
+/// two-row design from the saved training feature ranges. Returns
+/// `(name, range)` pairs in global-column coordinates, or `None` if the
+/// build fails (e.g. no training ranges available).
+fn smooth_term_column_ranges(
+    payload: &FittedModelPayload,
+    smooth_start: usize,
+) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    let spec = payload.resolved_termspec.as_ref()?;
+    if spec.smooth_terms.is_empty() {
+        return Some(Vec::new());
+    }
+    let ranges = payload.training_feature_ranges.as_ref()?;
+    let schema = payload.data_schema.as_ref()?;
+    let ncols = schema.columns.len();
+    if ranges.is_empty() || ncols == 0 {
+        return None;
+    }
+    let mut data = Array2::<f64>::zeros((2, ncols));
+    for (col, &(lo, hi)) in ranges.iter().take(ncols).enumerate() {
+        let (lo, hi) = if lo.is_finite() && hi.is_finite() {
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        };
+        data[[0, col]] = lo;
+        data[[1, col]] = hi;
+    }
+    let design = build_term_collection_design(data.view(), spec).ok()?;
+    let mut out = Vec::with_capacity(design.smooth.terms.len());
+    for term in &design.smooth.terms {
+        let r = term.coeff_range.clone();
+        let global = (smooth_start + r.start)..(smooth_start + r.end);
+        out.push((term.name.clone(), global));
+    }
+    Some(out)
+}
+
 fn coefficient_provenance_for_state(
     payload: &FittedModelPayload,
     beta_len: usize,
-) -> Vec<CoefficientProvenancePayload> {
+) -> (Vec<CoefficientProvenancePayload>, Vec<TermBlock>) {
     let mut provenance = (0..beta_len)
         .map(|index| CoefficientProvenancePayload {
             index,
@@ -5442,13 +5503,21 @@ fn coefficient_provenance_for_state(
             metadata: None,
         })
         .collect::<Vec<_>>();
+    let mut blocks: Vec<TermBlock> = Vec::new();
 
     let Some(spec) = payload.resolved_termspec.as_ref() else {
-        return provenance;
+        return (provenance, blocks);
     };
 
     if !provenance.is_empty() {
         provenance[0].term = Some("intercept".to_string());
+        provenance[0].label = "intercept".to_string();
+        blocks.push(TermBlock {
+            name: "intercept".to_string(),
+            kind: "intercept".to_string(),
+            start: 0,
+            end: 1,
+        });
     }
 
     for (offset, term) in spec.linear_terms.iter().enumerate() {
@@ -5456,12 +5525,21 @@ fn coefficient_provenance_for_state(
         if let Some(entry) = provenance.get_mut(index) {
             entry.term = Some(term.name.clone());
             entry.column = Some(term.name.clone());
+            entry.label = term.name.clone();
+            entry.source = "linear".to_string();
         }
+        blocks.push(TermBlock {
+            name: term.name.clone(),
+            kind: "linear".to_string(),
+            start: index,
+            end: index + 1,
+        });
     }
 
     let mut col = 1 + spec.linear_terms.len();
     for term in &spec.random_effect_terms {
         let levels = term.frozen_levels.as_deref().unwrap_or(&[]);
+        let block_start = col;
         for (local, bits) in levels.iter().copied().enumerate() {
             let index = col + local;
             let label =
@@ -5481,9 +5559,45 @@ fn coefficient_provenance_for_state(
             }
         }
         col += levels.len();
+        if col > block_start {
+            blocks.push(TermBlock {
+                name: term.name.clone(),
+                kind: "random_effect".to_string(),
+                start: block_start,
+                end: col,
+            });
+        }
     }
 
-    provenance
+    // Smooth terms: derive per-term column widths by building a synthetic
+    // design from training_feature_ranges. If that fails (older payloads
+    // without saved ranges, or unusual basis variants), the columns simply
+    // keep their default `__global__` labels.
+    if !spec.smooth_terms.is_empty() {
+        let smooth_start = col;
+        if let Some(smooth_ranges) = smooth_term_column_ranges(payload, smooth_start) {
+            for ((name, range), term_spec) in smooth_ranges.iter().zip(spec.smooth_terms.iter()) {
+                let kind = smooth_basis_kind_label(&term_spec.basis);
+                for idx in range.clone() {
+                    if let Some(entry) = provenance.get_mut(idx) {
+                        entry.term = Some(name.clone());
+                        entry.column = Some(name.clone());
+                        entry.label = format!("{}[{}]", name, idx - range.start);
+                        entry.source = "smooth".to_string();
+                    }
+                }
+                blocks.push(TermBlock {
+                    name: name.clone(),
+                    kind: kind.to_string(),
+                    start: range.start,
+                    end: range.end,
+                });
+            }
+        }
+    }
+
+    blocks.sort_by_key(|block| block.start);
+    (provenance, blocks)
 }
 
 fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
