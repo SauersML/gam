@@ -1977,7 +1977,7 @@ def _attach_basis_state(
     The keys ``knots_or_centers``, ``penalty``, ``basis_kind``,
     ``basis_order``, ``periodic``, and ``period`` are added so a caller
     can replay the exact same basis at predict time without recomputing
-    anything — pass them straight back into ``duchon_basis_1d`` or
+    anything — pass them straight back into ``duchon_basis`` or
     ``bspline_basis``.
     """
     payload["knots_or_centers"] = knots_or_centers

@@ -7,11 +7,14 @@ function here is a thin wrapper over the corresponding NumPy entry point in
 
 Layout:
 
-- Closed-form Gaussian REML fits — :func:`gaussian_reml_fit` and its batched
-  and position-based variants. Forward and backward both go through Rust.
-- Basis evaluations — :func:`bspline_basis`, :func:`duchon_basis_1d` and
-  their derivative siblings. Backward routes through the matching Rust
-  derivative primitive (chain rule applied at the boundary).
+- Closed-form Gaussian REML fits — :func:`gaussian_reml_fit`, its batched
+  variant :func:`gaussian_reml_fit_batched`, and the multi-smooth additive
+  wrapper :func:`gaussian_reml_fit_additive` (single-λ block-diagonal
+  composition). Forward and backward both go through Rust.
+- Basis evaluations — :func:`bspline_basis` and :func:`duchon_basis`. The
+  B-spline backward routes through the Rust derivative primitive (chain
+  rule applied at the boundary); the multi-dim Duchon basis is currently
+  forward-only with respect to its points input.
 - Penalty matrix construction and the closed-form ridge solver — forward-only.
 - Response-geometry transforms — forward-only numpy passthrough; for
   differentiable variants compose the underlying torch ops directly.
