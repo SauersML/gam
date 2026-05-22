@@ -945,23 +945,32 @@ pub fn build_survival_time_basis(
 ) -> Result<SurvivalTimeBuildOutput, String> {
     fn checked_log_survival_times(times: &Array1<f64>, label: &str) -> Result<Array1<f64>, String> {
         if let Some(row) = times.iter().position(|t| !t.is_finite()) {
-            return Err(format!(
-                "survival time basis requires finite {label} times (row {})",
-                row + 1
-            ));
+            return Err(SurvivalConstructionError::DataValidationFailed {
+                reason: format!(
+                    "survival time basis requires finite {label} times (row {})",
+                    row + 1
+                ),
+            }
+            .into());
         }
         if let Some(row) = times.iter().position(|t| *t < 0.0) {
-            return Err(format!(
-                "survival time basis requires non-negative {label} times (row {})",
-                row + 1
-            ));
+            return Err(SurvivalConstructionError::DataValidationFailed {
+                reason: format!(
+                    "survival time basis requires non-negative {label} times (row {})",
+                    row + 1
+                ),
+            }
+            .into());
         }
         Ok(times.mapv(|t| t.max(SURVIVAL_TIME_FLOOR).ln()))
     }
 
     let n = age_entry.len();
     if n != age_exit.len() {
-        return Err("survival time basis requires matching entry/exit lengths".to_string());
+        return Err(SurvivalConstructionError::IncompatibleDimensions {
+            reason: "survival time basis requires matching entry/exit lengths".to_string(),
+        }
+        .into());
     }
     for i in 0..n {
         if age_exit[i] < age_entry[i] {
@@ -1286,7 +1295,10 @@ pub fn build_survival_time_basis(
                 let x_exit_full = exit_arc.as_ref();
                 let p_time_full = x_exit_full.ncols();
                 if p_time_full == 0 {
-                    return Err("internal error: empty ispline time basis".to_string());
+                    return Err(SurvivalConstructionError::BasisConstructionFailed {
+                        reason: "internal error: empty ispline time basis".to_string(),
+                    }
+                    .into());
                 }
                 let db_exit = db_exit_arc.as_ref();
                 if db_exit.ncols() != p_time_full + 1 {
@@ -1323,7 +1335,10 @@ pub fn build_survival_time_basis(
                     );
                 }
                 if keep_cols.iter().any(|&j| j >= p_time_full) {
-                    return Err("saved survival ispline keep_cols exceed basis width".to_string());
+                    return Err(SurvivalConstructionError::MissingColumn {
+                        reason: "saved survival ispline keep_cols exceed basis width".to_string(),
+                    }
+                    .into());
                 }
 
                 let p_time = keep_cols.len();
