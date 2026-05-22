@@ -2873,28 +2873,37 @@ fn materialize_standard<'a>(
                 sigma_fixed: Some(_),
                 loading,
             } => {
-                return Err(format!(
-                    "latent-cloglog-binomial requires HazardLoading::Full, got {loading:?}"
-                ));
+                return Err(WorkflowError::MissingDependency {
+                    reason: format!(
+                        "latent-cloglog-binomial requires HazardLoading::Full, got {loading:?}"
+                    ),
+                }
+                .into());
             }
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: None, ..
             } => {
-                return Err(
-                    "latent-cloglog-binomial currently requires a fixed hazard-multiplier sigma"
-                        .to_string(),
-                );
+                return Err(WorkflowError::MissingDependency {
+                    reason:
+                        "latent-cloglog-binomial currently requires a fixed hazard-multiplier sigma"
+                            .to_string(),
+                }
+                .into());
             }
             FrailtySpec::GaussianShift { .. } => {
-                return Err(
-                    "latent-cloglog-binomial does not support GaussianShift frailty".to_string(),
-                );
+                return Err(WorkflowError::InvalidConfig {
+                    reason: "latent-cloglog-binomial does not support GaussianShift frailty"
+                        .to_string(),
+                }
+                .into());
             }
             FrailtySpec::None => {
-                return Err(
-                    "latent-cloglog-binomial requires config.frailty=HazardMultiplier with a fixed sigma"
-                        .to_string(),
-                );
+                return Err(WorkflowError::MissingDependency {
+                    reason:
+                        "latent-cloglog-binomial requires config.frailty=HazardMultiplier with a fixed sigma"
+                            .to_string(),
+                }
+                .into());
             }
         };
         Some(
@@ -2903,10 +2912,13 @@ fn materialize_standard<'a>(
         )
     } else {
         if config.frailty.is_some() {
-            return Err(format!(
-                "config.frailty is not supported for standard family {:?}; use a frailty-aware family instead",
-                family
-            ));
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "config.frailty is not supported for standard family {:?}; use a frailty-aware family instead",
+                    family
+                ),
+            }
+            .into());
         }
         None
     };
@@ -2984,10 +2996,16 @@ fn materialize_bernoulli_marginal_slope<'a>(
     let y = data.values.column(y_col).to_owned();
 
     if !is_binary_response(y.view()) {
-        return Err("Bernoulli marginal-slope requires a binary {0,1} response".to_string());
+        return Err(WorkflowError::SchemaMismatch {
+            reason: "Bernoulli marginal-slope requires a binary {0,1} response".to_string(),
+        }
+        .into());
     }
     if config.noise_formula.is_some() {
-        return Err("Bernoulli marginal-slope cannot also use noise_formula".to_string());
+        return Err(WorkflowError::InvalidConfig {
+            reason: "Bernoulli marginal-slope cannot also use noise_formula".to_string(),
+        }
+        .into());
     }
 
     let logslope_formula = config
@@ -3002,7 +3020,10 @@ fn materialize_bernoulli_marginal_slope<'a>(
     let (_, parsed_logslope) =
         parse_matching_auxiliary_formula(logslope_formula, &parsed.response, "logslope_formula")?;
     if parsed_logslope.linkspec.is_some() {
-        return Err("link(...) is not supported inside logslope_formula".to_string());
+        return Err(WorkflowError::InvalidConfig {
+            reason: "link(...) is not supported inside logslope_formula".to_string(),
+        }
+        .into());
     }
     validate_marginal_slope_z_column_exclusion(
         parsed,
@@ -3127,10 +3148,13 @@ fn materialize_survival<'a>(
             SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
         )
     {
-        return Err(format!(
-            "cause-specific competing risks with {cause_count} causes are currently supported for survival_likelihood='transformation' and 'weibull'; got '{}'",
-            config.survival_likelihood
-        ));
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "cause-specific competing risks with {cause_count} causes are currently supported for survival_likelihood='transformation' and 'weibull'; got '{}'",
+                config.survival_likelihood
+            ),
+        }
+        .into());
     }
     if parsed.linkwiggle.is_some()
         && !matches!(
@@ -3138,10 +3162,13 @@ fn materialize_survival<'a>(
             SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
         )
     {
-        return Err(format!(
-            "linkwiggle(...) is not defined for survival_likelihood='{}'",
-            config.survival_likelihood
-        ));
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "linkwiggle(...) is not defined for survival_likelihood='{}'",
+                config.survival_likelihood
+            ),
+        }
+        .into());
     }
     if parsed.linkspec.is_some()
         && matches!(
@@ -3152,10 +3179,13 @@ fn materialize_survival<'a>(
                 | SurvivalLikelihoodMode::LatentBinary
         )
     {
-        return Err(format!(
-            "link(...) is not implemented for survival_likelihood='{}'",
-            config.survival_likelihood
-        ));
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "link(...) is not implemented for survival_likelihood='{}'",
+                config.survival_likelihood
+            ),
+        }
+        .into());
     }
     let effective_timewiggle = parsed.timewiggle.clone();
     let baseline_target_raw = match survival_mode {
