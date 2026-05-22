@@ -11257,9 +11257,12 @@ impl SurvivalMarginalSlopeFamily {
                 self.logslope_design.ncols(),
                 "SurvivalMarginalSlope logslope",
             ))),
-            _ => Err(format!(
-                "survival marginal-slope psi: only baseline/slope spatial blocks are supported, got block {block_idx}"
-            )),
+            _ => Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                reason: format!(
+                    "survival marginal-slope psi: only baseline/slope spatial blocks are supported, got block {block_idx}"
+                ),
+            }
+            .into()),
         }
     }
 
@@ -13111,12 +13114,15 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         if v.len() != self.joint_hessian_operator.dim()
             || out.len() != self.joint_hessian_operator.dim()
         {
-            return Err(format!(
-                "hessian_matvec_into: dim mismatch v={} out={} op={}",
-                v.len(),
-                out.len(),
-                self.joint_hessian_operator.dim()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "hessian_matvec_into: dim mismatch v={} out={} op={}",
+                    v.len(),
+                    out.len(),
+                    self.joint_hessian_operator.dim()
+                ),
+            }
+            .into());
         }
         self.joint_hessian_operator
             .mul_vec_into(v.view(), out.view_mut());
@@ -16096,7 +16102,10 @@ impl SurvivalMarginalSlopeFamily {
 
 fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, String> {
     if knots.is_empty() {
-        return Err("survival-marginal-slope timewiggle requires at least one knot".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope timewiggle requires at least one knot".to_string(),
+        }
+        .into());
     }
     let probe = 0.5 * (knots[0] + knots[knots.len() - 1]);
     let h0 = Array1::from_vec(vec![probe]);
@@ -16674,11 +16683,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         if block_idx >= block_states.len() {
-            return Err(format!(
-                "post-update block index {} out of range for {} blocks",
-                block_idx,
-                block_states.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "post-update block index {} out of range for {} blocks",
+                    block_idx,
+                    block_states.len()
+                ),
+            }
+            .into());
         }
         if block_idx == 0 {
             let proposed = if let Some(constraints) = self.time_linear_constraints.as_ref() {
@@ -16693,20 +16705,26 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             if let Some(runtime) = &self.score_warp {
                 let current = &block_states[3].beta;
                 if current.len() != beta.len() {
-                    return Err(format!(
-                        "survival score-warp post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
+                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "survival score-warp post-update beta length mismatch: current={}, proposed={}",
+                            current.len(),
+                            beta.len()
+                        ),
+                    }
+                    .into());
                 }
                 let expected = runtime.basis_dim() * self.score_dim();
                 if beta.len() != expected {
-                    return Err(format!(
-                        "survival score-warp post-update beta length mismatch: proposed={}, expected {expected} for K={} and basis dim {}",
-                        beta.len(),
-                        self.score_dim(),
-                        runtime.basis_dim()
-                    ));
+                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "survival score-warp post-update beta length mismatch: proposed={}, expected {expected} for K={} and basis dim {}",
+                            beta.len(),
+                            self.score_dim(),
+                            runtime.basis_dim()
+                        ),
+                    }
+                    .into());
                 }
                 let mut projected = Array1::<f64>::zeros(beta.len());
                 for coord in 0..self.score_dim() {
@@ -16732,11 +16750,14 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                     .map(|state| &state.beta)
                     .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
                 if current.len() != beta.len() {
-                    return Err(format!(
-                        "survival link-deviation post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
+                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                        reason: format!(
+                            "survival link-deviation post-update beta length mismatch: current={}, proposed={}",
+                            current.len(),
+                            beta.len()
+                        ),
+                    }
+                    .into());
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
@@ -16823,17 +16844,23 @@ fn append_timewiggle_tail_nonnegative_constraints(
     }
     if let Some(base_constraints) = base.as_ref() {
         if base_constraints.a.ncols() != p_total {
-            return Err(format!(
-                "survival marginal-slope time constraint width mismatch: constraints={}, time block={p_total}",
-                base_constraints.a.ncols()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope time constraint width mismatch: constraints={}, time block={p_total}",
+                    base_constraints.a.ncols()
+                ),
+            }
+            .into());
         }
         if base_constraints.a.nrows() != base_constraints.b.len() {
-            return Err(format!(
-                "survival marginal-slope time constraint row mismatch: A rows={}, b len={}",
-                base_constraints.a.nrows(),
-                base_constraints.b.len()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival marginal-slope time constraint row mismatch: A rows={}, b len={}",
+                    base_constraints.a.nrows(),
+                    base_constraints.b.len()
+                ),
+            }
+            .into());
         }
     }
 
@@ -17018,89 +17045,125 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         || spec.marginal_offset.len() != n
         || spec.logslope_offset.len() != n
     {
-        return Err(format!(
-            "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}x{}, marginal_offset={}, logslope_offset={}",
-            n,
-            spec.age_exit.len(),
-            spec.event_target.len(),
-            spec.weights.len(),
-            spec.z.nrows(),
-            spec.z.ncols(),
-            spec.marginal_offset.len(),
-            spec.logslope_offset.len()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival-marginal-slope row mismatch: entry={}, exit={}, event={}, weights={}, z={}x{}, marginal_offset={}, logslope_offset={}",
+                n,
+                spec.age_exit.len(),
+                spec.event_target.len(),
+                spec.weights.len(),
+                spec.z.nrows(),
+                spec.z.ncols(),
+                spec.marginal_offset.len(),
+                spec.logslope_offset.len()
+            ),
+        }
+        .into());
     }
     if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {
-        return Err("survival-marginal-slope requires finite non-negative weights".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires finite non-negative weights".to_string(),
+        }
+        .into());
     }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
-        return Err("survival-marginal-slope requires finite z values".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires finite z values".to_string(),
+        }
+        .into());
     }
     if spec.marginal_offset.iter().any(|&value| !value.is_finite()) {
-        return Err("survival-marginal-slope requires finite marginal offsets".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires finite marginal offsets".to_string(),
+        }
+        .into());
     }
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
-        return Err("survival-marginal-slope requires finite logslope offsets".to_string());
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires finite logslope offsets".to_string(),
+        }
+        .into());
     }
     spec.frailty.validate_for_marginal_slope()?;
     match &spec.frailty {
         FrailtySpec::None => {}
         FrailtySpec::GaussianShift { sigma_fixed } => {
             let Some(sigma) = sigma_fixed else {
-                return Err(
-                    "survival-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
-                        .to_string(),
-                );
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason:
+                        "survival-marginal-slope requires GaussianShift sigma_fixed or FrailtySpec::None; learnable GaussianShift sigma is not implemented for the exact marginal-slope outer solver"
+                            .to_string(),
+                }
+                .into());
             };
             if !sigma.is_finite() || *sigma < 0.0 {
-                return Err(format!(
-                    "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                ));
+                return Err(SurvivalMarginalSlopeError::InvalidInput {
+                    reason: format!(
+                        "survival-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                    ),
+                }
+                .into());
             }
         }
         FrailtySpec::HazardMultiplier { .. } => unreachable!(),
     }
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
-        return Err(
-            "survival-marginal-slope requires binary event indicators (0.0 or 1.0)".to_string(),
-        );
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires binary event indicators (0.0 or 1.0)"
+                .to_string(),
+        }
+        .into());
     }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
-        return Err(format!(
-            "survival-marginal-slope requires derivative_guard > 0, got {}",
-            spec.derivative_guard
-        ));
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: format!(
+                "survival-marginal-slope requires derivative_guard > 0, got {}",
+                spec.derivative_guard
+            ),
+        }
+        .into());
     }
     for i in 0..n {
         if spec.age_exit[i] < spec.age_entry[i] {
-            return Err(format!(
-                "survival-marginal-slope row {i}: exit time ({}) < entry time ({})",
-                spec.age_exit[i], spec.age_entry[i]
-            ));
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: format!(
+                    "survival-marginal-slope row {i}: exit time ({}) < entry time ({})",
+                    spec.age_exit[i], spec.age_entry[i]
+                ),
+            }
+            .into());
         }
     }
     let n_entry = spec.time_block.design_entry.nrows();
     let n_exit = spec.time_block.design_exit.nrows();
     let n_deriv = spec.time_block.design_derivative_exit.nrows();
     if n_entry != n || n_exit != n || n_deriv != n {
-        return Err(format!(
-            "survival-marginal-slope time block design row mismatch: \
-             data={n}, design_entry={n_entry}, design_exit={n_exit}, design_derivative_exit={n_deriv}"
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival-marginal-slope time block design row mismatch: \
+                 data={n}, design_entry={n_entry}, design_exit={n_exit}, design_derivative_exit={n_deriv}"
+            ),
+        }
+        .into());
     }
     let p_entry = spec.time_block.design_entry.ncols();
     let p_exit = spec.time_block.design_exit.ncols();
     let p_deriv = spec.time_block.design_derivative_exit.ncols();
     if p_exit != p_entry || p_deriv != p_entry {
-        return Err(format!(
-            "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival-marginal-slope time block design column mismatch: entry={p_entry}, exit={p_exit}, deriv={p_deriv}"
+            ),
+        }
+        .into());
     }
     if !spec.time_block.structural_monotonicity {
-        return Err(
-            "survival-marginal-slope requires structural time monotonicity by construction; non-structural time transforms are no longer supported"
-                .to_string(),
-        );
+        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason:
+                "survival-marginal-slope requires structural time monotonicity by construction; non-structural time transforms are no longer supported"
+                    .to_string(),
+        }
+        .into());
     }
     if let Some(beta0) = &spec.time_block.initial_beta {
         let derivative_constraints = structural_time_coefficient_constraints(
@@ -17110,48 +17173,64 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         )?;
         if let Some(constraints) = derivative_constraints.as_ref() {
             if beta0.len() != constraints.a.ncols() {
-                return Err(format!(
-                    "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
-                    beta0.len(),
-                    constraints.a.ncols()
-                ));
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "survival-marginal-slope time_block initial_beta length mismatch: got {}, expected {}",
+                        beta0.len(),
+                        constraints.a.ncols()
+                    ),
+                }
+                .into());
             }
             for row in 0..constraints.a.nrows() {
                 let slack = constraints.a.row(row).dot(beta0) - constraints.b[row];
                 if slack < -1e-10 {
-                    return Err(format!(
-                        "survival-marginal-slope time_block initial_beta violates structural coefficient non-negativity at row {row}: slack={slack:.3e}"
-                    ));
+                    return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                        reason: format!(
+                            "survival-marginal-slope time_block initial_beta violates structural coefficient non-negativity at row {row}: slack={slack:.3e}"
+                        ),
+                    }
+                    .into());
                 }
             }
         }
     }
     if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
         if timewiggle.degree != 3 {
-            return Err(format!(
-                "survival-marginal-slope timewiggle requires cubic degree=3, got {}",
-                timewiggle.degree
-            ));
+            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                reason: format!(
+                    "survival-marginal-slope timewiggle requires cubic degree=3, got {}",
+                    timewiggle.degree
+                ),
+            }
+            .into());
         }
         let derived_ncols = time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree)?;
         if derived_ncols == 0 {
-            return Err(
-                "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "survival-marginal-slope timewiggle requires at least one wiggle coefficient"
                     .to_string(),
-            );
+            }
+            .into());
         }
         if timewiggle.ncols != derived_ncols {
-            return Err(format!(
-                "survival-marginal-slope timewiggle metadata width mismatch: metadata={}, basis={derived_ncols}",
-                timewiggle.ncols
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival-marginal-slope timewiggle metadata width mismatch: metadata={}, basis={derived_ncols}",
+                    timewiggle.ncols
+                ),
+            }
+            .into());
         }
         if spec.time_block.design_exit.ncols() < derived_ncols {
-            return Err(format!(
-                "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
-                derived_ncols,
-                spec.time_block.design_exit.ncols()
-            ));
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival-marginal-slope timewiggle requests {} tail columns but time block only has {} columns",
+                    derived_ncols,
+                    spec.time_block.design_exit.ncols()
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -17450,10 +17529,13 @@ pub fn fit_survival_marginal_slope_terms(
     let mut spec = spec;
     validate_spec(&spec)?;
     if spec.base_link != InverseLink::Standard(LinkFunction::Probit) {
-        return Err(format!(
-            "survival-marginal-slope currently supports only probit base_link, got {:?}",
-            spec.base_link
-        ));
+        return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+            reason: format!(
+                "survival-marginal-slope currently supports only probit base_link, got {:?}",
+                spec.base_link
+            ),
+        }
+        .into());
     }
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
@@ -17496,11 +17578,14 @@ pub fn fit_survival_marginal_slope_terms(
         .clone()
         .unwrap_or_else(|| vec![spec.logslopespec.clone()]);
     if logslope_specs_input.len() != spec.z.ncols() && logslope_specs_input.len() != 1 {
-        return Err(format!(
-            "survival marginal-slope expected either one shared logslope spec or one spec per z coordinate (K={}); got {}",
-            spec.z.ncols(),
-            logslope_specs_input.len()
-        ));
+        return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            reason: format!(
+                "survival marginal-slope expected either one shared logslope spec or one spec per z coordinate (K={}); got {}",
+                spec.z.ncols(),
+                logslope_specs_input.len()
+            ),
+        }
+        .into());
     }
     let mut design_specs = Vec::with_capacity(1 + logslope_specs_input.len());
     design_specs.push(spec.marginalspec.clone());
@@ -18138,11 +18223,14 @@ pub fn fit_survival_marginal_slope_terms(
         fit_started.elapsed().as_secs_f64(),
     );
     if !solved.fit.outer_converged {
-        return Err(format!(
-            "survival marginal-slope outer optimization did not converge: \
-             iterations={} final_objective={:.6e} |g|_inf={:.3e}",
-            solved.fit.outer_iterations, solved.fit.reml_score, solved.fit.outer_gradient_norm
-        ));
+        return Err(SurvivalMarginalSlopeError::IntegrationFailed {
+            reason: format!(
+                "survival marginal-slope outer optimization did not converge: \
+                 iterations={} final_objective={:.6e} |g|_inf={:.3e}",
+                solved.fit.outer_iterations, solved.fit.reml_score, solved.fit.outer_gradient_norm
+            ),
+        }
+        .into());
     }
 
     let (baseline_offset_residuals, baseline_offset_curvatures) = {
