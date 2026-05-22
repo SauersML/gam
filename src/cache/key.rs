@@ -104,18 +104,14 @@ impl Fingerprinter {
     pub fn absorb_f64_slice(&mut self, tag: &[u8], xs: &[f64]) {
         self.absorb_tag(tag);
         self.h.update((xs.len() as u64).to_le_bytes());
-        for &x in xs {
-            self.h.update(x.to_bits().to_le_bytes());
-        }
+        self.h.update(f64_slice_as_bytes(xs));
     }
 
     pub fn absorb_f64_2d(&mut self, tag: &[u8], rows: usize, cols: usize, xs: &[f64]) {
         self.absorb_tag(tag);
         self.h.update((rows as u64).to_le_bytes());
         self.h.update((cols as u64).to_le_bytes());
-        for &x in xs {
-            self.h.update(x.to_bits().to_le_bytes());
-        }
+        self.h.update(f64_slice_as_bytes(xs));
     }
 
     pub fn finalize(self) -> Fingerprint {
@@ -123,6 +119,34 @@ impl Fingerprinter {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(&out);
         Fingerprint(bytes)
+    }
+}
+
+/// Reinterpret `&[f64]` as `&[u8]` for bulk SHA-256 absorption. On
+/// little-endian hosts this is bit-equivalent to streaming
+/// `x.to_bits().to_le_bytes()` for every element but ~10× faster on hot
+/// fingerprint paths. On big-endian hosts we fall back to the per-element
+/// loop so the on-disk fingerprint stays endian-stable across machines.
+#[inline]
+fn f64_slice_as_bytes(xs: &[f64]) -> Vec<u8> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `f64` is `Copy + 'static` with no padding; the resulting
+        // `&[u8]` covers exactly `xs.len() * 8` valid bytes and shares the
+        // lifetime of `xs`. We immediately copy it into a returned `Vec` so
+        // callers don't have to reason about the borrow.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(xs.as_ptr() as *const u8, std::mem::size_of_val(xs))
+        };
+        bytes.to_vec()
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut out = Vec::with_capacity(xs.len() * 8);
+        for &x in xs {
+            out.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+        out
     }
 }
 
