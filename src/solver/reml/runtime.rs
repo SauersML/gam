@@ -13,6 +13,7 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
 use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -29,6 +30,257 @@ const EFS_SINGLE_LOOP_PIRLS_CAP_SENTINEL: usize = usize::MAX / 4;
 // Bail after 3 consecutive iterations whose surrogate/partial-inner drift is >= 10%.
 const EFS_SINGLE_LOOP_BIAS_THRESHOLD: f64 = 0.10;
 const EFS_SINGLE_LOOP_BIAS_CONSECUTIVE_LIMIT: usize = 3;
+const HGB_INNER_FLOOR: f64 = 1e-12;
+const HGB_LINEAR_FLOOR: f64 = 1e-12;
+const HGB_TRACE_FLOOR: f64 = 1e-12;
+const HGB_HISTORY_CAP: usize = 10;
+const HGB_WARMUP_ITERS: usize = 3;
+const HGB_TARGET_FRACTION: f64 = 0.1;
+const S_INNER_INIT: f64 = 1.0;
+const S_LINEAR_INIT: f64 = 1.0;
+const S_TRACE_INIT: f64 = 1.0;
+const HGB_SENS_FLOOR: f64 = 1e-6;
+
+pub(crate) struct HyperGradHistoryEntry {
+    pub(crate) rho: Array1<f64>,
+    pub(crate) g_outer: Array1<f64>,
+    pub(crate) e_inner: f64,
+    pub(crate) e_linear: f64,
+    pub(crate) sigma_sq: f64,
+    pub(crate) k: usize,
+}
+
+pub(crate) struct HyperGradientBudget {
+    pub(crate) target_mse: f64,
+    pub(crate) inner_floor: f64,
+    pub(crate) linear_floor: f64,
+    pub(crate) trace_floor: f64,
+    pub(crate) s_inner: f64,
+    pub(crate) s_linear: f64,
+    pub(crate) s_trace: f64,
+    pub(crate) history: VecDeque<HyperGradHistoryEntry>,
+}
+
+impl HyperGradientBudget {
+    fn new() -> Self {
+        Self {
+            target_mse: 0.0,
+            inner_floor: HGB_INNER_FLOOR,
+            linear_floor: HGB_LINEAR_FLOOR,
+            trace_floor: HGB_TRACE_FLOOR,
+            s_inner: S_INNER_INIT,
+            s_linear: S_LINEAR_INIT,
+            s_trace: S_TRACE_INIT,
+            history: VecDeque::with_capacity(HGB_HISTORY_CAP),
+        }
+    }
+
+    fn push(&mut self, entry: HyperGradHistoryEntry) {
+        self.history.push_back(entry);
+        while self.history.len() > HGB_HISTORY_CAP {
+            self.history.pop_front();
+        }
+    }
+
+    fn previous_gradient_norm(&self) -> f64 {
+        self.history
+            .iter()
+            .rev()
+            .nth(1)
+            .or_else(|| self.history.back())
+            .map(|entry| l2_norm(&entry.g_outer))
+            .filter(|norm| norm.is_finite())
+            .unwrap_or(0.0)
+    }
+
+    fn reestimate_sensitivities(&mut self) -> bool {
+        let Some(s_inner) = self.estimate_energy_sensitivity(|entry| entry.e_inner) else {
+            return false;
+        };
+        let Some(s_linear) = self.estimate_energy_sensitivity(|entry| entry.e_linear) else {
+            return false;
+        };
+        let Some(s_trace) = self.estimate_trace_sensitivity() else {
+            return false;
+        };
+        self.s_inner = s_inner.max(HGB_SENS_FLOOR);
+        self.s_linear = s_linear.max(HGB_SENS_FLOOR);
+        self.s_trace = s_trace.max(HGB_SENS_FLOOR);
+        true
+    }
+
+    fn estimate_energy_sensitivity<F>(&self, energy: F) -> Option<f64>
+    where
+        F: Fn(&HyperGradHistoryEntry) -> f64,
+    {
+        let pairs = self.finite_difference_pairs();
+        if pairs.len() < HGB_WARMUP_ITERS {
+            return None;
+        }
+        let mut estimates = Vec::new();
+        for i in 0..pairs.len() {
+            let (drho_i, dg_i, left_idx) = &pairs[i];
+            let mut predicted = Array1::<f64>::zeros(dg_i.len());
+            let mut total_weight = 0.0;
+            for (j, (drho_j, dg_j, _)) in pairs.iter().enumerate() {
+                if i == j || dg_j.len() != dg_i.len() {
+                    continue;
+                }
+                let denom = drho_j.dot(drho_j);
+                if !denom.is_finite() || denom <= 0.0 {
+                    continue;
+                }
+                let alpha = drho_i.dot(drho_j) / denom;
+                if !alpha.is_finite() {
+                    continue;
+                }
+                let weight = 1.0 / (1.0 + denom.sqrt());
+                predicted.scaled_add(weight * alpha, dg_j);
+                total_weight += weight;
+            }
+            if total_weight <= 0.0 {
+                continue;
+            }
+            predicted /= total_weight;
+            let residual = dg_i - &predicted;
+            let e0 = energy(&self.history[*left_idx]);
+            let e1 = energy(&self.history[*left_idx + 1]);
+            let denom_energy = e0.max(e1).max(1e-300);
+            if !denom_energy.is_finite() || denom_energy < 0.0 {
+                continue;
+            }
+            let estimate = l2_norm(&residual) / (2.0 * denom_energy).sqrt();
+            if estimate.is_finite() && estimate > 0.0 {
+                estimates.push(estimate);
+            }
+        }
+        mean_positive(&estimates)
+    }
+
+    fn finite_difference_pairs(&self) -> Vec<(Array1<f64>, Array1<f64>, usize)> {
+        let entries: Vec<_> = self.history.iter().collect();
+        let mut pairs = Vec::new();
+        for i in 0..entries.len().saturating_sub(1) {
+            let a = entries[i];
+            let b = entries[i + 1];
+            if a.rho.len() != b.rho.len() || a.g_outer.len() != b.g_outer.len() {
+                continue;
+            }
+            let drho = &b.rho - &a.rho;
+            let dg = &b.g_outer - &a.g_outer;
+            if drho.iter().all(|v| v.is_finite())
+                && dg.iter().all(|v| v.is_finite())
+                && drho.dot(&drho) > 0.0
+            {
+                pairs.push((drho, dg, i));
+            }
+        }
+        pairs
+    }
+
+    fn estimate_trace_sensitivity(&self) -> Option<f64> {
+        let last_k = self.history.back()?.k;
+        if last_k == 0 {
+            return None;
+        }
+        let fixed: Vec<&HyperGradHistoryEntry> = self
+            .history
+            .iter()
+            .rev()
+            .take_while(|entry| entry.k == last_k)
+            .collect();
+        if fixed.len() < HGB_WARMUP_ITERS {
+            return None;
+        }
+        let dim = fixed[0].g_outer.len();
+        if dim == 0 || fixed.iter().any(|entry| entry.g_outer.len() != dim) {
+            return None;
+        }
+        let mut means = Array1::<f64>::zeros(dim);
+        for entry in fixed.iter() {
+            means += &entry.g_outer;
+        }
+        means /= fixed.len() as f64;
+        let mut variance_sum = 0.0;
+        for entry in fixed.iter() {
+            let diff = &entry.g_outer - &means;
+            variance_sum += diff.dot(&diff);
+        }
+        let denom = ((fixed.len() - 1) * dim) as f64;
+        let std = (variance_sum / denom).max(0.0).sqrt();
+        (std.is_finite() && std > 0.0).then_some(std)
+    }
+
+    fn allocate(&self) -> (f64, f64, f64, [bool; 3]) {
+        let floors = self.inner_floor + self.linear_floor + self.trace_floor;
+        let usable = self.target_mse - floors;
+        if usable <= 0.0 || !usable.is_finite() {
+            log::warn!(
+                "[HGB] target_mse below mandatory floors; target_mse={:.3e} floors={:.3e}",
+                self.target_mse,
+                floors
+            );
+            return (
+                self.inner_floor,
+                self.linear_floor,
+                self.trace_floor,
+                [true, true, true],
+            );
+        }
+        // Sensitivity-weighted water filling: split the budget by s^2, then
+        // add mandatory floors. This monotone rule is deliberately simple and
+        // keeps every channel funded even when one sensitivity dominates.
+        let wi = self.s_inner * self.s_inner;
+        let wl = self.s_linear * self.s_linear;
+        let wt = self.s_trace * self.s_trace;
+        let sum = (wi + wl + wt).max(HGB_SENS_FLOOR * HGB_SENS_FLOOR);
+        (
+            self.inner_floor + usable * wi / sum,
+            self.linear_floor + usable * wl / sum,
+            self.trace_floor + usable * wt / sum,
+            [false, false, false],
+        )
+    }
+}
+
+struct HyperGradientRuntimeState {
+    budget: HyperGradientBudget,
+    adaptive_kkt_override: Option<f64>,
+    trace_state: Arc<Mutex<super::unified::StochasticTraceState>>,
+}
+
+impl HyperGradientRuntimeState {
+    fn new() -> Self {
+        Self {
+            budget: HyperGradientBudget::new(),
+            adaptive_kkt_override: None,
+            trace_state: Arc::new(Mutex::new(super::unified::StochasticTraceState::default())),
+        }
+    }
+}
+
+static HYPERGRADIENT_BUDGETS: OnceLock<Mutex<HashMap<usize, HyperGradientRuntimeState>>> =
+    OnceLock::new();
+
+fn hypergradient_budgets() -> &'static Mutex<HashMap<usize, HyperGradientRuntimeState>> {
+    HYPERGRADIENT_BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn l2_norm(values: &Array1<f64>) -> f64 {
+    values.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+fn mean_positive(values: &[f64]) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &value in values {
+        if value.is_finite() && value > 0.0 {
+            sum += value;
+            count += 1;
+        }
+    }
+    (count > 0).then_some(sum / count as f64)
+}
 
 #[derive(Default)]
 struct EfsSingleLoopBiasGuardState {
