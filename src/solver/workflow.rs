@@ -2166,7 +2166,7 @@ fn fit_transformation_normal_model(
     )
 }
 
-pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
+pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // Single warm-start chokepoint: open a persistent cache session
     // keyed on the FitRequest's exact family-shape fingerprint, and
     // attach it to the variant's BlockwiseFitOptions (or top-level
@@ -2211,14 +2211,21 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
     if let Some(mirror) = mirror_session.as_ref() {
         request.attach_cache_mirror(Arc::clone(mirror));
     }
+    // Each `fit_*_model` helper still returns `Result<_, String>` internally;
+    // the boundary conversion happens here so the public API returns
+    // `WorkflowError::IntegrationFailed` carrying the underlying solver text.
+    let wrap_solver_err =
+        |reason: String| -> WorkflowError { WorkflowError::IntegrationFailed { reason } };
     match request {
-        FitRequest::Standard(request) => fit_standard_model(request).map(FitResult::Standard),
-        FitRequest::GaussianLocationScale(request) => {
-            fit_gaussian_location_scale_model(request).map(FitResult::GaussianLocationScale)
-        }
-        FitRequest::BinomialLocationScale(request) => {
-            fit_binomial_location_scale_model(request).map(FitResult::BinomialLocationScale)
-        }
+        FitRequest::Standard(request) => fit_standard_model(request)
+            .map(FitResult::Standard)
+            .map_err(wrap_solver_err),
+        FitRequest::GaussianLocationScale(request) => fit_gaussian_location_scale_model(request)
+            .map(FitResult::GaussianLocationScale)
+            .map_err(wrap_solver_err),
+        FitRequest::BinomialLocationScale(request) => fit_binomial_location_scale_model(request)
+            .map(FitResult::BinomialLocationScale)
+            .map_err(wrap_solver_err),
         FitRequest::SurvivalLocationScale(request) => {
             // Outermost defensive catch: any path that surfaces empty
             // `block_states` to a family method (multiple possible —
@@ -2248,30 +2255,31 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, String> {
                              (3) `baseline_target=\"linear\"` to drop the parametric baseline, or \
                              (4) `noise_formula=\"1\"` to drop the noise GAM. Underlying error: {e}"
                         ),
-                    }
-                    .into())
+                    })
                 }
-                Err(e) => Err(e),
+                Err(reason) => Err(wrap_solver_err(reason)),
             }
         }
-        FitRequest::SurvivalTransformation(request) => {
-            fit_survival_transformation_model(request).map(FitResult::SurvivalTransformation)
-        }
+        FitRequest::SurvivalTransformation(request) => fit_survival_transformation_model(request)
+            .map(FitResult::SurvivalTransformation)
+            .map_err(wrap_solver_err),
         FitRequest::BernoulliMarginalSlope(request) => {
-            fit_bernoulli_marginal_slope_model(request).map(FitResult::BernoulliMarginalSlope)
+            fit_bernoulli_marginal_slope_model(request)
+                .map(FitResult::BernoulliMarginalSlope)
+                .map_err(wrap_solver_err)
         }
-        FitRequest::SurvivalMarginalSlope(request) => {
-            fit_survival_marginal_slope_model(request).map(FitResult::SurvivalMarginalSlope)
-        }
-        FitRequest::LatentSurvival(request) => {
-            fit_latent_survival_model(request).map(FitResult::LatentSurvival)
-        }
-        FitRequest::LatentBinary(request) => {
-            fit_latent_binary_model(request).map(FitResult::LatentBinary)
-        }
-        FitRequest::TransformationNormal(request) => {
-            fit_transformation_normal_model(request).map(FitResult::TransformationNormal)
-        }
+        FitRequest::SurvivalMarginalSlope(request) => fit_survival_marginal_slope_model(request)
+            .map(FitResult::SurvivalMarginalSlope)
+            .map_err(wrap_solver_err),
+        FitRequest::LatentSurvival(request) => fit_latent_survival_model(request)
+            .map(FitResult::LatentSurvival)
+            .map_err(wrap_solver_err),
+        FitRequest::LatentBinary(request) => fit_latent_binary_model(request)
+            .map(FitResult::LatentBinary)
+            .map_err(wrap_solver_err),
+        FitRequest::TransformationNormal(request) => fit_transformation_normal_model(request)
+            .map(FitResult::TransformationNormal)
+            .map_err(wrap_solver_err),
     }
 }
 
@@ -2488,7 +2496,9 @@ pub fn fit_from_formula(
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
     let mat = materialize(formula, data, config)?;
-    fit_model(mat.request).map_err(|reason| WorkflowError::IntegrationFailed { reason })
+    // `fit_model` already returns `WorkflowError` end-to-end; propagate it
+    // directly instead of stringifying then re-wrapping.
+    fit_model(mat.request)
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
