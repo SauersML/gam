@@ -362,20 +362,6 @@ fn mxtwx(
 }
 
 #[inline]
-fn mxtwx_with_parallelism(
-    left: &Array2<f64>,
-    weights: &Array1<f64>,
-    right: &Array2<f64>,
-    par: faer::Par,
-    mask: Option<&Array1<f64>>,
-) -> Result<Array2<f64>, String> {
-    match mask {
-        Some(m) => weighted_crossprod_dense_with_parallelism(left, &(weights * m), right, par),
-        None => weighted_crossprod_dense_with_parallelism(left, weights, right, par),
-    }
-}
-
-#[inline]
 fn mxtwxd(
     x: &Array2<f64>,
     weights: &Array1<f64>,
@@ -384,19 +370,6 @@ fn mxtwxd(
     match mask {
         Some(m) => safe_fast_xt_diag_x(x, &(weights * m)),
         None => safe_fast_xt_diag_x(x, weights),
-    }
-}
-
-#[inline]
-fn mxtwxd_with_parallelism(
-    x: &Array2<f64>,
-    weights: &Array1<f64>,
-    par: faer::Par,
-    mask: Option<&Array1<f64>>,
-) -> Array2<f64> {
-    match mask {
-        Some(m) => safe_fast_xt_diag_x_with_parallelism(x, &(weights * m), par),
-        None => safe_fast_xt_diag_x_with_parallelism(x, weights, par),
     }
 }
 
@@ -1568,6 +1541,7 @@ struct SurvivalExactNewtonJointPsiWorkspace {
     derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
     joint_quantities: SurvivalJointQuantities,
     psi_directions: ExactNewtonJointPsiDirectCache<SurvivalJointPsiDirection>,
+    row_mask: Option<Arc<Array1<f64>>>,
 }
 
 fn split_survival_psi_design(
