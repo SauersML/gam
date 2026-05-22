@@ -94,6 +94,24 @@ impl From<String> for SampleError {
     }
 }
 
+impl From<crate::families::survival_predict::SurvivalPredictError> for SampleError {
+    fn from(err: crate::families::survival_predict::SurvivalPredictError) -> SampleError {
+        SampleError::SamplerSetupFailed { reason: String::from(err) }
+    }
+}
+
+impl From<crate::inference::model::FittedModelError> for SampleError {
+    fn from(err: crate::inference::model::FittedModelError) -> SampleError {
+        SampleError::SamplerSetupFailed { reason: String::from(err) }
+    }
+}
+
+impl From<crate::inference::formula_dsl::FormulaDslError> for SampleError {
+    fn from(err: crate::inference::formula_dsl::FormulaDslError) -> SampleError {
+        SampleError::SamplerSetupFailed { reason: String::from(err) }
+    }
+}
+
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
 /// time-wiggle component. Re-exported because the survival fitter's tests
@@ -101,7 +119,7 @@ impl From<String> for SampleError {
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
 ) -> Result<Option<LinkWiggleFormulaSpec>, SampleError> {
-    model.saved_baseline_time_wiggle().map_err(|e| SampleError::from(String::from(e))).map(|runtime| {
+    model.saved_baseline_time_wiggle().map_err(SampleError::from).map(|runtime| {
         runtime.map(|saved| LinkWiggleFormulaSpec {
             degree: saved.degree,
             num_internal_knots: saved.knots.len().saturating_sub(2 * (saved.degree + 1)),
