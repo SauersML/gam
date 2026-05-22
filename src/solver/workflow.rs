@@ -1046,9 +1046,9 @@ fn fit_cause_specific_survival_transformation_custom(
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
     let cause_count = crate::survival::cause_count_from_event_codes(spec.event_target.view());
-    if cause_count <= 1 {
+    if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
-            reason: "cause-specific custom survival fit requires at least two causes".to_string(),
+            reason: "cause-specific custom survival fit requires at least one cause".to_string(),
         }
         .into());
     }
@@ -1721,7 +1721,7 @@ fn fit_survival_transformation_model(
 
     let (prepared, penalty_blocks, beta0, structural_lower_bounds, mut model) =
         build_working_model(&baseline_cfg)?;
-    if cause_count > 1 {
+    if cause_count > 1 || !spec.penalty_block_gamma_priors.is_empty() {
         return fit_cause_specific_survival_transformation_custom(
             &spec,
             resolvedspec,
