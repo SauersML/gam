@@ -1181,9 +1181,10 @@ pub fn build_smooth_basis(
                 | Some("mgcv")
                 | Some("sos") => Some(crate::basis::SphereWahbaKernel::Pseudo),
                 Some(other) => {
-                    return Err(format!(
+                    return Err(TermBuilderError::unsupported_feature(format!(
                         "unsupported sphere kernel '{other}'; use one of: sobolev | pseudo"
-                    ));
+                    ))
+                    .to_string());
                 }
             };
             let wahba_kernel = explicit_kernel
@@ -1261,13 +1262,14 @@ pub fn build_smooth_basis(
             // up-front instead of letting the user see the generic
             // "Matrix conditioning issue detected" wrapper from PIRLS.
             if matches!(nu, MaternNu::Half) && cols.len() >= 2 {
-                return Err(format!(
+                return Err(TermBuilderError::unsupported_feature(format!(
                     "matern() with nu=1/2 is not supported for d>=2 (got {} covariates): \
                      the exponential kernel's Laplacian is singular at center collisions, \
                      which makes the operator-collocation penalty non-invertible. \
                      Choose nu>=3/2 (e.g. nu=3/2 or the default nu=5/2) for multi-dimensional smooths.",
                     cols.len()
-                ));
+                ))
+                .to_string());
             }
             let aniso_log_scales = if option_bool(options, "scale_dims").unwrap_or(false) {
                 Some(vec![0.0; cols.len()])
@@ -1288,7 +1290,8 @@ pub fn build_smooth_basis(
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
-                    identifiability: parse_matern_identifiability(options)?,
+                    identifiability: parse_matern_identifiability(options)
+                        .map_err(|e| e.to_string())?,
                     aniso_log_scales,
                 },
                 input_scales: None,
@@ -1324,10 +1327,11 @@ pub fn build_smooth_basis(
                 ],
             )?;
             if options.contains_key("double_penalty") {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
                     vars.join(", ")
-                ));
+                ))
+                .to_string());
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64_strict(options, "length_scale")?;
@@ -1419,7 +1423,7 @@ pub fn build_smooth_basis(
                 }
             };
             if requested_centers <= polynomial_cols {
-                return Err(format!(
+                return Err(TermBuilderError::incompatible_config(format!(
                     "Duchon smooth '{}' requested basis dimension {} but order={:?} in {}D needs {} polynomial null-space columns; choose centers/k > {}",
                     vars.join(", "),
                     requested_centers,
@@ -1427,7 +1431,8 @@ pub fn build_smooth_basis(
                     cols.len(),
                     polynomial_cols,
                     polynomial_cols,
-                ));
+                ))
+                .to_string());
             }
             let mut centers = requested_centers;
             if !centers_explicit && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
@@ -1453,7 +1458,8 @@ pub fn build_smooth_basis(
                     length_scale,
                     power: power as f64,
                     nullspace_order,
-                    identifiability: parse_spatial_identifiability(options)?,
+                    identifiability: parse_spatial_identifiability(options)
+                        .map_err(|e| e.to_string())?,
                     aniso_log_scales,
                     operator_penalties,
                     periodic,
@@ -1461,7 +1467,10 @@ pub fn build_smooth_basis(
                 input_scales: None,
             })
         }
-        other => Err(format!("unsupported smooth type '{other}'")),
+        other => Err(TermBuilderError::unsupported_feature(format!(
+            "unsupported smooth type '{other}'"
+        ))
+        .to_string()),
     }
 }
 
@@ -1506,7 +1515,10 @@ pub fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
     let min = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let max = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     if !min.is_finite() || !max.is_finite() {
-        return Err("non-finite data encountered while inferring knot range".to_string());
+        return Err(TermBuilderError::degenerate_data(
+            "non-finite data encountered while inferring knot range",
+        )
+        .to_string());
     }
     if (max - min).abs() < 1e-12 {
         Ok((min, min + 1e-6))
@@ -1944,18 +1956,19 @@ pub fn parse_ps_internal_knots(
     let knots_internal = option_usize_strict(options, "knots")?;
     let basis_dim = option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
     if knots_internal.is_some() && basis_dim.is_some() {
-        return Err(
-            "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)"
-                .to_string(),
-        );
+        return Err(TermBuilderError::incompatible_config(
+            "ps/bspline smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)",
+        )
+        .to_string());
     }
     if let Some(k) = basis_dim {
         let min_k = degree + 1;
         if k < min_k {
-            return Err(format!(
+            return Err(TermBuilderError::invalid_option(format!(
                 "ps/bspline smooth: k={} too small for degree {}; expected k >= {}",
                 k, degree, min_k
-            ));
+            ))
+            .to_string());
         }
         Ok(((k - min_k).max(MIN_EXPRESSIVE_INTERNAL_KNOTS), false))
     } else {
@@ -2003,14 +2016,15 @@ pub fn validate_known_options(
             } else {
                 format!(" — did you mean one of [{}]?", suggestions.join(", "))
             };
-            return Err(format!(
+            return Err(TermBuilderError::invalid_option(format!(
                 "{term_name}() does not accept option `{key}`{hint} Known options: [{}]",
                 {
                     let mut sorted = known.to_vec();
                     sorted.sort_unstable();
                     sorted.join(", ")
                 }
-            ));
+            ))
+            .to_string());
         }
     }
     Ok(())
@@ -2031,10 +2045,11 @@ pub fn parse_countwith_basis_alias(
         &["k", "basis_dim", "basis-dim", "basisdim", "knots"],
     )?;
     if primary.is_some() && basis_dim.is_some() {
-        return Err(format!(
+        return Err(TermBuilderError::incompatible_config(format!(
             "specify either {}=<count> or k=<basis_dim> (not both)",
             primarykey
-        ));
+        ))
+        .to_string());
     }
     Ok(primary.or(basis_dim).unwrap_or(default_count))
 }
@@ -2092,9 +2107,10 @@ pub fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
 }
 
 fn unsupported_matern_nu_message(raw: &str) -> String {
-    format!(
+    TermBuilderError::unsupported_feature(format!(
         "unsupported Matern nu '{raw}'; supported half-integer values are 1/2, 3/2, 5/2, 7/2, and 9/2"
-    )
+    ))
+    .to_string()
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -2107,17 +2123,19 @@ pub fn parse_duchon_power_policy(
     options: &BTreeMap<String, String>,
 ) -> Result<DuchonPowerPolicy, String> {
     if let Some(raw_nu) = options.get("nu") {
-        return Err(format!(
+        return Err(TermBuilderError::incompatible_config(format!(
             "Duchon smooths use power=<integer>, not nu='{}'. Use power=0, power=1, etc.",
             raw_nu
-        ));
+        ))
+        .to_string());
     }
     match options.get("power") {
         Some(raw) => raw.parse::<usize>().map(DuchonPowerPolicy::Explicit).map_err(|_| {
-            format!(
+            TermBuilderError::invalid_option(format!(
                 "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1",
                 raw
-            )
+            ))
+            .to_string()
         }),
         None => Ok(DuchonPowerPolicy::MinimumAdmissibleForTripleOperator),
     }
@@ -2139,10 +2157,11 @@ pub fn parse_duchon_order(
             Ok(0) => Ok(DuchonNullspaceOrder::Zero),
             Ok(1) => Ok(DuchonNullspaceOrder::Linear),
             Ok(other) => Ok(DuchonNullspaceOrder::Degree(other)),
-            Err(_) => Err(format!(
+            Err(_) => Err(TermBuilderError::invalid_option(format!(
                 "invalid Duchon order '{}'; expected a non-negative integer such as order=0, order=1, or order=2",
                 raw
-            )),
+            ))
+            .to_string()),
         },
     }
 }
@@ -2678,7 +2697,8 @@ mod tests {
         opts.insert("side".to_string(), "left".to_string());
         opts.insert("anchor".to_string(), "2.5".to_string());
         let err = parse_bspline_boundary_conditions(&opts)
-            .expect_err("non-zero left anchor must be rejected");
+            .expect_err("non-zero left anchor must be rejected")
+            .to_string();
         assert!(
             err.contains("left") && err.contains("2.5"),
             "rejection should name the affected side and value: {err}"
@@ -2692,7 +2712,8 @@ mod tests {
         opts.insert("end_bc".to_string(), "zero".to_string());
         opts.insert("right_anchor".to_string(), "-1.0".to_string());
         let err = parse_bspline_boundary_conditions(&opts)
-            .expect_err("non-zero right anchor must be rejected");
+            .expect_err("non-zero right anchor must be rejected")
+            .to_string();
         assert!(
             err.contains("right") && err.contains("-1"),
             "rejection should name the affected side and value: {err}"
