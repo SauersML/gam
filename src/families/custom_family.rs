@@ -19711,11 +19711,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     struct CustomOuterState {
         warm_cache: Option<ConstrainedWarmStart>,
         last_error: Option<String>,
+        initial_gradient_norm: Option<f64>,
     }
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
+    let outer_inner_cap = options
+        .outer_inner_max_iterations
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicUsize::new(options.inner_max_cycles.max(1))));
+    outer_inner_cap.store(options.inner_max_cycles.max(1), Ordering::Relaxed);
     let mut outer_options = options.clone();
     outer_options.screening_max_inner_iterations = Some(Arc::clone(&screening_cap));
+    outer_options.outer_inner_max_iterations = Some(Arc::clone(&outer_inner_cap));
 
     let n_rho = rho0.len();
     let (cap_gradient, cap_hessian) =
@@ -19826,6 +19833,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             },
         ) {
             Ok(eval) if !eval.inner_converged => {
+                update_custom_outer_inner_cap_from_warm_start(
+                    &outer_options,
+                    &eval.warm_start,
+                    None,
+                    &mut outer.initial_gradient_norm,
+                );
                 outer.warm_cache = Some(eval.warm_start.clone());
                 outer.last_error = Some("custom-family inner solve did not converge".to_string());
                 return Err(EstimationError::RemlOptimizationFailed(
@@ -19848,6 +19861,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
+                let gradient_norm = eval
+                    .gradient
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt();
+                update_custom_outer_inner_cap_from_warm_start(
+                    &outer_options,
+                    &warm_start,
+                    Some(gradient_norm),
+                    &mut outer.initial_gradient_norm,
+                );
                 outer.warm_cache = Some(warm_start.clone());
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_key.as_deref(),
@@ -19888,6 +19913,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         CustomOuterState {
             warm_cache: persistent_warm_start.clone(),
             last_error: None,
+            initial_gradient_norm: None,
         },
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Always use warm cache when available — the previous inner solution
@@ -19907,6 +19933,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             ) {
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     let warm_start = eval.warm_start;
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &warm_start,
+                        None,
+                        &mut outer.initial_gradient_norm,
+                    );
                     store_persistent_custom_family_warm_start(
                         persistent_warm_start_key.as_deref(),
                         specs,
@@ -19917,6 +19949,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     Ok(eval.objective)
                 }
                 Ok(eval) => {
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &eval.warm_start,
+                        None,
+                        &mut outer.initial_gradient_norm,
+                    );
                     outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = Some(
                         "custom-family value-only inner solve did not converge or objective was non-finite"
@@ -19968,6 +20006,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 rho_prior.clone(),
             ) {
                 Ok((eval, warm, true)) => {
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &warm,
+                        None,
+                        &mut outer.initial_gradient_norm,
+                    );
                     store_persistent_custom_family_warm_start(
                         persistent_warm_start_key.as_deref(),
                         specs,
@@ -19978,6 +20022,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     Ok(eval)
                 }
                 Ok((_eval, warm, false)) => {
+                    update_custom_outer_inner_cap_from_warm_start(
+                        &outer_options,
+                        &warm,
+                        None,
+                        &mut outer.initial_gradient_norm,
+                    );
                     outer.warm_cache = Some(warm);
                     outer.last_error =
                         Some("custom-family EFS inner solve did not converge".to_string());
@@ -20055,13 +20105,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
 
     let per_block = split_labeled_log_lambdas(&rho_star, &label_layout)?;
     let final_seed = obj.state.warm_cache.clone();
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, final_seed.as_ref())
-        .map_err(|e| {
-            format!(
-                "outer smoothing optimization failed during final inner refit: \
+    let mut final_options = options.clone();
+    final_options.outer_inner_max_iterations = None;
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        &final_options,
+        final_seed.as_ref(),
+    )
+    .map_err(|e| {
+        format!(
+            "outer smoothing optimization failed during final inner refit: \
                      {e}.{last_error_detail}"
-            )
-        })?;
+        )
+    })?;
     if !inner.converged {
         return Err(CustomFamilyError::Optimization(format!(
             "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
@@ -22992,6 +23050,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_inner_max_iterations: None,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -23037,6 +23096,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_inner_max_iterations: None,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -23085,6 +23145,7 @@ mod tests {
             compute_covariance: false,
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
+            outer_inner_max_iterations: None,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
