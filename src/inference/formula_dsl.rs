@@ -65,13 +65,69 @@ pub struct FunctionCallSpec {
     pub args: Vec<CallArgSpec>,
 }
 
+/// Typed error surface for the formula DSL parser.
+///
+/// Every variant carries a free-form `reason: String` payload; `Display`
+/// emits exactly that payload, so converting a `FormulaDslError` into
+/// `String` (via the `From` impl below) is byte-equivalent to the pre-
+/// refactor `Err(format!(...))` / `Err("...".to_string())` strings that
+/// the same call sites produced. Public entry points keep their existing
+/// `Result<_, String>` signatures — CLI input handling stays unchanged —
+/// and typed errors flow across the boundary via `From<FormulaDslError>
+/// for String`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormulaDslError {
+    /// Pest grammar failure, unbalanced delimiters, empty terms, or
+    /// missing required parse fragments — i.e. the formula text is
+    /// not a well-formed DSL string.
+    ParseError { reason: String },
+    /// A referenced symbol (link name, blended-link component, term
+    /// function name, top-level RHS identifier) is not part of the
+    /// supported vocabulary.
+    UnknownIdentifier { reason: String },
+    /// A named option's value is unparseable, out of range, or not a
+    /// finite number / valid integer.
+    InvalidArgument { reason: String },
+    /// A combination of terms or options is disallowed (duplicate
+    /// terms, multiple linkwiggle/link/survmodel, mutually exclusive
+    /// option groups in bounded(), wiggle-incompatible links, etc.).
+    IncompatibleTerm { reason: String },
+    /// A required configuration option is missing or empty (e.g.
+    /// `link()` without `type=`, `survmodel()` with no options,
+    /// `bounded()` without a required argument).
+    MalformedConfig { reason: String },
+}
+
+impl std::fmt::Display for FormulaDslError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ParseError { reason }
+            | Self::UnknownIdentifier { reason }
+            | Self::InvalidArgument { reason }
+            | Self::IncompatibleTerm { reason }
+            | Self::MalformedConfig { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for FormulaDslError {}
+
+impl From<FormulaDslError> for String {
+    fn from(err: FormulaDslError) -> String {
+        err.to_string()
+    }
+}
+
 pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
     validate_balanced_delimiters(formula, "invalid formula syntax")?;
-    let mut parsed = FormulaParser::parse(Rule::formula, formula)
-        .map_err(|e| format!("invalid formula syntax: {e}"))?;
-    let formula_pair = parsed
-        .next()
-        .ok_or_else(|| "invalid formula syntax: empty parse".to_string())?;
+    let mut parsed = FormulaParser::parse(Rule::formula, formula).map_err(|e| {
+        FormulaDslError::ParseError {
+            reason: format!("invalid formula syntax: {e}"),
+        }
+    })?;
+    let formula_pair = parsed.next().ok_or_else(|| FormulaDslError::ParseError {
+        reason: "invalid formula syntax: empty parse".to_string(),
+    })?;
 
     let mut response_expr: Option<String> = None;
     let mut rhs_terms: Option<Vec<String>> = None;
@@ -88,11 +144,17 @@ pub fn parse_formula_dsl(formula: &str) -> Result<FormulaDslParse, String> {
         }
     }
 
-    let response_expr =
-        response_expr.ok_or_else(|| "invalid formula: missing response expression".to_string())?;
-    let rhs_terms = rhs_terms.ok_or_else(|| "invalid formula: missing RHS terms".to_string())?;
+    let response_expr = response_expr.ok_or_else(|| FormulaDslError::ParseError {
+        reason: "invalid formula: missing response expression".to_string(),
+    })?;
+    let rhs_terms = rhs_terms.ok_or_else(|| FormulaDslError::ParseError {
+        reason: "invalid formula: missing RHS terms".to_string(),
+    })?;
     if rhs_terms.is_empty() {
-        return Err("formula has no usable terms".to_string());
+        return Err(FormulaDslError::ParseError {
+            reason: "formula has no usable terms".to_string(),
+        }
+        .into());
     }
 
     Ok(FormulaDslParse {
@@ -126,7 +188,10 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
                     _ => unreachable!(),
                 };
                 if stack.pop() != Some(expected) {
-                    return Err(delimiter_balance_error(prefix));
+                    return Err(FormulaDslError::ParseError {
+                        reason: delimiter_balance_error(prefix),
+                    }
+                    .into());
                 }
             }
             _ => {}
@@ -134,7 +199,10 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
     }
 
     if in_single || in_double || !stack.is_empty() {
-        return Err(delimiter_balance_error(prefix));
+        return Err(FormulaDslError::ParseError {
+            reason: delimiter_balance_error(prefix),
+        }
+        .into());
     }
     Ok(())
 }
@@ -157,7 +225,10 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
             '+' if !in_single && !in_double && depth == 0 => {
                 let term = text[start..idx].trim();
                 if term.is_empty() {
-                    return Err("formula RHS contains an empty term".to_string());
+                    return Err(FormulaDslError::ParseError {
+                        reason: "formula RHS contains an empty term".to_string(),
+                    }
+                    .into());
                 }
                 out.push(term.to_string());
                 start = idx + 1;
@@ -166,11 +237,17 @@ fn extract_rhs_terms(rhs: Pair<'_, Rule>) -> Result<Vec<String>, String> {
         }
     }
     if in_single || in_double || depth != 0 {
-        return Err("formula RHS has unbalanced quotes or parentheses".to_string());
+        return Err(FormulaDslError::ParseError {
+            reason: "formula RHS has unbalanced quotes or parentheses".to_string(),
+        }
+        .into());
     }
     let tail = text[start..].trim();
     if tail.is_empty() {
-        return Err("formula RHS contains an empty term".to_string());
+        return Err(FormulaDslError::ParseError {
+            reason: "formula RHS contains an empty term".to_string(),
+        }
+        .into());
     }
     out.push(tail.to_string());
     Ok(out)
@@ -189,15 +266,20 @@ fn is_exact_ident(raw: &str) -> bool {
 
 pub fn parse_function_call(input: &str) -> Result<FunctionCallSpec, String> {
     validate_balanced_delimiters(input, "invalid function call syntax")?;
-    let mut parsed = FormulaParser::parse(Rule::top_function_call, input)
-        .map_err(|e| format!("invalid function call syntax: {e}"))?;
-    let top = parsed
-        .next()
-        .ok_or_else(|| "invalid function call syntax: empty parse".to_string())?;
+    let mut parsed = FormulaParser::parse(Rule::top_function_call, input).map_err(|e| {
+        FormulaDslError::ParseError {
+            reason: format!("invalid function call syntax: {e}"),
+        }
+    })?;
+    let top = parsed.next().ok_or_else(|| FormulaDslError::ParseError {
+        reason: "invalid function call syntax: empty parse".to_string(),
+    })?;
     let call = top
         .into_inner()
         .find(|p| p.as_rule() == Rule::function_call)
-        .ok_or_else(|| "invalid function call syntax: missing call".to_string())?;
+        .ok_or_else(|| FormulaDslError::ParseError {
+            reason: "invalid function call syntax: missing call".to_string(),
+        })?;
     parse_call_pair(call)
 }
 
@@ -225,13 +307,17 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
                             let mut ni = first.into_inner();
                             let key = ni
                                 .next()
-                                .ok_or_else(|| "invalid named argument key".to_string())?
+                                .ok_or_else(|| FormulaDslError::ParseError {
+                                    reason: "invalid named argument key".to_string(),
+                                })?
                                 .as_str()
                                 .trim()
                                 .to_ascii_lowercase();
                             let value = ni
                                 .next()
-                                .ok_or_else(|| "invalid named argument value".to_string())?
+                                .ok_or_else(|| FormulaDslError::ParseError {
+                                    reason: "invalid named argument value".to_string(),
+                                })?
                                 .as_str()
                                 .trim()
                                 .to_string();
@@ -247,7 +333,9 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
             _ => {}
         }
     }
-    let name = name.ok_or_else(|| "invalid function call: missing name".to_string())?;
+    let name = name.ok_or_else(|| FormulaDslError::ParseError {
+        reason: "invalid function call: missing name".to_string(),
+    })?;
     Ok(FunctionCallSpec { name, args })
 }
 
@@ -499,10 +587,13 @@ pub fn marginal_slope_logslope_surfaces(
     let mut seen = std::collections::BTreeSet::<String>::new();
     for surface in &surfaces {
         if !seen.insert(surface.z_column.clone()) {
-            return Err(format!(
-                "logslope formula declares z column '{}' more than once; each z coordinate needs exactly one log-slope surface",
-                surface.z_column
-            ));
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: format!(
+                    "logslope formula declares z column '{}' more than once; each z coordinate needs exactly one log-slope surface",
+                    surface.z_column
+                ),
+            }
+            .into());
         }
     }
     Ok(surfaces)
@@ -575,22 +666,31 @@ pub fn validate_marginal_slope_z_column_exclusion(
     let surfaces = marginal_slope_logslope_surfaces(logslope_formula, z_column)?;
     for z_column in surfaces.iter().map(|surface| surface.z_column.as_str()) {
         if parsed_terms_reference_column(&main_formula.terms, z_column) {
-            return Err(format!(
-                "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
-            ));
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: format!(
+                    "{context} reserves z column '{z_column}' as the auxiliary latent score; it cannot also appear in the main formula"
+                ),
+            }
+            .into());
         }
     }
     for reserved in surfaces.iter().map(|surface| surface.z_column.as_str()) {
         if parsed_terms_reference_column(&logslope_formula.terms, reserved) {
-            return Err(format!(
-                "{context} reserves z column '{reserved}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
-            ));
+            return Err(FormulaDslError::IncompatibleTerm {
+                reason: format!(
+                    "{context} reserves z column '{reserved}' as the auxiliary latent score; it cannot also appear in {logslope_label}"
+                ),
+            }
+            .into());
         }
         for surface in &surfaces {
             if parsed_terms_reference_column(&surface.terms, reserved) {
-                return Err(format!(
-                    "{context} reserves z column '{reserved}' as an auxiliary latent score; it cannot also appear in {logslope_label}"
-                ));
+                return Err(FormulaDslError::IncompatibleTerm {
+                    reason: format!(
+                        "{context} reserves z column '{reserved}' as an auxiliary latent score; it cannot also appear in {logslope_label}"
+                    ),
+                }
+                .into());
             }
         }
     }
@@ -713,9 +813,12 @@ pub fn require_binomial_inverse_link_supports_joint_wiggle(
     if binomial_inverse_link_supports_joint_wiggle(link) {
         Ok(())
     } else {
-        Err(format!(
-            "{context} does not support identity, log, latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted logit/probit/cloglog links"
-        ))
+        Err(FormulaDslError::IncompatibleTerm {
+            reason: format!(
+                "{context} does not support identity, log, latent-cloglog, SAS, BetaLogistic, or Mixture links; wiggle is only available for jointly fitted logit/probit/cloglog links"
+            ),
+        }
+        .into())
     }
 }
 
@@ -758,9 +861,12 @@ fn validate_known_term_options(
             } else {
                 format!("[{known_sorted}]")
             };
-            return Err(format!(
-                "{term_name}() does not accept option `{key}` (in `{raw}`); known options: {known_hint}"
-            ));
+            return Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "{term_name}() does not accept option `{key}` (in `{raw}`); known options: {known_hint}"
+                ),
+            }
+            .into());
         }
     }
     Ok(())
@@ -788,10 +894,13 @@ pub fn option_usize_strict(
     match map.get(key) {
         None => Ok(None),
         Some(raw) => raw.parse::<usize>().map(Some).map_err(|_| {
-            format!(
-                "option `{key}={raw}` is not a non-negative integer; \
-                 expected a whole number ≥ 0"
-            )
+            FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "option `{key}={raw}` is not a non-negative integer; \
+                     expected a whole number ≥ 0"
+                ),
+            }
+            .into()
         }),
     }
 }
@@ -822,12 +931,18 @@ pub fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Result<Op
         None => Ok(None),
         Some(raw) => match raw.parse::<f64>() {
             Ok(v) if v.is_finite() => Ok(Some(v)),
-            Ok(v) => Err(format!(
-                "option `{key}={raw}` parses as {v} which is not a finite number"
-            )),
-            Err(_) => Err(format!(
-                "option `{key}={raw}` is not a valid number; expected a finite decimal"
-            )),
+            Ok(v) => Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "option `{key}={raw}` parses as {v} which is not a finite number"
+                ),
+            }
+            .into()),
+            Err(_) => Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "option `{key}={raw}` is not a valid number; expected a finite decimal"
+                ),
+            }
+            .into()),
         },
     }
 }
@@ -865,9 +980,12 @@ fn parse_linear_constraint_bounds(
     if let (Some(min), Some(max)) = (min, max)
         && (!min.is_finite() || !max.is_finite() || min > max)
     {
-        return Err(format!(
-            "linear coefficient constraints require finite min <= max, got min={min}, max={max}: {raw}"
-        ));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!(
+                "linear coefficient constraints require finite min <= max, got min={min}, max={max}: {raw}"
+            ),
+        }
+        .into());
     }
     Ok((min, max))
 }
@@ -877,14 +995,17 @@ fn parse_required_f64_option(
     key: &str,
     raw: &str,
 ) -> Result<f64, String> {
-    let value = options
-        .get(key)
-        .ok_or_else(|| format!("bounded() is missing required '{key}' argument: {raw}"))?;
+    let value = options.get(key).ok_or_else(|| FormulaDslError::MalformedConfig {
+        reason: format!("bounded() is missing required '{key}' argument: {raw}"),
+    })?;
     value.parse::<f64>().map_err(|_| {
-        format!(
-            "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
-            value
-        )
+        FormulaDslError::InvalidArgument {
+            reason: format!(
+                "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+                value
+            ),
+        }
+        .into()
     })
 }
 
@@ -895,10 +1016,13 @@ fn parse_optional_f64_option(
 ) -> Result<Option<f64>, String> {
     match options.get(key) {
         Some(value) => value.parse::<f64>().map(Some).map_err(|_| {
-            format!(
-                "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
-                value
-            )
+            FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+                    value
+                ),
+            }
+            .into()
         }),
         None => Ok(None),
     }
@@ -913,18 +1037,21 @@ fn parse_optional_f64_option_alias(
     let mut found: Option<(&str, f64)> = None;
     for key in keys {
         if let Some(value) = options.get(*key) {
-            let parsed = value.parse::<f64>().map_err(|_| {
-                format!(
+            let parsed = value.parse::<f64>().map_err(|_| FormulaDslError::InvalidArgument {
+                reason: format!(
                     "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
                     value
-                )
+                ),
             })?;
             if found.is_some() {
-                return Err(format!(
-                    "{fn_label}() cannot specify both '{}' and '{}': {raw}",
-                    found.expect("present").0,
-                    key
-                ));
+                return Err(FormulaDslError::IncompatibleTerm {
+                    reason: format!(
+                        "{fn_label}() cannot specify both '{}' and '{}': {raw}",
+                        found.expect("present").0,
+                        key
+                    ),
+                }
+                .into());
             }
             found = Some((key, parsed));
         }
@@ -953,9 +1080,12 @@ fn parse_linkwiggle_penalty_orders(raw: Option<&str>) -> Result<Vec<usize>, Stri
             "curvature" | "2" => out.push(2),
             "curvature-change" | "curvature_change" | "3" => out.push(3),
             _ => {
-                return Err(format!(
-                    "invalid linkwiggle penalty_order '{t}'; use all|slope|curvature|curvature-change or 1/2/3"
-                ));
+                return Err(FormulaDslError::InvalidArgument {
+                    reason: format!(
+                        "invalid linkwiggle penalty_order '{t}'; use all|slope|curvature|curvature-change or 1/2/3"
+                    ),
+                }
+                .into());
             }
         }
     }
@@ -984,21 +1114,30 @@ pub fn parse_linkwiggle_formulaspec(
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
         let term_name = raw.split('(').next().unwrap_or("linkwiggle");
-        return Err(format!(
-            "{}() does not support option(s) {}: {raw}",
-            term_name,
-            unknown.join(", ")
-        ));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!(
+                "{}() does not support option(s) {}: {raw}",
+                term_name,
+                unknown.join(", ")
+            ),
+        }
+        .into());
     }
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
     let degree = option_usize(options, "degree").unwrap_or(defaults.degree);
     if degree < 1 {
-        return Err(format!("linkwiggle() requires degree >= 1: {raw}"));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!("linkwiggle() requires degree >= 1: {raw}"),
+        }
+        .into());
     }
     let num_internal_knots =
         option_usize(options, "internal_knots").unwrap_or(defaults.num_internal_knots);
     if num_internal_knots == 0 {
-        return Err(format!("linkwiggle() requires internal_knots > 0: {raw}"));
+        return Err(FormulaDslError::InvalidArgument {
+            reason: format!("linkwiggle() requires internal_knots > 0: {raw}"),
+        }
+        .into());
     }
     let penalty_orders =
         parse_linkwiggle_penalty_orders(options.get("penalty_order").map(String::as_str))?;
@@ -1018,9 +1157,14 @@ fn parse_link_formulaspec(
     let link = options
         .get("type")
         .map(|s| s.trim().to_string())
-        .ok_or_else(|| format!("link() requires type=<link-name>: {raw}"))?;
+        .ok_or_else(|| FormulaDslError::MalformedConfig {
+            reason: format!("link() requires type=<link-name>: {raw}"),
+        })?;
     if link.is_empty() {
-        return Err(format!("link() requires a non-empty type: {raw}"));
+        return Err(FormulaDslError::MalformedConfig {
+            reason: format!("link() requires a non-empty type: {raw}"),
+        }
+        .into());
     }
     let mixture_rho = options.get("rho").map(|s| s.trim().to_string());
     let sas_init = options.get("sas_init").map(|s| s.trim().to_string());
@@ -1040,9 +1184,12 @@ fn parse_survival_formulaspec(
     raw: &str,
 ) -> Result<SurvivalFormulaSpec, String> {
     if options.is_empty() {
-        return Err(format!(
-            "survmodel() requires at least one named option (e.g., spec=..., distribution=...): {raw}"
-        ));
+        return Err(FormulaDslError::MalformedConfig {
+            reason: format!(
+                "survmodel() requires at least one named option (e.g., spec=..., distribution=...): {raw}"
+            ),
+        }
+        .into());
     }
     Ok(SurvivalFormulaSpec {
         spec: options.get("spec").map(|s| s.trim().to_string()),
