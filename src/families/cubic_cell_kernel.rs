@@ -3173,20 +3173,75 @@ fn evaluate_non_affine_cell_state(
     let c3 = cell.c3;
     let moments_slice: &mut [f64] = &mut moments;
     debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
-    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+    // SIMD path: process 4 GL nodes per outer iteration, batching the two
+    // scalar `exp` calls into single 4-wide `wide::f64x4::exp` invocations.
+    // 384 is divisible by 4, so no scalar tail is needed for the GL sweep.
+    // The inner moment accumulation is then run scalar per-lane but with a
+    // 4-way unrolled slab over the moment slots to break the `z_pow *= z`
+    // serial dependency chain.
+    use wide::f64x4;
+    let center_v = f64x4::splat(center);
+    let half_width_v = f64x4::splat(half_width);
+    let c0_v = f64x4::splat(c0);
+    let c1_v = f64x4::splat(c1);
+    let c2_v = f64x4::splat(c2);
+    let c3_v = f64x4::splat(c3);
+    let half_v = f64x4::splat(0.5);
+    let neg_half_v = f64x4::splat(-0.5);
+    let n_total = GL_NODES.len();
+    let n_simd = n_total - (n_total % 4);
+    let mut i = 0;
+    while i < n_simd {
+        let node_v = f64x4::from([
+            GL_NODES[i],
+            GL_NODES[i + 1],
+            GL_NODES[i + 2],
+            GL_NODES[i + 3],
+        ]);
+        let weight_v = f64x4::from([
+            GL_WEIGHTS[i],
+            GL_WEIGHTS[i + 1],
+            GL_WEIGHTS[i + 2],
+            GL_WEIGHTS[i + 3],
+        ]);
+        let z_v = half_width_v.mul_add(node_v, center_v);
+        // Horner: ((c3*z + c2)*z + c1)*z + c0
+        let eta_v = c3_v
+            .mul_add(z_v, c2_v)
+            .mul_add(z_v, c1_v)
+            .mul_add(z_v, c0_v);
+        let z2_v = z_v * z_v;
+        let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
+        let scaled_weight_v = weight_v * half_width_v;
+        let exp_negq_v = neg_q_v.exp();
+        let neg_half_z2_v = neg_half_v * z2_v;
+        let exp_neg_half_z2_v = neg_half_z2_v.exp();
+        let moment_weight_v = scaled_weight_v * exp_negq_v;
+        let value_term_v = scaled_weight_v * exp_neg_half_z2_v;
+        let z_arr = z_v.to_array();
+        let eta_arr = eta_v.to_array();
+        let mw_arr = moment_weight_v.to_array();
+        let vt_arr = value_term_v.to_array();
+        for lane in 0..4 {
+            let z = z_arr[lane];
+            let mw = mw_arr[lane];
+            accumulate_moments_unrolled4(moments_slice, mw, z);
+            value_integral = vt_arr[lane].mul_add(normal_cdf(eta_arr[lane]), value_integral);
+        }
+        i += 4;
+    }
+    while i < n_total {
+        let node = GL_NODES[i];
+        let weight = GL_WEIGHTS[i];
         let z = center + half_width * node;
-        // Horner-form eta: c0 + z*(c1 + z*(c2 + z*c3)).
         let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
         let q = 0.5 * (z * z + eta * eta);
         let scaled_weight = weight * half_width;
         let moment_weight = scaled_weight * (-q).exp();
-        let mut z_pow = 1.0_f64;
-        for slot in moments_slice.iter_mut() {
-            *slot = moment_weight.mul_add(z_pow, *slot);
-            z_pow *= z;
-        }
+        accumulate_moments_unrolled4(moments_slice, moment_weight, z);
         value_integral =
             (scaled_weight * (-0.5 * z * z).exp()).mul_add(normal_cdf(eta), value_integral);
+        i += 1;
     }
     Ok(CellMomentState {
         branch,
@@ -3209,16 +3264,59 @@ fn evaluate_non_affine_cell_derivative_state(
     let c3 = cell.c3;
     let moments_slice: &mut [f64] = &mut moments;
     debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
-    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+    // See `evaluate_non_affine_cell_state` for the SIMD strategy. The
+    // derivative variant only needs `exp(-q)` (no value integral and so no
+    // second `exp` per node), but the same 4-wide GL batching still amortizes
+    // the single `exp` call across 4 lanes.
+    use wide::f64x4;
+    let center_v = f64x4::splat(center);
+    let half_width_v = f64x4::splat(half_width);
+    let c0_v = f64x4::splat(c0);
+    let c1_v = f64x4::splat(c1);
+    let c2_v = f64x4::splat(c2);
+    let c3_v = f64x4::splat(c3);
+    let neg_half_v = f64x4::splat(-0.5);
+    let n_total = GL_NODES.len();
+    let n_simd = n_total - (n_total % 4);
+    let mut i = 0;
+    while i < n_simd {
+        let node_v = f64x4::from([
+            GL_NODES[i],
+            GL_NODES[i + 1],
+            GL_NODES[i + 2],
+            GL_NODES[i + 3],
+        ]);
+        let weight_v = f64x4::from([
+            GL_WEIGHTS[i],
+            GL_WEIGHTS[i + 1],
+            GL_WEIGHTS[i + 2],
+            GL_WEIGHTS[i + 3],
+        ]);
+        let z_v = half_width_v.mul_add(node_v, center_v);
+        let eta_v = c3_v
+            .mul_add(z_v, c2_v)
+            .mul_add(z_v, c1_v)
+            .mul_add(z_v, c0_v);
+        let z2_v = z_v * z_v;
+        let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
+        let scaled_weight_v = weight_v * half_width_v;
+        let moment_weight_v = scaled_weight_v * neg_q_v.exp();
+        let z_arr = z_v.to_array();
+        let mw_arr = moment_weight_v.to_array();
+        for lane in 0..4 {
+            accumulate_moments_unrolled4(moments_slice, mw_arr[lane], z_arr[lane]);
+        }
+        i += 4;
+    }
+    while i < n_total {
+        let node = GL_NODES[i];
+        let weight = GL_WEIGHTS[i];
         let z = center + half_width * node;
         let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
         let q = 0.5 * (z * z + eta * eta);
         let moment_weight = (weight * half_width) * (-q).exp();
-        let mut z_pow = 1.0_f64;
-        for slot in moments_slice.iter_mut() {
-            *slot = moment_weight.mul_add(z_pow, *slot);
-            z_pow *= z;
-        }
+        accumulate_moments_unrolled4(moments_slice, moment_weight, z);
+        i += 1;
     }
     Ok(CellDerivativeMomentState { branch, moments })
 }

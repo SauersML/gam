@@ -322,7 +322,12 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
 // Cache
 // ---------------------------------------------------------------------------
 
-const MAX_CACHE_ENTRIES: usize = 4;
+// Biobank-scale workloads keep several distinct Arc<Array2> designs live
+// concurrently (main X, projected X, and per-fold X variants). The previous
+// capacity of 4 forced eviction-driven re-uploads of ~80 MiB designs on every
+// fold rotation. 16 comfortably covers realistic working sets while still
+// bounding GPU residency.
+const MAX_CACHE_ENTRIES: usize = 16;
 
 struct SessionCache {
     entries: Mutex<VecDeque<CacheEntry>>,
