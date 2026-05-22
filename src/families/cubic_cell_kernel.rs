@@ -1809,9 +1809,10 @@ fn require_scratch_capacity(
     label: &str,
 ) -> Result<(), String> {
     if required_len > capacity {
-        return Err(format!(
+        return Err(CubicCellKernelError::insufficient_moments(format!(
             "{label} polynomial convolution scratch too small: need {required_len}, have {capacity}"
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -2564,11 +2565,12 @@ where
     if left_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
         || left_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
     {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "left tail cell must be affine (deviations constant outside support), \
              got c2={:.3e}, c3={:.3e}",
             left_coeffs[2], left_coeffs[3]
-        ));
+        ))
+        .into());
     }
     out.push(DenestedPartitionCell {
         cell: DenestedCubicCell {
@@ -2617,11 +2619,12 @@ where
     if right_coeffs[2].abs() > NORMALIZED_CELL_BRANCH_TOL
         || right_coeffs[3].abs() > NORMALIZED_CELL_BRANCH_TOL
     {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "right tail cell must be affine (deviations constant outside support), \
              got c2={:.3e}, c3={:.3e}",
             right_coeffs[2], right_coeffs[3]
-        ));
+        ))
+        .into());
     }
     out.push(DenestedPartitionCell {
         cell: DenestedCubicCell {
@@ -2650,15 +2653,17 @@ pub fn normalized_non_affine_coefficients(
 ) -> Result<(f64, f64), String> {
     let width = right - left;
     if !width.is_finite() || width <= 0.0 {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "normalized cubic coefficients require a positive finite cell width, got left={left}, right={right}"
-        ));
+        ))
+        .into());
     }
     let anchor_scale = c0.abs() + c1.abs();
     if !anchor_scale.is_finite() {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "normalized cubic coefficients require finite affine coefficients, got c0={c0}, c1={c1}"
-        ));
+        ))
+        .into());
     }
     let mid = 0.5 * (left + right);
     let half = 0.5 * width;
@@ -2674,10 +2679,11 @@ pub fn branch_cell(cell: DenestedCubicCell) -> Result<ExactCellBranch, String> {
         if cell.c2.abs() <= tol && cell.c3.abs() <= tol {
             return Ok(ExactCellBranch::Affine);
         }
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "non-affine cells require finite bounds, got [{}, {}] with c2={:.6e}, c3={:.6e}",
             cell.left, cell.right, cell.c2, cell.c3
-        ));
+        ))
+        .into());
     }
     let (k2, k3) = normalized_non_affine_coefficients(
         cell.left, cell.right, cell.c0, cell.c1, cell.c2, cell.c3,
@@ -2715,15 +2721,22 @@ fn degenerate_sextic_branch(
 #[inline]
 fn validate_bvn_args(h: f64, k: f64, rho: f64) -> Result<(), String> {
     if !h.is_finite() && !h.is_infinite() {
-        return Err("bivariate normal cdf requires finite or infinite h".to_string());
+        return Err(CubicCellKernelError::bivariate_normal_domain(
+            "bivariate normal cdf requires finite or infinite h",
+        )
+        .into());
     }
     if !k.is_finite() && !k.is_infinite() {
-        return Err("bivariate normal cdf requires finite or infinite k".to_string());
+        return Err(CubicCellKernelError::bivariate_normal_domain(
+            "bivariate normal cdf requires finite or infinite k",
+        )
+        .into());
     }
     if !rho.is_finite() {
-        return Err(format!(
+        return Err(CubicCellKernelError::bivariate_normal_domain(format!(
             "bivariate normal cdf requires finite correlation, got {rho}"
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -3241,18 +3254,20 @@ fn evaluate_cell_state_dispatched<S>(
         // and the truncated-Gaussian moment vector handle infinite bounds.
         if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
         {
-            return Err(format!(
+            return Err(CubicCellKernelError::invalid_cell_shape(format!(
                 "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
                 cell.left, cell.right, cell.c2, cell.c3
-            ));
+            ))
+            .into());
         }
         return affine(cell, max_degree);
     }
     if cell.right <= cell.left {
-        return Err(format!(
+        return Err(CubicCellKernelError::invalid_cell_shape(format!(
             "finite cell must have left < right, got [{}, {}]",
             cell.left, cell.right
-        ));
+        ))
+        .into());
     }
     let branch = branch_cell(cell)?;
     if branch == ExactCellBranch::Affine {
@@ -3261,9 +3276,10 @@ fn evaluate_cell_state_dispatched<S>(
     if branch == ExactCellBranch::Sextic {
         let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
         if !lead.is_finite() {
-            return Err(format!(
+            return Err(CubicCellKernelError::invalid_cell_shape(format!(
                 "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"
-            ));
+            ))
+            .into());
         }
         if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
             return match lower_branch {

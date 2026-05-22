@@ -66,6 +66,72 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
+// Typed errors
+// ---------------------------------------------------------------------------
+
+/// Typed errors emitted by the transformation-normal family pipeline.
+///
+/// Each variant carries a pre-formatted `reason` so `Display` is
+/// byte-equivalent to the original `format!(...)` strings the module used
+/// before the typed-error migration. The category split lets callers
+/// pattern-match on the failure kind (e.g. distinguish a degenerate
+/// covariate design from a non-finite intermediate) without parsing text.
+///
+/// Public/trait boundaries (e.g. `CustomFamily::evaluate`) still return
+/// `Result<_, String>`; the `From<TransformationNormalError> for String`
+/// impl below provides the shim so every typed error flushes through `?`
+/// or `.into()` at the boundary without per-callsite `.map_err`.
+#[derive(Debug, Clone)]
+pub enum TransformationNormalError {
+    /// Shape/length/dimension/contract violations on inputs to a routine
+    /// (e.g. response/covariate row mismatch, beta length mismatch,
+    /// wrong number of blocks, malformed configuration parameters).
+    InvalidInput { reason: String },
+    /// A required covariate design or weight configuration cannot support
+    /// the routine — empty design, zero total weight, residual variance
+    /// not representable, warm-start coefficients all non-finite.
+    DesignDegenerate { reason: String },
+    /// A numeric intermediate (response transform, derivative,
+    /// log-likelihood, weight, offset, gradient component, calibration
+    /// quantity) came out non-finite or non-positive where positive
+    /// finite is required.
+    NonFinite { reason: String },
+    /// The fitted monotone transform's derivative dropped to or below
+    /// zero, or the response endpoint ordering required by the latent
+    /// score (lower < h < upper) was not satisfied at evaluation time.
+    MonotonicityViolated { reason: String },
+    /// A numerical step that maps through the standard-normal CDF
+    /// (endpoint mass, log-difference, PIT probability, derivative
+    /// ratio) underflowed or became non-representable at the requested
+    /// arguments.
+    NumericalFailure { reason: String },
+}
+
+impl std::fmt::Display for TransformationNormalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransformationNormalError::InvalidInput { reason }
+            | TransformationNormalError::DesignDegenerate { reason }
+            | TransformationNormalError::NonFinite { reason }
+            | TransformationNormalError::MonotonicityViolated { reason }
+            | TransformationNormalError::NumericalFailure { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for TransformationNormalError {}
+
+impl From<TransformationNormalError> for String {
+    /// Shim for the many `Result<_, String>` signatures the module exposes
+    /// (notably the `CustomFamily` and joint-Hessian / psi-workspace
+    /// trait surfaces). Lets a typed `Err(TransformationNormalError::…)`
+    /// flow through `?` or `.into()` without per-callsite stringification.
+    fn from(err: TransformationNormalError) -> String {
+        err.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -377,9 +443,9 @@ fn build_transformation_row_derived(
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "TransformationNormalFamily row_quantities: h[{i}] = {value} is not finite"
-        ));
+        ) }.into());
     }
     if let Some((i, value)) = weights
         .iter()
@@ -387,9 +453,9 @@ fn build_transformation_row_derived(
         .enumerate()
         .find(|(_, value)| !value.is_finite())
     {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "TransformationNormalFamily row_quantities: weight[{i}] = {value} is not finite"
-        ));
+        ) }.into());
     }
     for i in 0..n {
         let hp = h_prime[i];
@@ -417,18 +483,18 @@ fn build_transformation_row_derived(
         ];
         for (name, value) in derived_values {
             if !value.is_finite() {
-                return Err(format!(
+                return Err(TransformationNormalError::NonFinite { reason: format!(
                     "TransformationNormalFamily row_quantities: {name} at row {i} is not finite ({value}); h'={} is outside the finite exact-derivative range",
                     h_prime[i],
-                ));
+                ) }.into());
             }
         }
         endpoint_q.push(q);
     }
     if !log_likelihood.is_finite() {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "TransformationNormalFamily row_quantities: log-likelihood is not finite ({log_likelihood})"
-        ));
+        ) }.into());
     }
 
     Ok(TransformationNormalRowDerived {
@@ -439,14 +505,14 @@ fn build_transformation_row_derived(
 
 fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
     if !(upper.is_finite() && lower.is_finite()) {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "finite support endpoints required, got lower={lower}, upper={upper}"
-        ));
+        ) }.into());
     }
     if upper <= lower {
-        return Err(format!(
+        return Err(TransformationNormalError::MonotonicityViolated { reason: format!(
             "upper endpoint score must exceed lower endpoint score, got lower={lower:.6e}, upper={upper:.6e}"
-        ));
+        ) }.into());
     }
     if lower > 0.0 {
         return log_normal_cdf_diff(-lower, -upper);
@@ -455,15 +521,15 @@ fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
     let log_lower = normal_logcdf(lower);
     let gap = log_upper - log_lower;
     if !(gap.is_finite() && gap > 0.0) {
-        return Err(format!(
+        return Err(TransformationNormalError::NumericalFailure { reason: format!(
             "normal CDF endpoint mass is not representable, lower={lower:.6e}, upper={upper:.6e}"
-        ));
+        ) }.into());
     }
     let log_z = log_upper + log1mexp_positive(gap);
     if !log_z.is_finite() {
-        return Err(format!(
+        return Err(TransformationNormalError::NumericalFailure { reason: format!(
             "normal CDF endpoint mass underflowed, lower={lower:.6e}, upper={upper:.6e}"
-        ));
+        ) }.into());
     }
     Ok(log_z)
 }
@@ -475,19 +541,19 @@ pub(crate) fn transformation_normal_pit_score(
     clip_eps: f64,
 ) -> Result<f64, String> {
     if !(clip_eps.is_finite() && clip_eps > 0.0 && clip_eps < 0.5) {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "transformation-normal PIT requires clip_eps in (0, 0.5), got {clip_eps}"
-        ));
+        ) }.into());
     }
     if !(h.is_finite() && lower.is_finite() && upper.is_finite()) {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "transformation-normal PIT requires finite h/lower/upper, got h={h}, lower={lower}, upper={upper}"
-        ));
+        ) }.into());
     }
     if upper <= lower {
-        return Err(format!(
+        return Err(TransformationNormalError::MonotonicityViolated { reason: format!(
             "transformation-normal PIT endpoint order violated: lower={lower:.6e}, upper={upper:.6e}"
-        ));
+        ) }.into());
     }
 
     // Extrapolation outside `[lower, upper]` is *not* a malformed input —
@@ -521,9 +587,9 @@ pub(crate) fn transformation_normal_pit_score(
         let log_den = log_normal_cdf_diff(upper, lower)?;
         let ratio = (log_num - log_den).exp();
         if !(ratio.is_finite() && ratio >= -1.0e-12 && ratio <= 1.0 + 1.0e-12) {
-            return Err(format!(
+            return Err(TransformationNormalError::NumericalFailure { reason: format!(
                 "transformation-normal PIT probability is not representable: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e}, ratio={ratio}"
-            ));
+            ) }.into());
         }
         ratio.clamp(0.0, 1.0)
     };
@@ -679,9 +745,9 @@ fn log_normal_cdf_diff_derivatives(
 ) -> Result<LogNormalCdfDiffDerivatives, String> {
     let log_z = log_normal_cdf_diff(upper, lower)?;
     if !log_z.is_finite() {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "normal CDF endpoint log-mass is not finite, lower={lower:.6e}, upper={upper:.6e}"
-        ));
+        ) }.into());
     }
 
     let s_u = [
@@ -705,10 +771,10 @@ fn log_normal_cdf_diff_derivatives(
         r[order][0] = signed_normal_pdf_ratio(upper, s_u[order], log_z, factor);
         r[0][order] = signed_normal_pdf_ratio(lower, s_l[order], log_z, factor);
         if !(r[order][0].is_finite() && r[0][order].is_finite()) {
-            return Err(format!(
+            return Err(TransformationNormalError::NumericalFailure { reason: format!(
                 "normal CDF endpoint derivative ratio is not representable at order {order}, \
                  lower={lower:.6e}, upper={upper:.6e}, log_z={log_z:.6e}"
-            ));
+            ) }.into());
         }
     }
 
@@ -785,50 +851,50 @@ impl TransformationNormalFamily {
     ) -> Result<Self, String> {
         let n = response.len();
         if covariate_design.nrows() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response length {} != covariate design rows {}",
                 n,
                 covariate_design.nrows()
-            ));
+            ) }.into());
         }
         let p_cov = covariate_design.ncols();
         if p_cov == 0 {
-            return Err("covariate design has zero columns".to_string());
+            return Err(TransformationNormalError::DesignDegenerate { reason: "covariate design has zero columns".to_string() }.into());
         }
         if weights.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response length {} != weights length {}",
                 n,
                 weights.len()
-            ));
+            ) }.into());
         }
         if offset.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response length {} != offset length {}",
                 n,
                 offset.len()
-            ));
+            ) }.into());
         }
         for (i, &weight) in weights.iter().enumerate() {
             if !weight.is_finite() {
-                return Err(format!("weights[{i}] is not finite: {weight}"));
+                return Err(TransformationNormalError::NonFinite { reason: format!("weights[{i}] is not finite: {weight}") }.into());
             }
             if weight < 0.0 {
-                return Err(format!("weights[{i}] must be non-negative: {weight}"));
+                return Err(TransformationNormalError::InvalidInput { reason: format!("weights[{i}] must be non-negative: {weight}") }.into());
             }
         }
         for (i, &value) in offset.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!("offset[{i}] is not finite: {value}"));
+                return Err(TransformationNormalError::NonFinite { reason: format!("offset[{i}] is not finite: {value}") }.into());
             }
         }
         for (i, sp) in covariate_penalties.iter().enumerate() {
             let (r, c) = sp.shape();
             if r != p_cov || c != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "covariate penalty {} has shape ({r}, {c}), expected ({p_cov}, {p_cov})",
                     i,
-                ));
+                ) }.into());
             }
         }
 
@@ -935,68 +1001,68 @@ impl TransformationNormalFamily {
     ) -> Result<Self, String> {
         let n = response_val_basis.nrows();
         if response.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response length {} != response basis rows {}",
                 response.len(),
                 n
-            ));
+            ) }.into());
         }
         if covariate_design.nrows() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response basis rows {} != covariate design rows {}",
                 n,
                 covariate_design.nrows()
-            ));
+            ) }.into());
         }
         let p_cov = covariate_design.ncols();
         if p_cov == 0 {
-            return Err("covariate design has zero columns".to_string());
+            return Err(TransformationNormalError::DesignDegenerate { reason: "covariate design has zero columns".to_string() }.into());
         }
         if weights.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response basis rows {} != weights length {}",
                 n,
                 weights.len()
-            ));
+            ) }.into());
         }
         if offset.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response basis rows {} != offset length {}",
                 n,
                 offset.len()
-            ));
+            ) }.into());
         }
         for (i, &weight) in weights.iter().enumerate() {
             if !weight.is_finite() {
-                return Err(format!("weights[{i}] is not finite: {weight}"));
+                return Err(TransformationNormalError::NonFinite { reason: format!("weights[{i}] is not finite: {weight}") }.into());
             }
             if weight < 0.0 {
-                return Err(format!("weights[{i}] must be non-negative: {weight}"));
+                return Err(TransformationNormalError::InvalidInput { reason: format!("weights[{i}] must be non-negative: {weight}") }.into());
             }
         }
         for (i, &value) in offset.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!("offset[{i}] is not finite: {value}"));
+                return Err(TransformationNormalError::NonFinite { reason: format!("offset[{i}] is not finite: {value}") }.into());
             }
         }
         for (i, sp) in covariate_penalties.iter().enumerate() {
             let (r, c) = sp.shape();
             if r != p_cov || c != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "covariate penalty {} has shape ({r}, {c}), expected ({p_cov}, {p_cov})",
                     i,
-                ));
+                ) }.into());
             }
         }
 
         let p_resp = response_val_basis.ncols();
         if response_transform.ncols() + 1 != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "response transform columns {} imply p_resp {}, but response value basis has {} columns",
                 response_transform.ncols(),
                 response_transform.ncols() + 1,
                 p_resp
-            ));
+            ) }.into());
         }
         let (response_lower_basis, response_upper_basis) =
             response_endpoint_value_bases(&response_transform);
@@ -1143,11 +1209,11 @@ impl TransformationNormalFamily {
         let n = cov.nrows();
         let p_resp = self.response_val_basis.ncols();
         if beta.len() != p_resp * self.covariate_design.ncols() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP endpoint beta length {} != p_resp({p_resp}) * p_cov({})",
                 beta.len(),
                 self.covariate_design.ncols()
-            ));
+            ) }.into());
         }
         let mut lower = Array1::<f64>::zeros(n);
         let mut upper = Array1::<f64>::zeros(n);
@@ -1243,14 +1309,14 @@ impl TransformationNormalFamily {
         }
         for (i, &value) in h.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!(
+                return Err(TransformationNormalError::NonFinite { reason: format!(
                     "TransformationNormalFamily row_quantities: h[{i}] = {value} is not finite"
-                ));
+                ) }.into());
             }
             if value.abs() > TRANSFORMATION_NORMAL_H_ABS_MAX {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "TransformationNormalFamily row_quantities: h[{i}] = {value:.6e} exceeds the standard-normal domain bound ±{TRANSFORMATION_NORMAL_H_ABS_MAX}"
-                ));
+                ) }.into());
             }
         }
         // Hard monotonicity / finiteness gate: the reciprocal powers `1/h'^k`
@@ -1276,16 +1342,16 @@ impl TransformationNormalFamily {
             }
         }
         if let Some(i) = nonfinite_idx {
-            return Err(format!(
+            return Err(TransformationNormalError::NonFinite { reason: format!(
                 "TransformationNormalFamily row_quantities: h'[{i}] = {} is not finite",
                 h_prime[i]
-            ));
+            ) }.into());
         }
         if min_hp <= 0.0 {
-            return Err(format!(
+            return Err(TransformationNormalError::MonotonicityViolated { reason: format!(
                 "TransformationNormalFamily row_quantities: h' has non-positive values (min = {min_hp:.6e}). \
                  Monotonicity constraint may be violated."
-            ));
+            ) }.into());
         }
         // Compute exact f64 row derivatives. If any required reciprocal power
         // is outside the finite representable range, surface an evaluation
@@ -1337,10 +1403,10 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
         if !row_quantities.matches_beta(beta) {
             return Err(
@@ -1356,13 +1422,13 @@ impl TransformationNormalFamily {
         let endpoint_q = row_quantities.endpoint_q.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP gradient/Hessian gamma cache shape mismatch: got {}x{}, expected {}x{}",
                 gamma_rows.nrows(),
                 gamma_rows.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let response_val_basis = &self.response_val_basis;
         let response_deriv_basis = &self.response_deriv_basis;
@@ -1515,13 +1581,13 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
         if !row_quantities.matches_beta(beta) {
-            return Err("SCOP gradient received row quantities for a different beta".to_string());
+            return Err(TransformationNormalError::InvalidInput { reason: "SCOP gradient received row quantities for a different beta".to_string() }.into());
         }
         let cov = self
             .covariate_dense_arc()
@@ -1531,13 +1597,13 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP gradient gamma cache shape mismatch: got {}x{}, expected {}x{}",
                 gamma_rows.nrows(),
                 gamma_rows.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let mut gradient = Array1::<f64>::zeros(p_total);
         let mut lower_factor = vec![0.0; p_resp];
@@ -1619,11 +1685,11 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total || direction.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian directional derivative length mismatch: beta={}, direction={}, expected={p_total}",
                 beta.len(),
                 direction.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -1818,12 +1884,12 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total || direction_u.len() != p_total || direction_v.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian second directional derivative length mismatch: beta={}, u={}, v={}, expected={p_total}",
                 beta.len(),
                 direction_u.len(),
                 direction_v.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -2056,12 +2122,12 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total || probe.len() != p_total || out.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian matvec length mismatch: beta={}, probe={}, out={}, expected={p_total}",
                 beta.len(),
                 probe.len(),
                 out.len()
-            ));
+            ) }.into());
         }
         if !row_quantities.matches_beta(beta) {
             return Err(
@@ -2080,13 +2146,13 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian matvec gamma cache shape mismatch: got {}x{}, expected {}x{}",
                 gamma_rows.nrows(),
                 gamma_rows.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
 
         out.fill(0.0);
@@ -2210,12 +2276,12 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let n_probe = probes.ncols();
         if beta.len() != p_total || direction.len() != p_total || probes.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP dH matmat length mismatch: beta={}, direction={}, probes rows={}, expected={p_total}",
                 beta.len(),
                 direction.len(),
                 probes.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -2419,10 +2485,10 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP projected response Gram factor row mismatch: factor_rows={}, expected={p_total}",
                 factor.nrows()
-            ));
+            ) }.into());
         }
         let cov = self.covariate_dense_arc().map_err(|e| {
             format!("SCOP projected response Gram requires cached covariate design: {e}")
@@ -2490,20 +2556,20 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total || direction.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP dH projected trace length mismatch: beta={}, direction={}, expected={p_total}",
                 beta.len(),
                 direction.len()
-            ));
+            ) }.into());
         }
         if row_grams.nrows() != n || row_grams.ncols() != p_resp * p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP dH projected trace Gram shape {}x{} != expected {}x{}",
                 row_grams.nrows(),
                 row_grams.ncols(),
                 n,
                 p_resp * p_resp
-            ));
+            ) }.into());
         }
         if !row_quantities.matches_beta(beta) {
             return Err(
@@ -2707,13 +2773,13 @@ impl TransformationNormalFamily {
             || direction_v.len() != p_total
             || probes.nrows() != p_total
         {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP d2H matmat length mismatch: beta={}, u={}, v={}, probes rows={}, expected={p_total}",
                 beta.len(),
                 direction_u.len(),
                 direction_v.len(),
                 probes.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -2994,10 +3060,10 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian diagonal beta length {} != expected {p_total}",
                 beta.len()
-            ));
+            ) }.into());
         }
         if !row_quantities.matches_beta(beta) {
             return Err(
@@ -3012,13 +3078,13 @@ impl TransformationNormalFamily {
         let h_prime = row_quantities.h_prime.as_ref();
         let gamma_rows = row_quantities.gamma.as_ref();
         if gamma_rows.nrows() != n || gamma_rows.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP Hessian diagonal gamma cache shape mismatch: got {}x{}, expected {}x{}",
                 gamma_rows.nrows(),
                 gamma_rows.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let mut diag = Array1::<f64>::zeros(p_total);
         for i in 0..n {
@@ -3113,10 +3179,10 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi terms beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -3129,13 +3195,13 @@ impl TransformationNormalFamily {
             .materialize_cov_first_axis(axis)
             .map_err(|e| format!("SCOP psi materialize_cov_first failed: {e}"))?;
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi covariate derivative shape {}x{} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
 
         let weights = self.weights.as_ref();
@@ -3302,20 +3368,20 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if cov.nrows() != n || cov.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian apply covariate shape {}x{} != expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || direction.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian apply length mismatch: beta={}, direction={}, expected={p_total}",
                 beta.len(),
                 direction.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -3326,13 +3392,13 @@ impl TransformationNormalFamily {
             .into_shape_with_order((p_resp, p_cov))
             .map_err(|e| format!("SCOP psi Hessian apply direction reshape failed: {e}"))?;
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
 
         let weights = self.weights.as_ref();
@@ -3546,29 +3612,29 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if cov.nrows() != n || cov.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian batched apply covariate shape {}x{} != expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian batched apply covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian batched apply length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -3892,29 +3958,29 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if cov.nrows() != n || cov.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace covariate shape {}x{} != expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace covariate derivative shape {}x{} for axis {axis} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -4156,37 +4222,37 @@ impl TransformationNormalFamily {
             return Ok(Vec::new());
         }
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if cov.nrows() != n || cov.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace covariate chunk shape {}x{} != expected {}x{}",
                 cov.nrows(),
                 cov.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         for (axis, cov_psi) in cov_psi_per_axis.iter().enumerate() {
             if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "SCOP psi Hessian projected trace covariate derivative chunk shape {}x{} for axis {axis} != expected {}x{}",
                     cov_psi.nrows(),
                     cov_psi.ncols(),
                     n,
                     p_cov
-                ));
+                ) }.into());
             }
         }
         if beta.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian projected trace length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -4454,38 +4520,38 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         for (name, mat) in [
             ("cov", cov),
@@ -4494,13 +4560,13 @@ impl TransformationNormalFamily {
             ("cov_ij", cov_ij),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "SCOP psi-psi {name} shape {}x{} != expected {}x{}",
                     mat.nrows(),
                     mat.ncols(),
                     n,
                     p_cov
-                ));
+                ) }.into());
             }
         }
         let beta_mat = beta
@@ -4510,10 +4576,10 @@ impl TransformationNormalFamily {
         let direction_mat = match direction {
             Some(v) => {
                 if v.len() != p_total {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "SCOP psi-psi HVP direction length {} != p_total {p_total}",
                         v.len()
-                    ));
+                    ) }.into());
                 }
                 Some(
                     v.view()
@@ -5107,39 +5173,39 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi batched HVP row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi batched HVP length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi batched HVP endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi batched HVP row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi batched HVP gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         for (name, mat) in [
             ("cov", cov),
@@ -5148,13 +5214,13 @@ impl TransformationNormalFamily {
             ("cov_ij", cov_ij),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "SCOP psi-psi batched HVP {name} shape {}x{} != expected {}x{}",
                     mat.nrows(),
                     mat.ncols(),
                     n,
                     p_cov
-                ));
+                ) }.into());
             }
         }
 
@@ -5582,40 +5648,40 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || left.len() != p_total || right.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear length mismatch: beta={}, left={}, right={}, expected={p_total}",
                 beta.len(),
                 left.len(),
                 right.len()
-            ));
+            ) }.into());
         }
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         for (name, mat) in [
             ("cov", cov),
@@ -5624,13 +5690,13 @@ impl TransformationNormalFamily {
             ("cov_ij", cov_ij),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "SCOP psi-psi bilinear {name} shape {}x{} != expected {}x{}",
                     mat.nrows(),
                     mat.ncols(),
                     n,
                     p_cov
-                ));
+                ) }.into());
             }
         }
         let beta_mat = beta
@@ -5951,42 +6017,42 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi projected trace row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi projected trace length mismatch: beta={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi projected trace gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let factor_data = factor.as_slice().ok_or_else(|| {
             "SCOP psi-psi projected trace factor matrix must be standard contiguous".to_string()
         })?;
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi projected trace endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi projected trace row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         for (name, mat) in [
             ("cov", cov),
@@ -5995,13 +6061,13 @@ impl TransformationNormalFamily {
             ("cov_ij", cov_ij),
         ] {
             if mat.nrows() != n || mat.ncols() != p_cov {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "SCOP psi-psi projected trace {name} shape {}x{} != expected {}x{}",
                     mat.nrows(),
                     mat.ncols(),
                     n,
                     p_cov
-                ));
+                ) }.into());
             }
         }
 
@@ -6323,26 +6389,26 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi operator endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi operator row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi operator gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
         let mut objective = 0.0;
@@ -6393,27 +6459,27 @@ impl TransformationNormalFamily {
         let n = self.response_val_basis.nrows();
         let p_cov = self.covariate_design.ncols();
         if endpoint_q.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear operator endpoint normalizer cache length {} != n={n}",
                 endpoint_q.len()
-            ));
+            ) }.into());
         }
         if cached_h.len() != n || cached_h_prime.len() != n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear operator row-quantity cache length mismatch: h={}, h_prime={}, expected={n}",
                 cached_h.len(),
                 cached_h_prime.len()
-            ));
+            ) }.into());
         }
         let p_resp = self.response_val_basis.ncols();
         if cached_gamma.nrows() != n || cached_gamma.ncols() != p_resp {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi bilinear operator gamma cache shape {}x{} != expected {}x{}",
                 cached_gamma.nrows(),
                 cached_gamma.ncols(),
                 n,
                 p_resp
-            ));
+            ) }.into());
         }
         let rows_per_chunk = self.scop_psi_pair_rows_per_chunk(p_cov).min(n.max(1));
         let mut total = 0.0;
@@ -6453,11 +6519,11 @@ impl TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total || direction.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian directional derivative length mismatch: beta={}, direction={}, expected={p_total}",
                 beta.len(),
                 direction.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -6475,13 +6541,13 @@ impl TransformationNormalFamily {
             .map_err(|e| format!("SCOP psi hessian materialize_cov_first failed: {e}"))?;
         let cov_psi = cov_psi_arc.view();
         if cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi hessian covariate derivative shape {}x{} != expected {}x{}",
                 cov_psi.nrows(),
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
 
         let weights = self.weights.as_ref();
@@ -6874,13 +6940,13 @@ impl TransformationNormalFamily {
         let p_total = p_resp * p_cov;
         let rank = factor.ncols();
         if row_start > total_n || row_start + n > total_n {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian directional projected trace row window [{row_start}, {}) exceeds n={total_n}",
                 row_start + n
-            ));
+            ) }.into());
         }
         if cov.ncols() != p_cov || cov_psi.nrows() != n || cov_psi.ncols() != p_cov {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian directional projected trace chunk shape mismatch: cov={}x{}, cov_psi={}x{}, expected n={} p_cov={}",
                 cov.nrows(),
                 cov.ncols(),
@@ -6888,15 +6954,15 @@ impl TransformationNormalFamily {
                 cov_psi.ncols(),
                 n,
                 p_cov
-            ));
+            ) }.into());
         }
         if beta.len() != p_total || direction.len() != p_total || factor.nrows() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi Hessian directional projected trace length mismatch: beta={}, direction={}, factor_rows={}, expected={p_total}",
                 beta.len(),
                 direction.len(),
                 factor.nrows()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -6995,13 +7061,13 @@ impl TransformationNormalFamily {
         let projected_cov_f = match projected_cov_f {
             Some(view) => {
                 if view.nrows() != n || view.ncols() != projected_len {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "SCOP psi Hessian directional projected cov-factor shape {}x{} != expected {}x{}",
                         view.nrows(),
                         view.ncols(),
                         n,
                         projected_len
-                    ));
+                    ) }.into());
                 }
                 view
             }
@@ -7022,13 +7088,13 @@ impl TransformationNormalFamily {
         let projected_psi_f = match projected_psi_f {
             Some(view) => {
                 if view.nrows() != n || view.ncols() != projected_len {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "SCOP psi Hessian directional projected psi-factor shape {}x{} != expected {}x{}",
                         view.nrows(),
                         view.ncols(),
                         n,
                         projected_len
-                    ));
+                    ) }.into());
                 }
                 view
             }
@@ -7305,13 +7371,13 @@ fn factored_weighted_cross(
 ) -> Result<Array2<f64>, String> {
     let n = weights.len();
     if a.nrows() != n || b.nrows() != n || c.nrows() != n || d.nrows() != n {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "factored_weighted_cross row mismatch: weights={n}, a={}, b={}, c={}, d={}",
             a.nrows(),
             b.nrows(),
             c.nrows(),
             d.nrows()
-        ));
+        ) }.into());
     }
     let pa = a.ncols();
     let pc = c.ncols();
@@ -7461,10 +7527,10 @@ fn chunked_weighted_bt_d_designmatrix(
 impl CustomFamily for TransformationNormalFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 1 {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalFamily expects 1 block, got {}",
                 block_states.len()
-            ));
+            ) }.into());
         }
         let evaluate_start = std::time::Instant::now();
         let beta = &block_states[0].beta;
@@ -7519,7 +7585,7 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
         if block_states.len() != 1 {
-            return Err("expected 1 block".to_string());
+            return Err(TransformationNormalError::InvalidInput { reason: "expected 1 block".to_string() }.into());
         }
         // The line search uses NEG_INFINITY as the barrier-violation signal,
         // so we can't propagate the row_quantities Err here. Translate any
@@ -7552,10 +7618,10 @@ impl CustomFamily for TransformationNormalFamily {
         _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         if block_states.len() != 1 {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalFamily expects 1 block, got {}",
                 block_states.len()
-            ));
+            ) }.into());
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
@@ -7679,17 +7745,17 @@ impl CustomFamily for TransformationNormalFamily {
             return Ok(None);
         }
         if block_states.len() != 1 {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalFamily expects 1 block, got {}",
                 block_states.len()
-            ));
+            ) }.into());
         }
         if delta.len() != block_states[0].beta.len() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN line-search step length {} != beta length {}",
                 delta.len(),
                 block_states[0].beta.len()
-            ));
+            ) }.into());
         }
         // SCOP encodes monotonicity as
         //   h'(y, x) = epsilon + sum_k M_k(y) * gamma_k(x)^2.
@@ -7826,10 +7892,10 @@ impl CustomFamily for TransformationNormalFamily {
         let p_cov = self.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "SCOP psi-psi terms beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
 
         let op = deriv_i
@@ -7879,14 +7945,14 @@ impl CustomFamily for TransformationNormalFamily {
         // exact-Newton evaluation instead of passing NaNs into the unified
         // outer evaluator.
         if !objective_psi_psi.is_finite() || !score_psi_psi.iter().all(|v| v.is_finite()) {
-            return Err(format!(
+            return Err(TransformationNormalError::NonFinite { reason: format!(
                 "TransformationNormalFamily exact ψ-ψ second-order terms produced \
                  non-finite values at psi_i={psi_i}, psi_j={psi_j}: \
                  obj_finite={}, score_all_finite={}. \
                  The outer evaluator should retreat from this trial point.",
                 objective_psi_psi.is_finite(),
                 score_psi_psi.iter().all(|v| v.is_finite()),
-            ));
+            ) }.into());
         }
 
         log::info!(
@@ -7940,10 +8006,10 @@ impl CustomFamily for TransformationNormalFamily {
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if block_states.len() != 1 {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalFamily expects 1 block, got {}",
                 block_states.len()
-            ));
+            ) }.into());
         }
         let beta = &block_states[0].beta;
         let row_quantities = self.row_quantities(beta)?;
@@ -8150,16 +8216,16 @@ impl TransformationNormalJointHessianWorkspace {
             .family
             .scop_gradient_and_negative_hessian(&self.beta, &self.row_quantities)?;
         if hessian.nrows() != self.p_total() || hessian.ncols() != self.p_total() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN dense Hessian cache shape mismatch: got {}x{}, expected {}x{}",
                 hessian.nrows(),
                 hessian.ncols(),
                 self.p_total(),
                 self.p_total()
-            ));
+            ) }.into());
         }
         if hessian.iter().any(|value| !value.is_finite()) {
-            return Err("CTN dense Hessian cache produced non-finite values".to_string());
+            return Err(TransformationNormalError::NonFinite { reason: "CTN dense Hessian cache produced non-finite values".to_string() }.into());
         }
         let arc = Arc::new(hessian);
         self.persistent_dense_hessian.install(key, Arc::clone(&arc));
@@ -8177,11 +8243,11 @@ impl TransformationNormalJointHessianWorkspace {
 
     fn apply_hessian(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
         if v.len() != self.p_total() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN joint Hessian matvec: input length {} != p_total {}",
                 v.len(),
                 self.p_total()
-            ));
+            ) }.into());
         }
         let mut out = Array1::<f64>::zeros(self.p_total());
         self.apply_hessian_into(v, &mut out)?;
@@ -8190,12 +8256,12 @@ impl TransformationNormalJointHessianWorkspace {
 
     fn apply_hessian_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
         if v.len() != self.p_total() || out.len() != self.p_total() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN joint Hessian matvec_into dimension mismatch: v={} out={} p_total={}",
                 v.len(),
                 out.len(),
                 self.p_total()
-            ));
+            ) }.into());
         }
         if self.should_build_dense() {
             let hessian = self.dense_hessian()?;
@@ -8265,11 +8331,11 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let p_total = self.p_total();
         if d_beta_flat.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN directional_derivative_operator length mismatch: got {}, expected {}",
                 d_beta_flat.len(),
                 p_total
-            ));
+            ) }.into());
         }
         let op = TransformationNormalDhMatrixFreeOperator::new(
             Arc::clone(&self.family),
@@ -8295,12 +8361,12 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         let p_total = self.p_total();
         if d_beta_u.len() != p_total || d_beta_v.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "CTN second_directional_derivative_operator length mismatch: u={}, v={}, expected {}",
                 d_beta_u.len(),
                 d_beta_v.len(),
                 p_total
-            ));
+            ) }.into());
         }
         let op = TransformationNormalD2hMatrixFreeOperator::new(
             Arc::clone(&self.family),
@@ -9421,19 +9487,19 @@ fn build_response_basis(
 > {
     let n = response.len();
     if n < 4 {
-        return Err(format!("need at least 4 observations, got {n}"));
+        return Err(TransformationNormalError::InvalidInput { reason: format!("need at least 4 observations, got {n}") }.into());
     }
     for (i, &v) in response.iter().enumerate() {
         if !v.is_finite() {
-            return Err(format!("response[{i}] is not finite: {v}"));
+            return Err(TransformationNormalError::NonFinite { reason: format!("response[{i}] is not finite: {v}") }.into());
         }
     }
 
     let response_degree = config.response_degree;
     if response_degree < 1 {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "response_degree must be >= 1 for the I-spline basis, got {response_degree}"
-        ));
+        ) }.into());
     }
     let k_internal = config.response_num_internal_knots;
     let k_prime = k_internal.checked_sub(2).ok_or_else(|| {
@@ -9476,16 +9542,16 @@ fn build_response_basis(
     let shape_deriv = create_ispline_derivative_dense(response.view(), &knots, response_degree, 1)
         .map_err(|e| e.to_string())?;
     if shape_deriv.ncols() != p_shape {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "I-spline derivative column count {} does not match value basis {p_shape}",
             shape_deriv.ncols()
-        ));
+        ) }.into());
     }
     if shape_deriv.nrows() != n {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "I-spline derivative row count {} does not match n = {n}",
             shape_deriv.nrows()
-        ));
+        ) }.into());
     }
 
     let p_resp = p_shape + 1;
@@ -9680,11 +9746,11 @@ enum KroneckerDesign {
 impl KroneckerDesign {
     fn new_khatri_rao(left: &Array2<f64>, right: DesignMatrix) -> Result<Self, String> {
         if left.nrows() != right.nrows() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "KroneckerDesign row mismatch: left={}, right={}",
                 left.nrows(),
                 right.nrows()
-            ));
+            ) }.into());
         }
         assert_rowwise_kronecker_dimensions(left.nrows(), left.ncols(), right.ncols(), "CTN");
         Ok(KroneckerDesign::KhatriRao {
@@ -9869,14 +9935,14 @@ impl KroneckerDesign {
                 let pb = b.ncols();
                 let pd = d.ncols();
                 if a.nrows() != n || b.nrows() != n || c.nrows() != n || d.nrows() != n {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "KroneckerDesign::weighted_cross_with row mismatch: weights={n}, \
                          a={}, b={}, c={}, d={}",
                         a.nrows(),
                         b.nrows(),
                         c.nrows(),
                         d.nrows()
-                    ));
+                    ) }.into());
                 }
                 let mut out = Array2::<f64>::zeros((pa * pb, pc * pd));
                 let mut pair_weights = Array1::<f64>::zeros(n);
@@ -9921,11 +9987,11 @@ impl LinearOperator for KroneckerDesign {
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "KroneckerDesign::diag_xtw_x dimension mismatch: weights={}, nrows={}",
                 weights.len(),
                 self.nrows()
-            ));
+            ) }.into());
         }
         // The `LinearOperator` trait fixes the signature, so this entry point
         // defaults the resource policy. Internal callers in this file go
@@ -10071,9 +10137,9 @@ fn compute_warm_start(
     let n = response.len();
     let p_total = p_resp * p_cov;
     if p_resp < 2 {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "transformation warm start requires at least 2 response basis columns, got {p_resp}"
-        ));
+        ) }.into());
     }
 
     let default_ws;
@@ -10090,7 +10156,7 @@ fn compute_warm_start(
         }
     };
     if ws.location.len() != n || ws.scale.len() != n {
-        return Err("warm start location/scale length mismatch".to_string());
+        return Err(TransformationNormalError::InvalidInput { reason: "warm start location/scale length mismatch".to_string() }.into());
     }
 
     // Per-row affine targets for the transformation scale.
@@ -10113,7 +10179,7 @@ fn compute_warm_start(
     // then solve only the unconstrained location row in β-space.
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err("SCOP warm start requires positive finite total weight".to_string());
+        return Err(TransformationNormalError::DesignDegenerate { reason: "SCOP warm start requires positive finite total weight".to_string() }.into());
     }
     let mean_target_hp = weights
         .iter()
@@ -10122,9 +10188,9 @@ fn compute_warm_start(
         .sum::<f64>()
         / weight_sum;
     if !(mean_target_hp.is_finite() && mean_target_hp > 0.0) {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "SCOP warm start derivative target is not positive finite: {mean_target_hp}"
-        ));
+        ) }.into());
     }
 
     let mut beta = Array1::<f64>::zeros(p_total);
@@ -10139,15 +10205,15 @@ fn compute_warm_start(
         .sum::<f64>()
         / weight_sum;
     if !(mean_unit_shape_hp.is_finite() && mean_unit_shape_hp > 0.0) {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "SCOP warm start unit shape derivative is not positive finite: {mean_unit_shape_hp}"
-        ));
+        ) }.into());
     }
     let gamma_const = (mean_target_hp / mean_unit_shape_hp).sqrt();
     if !(gamma_const.is_finite() && gamma_const > 0.0) {
-        return Err(format!(
+        return Err(TransformationNormalError::NonFinite { reason: format!(
             "SCOP warm start shape scale is not positive finite: {gamma_const}"
-        ));
+        ) }.into());
     }
     beta.fill(0.0);
     for k in 1..p_resp {
@@ -10172,7 +10238,7 @@ fn compute_warm_start(
     }
 
     if beta.iter().any(|v| !v.is_finite()) {
-        return Err("SCOP warm start produced non-finite coefficients".to_string());
+        return Err(TransformationNormalError::DesignDegenerate { reason: "SCOP warm start produced non-finite coefficients".to_string() }.into());
     }
     Ok(beta)
 }
@@ -10185,11 +10251,11 @@ fn estimate_default_warm_start(
 ) -> Result<TransformationWarmStart, String> {
     let n = response.len();
     if weights.len() != n {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "transformation warm start weights length mismatch: response={}, weights={}",
             n,
             weights.len()
-        ));
+        ) }.into());
     }
     let zero_offset = Array1::zeros(n);
     let log_lambdas = Array1::zeros(covariate_penalties.len());
@@ -10205,7 +10271,7 @@ fn estimate_default_warm_start(
     let location = covariate_design.matrixvectormultiply(&beta_location);
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !(weight_sum.is_finite() && weight_sum > 0.0) {
-        return Err("transformation warm start requires positive finite total weight".to_string());
+        return Err(TransformationNormalError::DesignDegenerate { reason: "transformation warm start requires positive finite total weight".to_string() }.into());
     }
     let weighted_ss = response
         .iter()
@@ -10217,7 +10283,7 @@ fn estimate_default_warm_start(
         })
         .sum::<f64>();
     if !weighted_ss.is_finite() {
-        return Err("transformation warm start residual variance is not finite".to_string());
+        return Err(TransformationNormalError::DesignDegenerate { reason: "transformation warm start residual variance is not finite".to_string() }.into());
     }
     let global_scale = (weighted_ss / weight_sum).sqrt().max(1e-6);
     let residual_floor = global_scale * 1e-3 + 1e-12;
@@ -10246,16 +10312,16 @@ fn calibrate_transformation_scores(
     mut fit: UnifiedFitResult,
 ) -> Result<(UnifiedFitResult, TransformationScoreCalibration), String> {
     let Some(block_state) = fit.block_states.first() else {
-        return Err("transformation score calibration requires one fitted block".to_string());
+        return Err(TransformationNormalError::InvalidInput { reason: "transformation score calibration requires one fitted block".to_string() }.into());
     };
     let p_resp = family.response_val_basis.ncols();
     let p_cov = family.covariate_design.ncols();
     let p_total = p_resp * p_cov;
     if block_state.beta.len() != p_total {
-        return Err(format!(
+        return Err(TransformationNormalError::InvalidInput { reason: format!(
             "transformation calibration beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
             block_state.beta.len()
-        ));
+        ) }.into());
     }
 
     let row_quantities = family.row_quantities(&block_state.beta)?;
@@ -13448,10 +13514,10 @@ impl TransformationNormalPsiWorkspace {
     /// reduction shape change.
     fn compute_all_axes(&self) -> Result<Vec<TransformationNormalPsiWorkspaceCacheEntry>, String> {
         if self.block_states.len() != 1 {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalFamily expects 1 block, got {}",
                 self.block_states.len()
-            ));
+            ) }.into());
         }
         if self.derivative_blocks.is_empty() {
             return Ok(Vec::new());
@@ -13469,10 +13535,10 @@ impl TransformationNormalPsiWorkspace {
         let p_cov = self.family.covariate_design.ncols();
         let p_total = p_resp * p_cov;
         if beta.len() != p_total {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalPsiWorkspace beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
                 beta.len()
-            ));
+            ) }.into());
         }
         let beta_mat = beta
             .view()
@@ -13593,13 +13659,13 @@ impl TransformationNormalPsiWorkspace {
                             format!("ψ workspace covariate ψ row chunk axis {axis} {start}..{end}: {e}")
                         })?;
                     if cov_psi.nrows() != end - start || cov_psi.ncols() != p_cov {
-                        return Err(format!(
+                        return Err(TransformationNormalError::InvalidInput { reason: format!(
                             "ψ workspace covariate derivative chunk shape {}x{} for axis {axis} rows {start}..{end} != expected {}x{}",
                             cov_psi.nrows(),
                             cov_psi.ncols(),
                             end - start,
                             p_cov
-                        ));
+                        ) }.into());
                     }
                     cov_psi_chunks.push(cov_psi);
                 }
@@ -13819,9 +13885,9 @@ impl TransformationNormalPsiWorkspace {
                 .downcast_ref::<TensorKroneckerPsiOperator>()
                 .is_none()
             {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "TransformationNormalPsiWorkspace psi-psi pair cache requires tensor-backed operator at axis {psi_index}"
-                ));
+                ) }.into());
             }
         }
 
@@ -13878,7 +13944,7 @@ impl TransformationNormalPsiWorkspace {
                         )
                     })?;
                 if cov_psi.nrows() != end - start || cov_psi.ncols() != p_cov {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "TransformationNormalPsiWorkspace psi-psi pair cache first-axis chunk shape {}x{} \
                          for psi_index={psi_index}, axis={} rows {start}..{end} != expected {}x{}",
                         cov_psi.nrows(),
@@ -13886,7 +13952,7 @@ impl TransformationNormalPsiWorkspace {
                         entry.axis,
                         end - start,
                         p_cov
-                    ));
+                    ) }.into());
                 }
                 cov_psi_chunks.push(cov_psi);
             }
@@ -13904,7 +13970,7 @@ impl TransformationNormalPsiWorkspace {
                         )
                     })?;
                 if cov_ij.nrows() != end - start || cov_ij.ncols() != p_cov {
-                    return Err(format!(
+                    return Err(TransformationNormalError::InvalidInput { reason: format!(
                         "TransformationNormalPsiWorkspace psi-psi pair cache second-axis chunk shape {}x{} \
                          for pair=({psi_i},{psi_j}), axes=({}, {}) rows {start}..{end} != expected {}x{}",
                         cov_ij.nrows(),
@@ -13913,7 +13979,7 @@ impl TransformationNormalPsiWorkspace {
                         entry_j.axis,
                         end - start,
                         p_cov
-                    ));
+                    ) }.into());
                 }
                 let (objective_chunk, score_chunk, _) =
                     self.family.scop_psi_psi_value_score_hvp_from_cov(
@@ -13937,12 +14003,12 @@ impl TransformationNormalPsiWorkspace {
         let mut table = vec![vec![None; n_psi]; n_psi];
         for ((i, j), acc) in pairs.into_iter().zip(accum.into_iter()) {
             if !acc.objective.is_finite() || !acc.score.iter().all(|v: &f64| v.is_finite()) {
-                return Err(format!(
+                return Err(TransformationNormalError::NonFinite { reason: format!(
                     "TransformationNormalPsiWorkspace psi-psi pair cache produced non-finite values at \
                      psi_i={i}, psi_j={j}: obj_finite={}, score_all_finite={}",
                     acc.objective.is_finite(),
                     acc.score.iter().all(|v: &f64| v.is_finite()),
-                ));
+                ) }.into());
             }
             let entry_i = &axes[i];
             let entry_j = &axes[j];
@@ -14088,11 +14154,11 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
         }
         let entry = &cached[psi_index];
         if d_beta_flat.len() != entry.beta.len() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "TransformationNormalPsiWorkspace psi dH direction length {} != expected {}",
                 d_beta_flat.len(),
                 entry.beta.len()
-            ));
+            ) }.into());
         }
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::clone(&entry.beta),
@@ -14301,11 +14367,11 @@ impl TransformationExactGeometryCache {
             .first_mut()
             .ok_or_else(|| "missing transformation block spec".to_string())?;
         if log_lambdas.len() != spec.initial_log_lambdas.len() {
-            return Err(format!(
+            return Err(TransformationNormalError::InvalidInput { reason: format!(
                 "transformation final fit rho length mismatch: got {}, expected {}",
                 log_lambdas.len(),
                 spec.initial_log_lambdas.len()
-            ));
+            ) }.into());
         }
         spec.initial_log_lambdas = log_lambdas.clone();
         Ok(())
@@ -14802,9 +14868,9 @@ pub fn fit_transformation_normal(
             }
 
             if !eval.inner_converged {
-                return Err(format!(
+                return Err(TransformationNormalError::InvalidInput { reason: format!(
                     "transformation exact joint inner solve did not converge for eval_mode={eval_mode:?}; cached warm start for retry"
-                ));
+                ) }.into());
             }
 
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
