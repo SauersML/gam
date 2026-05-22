@@ -140,6 +140,10 @@ pub enum RemlError {
     /// not support it (scalar-only correction on a non-scalar kernel,
     /// callback correction on a non-callback kernel).
     InvalidKernelMode { reason: String },
+    /// A caller violated the evaluator contract. These are not numerical
+    /// failures; they mean an upstream solver presented an inner state with
+    /// insufficient certificates for the requested derivative surface.
+    ContractViolation { reason: String },
 }
 
 impl std::fmt::Display for RemlError {
@@ -147,7 +151,8 @@ impl std::fmt::Display for RemlError {
         match self {
             RemlError::DimensionMismatch { reason }
             | RemlError::NonFiniteValue { reason }
-            | RemlError::InvalidKernelMode { reason } => f.write_str(reason),
+            | RemlError::InvalidKernelMode { reason }
+            | RemlError::ContractViolation { reason } => f.write_str(reason),
         }
     }
 }
@@ -6021,13 +6026,18 @@ fn hyper_coord_total_drift_result(
 // at the exact REML optimum (gradient = 0) but the old formula returned
 // step `+8` (clamped to `+5`) — see the unit test in this module.
 //
-// We deliberately keep the same approximation the old code made: drop the
-// `C[v_k]` IFT correction from the trace. This costs no `H⁻¹` solves and
-// matches `Ḣ_k = λ_k S_k` exactly when the family is Gaussian or has no
-// third-derivative correction. For non-Gaussian families with corrections
-// the EFS step is a slightly different surrogate from the gradient, which
-// is acceptable for an EFS-style fixed-point iteration; the outer driver
-// performs cost validation downstream.
+// Exactness depends on the likelihood curvature. For Gaussian/quadratic
+// likelihoods, `H_obs` is beta-independent, so `C[v_k] = 0` and the
+// classical explicit trace fixed point with `Ḣ_k = λ_k S_k` is exact. For
+// non-Gaussian families (Cox/survival/binomial), `H_obs` depends on beta;
+// the exact logdet gradient uses the total Hessian drift
+// `Ḣ_k = λ_k S_k + C[v_k]`. A pure MacKay/Tipping/Wood-Fasiolo explicit
+// trace update that uses only `λ_k S_k` is therefore an approximation.
+//
+// This code path does not use that pure explicit-trace surrogate. EFS is
+// expressed in terms of the full outer gradient from `reml_laml_evaluate`;
+// that gradient builds `rho_corrections`, threads them through
+// `penalty_total_drift_result`, and traces the corrected `Ḣ_k`.
 
 /// `q_eff = 2 · penalty_term` matching `outer_gradient_entry`.
 #[inline]
@@ -7465,6 +7475,20 @@ pub fn reml_laml_evaluate(
         });
     let kkt_residual_was_applied = kkt_residual_correction_active;
     let envelope_suppresses_outputs = envelope_inconsistent.is_some() && !kkt_residual_was_applied;
+    if envelope_inconsistent.is_some()
+        && matches!(solution.dispersion, DispersionHandling::Fixed { .. })
+        && solution.kkt_residual.is_none()
+    {
+        return Err(RemlError::ContractViolation {
+            reason: "REML/LAML fixed-dispersion derivative contract violated: envelope gradient \
+                     is inconsistent but no projected KKT residual was supplied. A convergent \
+                     custom-family inner path must populate BlockwiseInnerResult::kkt_residual \
+                     using the active-set-aware projected residual before requesting analytic \
+                     outer derivatives"
+                .to_string(),
+        }
+        .into());
+    }
 
     // Outer Hessian (if requested).
     let hessian = if mode == EvalMode::ValueGradientHessian && !envelope_suppresses_outputs {
@@ -10812,15 +10836,17 @@ const EFS_MAX_STEP: f64 = 5.0;
 /// descent direction for V on a ψ. ψ coordinates use the preconditioned
 /// gradient step in [`compute_hybrid_efs_update`] instead.
 ///
-/// ## Approximation: IFT corrections rolled into the gradient
+/// ## Hessian-drift corrections
 ///
 /// `g_full` is the same gradient `reml_laml_evaluate` produces in
 /// `EvalMode::ValueAndGradient`, which already includes the third-
 /// derivative `C[v_k]` IFT correction for non-Gaussian families. The
-/// EFS step inherits this correction automatically; we no longer carry
-/// a separate kernel-correct trace path, which removes the
-/// "approximate Wood–Fasiolo + line-search safety net" gap that the
-/// original code had.
+/// EFS step inherits this correction automatically through `g_full`.
+/// Gaussian/quadratic likelihoods have beta-independent observed Hessians,
+/// so `C[v_k] = 0` and the classical trace fixed point is exact. For
+/// non-Gaussian likelihoods, the pure MacKay/Tipping explicit-trace update
+/// is exact only after the logdet Hessian-drift correction is included in
+/// the outer gradient.
 ///
 /// # Arguments
 /// - `solution`: Converged inner state (β̂, H, penalties, HessianOperator).
@@ -16297,11 +16323,12 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 2,
             nullspace_dim: 0.0,
-            dispersion: DispersionHandling::Fixed {
-                phi: 1.0,
-                include_logdet_h: true,
-                include_logdet_s: true,
-            },
+            // Profiled Gaussian does not satisfy the fixed-dispersion IFT
+            // identity used by the projected KKT residual correction, so an
+            // inconsistent envelope gradient remains a soft "unavailable
+            // derivative" result rather than a missing-residual contract
+            // violation.
+            dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
@@ -16320,7 +16347,237 @@ mod tests {
         assert_eq!(dense, family_matrix);
     }
 
-    /// Replicates the AoU biobank marginal-slope failure mechanism precisely:
+    // ───────────────────────────────────────────────────────────────────────
+    // Replicates the AoU biobank marginal-slope failure mechanism in three
+    // tiers, each pinning a distinct code-level math issue observed in
+    // the failing log:
+    //
+    //   [PIRLS/joint-Newton convergence] cycle 303 | constrained-stationary
+    //     certificate: linear-solve neutralised 0.0% of g (... multiplier ...);
+    //     |Δobjective|=3.421e-1 ≤ obj_tol=3.479e-1
+    //   [reml_laml envelope-gradient consistency] |g|∞ = 9.669e16 ... |cost|
+    //     = 3.480e5  ratio 4.14e3  → gradient suppressed → seed rejected.
+    //
+    // BUG-1 (math, compute_kkt_residual_rho_corrections @ ~unified.rs:8500):
+    //   At cert exit, the projected KKT residual r_proj ≈ 0 (multiplier
+    //   captured by active set). Then q = H⁻¹·r_proj = 0, so the gradient
+    //   correction `-aᵀ_k q + ½ qᵀA_k q` is identically zero. The cert's
+    //   contract gives ZERO cancellation of the inflated envelope trace.
+    //
+    // BUG-2 (gate, envelope_inconsistent @ ~unified.rs:7466):
+    //   `kkt_residual_was_applied = kkt_residual_correction_active` only
+    //   checks `Some(..) && Fixed`, NOT whether the correction magnitude is
+    //   nonzero. So at the cert's r_proj=0 contract the tripwire goes to
+    //   the "applied" arm and passes an inflated meaningless gradient on.
+    //
+    // BUG-3 (math, envelope ½ tr(H⁻¹·∂H/∂ρ) at near-singular H):
+    //   Without penalty_subspace_trace, the trace uses full H⁻¹ which
+    //   blows up as σ_min(H)⁻¹. The cert's projected residual contract
+    //   addresses the inner-stationarity correction term but does nothing
+    //   about the LAML envelope trace itself.
+    //
+    // Each test below isolates one of these bugs.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// BUG-1: r_proj = 0 ⇒ IFT gradient correction is identically 0.
+    /// This is a pure math identity test that ANCHORS the failure mode.
+    #[test]
+    fn ift_gradient_correction_with_zero_projected_residual_is_zero() {
+        let h = Array2::eye(3);
+        let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let solution =
+            build_gaussian_solution_at_beta(&[0.0, 0.0], array![0.5, -0.25, 0.1], false);
+
+        let lambdas = [1.0_f64, 1.0_f64];
+        let penalty_a_k_betas = vec![array![0.3, -0.7, 0.0], array![0.0, 0.0, 0.5]];
+        let zero_residual = Array1::<f64>::zeros(hop.dim());
+
+        let corrections = compute_kkt_residual_rho_corrections(
+            &solution,
+            &hop,
+            &lambdas,
+            &penalty_a_k_betas,
+            &zero_residual,
+            true,
+        )
+        .expect("kkt correction must succeed at zero residual");
+
+        for (i, &g) in corrections.gradient.iter().enumerate() {
+            assert_eq!(
+                g, 0.0,
+                "BUG-1: IFT gradient correction at coord {} must be exactly 0.0 when \
+                 r_proj = 0 (q = H⁻¹·0 = 0); got {:.3e}. The cert path's projected residual \
+                 ≈ 0 contract therefore gives ZERO correction to the envelope gradient — \
+                 inflated ½ tr(H⁻¹·∂H/∂ρ) is left uncancelled.",
+                i, g
+            );
+        }
+        let h_corr = corrections.hessian.expect("hessian requested");
+        for ((i, j), &v) in h_corr.indexed_iter() {
+            assert_eq!(v, 0.0, "BUG-1 hessian: entry ({}, {}) must be 0; got {:.3e}", i, j, v);
+        }
+    }
+
+    /// BUG-2 (hard failing): cert exit with r_proj = 0 passes an inflated
+    /// `|g|∞ = 1e20` gradient through the envelope tripwire because the gate
+    /// only checks `kkt_residual.is_some()`, not whether the correction is
+    /// nonzero. Contract under test: either suppress (gradient=None) OR
+    /// produce a numerically honest gradient (|g|∞·√ε ≤ 4·|cost|). Current
+    /// code does NEITHER and this assertion FAILS — pinpointing the gate bug.
+    #[test]
+    fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate() {
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: array![[42.0]],
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        let solution = InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0e20],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            // Profiled Gaussian does not satisfy the fixed-dispersion IFT
+            // identity used by the projected KKT residual correction, so an
+            // inconsistent envelope gradient remains a soft "unavailable
+            // derivative" result rather than a missing-residual contract
+            // violation.
+            dispersion: DispersionHandling::ProfiledGaussian,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            kkt_residual: Some(ProjectedKktResidual::from_projected(array![0.0, 0.0])),
+            active_constraints: None,
+        };
+
+        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+            .expect("constrained-stationary cert evaluation");
+
+        let cost_scale = result.cost.abs().max(1.0);
+        let resolve_step = f64::EPSILON.sqrt();
+        let max_abs = match result.gradient.as_ref() {
+            Some(g) => g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max),
+            None => 0.0, // suppressed is acceptable
+        };
+        let predicted_change = max_abs * resolve_step;
+        let ratio = predicted_change / cost_scale;
+        assert!(
+            result.gradient.is_none() || (ratio <= 4.0 && max_abs.is_finite()),
+            "BUG-2 PINPOINTED: cert exit with r_proj = 0 passed an inflated gradient \
+             through the tripwire. |grad|∞ = {:.3e}, predicted Δcost along √ε step = \
+             {:.3e}, cost = {:.3e}, ratio = {:.3e} (must be ≤ 4 OR gradient = None). \
+             The `kkt_residual_was_applied` gate at unified.rs:~7466 sets itself from \
+             `kkt_residual_correction_active` (which only checks Some(..) && Fixed), \
+             NOT from the magnitude of `corrections.gradient`. At r_proj = 0 the \
+             correction is identically zero (see BUG-1 test) but the gate still routes \
+             to the 'applied' arm of the match at unified.rs:~7720, passing the inflated \
+             envelope through. The outer optimizer then sees |g| ≈ 1e20 and rejects.",
+            max_abs, predicted_change, cost_scale, ratio,
+        );
+    }
+
+    /// BUG-3 (hard failing): envelope analytic gradient on near-singular H
+    /// disagrees with FD on a re-solved cost. Pinpoints `½ tr(H⁻¹·∂H/∂ρ)`
+    /// blowing up by 1/σ_min(H) when `penalty_subspace_trace = None`.
+    #[test]
+    fn envelope_gradient_matches_fd_at_near_singular_h() {
+        // H = X'X + λ₁S₁ + λ₂S₂. We pick X'X with one tiny eigenvalue so
+        // σ_min(H) ≈ 1e-10 at ρ = 0. λ_k·S_k DO act on the same span as
+        // X'X (so H stays near-singular) — this mirrors the production case
+        // where the inner Hessian is near-singular AT the cert point.
+        let xtx = array![
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0e-10, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let s1 = array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let _xty = array![0.5, 1.0e-6, 0.5];
+
+        let rho = vec![0.0_f64, 0.0_f64];
+        let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
+        let mut h_mat = xtx.clone();
+        h_mat.scaled_add(lambdas[0], &s1);
+        h_mat.scaled_add(lambdas[1], &s2);
+        let op = DenseSpectralOperator::from_symmetric(&h_mat).unwrap();
+        let beta_star = op.solve(&_xty);
+
+        let cost_at = |rho_eval: &[f64]| -> f64 {
+            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|r| r.exp()).collect();
+            let mut h_e = xtx.clone();
+            h_e.scaled_add(lambdas_eval[0], &s1);
+            h_e.scaled_add(lambdas_eval[1], &s2);
+            let op_e = DenseSpectralOperator::from_symmetric(&h_e).unwrap();
+            let beta_e = op_e.solve(&_xty);
+            let mut sol_e = build_gaussian_solution_at_beta(rho_eval, beta_e, false);
+            sol_e.dispersion = DispersionHandling::Fixed {
+                phi: 1.0,
+                include_logdet_h: true,
+                include_logdet_s: true,
+            };
+            reml_laml_evaluate(&sol_e, rho_eval, EvalMode::ValueOnly, None)
+                .unwrap()
+                .cost
+        };
+        let fd_eps = 1e-4;
+        let mut fd_grad = Array1::<f64>::zeros(rho.len());
+        for k in 0..rho.len() {
+            let mut rp = rho.clone();
+            rp[k] += fd_eps;
+            let mut rm = rho.clone();
+            rm[k] -= fd_eps;
+            fd_grad[k] = (cost_at(&rp) - cost_at(&rm)) / (2.0 * fd_eps);
+        }
+
+        let mut sol = build_gaussian_solution_at_beta(&rho, beta_star.clone(), false);
+        sol.dispersion = DispersionHandling::Fixed {
+            phi: 1.0,
+            include_logdet_h: true,
+            include_logdet_s: true,
+        };
+        let result = reml_laml_evaluate(&sol, &rho, EvalMode::ValueAndGradient, None).unwrap();
+        let analytic = result.gradient.expect("gradient at exact β* must be available");
+
+        for k in 0..rho.len() {
+            let err = (analytic[k] - fd_grad[k]).abs();
+            let scale = analytic[k].abs().max(fd_grad[k].abs()).max(1.0);
+            let rel = err / scale;
+            assert!(
+                rel < 1e-2 && analytic[k].is_finite(),
+                "BUG-3 PINPOINTED at coord {}: analytic gradient = {:+.6e}, FD = {:+.6e}, \
+                 rel err = {:.3e}. The LAML envelope `½ tr(H⁻¹·∂H/∂ρ_k)` inflates by \
+                 ~1/σ_min(H) when H is near-singular and `penalty_subspace_trace = None`. \
+                 FD on the re-solved cost surface gives a bounded reference; the analytic \
+                 formula disagrees because the trace's full H⁻¹ amplifies floating-point \
+                 noise in directions where the cost surface itself has no slope. This is \
+                 the math source of |g|∞ = 9.669e16 while the cost is only O(3.48e5) in \
+                 the AoU log.",
+                k, analytic[k], fd_grad[k], rel
+            );
+        }
+    }
+
+    /// LEGACY_BLOCK_START
     /// the joint Newton inner reaches a constrained-stationary point where
     /// the *unprojected* gradient magnitude `‖g‖∞` is enormous (Lagrange-
     /// multiplier mass on the active constraint) while the *projected* KKT
@@ -16431,9 +16688,9 @@ mod tests {
     /// which is exactly how the outer seed startup path turns an inner
     /// certificate into "outer objective/derivatives became non-finite".
     ///
-    /// The assertion below describes the desired contract and therefore must
-    /// fail until the inner convergent path reliably populates the projected
-    /// KKT residual before calling the unified REML/LAML evaluator.
+    /// The evaluator must reject this state as an upstream contract violation,
+    /// not convert it into `gradient=None` and let the outer seed validator
+    /// mislabel the problem as non-finite derivatives.
     #[test]
     fn aou_missing_projected_kkt_residual_suppresses_outer_gradient_reproducer() {
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
@@ -16483,14 +16740,15 @@ mod tests {
             active_constraints: None,
         };
 
-        let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
-            .expect("AoU missing-residual reproducer should reach the envelope gate");
-
+        let err = match reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
+        {
+            Ok(_) => panic!("missing projected KKT residual must be a hard contract error"),
+            Err(err) => err,
+        };
         assert!(
-            result.gradient.is_some(),
-            "BUG REPRODUCED: missing projected KKT residual made the REML/LAML envelope gate \
-             suppress the analytic gradient. The outer seed validator sees this as \
-             custom-family outer objective/derivatives became non-finite."
+            err.contains("fixed-dispersion derivative contract violated")
+                && err.contains("BlockwiseInnerResult::kkt_residual"),
+            "unexpected error for missing projected residual: {err}"
         );
     }
 

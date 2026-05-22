@@ -726,14 +726,34 @@ pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8
     Ok(rounded as u8)
 }
 
-pub fn cause_count_from_event_codes(event_codes: ArrayView1<'_, u8>) -> usize {
-    event_codes
-        .iter()
-        .copied()
-        .max()
-        .map(usize::from)
-        .unwrap_or(0)
-        .max(1)
+pub fn cause_count_from_event_codes(
+    event_codes: ArrayView1<'_, u8>,
+) -> Result<usize, SurvivalError> {
+    let max_code = event_codes.iter().copied().max().map_or(0, usize::from);
+    if max_code == 0 {
+        return Ok(1);
+    }
+
+    let mut present = vec![false; max_code + 1];
+    for code in event_codes.iter().copied() {
+        present[usize::from(code)] = true;
+    }
+    if (1..=max_code).any(|code| !present[code]) {
+        let actual = present
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(code, &seen)| seen.then_some(code.to_string()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "survival competing-risks event codes must use contiguous positive codes; observed nonzero codes are {{{actual}}}. Remap event codes contiguously (for example, {{0,1,3}} -> {{0,1,2}}), otherwise a phantom cause is fit with no events and pollutes CIF assembly."
+            ),
+        });
+    }
+
+    Ok(max_code)
 }
 
 pub fn expand_cause_specific_penalty_blocks(
@@ -798,7 +818,7 @@ pub fn expand_cause_specific_survival_flat_inputs(
     {
         return Err(SurvivalError::DimensionMismatch);
     }
-    let cause_count = cause_count_from_event_codes(event_codes);
+    let cause_count = cause_count_from_event_codes(event_codes)?;
     let joint_n = n * cause_count;
     let joint_p = p * cause_count;
     let mut joint_age_entry = Array1::<f64>::zeros(joint_n);
