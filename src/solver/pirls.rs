@@ -4449,6 +4449,10 @@ where
     // path the whole way through.
     let mut aa_state = AndersonOneState::new();
     let mut force_fisher_for_rest = false;
+    // Reused across LM attempts and PIRLS iterations. On acceptance we swap
+    // the old beta allocation back into this buffer, so the hot path keeps
+    // one O(p) candidate allocation for the whole solve.
+    let mut candidate_buf: Array1<f64> = Array1::zeros(beta.len());
     let kkt_tolerance = effective_kkt_tolerance(options);
     if let Some(adaptive) = options.adaptive_kkt_tolerance {
         log::info!(
@@ -4639,7 +4643,7 @@ where
         // where `state.gradient` has been computed by `update_with_curvature`).
         // Used by the [PIRLS solve-end] summary log to report the
         // geometric reduction factor.
-        if initial_gradient_norm.is_none() {
+        if log::log_enabled!(log::Level::Info) && initial_gradient_norm.is_none() {
             let g0_sq: f64 = state
                 .gradient
                 .iter()
@@ -4708,15 +4712,8 @@ where
         let mut madsen_reject_factor = 2.0_f64;
 
         // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
-        let mut regularized = match (regularized_buf.take(), state.hessian.as_dense()) {
-            (Some(crate::linalg::matrix::SymmetricMatrix::Dense(mut buf)), Some(src))
-                if buf.nrows() == src.nrows() && buf.ncols() == src.ncols() =>
-            {
-                buf.assign(src);
-                crate::linalg::matrix::SymmetricMatrix::Dense(buf)
-            }
-            _ => state.hessian.clone(),
-        };
+        let mut regularized =
+            reuse_regularized_hessian_buffer(regularized_buf.take(), &state.hessian);
         let mut applied_lambda = 0.0_f64;
         // Cache for sparse regularized hessian (reuse for predicted reduction
         // and for in-place diagonal updates on subsequent LM attempts).
@@ -4725,10 +4722,6 @@ where
         // diagonal so we can apply a delta update (loop_lambda - sparse_applied_lambda)
         // rather than rebuilding the regularized matrix each attempt.
         let mut sparse_applied_lambda = 0.0_f64;
-        // Reusable candidate-coefficient buffer; size never changes across LM
-        // attempts so we hoist the allocation outside the loop.
-        let mut candidate_buf: Array1<f64> = Array1::zeros(beta.len());
-
         loop {
             attempts += 1;
             lm_attempts_done += 1;
@@ -4887,23 +4880,10 @@ where
             // reject the accelerated candidate, fall back to the plain Fisher
             // candidate transparently — no change to the rest of the loop.
             let mut aa_attempt = false;
-            // Snapshot beta and the plain Fisher residual r_k = direction at
-            // this attempt so that — on acceptance — we can refresh the AA
-            // history with the *plain* fixed-point step regardless of
-            // whether the accelerated or plain candidate ended up accepted.
-            let beta_old_snapshot: Option<Array1<f64>> = if force_fisher_for_rest {
-                Some(beta.as_ref().clone())
-            } else {
-                None
-            };
-            let plain_residual_snapshot: Option<Array1<f64>> = if force_fisher_for_rest {
-                Some(direction.clone())
-            } else {
-                None
-            };
             if force_fisher_for_rest && !aa_state.disabled {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
-                if let Some(mut beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
+                if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
+                    candidate_buf.assign(beta_accel);
                     // Apply the same bound projection the loop already runs on
                     // the plain candidate. Treat this as the "existing
                     // validity check": if projection moves the accelerated
@@ -4914,10 +4894,9 @@ where
                     if options.linear_constraints.is_none()
                         && let Some(lb) = options.coefficient_lower_bounds.as_ref()
                     {
-                        project_coefficients_to_lower_bounds(&mut beta_accel, lb);
+                        project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
                     }
-                    if array1_is_finite(&beta_accel) {
-                        candidate_buf = beta_accel;
+                    if array1_is_finite(&candidate_buf) {
                         aa_attempt = true;
                     }
                 }
@@ -4986,6 +4965,7 @@ where
                                             ),
                                         ));
                                     }
+                                    candidate_buf = candidate_beta.into();
                                     if lm_can_retry(loop_lambda) {
                                         loop_lambda *= madsen_reject_factor;
                                         madsen_reject_factor *= 2.0;
@@ -5027,6 +5007,7 @@ where
                                                     ),
                                                 ));
                                             }
+                                            candidate_buf = candidate_beta.into();
                                             loop_lambda *= madsen_reject_factor;
                                             madsen_reject_factor *= 2.0;
                                             continue;
@@ -5053,6 +5034,7 @@ where
                             if aa_attempt {
                                 aa_state.note_reject(iter);
                             }
+                            candidate_buf = candidate_beta.into();
                             loop_lambda *= madsen_reject_factor;
                             madsen_reject_factor *= 2.0;
                             continue;
@@ -5067,17 +5049,11 @@ where
                         if aa_attempt {
                             aa_state.note_accept(iter);
                         }
-                        // Refresh AA(1) history with the plain Fisher
-                        // fixed-point step from THIS iteration. We always
-                        // mix against the plain residual `r_k = direction`,
-                        // not the accelerated step, so the next iter's AA
-                        // formula stays faithful to the underlying
-                        // contraction map regardless of whether AA was used
-                        // or which candidate was finally accepted.
-                        if let (Some(b_old), Some(r_plain)) =
-                            (beta_old_snapshot.as_ref(), plain_residual_snapshot.as_ref())
-                        {
-                            aa_state.update_history(b_old, r_plain);
+                        // Refresh AA(1) history with the plain Fisher residual
+                        // before `beta` is replaced; borrowing here avoids the
+                        // speculative O(p) beta/direction clones on rejected LM attempts.
+                        if force_fisher_for_rest {
+                            aa_state.update_history(beta.as_ref(), direction);
                         }
                         // Accept Step.
                         // Stash the accepted gain ratio for the
@@ -5092,8 +5068,11 @@ where
                         // for the textbook derivation and canonical values.
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
 
-                        // Updates for next iteration
-                        beta = candidate_beta;
+                        // Updates for next iteration. Recycle the previous beta
+                        // allocation as the next candidate buffer instead of
+                        // allocating a fresh O(p) Array1 on the following iter.
+                        let old_beta = std::mem::replace(&mut beta, candidate_beta);
+                        candidate_buf = old_beta.into();
 
                         // Update Iteration Info
                         let candidategrad_norm = constrained_stationarity_norm(
@@ -5276,6 +5255,7 @@ where
 
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
+                        candidate_buf = candidate_beta.into();
                         if aa_attempt {
                             aa_state.note_reject(iter);
                         }
@@ -5310,7 +5290,10 @@ where
                             state =
                                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                             curvature_total += fisher_fallback_start.elapsed();
-                            regularized = state.hessian.clone();
+                            regularized = reuse_regularized_hessian_buffer(
+                                Some(regularized),
+                                &state.hessian,
+                            );
                             applied_lambda = 0.0;
                             cached_sparse_regularized = None;
                             sparse_applied_lambda = 0.0;
@@ -5425,6 +5408,7 @@ where
                     }
                 }
                 Err(err) => {
+                    candidate_buf = candidate_beta.into();
                     if state.hessian_curvature == HessianCurvatureKind::Observed
                         && !used_fisher_fallback_this_iter
                     {
@@ -5453,7 +5437,8 @@ where
                         let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                         curvature_total += fisher_err_start.elapsed();
-                        regularized = state.hessian.clone();
+                        regularized =
+                            reuse_regularized_hessian_buffer(Some(regularized), &state.hessian);
                         applied_lambda = 0.0;
                         cached_sparse_regularized = None;
                         sparse_applied_lambda = 0.0;
