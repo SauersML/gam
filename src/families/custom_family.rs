@@ -3037,6 +3037,21 @@ fn screened_outer_warm_start<'a>(
     warm_start.filter(|seed| seed.rho.len() == rho.len())
 }
 
+fn warm_start_without_cached_inner_for_psi_derivatives(
+    warm_start: Option<&ConstrainedWarmStart>,
+    has_psi_derivatives: bool,
+) -> Option<ConstrainedWarmStart> {
+    if !has_psi_derivatives {
+        return None;
+    }
+    // TODO(WS1b-long-term): replace this conservative invalidation with a
+    // geometry_key/theta_key on the cached inner-mode record.
+    warm_start.cloned().map(|mut warm| {
+        warm.cached_inner = None;
+        warm
+    })
+}
+
 const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
 
 fn update_custom_outer_inner_cap_from_warm_start(
@@ -16907,7 +16922,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let psi_safe_warm_start =
+        warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0);
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        psi_safe_warm_start.as_ref().or(warm_start),
+    )?;
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         return Err(CustomFamilyError::UnsupportedConfiguration {
@@ -17893,16 +17916,16 @@ fn derivative_quality_options_and_warm_start(
         return (eval_options, None);
     }
     eval_options.inner_tol = direct_joint_hyper_inner_tol;
+    let psi_safe_warm_start =
+        warm_start_without_cached_inner_for_psi_derivatives(warm_start.map(|warm| &warm.inner), true)
+            .map(|inner| CustomFamilyWarmStart { inner });
     let strict_warm_start = if tightening {
         eval_options.inner_max_cycles = eval_options
             .inner_max_cycles
             .max(DIRECT_JOINT_HYPER_MIN_CYCLES);
-        warm_start.cloned().map(|mut warm| {
-            warm.inner.cached_inner = None;
-            warm
-        })
+        psi_safe_warm_start
     } else {
-        None
+        psi_safe_warm_start
     };
     (eval_options, strict_warm_start)
 }
@@ -18010,7 +18033,15 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
     let per_block = split_log_lambdas(rho_current, penalty_counts)?;
-    let mut inner = inner_blockwise_fit(family, specs, &per_block, options, warm_start)?;
+    let psi_safe_warm_start =
+        warm_start_without_cached_inner_for_psi_derivatives(warm_start, true);
+    let mut inner = inner_blockwise_fit(
+        family,
+        specs,
+        &per_block,
+        options,
+        psi_safe_warm_start.as_ref().or(warm_start),
+    )?;
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         log::warn!(

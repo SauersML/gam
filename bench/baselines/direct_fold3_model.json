@@ -1,0 +1,8 @@
+{
+  "edf_per_term": {
+    "duchon(pc1, pc2, pc3, centers=6, order=0, power=1, double_penalty=true)": 4.9155972237632595,
+    "smooth_1": 4.864040148788609,
+    "smooth_2": 4.965463951342296
+  },
+  "final_neg_v": 1296.3278805233085
+}
