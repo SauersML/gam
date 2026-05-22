@@ -108,6 +108,18 @@ impl From<WorkflowError> for String {
     }
 }
 
+/// Cross-module cascade: a `FormulaDslError` raised inside `materialize` /
+/// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
+/// up as a `WorkflowError::InvalidConfig` so the typed error survives the
+/// boundary instead of stringifying immediately.
+impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
+    fn from(err: crate::inference::formula_dsl::FormulaDslError) -> Self {
+        Self::InvalidConfig {
+            reason: err.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LinkWiggleConfig {
     pub degree: usize,
@@ -2474,9 +2486,9 @@ pub fn fit_from_formula(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<FitResult, String> {
+) -> Result<FitResult, WorkflowError> {
     let mat = materialize(formula, data, config)?;
-    fit_model(mat.request)
+    fit_model(mat.request).map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
@@ -2484,7 +2496,7 @@ pub fn materialize<'a>(
     formula: &str,
     data: &'a Dataset,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
