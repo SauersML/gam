@@ -170,8 +170,13 @@ impl<'a> LowRankWeight<'a> {
         }
 
         let xtu = transpose_design_times_dense(design, &self.u)?; // p × r
+        // Symmetric short-circuit: only safe when the *strides* also match.
+        // Two views can share the same `as_ptr()` and shape yet have different
+        // strides (e.g. a square matrix and its transpose), in which case
+        // `xtu.clone()` would compute `(XᵀU)(XᵀU)ᵀ` instead of `(XᵀU)(XᵀV)ᵀ`.
         let xtv = if std::ptr::eq(self.u.as_ptr(), self.v.as_ptr())
             && self.u.shape() == self.v.shape()
+            && self.u.strides() == self.v.strides()
         {
             xtu.clone()
         } else {

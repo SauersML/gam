@@ -2764,3 +2764,142 @@ exec
 1365:                if l2 == 0.0 {
 1368:                let denom = n.sqrt() - 1.0;
 
+codex
+**FINDINGS**
+
+1. [src/terms/analytic_penalties.rs:828](/Users/user/gam/src/terms/analytic_penalties.rs:828)  
+Wrong expression: `out[n * d + c] = mu * acc;` under `Metric-residual Gauss-Newton HVP`.  
+Severity: definitive. This is not the Hessian-vector product promised by `hvp`; it is only `mu A^T A v`. For `P = 0.5 mu ||D||_F^2`, `D = g - g_ref`, the true HVP is:
+```text
+(Hv)_c = mu sum_ab A_ab,c sum_d A_ab,d v_d
+       + mu sum_ab D_ab sum_d B_ab,cd v_d
+```
+where `A_ab,c = d g_ab / d t_c` and `B_ab,cd = d^2 g_ab / d t_c d t_d`. The missing residual-curvature term contains third decoder derivatives:
+```text
+B_ab,cd =
+  K_a,cd^T W J_b + H_a,c^T W H_b,d
++ H_a,d^T W H_b,c + J_a^T W K_b,cd
+```
+Derivation: differentiate `grad_c = mu sum_ab D_ab A_ab,c`. Proposal §4(b) requires the isometry penalty’s nontrivial `(beta,t)` derivatives, not a Gauss-Newton substitution.
+
+2. [src/terms/analytic_penalties.rs:1270](/Users/user/gam/src/terms/analytic_penalties.rs:1270)  
+Wrong expression: `let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);`  
+Severity: definitive. This is not the Hoyer sparsity index. Standard Hoyer sparsity is:
+```text
+H(x) = (sqrt(n) - ||x||_1 / ||x||_2) / (sqrt(n) - 1)
+```
+If this is meant as a penalty minimized for sparsity, use the complement:
+```text
+P_Hoyer(x) = (||x||_1 / ||x||_2 - 1) / (sqrt(n) - 1)
+```
+The current formula maps a dense equal-magnitude vector to `sqrt(n)+1`, not to the Hoyer dense endpoint.
+
+3. [src/terms/analytic_penalties.rs:1371](/Users/user/gam/src/terms/analytic_penalties.rs:1371)  
+Wrong expression: `d[i] = coeff;` for Hoyer Hessian diagonal.  
+Severity: definitive. Even for the currently implemented Hoyer value, the diagonal is not constant. Away from `x_i = 0`, with `r = ||x||_2`, `L1 = ||x||_1`, and `A = lambda * sqrt(n)/(sqrt(n)-1)`, the correct diagonal is:
+```text
+H_ii = A * (-2 |x_i| / r^3 - L1 / r^3 + 3 L1 x_i^2 / r^5)
+```
+The exact HVP is dense:
+```text
+Hv = A * ( -s (x^T v)/r^3 - x (s^T v)/r^3
+           - L1 v/r^3 + 3 L1 x (x^T v)/r^5 )
+```
+where `s = sign(x)`. The default `hvp` consumes this diagonal, so Hoyer HVP is also wrong.
+
+4. [src/terms/analytic_penalties.rs:1555](/Users/user/gam/src/terms/analytic_penalties.rs:1555)  
+Wrong expression: `out[self.rho_indices[j]] = 0.5 * lam_j * sq;`  
+Severity: definitive. This cannot drive unused ARD axes’ precision to infinity: if `t[:,j] = 0`, the gradient is exactly zero. Per proposal §4(d), ARD needs the Gaussian precision normalizer / Occam term. For a normalized per-axis Gaussian prior in a minimization objective:
+```text
+P_j = 0.5 exp(rho_j) sum_n t_nj^2 - (N_eff/2) rho_j + const
+dP_j/drho_j = 0.5 exp(rho_j) sum_n t_nj^2 - N_eff/2
+```
+At an unused axis this derivative is `-N_eff/2`, so minimization pushes `rho_j -> +infinity`.
+
+5. [src/terms/analytic_penalties.rs:1767](/Users/user/gam/src/terms/analytic_penalties.rs:1767), [src/terms/analytic_penalties.rs:1839](/Users/user/gam/src/terms/analytic_penalties.rs:1839)  
+Wrong expression/assumption: `smoothed-L¹ and Log have positive diagonals by construction` and routing all `AnalyticPenaltyKind::Sparsity(_)` through diagonal `log_det_plus_lambda_i`.  
+Severity: definitive. The Log sparsity Hessian is:
+```text
+d2/dx2 [lambda log(1 + x^2/delta^2)]
+= 2 lambda (delta^2 - x^2) / (delta^2 + x^2)^2
+```
+It is negative whenever `|x| > delta`, so it is not a PSD `PenaltyOp`. The correct PSD operator must either exclude exact Log Hessians from PSD/logdet treatment or use an explicit positive majorizer such as the IRLS curvature `2 lambda / (delta^2 + x^2)`.
+
+6. [src/terms/analytic_penalties.rs:1270](/Users/user/gam/src/terms/analytic_penalties.rs:1270), [src/terms/analytic_penalties.rs:1277](/Users/user/gam/src/terms/analytic_penalties.rs:1277), [src/terms/analytic_penalties.rs:1295](/Users/user/gam/src/terms/analytic_penalties.rs:1295), [src/terms/analytic_penalties.rs:1341](/Users/user/gam/src/terms/analytic_penalties.rs:1341)  
+Wrong/missing domain guards: Hoyer divides by `sqrt(n) - 1`; Log divides by `d2`; smoothed L1 gradient/Hessian divide by powers of `sqrt(x^2 + eps^2)`.  
+Severity: definitive. These can produce division by zero / NaN for public inputs: Hoyer with `target.len() == 1`, Log with `delta == 0`, or smoothed L1 with `eps == 0` at `x == 0`. Correct domain requirements are:
+```text
+Hoyer: n > 1 and ||x||_2 > 0
+Log: delta > 0
+SmoothedL1: eps > 0 for differentiability at x = 0
+```
+tokens used
+75,882
+**FINDINGS**
+
+1. [src/terms/analytic_penalties.rs:828](/Users/user/gam/src/terms/analytic_penalties.rs:828)  
+Wrong expression: `out[n * d + c] = mu * acc;` under `Metric-residual Gauss-Newton HVP`.  
+Severity: definitive. This is not the Hessian-vector product promised by `hvp`; it is only `mu A^T A v`. For `P = 0.5 mu ||D||_F^2`, `D = g - g_ref`, the true HVP is:
+```text
+(Hv)_c = mu sum_ab A_ab,c sum_d A_ab,d v_d
+       + mu sum_ab D_ab sum_d B_ab,cd v_d
+```
+where `A_ab,c = d g_ab / d t_c` and `B_ab,cd = d^2 g_ab / d t_c d t_d`. The missing residual-curvature term contains third decoder derivatives:
+```text
+B_ab,cd =
+  K_a,cd^T W J_b + H_a,c^T W H_b,d
++ H_a,d^T W H_b,c + J_a^T W K_b,cd
+```
+Derivation: differentiate `grad_c = mu sum_ab D_ab A_ab,c`. Proposal §4(b) requires the isometry penalty’s nontrivial `(beta,t)` derivatives, not a Gauss-Newton substitution.
+
+2. [src/terms/analytic_penalties.rs:1270](/Users/user/gam/src/terms/analytic_penalties.rs:1270)  
+Wrong expression: `let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);`  
+Severity: definitive. This is not the Hoyer sparsity index. Standard Hoyer sparsity is:
+```text
+H(x) = (sqrt(n) - ||x||_1 / ||x||_2) / (sqrt(n) - 1)
+```
+If this is meant as a penalty minimized for sparsity, use the complement:
+```text
+P_Hoyer(x) = (||x||_1 / ||x||_2 - 1) / (sqrt(n) - 1)
+```
+The current formula maps a dense equal-magnitude vector to `sqrt(n)+1`, not to the Hoyer dense endpoint.
+
+3. [src/terms/analytic_penalties.rs:1371](/Users/user/gam/src/terms/analytic_penalties.rs:1371)  
+Wrong expression: `d[i] = coeff;` for Hoyer Hessian diagonal.  
+Severity: definitive. Even for the currently implemented Hoyer value, the diagonal is not constant. Away from `x_i = 0`, with `r = ||x||_2`, `L1 = ||x||_1`, and `A = lambda * sqrt(n)/(sqrt(n)-1)`, the correct diagonal is:
+```text
+H_ii = A * (-2 |x_i| / r^3 - L1 / r^3 + 3 L1 x_i^2 / r^5)
+```
+The exact HVP is dense:
+```text
+Hv = A * ( -s (x^T v)/r^3 - x (s^T v)/r^3
+           - L1 v/r^3 + 3 L1 x (x^T v)/r^5 )
+```
+where `s = sign(x)`. The default `hvp` consumes this diagonal, so Hoyer HVP is also wrong.
+
+4. [src/terms/analytic_penalties.rs:1555](/Users/user/gam/src/terms/analytic_penalties.rs:1555)  
+Wrong expression: `out[self.rho_indices[j]] = 0.5 * lam_j * sq;`  
+Severity: definitive. This cannot drive unused ARD axes’ precision to infinity: if `t[:,j] = 0`, the gradient is exactly zero. Per proposal §4(d), ARD needs the Gaussian precision normalizer / Occam term. For a normalized per-axis Gaussian prior in a minimization objective:
+```text
+P_j = 0.5 exp(rho_j) sum_n t_nj^2 - (N_eff/2) rho_j + const
+dP_j/drho_j = 0.5 exp(rho_j) sum_n t_nj^2 - N_eff/2
+```
+At an unused axis this derivative is `-N_eff/2`, so minimization pushes `rho_j -> +infinity`.
+
+5. [src/terms/analytic_penalties.rs:1767](/Users/user/gam/src/terms/analytic_penalties.rs:1767), [src/terms/analytic_penalties.rs:1839](/Users/user/gam/src/terms/analytic_penalties.rs:1839)  
+Wrong expression/assumption: `smoothed-L¹ and Log have positive diagonals by construction` and routing all `AnalyticPenaltyKind::Sparsity(_)` through diagonal `log_det_plus_lambda_i`.  
+Severity: definitive. The Log sparsity Hessian is:
+```text
+d2/dx2 [lambda log(1 + x^2/delta^2)]
+= 2 lambda (delta^2 - x^2) / (delta^2 + x^2)^2
+```
+It is negative whenever `|x| > delta`, so it is not a PSD `PenaltyOp`. The correct PSD operator must either exclude exact Log Hessians from PSD/logdet treatment or use an explicit positive majorizer such as the IRLS curvature `2 lambda / (delta^2 + x^2)`.
+
+6. [src/terms/analytic_penalties.rs:1270](/Users/user/gam/src/terms/analytic_penalties.rs:1270), [src/terms/analytic_penalties.rs:1277](/Users/user/gam/src/terms/analytic_penalties.rs:1277), [src/terms/analytic_penalties.rs:1295](/Users/user/gam/src/terms/analytic_penalties.rs:1295), [src/terms/analytic_penalties.rs:1341](/Users/user/gam/src/terms/analytic_penalties.rs:1341)  
+Wrong/missing domain guards: Hoyer divides by `sqrt(n) - 1`; Log divides by `d2`; smoothed L1 gradient/Hessian divide by powers of `sqrt(x^2 + eps^2)`.  
+Severity: definitive. These can produce division by zero / NaN for public inputs: Hoyer with `target.len() == 1`, Log with `delta == 0`, or smoothed L1 with `eps == 0` at `x == 0`. Correct domain requirements are:
+```text
+Hoyer: n > 1 and ||x||_2 > 0
+Log: delta > 0
+SmoothedL1: eps > 0 for differentiability at x = 0
+```
