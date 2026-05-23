@@ -99,9 +99,9 @@
 //!   weights *and* a smooth gradient. The relaxation parameter is the
 //!   smoothing scale `ε` of the smoothed-L¹, REML-selectable.
 //!
-//! All three implement [`AtomSelectionStrategy`], which exposes the value,
-//! gradient, and (where closed-form) Hessian of the assignment-to-code map
-//! and the corresponding penalty contribution.
+//! All three implement [`AtomSelectionStrategy`], which exposes the value and
+//! gradient of the assignment-to-code map plus the corresponding penalty
+//! contribution.
 //!
 //! ## Closed-form gradients and production assembly
 //!
@@ -260,7 +260,6 @@ impl AtomLibrary {
     pub fn fresh_codes(&self) -> SparseAtomCodes {
         SparseAtomCodes::empty(self.n_obs, self.k_atoms())
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +368,6 @@ pub trait AtomSelectionStrategy: AssignmentSparsityCoupling {
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64>;
-
 }
 
 // --- EntropicSoftmax --------------------------------------------------------
@@ -499,7 +497,6 @@ impl AtomSelectionStrategy for EntropicSoftmax {
         let a = self.softmax(free_amplitudes_row);
         self.jvp_logits(a.view(), grad_a_row)
     }
-
 }
 
 impl AssignmentSparsityCoupling for EntropicSoftmax {
@@ -609,7 +606,6 @@ impl AtomSelectionStrategy for TopK {
     ) -> Array1<f64> {
         self.backward_straight_through(code, grad_a_row)
     }
-
 }
 
 impl AssignmentSparsityCoupling for TopK {
@@ -700,7 +696,6 @@ impl AtomSelectionStrategy for L1Relaxed {
         }
         out
     }
-
 }
 
 impl AssignmentSparsityCoupling for L1Relaxed {
@@ -766,10 +761,7 @@ mod tests {
             array![[0.0, 0.0], [0.1, 0.2]].view(),
             LatentIdMode::None,
         );
-        let c1 = LatentCoordValues::from_matrix(
-            array![[0.0], [1.0]].view(),
-            LatentIdMode::None,
-        );
+        let c1 = LatentCoordValues::from_matrix(array![[0.0], [1.0]].view(), LatentIdMode::None);
         AtomLibrary::new(vec![
             AtomRecord::new(
                 ShapeRef {
