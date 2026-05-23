@@ -2422,7 +2422,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                                 options,
                                 warm_start.as_ref(),
                                 0,
-                                0.0,
+                                None,
                                 true,
                             )?
                         } else {

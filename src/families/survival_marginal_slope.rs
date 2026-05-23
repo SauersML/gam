@@ -18227,7 +18227,7 @@ pub fn fit_survival_marginal_slope_terms(
         return Err(SurvivalMarginalSlopeError::IntegrationFailed {
             reason: format!(
                 "survival marginal-slope outer optimization did not converge: \
-                 iterations={} final_objective={:.6e} |g|_inf={:.3e}",
+                 iterations={} final_objective={:.6e} |g|_inf={:?}",
                 solved.fit.outer_iterations, solved.fit.reml_score, solved.fit.outer_gradient_norm
             ),
         }

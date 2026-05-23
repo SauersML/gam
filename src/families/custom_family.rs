@@ -19956,7 +19956,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
                 outer_iterations: 0,
-                outer_gradient_norm: 0.0,
+                // No outer optimization ran — there is no gradient to report.
+                outer_gradient_norm: None,
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry,
@@ -20018,7 +20019,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
                 outer_iterations: 0,
-                outer_gradient_norm: 0.0,
+                // No outer optimization ran — there is no gradient to report.
+                outer_gradient_norm: None,
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry: None,
@@ -20424,12 +20426,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
         ));
     }
-    // `final_grad_norm` is None when the optimizer skipped gradient evaluation
-    // (cache-hit short-circuit, gradient-free compass search). Store 0.0 to
-    // match the codebase-wide convention for "no gradient measurement at this
-    // termination" — `outer_converged` is the authoritative convergence
-    // signal and is persisted alongside.
-    let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(0.0);
+    let outer_grad_norm = outer_result.final_grad_norm;
     let rho_star = outer_result.rho;
     let outer_iters = outer_result.iterations;
     screening_cap.store(0, Ordering::Relaxed);
