@@ -2274,7 +2274,7 @@ impl TotalVariationPenalty {
         rho: ArrayView1<'_, f64>,
         lambda: f64,
     ) -> Result<f64, String> {
-        if !matches!(self.difference_op, DifferenceOpKind::ForwardDiff1D) {
+        if !matches!(&self.difference_op, DifferenceOpKind::ForwardDiff1D) {
             return Err(
                 "TotalVariationPenalty::log_det_plus_lambda_i_forward_1d requires ForwardDiff1D"
                     .to_string(),
@@ -2731,6 +2731,7 @@ pub enum AnalyticPenaltyKind {
     SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
     IBPAssignment(Arc<IBPAssignmentPenalty>),
     Ard(Arc<ARDPenalty>),
+    TotalVariation(Arc<TotalVariationPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -2742,6 +2743,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.tier(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
+            AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -2753,6 +2755,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
+            AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -2764,6 +2767,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.name(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
+            AnalyticPenaltyKind::TotalVariation(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -2775,6 +2779,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
+            AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -2790,6 +2795,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -2805,6 +2811,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -2820,6 +2827,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -2843,6 +2851,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -2952,6 +2961,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
+            AnalyticPenaltyKind::TotalVariation(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
@@ -2977,9 +2989,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             ));
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
-        // closed form is `Σ_i log(d_i + λ)`. Orthogonality keeps the exact
-        // dense eigensolve only below the small-block threshold; large blocks
-        // use Hutchinson/SLQ against the analytic HVP.
+        // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
+        // tridiagonal path-graph structure; graph TV falls back to dense.
+        // Orthogonality keeps the exact dense eigensolve only below the
+        // small-block threshold; large blocks use Hutchinson/SLQ against the
+        // analytic HVP.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::Sparsity(_)
@@ -2999,6 +3013,17 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 }
                 Ok(s)
             }
+            AnalyticPenaltyKind::TotalVariation(p) => match &p.difference_op {
+                DifferenceOpKind::ForwardDiff1D => p.log_det_plus_lambda_i_forward_1d(
+                    self.target.view(),
+                    self.rho.view(),
+                    lambda,
+                ),
+                DifferenceOpKind::GraphEdges(_) => {
+                    let dense = p.as_dense(self.target.view(), self.rho.view());
+                    <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+                }
+            },
             AnalyticPenaltyKind::Orthogonality(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -3012,6 +3037,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn as_dense(&self) -> Array2<f64> {
+        if let AnalyticPenaltyKind::TotalVariation(p) = &self.penalty {
+            return p.as_dense(self.target.view(), self.rho.view());
+        }
         let n = self.target.len();
         let mut m = Array2::<f64>::zeros((n, n));
         let mut e = Array1::<f64>::zeros(n);

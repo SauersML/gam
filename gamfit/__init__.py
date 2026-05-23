@@ -75,6 +75,7 @@ from ._penalties import (
     OrthogonalityPenalty,
     Penalty,
     SparsityPenalty,
+    TotalVariationPenalty,
 )
 from .topology import (
     Circle,
@@ -194,6 +195,7 @@ __all__ = [
     "OrthogonalityPenalty",
     "Penalty",
     "SparsityPenalty",
+    "TotalVariationPenalty",
     "Summary",
     "SurvivalPrediction",
     "TermBlock",

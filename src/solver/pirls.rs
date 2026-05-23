@@ -8470,14 +8470,18 @@ fn write_gamma_log_working_state(
     }
 }
 
+const TWEEDIE_LIMIT_EPS: f64 = 1.0e-6;
+
 #[inline]
 fn tweedie_p_is_poisson(p: f64) -> bool {
-    (p - 1.0).abs() <= 1e-12
+    // 1e-6 avoids cancellation in the Tweedie unit-deviance denominators near p=1.
+    (p - 1.0).abs() <= TWEEDIE_LIMIT_EPS
 }
 
 #[inline]
 fn tweedie_p_is_gamma(p: f64) -> bool {
-    (p - 2.0).abs() <= 1e-12
+    // 1e-6 avoids cancellation in the Tweedie unit-deviance denominators near p=2.
+    (p - 2.0).abs() <= TWEEDIE_LIMIT_EPS
 }
 
 #[inline]
@@ -10559,11 +10563,12 @@ pub fn calculate_deviance(
                     .map(|i| {
                         let yi = y[i];
                         let mui_c = mu[i].max(EPS);
-                        let y_term = if yi > EPS {
-                            yi * (yi.powf(1.0 - p) - mui_c.powf(1.0 - p)) / (1.0 - p)
-                                - (yi.powf(2.0 - p) - mui_c.powf(2.0 - p)) / (2.0 - p)
-                        } else {
+                        let y_term = if yi == 0.0 {
                             mui_c.powf(2.0 - p) / (2.0 - p)
+                        } else {
+                            yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p))
+                                - yi * mui_c.powf(1.0 - p) / (1.0 - p)
+                                + mui_c.powf(2.0 - p) / (2.0 - p)
                         };
                         priorweights[i] * y_term / phi
                     })
