@@ -49,7 +49,7 @@ use crate::smooth::{
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::terms::latent_coord::{
-    AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode,
+    AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -2924,11 +2924,18 @@ struct LatentDimSelectionSpec {
 }
 
 #[derive(Clone)]
+struct LatentManifoldSpec {
+    manifold: LatentManifold,
+    auto: bool,
+}
+
+#[derive(Clone)]
 struct LatentSpec {
     target: String,
     n: usize,
     d: usize,
     init: LatentInitSpec,
+    manifold: LatentManifoldSpec,
     aux_prior: Option<LatentAuxPriorSpec>,
     dim_selection: Option<LatentDimSelectionSpec>,
     explicit_none_mode: bool,

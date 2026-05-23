@@ -176,10 +176,11 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
         let mut iter = 0_usize;
 
         while iter < opts.max_iterations {
-            let system = self
+            let mut system = self
                 .assembler
                 .assemble(self.beta.view(), self.latent)
                 .map_err(|e| format!("LatentInnerSolver: assembler failed at iter {iter}: {e}"))?;
+            system.apply_riemannian_latent_geometry(self.latent);
 
             // Convergence test: relative joint gradient norm.
             let g_norm_sq = system_gradient_norm_sq(&system);
@@ -192,7 +193,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 // effort — if the factorization fails (e.g. ill-
                 // conditioned at the very converged point), skip the
                 // cache; the predictor will then no-op.
-                let solve_options = latent_arrow_solve_options(&system, &opts);
+                let solve_options =
+                    latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
                 if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
                     &system,
                     ridge_t.max(1e-12),
@@ -207,7 +209,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             // Attempt the LM-damped arrow-Schur step. On failure (per-
             // row PD violation or Schur PD violation), grow the ridge
             // and retry without consuming an outer iteration.
-            let solve_options = latent_arrow_solve_options(&system, &opts);
+            let solve_options =
+                latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
             let step_result =
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
@@ -216,11 +219,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                     for (b, db) in self.beta.iter_mut().zip(delta_beta.iter()) {
                         *b += *db;
                     }
-                    let mut flat_t = self.latent.as_flat().clone();
-                    for (t, dt) in flat_t.iter_mut().zip(delta_t.iter()) {
-                        *t += *dt;
-                    }
-                    self.latent.set_flat(flat_t.view());
+                    self.latent.retract_flat_delta(delta_t.view());
                     ridge_t = (ridge_t * opts.lm_shrink).max(0.0);
                     ridge_beta = (ridge_beta * opts.lm_shrink).max(0.0);
                     last_cache = Some(cache);
@@ -265,12 +264,14 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
 fn latent_arrow_solve_options(
     system: &ArrowSchurSystem,
     opts: &LatentInnerOptions,
+    riemannian_trust_region: bool,
 ) -> ArrowSolveOptions {
     let mut solve_options = ArrowSolveOptions::automatic(system.k);
     if let Some(mode) = opts.solver_mode {
         solve_options.mode = mode;
     }
     solve_options.trust_region.radius = opts.trust_region_radius;
+    solve_options.riemannian_trust_region = riemannian_trust_region;
     solve_options
 }
 

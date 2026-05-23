@@ -475,6 +475,39 @@ pub fn ift_warm_start_latent(
     LatentIftOutcome::Applied { delta_t }
 }
 
+// ---------------------------------------------------------------------------
+// Riemannian retraction wrapper (additive)
+// ---------------------------------------------------------------------------
+
+/// Apply an IFT-predicted Euclidean tangent `delta_t` through per-row
+/// retractions, returning the *new* latent field as a flat row-major array.
+///
+/// The predicted `δt_i` produced by [`ift_warm_start_latent`] is a tangent
+/// vector at the current `t_i`. When the per-row latent coordinate lives on
+/// a non-trivial manifold (S¹, S², torus, interval), the additive update
+/// `t_i + δt_i` exits the manifold; we must apply the retraction
+/// `R_{t_i}(P_{T_{t_i}}(δt_i))`.
+///
+/// For `manifolds[i] = None` or `Some(ManifoldKind::Euclidean(_))` the
+/// behavior collapses to plain addition (bit-equivalent to the pre-Riemannian
+/// path). The vector-transport-aware Taylor extension for small `Δβ`
+/// reuses the parallel-transport approximation embedded in each
+/// `Manifold::vector_transport` implementation — see
+/// [`crate::solver::riemannian`].
+pub fn apply_ift_retraction(
+    point_flat: &Array1<f64>,
+    delta_t: &Array1<f64>,
+    row_ambient_dim: usize,
+    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
+) -> Array1<f64> {
+    crate::solver::arrow_schur::apply_per_row_retraction(
+        point_flat,
+        delta_t,
+        row_ambient_dim,
+        manifolds,
+    )
+}
+
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
