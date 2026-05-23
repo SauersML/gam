@@ -840,4 +840,116 @@ mod tests {
         assert_eq!(out[2], 9.0);
         assert_eq!(out[3], 10.0);
     }
+
+    // ----------------------------------------------------------------
+    // Degenerate-collision tests (F1–F5)
+    //
+    // These do not invoke any executable test runner here (they compile-
+    // check only under `cargo check --all-features --all-targets`); the
+    // intent is to lock in the contract that divergent kernels surface a
+    // `BasisError::DegenerateAtCollision` instead of a silent zero, and
+    // that a finite-difference probe at ε just away from the collision
+    // produces a large value consistent with the analytic divergence.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn matern_half_collision_returns_degenerate_error() {
+        let kernel = RadialInputKernel::Matern {
+            length_scale: 1.0,
+            nu: MaternNu::Half,
+        };
+        let t: Array2<f64> = array![[0.0, 0.0]];
+        let centers: Array2<f64> = array![[0.0, 0.0]];
+        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+            .expect_err("ν=1/2 collision must be reported as degenerate");
+        assert!(matches!(err, BasisError::DegenerateAtCollision { .. }));
+    }
+
+    #[test]
+    fn matern_half_finite_difference_diverges_near_collision() {
+        // φ(r) = exp(−r); q = −exp(−r)/r → −∞ as r → 0+.
+        // At r = ε the design gradient component along the axis is
+        // q·s_axis = −exp(−ε)/ε · ε = −exp(−ε) ≈ −1, but the per-r
+        // scalar q itself blows up at ~1/ε, which is the witness for the
+        // divergence flagged by F1.
+        let kernel = RadialInputKernel::Matern {
+            length_scale: 1.0,
+            nu: MaternNu::Half,
+        };
+        let kind = kernel.into_scalar_kind();
+        let eps = 1e-8_f64;
+        let (_, q, _) = kind
+            .eval_design_triplet(eps)
+            .expect("ν=1/2 at r=ε is finite");
+        assert!(q.abs() > 1e6, "expected divergent q for Matérn ν=1/2 near r=0, got {q}");
+    }
+
+    #[test]
+    fn pure_duchon_collision_log_case_is_degenerate() {
+        // m = 2, d = 2 ⇒ α = 2m − d = 2, even ⇒ log case. φ = c r² log r,
+        // q = c (2 log r + 1) → −∞. Must surface as degenerate.
+        let kernel = RadialInputKernel::DuchonPure {
+            block_order: 2,
+            p_order: 2,
+            s_order: 0,
+            dim: 2,
+        };
+        let t: Array2<f64> = array![[0.0, 0.0]];
+        let centers: Array2<f64> = array![[0.0, 0.0]];
+        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+            .expect_err("pure-Duchon log-case collision must error");
+        assert!(matches!(err, BasisError::DegenerateAtCollision { .. }));
+    }
+
+    #[test]
+    fn thin_plate_collision_3d_is_degenerate() {
+        // dim = 3, φ = −r/ℓ, q = −1/(ℓ r) → −∞. Hessian direction is
+        // genuinely undefined at the collision.
+        let kernel = RadialInputKernel::ThinPlate {
+            length_scale: 1.0,
+            dim: 3,
+        };
+        let t: Array2<f64> = array![[0.0, 0.0, 0.0]];
+        let centers: Array2<f64> = array![[0.0, 0.0, 0.0]];
+        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+            .expect_err("thin-plate 3-D collision must error");
+        assert!(matches!(err, BasisError::DegenerateAtCollision { .. }));
+    }
+
+    #[test]
+    fn thin_plate_collision_2d_finite_difference_diverges() {
+        // φ(r) = (r/ℓ)² log(r/ℓ); q = (1/ℓ²)(2 log(r/ℓ) + 1) → −∞.
+        let kernel = RadialInputKernel::ThinPlate {
+            length_scale: 1.0,
+            dim: 2,
+        };
+        let kind = kernel.into_scalar_kind();
+        let eps = 1e-10_f64;
+        let (_, q, _) = kind
+            .eval_design_triplet(eps)
+            .expect("TPS dim=2 at r=ε is finite");
+        assert!(q.abs() > 10.0, "expected large |q| for TPS dim=2 near r=0, got {q}");
+    }
+
+    #[test]
+    fn periodic_branch_cut_returns_branch_cut_error() {
+        // raw = +period/2 sits exactly on the wrap branch cut.
+        let period = 1.0_f64;
+        let t = ndarray::Array1::from(vec![0.5_f64]);
+        let centers = ndarray::Array1::from(vec![0.0_f64]);
+        let mut out = ndarray::Array2::<f64>::zeros((1, 1));
+        let kernel = RadialInputKernel::ThinPlate {
+            length_scale: 1.0,
+            dim: 1,
+        };
+        let err = periodic_radial_input_loc_grad_1d(
+            &kernel,
+            t.view(),
+            centers.view(),
+            period,
+            out.view_mut(),
+        )
+        .expect_err("branch-cut evaluation must surface as PeriodicWrapBranchCut");
+        assert!(matches!(err, BasisError::PeriodicWrapBranchCut { .. }));
+    }
 }
