@@ -4949,7 +4949,7 @@ where
                 // Snapshot the standard-step direction; clone is cheap (p)
                 // relative to the two model.update calls below.
                 let dir_snapshot = newton_direction.clone();
-                let dir_norm = stable_norm(&dir_snapshot);
+                let dir_norm = array1_l2_norm(&dir_snapshot);
                 if dir_norm > 0.0
                     && dir_norm.is_finite()
                     && let Some(h_dense) = regularized.as_dense()
@@ -4978,7 +4978,7 @@ where
                             if solve_newton_direction_dense(h_dense, &k_rhs, &mut delta2).is_ok()
                                 && array1_is_finite(&delta2)
                             {
-                                let d2_norm = stable_norm(&delta2);
+                                let d2_norm = array1_l2_norm(&delta2);
                                 if d2_norm.is_finite()
                                     && d2_norm <= GEODESIC_ACCEPT_ALPHA * dir_norm
                                 {
@@ -4989,6 +4989,11 @@ where
                     }
                 }
             }
+            // Re-borrow after the geodesic block (which may have written
+            // δp₂ into `newton_direction`). NLL ended the previous
+            // `direction` borrow at `array1_is_finite(direction)` above,
+            // so this fresh borrow is the one downstream code reads.
+            let direction: &Array1<f64> = &newton_direction;
 
             // 2. Compute Predicted Reduction
             // Pred = -g'δ - 0.5 * δ'(H)δ
