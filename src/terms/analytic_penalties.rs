@@ -1034,7 +1034,6 @@ mod tests {
     #[test]
     fn ard_value_matches_quadratic_form() {
         let d = 2;
-        let n_obs = 3;
         let t = array![0.5_f64, 1.0, 2.0, -1.0, 0.0, 3.0];
         let target = PsiSlice::full(t.len(), Some(d));
         let ard = ARDPenalty::new(target, d);
