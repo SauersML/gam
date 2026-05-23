@@ -245,6 +245,14 @@ Expected:
 - Procrustes disparity across seeds ≤ 0.2 (auto_71 was 0.99 unfixed).
 - REML-selected `d` ∈ {3, 4} when `dim_selection="reml"` is enabled.
 
+Empirical baseline observed in the prototype (`auto_75.py`, K_PC=16):
+- observed-only (hue + sv) CV R² = 0.41 (the K_PC=16 ceiling, vs 0.32 at K_PC=64).
+- LatentCoord d=4 with τ=0.5 aux-prior on RGB: CV R² ≈ 0.50 (early).
+- The prototype's pure-Python out-of-fold `t_test` refinement is the
+  bottleneck for full parity with auto_74; the Rust LatentCoord with
+  IFT-warm-started `grad_t` would close this gap with better step
+  control (and at production speed).
+
 The companion prototype `experiments/auto_75.py` simulates this in
 pure Python (using gamfit's existing primitives + a hand-rolled outer
 on `t`) to validate the loss surface and identifiability gain *before*
