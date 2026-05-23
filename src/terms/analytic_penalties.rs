@@ -443,6 +443,8 @@ pub struct IsometryPenalty {
 }
 
 impl IsometryPenalty {
+    pub const DEFAULT_VALUE_ON_MISSING_CACHE: f64 = 0.0;
+
     pub fn new_euclidean(target: PsiSlice, p_out: usize) -> Self {
         Self {
             target,
@@ -502,6 +504,51 @@ impl IsometryPenalty {
     pub fn with_weight(mut self, weight: WeightField) -> Self {
         self.weight = weight;
         self
+    }
+
+    fn missing_cache_default(&self, method: &str, detail: &str) {
+        let has_required_cache = false;
+        debug_assert!(
+            has_required_cache,
+            "IsometryPenalty::{method} missing required derivative state: {detail}"
+        );
+        log::warn!(
+            "IsometryPenalty::{method} missing required derivative state: {detail}; \
+             returning the zero safe default"
+        );
+    }
+
+    fn has_jacobian_cache(&self, method: &str) -> bool {
+        if self.jacobian_cache.is_some() {
+            true
+        } else {
+            self.missing_cache_default(method, "jacobian_cache is None");
+            false
+        }
+    }
+
+    fn has_jacobian_second_source(&self, method: &str) -> bool {
+        if self.jacobian_second_cache.is_some() || self.duchon_radial_source.is_some() {
+            true
+        } else {
+            self.missing_cache_default(
+                method,
+                "both jacobian_second_cache and duchon_radial_source are None",
+            );
+            false
+        }
+    }
+
+    fn has_jacobian_third_source(&self, method: &str) -> bool {
+        if self.cache_third_decoder_derivative.is_some() || self.duchon_radial_source.is_some() {
+            true
+        } else {
+            self.missing_cache_default(
+                method,
+                "both cache_third_decoder_derivative and duchon_radial_source are None",
+            );
+            false
+        }
     }
 
     /// Build `M_n = U_n^T J_n ∈ ℝ^{r_n × d}` for row `n`. For
@@ -757,16 +804,21 @@ impl IsometryPenalty {
         target: ArrayView1<'_, f64>,
         n_obs: usize,
         d: usize,
-    ) -> Array2<f64> {
+    ) -> Option<Array2<f64>> {
         if let Some(jac2) = self.jacobian_second_cache.as_ref() {
-            return jac2.as_ref().clone();
+            return Some(jac2.as_ref().clone());
         }
-        let source = self.duchon_radial_source.as_ref().expect(
-            "exact isometry gradient/HVP requires jacobian_second_cache \
-             or duchon_radial_source",
-        );
-        self.duchon_radial_jacobian_second(target, n_obs, d, source)
-            .expect("failed to materialize Duchon radial second derivative for isometry")
+        let source = self.duchon_radial_source.as_ref()?;
+        match self.duchon_radial_jacobian_second(target, n_obs, d, source) {
+            Ok(jac2) => Some(jac2),
+            Err(err) => {
+                self.missing_cache_default(
+                    "jacobian_second",
+                    &format!("failed to materialize Duchon radial second derivative: {err}"),
+                );
+                None
+            }
+        }
     }
 
     fn jacobian_third(
@@ -774,16 +826,21 @@ impl IsometryPenalty {
         target: ArrayView1<'_, f64>,
         n_obs: usize,
         d: usize,
-    ) -> ndarray::Array3<f64> {
+    ) -> Option<ndarray::Array3<f64>> {
         if let Some(jac3) = self.cache_third_decoder_derivative.as_ref() {
-            return jac3.as_ref().clone();
+            return Some(jac3.as_ref().clone());
         }
-        let source = self.duchon_radial_source.as_ref().expect(
-            "analytic isometry HVP requires cache_third_decoder_derivative \
-             or duchon_radial_source",
-        );
-        self.duchon_radial_jacobian_third(target, n_obs, d, source)
-            .expect("failed to materialize Duchon radial third derivative for isometry")
+        let source = self.duchon_radial_source.as_ref()?;
+        match self.duchon_radial_jacobian_third(target, n_obs, d, source) {
+            Ok(jac3) => Some(jac3),
+            Err(err) => {
+                self.missing_cache_default(
+                    "jacobian_third",
+                    &format!("failed to materialize Duchon radial third derivative: {err}"),
+                );
+                None
+            }
+        }
     }
 
     /// Per-row pullback metric `g_n = J_n^T W_n J_n = M_n^T M_n` with
@@ -852,6 +909,9 @@ impl AnalyticPenalty for IsometryPenalty {
             .latent_dim
             .expect("IsometryPenalty requires latent_dim on its PsiSlice");
         let n_obs = target.len() / d;
+        if !self.has_jacobian_cache("value") {
+            return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
+        }
         let g = self.pullback_metric(d);
         let g_ref = self.reference_metric(n_obs, d);
         let mu = rho[self.rho_index].exp();
@@ -887,12 +947,19 @@ impl AnalyticPenalty for IsometryPenalty {
             .latent_dim
             .expect("IsometryPenalty requires latent_dim on its PsiSlice");
         let n_obs = target.len() / d;
+        if !self.has_jacobian_cache("grad_target")
+            || !self.has_jacobian_second_source("grad_target")
+        {
+            return Array1::<f64>::zeros(target.len());
+        }
         let g = self.pullback_metric(d);
         let g_ref = self.reference_metric(n_obs, d);
         let p = self.p_out;
         let mu = rho[self.rho_index].exp();
         let mut grad = Array1::<f64>::zeros(target.len());
-        let jac2 = self.jacobian_second(target, n_obs, d);
+        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
+            return grad;
+        };
         debug_assert_eq!(jac2.ncols(), p * d * d);
 
         for n in 0..n_obs {
@@ -942,12 +1009,22 @@ impl AnalyticPenalty for IsometryPenalty {
             .latent_dim
             .expect("IsometryPenalty requires latent_dim on its PsiSlice");
         let n_obs = target.len() / d;
+        if !self.has_jacobian_cache("hvp")
+            || !self.has_jacobian_second_source("hvp")
+            || !self.has_jacobian_third_source("hvp")
+        {
+            return Array1::<f64>::zeros(v.len());
+        }
         let p = self.p_out;
-        let jac2 = self.jacobian_second(target, n_obs, d);
-        let jac3 = self.jacobian_third(target, n_obs, d);
+        let mut out = Array1::<f64>::zeros(v.len());
+        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
+            return out;
+        };
+        let Some(jac3) = self.jacobian_third(target, n_obs, d) else {
+            return out;
+        };
         let g = self.pullback_metric(d);
         let g_ref = self.reference_metric(n_obs, d);
-        let mut out = Array1::<f64>::zeros(v.len());
 
         for n in 0..n_obs {
             let wj = self.weighted_jacobian_row(n, d);
@@ -1168,11 +1245,11 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let lambda = rho[0].exp();
         let n = target.len() / self.k_atoms;
-        let slice = target.as_slice().expect("contiguous softmax target");
+        let values: Vec<f64> = target.iter().copied().collect();
         let mut acc = 0.0;
         for row in 0..n {
             let start = row * self.k_atoms;
-            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            let a = self.softmax_row(&values[start..start + self.k_atoms]);
             for v in a {
                 if v > 0.0 {
                     acc += -v * v.ln();
@@ -1189,12 +1266,12 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     ) -> Array1<f64> {
         let lambda = rho[0].exp();
         let n = target.len() / self.k_atoms;
-        let slice = target.as_slice().expect("contiguous softmax target");
+        let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau = 1.0 / self.temperature;
         for row in 0..n {
             let start = row * self.k_atoms;
-            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            let a = self.softmax_row(&values[start..start + self.k_atoms]);
             let mut d_h_da = vec![0.0; self.k_atoms];
             let mut mean = 0.0;
             for k in 0..self.k_atoms {
@@ -1216,12 +1293,12 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     ) -> Option<Array1<f64>> {
         let lambda = rho[0].exp();
         let n = target.len() / self.k_atoms;
-        let slice = target.as_slice().expect("contiguous softmax target");
+        let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
         let inv_tau2 = 1.0 / (self.temperature * self.temperature);
         for row in 0..n {
             let start = row * self.k_atoms;
-            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            let a = self.softmax_row(&values[start..start + self.k_atoms]);
             for k in 0..self.k_atoms {
                 out[start + k] = lambda * a[k] * (1.0 - a[k]) * inv_tau2;
             }
@@ -1858,13 +1935,14 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut acc = 0.0;
         for j in 0..d {
-            let lam_j = rho[self.rho_indices[j]].exp();
+            let rho_j = rho[self.rho_indices[j]];
+            let lam_j = rho_j.exp();
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
                 sq += v * v;
             }
-            acc += 0.5 * lam_j * sq;
+            acc += 0.5 * lam_j * sq - 0.5 * self.n_eff * rho_j;
         }
         acc
     }
